@@ -38,6 +38,7 @@ impl LlmProvider for OverflowWhenLarge {
                 message: "This model's maximum context length is 8192 tokens".into(),
                 http_status: Some(400),
                 code: Some("context_length_exceeded".into()),
+                retry_after_secs: None,
             });
         }
         Ok(Box::pin(futures::stream::iter(vec![

@@ -384,6 +384,8 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ApprovalPrompt { .. } => "ApprovalPrompt",
         UiLine::Error(_) => "Error",
         UiLine::Warning(_) => "Warning",
+        UiLine::Muted(_) => "Muted",
+        UiLine::CompactionMark(_) => "CompactionMark",
         UiLine::TurnCancelled => "TurnCancelled",
         UiLine::TurnComplete => "TurnComplete",
         UiLine::Spinner { .. } => "Spinner",

@@ -156,7 +156,7 @@ fn generate_commit_message(files: &[String]) -> String {
     // Extract short file names for the message
     let short_names: Vec<&str> = files
         .iter()
-        .map(|f| f.rsplit('/').next().unwrap_or(f))
+        .map(|f| Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f))
         .collect();
 
     if file_count == 1 {
@@ -258,6 +258,66 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&status.stdout).trim(),
             "pre_staged.txt"
+        );
+    }
+
+    #[test]
+    fn commit_message_uses_basename_for_forward_slash_paths() {
+        // A nested path is reduced to its file name, dir stripped.
+        assert_eq!(
+            generate_commit_message(&["src/agent/mod.rs".to_string()]),
+            "atomcode: edit mod.rs"
+        );
+        // A bare file name (no separator) passes through unchanged.
+        assert_eq!(
+            generate_commit_message(&["README.md".to_string()]),
+            "atomcode: edit README.md"
+        );
+    }
+
+    #[test]
+    fn commit_message_formats_two_and_three_files() {
+        assert_eq!(
+            generate_commit_message(&["a/x.rs".to_string(), "b/y.rs".to_string()]),
+            "atomcode: edit x.rs, y.rs"
+        );
+        assert_eq!(
+            generate_commit_message(&[
+                "a/x.rs".to_string(),
+                "b/y.rs".to_string(),
+                "c/z.rs".to_string(),
+            ]),
+            "atomcode: edit x.rs, y.rs, z.rs"
+        );
+    }
+
+    #[test]
+    fn commit_message_summarizes_more_than_three_files() {
+        assert_eq!(
+            generate_commit_message(&[
+                "a/x.rs".to_string(),
+                "b/y.rs".to_string(),
+                "c/z.rs".to_string(),
+                "d/w.rs".to_string(),
+            ]),
+            "atomcode: edit x.rs, y.rs and 2 more"
+        );
+    }
+
+    // The regression this module's `Path::file_name()` fix targets: Windows
+    // backslash paths. `Path::file_name()` only treats `\` as a separator on
+    // Windows, so this is platform-gated — on Unix a backslash is a valid file
+    // name character and the path would (correctly, for Unix) pass through whole.
+    #[cfg(windows)]
+    #[test]
+    fn commit_message_uses_basename_for_backslash_paths() {
+        assert_eq!(
+            generate_commit_message(&["src\\agent\\mod.rs".to_string()]),
+            "atomcode: edit mod.rs"
+        );
+        assert_eq!(
+            generate_commit_message(&["C:\\Users\\me\\proj\\main.rs".to_string()]),
+            "atomcode: edit main.rs"
         );
     }
 }

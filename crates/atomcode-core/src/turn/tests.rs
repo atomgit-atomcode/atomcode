@@ -291,22 +291,9 @@ fn test_config() -> Config {
 },
     );
     Config {
-        default_provider: "test".to_string(),
-        evaluator_provider: None,
-        default_workdir: None,
         providers,
-        datalog: Default::default(),
-        notifications: Default::default(),
         auto_update: false,
-        telemetry: Default::default(),
-        lsp: Default::default(),
-        auto_commit: false,
-        subagent: Default::default(),
-        vision_preprocessor_provider: None,
-        language: None,
-        ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
+        ..Config::with_default_provider("test")
     }
 }
 

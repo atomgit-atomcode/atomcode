@@ -6,6 +6,9 @@ description = "L2 coding specialization: assembles the neutral kernel + capabili
 
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
+# CodingPlan REST client + types for the RateLimitHook (rate_limit.rs).
+# L2 is allowed to depend on core (core does not depend on kernel/capabilities/coding).
+atomcode-core = { path = "../atomcode-core" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
 # with web/skills/mcp/session/memory wired (the leaner features exist for other
 # embedders, not for this crate).

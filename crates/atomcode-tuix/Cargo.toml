@@ -8,7 +8,9 @@ default = []
 distro-pm = ["atomcode-core/distro-pm"]
 
 [dependencies]
+atomcode-askpass = { path = "../atomcode-askpass" }
 atomcode-core = { path = "../atomcode-core" }
+zeroize = "1"
 atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"

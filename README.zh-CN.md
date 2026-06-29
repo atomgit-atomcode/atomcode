@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.7-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -290,6 +290,7 @@ atomcode --prompt-file task.md
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
+| `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |
 | `Ctrl+U` | 清空当前行 |

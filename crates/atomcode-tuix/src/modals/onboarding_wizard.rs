@@ -1547,24 +1547,7 @@ mod tests {
     /// a new field forces every test to update), so we mirror the
     /// blank_config_with_lsp helper from `core::config::tests` here.
     fn blank_config_for_test() -> atomcode_core::config::Config {
-        atomcode_core::config::Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: Default::default(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        atomcode_core::config::Config::default()
     }
 
     // ── Step 3 (Setup) draw tests ──

@@ -3,7 +3,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -352,6 +352,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
       // 无 id（新建）则不加载、直接落地。
       setLoading(sessionId != null);
+      // sync 模式：本端在侧栏切到另一个（已存在）会话时，通知后端广播会话切换，
+      // 使同进程 sync 模式的 TUI 跟随加载该会话历史。
+      // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
+      // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
+      if (sync && sessionId) {
+        postLiveSwitchSession(sessionId).catch(() => {});
+      }
     }
 
     if (!sessionId) return;
@@ -579,6 +586,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
+      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
       default: return null;
     }
   }
@@ -623,11 +631,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 重新连接后 /live handler 会绑定到新 LiveSession。
     if (e.type === 'session_switched') {
       liveSessionIdRef.current = e.session_id;
+      // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
+      // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
+      // 画布，否则刚 getSession 加载好的历史会被自己的广播回流抹掉（且 sessionId 未变，
+      // 加载 effect 不会重跑，history 永远回不来）。仅把实时流重绑到新 LiveSession 即可。
+      const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
-      onSessionId(e.session_id);
-      setMessages([]);
-      setTokens(null);
-      setHistoryHint(null);
+      if (!alreadyViewing) {
+        onSessionId(e.session_id);
+        setMessages([]);
+        setTokens(null);
+        setHistoryHint(null);
+      }
       if (sync) {
         stopLiveStream();
         startLiveStream();
@@ -691,7 +706,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setSync((prev) => {
       const next = !prev;
       if (next) {
-        startLiveStream();
+        // 重新开启同步：先把当前会话广播给 TUI，再启动本端实时流。
+        // 关闭同步期间 webui 可能已切换/新建到别的会话（不广播），此时全局 LiveSession
+        // 仍绑在旧会话、TUI 也订阅着旧实例。若直接 startLiveStream，/live 会以新 session_id
+        // 替换全局 LiveSession 却不通知旧实例的订阅者，TUI 就此被孤立、停在旧会话不跟随。
+        // 故必须先 postLiveSwitchSession：它在「旧」全局实例上广播 SessionSwitched，TUI 据此
+        // 加载本端会话并把实时总线重绑到新实例——与侧栏切换会话的同步路径一致。
+        // 顺序关键：必须等广播发出（落在 TUI 仍订阅的旧实例上）后再启动会替换全局的实时流。
+        const sid = activeIdRef.current;
+        if (sid) {
+          postLiveSwitchSession(sid).catch(() => {}).finally(() => startLiveStream());
+        } else {
+          startLiveStream();
+        }
       } else {
         stopLiveStream();
       }
@@ -726,6 +753,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const last = prev[prev.length - 1];
       if (last.role !== 'assistant') return prev;
       const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
+      return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
+  function pushRateLimitedToLastAssistant(text: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant') return prev;
+      const parts: MsgPart[] = [...last.parts, { kind: 'rate_limited', text }];
       return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
@@ -858,6 +895,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
         break;
+
+      case 'rate_limited': {
+        // 限流暂停：渲染成暗色中性卡片，非红色 error 样式；保留已完成内容，不结束回合。
+        // auto_resuming=true → WaitAndRetry (kernel will sleep then retry)
+        // auto_resuming=false + reset_at_display → Pause with known reset time
+        // auto_resuming=false + empty reset_at_display → Pause with unknown reset time
+        const time = event.reset_at_display;
+        let text: string;
+        if (event.auto_resuming) {
+          text = t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        } else if (time) {
+          text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
+        } else {
+          // Pause with no wall-clock time but a known remaining duration: show it
+          // (compact h/m/s, matching the TUI) instead of dropping secs_until_reset.
+          const secs = event.secs_until_reset;
+          const dur = secs == null ? '' :
+            secs >= 3600 ? `（还有 ${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m）` :
+            secs >= 60 ? `（还有 ${Math.floor(secs / 60)}m）` : `（还有 ${secs}s）`;
+          text = `${t('chat.rateLimited.pausedNoTime')}${dur} · ${t('chat.rateLimited.hint')}`;
+        }
+        pushRateLimitedToLastAssistant(text);
+        break;
+      }
 
       default:
         // Ignore tool_batch, artifact_*, etc.
@@ -1649,6 +1710,13 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
+          {p.text}
+        </div>,
+      );
+      i++;
+    } else if (p.kind === 'rate_limited') {
+      out.push(
+        <div class="rate-limited-notice" key={`rl-${i}`}>
           {p.text}
         </div>,
       );

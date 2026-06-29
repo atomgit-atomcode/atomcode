@@ -66,6 +66,7 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         (KeyCode::End, _) => Action::LineEnd,
         (KeyCode::Up, _) => Action::HistoryPrev,
         (KeyCode::Down, _) => Action::HistoryNext,
+        (KeyCode::Esc, _) => Action::Cancel,
         (KeyCode::Backspace, _) => Action::Backspace,
         (KeyCode::Delete, _) => Action::DeleteForward,
         _ => Action::NoOp,
@@ -125,6 +126,11 @@ mod tests {
     #[test]
     fn ctrl_c_cancels() {
         assert_eq!(k(KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Cancel);
+    }
+
+    #[test]
+    fn esc_cancels() {
+        assert_eq!(k(KeyCode::Esc, KeyModifiers::NONE), Action::Cancel);
     }
 
     #[test]

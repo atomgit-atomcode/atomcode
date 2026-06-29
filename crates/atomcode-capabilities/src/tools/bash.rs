@@ -35,10 +35,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the working directory and return its combined \
-         stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
-         commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
-         risky and may require approval."
+        shell_tool_description(cfg!(target_os = "windows"))
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -75,7 +72,46 @@ impl Tool for BashTool {
         let secs = a.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
         let dur = Duration::from_secs(secs);
 
-        let mut cmd = build_command(&a.command);
+        // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
+        // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
+        // the askpass helper is actually active; off Windows the command is untouched.
+        #[cfg(unix)]
+        let effective_command = if atomcode_askpass::current_env().is_some() {
+            rewrite_sudo_for_askpass(&a.command)
+        } else {
+            a.command.clone()
+        };
+        #[cfg(not(unix))]
+        let effective_command = a.command.clone();
+
+        let mut cmd = match build_command(&effective_command) {
+            Ok(c) => c,
+            Err(reason) => return err(reason),
+        };
+        // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
+        // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
+        // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
+        // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
+        // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
+        // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
+        // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
+        // AtomCode's own decode_output UTF-8-first policy.
+        //
+        // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
+        //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
+        //      pipe over real binary still crashes — just with a utf-8 codec error. The real
+        //      fix there is the model using bytes mode / `errors=` (its code, not ours).
+        //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
+        //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
+        //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
+        //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
+        //      this one — they cannot be decoupled. Accepted because modern files/output are
+        //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
+        #[cfg(windows)]
+        {
+            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONIOENCODING", "utf-8");
+        }
         // No console-window flash per command on Windows: in headless/daemon mode (e.g.
         // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
         // otherwise allocate a NEW console window on the desktop. No-op off Windows.
@@ -85,6 +121,28 @@ impl Tool for BashTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true); // dropping the wait future (cancel/timeout) SIGKILLs the child
+
+        // Unix only: detach from controlling tty (setsid) so sudo/ssh don't fight the TUI
+        // for /dev/tty, and inject the askpass env vars so they use our password prompt.
+        #[cfg(unix)]
+        {
+            if let Some(env) = atomcode_askpass::current_env() {
+                apply_askpass_env(&mut cmd, env);
+            }
+            // Mirror exactly how atomcode-core/src/tool/bash.rs attaches setsid:
+            // call the setsid(2) syscall in a pre_exec hook so every bash child gets a
+            // new session/pgroup and loses the controlling tty. Failure (already a
+            // pgroup leader) is harmless — ignore the return value.
+            unsafe {
+                cmd.pre_exec(|| {
+                    extern "C" {
+                        fn setsid() -> i32;
+                    }
+                    setsid();
+                    Ok(())
+                });
+            }
+        }
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -108,20 +166,317 @@ impl Tool for BashTool {
     }
 }
 
+/// The `bash` tool description for the current platform.
+///
+/// The tool keeps the name `bash` (every provider's model is trained to reach
+/// for a `bash` tool), but on Windows it actually executes via `cmd.exe` (see
+/// `build_command`). Left unsaid, weak models follow the `bash` name and emit
+/// bash-only syntax — heredocs, `$(...)`, `printf '\n'`, single-quote quoting —
+/// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
+/// Naming the real shell here removes the contradiction. Pure (takes a bool) so
+/// the Windows wording is unit-testable off Windows.
+fn shell_tool_description(is_windows: bool) -> &'static str {
+    // Single-source the base paragraph so a Windows/Unix edit can't drift. A
+    // macro (not a `const`) because `concat!` only splices literals.
+    macro_rules! base {
+        () => {
+            "Run a shell command in the working directory and return its combined \
+             stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
+             commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
+             risky and may require approval."
+        };
+    }
+    if is_windows {
+        concat!(
+            base!(),
+            "\n\
+             Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
+             bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
+             printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
+             message) write it to a temp file and pass the file (e.g. git commit -F msg.txt).\n\
+             Default to ONE shell — cmd.exe — and do NOT randomly switch between shells mid-task. \
+             Do NOT use git-bash forms like `cmd //c`. Use PowerShell (`pwsh -Command ...`) ONLY \
+             when a task genuinely needs a PowerShell-only feature, never as a substitute for a \
+             cmd.exe builtin. Always quote paths \
+             containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
+             splits into two tokens and reports a false \"not found\".\n\
+             Prefer the dedicated tools over shell file operations: read_file to read a file, \
+             grep to search file contents, glob to list or find files by pattern — instead of \
+             cmd's type/find/dir. They are cross-platform and avoid all the cmd.exe quoting \
+             pitfalls above."
+        )
+    } else {
+        base!()
+    }
+}
+
+/// Set the five askpass/socket env vars on the command so sudo/ssh use our TUI
+/// password prompt instead of fighting the TUI for /dev/tty.
 #[cfg(unix)]
-fn build_command(command: &str) -> tokio::process::Command {
+fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &atomcode_askpass::server::AskpassEnv) {
+    cmd.env("SUDO_ASKPASS", &env.askpass_script)
+        .env("SSH_ASKPASS", &env.askpass_script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("ATOMCODE_ASKPASS_SOCK", &env.sock_path)
+        .env("ATOMCODE_ASKPASS_TOKEN", &env.token);
+}
+
+/// Rewrite `sudo` command words to `sudo -A` so the askpass helper is actually used.
+///
+/// macOS sudo (and some Linux sudoers configs) does NOT auto-invoke `SUDO_ASKPASS` just
+/// because no tty is available — it needs an explicit `-A`. Models write plain `sudo`, so
+/// without this they hit "sudo: a terminal is required to read the password". Only called
+/// when the askpass helper is active (`current_env()` is `Some`).
+///
+/// `sudo` is matched only in COMMAND POSITION (string start, or after a shell separator
+/// `; | & ( { \n`), never inside quotes or as an argument. `-A` is skipped when the sudo
+/// invocation already carries `-A`/`--askpass`, `-n`/`--non-interactive` (explicit
+/// no-prompt — adding `-A` would wrongly make it prompt), or `-S`/`--stdin`.
+#[cfg(unix)]
+fn rewrite_sudo_for_askpass(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut cmd_start = true;
+    let mut i = 0;
+    while i < command.len() {
+        let c = command[i..].chars().next().unwrap();
+        let clen = c.len_utf8();
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            i += clen;
+            cmd_start = false;
+            continue;
+        }
+        if in_double {
+            out.push(c);
+            if c == '"' {
+                in_double = false;
+            }
+            i += clen;
+            cmd_start = false;
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                out.push(c);
+                cmd_start = false;
+            }
+            '"' => {
+                in_double = true;
+                out.push(c);
+                cmd_start = false;
+            }
+            ';' | '|' | '&' | '(' | '{' | '\n' => {
+                out.push(c);
+                cmd_start = true;
+            }
+            _ if c.is_whitespace() => {
+                out.push(c); // leading whitespace doesn't end command position
+            }
+            _ => {
+                if cmd_start
+                    && command[i..].starts_with("sudo")
+                    && command[i + 4..].chars().next().is_some_and(|n| n.is_whitespace())
+                    && !sudo_opts_have_askpass_or_noninteractive(&command[i + 4..])
+                {
+                    out.push_str("sudo -A");
+                    i += 4;
+                    cmd_start = false;
+                    continue;
+                }
+                out.push(c);
+                cmd_start = false;
+            }
+        }
+        i += clen;
+    }
+    out
+}
+
+/// True if the option run immediately after `sudo` already contains `-A`/`--askpass`,
+/// `-n`/`--non-interactive`, or `-S`/`--stdin`. Scans leading option tokens (consuming the
+/// argument of arg-taking short options like `-u`), stopping at the command word.
+#[cfg(unix)]
+fn sudo_opts_have_askpass_or_noninteractive(rest: &str) -> bool {
+    const ARG_TAKING: &[char] = &['u', 'g', 'p', 'U', 'C', 'c', 'h', 'r', 't', 'T', 'R'];
+    let mut tokens = rest.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if matches!(tok, ";" | "|" | "&" | "&&" | "||") {
+            break;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "askpass" | "non-interactive" | "stdin" => return true,
+                _ => continue,
+            }
+        } else if let Some(short) = tok.strip_prefix('-') {
+            if short.is_empty() {
+                break; // lone "-" is not an option
+            }
+            if short.contains('A') || short.contains('n') || short.contains('S') {
+                return true;
+            }
+            if short.chars().last().is_some_and(|l| ARG_TAKING.contains(&l)) {
+                tokens.next(); // consume this option's argument
+            }
+        } else {
+            break; // first non-option token = the command
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // Prefer bash for the bash-isms models emit; the OS PATH resolves it. If bash is
     // absent the spawn fails and the model sees a clear error (it can retry with sh).
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg(command);
-    cmd
+    Ok(cmd)
 }
 
+// ─── Windows shell compatibility (#882, #883) ────────────────────────────────────
+//
+// Models (GLM-5.2, Claude, etc.) emit bash-semantic scripts: `$(...)`, `$VAR`, `&&`,
+// inline `python -c "..."`, heredocs, `<<<` here-strings, `< <(...)` process substitution.
+// The old Windows branch硬走 `cmd.exe /C`, which is NOT a POSIX shell — it silently
+// corrupts these constructs: `$` is literal (no expansion), inline Python gets its
+// quotes stripped → `SyntaxError: unterminated string literal`, multi-line `git commit
+// -m "..."` loses everything after the first newline. The model retries blindly, wasting
+// turns + API quota.
+//
+// Industrial fix: detect bash on Windows (Git Bash / WSL / MSYS2 are common), route
+// through `bash -c` to unify with the Unix path. Only when bash is genuinely absent do
+// we fall back to cmd.exe — and then we GUARD against unsupported bash constructs so the
+// model gets a clear "rewrite for cmd.exe" error instead of silent corruption.
+
+/// `C:\Windows\System32\bash.exe` (and SysWOW64 / Sysnative) is the WSL launcher, NOT a
+/// usable POSIX shell here: it runs the command INSIDE the Linux distro — different
+/// filesystem (`/mnt/c` vs `C:\`), Linux `python`/`node` (not the user's Windows ones),
+/// and a Windows `working_dir` it cannot `cd` into. Excluded from bash detection. Pure
+/// path check so it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_wsl_launcher(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    s.contains(r"\windows\system32\")
+        || s.contains(r"\windows\syswow64\")
+        || s.contains(r"\windows\sysnative\")
+}
+
+/// Detect a Git Bash / MSYS2 bash on Windows. Checks PATH (`where bash`) then common
+/// install locations. Deliberately EXCLUDES the WSL launcher (see `is_wsl_launcher`) —
+/// only shells that inherit the Windows PATH and honor a Windows cwd are usable here.
+/// Returns the resolved path so the caller can `Command::new(path)`; `None` if no usable
+/// bash is available (cmd.exe fallback).
+///
+/// Cheap to call (one `where` + a few `stat`s); cached per-process via `std::sync::OnceLock`.
 #[cfg(windows)]
-fn build_command(command: &str) -> tokio::process::Command {
+fn detect_windows_bash() -> Option<std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        // 1. PATH lookup via `where bash` (cmd.exe builtin, always available). SKIP the
+        // WSL launcher — it is usually first on PATH but runs in the Linux distro.
+        let where_out = std::process::Command::new("where").arg("bash").output();
+        if let Ok(o) = where_out {
+            if o.status.success() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for line in txt.lines() {
+                    let p = std::path::PathBuf::from(line.trim());
+                    if p.is_file() && !is_wsl_launcher(&p) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        // 2. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
+        // `System32\bash.exe` (WSL): see `is_wsl_launcher`.
+        let candidates = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\msys32\usr\bin\bash.exe",
+        ];
+        for c in candidates {
+            let p = std::path::PathBuf::from(c);
+            if p.is_file() && !is_wsl_launcher(&p) {
+                return Some(p);
+            }
+        }
+        None
+    }).clone()
+}
+
+/// Detect bash constructs that cmd.exe cannot interpret. When bash is absent and we must
+/// fall back to cmd.exe, returning a clear error here (instead of letting cmd.exe silently
+/// corrupt the script) lets the model rewrite instead of retrying blindly. Returns
+/// `Some(reason)` when the command should NOT be routed through cmd.exe.
+///
+/// DELIBERATELY CONSERVATIVE — only flags constructs that cmd.exe provably mishandles AND
+/// that a substring match rarely false-positives on. We do NOT flag bare `$VAR` (matches
+/// ANY `$` — prices, regex, literals), backticks (markdown / commit messages), or bare
+/// `<<` heredocs (bit-shift `1<<4`, C++ `cout <<`): the false-positive rate would block
+/// valid cmd.exe commands. Those un-flagged constructs just fall through to cmd.exe
+/// (mangled, as before this guard) rather than being hard-errored. `&&` / `||` chains and
+/// `2>&1` work in cmd.exe and are left alone.
+///
+/// Pure / platform-independent so it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
+    // Command substitution `$(...)` — cmd.exe has no `$()` syntax. (Small residual FP risk
+    // on e.g. awk `$(NF)` passed to a child; accepted for the high value of this one.)
+    if command.contains("$(") {
+        return Some("command substitution `$(...)` — cmd.exe has no `$()` syntax");
+    }
+    // Here-string `<<<` — cmd.exe has no here-string.
+    if command.contains("<<<") {
+        return Some("here-string `<<<` — cmd.exe does not support here-strings");
+    }
+    // Process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd.
+    if command.contains("< <(") || command.contains(">(") {
+        return Some("process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd");
+    }
+    None
+}
+
+/// Windows shell selection. Returns `Ok(Command)` ready to spawn, or `Err(reason)` when
+/// the command contains bash constructs that neither bash (absent) nor cmd.exe can handle
+/// safely — the caller surfaces that as a clear tool error so the model can rewrite.
+#[cfg(windows)]
+fn build_command(command: &str) -> Result<tokio::process::Command, String> {
+    if let Some(bash) = detect_windows_bash() {
+        // Bash available (Git Bash / WSL / MSYS2) — route through it, unifying with
+        // the Unix path. `bash -c "<script>"` honors bash quoting exactly as the model
+        // expects; no silent corruption of `$()`, inline Python, or multi-line strings.
+        let mut cmd = tokio::process::Command::new(bash);
+        cmd.arg("-c").arg(command);
+        return Ok(cmd);
+    }
+    // No bash — cmd.exe fallback. Guard against constructs cmd.exe will silently corrupt
+    // so the model gets a rewrite directive instead of a wasted turn (#883).
+    if let Some(reason) = unsupported_bash_construct(command) {
+        return Err(format!(
+            "bash is not installed and cmd.exe cannot run this command: {}. \
+             Rewrite for cmd.exe (use `%VAR%` for variables, avoid `$(...)`/backticks/\
+             heredocs, use `-F file` for multi-line git commit messages), or install \
+             Git Bash / WSL.",
+            reason
+        ));
+    }
+    // cmd.exe fallback — pass the command VERBATIM via `raw_arg` (preserves the pre-merge
+    // HEAD fix): std's `.arg()` applies `CommandLineToArgvW` quoting that cmd.exe does NOT
+    // follow, mangling embedded quotes (`node -e "..."`), `%VAR%`, `^`. Mirrors
+    // atomcode-core's process_utils::shell_command / tool/bash.rs.
+    use std::os::windows::process::CommandExt;
     let mut cmd = tokio::process::Command::new("cmd.exe");
-    cmd.arg("/C").arg(command);
-    cmd
+    cmd.arg("/C");
+    cmd.as_std_mut().raw_arg(command);
+    Ok(cmd)
 }
 
 /// Decode subprocess output to text. UTF-8 is the fast path; if that fails we fall
@@ -569,10 +924,56 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn apply_askpass_env_sets_sudo_ssh_vars() {
+    use atomcode_askpass::server::AskpassEnv;
+    let env = AskpassEnv { sock_path: "/run/x.sock".into(), token: "tok".into(), askpass_script: "/run/askpass.sh".into() };
+    let mut cmd = tokio::process::Command::new("bash");
+    apply_askpass_env(&mut cmd, &env);
+    // std Command exposes get_envs(): assert the 5 vars are present with expected values.
+    let got: std::collections::HashMap<_,_> = cmd.as_std().get_envs()
+        .filter_map(|(k,v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))).collect();
+    assert_eq!(got.get("SUDO_ASKPASS").map(String::as_str), Some("/run/askpass.sh"));
+    assert_eq!(got.get("SSH_ASKPASS").map(String::as_str), Some("/run/askpass.sh"));
+    assert_eq!(got.get("SSH_ASKPASS_REQUIRE").map(String::as_str), Some("force"));
+    assert_eq!(got.get("ATOMCODE_ASKPASS_SOCK").map(String::as_str), Some("/run/x.sock"));
+    assert_eq!(got.get("ATOMCODE_ASKPASS_TOKEN").map(String::as_str), Some("tok"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn wsl_launcher_excluded_git_bash_and_msys_allowed() {
+        use std::path::Path;
+        // WSL launcher (System32 / SysWOW64 / Sysnative) — must be rejected.
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\SysWOW64\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\Sysnative\bash.exe")));
+        // Git Bash / MSYS2 are real shells we CAN use — must NOT be rejected.
+        assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
+        assert!(!is_wsl_launcher(Path::new(r"C:\msys64\usr\bin\bash.exe")));
+    }
+
+    #[test]
+    fn unsupported_construct_flags_real_bashisms() {
+        assert!(unsupported_bash_construct("echo $(date)").is_some());
+        assert!(unsupported_bash_construct("cat <<< hi").is_some());
+        assert!(unsupported_bash_construct("wc -l < <(ls)").is_some());
+        assert!(unsupported_bash_construct("tee >(cat)").is_some());
+    }
+
+    #[test]
+    fn unsupported_construct_no_false_positive_on_valid_cmd() {
+        // All RUN fine under cmd.exe — the over-broad pre-fix guard wrongly blocked these.
+        assert!(unsupported_bash_construct(r#"echo "price is $5""#).is_none()); // bare $
+        assert!(unsupported_bash_construct("git commit -m \"use `x`\"").is_none()); // backtick
+        assert!(unsupported_bash_construct(r#"python -c "print(1<<4)""#).is_none()); // << bit-shift
+        assert!(unsupported_bash_construct("dir && echo ok").is_none()); // && chain
+    }
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
@@ -580,6 +981,80 @@ mod tests {
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+    }
+
+    // macOS sudo (and some Linux configs) does NOT auto-use SUDO_ASKPASS just because
+    // there is no tty — it needs an explicit `-A`. When the askpass helper is active we
+    // rewrite `sudo` command words to `sudo -A` so a plain `sudo` pops our password modal.
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_sudo_inserts_dash_A_only_when_appropriate() {
+        // bare sudo in command position → gets -A
+        assert_eq!(rewrite_sudo_for_askpass("sudo find / -name x"), "sudo -A find / -name x");
+        // already has -A → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -A find /"), "sudo -A find /");
+        // -n (non-interactive: explicit no-prompt) → MUST NOT add -A
+        assert_eq!(rewrite_sudo_for_askpass("sudo -n true"), "sudo -n true");
+        // -S (read password from stdin) → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -S cat /etc/x"), "sudo -S cat /etc/x");
+        // `sudo` as an argument, not a command → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("echo sudo here"), "echo sudo here");
+        // after `&&` → command position → rewritten
+        assert_eq!(rewrite_sudo_for_askpass("cd /x && sudo make install"), "cd /x && sudo -A make install");
+        // in a pipe → command position → rewritten
+        assert_eq!(rewrite_sudo_for_askpass("ls | sudo tee f"), "ls | sudo -A tee f");
+        // `sudo` inside quotes → not a command → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("grep 'sudo' file"), "grep 'sudo' file");
+        // other leading flags → -A inserted right after sudo
+        assert_eq!(rewrite_sudo_for_askpass("sudo -E find /"), "sudo -A -E find /");
+        // -u takes an arg (root); the command `find` follows → -A inserted, arg not mistaken
+        assert_eq!(rewrite_sudo_for_askpass("sudo -u root find /"), "sudo -A -u root find /");
+        // -u root then -n → non-interactive present → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("sudo -u root -n true"), "sudo -u root -n true");
+        // two sudo segments → both rewritten
+        assert_eq!(rewrite_sudo_for_askpass("sudo a; sudo b"), "sudo -A a; sudo -A b");
+        // no sudo at all → unchanged
+        assert_eq!(rewrite_sudo_for_askpass("find / -name x"), "find / -name x");
+    }
+
+    // On Windows the description must explicitly tell the model it runs via
+    // cmd.exe (not bash) and steer it away from bash-only syntax — otherwise the
+    // model follows the `bash` tool name and emits heredocs / $(...) / single-quote
+    // quoting that cmd.exe can't parse, then thrashes into temp-file workarounds.
+    #[test]
+    fn windows_description_steers_to_cmd_not_bash() {
+        let win = shell_tool_description(true);
+        assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
+        let lc = win.to_lowercase();
+        assert!(lc.contains("not bash"), "windows desc must say it is not bash");
+        assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
+        assert!(win.contains("$("), "windows desc must warn off command substitution");
+
+        let unix = shell_tool_description(false);
+        assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
+    }
+
+    // The reported Windows pain: the model thrashes across cmd / pwsh / git-bash
+    // (`pwsh -Command`, `cmd //c`, `dir`) and mishandles spaced paths
+    // (`if exist "C:\Program Files"` wrongly reported as not existing). The
+    // description must (a) pin a single shell, (b) demand quoting spaced paths,
+    // and (c) steer file ops to the native read_file/grep/glob tools.
+    #[test]
+    fn windows_description_discourages_shell_mixing_and_steers_to_native_tools() {
+        let win = shell_tool_description(true);
+        let lc = win.to_lowercase();
+        // Don't switch shells: cmd.exe only, no PowerShell, no git-bash `cmd //c`.
+        assert!(lc.contains("powershell") || lc.contains("pwsh"), "must warn off PowerShell: {win}");
+        assert!(win.contains("//c"), "must warn off git-bash `cmd //c`: {win}");
+        // Quote paths containing spaces.
+        assert!(win.contains(r#""C:\Program Files""#), "must show quoting a spaced path: {win}");
+        // Prefer atomcode's native file tools over shell file ops.
+        assert!(win.contains("glob"), "must steer to glob: {win}");
+        assert!(win.contains("grep"), "must steer to grep: {win}");
+        assert!(win.contains("read_file"), "must steer to read_file: {win}");
+        // The unix description stays lean (no Windows shell noise).
+        let unix = shell_tool_description(false);
+        assert!(!unix.contains("PowerShell") && !unix.contains("//c"), "unix desc unchanged: {unix}");
     }
 
     #[test]

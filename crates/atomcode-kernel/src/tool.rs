@@ -53,11 +53,21 @@ pub enum RiskLevel {
     Risky,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
     pub content: String,
     pub is_error: bool,
+    /// Inline images a tool produced for a VISION model to SEE (e.g. `read_file`
+    /// returning a picture instead of the "binary, cannot display" dead-end). A
+    /// TRANSIENT carrier on the result, NOT persisted onto the tool-result message:
+    /// the agent loop lifts these onto a follow-up `Role::User` message (the only
+    /// role a provider serializes images on — OpenAI rejects images in a `tool`
+    /// message), exactly mirroring how user-pasted images already reach the model.
+    /// Empty for every text tool. ADDITIVE: `#[serde(default)]` so an older snapshot
+    /// (no `images`) still deserializes (→ empty). See [`crate::message::ImageContent`].
+    #[serde(default)]
+    pub images: Vec<crate::message::ImageContent>,
 }
 
 /// What the LLM sees for a mounted tool.
@@ -244,7 +254,7 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
         fn risk(&self, _args: &str) -> RiskLevel { self.1 }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: "ok".into(), is_error: false }
+            ToolResult { call_id: String::new(), content: "ok".into(), is_error: false, images: vec![] }
         }
     }
 

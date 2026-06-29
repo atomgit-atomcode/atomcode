@@ -12,6 +12,7 @@ use crate::conversation::{
     message::{Message, Role},
     Conversation, ConversationSnapshot,
 };
+use crate::setup::fs_atomic::atomic_write;
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -339,7 +340,11 @@ impl SessionManager {
                                 let src_file = file.path();
                                 let dst_file = dst.join(file.file_name());
                                 if let Err(e) = std::fs::copy(&src_file, &dst_file) {
-                                    tracing::warn!("[session] Failed to copy {:?}: {}", src_file, e);
+                                    tracing::warn!(
+                                        "[session] Failed to copy {:?}: {}",
+                                        src_file,
+                                        e
+                                    );
                                 } else {
                                     migrated += 1;
                                 }
@@ -388,9 +393,9 @@ impl SessionManager {
     pub fn save(&self, session: &Session) -> std::io::Result<()> {
         self.ensure_dir()?;
         let path = self.project_dir().join(format!("{}.json", session.id));
-        let json = serde_json::to_string_pretty(session)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, json)
+        let json = serde_json::to_vec_pretty(session)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        atomic_write(&path, &json, 0o644).map_err(std::io::Error::other)
     }
 
     /// Load a session by ID.
@@ -398,6 +403,36 @@ impl SessionManager {
         let path = self.project_dir().join(format!("{}.json", id));
         let json = std::fs::read_to_string(path)?;
         serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    /// Find and load a session by ID across **all** project buckets.
+    ///
+    /// Sessions are sharded into `<sessions_root>/<project_hash>/<id>.json` by
+    /// the working dir's hash, so `load` needs to know the project. A webui
+    /// session-switch broadcast carries only the id (the TUI may even be in a
+    /// different project), so here we scan every bucket for a matching file and
+    /// return the first hit — the loaded session's own `working_dir` then tells
+    /// the caller which project it belongs to. Errs `NotFound` when no bucket
+    /// contains the id.
+    pub fn load_any(id: &SessionId) -> std::io::Result<Session> {
+        let root = Self::sessions_root_dir();
+        let file_name = format!("{}.json", id);
+        for entry in std::fs::read_dir(&root)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let candidate = path.join(&file_name);
+            if candidate.is_file() {
+                let json = std::fs::read_to_string(&candidate)?;
+                return serde_json::from_str(&json)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session {id} not found in any project"),
+        ))
     }
 
     /// List all sessions for this project (metadata only).
@@ -607,8 +642,14 @@ mod tests {
 
         // Simulate second turn: load existing, update, save — should keep first turn_stats
         let mut loaded = manager.load(&s.id).unwrap();
-        assert_eq!(loaded.turn_stats.len(), 1, "first turn_stats must survive load");
-        loaded.messages.push(Message::new(Role::Assistant, "hi back"));
+        assert_eq!(
+            loaded.turn_stats.len(),
+            1,
+            "first turn_stats must survive load"
+        );
+        loaded
+            .messages
+            .push(Message::new(Role::Assistant, "hi back"));
         loaded.turn_stats.push(TurnStat {
             after_message: 2,
             duration_ms: 300,
@@ -622,10 +663,66 @@ mod tests {
 
         // Reload: both turn_stats must still be there
         let reloaded = manager.load(&s.id).unwrap();
-        assert_eq!(reloaded.turn_stats.len(), 2, "accumulated turn_stats must survive save/load cycle");
+        assert_eq!(
+            reloaded.turn_stats.len(),
+            2,
+            "accumulated turn_stats must survive save/load cycle"
+        );
         assert_eq!(reloaded.turn_stats[0].after_message, 1);
         assert_eq!(reloaded.turn_stats[1].after_message, 2);
         assert_eq!(reloaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn session_save_overwrites_existing_json_and_remains_loadable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let mut session = Session::new(wd.clone());
+        session.id = SessionId::from_string("atomic-overwrite".to_string());
+        session.messages.push(Message::new(Role::User, "first"));
+        manager.save(&session).unwrap();
+
+        session
+            .messages
+            .push(Message::new(Role::Assistant, "second"));
+        session.touch();
+        manager.save(&session).unwrap();
+
+        let loaded = manager.load(&session.id).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].text(), Some("first"));
+        assert_eq!(loaded.messages[1].text(), Some("second"));
+    }
+
+    #[test]
+    fn session_save_leaves_no_temporary_files_behind() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let mut session = Session::new(wd.clone());
+        session.id = SessionId::from_string("atomic-no-tmp".to_string());
+        manager.save(&session).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(manager.project_dir())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "successful atomic save must leave only the session json"
+        );
+        assert_eq!(
+            entries[0].path().extension().and_then(|ext| ext.to_str()),
+            Some("json")
+        );
     }
 
     #[test]
@@ -638,12 +735,14 @@ mod tests {
     #[test]
     fn auto_name_uses_first_real_user_message() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        session
-            .messages
-            .push(Message::new(Role::User, "[System meta · not a user message]\nignored"));
-        session
-            .messages
-            .push(Message::new(Role::User, "帮我修复 VS Code 会话标题自动命名的问题\n更多内容"));
+        session.messages.push(Message::new(
+            Role::User,
+            "[System meta · not a user message]\nignored",
+        ));
+        session.messages.push(Message::new(
+            Role::User,
+            "帮我修复 VS Code 会话标题自动命名的问题\n更多内容",
+        ));
 
         session.auto_name_from_messages();
 
@@ -654,7 +753,9 @@ mod tests {
     fn auto_name_preserves_user_renamed_session() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
         session.rename("手动命名".to_string());
-        session.messages.push(Message::new(Role::User, "新的用户消息"));
+        session
+            .messages
+            .push(Message::new(Role::User, "新的用户消息"));
 
         session.auto_name_from_messages();
 
@@ -664,15 +765,23 @@ mod tests {
     #[test]
     fn rename_sets_user_renamed_flag() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        assert!(!session.user_renamed, "fresh session must not be flagged as user-renamed");
+        assert!(
+            !session.user_renamed,
+            "fresh session must not be flagged as user-renamed"
+        );
         session.rename("我的会话".to_string());
-        assert!(session.user_renamed, "rename() must mark the session as user-renamed");
+        assert!(
+            session.user_renamed,
+            "rename() must mark the session as user-renamed"
+        );
     }
 
     #[test]
     fn auto_name_does_not_set_user_renamed_flag() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        session.messages.push(Message::new(Role::User, "first message body"));
+        session
+            .messages
+            .push(Message::new(Role::User, "first message body"));
         session.auto_name_from_messages();
         assert_eq!(session.name, "first message body");
         assert!(
@@ -765,5 +874,238 @@ mod tests {
         p.hash(&mut expected);
         let legacy = format!("{:016x}", expected.finish());
         assert_eq!(hash_path(p), legacy);
+    }
+
+    // --- P0-4: Session persistence fault-tolerance tests ---
+
+    #[test]
+    fn concurrent_writes_from_same_manager_do_not_corrupt() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let mut session = Session::new(wd.clone());
+        session.id = SessionId::from_string("concurrent-test".to_string());
+
+        // Simulate rapid successive saves (as if multiple turns completed quickly)
+        for i in 0..20 {
+            session.messages.push(Message::new(Role::User, &format!("msg {}", i)));
+            session.touch();
+            manager.save(&session).unwrap();
+        }
+
+        // Verify final state is consistent
+        let loaded = manager.load(&session.id).unwrap();
+        assert_eq!(loaded.messages.len(), 20);
+        assert_eq!(loaded.messages[19].text(), Some("msg 19"));
+    }
+
+    #[test]
+    fn corrupted_session_file_returns_error_on_load() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let session = Session::new(wd.clone());
+        manager.save(&session).unwrap();
+
+        // Corrupt the file
+        let path = manager.project_dir().join(format!("{}.json", session.id));
+        std::fs::write(&path, "{{invalid json!!!").unwrap();
+
+        // Load should fail, not panic
+        let result = manager.load(&session.id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn partial_write_does_not_destroy_previous_valid_session() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // Save a valid session
+        let mut session = Session::new(wd.clone());
+        session.id = SessionId::from_string("partial-write-test".to_string());
+        session.messages.push(Message::new(Role::User, "original content"));
+        manager.save(&session).unwrap();
+
+        // Simulate a failed write by corrupting the file manually
+        let path = manager.project_dir().join(format!("{}.json", session.id));
+        std::fs::write(&path, "{truncated").unwrap();
+
+        // Load should fail for corrupted file
+        assert!(manager.load(&session.id).is_err());
+
+        // Restore valid content and verify load works
+        manager.save(&session).unwrap();
+        let loaded = manager.load(&session.id).unwrap();
+        assert_eq!(loaded.messages[0].text(), Some("original content"));
+    }
+
+    #[test]
+    fn session_delete_removes_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let session = Session::new(wd.clone());
+        manager.save(&session).unwrap();
+        assert!(manager.load(&session.id).is_ok());
+
+        manager.delete(&session.id).unwrap();
+        assert!(manager.load(&session.id).is_err());
+    }
+
+    #[test]
+    fn session_list_returns_all_sessions_sorted_by_updated_at() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // Create 3 sessions with different timestamps
+        for i in 0..3 {
+            let mut session = Session::new(wd.clone());
+            session.id = SessionId::from_string(format!("list-{}", i));
+            // Stagger updated_at so sorting is deterministic
+            session.updated_at = 1000 + i as u64;
+            manager.save(&session).unwrap();
+        }
+
+        let sessions = manager.list().unwrap();
+        assert_eq!(sessions.len(), 3);
+        // Should be sorted descending by updated_at
+        assert!(sessions[0].updated_at >= sessions[1].updated_at);
+        assert!(sessions[1].updated_at >= sessions[2].updated_at);
+    }
+
+    #[test]
+    fn session_list_returns_empty_for_new_project() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        let sessions = manager.list().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn latest_returns_most_recent_session() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // No sessions yet
+        assert!(manager.latest().unwrap().is_none());
+
+        // Create two sessions
+        let mut s1 = Session::new(wd.clone());
+        s1.id = SessionId::from_string("older".to_string());
+        s1.updated_at = 1000;
+        manager.save(&s1).unwrap();
+
+        let mut s2 = Session::new(wd.clone());
+        s2.id = SessionId::from_string("newer".to_string());
+        s2.updated_at = 2000;
+        manager.save(&s2).unwrap();
+
+        let latest = manager.latest().unwrap().unwrap();
+        assert_eq!(latest.id, s2.id);
+    }
+
+    #[test]
+    fn has_sessions_returns_correctly() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        assert!(!manager.has_sessions());
+
+        let session = Session::new(wd.clone());
+        manager.save(&session).unwrap();
+
+        assert!(manager.has_sessions());
+    }
+
+    #[test]
+    fn session_meta_from_session_preserves_fields() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.name = "custom name".to_string();
+        session.messages.push(Message::new(Role::User, "hello"));
+
+        let meta = SessionMeta::from(&session);
+        assert_eq!(meta.id, session.id);
+        assert_eq!(meta.name, "custom name");
+        assert_eq!(meta.message_count, 1);
+        assert_eq!(meta.working_dir, PathBuf::from("/tmp/test"));
+    }
+
+    #[test]
+    fn session_save_shorter_content_leaves_no_trailing_bytes_on_disk() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wd = dir.path().to_path_buf();
+        let manager = SessionManager::new(&wd);
+
+        // 1. Create session with many long messages → large JSON
+        let mut session = Session::new(wd.clone());
+        session.id = SessionId::from_string("no-trailing-test".to_string());
+        for i in 0..20 {
+            session
+                .messages
+                .push(Message::new(Role::User, &format!("msg {}: {}", i, "x".repeat(200))));
+        }
+        manager.save(&session).unwrap();
+        let path = manager.project_dir().join(format!("{}.json", session.id));
+        let size_big = std::fs::metadata(&path).unwrap().len();
+        assert!(size_big > 2000, "big session should be >2KB, got {}", size_big);
+
+        // 2. Clear all messages → small JSON
+        session.messages.clear();
+        session.touch();
+        manager.save(&session).unwrap();
+
+        // 3. File must be much smaller now
+        let size_small = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_small < size_big / 2,
+            "small session should be < half of big: {} vs {}",
+            size_small,
+            size_big
+        );
+
+        // 4. Raw bytes must be valid JSON with no trailing content
+        let raw = std::fs::read(&path).unwrap();
+        // Last meaningful byte must be '}' or whitespace before it
+        let trimmed_end = raw.iter().rposition(|&b| b != b'\n' && b != b' ').unwrap_or(0);
+        assert_eq!(
+            raw[trimmed_end], b'}',
+            "file must end with closing brace, got {:?}",
+            &raw[trimmed_end.saturating_sub(5)..]
+        );
+
+        // 5. Deserialized content must match
+        let loaded: Session = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            loaded.messages.is_empty(),
+            "loaded session must have 0 messages"
+        );
     }
 }

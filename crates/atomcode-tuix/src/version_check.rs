@@ -53,7 +53,7 @@ fn format_version(v: (u64, u64, u64)) -> String {
 /// version. Short timeout keeps startup snappy; any error (network, HTTP,
 /// parse) returns `None` silently.
 pub async fn check_latest(current: &str) -> Option<String> {
-    let client = reqwest::Client::builder()
+    let client = atomcode_core::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
         .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
         .build()

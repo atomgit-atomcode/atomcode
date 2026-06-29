@@ -20,8 +20,7 @@ pub(crate) mod live_sync;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
-use commands::execute_slash_command;
-use commands::attach_live_session;
+use commands::{attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -37,8 +36,8 @@ use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
-use base64::Engine;
 use atomcode_core::conversation::message::ImagePart;
+use base64::Engine;
 
 use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::input::history::History;
@@ -183,7 +182,11 @@ fn ext_for_mt(mt: &str) -> &'static str {
 /// already exists (cache is content-addressable). Failures are
 /// trace-logged and swallowed — the in-memory pending_images path is
 /// the source of truth for the current submit.
-fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversation::message::ImagePart, hash: u64) {
+fn cache_write_image(
+    cache_dir: &std::path::Path,
+    img: &atomcode_core::conversation::message::ImagePart,
+    hash: u64,
+) {
     let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
     if path.exists() {
         return;
@@ -288,7 +291,9 @@ pub(crate) fn compute_input_attachments(
             let mut n: usize = 0;
             let mut had_digit = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as usize);
                 j += 1;
                 had_digit = true;
             }
@@ -333,19 +338,18 @@ pub(crate) fn hydrate_recalled_attachments(
                     &format!("[Image #{}]", new_marker),
                 );
                 let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
-                state.pending_images.push(atomcode_core::conversation::message::ImagePart {
-                    media_type: refed.mt.clone(),
-                    data: base64::engine::general_purpose::STANDARD.encode(&raw),
-                });
+                state
+                    .pending_images
+                    .push(atomcode_core::conversation::message::ImagePart {
+                        media_type: refed.mt.clone(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&raw),
+                    });
                 state.pending_image_hashes.push(hash_u64);
                 state.pending_image_markers.push(new_marker);
             }
             Err(_) => {
                 *line = line.replace(&format!("[Image #{}]", refed.n), "");
-                notices.push(format!(
-                    "[Image #{}] 缓存已丢失，已从消息中移除",
-                    refed.n
-                ));
+                notices.push(format!("[Image #{}] 缓存已丢失，已从消息中移除", refed.n));
             }
         }
     }
@@ -646,7 +650,10 @@ mod compute_input_attachments_tests {
     fn typed_marker_with_no_pending_emits_no_preview() {
         let s = UiState::default();
         let attachments = compute_input_attachments(&s, "I typed [Image #99] literally");
-        assert!(attachments.is_empty(), "literal text must not surface a preview row");
+        assert!(
+            attachments.is_empty(),
+            "literal text must not surface a preview row"
+        );
     }
 
     #[test]
@@ -656,7 +663,10 @@ mod compute_input_attachments_tests {
         let with_marker = compute_input_attachments(&s, "see [Image #1]");
         assert_eq!(with_marker, vec![1]);
         let without_marker = compute_input_attachments(&s, "no marker now");
-        assert!(without_marker.is_empty(), "removing marker text must drop preview row");
+        assert!(
+            without_marker.is_empty(),
+            "removing marker text must drop preview row"
+        );
     }
 
     #[test]
@@ -664,7 +674,11 @@ mod compute_input_attachments_tests {
         let mut s = UiState::default();
         s.pending_image_markers.push(2);
         let attachments = compute_input_attachments(&s, "[Image #2] then [Image #2] again");
-        assert_eq!(attachments, vec![2], "same marker referenced twice must surface a single preview row");
+        assert_eq!(
+            attachments,
+            vec![2],
+            "same marker referenced twice must surface a single preview row"
+        );
     }
 
     #[test]
@@ -673,7 +687,11 @@ mod compute_input_attachments_tests {
         s.pending_image_markers.push(5);
         s.pending_recalled_attachments.push(recalled(3));
         let attachments = compute_input_attachments(&s, "first [Image #5] then [Image #3]");
-        assert_eq!(attachments, vec![5, 3], "preview rows follow buffer text order, not source order");
+        assert_eq!(
+            attachments,
+            vec![5, 3],
+            "preview rows follow buffer text order, not source order"
+        );
     }
 }
 
@@ -763,9 +781,8 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot: std::sync::Arc<
-        std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>,
-    >,
+    pub usage_slot:
+        std::sync::Arc<std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>>,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -853,7 +870,8 @@ pub struct LoopCtx {
     /// so the manager's start failures land in scrollback as `✗ LSP server
     /// 'rust-analyzer' for .rs failed: ...` instead of leaking to stderr
     /// and printing inside the input box.
-    pub lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
+    pub lsp_connect_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -916,6 +934,12 @@ pub struct LoopCtx {
     pub reasoning_effort: Option<String>,
     /// Transient status-line hint with auto-dismiss.
     pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
+    /// Receiver for password-prompt requests forwarded by the askpass server.
+    /// `Some` when the TUI is running an askpass-capable session (Task 10 wires
+    /// the real value); `None` means the arm is inert. Unix-only — sudo/SSH
+    /// askpass is not supported on Windows.
+    #[cfg(unix)]
+    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>,
 }
 
 /// A transient hint shown on the status line, with auto-dismiss deadline.
@@ -985,6 +1009,12 @@ pub struct Buffer {
     stash: String,
     /// Placeholder index → original pasted text. Index 0 = paste #1.
     pastes: Vec<String>,
+    /// The draft's `pastes` registry, parked alongside `stash` when the
+    /// user scrolls into history (Up). Restored together with `stash`
+    /// when HistoryNext walks back past the newest entry, so a draft
+    /// that contained a folded paste survives a round-trip through
+    /// history navigation. Mirrors `stash` for the paste registry.
+    stash_pastes: Vec<String>,
 }
 
 /// Minimum line count or char count for a paste to fold into a
@@ -1010,6 +1040,7 @@ impl Buffer {
             menu_suppressed: false,
             stash: String::new(),
             pastes: Vec::new(),
+            stash_pastes: Vec::new(),
         }
     }
 
@@ -1189,9 +1220,9 @@ impl Buffer {
                 let mut line = self.text.trim();
                 // Strip leading shell prompt characters (❯, $, >, #, %, λ)
                 // that users accidentally paste from terminal output.
-                while let Some(rest) = line.strip_prefix(|c: char| {
-                    matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ')
-                }) {
+                while let Some(rest) =
+                    line.strip_prefix(|c: char| matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ'))
+                {
                     line = rest.trim_start();
                 }
                 let line = line.to_string();
@@ -1292,6 +1323,9 @@ impl Buffer {
                 let new_idx = match self.history_idx {
                     None => {
                         self.stash = self.text.clone();
+                        // Park the draft's paste registry too, so a draft
+                        // containing a folded paste survives Up→Down.
+                        self.stash_pastes = self.pastes.clone();
                         Some(history.len() - 1)
                     }
                     Some(i) if i > 0 => Some(i - 1),
@@ -1300,6 +1334,12 @@ impl Buffer {
                 self.history_idx = new_idx;
                 if let Some(i) = new_idx {
                     self.text = history[i].text.clone();
+                    // Rehydrate the paste registry from the recalled entry
+                    // so its `[Pasted #N …]` placeholders expand back to the
+                    // original bodies on submit (issue #843). The live
+                    // registry was cleared after the prior submit, so without
+                    // this the agent would receive the literal placeholder.
+                    self.pastes = history[i].pastes.clone();
                     // Park cursor at column 0 — recalled history is for
                     // re-running, not editing in place. A `/session foo`
                     // pulled from history would otherwise leave the
@@ -1319,6 +1359,9 @@ impl Buffer {
                         // as HistoryPrev.
                         self.history_idx = Some(i + 1);
                         self.text = history[i + 1].text.clone();
+                        // Rehydrate pastes for the newly shown entry, same
+                        // as HistoryPrev (issue #843).
+                        self.pastes = history[i + 1].pastes.clone();
                         self.cursor = 0;
                     } else {
                         // Past the newest entry — restore the user's
@@ -1327,6 +1370,7 @@ impl Buffer {
                         // they started scrolling.
                         self.history_idx = None;
                         self.text = self.stash.clone();
+                        self.pastes = self.stash_pastes.clone();
                         self.cursor = self.text.len();
                     }
                 }
@@ -1379,8 +1423,8 @@ impl Buffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor =
-            prev_line_start + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
+        self.cursor = prev_line_start
+            + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
         true
     }
 
@@ -1407,8 +1451,8 @@ impl Buffer {
             .find('\n')
             .map(|i| next_line_start + i)
             .unwrap_or(self.text.len());
-        self.cursor =
-            next_line_start + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
+        self.cursor = next_line_start
+            + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
         true
     }
 }
@@ -1433,21 +1477,88 @@ mod buffer_tests {
     use super::*;
 
     #[test]
-    fn spinner_label_surfaces_network_stall_hint_then_clears_on_activity() {
-        // End-to-end on the REAL spinner renderer: a model stream silent past the
-        // threshold must put the localized "network may be down · esc" hint into the
-        // footer label; a fresh chunk (note_stream_activity) must clear it.
+    fn second_esc_within_window_triggers_undo() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW;
+        assert!(second_esc_triggers_undo(Some(first), second));
+    }
+
+    #[test]
+    fn second_esc_after_window_does_not_trigger_undo() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW + Duration::from_millis(1);
+        assert!(!second_esc_triggers_undo(Some(first), second));
+        assert!(!second_esc_triggers_undo(None, second));
+    }
+
+    #[test]
+    fn first_empty_bare_esc_is_consumed_and_arms_undo() {
+        let now = std::time::Instant::now();
+        let mut pending = None;
+
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, now),
+            EmptyEscIntercept::Consumed
+        );
+        assert_eq!(pending, Some(now));
+    }
+
+    #[test]
+    fn second_empty_bare_esc_triggers_undo_and_clears_pending() {
+        let first = std::time::Instant::now();
+        let second = first + DOUBLE_ESC_UNDO_WINDOW;
+        let mut pending = Some(first);
+
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, second),
+            EmptyEscIntercept::TriggerUndo
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn spinner_label_never_shows_stall_hint() {
+        // The "· esc to cancel" stall hint was removed by request: even a model
+        // stream silent well past the threshold must NOT advertise it in the
+        // footer (esc still cancels — it's just not shown).
         let mut s = UiState::new();
         s.on_submit(); // phase=Streaming, spinner = a thinking label
         s.last_stream_activity =
             Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT * 2);
         let hint = crate::i18n::t(crate::i18n::Msg::StreamStalled);
         let stalled = format_spinner_label(&s, 0, None);
-        assert!(stalled.contains(&*hint), "stalled spinner must show the hint, got {stalled:?}");
+        assert!(
+            !stalled.contains(&*hint),
+            "stall hint must never appear in the spinner, got {stalled:?}"
+        );
+    }
 
-        s.note_stream_activity(); // a byte arrived → stream is alive again
-        let live = format_spinner_label(&s, 0, None);
-        assert!(!live.contains(&*hint), "live stream must not show the hint, got {live:?}");
+    #[test]
+    fn spinner_label_maps_tool_names_to_thinking_word() {
+        // Tool-execution labels must not flash tool names in the footer spinner;
+        // they map back to the turn's thinking word. The body ▸ rows carry the
+        // tool detail instead.
+        let mut s = UiState::new();
+        s.on_submit();
+        let thinking = format_spinner_label(&s, 0, None);
+
+        s.on_tool_call_streaming("ReadFile");
+        let preparing = format_spinner_label(&s, 0, None);
+        assert!(
+            !preparing.contains("ReadFile") && !preparing.contains("Preparing"),
+            "streaming spinner leaked a tool name: {preparing:?}"
+        );
+
+        s.on_tool_call_started("Bash");
+        let running = format_spinner_label(&s, 0, None);
+        assert!(
+            !running.contains("Bash") && !running.contains("Running"),
+            "running spinner leaked a tool name: {running:?}"
+        );
+        // …and it's the same thinking word the turn started with (minus the
+        // ticking elapsed suffix).
+        let word = |s: &str| s.split('…').next().unwrap_or("").to_string();
+        assert_eq!(word(&running), word(&thinking));
     }
 
     #[test]
@@ -1481,6 +1592,38 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    /// The conversation scrollback echoes the SAME expanded text the agent
+    /// receives (`expand_pastes` output) — the full pasted body, never the
+    /// `[Pasted #N …]` placeholder — while the input box and Up-arrow history
+    /// keep the folded form. Regression guard for "对话框里还显示
+    /// [Pasted #1 +N lines]"; documents the asymmetry both submit-echo sites
+    /// rely on (they render `expanded.clone()`, history stores folded `line`).
+    #[test]
+    fn conversation_echo_uses_expanded_payload_not_placeholder() {
+        let mut b = Buffer::new();
+        let body = "line of pasted code\n".repeat(11);
+        b.insert_paste(body.clone());
+
+        // Input box + Up-arrow history: folded placeholder.
+        let folded = b.text.clone();
+        assert!(
+            folded.contains("[Pasted #1 +11 lines]"),
+            "input/history must keep the compact placeholder: {folded:?}"
+        );
+
+        // Agent payload AND conversation echo: fully expanded (no placeholder).
+        let expanded = b.expand_pastes(&folded);
+        assert!(expanded.contains(&body), "echo/payload must carry the full body");
+        assert!(
+            !expanded.contains("[Pasted #"),
+            "no placeholder may survive in the echo/payload: {expanded:?}"
+        );
+        assert_ne!(
+            expanded, folded,
+            "echo (expanded) and input/history (folded) must differ for a folded paste"
+        );
     }
 
     #[test]
@@ -1589,7 +1732,88 @@ mod buffer_tests {
             "expand-before-clear must surface the body: {}",
             &expanded[..expanded.len().min(120)]
         );
-        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+        assert!(
+            b.pastes.is_empty(),
+            "clear after expand must still empty the registry"
+        );
+    }
+
+    /// Regression (issue #843): a message containing a folded paste is
+    /// submitted, then recalled via Up-arrow and re-sent. Before the fix
+    /// the recalled buffer carried only the `[Pasted #N …]` placeholder
+    /// — the live `pastes` registry had been cleared after the first
+    /// submit — so `expand_pastes` was a no-op and the agent received the
+    /// literal placeholder. The history entry now persists the paste
+    /// bodies and `HistoryPrev` rehydrates `Buffer.pastes`, so expansion
+    /// works on recall.
+    #[test]
+    fn recalled_paste_expands_after_history_prev() {
+        use crate::input::history::HistoryEntry;
+        let reg = CommandRegistry::builtin();
+
+        // Simulate the first submit: paste folds, then the submit path
+        // snapshots the live registry into the pushed history entry.
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(8);
+        b.insert_paste(body.clone());
+        let submitted_text = b.text.clone();
+        assert!(submitted_text.contains("[Pasted #1"), "should fold to placeholder");
+        let entry = HistoryEntry {
+            text: submitted_text.clone(),
+            images: vec![],
+            pastes: b.pastes.clone(),
+        };
+        // Submit consumes the buffer + clears the live registry.
+        b.text.clear();
+        b.cursor = 0;
+        b.clear_pastes();
+
+        // A fresh turn: empty buffer, empty registry. User presses Up.
+        let history = vec![entry];
+        let _ = b.apply(Action::HistoryPrev, &history, &reg);
+        assert_eq!(b.text, submitted_text, "Up recalls the folded text");
+        assert!(!b.pastes.is_empty(), "registry must be rehydrated on recall");
+
+        // Submitting now expands back to the real body, not the placeholder.
+        let expanded = b.expand_pastes(&b.text);
+        assert!(
+            expanded.contains("important data"),
+            "recalled paste must expand to its body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(!expanded.contains("[Pasted #"), "no placeholder may survive");
+    }
+
+    /// A folded paste in the draft must survive an Up→Down round-trip
+    /// through history: pressing Down past the newest entry restores the
+    /// stashed draft AND its paste registry, so expansion still works.
+    #[test]
+    fn draft_paste_survives_history_round_trip() {
+        use crate::input::history::HistoryEntry;
+        let reg = CommandRegistry::builtin();
+        let history = vec![HistoryEntry {
+            text: "earlier".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let mut b = Buffer::new();
+        let body = "draft body\n".repeat(8);
+        b.insert_paste(body.clone());
+        let draft_text = b.text.clone();
+
+        // Up into history (stashes draft + its pastes), then Down back out.
+        let _ = b.apply(Action::HistoryPrev, &history, &reg);
+        assert_eq!(b.text, "earlier");
+        let _ = b.apply(Action::HistoryNext, &history, &reg);
+        assert_eq!(b.text, draft_text, "draft text restored");
+
+        let expanded = b.expand_pastes(&b.text);
+        assert!(
+            expanded.contains("draft body"),
+            "draft paste must still expand after round-trip: {}",
+            &expanded[..expanded.len().min(120)]
+        );
     }
 
     #[test]
@@ -1613,8 +1837,15 @@ mod buffer_tests {
         let mut b = Buffer::new();
         b.set_restored_text("/provider".to_string());
         assert_eq!(b.text, "/provider");
-        assert_eq!(b.cursor, "/provider".len(), "cursor at end for edit-and-resend");
-        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+        assert_eq!(
+            b.cursor,
+            "/provider".len(),
+            "cursor at end for edit-and-resend"
+        );
+        assert!(
+            b.menu_suppressed(),
+            "restored /command must not pop the menu"
+        );
     }
 
     #[test]
@@ -1723,7 +1954,8 @@ mod menu_tests {
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let items = build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
+        let items =
+            build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
@@ -1869,7 +2101,15 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(build_menu_items("/skills brainstorming why", 0, &reg, &custom, Some(&lock), None).is_none());
+        assert!(build_menu_items(
+            "/skills brainstorming why",
+            0,
+            &reg,
+            &custom,
+            Some(&lock),
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -1901,7 +2141,9 @@ mod menu_tests {
         let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
             .expect("/effort gateway must appear");
         assert!(items.iter().any(|(n, _)| n == "effort"));
-        assert!(!items.iter().any(|(n, _)| n == "high" || n == "max" || n == "off"));
+        assert!(!items
+            .iter()
+            .any(|(n, _)| n == "high" || n == "max" || n == "off"));
     }
 
     #[test]
@@ -1934,7 +2176,8 @@ mod menu_tests {
         let custom = CustomCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
-        let with_empty = build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
+        let with_empty =
+            build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
             with_none.len(),
             with_empty.len(),
@@ -1973,8 +2216,8 @@ mod menu_tests {
         skills.register(skill_fixture("skills:hidden", "no", false));
         let lock = std::sync::RwLock::new(skills);
 
-        let items = build_menu_items("$", 0, &reg, &custom, Some(&lock), None)
-            .expect("$ must list skills");
+        let items =
+            build_menu_items("$", 0, &reg, &custom, Some(&lock), None).expect("$ must list skills");
         assert!(items.iter().any(|(n, _)| n == "brainstorming"));
         assert!(items.iter().any(|(n, _)| n == "web-access"));
         assert!(!items.iter().any(|(n, _)| n == "hidden"));
@@ -2026,7 +2269,7 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -2138,7 +2381,7 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -2160,7 +2403,7 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
@@ -2172,7 +2415,7 @@ mod menu_tests {
     fn sync_recalled_attachments_mirrors_buffer_history_idx() {
         use crate::input::history::{HistoryEntry, HistoryImageRef};
         let history: Vec<HistoryEntry> = vec![
-            HistoryEntry { text: "no img".into(), images: vec![] },
+            HistoryEntry { text: "no img".into(), images: vec![], pastes: vec![] },
             HistoryEntry {
                 text: "with img".into(),
                 images: vec![HistoryImageRef {
@@ -2180,6 +2423,7 @@ mod menu_tests {
                     mt: "image/png".into(),
                     n: 1,
                 }],
+                pastes: vec![],
             },
         ];
         let reg = CommandRegistry::builtin();
@@ -2217,6 +2461,7 @@ mod menu_tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         }];
         let reg = CommandRegistry::builtin();
         let mut buf = Buffer::new();
@@ -2249,6 +2494,7 @@ mod menu_tests {
                 mt: "image/png".into(),
                 n: 1,
             }],
+            pastes: vec![],
         }];
         let reg = CommandRegistry::builtin();
         let mut buf = Buffer::new();
@@ -2371,6 +2617,7 @@ mod menu_tests {
                 mt: img.media_type.clone(),
                 n: 1,
             }],
+            pastes: vec![],
         });
         history.save().unwrap();
         // GC must NOT delete our file (it's referenced).
@@ -2423,14 +2670,26 @@ mod menu_tests {
         assert_eq!(state.pending_images.len(), 1);
         assert_eq!(line, "describe [Image #1]"); // first paste this session
         assert_eq!(state.pending_image_markers, vec![1]);
-        assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+        assert!(
+            line.contains("[Image #1]"),
+            "marker survives in line for the survival filter"
+        );
     }
 
     #[test]
     fn parse_dollar_line_splits_name_and_args() {
-        assert_eq!(parse_dollar_line("$brainstorming"), Some(("brainstorming".to_string(), String::new())));
-        assert_eq!(parse_dollar_line("$brainstorming why is X"), Some(("brainstorming".to_string(), "why is X".to_string())));
-        assert_eq!(parse_dollar_line("$brainstorming  spaced "), Some(("brainstorming".to_string(), "spaced".to_string())));
+        assert_eq!(
+            parse_dollar_line("$brainstorming"),
+            Some(("brainstorming".to_string(), String::new()))
+        );
+        assert_eq!(
+            parse_dollar_line("$brainstorming why is X"),
+            Some(("brainstorming".to_string(), "why is X".to_string()))
+        );
+        assert_eq!(
+            parse_dollar_line("$brainstorming  spaced "),
+            Some(("brainstorming".to_string(), "spaced".to_string()))
+        );
         assert_eq!(parse_dollar_line("hello"), None);
         assert_eq!(parse_dollar_line("/skills x"), None);
         assert_eq!(parse_dollar_line("$"), None);
@@ -2511,7 +2770,10 @@ mod tool_format_tests {
         assert_eq!(display_tool_name_short("edit_file"), "Edit");
         assert_eq!(display_tool_name_short("create_file"), "Create");
         assert_eq!(display_tool_name_short("list_directory"), "List");
-        assert_eq!(display_tool_name_short("parallel_edit_files"), "ParallelEdit");
+        assert_eq!(
+            display_tool_name_short("parallel_edit_files"),
+            "ParallelEdit"
+        );
         // Suffixes not in strip list pass through.
         assert_eq!(display_tool_name_short("bash"), "Bash");
         assert_eq!(display_tool_name_short("grep"), "Grep");
@@ -2612,6 +2874,44 @@ mod tool_format_tests {
         let args = r#"{"action":"update","id":2,"status":"completed"}"#;
         let out = format_tool_detail("todo", args);
         assert_eq!(out, "#2 → completed");
+    }
+
+    #[test]
+    fn parse_todo_titles_extracts_id_to_content() {
+        let mut map = std::collections::HashMap::new();
+        // The full-list shape every todo result returns, with a preamble
+        // line that must be ignored.
+        let output = "Task #4 'Write tests' updated to 'completed'\n\
+                      [x] 4. Write tests\n\
+                      [>] 5. Fix the parser\n\
+                      [ ] 6. Update docs";
+        parse_todo_titles_into(&mut map, output);
+        assert_eq!(map.get(&4).map(String::as_str), Some("Write tests"));
+        assert_eq!(map.get(&5).map(String::as_str), Some("Fix the parser"));
+        assert_eq!(map.get(&6).map(String::as_str), Some("Update docs"));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn enrich_todo_detail_splices_title_into_update() {
+        let mut titles = std::collections::HashMap::new();
+        titles.insert(4u64, "Write tests".to_string());
+        let args = r#"{"action":"update","id":4,"status":"completed"}"#;
+        let base = format_tool_detail("todo", args); // "#4 → completed"
+        let out = enrich_todo_detail("todo", args, &base, &titles);
+        assert_eq!(out, "#4 Write tests \u{2192} completed");
+    }
+
+    #[test]
+    fn enrich_todo_detail_falls_back_without_title() {
+        let titles = std::collections::HashMap::new();
+        let args = r#"{"action":"update","id":4,"status":"completed"}"#;
+        let base = format_tool_detail("todo", args);
+        // Unknown id ⇒ unchanged id-only detail.
+        assert_eq!(enrich_todo_detail("todo", args, &base, &titles), base);
+        // Non-update actions and non-todo tools pass through untouched.
+        assert_eq!(enrich_todo_detail("todo", r#"{"action":"add","content":"x"}"#, "x", &titles), "x");
+        assert_eq!(enrich_todo_detail("bash", r#"{"command":"ls"}"#, "ls", &titles), "ls");
     }
 
     #[test]
@@ -2839,6 +3139,46 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn web_search_domains_from_ddg_output() {
+        // DuckDuckGo backend: explicit URL lines under each numbered result.
+        let out = "Search results for \"北京建筑大学 录取分数线\":\n\n\
+            1. 北京建筑大学2024录取分数\n   https://www.eol.cn/beijing/123\n   snippet\n\n\
+            2. 院校库\n   https://gaokao.com/school/456?ref=x\n   snippet\n\n\
+            3. 阳光高考\n   https://gaokao.com/school/789\n   snippet\n";
+        // www. stripped, gaokao.com deduped, first-seen order preserved.
+        assert_eq!(web_search_source_domains(out), vec!["eol.cn", "gaokao.com"]);
+    }
+
+    #[test]
+    fn web_search_domains_from_inline_text() {
+        // Exa-style blob: URLs embedded mid-sentence with trailing punctuation.
+        let out = "See (https://bjeea.cn/page) and http://dxsbb.com/a, also https://bjeea.cn/other.";
+        assert_eq!(web_search_source_domains(out), vec!["bjeea.cn", "dxsbb.com"]);
+    }
+
+    #[test]
+    fn web_search_domains_empty_when_no_links() {
+        // A link-less Exa text blob or an error message yields no domains.
+        assert!(web_search_source_domains("Exa returned a prose summary with no links.").is_empty());
+        assert!(web_search_source_domains("").is_empty());
+    }
+
+    #[test]
+    fn web_search_suffix_collapses_extra_sources() {
+        let out = "a https://eol.cn/1 b https://gaokao.com/2 c https://bjeea.cn/3 d https://dxsbb.com/4";
+        // Two shown, the rest collapse into +N.
+        assert_eq!(
+            web_search_result_suffix(out).as_deref(),
+            Some("eol.cn, gaokao.com +2")
+        );
+    }
+
+    #[test]
+    fn web_search_suffix_none_without_links() {
+        assert_eq!(web_search_result_suffix("no links here"), None);
+    }
+
+    #[test]
     fn plan_mode_block_reason_detects_gate_blocks() {
         // A PlanModeGate block → calm hint (reason without the `blocked: ` prefix).
         assert_eq!(
@@ -2985,6 +3325,9 @@ pub struct App {
     /// Requires a second press within `CTRL_C_EXIT_WINDOW` to actually
     /// exit — protects against accidental single-tap exits.
     pub exit_pending: Option<std::time::Instant>,
+    /// Timestamp of the first bare Esc press on an empty idle buffer.
+    /// A second Esc within `DOUBLE_ESC_UNDO_WINDOW` triggers `/undo`.
+    pub esc_undo_pending: Option<std::time::Instant>,
     /// Set by `/fixissue <url>` while the agent is resolving that issue.
     /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
     /// back as an issue comment + the `fixed` label is applied. Cleared
@@ -3011,6 +3354,30 @@ pub struct App {
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
+const DOUBLE_ESC_UNDO_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyEscIntercept {
+    Consumed,
+    TriggerUndo,
+}
+
+fn second_esc_triggers_undo(pending: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    pending.is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_UNDO_WINDOW)
+}
+
+fn intercept_empty_bare_esc(
+    pending: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> EmptyEscIntercept {
+    if second_esc_triggers_undo(*pending, now) {
+        *pending = None;
+        EmptyEscIntercept::TriggerUndo
+    } else {
+        *pending = Some(now);
+        EmptyEscIntercept::Consumed
+    }
+}
 
 /// Grace period after a quit request before the force-exit watchdog fires. The
 /// graceful path (engine teardown closes `cmd_tx`) normally completes in well
@@ -3030,6 +3397,7 @@ impl App {
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
+            esc_undo_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             setup_pending: false,
@@ -3081,7 +3449,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         std::env::remove_var("ATOMCODE_UPGRADED_FROM");
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
         renderer.render(UiLine::CommandOutput(
-            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess {
+                from: &prev,
+                to: &current,
+            })
+            .into_owned(),
         ));
     }
     // Warn the user when --dangerously-skip-permissions / -y is active.
@@ -3237,6 +3609,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             ));
             app.setup_hint_shown = true;
         }
+        // One-shot legacy-conhost scroll hint. The classic Windows console
+        // host snaps the viewport back to the bottom on every write, so the
+        // live footer repaint during a running task makes scrolling up to
+        // read history impossible until the task ends — a conhost limitation
+        // we don't fix in-app. Show it once here at startup (this block runs
+        // exactly once per session) and ONLY on legacy conhost; Windows
+        // Terminal and every other terminal set `legacy_conhost = false`.
+        // Gated out of the plain renderer (CI / pipe) where there's no live
+        // footer and no human to read the hint.
+        if !ctx.is_plain_renderer && ctx.caps.legacy_conhost {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::ConhostScrollHint).into_owned(),
+            ));
+        }
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -3389,7 +3775,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Skip the spinner repaint while a capturing modal (the password
+            // prompt) is up — the spinner repaints the same footer/input
+            // region the modal draws, and would clobber the masked line.
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming)
+                && app.active_modal.as_ref().map_or(true, |m| !m.captures_all_keys()) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
@@ -3676,6 +4066,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
                     handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    // A turn ending with a password modal still up = orphan (the sudo/ssh
+                    // that asked for it finished or timed out); dismiss it so `Password:`
+                    // doesn't linger in the input box.
+                    dismiss_orphan_capturing_modal(&mut app, &ctx, renderer);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3716,6 +4110,39 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         runtime_event.event,
                         &ctx.session_manager,
                     );
+                }
+            }
+
+            // ── Askpass password prompt ──
+            // Fired by the askpass server when a child process (sudo/ssh)
+            // asks for a password. Installs the PasswordModal so the user
+            // can type their password without it ever touching the main
+            // input buffer or history. When `askpass_rx` is `None` (the
+            // common case before Task 10 wires it, or after the channel
+            // closes) the async block resolves to `std::future::pending()`
+            // which never fires, making the arm completely inert at zero cost.
+            //
+            // The arm binds the raw `Option<AskpassPrompt>` so we can also
+            // handle the `None` / channel-closed case: once the sender half
+            // is dropped we set `askpass_rx = None` so subsequent iterations
+            // skip the inner `rx.recv()` and go straight back to `pending()`.
+            maybe_p = async {
+                match ctx.askpass_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match maybe_p {
+                    Some(p) => {
+                        install_password_modal(&mut app, p.prompt, p.reply);
+                        if let Some(m) = app.active_modal.as_ref() {
+                            m.draw(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    None => {
+                        // Channel closed — degrade back to the inert pending() path.
+                        ctx.askpass_rx = None;
+                    }
                 }
             }
 
@@ -3770,6 +4197,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // rather than shut down the whole application.
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
                     cancel_active_turn(&ctx);
+                    clear_capturing_modal_on_cancel(&mut app);
                     restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
                 } else {
                     crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
@@ -3786,7 +4214,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Skip the spinner repaint while a capturing modal (the password
+            // prompt) is up — the spinner repaints the same footer/input
+            // region the modal draws, and would clobber the masked line.
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming)
+                && app.active_modal.as_ref().map_or(true, |m| !m.captures_all_keys()) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
@@ -4069,6 +4501,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
                     handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    // A turn ending with a password modal still up = orphan (the sudo/ssh
+                    // that asked for it finished or timed out); dismiss it so `Password:`
+                    // doesn't linger in the input box.
+                    dismiss_orphan_capturing_modal(&mut app, &ctx, renderer);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -4449,6 +4885,34 @@ fn handle_input(
             // where pasting URLs / API keys / tokens is the natural UX.
             // Modals that don't want paste can override `handle_paste`
             // to drop it; the default inserts into `buf` + redraws.
+            //
+            // A capturing modal (the password prompt) installs mid-turn while a
+            // tool runs (phase == Streaming), so route paste to it regardless of
+            // phase — otherwise the pasted password leaks into `buf`. Non-
+            // capturing modals keep their Idle-only routing below.
+            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+                let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action =
+                        modal.handle_paste(&text, &mut app.buf, &mut app.state, ctx, renderer)?;
+                    if matches!(action, crate::modals::ModalAction::Close) {
+                        app.active_modal = None;
+                        if streaming {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action =
@@ -4526,6 +4990,42 @@ fn handle_input(
             modifiers,
             ..
         }) => {
+            // A capturing modal (the password prompt) installs mid-turn while a
+            // tool runs (phase == Streaming). It must receive EVERY key
+            // regardless of phase — otherwise typed chars leak into the
+            // type-ahead `buf` and Esc/Ctrl+C cancel the whole turn instead of
+            // the modal, so the modal's oneshot never fires and the askpass
+            // server hangs. Route here BEFORE any phase dispatch. Non-capturing
+            // modals (the default) keep their Idle-only routing below.
+            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+                let streaming = matches!(app.state.phase, UiPhase::Streaming);
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action = modal.handle_key(
+                        code,
+                        modifiers,
+                        &mut app.buf,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                    )?;
+                    if matches!(action, ModalAction::Close) {
+                        app.active_modal = None;
+                        if streaming {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
@@ -4580,14 +5080,16 @@ fn handle_input(
                                             number: created.number,
                                             title: &created.title,
                                             url: &shown_url,
-                                        }).into_owned(),
+                                        })
+                                        .into_owned(),
                                     ));
                                 }
                                 Err(e) => {
                                     renderer.render(UiLine::CommandOutput(
                                         crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
                                             error: &format!("{:#}", e),
-                                        }).into_owned(),
+                                        })
+                                        .into_owned(),
                                     ));
                                 }
                             }
@@ -4651,10 +5153,8 @@ fn handle_input(
             // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
             // Plain Text") still pass through to whatever else might
             // bind them in the future.
-            if matches!(
-                app.state.phase,
-                UiPhase::Idle | UiPhase::Streaming
-            ) && code == crossterm::event::KeyCode::Char('v')
+            if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
+                && code == crossterm::event::KeyCode::Char('v')
                 && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                 && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
                 && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
@@ -4884,9 +5384,7 @@ fn build_menu_items(
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any
     // `/` interpretation.
-    if let (Some(idx), Some(token)) =
-        (file_index, file_index::detect_at_mention(buf, cursor))
-    {
+    if let (Some(idx), Some(token)) = (file_index, file_index::detect_at_mention(buf, cursor)) {
         let (scope_dir, filter) = file_index::split_token(&token);
         let entries = idx.filter(&scope_dir, &filter);
         if entries.is_empty() {
@@ -5034,6 +5532,7 @@ fn handle_idle_key(
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
             cancel_active_turn(ctx);
+            clear_capturing_modal_on_cancel(app);
             crate::tuix_trace!(
                 "KEY",
                 "idle goal-active {} -> Cancel",
@@ -5155,6 +5654,7 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
+                        pastes: Vec::new(),
                     });
                     app.state.last_submitted_message = Some(committed.clone());
                     execute_slash_command(
@@ -5283,6 +5783,7 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
+                        pastes: Vec::new(),
                     });
                     if let Some((cmd, arg)) = parse_slash_line(&committed) {
                         execute_slash_command(
@@ -5345,6 +5846,7 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: committed.clone(),
                     images: Vec::new(),
+                    pastes: Vec::new(),
                 });
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
                     if cmd.eq_ignore_ascii_case("paste") {
@@ -5401,6 +5903,34 @@ fn handle_idle_key(
         renderer.flush();
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
+    }
+
+    if code == KeyCode::Esc
+        && modifiers.is_empty()
+        && menu_items.is_none()
+        && app.buf.text.is_empty()
+    {
+        match intercept_empty_bare_esc(&mut app.esc_undo_pending, std::time::Instant::now()) {
+            EmptyEscIntercept::Consumed => {
+                app.exit_pending = None;
+                // Surface the second-press affordance, mirroring the
+                // "press Ctrl+C again to exit" hint — otherwise the first
+                // Esc is silently swallowed and the undo gesture is
+                // undiscoverable (and a reflexive double-tap surprises).
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::EscAgainToUndo).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            EmptyEscIntercept::TriggerUndo => {
+                app.exit_pending = None;
+                dispatch_undo("", &app.state, ctx, renderer);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+        }
     }
 
     // Ctrl+V: try clipboard image first, fall back to text paste.
@@ -5514,6 +6044,9 @@ fn handle_idle_key(
     if !matches!(result, BufferResult::Exit) {
         app.exit_pending = None;
     }
+    if code != KeyCode::Esc || !modifiers.is_empty() || !app.buf.text.is_empty() {
+        app.esc_undo_pending = None;
+    }
     match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
@@ -5566,6 +6099,9 @@ fn handle_idle_key(
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: line.clone(),
                         images: Vec::new(),
+                        // Registry still live here (cleared after dispatch);
+                        // carry it so recall re-expands any folded paste.
+                        pastes: app.buf.pastes.clone(),
                     });
                     app.state.last_submitted_message = Some(line.clone());
                     let arg = if skill_args.is_empty() {
@@ -5621,7 +6157,9 @@ fn handle_idle_key(
                 renderer.render(UiLine::User(line.clone()));
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::LocalShell { cmd: bash_cmd.to_string() })
+                    .send(AgentCommand::LocalShell {
+                        cmd: bash_cmd.to_string(),
+                    })
                     .ok();
                 // `!` lines carry no pastes/images; submit consumes the buffer.
                 app.buf.clear_pastes();
@@ -5639,6 +6177,9 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: Vec::new(),
+                    // `/goal <pasted body>` recall must re-expand too — the
+                    // registry is still live here (cleared after dispatch).
+                    pastes: app.buf.pastes.clone(),
                 });
                 // Stash for Esc-restore, same as regular messages. Most slash
                 // commands run synchronously (cleared in the Idle branch
@@ -5706,6 +6247,12 @@ fn handle_idle_key(
                     renderer.render(UiLine::Warning(n));
                 }
                 let mut expanded = app.buf.expand_pastes(&line);
+                // Snapshot the live paste registry BEFORE clearing it, so
+                // the history entry can carry the original paste bodies.
+                // Up-arrow recall rehydrates `Buffer.pastes` from this so a
+                // recalled message's `[Pasted #N …]` placeholder expands to
+                // the real content instead of being sent literally (#843).
+                let submitted_pastes = app.buf.pastes.clone();
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
                 // (e.g. up at the buf.text.clear() prep) was the
@@ -5764,8 +6311,15 @@ fn handle_idle_key(
                     &mut kept_markers,
                 );
                 if ctx.sync_session.is_none() {
+                    // Echo the EXACT text the agent receives (`expanded`): the
+                    // full pasted body with `[Pasted #N …]` placeholders expanded
+                    // and typed image paths already rewritten to `[Image #N]`
+                    // markers — never the opaque placeholder. The input box and
+                    // Up-arrow history below stay folded (compact `line`). Sync
+                    // mode echoes via AgentEvent::UserEcho, so this branch is the
+                    // local-TUI path only.
                     renderer.render(UiLine::UserWithAttachments {
-                        text: line.clone(),
+                        text: expanded.clone(),
                         attachments: kept_markers.clone(),
                     });
                 }
@@ -5773,6 +6327,7 @@ fn handle_idle_key(
                 ctx.history.push(crate::input::history::HistoryEntry {
                     text: line.clone(),
                     images: kept_refs,
+                    pastes: submitted_pastes,
                 });
                 // Clear stale hook warning at the start of each turn.
                 if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
@@ -5781,7 +6336,10 @@ fn handle_idle_key(
                 if let Some(live) = &ctx.sync_session {
                     // 同步模式：投递到 LiveSession。
                     use atomcode_core::live::UserInput;
-                    live.send_input(UserInput { text: expanded, images });
+                    live.send_input(UserInput {
+                        text: expanded,
+                        images,
+                    });
                     app.state.on_submit();
                 } else {
                     // —— 原有逻辑，原样保留 ——
@@ -5973,7 +6531,10 @@ mod parse_already_latest_versions_tests {
     #[test]
     fn extracts_both_versions() {
         let s = "already on v4.22.2 (latest is v4.22.2). Pass --force to reinstall.";
-        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.2", "v4.22.2")));
+        assert_eq!(
+            parse_already_latest_versions(s),
+            Some(("v4.22.2", "v4.22.2"))
+        );
     }
     #[test]
     fn rejects_unrelated_strings() {
@@ -6094,6 +6655,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
+            atomcode_core::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
             ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
@@ -6101,7 +6663,12 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .send(AgentCommand::ReloadConfig(ctx.config.clone()));
         }
         Err(e) => {
-            renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &format!("{}", e),
+                })
+                .into_owned(),
+            ));
             renderer.flush();
         }
     }
@@ -6217,6 +6784,7 @@ fn handle_streaming_key(
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         let send_ok = cancel_active_turn(ctx);
+        clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
             "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
@@ -6233,6 +6801,7 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         let send_ok = cancel_active_turn(ctx);
+        clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
             "streaming Esc -> Cancel send_ok={} spinner={:?}",
@@ -6372,6 +6941,7 @@ fn handle_streaming_key(
             if let Some((cmd, arg)) = streaming_executable_slash(&line) {
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
+                    clear_capturing_modal_on_cancel(app);
                 }
                 commands::execute_slash_command(
                     &cmd,
@@ -6421,7 +6991,8 @@ fn handle_streaming_key(
             // dropped on dispatch.
             let mut line = line;
             let cache_dir_for_hydrate = crate::platform::image_cache_dir();
-            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate) {
+            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate)
+            {
                 renderer.render(UiLine::Warning(n));
             }
             let expanded = app.buf.expand_pastes(&line);
@@ -6452,14 +7023,21 @@ fn handle_streaming_key(
                 }
             }
             if ctx.sync_session.is_none() {
+                // Same as the idle submit path: echo the EXACT text queued for
+                // the agent (`expanded`) — the full pasted body, no
+                // `[Pasted #N …]` placeholder — while history keeps the folded
+                // `line` for compact Up-arrow recall.
                 renderer.render(UiLine::UserWithAttachments {
-                    text: line.clone(),
+                    text: expanded.clone(),
                     attachments: q_markers.clone(),
                 });
             }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
                 images: q_refs,
+                // Snapshot before the clear_pastes() below so recall of a
+                // queued message re-expands its folded paste (#843).
+                pastes: app.buf.pastes.clone(),
             });
             app.message_queue.push_back(crate::state::QueuedMessage {
                 text: expanded,
@@ -6486,6 +7064,7 @@ fn handle_streaming_key(
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
             cancel_active_turn(ctx);
+            clear_capturing_modal_on_cancel(app);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
@@ -6507,6 +7086,35 @@ fn arm_shutdown_watchdog(ctx: &mut LoopCtx) {
     // earliest deadline so spamming the key can't indefinitely defer the exit.
     if ctx.shutdown_deadline.is_none() {
         ctx.shutdown_deadline = Some(std::time::Instant::now() + SHUTDOWN_WATCHDOG);
+    }
+}
+
+/// Drop a capturing modal (the password prompt) when the turn it is attached to
+/// is being cancelled. Dropping `PasswordModal` drops its `reply` Sender, which
+/// resolves the askpass server's `reply_rx.await` to `Err` → the helper (and
+/// thus sudo) gets a clean failure instead of hanging forever, and the server
+/// task doesn't leak. No-op for non-capturing modals and when none is installed.
+fn clear_capturing_modal_on_cancel(app: &mut App) {
+    if app
+        .active_modal
+        .as_ref()
+        .is_some_and(|m| m.captures_all_keys())
+    {
+        app.active_modal = None;
+    }
+}
+
+/// After a turn ends (phase back to `Idle`), a still-installed capturing modal is an
+/// ORPHAN: the sudo/ssh that requested the password finished or timed out, so the prompt
+/// can never be answered. Dismiss it (drop → the askpass server's `reply_rx` resolves to
+/// `Err` → clean failure, no task leak) and repaint the idle prompt so the stale
+/// `Password:` line is cleared. No-op unless `Idle` with a capturing modal up.
+fn dismiss_orphan_capturing_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if matches!(app.state.phase, UiPhase::Idle)
+        && app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys())
+    {
+        app.active_modal = None;
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
 }
 
@@ -6545,9 +7153,7 @@ fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     if ctx.sync_forwarder.is_some() {
         let decision = match cmd {
             AgentCommand::ApproveTool => atomcode_core::tool::PermissionDecision::Allow,
-            AgentCommand::ApproveToolAlways => {
-                atomcode_core::tool::PermissionDecision::AllowAlways
-            }
+            AgentCommand::ApproveToolAlways => atomcode_core::tool::PermissionDecision::AllowAlways,
             _ => atomcode_core::tool::PermissionDecision::Deny,
         };
         if let Some(session) = atomcode_daemon::current_live_session() {
@@ -6691,21 +7297,11 @@ pub(super) fn handle_plugin_job_event(
             if let Some(topic) = ctx.pending_guide_topic.take() {
                 if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
-                            topic: &topic,
-                        })
-                        .into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })
+                            .into_owned(),
                     ));
                     renderer.flush();
-                    state.on_submit();
-                    ctx.agent
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
+                    commands::submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideSkillNotFound).into_owned(),
@@ -6739,21 +7335,11 @@ pub(super) fn handle_plugin_job_event(
                 let _ = reload_plugins(ctx);
                 if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
-                            topic: &topic,
-                        })
-                        .into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })
+                            .into_owned(),
                     ));
                     renderer.flush();
-                    state.on_submit();
-                    ctx.agent
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
+                    commands::submit_agent_turn(ctx, state, rendered);
                 }
             }
             renderer.render(UiLine::CommandOutput(
@@ -6776,7 +7362,8 @@ pub(super) fn handle_upgrade_event(
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version }).into_owned(),
+                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version })
+                    .into_owned(),
             ));
         }
         UpgradeEvent::Downloading { bytes, total } => {
@@ -6792,7 +7379,8 @@ pub(super) fn handle_upgrade_event(
                 // since there's no in-place update here.
                 if pct == 25 || pct == 50 || pct == 75 || pct == 100 {
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total }).into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total })
+                            .into_owned(),
                     ));
                 }
             }
@@ -6807,12 +7395,17 @@ pub(super) fn handle_upgrade_event(
                 crate::i18n::t(crate::i18n::Msg::UpgradeReplacing).into_owned(),
             ));
         }
-        UpgradeEvent::Done { version, backup, exe } => {
+        UpgradeEvent::Done {
+            version,
+            backup,
+            exe,
+        } => {
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::UpgradeDone {
                     version: &version,
                     backup: &backup.display().to_string(),
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             // Push the hint in the status bar to match the new reality —
             // the little "↑ vX" arrow goes away for this session.
@@ -6845,10 +7438,11 @@ pub(super) fn handle_upgrade_event(
                     &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
                     "",
                 );
-                let (current, latest) = parse_already_latest_versions(&friendly)
-                    .unwrap_or(("?", "?"));
+                let (current, latest) =
+                    parse_already_latest_versions(&friendly).unwrap_or(("?", "?"));
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest })
+                        .into_owned(),
                 ));
             } else {
                 renderer.render(UiLine::Error(
@@ -6861,7 +7455,8 @@ pub(super) fn handle_upgrade_event(
                 crate::i18n::t(crate::i18n::Msg::UpgradeRolledBack {
                     exe: &exe.display().to_string(),
                     backup: &backup.display().to_string(),
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             *done = Some(exe);
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
@@ -7242,6 +7837,7 @@ fn handle_agent_event(
             arguments,
         } => {
             let detail = format_tool_detail(&name, &arguments);
+            let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
 
             // If this call is part of an active batch, the
@@ -7311,6 +7907,14 @@ fn handle_agent_event(
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
             // approval" row first so it doesn't linger above the result.
             retract_stale_approval(state, renderer);
+            // Learn task id → content from every todo result (each action
+            // returns the full list). This is what later `todo update`
+            // rows look up to show the task NAME instead of a bare id.
+            // Parsed before the batch early-return below so both batched
+            // and single todo results feed the map.
+            if name == "todo" {
+                parse_todo_titles_into(&mut state.todo_titles, &output);
+            }
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
             // child completion and skip the full ▸ + ⎿ body render.
@@ -7340,12 +7944,21 @@ fn handle_agent_event(
                 // between batched and single tool-call paths.
                 let child_glyph = "\u{2514}";
                 let arrow = "\u{2192}";
-                let suffix = if success {
+                // web_search shows the result SOURCE domains (e.g. `→ eol.cn,
+                // gaokao.com +3`) so the user can see which sites the data came
+                // from; every other tool (and a link-less search result) falls
+                // back to the generic line count.
+                let web_sources = (name == "web_search" && success)
+                    .then(|| web_search_result_suffix(&output))
+                    .flatten();
+                let suffix = if !success {
+                    format!(" {} \u{2717}", arrow)
+                } else if let Some(srcs) = web_sources {
+                    format!(" {} {}", arrow, srcs)
+                } else {
                     let n = output.lines().count().max(1);
                     let unit = if n == 1 { "line" } else { "lines" };
                     format!(" {} {} {}", arrow, n, unit)
-                } else {
-                    format!(" {} \u{2717}", arrow)
                 };
                 // Reuse the original Tool(arg) prefix the
                 // ToolBatchStarted handler painted. pending_tools
@@ -7354,11 +7967,7 @@ fn handle_agent_event(
                 // visual consistency with the initial child row.
                 let prefix = pending_tools
                     .remove(&call_id)
-                    .map(|(_, det, _)| format!(
-                        "{}({})",
-                        display_tool_name_short(&name),
-                        det
-                    ))
+                    .map(|(_, det, _)| format!("{}({})", display_tool_name_short(&name), det))
                     .unwrap_or_else(|| display_tool_name_short(&name));
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
@@ -7421,7 +8030,17 @@ fn handle_agent_event(
                 if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
                 } else {
-                    let summary = summarise(&output);
+                    // A single web_search call gets the same source-domain
+                    // summary as the parallel child rows (`sources: eol.cn,
+                    // gaokao.com +3`); fall back to the generic snippet when no
+                    // links are present or on failure.
+                    let summary = if name == "web_search" && success {
+                        web_search_result_suffix(&output)
+                            .map(|s| format!("sources: {s}"))
+                            .unwrap_or_else(|| summarise(&output))
+                    } else {
+                        summarise(&output)
+                    };
                     renderer.render(UiLine::ToolResult { success, summary });
                 }
             }
@@ -7479,10 +8098,7 @@ fn handle_agent_event(
             // The previous over-correction (screenshot 44 → 47) showed
             // that "looks like 2 blank lines" is just font line-height
             // padding — the actual row count is 1, which is correct.
-            if name == "bash"
-                && !state.show_tool_output
-                && !call_id.starts_with("local-shell-")
-            {
+            if name == "bash" && !state.show_tool_output && !call_id.starts_with("local-shell-") {
                 // Use muted style matching ToolResult's summary_style:
                 // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
                 let reset = "\x1b[0m";
@@ -7716,10 +8332,7 @@ fn handle_agent_event(
                     .unwrap_or(true);
                 if cooled {
                     ctx.usage_last_check_at = Some(std::time::Instant::now());
-                    usage_monitor::spawn_check(
-                        ctx.usage_slot.clone(),
-                        ctx.wake_tx.clone(),
-                    );
+                    usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
                 }
             }
 
@@ -7756,7 +8369,11 @@ fn handle_agent_event(
                 let (skills_loaded, warnings) = reload_plugins(ctx);
                 let warn_count = warnings.len();
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::SetupAutoReloaded { skills: skills_loaded, warnings: warn_count }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::SetupAutoReloaded {
+                        skills: skills_loaded,
+                        warnings: warn_count,
+                    })
+                    .into_owned(),
                 ));
                 if !warnings.is_empty() {
                     for w in &warnings {
@@ -7861,12 +8478,18 @@ fn handle_agent_event(
             renderer.flush();
             state.on_turn_complete();
         }
-        AgentEvent::UndoFailed { requested, available } => {
+        AgentEvent::UndoFailed {
+            requested,
+            available,
+        } => {
             let line = if available == 0 {
                 crate::i18n::t(crate::i18n::Msg::CmdUndoNoTurns).into_owned()
             } else {
-                crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange { requested, available })
-                    .into_owned()
+                crate::i18n::t(crate::i18n::Msg::CmdUndoOutOfRange {
+                    requested,
+                    available,
+                })
+                .into_owned()
             };
             renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
@@ -7902,6 +8525,40 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::CompactionUi(kind) => match kind {
+            atomcode_core::agent::CompactionUiKind::Begin => {
+                state.compacting = true;
+                // A standalone manual `/compact` runs from Idle (its command
+                // handler does NOT call on_submit), so the spinner wouldn't
+                // animate. Force Streaming so "Compacting…" shows, and record
+                // it so completion restores Idle. An auto-compaction is already
+                // mid-turn (Streaming) — leave its phase to the turn lifecycle.
+                if !matches!(state.phase, UiPhase::Streaming) {
+                    state.compaction_forced_streaming = true;
+                    state.phase = UiPhase::Streaming;
+                    state.phase_started_at = Some(std::time::Instant::now());
+                }
+                state.note_stream_activity();
+            }
+            atomcode_core::agent::CompactionUiKind::End => {
+                state.compacting = false;
+                if state.compaction_forced_streaming {
+                    state.compaction_forced_streaming = false;
+                    state.phase = UiPhase::Idle;
+                    state.spinner_label.clear();
+                }
+            }
+            atomcode_core::agent::CompactionUiKind::Mark(label) => {
+                state.compacting = false;
+                renderer.render(UiLine::CompactionMark(label));
+                renderer.flush();
+                if state.compaction_forced_streaming {
+                    state.compaction_forced_streaming = false;
+                    state.phase = UiPhase::Idle;
+                    state.spinner_label.clear();
+                }
+            }
+        },
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -7914,10 +8571,7 @@ fn handle_agent_event(
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
                 .into_owned();
-            renderer.render(UiLine::VisionPreprocessSuccess {
-                msg,
-                model: vl_key,
-            });
+            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_key });
             renderer.flush();
         }
         AgentEvent::RestorePendingImages { images, markers } => {
@@ -8113,7 +8767,10 @@ fn handle_agent_event(
                 .collect();
             let disambiguated = disambiguate_batch_details(
                 &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-                &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
+                &calls
+                    .iter()
+                    .map(|c| c.arguments.as_str())
+                    .collect::<Vec<_>>(),
                 &raw_details,
             );
             // For todo add calls, prepend batch-sequential task numbers
@@ -8131,9 +8788,24 @@ fn handle_agent_event(
                         let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
                             .ok()
                             .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
-                        if action.as_deref() == Some("add") {
-                            todo_add_counter += 1;
-                            return format!("#{} {}", todo_add_counter, detail);
+                        match action.as_deref() {
+                            Some("add") => {
+                                todo_add_counter += 1;
+                                return format!("#{} {}", todo_add_counter, detail);
+                            }
+                            // Upgrade `#4 → completed` to `#4 Write tests →
+                            // completed` using the title learned from earlier
+                            // todo results (issue: parallel updates showed no
+                            // task name).
+                            Some("update") => {
+                                return enrich_todo_detail(
+                                    &c.name,
+                                    &c.arguments,
+                                    detail,
+                                    &state.todo_titles,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     detail.clone()
@@ -8162,9 +8834,7 @@ fn handle_agent_event(
 
             let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
             for cid in &call_ids {
-                state
-                    .call_id_to_batch
-                    .insert(cid.clone(), batch_id.clone());
+                state.call_id_to_batch.insert(cid.clone(), batch_id.clone());
             }
             // Pre-populate `pending_tools` with the final (potentially
             // todo-numbered) detail so that subsequent ToolCallStarted /
@@ -8277,13 +8947,23 @@ fn handle_agent_event(
             // view. State tracking still happens via DispatchStart's
             // task list. Nothing to render here.
         }
-        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+        AgentEvent::SubAgentTaskDone {
+            index: _,
+            elapsed_ms: _,
+            turns: _,
+            summary: _,
+        } => {
             // Per-task done lines suppressed — final count shows in
             // DispatchEnd summary. Still tick the counter so the
             // aggregate `N/M ok` reflects this completion.
             state.on_sub_agent_task_done();
         }
-        AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+        AgentEvent::SubAgentTaskFailed {
+            index,
+            elapsed_ms,
+            turns: _,
+            reason,
+        } => {
             // Failures KEEP their per-task line. Rationale: the user
             // needs to know which sub-agent failed for diagnosis;
             // collapsing into "1 fail" leaves them blind. Successes
@@ -8298,7 +8978,11 @@ fn handle_agent_event(
                     info.path,
                     info.dedup_suffix,
                     fmt_elapsed(elapsed_ms),
-                    if short_reason.is_empty() { "failed" } else { short_reason }
+                    if short_reason.is_empty() {
+                        "failed"
+                    } else {
+                        short_reason
+                    }
                 )));
                 renderer.flush();
             }
@@ -8340,7 +9024,12 @@ fn handle_agent_event(
             }
             state.on_sub_agent_dispatch_end();
         }
-        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+        AgentEvent::BackgroundComplete {
+            summary,
+            files_edited,
+            turns,
+            success,
+        } => {
             let header = if success {
                 crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
             } else {
@@ -8439,14 +9128,27 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SessionSwitched(session_id) => {
-            // webui 新建对话，TUI 跟随切换到新会话。与 ProjectSwitched 不同，
-            // 这里不切目录，只切换到指定 session_id 的新会话。
+            // 另一端（webui 新建对话 / webui 侧栏切到已存在会话）切换了会话，
+            // 同步模式的 TUI 跟随。按 session_id 跨项目定位会话文件：
+            //  - webui「新建」：文件已落盘但为空 → 回放空历史 = 干净空白会话；
+            //  - webui 切到「已存在」会话：把该会话的历史一并加载、回放进 TUI。
+            // 二者统一走 load_any，省掉「新建/切换」分支。找不到文件（罕见）才退回
+            // 到「按指定 id 建空白会话」的旧行为。
             crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
             let sid = atomcode_core::session::SessionId::from_string(session_id);
-            // 清除当前对话、重置到新 session，但用 webui 指定的 session_id
-            // 以确保三端（TUI / webui / 磁盘）落到同一个文件。
+            // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
+            // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
+            // ctx.current_session.id 已是目标 id，无需重复清场/回放/重挂——直接忽略，避免
+            // 双重渲染。仅「另一端发起」的切换（id 与当前不同）才走下面的完整跟随逻辑。
+            // 与 ProviderChanged 臂同款的自回声去重。
+            if ctx.current_session.id == sid {
+                crate::tuix_trace!("TUI", "SessionSwitched: self-echo for current session, ignoring");
+                return;
+            }
+            let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
+
+            // 重置对话与计数（无论加载成功与否都先清场）。
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-            ctx.current_session_id = None;
             state.total_tokens = 0;
             state.prompt_tokens = 0;
             state.completion_tokens = 0;
@@ -8455,37 +9157,89 @@ fn handle_agent_event(
             state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
-            // 使用 webui 指定的 session_id 创建新 session，保证三端一致。
-            let mut new_session =
-                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-            new_session.id = sid;
-            ctx.current_session = new_session;
+
+            // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
+            let target_session = match loaded {
+                Some(session) => {
+                    // 该会话属于另一个项目 → 先像 /cd 一样切目录（与 webui handleSelectSession
+                    // 的 setCwd 对齐），保证后续回合在正确项目里执行、@-索引/会话列表也跟随。
+                    if ctx.working_dir != session.working_dir {
+                        commands::apply_cd(ctx, session.working_dir.clone());
+                    }
+                    ctx.current_session_id = Some(sid.clone());
+                    session
+                }
+                None => {
+                    // 罕见：磁盘上找不到该会话（如 webui 刚新建、广播早于落盘）。
+                    // 退回旧行为：用指定 id 建一个空白会话，保证三端落同一文件。
+                    ctx.current_session_id = None;
+                    let mut new_session =
+                        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+                    new_session.id = sid;
+                    new_session
+                }
+            };
+
+            // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetConversation(
+                    target_session.to_conversation_snapshot(),
+                ))
+                .ok();
+            commands::bind_telemetry_to_session(ctx, &target_session);
+            ctx.current_session = target_session;
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
-            commands::bind_telemetry_to_session(ctx, &ctx.current_session);
-            // 如果在同步模式，重新附着 LiveSession 以绑定新 session_id。
+
+            // 重绘画布并回放目标会话历史（/resume 同款干净回放，不带「同步快照」分隔）。
+            renderer.begin_sync();
+            renderer.reset();
+            if ctx.current_session.messages.is_empty() {
+                let dir_display =
+                    crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+                renderer.render(UiLine::Welcome {
+                    model: ctx.model_name.clone(),
+                    working_dir: dir_display,
+                });
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+                ));
+            } else {
+                crate::modals::session_picker::replay_session(
+                    renderer,
+                    &ctx.current_session,
+                    true,
+                );
+            }
+            renderer.flush();
+            renderer.end_sync();
+
+            // 同步模式：用「带历史」的 session_id 重新附着 LiveSession，使三端
+            // （TUI / webui / 磁盘）落到同一会话、同一对话。render_snapshot=false：
+            // 历史已在上面 replay 过，避免重复刷。
             if ctx.sync_session.is_some() {
                 let session = atomcode_daemon::ensure_live_session(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    Vec::new(),
+                    ctx.current_session.messages.clone(),
                 );
-                crate::tuix_trace!("TUI", "SessionSwitched: attaching new LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!("TUI", "SessionSwitched: attaching LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
-            renderer.begin_sync();
-            renderer.reset();
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
-            ));
+        }
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+            // Non-error pause line: dim/plain body row, never red.
+            // auto_resuming=true  (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
+            // auto_resuming=false (Pause, has time): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
+            // auto_resuming=false (Pause, no time):  "⏸ 5小时窗口已用尽，稍后恢复…"
+            // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
+            // Rate-limit is a pause, not an error/warning — it must not
+            // render with the yellow `! ` prefix that Warning applies.
+            let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset, auto_resuming);
+            renderer.render(UiLine::Muted(line));
             renderer.flush();
-            renderer.end_sync();
         }
     }
 }
@@ -8513,8 +9267,10 @@ fn persist_current_session(
     // assume "the session was lost" with no idea anything went wrong.
     if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
         renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed { error: &e.to_string() })
-                .into_owned(),
+            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                error: &e.to_string(),
+            })
+            .into_owned(),
         ));
         renderer.flush();
     }
@@ -8907,7 +9663,11 @@ fn draw_spinner_now(
         } else {
             crate::render::MenuKind::SlashCommand
         };
-        crate::render::MenuPayload { items, selected, kind }
+        crate::render::MenuPayload {
+            items,
+            selected,
+            kind,
+        }
     });
     let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::StreamingBox {
@@ -8928,7 +9688,25 @@ fn draw_spinner_now(
 /// queued suffixes are appended here so format is consistent across
 /// every call site.
 fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
-    let base = &state.spinner_label;
+    // Compaction takes over the spinner: show "Compacting…" (or a slow variant
+    // past the stall threshold) with the phase elapsed appended, instead of a
+    // thinking label. Unified for auto + manual /compact.
+    if state.compacting {
+        let base = if state.compaction_stalled() {
+            crate::i18n::t(crate::i18n::Msg::CompactingSlow)
+        } else {
+            crate::i18n::t(crate::i18n::Msg::Compacting)
+        };
+        let mut out = base.into_owned();
+        if let Some(d) = state.phase_elapsed() {
+            out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
+        }
+        return out;
+    }
+    // `display_spinner_label` maps `Running X` / `Preparing X` back to the
+    // thinking word so the footer never flashes tool names — tool progress is
+    // carried by the body `▸ Tool(detail)` rows. Other labels pass through.
+    let base = state.display_spinner_label();
     let mut out = format!("{}{}", base, state.ellipsis());
     // Order matters. The phase clock (`· 372ms`) ticks every frame, and any
     // segment AFTER a rapidly-changing field shifts on every redraw — which
@@ -8948,14 +9726,9 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
-    // Network-stall warning: a streaming response that's gone silent past the
-    // threshold (e.g. mid-stream network drop) reads as a freeze with no feedback.
-    // Surface a hint that it isn't frozen and esc cancels. Static text, placed
-    // BEFORE the ticking elapsed so its width never jitters the segments after it.
-    if state.stream_stalled() {
-        out.push_str(" · ");
-        out.push_str(&crate::i18n::t(crate::i18n::Msg::StreamStalled));
-    }
+    // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
+    // still cancels, it's just no longer advertised in the spinner. The stall
+    // machinery (`stream_stalled`) stays for the compaction-slow variant.)
     // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
     // `Running ReadFile… 4s`. CC behaviour: timer resets on every phase
     // transition so the user reads "this thing has been running for N
@@ -9026,6 +9799,74 @@ pub fn display_tool_name_short(snake: &str) -> String {
         .find_map(|s| snake.strip_suffix(s))
         .unwrap_or(snake);
     display_tool_name(trimmed)
+}
+
+/// Parse the full task list every `todo` result returns into `map`
+/// (id → content). The list renders as `{icon} {id}. {content}` lines
+/// (see `todo.rs::render`); we match that shape and ignore everything
+/// else (the "Added task #N: …" / "Task #N '…' updated" preamble lines
+/// don't match and are skipped). Both the core and capabilities todo
+/// tools share this line format, so one parser covers both.
+pub(crate) fn parse_todo_titles_into(
+    map: &mut std::collections::HashMap<u64, String>,
+    output: &str,
+) {
+    for line in output.lines() {
+        let line = line.trim_start();
+        // "[<icon>] <id>. <content>"
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((_icon, after)) = rest.split_once("] ") else {
+            continue;
+        };
+        let Some((id_str, content)) = after.split_once(". ") else {
+            continue;
+        };
+        let Ok(id) = id_str.trim().parse::<u64>() else {
+            continue;
+        };
+        let content = content.trim();
+        if !content.is_empty() {
+            map.insert(id, content.to_string());
+        }
+    }
+}
+
+/// Splice the known task title into a `todo update` detail so the row
+/// shows the NAME, not just the id: `#4 → completed` becomes
+/// `#4 Write tests → completed`. Returns `base` unchanged for non-todo
+/// tools, non-update actions, or ids whose title we haven't learned yet
+/// (graceful fallback to the id-only form).
+pub(crate) fn enrich_todo_detail(
+    name: &str,
+    args_json: &str,
+    base: &str,
+    titles: &std::collections::HashMap<u64, String>,
+) -> String {
+    if name != "todo" {
+        return base.to_string();
+    }
+    let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) else {
+        return base.to_string();
+    };
+    if v.get("action").and_then(|a| a.as_str()) != Some("update") {
+        return base.to_string();
+    }
+    let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+        return base.to_string();
+    };
+    let Some(title) = titles.get(&id) else {
+        return base.to_string();
+    };
+    let title = crate::width::truncate_with_ellipsis(title, 80);
+    // `base` is `#<id> → <status>` (or bare `#<id>`); insert the title
+    // right after the id so the arrow keeps pointing at the status.
+    match base.split_once(" \u{2192} ") {
+        Some((head, tail)) => format!("{} {} \u{2192} {}", head, title, tail),
+        None => format!("{} {}", base, title),
+    }
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
@@ -9135,7 +9976,10 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 let names: Vec<String> = files
                     .iter()
                     .filter_map(|entry| {
-                        entry.get("path").and_then(|p| p.as_str()).map(|s| basename(s))
+                        entry
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| basename(s))
                     })
                     .collect();
                 let detail = names.join(", ");
@@ -9261,7 +10105,9 @@ fn disambiguate_batch_details(
         let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         match name {
             "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols"
-            | "blast_radius" | "file_dependencies" => get_str("file_path").or_else(|| get_str("file")),
+            | "blast_radius" | "file_dependencies" => {
+                get_str("file_path").or_else(|| get_str("file"))
+            }
             "search_replace" => get_str("file_path").or_else(|| get_str("file")),
             "read_symbol" => get_str("file_path"),
             _ => None,
@@ -9279,8 +10125,7 @@ fn disambiguate_batch_details(
     let mut result = raw_details.to_vec();
 
     // Collect groups of indices that share the same raw_detail.
-    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, d) in raw_details.iter().enumerate() {
         groups.entry(d.as_str()).or_default().push(i);
     }
@@ -9297,15 +10142,19 @@ fn disambiguate_batch_details(
             // Strategy: progressively add parent path components until
             // all entries are unique. Start with 1 parent component
             // (e.g. `a/SKILL.md`), then 2 (`b/a/SKILL.md`), etc.
-            let paths: Vec<&str> = indices.iter().map(|&i| full_paths[i].as_deref().unwrap()).collect();
+            let paths: Vec<&str> = indices
+                .iter()
+                .map(|&i| full_paths[i].as_deref().unwrap())
+                .collect();
             let mut depth = 1usize;
-            let max_depth = paths.iter().map(|p| p.matches('/').count()).max().unwrap_or(0);
+            let max_depth = paths
+                .iter()
+                .map(|p| p.matches('/').count())
+                .max()
+                .unwrap_or(0);
 
             loop {
-                let candidates: Vec<String> = paths
-                    .iter()
-                    .map(|p| tail_path(p, depth))
-                    .collect();
+                let candidates: Vec<String> = paths.iter().map(|p| tail_path(p, depth)).collect();
 
                 let all_unique = {
                     let mut s = std::collections::HashSet::new();
@@ -9314,10 +10163,7 @@ fn disambiguate_batch_details(
 
                 if all_unique || depth >= max_depth {
                     for (i, &idx) in indices.iter().enumerate() {
-                        result[idx] = crate::width::truncate_with_ellipsis(
-                            &candidates[i],
-                            100,
-                        );
+                        result[idx] = crate::width::truncate_with_ellipsis(&candidates[i], 100);
                     }
                     break;
                 }
@@ -9388,6 +10234,69 @@ pub(crate) fn fmt_elapsed(ms: u64) -> String {
 /// 512-col cap that remains is a pure safety bound: it only trips for a
 /// pathological multi-KB single line (e.g. a minified file) so it can't
 /// wrap into dozens of rows. Real first lines are far shorter.
+/// Extract the unique result source domains from a `web_search` tool result.
+///
+/// Scans the output text for `http(s)://` URLs, keeps each host, strips a
+/// leading `www.`, and dedupes preserving first-seen order. Works for the
+/// DuckDuckGo backend (explicit `url` lines) and the Exa backend (URLs are
+/// embedded in the LLM-ready text blob). Returns `[]` when the output carries
+/// no URLs (an Exa blob without links, or an error message) so the caller can
+/// fall back to the generic line count.
+pub(crate) fn web_search_source_domains(output: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rest = output;
+    while let Some(pos) = rest.find("http") {
+        let after = &rest[pos..];
+        let scheme_len = if after.starts_with("https://") {
+            8
+        } else if after.starts_with("http://") {
+            7
+        } else {
+            // "http" not part of a URL scheme — step past it (ASCII, so the
+            // byte offset is a valid char boundary) and keep scanning.
+            rest = &rest[pos + 4..];
+            continue;
+        };
+        let host_part = &after[scheme_len..];
+        // Host ends at the first path / query / port / delimiter byte. All
+        // candidates are ASCII, so the split stays on a char boundary even if
+        // the host itself contains non-ASCII (IDN) bytes.
+        let end = host_part
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | ':' | ')' | ']' | '"' | '\'' | '>' | '<' | ',')
+                    || c.is_whitespace()
+            })
+            .unwrap_or(host_part.len());
+        let host = host_part[..end].trim_end_matches('.');
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        if host.contains('.') && seen.insert(host.to_string()) {
+            out.push(host.to_string());
+        }
+        rest = &host_part[end..];
+    }
+    out
+}
+
+/// Build the ` → src1, src2 +N` summary suffix for a completed `web_search`
+/// call. Shows up to two source domains; any remainder collapses to `+N`.
+/// Returns `None` when no domains could be extracted, so the caller keeps the
+/// generic line-count suffix.
+pub(crate) fn web_search_result_suffix(output: &str) -> Option<String> {
+    const SHOWN: usize = 2;
+    let domains = web_search_source_domains(output);
+    if domains.is_empty() {
+        return None;
+    }
+    let head = domains.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    let extra = domains.len().saturating_sub(SHOWN);
+    Some(if extra > 0 {
+        format!("{head} +{extra}")
+    } else {
+        head
+    })
+}
+
 pub(crate) fn summarise(output: &str) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
@@ -9458,4 +10367,45 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
         && atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
             &ctx.model_name,
         )
+}
+
+/// Install a [`crate::modals::password::PasswordModal`] as the active modal on
+/// `app`. Called from the `askpass_rx` select! arm and from the test below.
+#[cfg(unix)]
+pub(crate) fn install_password_modal(
+    app: &mut App,
+    prompt: String,
+    reply: tokio::sync::oneshot::Sender<Option<String>>,
+) {
+    app.active_modal = Some(Box::new(
+        crate::modals::password::PasswordModal::new(prompt, reply),
+    ));
+}
+
+#[cfg(test)]
+mod install_password_modal_tests {
+    use super::*;
+
+    fn caps_for_test() -> crate::terminal::TerminalCaps {
+        crate::terminal::TerminalCaps {
+            tty: false,
+            colors: false,
+            spinner: false,
+            bracketed_paste: false,
+            raw_mode: false,
+            scroll_region: false,
+            unicode_symbols: false,
+            legacy_conhost: false,
+            jediterm: false,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_password_modal_sets_active_modal() {
+        let mut app = App::new(&caps_for_test());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        install_password_modal(&mut app, "[sudo] password:".into(), tx);
+        assert!(app.active_modal.is_some(), "modal installed");
+    }
 }

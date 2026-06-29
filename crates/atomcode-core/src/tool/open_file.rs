@@ -317,6 +317,9 @@ impl Tool for OpenFileTool {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Suppress the `cmd /c start` console-window flash on Windows (parity with the
+        // capabilities/v2 open_file twin). No-op off Windows.
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
 
         match cmd.spawn() {
             Ok(_child) => Ok(ToolResult {

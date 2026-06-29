@@ -226,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn safe_ordinary_read_passes_without_round_trip() {
         let gate = SensitivePathGate::new();
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call =
             ToolCall { id: "1".into(), name: "read_file".into(), arguments: r#"{"file_path":"src/main.rs"}"#.into() };
         // Ordinary path → Proceed WITHOUT awaiting the (silent) driver.
@@ -250,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn sensitive_read_fails_closed_when_driver_silent() {
         let gate = SensitivePathGate::new();
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "read_file".into(),

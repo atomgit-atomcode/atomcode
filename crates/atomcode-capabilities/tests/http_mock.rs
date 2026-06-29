@@ -224,7 +224,7 @@ impl Tool for GetTimeTool {
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
         // call_id left empty: the kernel fills it from the originating tool_call.
-        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false, images: vec![] }
     }
 }
 

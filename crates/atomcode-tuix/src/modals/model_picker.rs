@@ -299,22 +299,8 @@ mod tests {
             );
         }
         Config {
-            default_provider: default.to_string(),
-            evaluator_provider: None,
-            default_workdir: None,
             providers: map,
-            datalog: Default::default(),
-            notifications: Default::default(),
-            auto_update: true,
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
+            ..Config::with_default_provider(default)
         }
     }
 

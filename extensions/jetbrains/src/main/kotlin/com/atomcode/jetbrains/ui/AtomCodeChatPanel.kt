@@ -879,6 +879,43 @@ class AtomCodeChatPanel(
         }
     }
 
+    private fun rerenderFinishedSessionFromHistory(session: SessionRefView) {
+        Timer(150) {
+            (it.source as? Timer)?.stop()
+            loadFinishedSessionFromHistory(session)
+        }.apply {
+            isRepeats = false
+            start()
+        }
+    }
+
+    private fun loadFinishedSessionFromHistory(session: SessionRefView) {
+        val meta = SessionMeta(
+            id = session.id,
+            name = session.name,
+            projectHash = session.projectHash,
+            updatedAt = 0L,
+            messageCount = 0,
+        )
+
+        service.loadSessionDetail(meta).whenComplete { detail, error ->
+            SwingUtilities.invokeLater {
+                if (error != null) return@invokeLater
+                if (generating || activeGenerationId != null) return@invokeLater
+                if (currentSession?.id != session.id) return@invokeLater
+
+                currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
+                runtime?.loadSession(detail)
+                updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
+                persistRuntimeSession()
+                replaceSelectedSession(detail.id)
+                renderSession(detail)
+                streamHandler.replayLastTurnSummary()
+                inputPanel.focusInput()
+            }
+        }
+    }
+
     private fun renderHistoryToolMessage(content: String) {
         val detail = content.trim()
         if (detail.isBlank()) return
@@ -969,6 +1006,7 @@ class AtomCodeChatPanel(
                     runtime?.updateSession(session)
                     replaceSelectedSession(session.id)
                     persistRuntimeSession()
+                    rerenderFinishedSessionFromHistory(session)
                 }
             }
         }
@@ -983,8 +1021,13 @@ class AtomCodeChatPanel(
             is ChatEvent.ToolStart -> streamHandler.onToolStart(event.name, event.arguments)
             is ChatEvent.ToolOutput -> streamHandler.onToolOutput(event.chunk)
             is ChatEvent.ToolResult -> streamHandler.onToolResult(event.name, event.output, event.success, event.durationMs)
-            is ChatEvent.ArtifactStart -> streamHandler.onArtifactStart(event.title)
-            is ChatEvent.ArtifactContent -> streamHandler.onArtifactContent(event.content)
+            is ChatEvent.ArtifactStart -> streamHandler.onArtifactStart(
+                event.id,
+                event.artifactType,
+                event.language,
+                event.title,
+            )
+            is ChatEvent.ArtifactContent -> streamHandler.onArtifactContent(event.id, event.content)
             is ChatEvent.ArtifactEnd -> streamHandler.onArtifactEnd(event.id)
             is ChatEvent.PermissionRequest -> {
                 streamHandler.onPermissionRequired(event)
@@ -1825,6 +1868,8 @@ internal fun slashPromptTemplate(prompt: String): String? {
 }
 
 internal fun extractLastCodeBlock(text: String): String? {
-    val matches = Regex("""```[^\n`]*\n([\s\S]*?)```""").findAll(text).toList()
-    return matches.lastOrNull()?.groupValues?.getOrNull(1)?.trimEnd()
+    val matches = Regex("""(?m)^[ \t]*(`{3,})[^\n`]*\n([\s\S]*?)^[ \t]*\1[ \t]*$""")
+        .findAll(text)
+        .toList()
+    return matches.lastOrNull()?.groupValues?.getOrNull(2)?.trimEnd()
 }

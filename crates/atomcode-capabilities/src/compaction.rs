@@ -115,6 +115,16 @@ const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
 /// SECOND, higher gate that decides stub-vs-summarize.
 const AUTO_DRAIN_UTILIZATION: f32 = 0.85;
 
+/// Hard ceiling on a generated summary. A runaway model could emit an enormous summary that
+/// still passes `apply_plan`'s net-loss guard (it's smaller than the drained span) yet bloats
+/// the wire on every subsequent turn (#747). We truncate the accumulated summary at this many
+/// bytes — the HARD guarantee, independent of whether the provider honors `max_tokens`. A real
+/// span summary is a paragraph, far under this; 64 KiB only catches pathological runaways.
+const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+/// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
+/// generation early; the byte cap above is the backstop if the gateway ignores it.
+const MAX_SUMMARY_TOKENS: u32 = 16_000;
+
 /// System prompt for the tier-2 overflow summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
     "You compress conversation history. Produce a faithful, compact summary that another \
@@ -249,11 +259,30 @@ impl OverflowCompaction {
                  paths touched, and any unresolved threads.{focus_line} Be concise.\n\n{transcript}"
             )),
         ];
-        let mut stream = provider.chat_stream(&prompt, &[], &ChatOptions::default()).await.ok()?;
+        // Soft-cap the generation (`max_tokens`); the byte loop below is the hard backstop.
+        let opts = ChatOptions { max_tokens: Some(MAX_SUMMARY_TOKENS), ..ChatOptions::default() };
+        let mut stream = provider.chat_stream(&prompt, &[], &opts).await.ok()?;
         let mut out = String::new();
         while let Some(ev) = stream.next().await {
             if let StreamEvent::TextDelta(t) = ev {
-                out.push_str(&t);
+                // Hard byte ceiling (#747): a summary larger than the drained span is refused by
+                // the net-loss guard anyway, but a merely-large one bloats every later turn — and
+                // we don't want even a transient huge `out` for a single giant delta. So push only
+                // up to the remaining budget (walked back to a char boundary IN `t`) and stop;
+                // `out` is thus bounded by MAX_SUMMARY_BYTES at all times. (max_tokens is the soft
+                // cap; this is the hard backstop if the gateway ignores it.) Invariant on entry:
+                // out.len() < MAX_SUMMARY_BYTES (we break the moment it would reach the cap).
+                let remaining = MAX_SUMMARY_BYTES - out.len();
+                if t.len() <= remaining {
+                    out.push_str(&t);
+                } else {
+                    let mut cut = remaining;
+                    while !t.is_char_boundary(cut) {
+                        cut -= 1; // is_char_boundary(0) == true, so this always terminates
+                    }
+                    out.push_str(&t[..cut]);
+                    break;
+                }
             }
         }
         let out = out.trim().to_string();
@@ -651,6 +680,78 @@ mod tests {
                 StreamEvent::Done { truncated: false },
             ])))
         }
+    }
+
+    /// Streams ~96 KiB of a 3-byte CJK char so the summary blows past `MAX_SUMMARY_BYTES`,
+    /// exercising BOTH the byte ceiling and char-boundary-safe truncation (96 KiB is not a
+    /// multiple of 3, so the cut lands mid-char and must be walked back).
+    struct HugeSummaryProvider {
+        /// Records the `max_tokens` the summarizer forwarded, so the test can assert the SOFT
+        /// cap is actually sent (the byte hard-cap would otherwise mask a dropped max_tokens).
+        max_tokens_seen: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    #[async_trait]
+    impl LlmProvider for HugeSummaryProvider {
+        fn model_name(&self) -> &str {
+            "huge"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            opts: &ChatOptions,
+        ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError>
+        {
+            self.max_tokens_seen
+                .store(opts.max_tokens.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+            let chunk = "你".repeat(8 * 1024); // 24 KiB per delta
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(chunk.clone()),
+                StreamEvent::TextDelta(chunk.clone()),
+                StreamEvent::TextDelta(chunk.clone()),
+                StreamEvent::TextDelta(chunk),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_is_capped_at_max_bytes() {
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant(big("a1"), vec![]),
+            Message::user(big("u2")),
+            Message::assistant(big("a2"), vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(HugeSummaryProvider { max_tokens_seen: seen.clone() })),
+        );
+        let plan = strat.plan(&overflow_view(&conv.messages, floor, 2, 8000)).await;
+        let summary = plan.summary.expect("tier 2 produces a summary");
+        // Hard byte ceiling enforced (provider streamed ~96 KiB).
+        assert!(
+            summary.len() <= MAX_SUMMARY_BYTES,
+            "summary {} bytes exceeds cap {MAX_SUMMARY_BYTES}",
+            summary.len()
+        );
+        // Cut landed right at the cap (walked back to the nearest char boundary, not far).
+        assert!(summary.len() > MAX_SUMMARY_BYTES - 4, "should truncate near the cap, got {}", summary.len());
+        // Char-boundary-safe: the String is intact (no panic) and content is preserved.
+        assert!(summary.chars().all(|c| c == '你'), "truncation must not corrupt multibyte chars");
+        // SOFT cap was actually forwarded (not masked by the byte hard-cap / dropped like the
+        // historical v2 max_tokens regression).
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SUMMARY_TOKENS,
+            "summarize() must forward max_tokens as the soft cap"
+        );
     }
 
     #[tokio::test]

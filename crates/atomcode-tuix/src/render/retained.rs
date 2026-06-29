@@ -73,16 +73,12 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
         format!("{} tok", used_label)
     } else {
         let window_label = format_tok_count(window, /*round_clean=*/ true);
-        // Surface the utilization percentage once the prompt approaches (>=90%)
-        // or exceeds the window, so an over-window request (e.g. a 339k prompt
-        // into a 200k window) is visible instead of silent. Below the near-limit
-        // threshold the counter stays terse, keeping the common case clean.
-        if used * 10 >= window * 9 {
-            let pct = (used as f64 / window as f64 * 100.0).round() as u64;
-            format!("{}/{} tok ({}%)", used_label, window_label, pct)
-        } else {
-            format!("{}/{} tok", used_label, window_label)
-        }
+        // Always surface the utilization percentage so the user can watch the
+        // context fill toward the auto-compaction threshold (~70%), not only
+        // once it's near-full. Auto-compaction at 0.7 was effectively invisible
+        // when the % only appeared at >=90%.
+        let pct = (used as f64 / window as f64 * 100.0).round() as u64;
+        format!("{}/{} tok ({}%)", used_label, window_label, pct)
     }
 }
 
@@ -3984,6 +3980,32 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let body = format!("! {}", scrub_controls(&msg));
                 self.push_body_text(&body, &warn_style);
             }
+            UiLine::Muted(msg) => {
+                // Dim, non-bold informational line — no forced prefix.
+                // Same DarkGrey palette as CompactionMark so it recedes
+                // into scrollback without reading as a warning or error.
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::DarkGrey),
+                    bold: false,
+                    ..CellStyle::default()
+                };
+                self.push_body_text(&scrub_controls(&msg), &style);
+            }
+            UiLine::CompactionMark(label) => {
+                // Dim, left-aligned rule marking where compaction folded
+                // history. Faint DarkGrey (not bold) so it reads as structure,
+                // not an alert — deliberately distinct from Warning's bold
+                // yellow. Unified for auto + manual /compact.
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::DarkGrey),
+                    ..CellStyle::default()
+                };
+                let body = crate::render::compaction_rule(
+                    &scrub_controls(&label),
+                    self.caps.unicode_symbols,
+                );
+                self.push_body_text(&body, &style);
+            }
             UiLine::CommandOutput(text) => {
                 // CommandOutput is trusted internal text — let SGR
                 // through the sanitizer so colour / bold / faint
@@ -4955,7 +4977,7 @@ mod tests {
         // The user's actual ask: "10.4k tokens" alone is uninformative —
         // they want to see how close to the limit the context is. With a
         // window, render `used/window tok` so saturation is visible.
-        assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok");
+        assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok (8%)");
     }
 
     #[test]
@@ -5018,7 +5040,7 @@ mod tests {
     #[test]
     fn ctx_usage_keeps_round_window_clean() {
         // 128k window is the common default — render as `128k`, not `128.0k`.
-        assert_eq!(format_ctx_usage(50_000, 128_000), "50.0k/128k tok");
+        assert_eq!(format_ctx_usage(50_000, 128_000), "50.0k/128k tok (39%)");
     }
 
     #[test]
@@ -5030,14 +5052,14 @@ mod tests {
 
     #[test]
     fn ctx_usage_under_one_thousand_keeps_raw_count() {
-        assert_eq!(format_ctx_usage(523, 131_000), "523/131k tok");
+        assert_eq!(format_ctx_usage(523, 131_000), "523/131k tok (0%)");
         assert_eq!(format_ctx_usage(523, 0), "523 tok");
     }
 
     #[test]
     fn ctx_usage_non_round_window_rounds_to_nearest_k() {
         // GLM-5.1 endpoint ships a 131_072 window; we display 131k, not 131.072k.
-        assert_eq!(format_ctx_usage(50_000, 131_072), "50.0k/131k tok");
+        assert_eq!(format_ctx_usage(50_000, 131_072), "50.0k/131k tok (38%)");
     }
 
     #[test]
@@ -5045,9 +5067,9 @@ mod tests {
         // 1m-context models would previously show `1000k`, mixing k/m in
         // the user's head and burning width on a leading zero parade.
         // Round million → bare `1m`; non-round million → one-decimal `1.5m`.
-        assert_eq!(format_ctx_usage(1_400, 1_000_000), "1.4k/1m tok");
-        assert_eq!(format_ctx_usage(50_000, 2_000_000), "50.0k/2m tok");
-        assert_eq!(format_ctx_usage(50_000, 1_500_000), "50.0k/1.5m tok");
+        assert_eq!(format_ctx_usage(1_400, 1_000_000), "1.4k/1m tok (0%)");
+        assert_eq!(format_ctx_usage(50_000, 2_000_000), "50.0k/2m tok (3%)");
+        assert_eq!(format_ctx_usage(50_000, 1_500_000), "50.0k/1.5m tok (3%)");
     }
 
     #[test]
@@ -5067,15 +5089,31 @@ mod tests {
     }
 
     #[test]
-    fn ctx_usage_pct_appears_at_ninety_percent_threshold() {
-        // 90% is the inclusive near-limit threshold.
+    fn ctx_usage_at_ninety_percent() {
+        // Exact 90%: 180k of 200k rounds cleanly to 90% — just a representative value now, not a gate.
         assert_eq!(format_ctx_usage(180_000, 200_000), "180.0k/200k tok (90%)");
     }
 
     #[test]
-    fn ctx_usage_terse_below_near_limit() {
-        // Just under 90% stays terse (no percentage) — common case unchanged.
-        assert_eq!(format_ctx_usage(179_000, 200_000), "179.0k/200k tok");
+    fn ctx_usage_always_shows_percentage() {
+        // Previously terse below 90% — now % is always shown so the user can
+        // watch context fill toward the 0.7 auto-compaction threshold.
+        // 179k/200k = 89.5% → rounds to 90%.
+        assert_eq!(format_ctx_usage(179_000, 200_000), "179.0k/200k tok (90%)");
+    }
+
+    #[test]
+    fn format_ctx_usage_shows_percentage_below_ninety() {
+        // Pre-change this stayed terse ("138k/200k tok") below 90%, hiding the
+        // climb toward the 0.7 auto-compaction threshold. Now % is always shown.
+        let s = format_ctx_usage(138_000, 200_000);
+        assert!(s.contains("(69%)"), "expected percentage, got: {s}");
+    }
+
+    #[test]
+    fn format_ctx_usage_no_percentage_when_window_unknown() {
+        let s = format_ctx_usage(5_000, 0);
+        assert!(!s.contains('%'), "no window ⇒ no percentage, got: {s}");
     }
 
     fn caps_with_color() -> TerminalCaps {

@@ -39,6 +39,7 @@ pub mod list;
 pub mod open_file;
 pub mod parallel_edit;
 pub mod read;
+pub mod repair;
 pub mod report_finding;
 pub mod search_replace;
 pub mod sensitive_path;
@@ -58,6 +59,7 @@ pub use approval::{
     ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
     PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
+pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use cd::ChangeDirTool;
@@ -88,9 +90,19 @@ pub fn coding_tool_names() -> &'static [&'static str] {
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
-/// given specialization should expose to the model).
+/// given specialization should expose to the model). Vision support OFF — `read_file`
+/// reports images as binary (use [`register_coding_tools_with_vision`] for a VL model).
 pub fn register_coding_tools(reg: &mut ToolRegistry) {
-    reg.register(Arc::new(ReadFileTool));
+    register_coding_tools_with_vision(reg, false);
+}
+
+/// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
+/// image file back to the model as an actual picture (a VISION model SEES it) instead
+/// of the "binary, cannot display" text. The caller decides the flag from the model
+/// (the coding layer uses `atomcode_core::provider::model_name_suggests_vision`, the
+/// same detector as the user-paste path) — kept out of this crate so it stays core-free.
+pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
+    reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool));
     reg.register(Arc::new(EditFileTool));
     reg.register(Arc::new(ListDirTool));
@@ -201,17 +213,68 @@ pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
 /// A successful tool result (`is_error: false`). `call_id` is filled by the kernel
 /// after `execute` returns.
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
+}
+/// A successful tool result that also carries inline `images` for a VISION model to
+/// SEE (e.g. `read_file` returning a picture). The agent loop lifts these onto a
+/// follow-up `Role::User` message — the only role a provider serializes images on.
+pub(crate) fn ok_with_images(
+    content: impl Into<String>,
+    images: Vec<atomcode_kernel::message::ImageContent>,
+) -> ToolResult {
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images }
 }
 /// A failed tool result (`is_error: true`) — surfaced to the model so it can recover.
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
+}
+
+/// Max wall-clock a permission gate may spend on blocking filesystem classification
+/// (path canonicalization). The workspace can sit on a stalled mount (e.g. a hung
+/// network share) where `std::fs::canonicalize` blocks for minutes; bounding it keeps
+/// the kernel's turn loop responsive (Esc/Ctrl-C stay live) instead of freezing — the
+/// exact symptom of a `before()` gate hanging on `/Volumes/<share>`.
+pub(crate) const GATE_FS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run blocking `f` OFF the async worker (so a stalled syscall can't pin the runtime
+/// thread mid-poll), bounded by `timeout`. Returns `default` if `f` doesn't finish in
+/// time or its thread panics — a hung filesystem degrades to a safe fallback, never a
+/// hang. The orphaned blocking thread is abandoned (it finishes when the syscall
+/// eventually returns); acceptable for the rare stalled-mount case.
+pub(crate) async fn run_bounded<T, F>(timeout: std::time::Duration, default: T, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => v,
+        _ => default,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[tokio::test]
+    async fn run_bounded_yields_default_when_blocking_exceeds_timeout() {
+        // A stalled syscall (simulated by a long sleep on the blocking thread) must NOT
+        // hang the caller: the bound fires and returns the safe default well before the
+        // closure would finish.
+        let got = run_bounded(std::time::Duration::from_millis(50), false, || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            true
+        })
+        .await;
+        assert!(!got, "exceeding the timeout must return the default, not block");
+    }
+
+    #[tokio::test]
+    async fn run_bounded_returns_value_when_fast() {
+        let got = run_bounded(std::time::Duration::from_secs(5), false, || true).await;
+        assert!(got, "a fast closure returns its real value");
+    }
 
     #[test]
     fn resolve_path_treats_windows_drive_and_unc_as_absolute() {
@@ -314,5 +377,36 @@ mod tests {
         assert!(mounted.get("write_file").is_none(), "unmounted tool must not resolve");
         assert!(mounted.get("edit_file").is_none(), "unmounted tool must not resolve");
         assert!(mounted.get("open_file").is_none(), "unmounted tool must not resolve");
+    }
+
+    /// A `/model` swap re-registers `read_file` (see `coding::parts::assemble`) to refresh
+    /// its vision flag. This guards the mechanism that fix relies on: re-registering with a
+    /// new `vision` value OVERWRITES the prior `read_file`, so a model swap from text→vision
+    /// (or vision→text) actually changes how it treats an image — it does not go stale.
+    #[tokio::test]
+    async fn re_registering_read_file_overwrites_its_vision_flag() {
+        use atomcode_kernel::tool::{ToolContext, ProgressSink};
+        let d = tempfile::tempdir().unwrap();
+        // JPEG-ish blob with a NUL so `looks_binary` flags it.
+        std::fs::write(d.path().join("c.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00]).unwrap();
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+        };
+
+        // First mount: text-only model → read of an image stays the binary-text dead-end.
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let r = reg.mount(&["read_file"]).get("read_file").unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
+        assert!(r.images.is_empty() && r.content.starts_with("Binary file"), "{}", r.content);
+
+        // Re-register on the SAME registry as if the model swapped to a VL model → the read
+        // tool must now hand over the image, proving the swap takes effect (no stale flag).
+        register_coding_tools_with_vision(&mut reg, true);
+        let r = reg.mount(&["read_file"]).get("read_file").unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
+        assert_eq!(r.images.len(), 1, "after re-register with vision, image must be attached: {}", r.content);
     }
 }

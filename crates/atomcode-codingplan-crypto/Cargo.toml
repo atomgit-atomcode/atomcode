@@ -4,21 +4,15 @@ version = "0.1.0"
 edition = "2021"
 license = "Proprietary"
 publish = false
-description = "Closed-source request signing for the AtomGit LLM gateway. Linked into atomcode-core only by the official-release build pipeline."
+description = "Open-source placeholder for the AtomGit request-signing crate; the real implementation is overlaid by the official-release build pipeline."
 
 [lib]
 path = "src/lib.rs"
 
-# Leaf crate — does NOT depend on atomcode-core. The wrapper that
-# implements atomcode_core::coding_plan::crypto::RequestSigner using
-# the primitive functions exported from here lives in atomcode-core
-# itself (added by the official-CI patch).
+# Open-source stub: no dependencies and no signing logic. The official build
+# (scripts/build-official.sh) replaces this whole directory with the private
+# crate, which brings its own Cargo.toml and dependencies.
 [dependencies]
-hmac = "0.12"
-sha2 = "0.10"
-hkdf = "0.12"
-zeroize = { version = "1", features = ["zeroize_derive"] }
-subtle = "2"
 
 # No `[profile.release]` here. This crate is overlaid into the public
 # `atomcode` workspace at build time; nested profile blocks in non-root

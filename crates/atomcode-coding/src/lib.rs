@@ -36,6 +36,7 @@ pub mod plan_mode;
 pub mod telemetry;
 
 mod assemble;
+mod rate_limit;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::CodingAgentConfig;

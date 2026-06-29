@@ -208,6 +208,14 @@ impl Message {
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
         Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images, reasoning_blocks: vec![] }
     }
+    /// A KERNEL-INJECTED `Role::User` message carrying `images` — used by the agent
+    /// loop to surface images a TOOL produced (e.g. `read_file` on a picture) to the
+    /// model, since a provider only serializes images on a user message, never a tool
+    /// message. `synthetic = true` so `sacred_floor` skips it when locating the real
+    /// task prompt (same rationale as [`Message::synthetic_user`]).
+    pub fn synthetic_user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
+        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images, reasoning_blocks: vec![] }
+    }
 
     /// Approximate token count for this message — a byte heuristic (~4 bytes/token;
     /// images ≈ 1600 tokens each). Used ONLY as a FALLBACK for context-pressure when

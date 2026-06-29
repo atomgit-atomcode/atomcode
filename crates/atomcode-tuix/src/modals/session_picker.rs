@@ -303,6 +303,9 @@ impl Modal for SessionPicker {
                         ctx.bg_manager
                             .set_foreground_session(ctx.current_session.clone());
                         state.on_turn_complete();
+                        // 同步模式：把这次「本地切换到历史会话」双向同步到 webui，并把
+                        // 共享 LiveSession 重绑到该会话（含其历史）。非同步模式下为 no-op。
+                        crate::event_loop::commands::sync_local_session_switch(ctx, renderer);
                         Ok(ModalAction::Close)
                     }
                     Err(e) => {

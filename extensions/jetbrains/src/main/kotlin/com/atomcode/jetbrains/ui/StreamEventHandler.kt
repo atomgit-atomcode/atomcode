@@ -13,6 +13,15 @@ import com.google.gson.JsonParser
 class StreamEventHandler(
     private val messageView: JBCefMessageView,
 ) {
+    private data class TurnSummary(
+        val label: String,
+        val rounds: Int,
+        val toolCalls: Int,
+        val duration: String,
+        val tokens: Int,
+        val failed: Boolean,
+    )
+
     /** AI 是否已开始输出（收到过 Text/Reasoning 事件） */
     var hasOutput: Boolean = false
         private set
@@ -24,6 +33,12 @@ class StreamEventHandler(
     /** 当前工具事件之间的文本段；用于保持“文本 → 工具 → 文本”的展示顺序。 */
     private var assistantSegmentText: String = ""
 
+    private var activeArtifactId: String? = null
+    private var activeArtifactText: String = ""
+    private var activeArtifactAssistantPrefix: String = ""
+    private var activeArtifactLanguage: String = "text"
+    private var activeArtifactTitle: String? = null
+
     /** AI 思考过程累积 */
     var reasoningText: String = ""
         private set
@@ -33,21 +48,12 @@ class StreamEventHandler(
     private var activeToolSummary: String = ""
     private var turnStartedAtNanos: Long = System.nanoTime()
     private var turnSummaryShown: Boolean = false
+    private var lastTurnSummary: TurnSummary? = null
 
     // ── Event handlers ──
 
     fun onText(content: String) {
-        assistantText += content
-        assistantSegmentText += content
-        if (!hasOutput) {
-            messageView.replaceThinkingWithAssistant("")
-            messageView.updateLastAssistantMessage(assistantSegmentText)
-            messageView.showStreamingCursor()
-            hasOutput = true
-        } else {
-            messageView.updateLastAssistantMessage(assistantSegmentText)
-            messageView.showStreamingCursor()
-        }
+        appendAssistantMarkdown(content)
     }
 
     fun onReasoning(content: String) {
@@ -56,12 +62,14 @@ class StreamEventHandler(
     }
 
     fun onToolBatch() {
+        flushAssistantSegment()
         assistantSegmentText = ""
         messageView.hideStreamingCursor()
         messageView.addAssistantEvent("[Tools queued]")
     }
 
     fun onToolStart(name: String, arguments: String) {
+        flushAssistantSegment()
         assistantSegmentText = ""
         messageView.hideStreamingCursor()
         activeToolName = name
@@ -88,19 +96,37 @@ class StreamEventHandler(
         activeToolSummary = ""
     }
 
-    fun onArtifactStart(title: String?) {
-        // Artifact lifecycle events mirror content that is already present in
-        // the streamed markdown. Rendering them inline splits the text segment
-        // and causes the next delta to replay the accumulated segment.
+    fun onArtifactStart(id: String, artifactType: String, language: String?, title: String?) {
+        clearActiveArtifact()
+        flushAssistantSegment()
+        assistantSegmentText = ""
+        activeArtifactId = id
+        activeArtifactText = ""
+        val fenceLanguage = artifactLanguage(artifactType, language, title)
+        activeArtifactAssistantPrefix = assistantText
+        activeArtifactLanguage = fenceLanguage
+        activeArtifactTitle = title
+        ensureAssistantOutputStarted()
+        assistantText = activeArtifactAssistantPrefix + fencedArtifactMarkdown(fenceLanguage, activeArtifactText)
+        messageView.updateArtifactCodeBlock(id, fenceLanguage, title, activeArtifactText)
+        messageView.showStreamingCursor()
     }
 
-    fun onArtifactContent(content: String) {
-        // Artifacts are rendered as separate daemon events. Do not append them to
-        // assistantText here, otherwise final assistant content can be duplicated.
+    fun onArtifactContent(id: String, content: String) {
+        if (content.isEmpty()) return
+        if (activeArtifactId != id) return
+
+        activeArtifactText = appendArtifactContent(activeArtifactText, content)
+        assistantText = activeArtifactAssistantPrefix + fencedArtifactMarkdown(activeArtifactLanguage, activeArtifactText)
+        messageView.updateArtifactCodeBlock(id, activeArtifactLanguage, activeArtifactTitle, activeArtifactText)
+        messageView.showStreamingCursor()
     }
 
     fun onArtifactEnd(id: String) {
-        // See onArtifactStart: keep artifact bookkeeping out of the transcript.
+        if (activeArtifactId == null || activeArtifactId == id) {
+            clearActiveArtifact()
+            assistantSegmentText = ""
+        }
     }
 
     fun onPermissionRequired(event: ChatEvent.PermissionRequest) {
@@ -108,12 +134,14 @@ class StreamEventHandler(
     }
 
     fun onStopped() {
+        flushAssistantSegment()
         messageView.finishAssistantTurn()
         messageView.addAssistantEvent("[Stopped]")
         addTurnSummary("Stopped", tokens = 0, toolCalls = 0, failed = true)
     }
 
     fun onError(message: String) {
+        flushAssistantSegment()
         messageView.finishAssistantTurn()
         messageView.addError(message)
         addTurnSummary("Error", tokens = 0, toolCalls = 0, failed = true)
@@ -131,12 +159,14 @@ class StreamEventHandler(
     }
 
     fun onDone(tokens: Int, toolCalls: Int) {
+        flushAssistantSegment()
         messageView.finishAssistantTurn()
         addTurnSummary("Dialed in", tokens, toolCalls, failed = false)
     }
 
     /** 流完成时收尾：如果没有输出，清理思考指示器 */
     fun onComplete() {
+        flushAssistantSegment()
         messageView.finishAssistantTurn()
         if (!hasOutput) {
             messageView.replaceThinkingWithAssistant("(no output)")
@@ -149,18 +179,36 @@ class StreamEventHandler(
         hasOutput = false
         assistantText = ""
         assistantSegmentText = ""
+        activeArtifactId = null
+        activeArtifactText = ""
+        activeArtifactAssistantPrefix = ""
+        activeArtifactLanguage = "text"
+        activeArtifactTitle = null
         reasoningText = ""
         activeToolName = null
         activeToolOutput = ""
         activeToolSummary = ""
         turnStartedAtNanos = System.nanoTime()
         turnSummaryShown = false
+        lastTurnSummary = null
+    }
+
+    fun replayLastTurnSummary() {
+        val summary = lastTurnSummary ?: return
+        messageView.addTurnSummary(
+            label = summary.label,
+            rounds = summary.rounds,
+            toolCalls = summary.toolCalls,
+            duration = summary.duration,
+            tokens = summary.tokens,
+            failed = summary.failed,
+        )
     }
 
     private fun addTurnSummary(label: String, tokens: Int, toolCalls: Int, failed: Boolean) {
         if (turnSummaryShown) return
         turnSummaryShown = true
-        messageView.addTurnSummary(
+        val summary = TurnSummary(
             label = label,
             rounds = 1,
             toolCalls = toolCalls.coerceAtLeast(0),
@@ -168,8 +216,92 @@ class StreamEventHandler(
             tokens = tokens.coerceAtLeast(0),
             failed = failed,
         )
+        lastTurnSummary = summary
+        messageView.addTurnSummary(
+            label = summary.label,
+            rounds = summary.rounds,
+            toolCalls = summary.toolCalls,
+            duration = summary.duration,
+            tokens = summary.tokens,
+            failed = summary.failed,
+        )
+    }
+
+    private fun flushAssistantSegment() {
+        if (assistantSegmentText.isEmpty()) {
+            messageView.finishAssistantMarkdownStream()
+        } else {
+            messageView.finishAssistantMarkdownStream(assistantSegmentText)
+        }
+    }
+
+    private fun appendAssistantMarkdown(content: String) {
+        assistantText += content
+        assistantSegmentText += content
+        ensureAssistantOutputStarted()
+        messageView.appendAssistantDelta(content)
+        messageView.showStreamingCursor()
+    }
+
+    private fun ensureAssistantOutputStarted() {
+        if (!hasOutput) {
+            messageView.replaceThinkingWithAssistant("")
+            hasOutput = true
+        }
+    }
+
+    private fun clearActiveArtifact() {
+        activeArtifactId = null
+        activeArtifactText = ""
+        activeArtifactAssistantPrefix = ""
+        activeArtifactLanguage = "text"
+        activeArtifactTitle = null
+    }
+
+}
+
+internal fun appendArtifactContent(
+    current: String,
+    incoming: String,
+): String = current + incoming
+
+internal fun fencedArtifactMarkdown(language: String, content: String): String {
+    val maxBacktickRun = Regex("`+").findAll(content)
+        .maxOfOrNull { it.value.length }
+        ?: 0
+    val fence = "`".repeat(maxOf(3, maxBacktickRun + 1))
+    return buildString {
+        append(fence)
+        append(language)
+        append('\n')
+        append(content)
+        if (content.isNotEmpty() && !content.endsWith("\n")) {
+            append('\n')
+        }
+        append(fence)
+        append('\n')
     }
 }
+
+internal fun artifactLanguage(artifactType: String, language: String?, title: String?): String {
+    val candidates = listOf(language, artifactType, title)
+    return candidates.asSequence()
+        .filterNot { it.isNullOrBlank() }
+        .mapNotNull { candidate ->
+            val cleaned = candidate
+                ?.trim()
+                ?.takeUnless { it.any { ch -> ch == '\n' || ch == '\r' || ch == '`' || ch == '~' } }
+            val token = cleaned
+                ?.split(Regex("[ \t]+"))
+                ?.firstOrNull()
+                ?.ifBlank { null }
+            token?.takeIf { SAFE_ARTIFACT_LANGUAGE.matches(it) }
+        }
+        .firstOrNull()
+        ?: "text"
+}
+
+private val SAFE_ARTIFACT_LANGUAGE = Regex("[A-Za-z0-9][A-Za-z0-9_+.#-]*")
 
 private fun formatDuration(nanos: Long): String {
     val millis = (nanos / 1_000_000).coerceAtLeast(0)

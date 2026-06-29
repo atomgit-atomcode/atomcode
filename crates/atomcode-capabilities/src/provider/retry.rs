@@ -130,11 +130,20 @@ pub(crate) fn stream_read_error_message(err: &(dyn std::error::Error + 'static))
     }
 }
 
-/// Parse `Retry-After` as integer seconds. `None` for absent / malformed / HTTP-date.
+/// Parse `Retry-After` (RFC 7231 §7.1.3) into a wait duration. Handles BOTH forms:
+/// delta-seconds (a bare integer) and an HTTP-date (e.g. some Anthropic 429s) — for the
+/// date form the wait is `date - now`, clamped to zero for a past date. `None` only when
+/// the header is absent or unparseable as either form.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let secs: u64 = value.trim().parse().ok()?;
-    Some(Duration::from_secs(secs))
+    let trimmed = value.trim();
+    // delta-seconds form: a bare integer.
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date form: wait until that instant (a past date → retry now = ZERO).
+    let when = httpdate::parse_http_date(trimmed).ok()?;
+    Some(when.duration_since(std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
 }
 
 /// Exponential backoff with real ±25% jitter, capped at `max_delay`. `attempt`
@@ -211,9 +220,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_http_date_is_none() {
+    fn parse_retry_after_http_date_future_is_delta_from_now() {
+        // A future HTTP-date → wait ≈ (date − now). Build it from now so the assertion
+        // is stable. HTTP-date has 1s resolution; allow slack for test execution time.
+        let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap());
+        let got = parse_retry_after(&h).expect("future HTTP-date must parse");
+        assert!(got.as_secs() >= 3590 && got.as_secs() <= 3600, "got {got:?}");
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_past_is_zero() {
+        // A past HTTP-date means "retry now" → ZERO (not None, not an underflow panic).
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_is_none() {
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("not-a-date-or-number"));
         assert_eq!(parse_retry_after(&h), None);
     }
 

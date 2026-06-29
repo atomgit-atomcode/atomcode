@@ -42,6 +42,20 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// (auth / 400 / balance) never enter this path — they fail fast.
 const MAX_PROVIDER_RETRIES: u32 = 3;
 
+/// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
+/// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
+/// of what the host hook returns. Guards against a livelock if the host hook is
+/// broken or the rate-limit window never reopens. This is a LAST-RESORT backstop,
+/// not the normal path — a real window recovery will cause the next OPEN to succeed,
+/// resetting this counter to 0 before it is ever reached in practice.
+///
+/// Worst-case in-turn blocking = `MAX_RATE_LIMIT_WAITS` × the host's per-wait cap
+/// (`atomcode_kernel::hook::RATE_LIMIT_AUTO_WAIT_SECS`, 120s) = 5 × 120s = 10 min.
+/// Kept on the scale of the other per-turn fuses (`MAX_PROVIDER_RETRIES` = 3,
+/// `EMPTY_RESPONSE_MAX_RETRIES` = 5) rather than the old 20 (which permitted a
+/// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
+const MAX_RATE_LIMIT_WAITS: u32 = 5;
+
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
 /// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
@@ -52,6 +66,23 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// than the generic error path (the empty body returns instantly; a long wait is
 /// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
 const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
+
+/// How many times a turn may auto-continue after the model's output was cut off at
+/// the token limit (`finish_reason=length`) with no tool call. A truncated response
+/// is almost always unfinished work; v1 (atomcode-core/src/agent/mod.rs:3064) nudged
+/// the model to resume rather than silently ending the turn. BOUNDED (tightly — the
+/// nudge tells the model to switch to incremental file writes, so it should not need
+/// many) so a model that truncates every round cannot livelock the loop.
+const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
+
+/// Synthetic user message injected after an output-limit truncation. Mirrors v1's
+/// wording but steers toward INCREMENTAL file writes (the durable fix for output
+/// that exceeds a single response's token budget) instead of re-emitting it all.
+const TRUNCATION_RESUME_NUDGE: &str =
+    "Output limit hit — your last response was cut off before finishing. If the task is \
+     already complete, reply with a short summary and stop (no tool calls). Otherwise resume \
+     where you left off, writing the remaining content INCREMENTALLY to a file (append the \
+     next section with edit_file) rather than re-emitting it all in one response.";
 
 /// Short, human reason for the visible "retrying" advisory. Branches on the
 /// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
@@ -71,6 +102,26 @@ fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
             }
         }
     }
+}
+
+/// Best-effort parse of a "try again in N seconds" hint from a provider error
+/// message (some OpenAI-compatible gateways embed it on a 429). Returns None
+/// when no such hint is found — the host hook is the authoritative reset source;
+/// this is only a fallback for the default (no-host) path.
+fn parse_retry_after_secs(msg: &str) -> Option<u64> {
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("try again in ")? + "try again in ".len();
+    let rest = &lower[idx..];
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse::<u64>().ok()
+}
+
+/// Authoritative Retry-After seconds for a 429's rate-limit hint. PREFERS the provider's
+/// real `Retry-After` response header (`ProviderError::retry_after_secs`, populated by the
+/// provider open path), falling back to the "try again in N seconds" text that some
+/// gateways (e.g. LiteLLM) embed only in the BODY when they send no header.
+fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
+    e.retry_after_secs.or_else(|| parse_retry_after_secs(&e.message))
 }
 
 /// Build the user-facing message shown when the empty-response retry budget is
@@ -300,6 +351,10 @@ pub struct Agent {
     /// TIME-determinism seam (default [`SystemClock`]; a `FixedClock` makes a run's
     /// snapshots byte-reproducible for eval/replay). See [`crate::clock`].
     clock: Arc<dyn Clock>,
+    /// When `true`, a cancelled turn PRESERVES its partial assistant/tool work in
+    /// history (backfilled to stay API-valid) instead of rolling back. Default
+    /// `false` = CANCEL = UNDO. See `AgentBuilder::keep_interrupted_context`.
+    keep_interrupted_context: bool,
 }
 
 impl Agent {
@@ -351,6 +406,7 @@ impl Agent {
             turn_counter: AtomicU64::new(turn_seed),
             request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
+            keep_interrupted_context: self.keep_interrupted_context,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle { commands: cmd_tx, events: ev_rx, task }
@@ -440,6 +496,8 @@ struct RunningAgent {
     request_counter: AtomicU64,
     /// Injectable monotonic clock for `elapsed_ms` (see [`crate::clock`]).
     clock: Arc<dyn Clock>,
+    /// See `Agent::keep_interrupted_context`.
+    keep_interrupted_context: bool,
 }
 
 impl RunningAgent {
@@ -785,8 +843,39 @@ impl RunningAgent {
     /// than risk cutting compacted history at a stale index. Funnels through
     /// `finish_turn` so the `turn_complete` hook + `TurnComplete` event still fire
     /// (on the now-clean conversation).
+    /// Cancel funnel: called by all 7 cancel sites. Two modes:
+    /// - `keep_interrupted_context = false` (default): CANCEL = UNDO — roll back to before
+    ///   the user message so the cancelled prompt + partial work leaves NO trace.
+    /// - `keep_interrupted_context = true`: PRESERVE — keep this turn's partial
+    ///   assistant/tool work; backfill a `(cancelled)` result for every dangling
+    ///   tool_call so the wire stays API-valid. APPEND-ONLY — prefix-cache safe.
     async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
-        convo.messages.truncate(rollback_len);
+        if self.keep_interrupted_context {
+            // PRESERVE: keep this turn's partial assistant/tool work; backfill a
+            // `(cancelled)` result for every dangling tool_call so the wire stays
+            // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
+            // `Conversation::cancel_current_turn`.
+            convo.backfill_cancelled_tool_results();
+            // Inject a SYNTHETIC user-role interruption marker — wire-safe on all
+            // adapters. A system message placed mid-conversation is rejected or silently
+            // dropped by many openai-compat gateways (non-leading system), and the
+            // Anthropic adapter lifts ALL system messages to the top-level `system`
+            // field, detaching this marker from its position. A user-role message merges
+            // cleanly into the next user prompt on Anthropic and is valid consecutive-user
+            // on openai-compat.
+            // `synthetic_user` (not `user`) so the marker is excluded from prompt
+            // counting: `compute_undo` in the bridge skips `synthetic = true` messages
+            // when locating the /undo target, and compaction's `active_turn_start`
+            // skip synthetic messages when computing keep-recent-turns boundaries.
+            convo.push(Message::synthetic_user(
+                "[The previous response was interrupted by the user before completing. \
+                 Reconsider the approach in light of this interruption before continuing.]",
+            ));
+        } else {
+            // CANCEL = UNDO (default): roll back to before the user message so the
+            // cancelled prompt + partial work leaves NO trace.
+            convo.messages.truncate(rollback_len);
+        }
         self.rt.emit(AgentEvent::Cancelled);
         self.finish_turn(convo, StopReason::Cancelled, ctx).await;
     }
@@ -823,6 +912,10 @@ impl RunningAgent {
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
         // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
+        // SAFETY FUSE counter: how many times THIS turn auto-continued after an
+        // output-limit truncation (`finish_reason=length`). Bounded by
+        // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
+        let mut truncation_continuations: u32 = 0;
         // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
         // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
         let mut overflow_attempt: u8 = 0;
@@ -830,6 +923,12 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
+        // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
+        // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
+        // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
+        // livelock if the host hook is broken or the window never opens — at that
+        // point the kernel forces a Pause stop rather than spinning indefinitely.
+        let mut rate_limit_waits: u32 = 0;
         // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
         // after a content-free 200. UNLIKE the two above it is NOT reset per round —
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
@@ -936,6 +1035,7 @@ impl RunningAgent {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
+                    rate_limit_waits = 0; // window reopened — reset the livelock fuse
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -954,7 +1054,75 @@ impl RunningAgent {
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
                 }
-                // TRANSIENT failure (429/5xx/transport — `retryable` is set by the
+                // 429 RATE LIMIT: defer to the host's usage-aware verdict instead of
+                // the blind 3/6/9s transient retry (useless for a 5-hour window).
+                // WaitAndRetry => cancellable sleep then re-issue this round.
+                // Pause       => clean RateLimited stop preserving already-produced
+                //                content (NOT a red Error).
+                // Placed BEFORE the generic retryable branch so a 429 never enters
+                // the blind 3/6/9s path.
+                Err(e) if e.http_status == Some(429) => {
+                    let hint = crate::hook::RateLimitHint {
+                        http_status: e.http_status,
+                        retry_after_secs: effective_retry_after(&e),
+                    };
+                    let decision = self
+                        .hooks
+                        .on_rate_limit(&hint)
+                        .await
+                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                    match decision {
+                        crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                            rate_limit_waits += 1;
+                            if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+                                // Livelock fuse: the host hook has returned WaitAndRetry
+                                // MAX_RATE_LIMIT_WAITS times without the window reopening.
+                                // Force a clean Pause stop to prevent spinning indefinitely
+                                // (e.g. a broken hook that always returns WaitAndRetry).
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: None,
+                                    auto_resuming: false,
+                                });
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                return;
+                            }
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display: String::new(),
+                                reset_label: String::new(),
+                                secs_until_reset: Some(secs),
+                                auto_resuming: true,
+                            });
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                            }
+                            provider_retry = 0; // 429 must not consume the generic transient-retry budget
+                            round -= 1; // re-issue this round, not a new one
+                            continue;
+                        }
+                        crate::hook::RateLimitDecision::Pause {
+                            reset_at_display,
+                            reset_label,
+                            secs_until_reset,
+                        } => {
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                                auto_resuming: false,
+                            });
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                            return;
+                        }
+                    }
+                }
+                // TRANSIENT failure (5xx/transport — `retryable` is set by the
                 // provider's classifier, incl. `is_retryable_reqwest_error` covering
                 // the stale keep-alive ConnectionReset class). The transport layer
                 // already did its OWN fast retries (~1.5s); this is the SECOND,
@@ -963,7 +1131,8 @@ impl RunningAgent {
                 // connection — and the Warning tells the user a retry is underway
                 // (silent fast-fail read as "no retry happened at all"). NON-retryable
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
-                // never spin ~18s on an error that cannot recover.
+                // never spin ~18s on an error that cannot recover. 429 is handled
+                // above by the host hook before reaching this branch.
                 Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
@@ -1021,6 +1190,9 @@ impl RunningAgent {
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
             // notice (malformed/garbled vs truly empty); it is NOT content.
             let mut saw_malformed = false;
+            // Set to true by the mid-stream 429 WaitAndRetry arm so we can break
+            // out of the inner stream loop and retry the round from the outer loop.
+            let mut retry_this_round = false;
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -1130,6 +1302,92 @@ impl RunningAgent {
                     StreamEvent::ResponseId(id) => response_id = Some(id),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
+                    // 429 mid-stream: consult the host hook before emitting an Error.
+                    StreamEvent::Error(e) if e.http_status == Some(429) => {
+                        let hint = crate::hook::RateLimitHint {
+                            http_status: e.http_status,
+                            retry_after_secs: effective_retry_after(&e),
+                        };
+                        let decision = self
+                            .hooks
+                            .on_rate_limit(&hint)
+                            .await
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                        match decision {
+                            crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                rate_limit_waits += 1;
+                                if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+                                    // Livelock fuse (mid-stream path): same guard as the OPEN
+                                    // path — force a clean Pause stop rather than spinning.
+                                    self.rt.emit(AgentEvent::RateLimited {
+                                        reset_at_display: String::new(),
+                                        reset_label: String::new(),
+                                        secs_until_reset: None,
+                                        auto_resuming: false,
+                                    });
+                                    self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                    return;
+                                }
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: Some(secs),
+                                    auto_resuming: true,
+                                });
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                }
+                                // I-1: Commit any accumulated partial content (text, reasoning,
+                                // tool calls) to the conversation BEFORE re-issuing the round.
+                                // Without this the re-issued round presents the same bare user
+                                // prompt to the model, which then re-generates from scratch and
+                                // emits duplicate TextDelta events (the partial stream already
+                                // in the UI is irrecoverable — gateways usually reject at the
+                                // header layer so true mid-stream 429s are rare). With the
+                                // partial message committed, a well-behaved model continues from
+                                // the committed text rather than restarting. Known residual
+                                // limitation: already-emitted TextDelta events cannot be
+                                // recalled from the UI — if the model re-generates identical
+                                // content the user will see it twice. Full rollback would
+                                // require a streaming-rewind mechanism beyond this scope.
+                                if !assistant_text.is_empty()
+                                    || !reasoning.is_empty()
+                                    || !pending_calls.is_empty()
+                                {
+                                    let mut partial = crate::message::Message::assistant(
+                                        assistant_text.clone(),
+                                        pending_calls.clone(),
+                                    );
+                                    partial.reasoning =
+                                        if reasoning.is_empty() { None } else { Some(reasoning.clone()) };
+                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                    convo.push(partial);
+                                }
+                                provider_retry = 0; // 429 must not consume the generic transient-retry budget
+                                retry_this_round = true;
+                                break; // exit stream loop; outer loop will re-issue round
+                            }
+                            crate::hook::RateLimitDecision::Pause {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                            } => {
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display,
+                                    reset_label,
+                                    secs_until_reset,
+                                    auto_resuming: false,
+                                });
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                return;
+                            }
+                        }
+                    }
                     StreamEvent::Error(e) => {
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
@@ -1146,6 +1404,13 @@ impl RunningAgent {
                         break;
                     }
                 }
+            }
+            // MID-STREAM 429 WaitAndRetry: the stream loop set retry_this_round and
+            // broke out. Re-issue the same logical round (round was already
+            // incremented at the top of the outer loop, so decrement to neutralize).
+            if retry_this_round {
+                round -= 1;
+                continue;
             }
             // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
             // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
@@ -1217,13 +1482,12 @@ impl RunningAgent {
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
                 return;
             }
-            // Truncation is observable via a Warning; the round still finishes
-            // normally (continuation is a separate follow-up task).
-            if truncated {
-                self.rt.emit(AgentEvent::Warning(
-                    "response truncated: finish_reason=length".into(),
-                ));
-            }
+            // Truncation (`finish_reason=length`) is recorded on the message meta
+            // below. The user-facing Warning is DEFERRED: it fires only if the
+            // truncation actually ENDS the turn with unfinished work (see the
+            // StopReason::Stopped path below). When the kernel auto-continues to
+            // finish the cut-off output, a red "response truncated" alarm would be
+            // misleading, so it is suppressed on the recovered path.
             let ctx_window = self.provider.context_window();
             // Prefer the provider's EXACT prompt count. FALL BACK to a byte estimate over
             // the OUTGOING request (`messages`, post-`pre_request`) when the provider omits
@@ -1266,6 +1530,42 @@ impl RunningAgent {
                 session_id: self.session_id.as_deref().map(str::to_string),
                 finish_reason,
             };
+            // RECOVER a MISROUTED answer. Some gateways/serving layers put the model's
+            // ACTUAL answer into the reasoning channel and leave `content` empty — observed
+            // with Qwen3-VL via a gateway whose reasoning-parser never sees a closing
+            // `</think>`, so the whole answer lands in `reasoning_content`. The turn would
+            // otherwise render BLANK (the driver hides reasoning by default). When a turn
+            // ends with NO content, NO tool calls, and a real (stop) finish but NON-empty
+            // reasoning, PROMOTE the reasoning to be the body: emit it live (so the driver
+            // shows the answer, not a blank) and let it ride the stored message as `content`
+            // so it persists for the next turn's context. GATED TIGHTLY so a normal model is
+            // never affected: a turn with ANY content, or any tool-call turn, is excluded —
+            // a model that legitimately separates reasoning from its answer keeps both.
+            if assistant_text.trim().is_empty()
+                && !reasoning.trim().is_empty()
+                && pending_calls.is_empty()
+                && !truncated
+                // Only the PLAIN-text reasoning path (OpenAI-compatible / Qwen). A turn that
+                // carries SIGNED reasoning blocks (Anthropic-style) is left untouched —
+                // promoting the flat reasoning to content while signed blocks still hold the
+                // same text would desync the message (content == thinking) and make a
+                // thinking-block adapter echo BOTH a thinking and a text block (double-send).
+                && reasoning_blocks.is_empty()
+            {
+                // Route the recovered answer through the SAME content-scrub seam a normal
+                // text delta passes (`on_text_delta`), so a hook that redacts/suppresses
+                // content treats the promoted answer identically — the live emit must not
+                // bypass the seam (its invariant: live stream AND storage are consistently
+                // transformed). Clone first so a hook that CLEARS the chunk leaves the
+                // reasoning intact to be STORED as reasoning (matching the no-promotion path).
+                let mut promoted = reasoning.clone();
+                self.hooks.on_text_delta(&mut promoted).await;
+                if !promoted.is_empty() {
+                    assistant_text = promoted;
+                    reasoning.clear(); // now the body; do not also store it as reasoning
+                    self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                }
+            }
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
             // STORE the accumulated reasoning losslessly: Some(..) iff the model
@@ -1286,6 +1586,17 @@ impl RunningAgent {
             let pending_calls = assistant_msg.tool_calls.clone();
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
+                // TRUNCATION auto-continuation (v1 parity). The response was cut off at
+                // the OUTPUT-token limit with no tool call ⇒ almost certainly unfinished.
+                // Nudge the model to resume (or to summarize+stop if it is actually done)
+                // instead of silently ending the turn. BOUNDED so endless truncation can't
+                // livelock. Runs BEFORE `offer_continuation` so a discipline hook's nudge
+                // does not pre-empt finishing the truncated content.
+                if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
+                    truncation_continuations += 1;
+                    convo.push(Message::user(TRUNCATION_RESUME_NUDGE.to_string()));
+                    continue;
+                }
                 if let Some(reminder) = self.hooks.offer_continuation(convo).await {
                     // SAFETY FUSE: a `offer_continuation` that always continues is an infinite
                     // kernel-driven loop with no model agency to stop. Before
@@ -1304,6 +1615,15 @@ impl RunningAgent {
                     continuations += 1;
                     convo.push(Message::user(reminder));
                     continue;
+                }
+                // The turn is ENDING. If it ends because the output was truncated and
+                // we could NOT recover (auto-continuation budget exhausted, no hook
+                // continuation), surface the warning now — this is the one case the
+                // user needs to see: real work was cut off and is not being finished.
+                if truncated {
+                    self.rt.emit(AgentEvent::Warning(
+                        "response truncated: finish_reason=length".into(),
+                    ));
                 }
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
                 return;
@@ -1359,6 +1679,10 @@ impl RunningAgent {
             let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut seen_calls: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
+            // VISION: images a tool produced this batch (e.g. read_file on a picture),
+            // collected to attach to ONE follow-up user message AFTER every tool_result
+            // is in — see the injection at the loop's end for why this is deferred.
+            let mut turn_images: Vec<crate::message::ImageContent> = vec![];
             for mut call in pending_calls {
                 // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
                 // tool_call once cancelled. Under "cancel = undo" the whole turn is
@@ -1413,6 +1737,7 @@ impl RunningAgent {
                                   call this turn; result already returned above]"
                             .to_string(),
                         is_error: false,
+                        images: vec![],
                     };
                     result_ids.insert(call.id.clone());
                     self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
@@ -1429,6 +1754,7 @@ impl RunningAgent {
                         call_id: call.id.clone(),
                         content: format!("unknown or unmounted tool: {}", call.name),
                         is_error: true,
+                        images: vec![],
                     },
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
@@ -1460,6 +1786,7 @@ impl RunningAgent {
                                 call_id: call.id.clone(),
                                 content: format!("blocked: {reason}"),
                                 is_error: true,
+                                images: vec![],
                             }
                         } else {
                             executed = true;
@@ -1510,6 +1837,7 @@ impl RunningAgent {
                                     call_id: call.id.clone(),
                                     content: "(cancelled — side effects unknown)".into(),
                                     is_error: true,
+                                    images: vec![],
                                 },
                             };
                             r.call_id = call.id.clone();
@@ -1538,6 +1866,18 @@ impl RunningAgent {
                     self.hooks.on_error(&result.content).await;
                 } else if batch_start.is_some() {
                     batch_ok += 1;
+                }
+                // VISION: a tool may return inline images (read_file on a picture). The
+                // tool-result message itself stays TEXT — a provider rejects images in a
+                // tool message — so harvest them here and attach to a single follow-up
+                // user message once ALL of this assistant's tool_results are pushed
+                // (interleaving a user message between tool_results would be an
+                // API-invalid payload). Not size-capped: matches user-pasted images.
+                // Drained BEFORE the event/message below so the emitted ToolResult event
+                // (consumed only for its text/call_id/is_error) never clones the multi-MB
+                // base64 payload, and the stored tool_result message never carries it.
+                if !result.images.is_empty() {
+                    turn_images.append(&mut result.images);
                 }
                 self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
                 convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
@@ -1574,6 +1914,18 @@ impl RunningAgent {
                     elapsed_ms: started_at.elapsed().as_millis() as u64,
                 });
             }
+            // VISION: surface any images this batch's tools produced to the model via a
+            // SINGLE follow-up user message (collected above). Pushed AFTER all
+            // tool_results so the assistant's tool_calls stay contiguous (API-valid),
+            // and BEFORE the next round's model call so the model sees the pictures.
+            // `synthetic_user_with_images` marks it synthetic so `sacred_floor` never
+            // mistakes it for the real task prompt.
+            if !turn_images.is_empty() {
+                convo.push(Message::synthetic_user_with_images(
+                    "[Images returned by the tool calls above are attached for you to view.]",
+                    std::mem::take(&mut turn_images),
+                ));
+            }
         }
     }
 }
@@ -1606,6 +1958,8 @@ pub struct AgentBuilder {
     session_id: Option<Arc<str>>,
     /// Injectable monotonic clock (see [`crate::clock`]). Default [`SystemClock`].
     clock: Arc<dyn Clock>,
+    /// See `Agent::keep_interrupted_context`. Default `false`.
+    keep_interrupted_context: bool,
 }
 
 impl Default for AgentBuilder {
@@ -1650,6 +2004,8 @@ impl Default for AgentBuilder {
             // NEUTRAL default: the real monotonic clock. An eval/replay swaps in a
             // FixedClock so the elapsed_ms sidecar (and thus snapshots) is reproducible.
             clock: Arc::new(SystemClock::new()),
+            // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
+            keep_interrupted_context: false,
         }
     }
 }
@@ -1865,6 +2221,11 @@ impl AgentBuilder {
         self.clock = clock;
         self
     }
+    /// Opt into preserving a cancelled turn's partial work in history (default off).
+    pub fn keep_interrupted_context(mut self, yes: bool) -> Self {
+        self.keep_interrupted_context = yes;
+        self
+    }
     pub fn build(self) -> Agent {
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -1889,7 +2250,46 @@ impl AgentBuilder {
             cancel_token: self.cancel_token,
             session_id: self.session_id,
             clock: self.clock,
+            keep_interrupted_context: self.keep_interrupted_context,
         }
+    }
+}
+
+#[cfg(test)]
+mod effective_retry_after_tests {
+    use super::effective_retry_after;
+    use crate::stream::ProviderError;
+
+    fn err(message: &str, retry_after_secs: Option<u64>) -> ProviderError {
+        ProviderError {
+            retryable: true,
+            message: message.into(),
+            http_status: Some(429),
+            code: None,
+            retry_after_secs,
+        }
+    }
+
+    #[test]
+    fn prefers_real_header() {
+        // Header present → used verbatim, body text ignored.
+        assert_eq!(effective_retry_after(&err("429 rate limited", Some(42))), Some(42));
+        // Header wins even when the body ALSO carries a "try again in N" hint.
+        assert_eq!(effective_retry_after(&err("Try again in 30 seconds", Some(5))), Some(5));
+    }
+
+    #[test]
+    fn falls_back_to_body_text_when_no_header() {
+        // Gateways (e.g. LiteLLM) that put the hint only in the BODY, no Retry-After header.
+        assert_eq!(
+            effective_retry_after(&err("No deployments available. Try again in 30 seconds.", None)),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn none_when_neither_header_nor_body_hint() {
+        assert_eq!(effective_retry_after(&err("429 Too Many Requests", None)), None);
     }
 }
 
@@ -1976,7 +2376,7 @@ mod cap_tests {
     use crate::tool::ToolResult;
 
     fn res(content: &str) -> ToolResult {
-        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false }
+        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false, images: vec![] }
     }
 
     #[test]

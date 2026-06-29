@@ -42,12 +42,15 @@ pub enum Msg<'a> {
     /// text — there's nothing to put after `— `, so the line stops
     /// at the prefix.
     CpClaimFailedBare,
-    /// Per-tier cascade row — winning tier, fresh claim.
-    /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
-    CpClaimTierSucceeded { tier: &'a str },
+    /// Per-tier cascade row — winning tier, fresh claim. `plan` is the
+    /// full plan label already including the "CodingPlan " prefix (the
+    /// server's `plan_name`, e.g. "CodingPlan Pro", or "CodingPlan
+    /// {tier}" fallback). Example (zh-CN): `  ✓ CodingPlan Pro 生效`
+    CpClaimTierSucceeded { plan: &'a str },
     /// Per-tier cascade row — winning tier, server reported the user
-    /// already holds this tier or higher (`duplicate=true`).
-    CpClaimTierAlreadyHeld { tier: &'a str },
+    /// already holds this tier or higher (`duplicate=true`). `plan` as
+    /// above.
+    CpClaimTierAlreadyHeld { plan: &'a str },
     /// Per-tier cascade row — tier was refused (2xx with success=
     /// false / 5xx / transport). `reason` is the server's human-
     /// readable message (e.g. `额度已满`, `暂无开放`) or a short
@@ -76,7 +79,6 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
-    CpMonthlyQuotaExhausted { duration: &'a str },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
@@ -151,7 +153,6 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     StatusCpUsage { usage: &'a str, reset_at: &'a str, duration: &'a str },
-    StatusCpMonthlyExhausted { duration: &'a str },
     StatusCpWindowExhausted,
     StatusCpWindowHint { hint: &'a str },
     StatusInstructionFilesHeader,
@@ -770,6 +771,19 @@ pub enum Msg<'a> {
     CompactStarting,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
+    /// Footer spinner label while a compaction's LLM summary runs (slow tier).
+    Compacting,
+    /// Spinner label variant when the compaction summary has stalled (>20s).
+    CompactingSlow,
+    /// Scrollback marker for a committed drain+summarize compaction (auto or
+    /// manual). `messages` = exact count summarized; `before`/`after` = raw
+    /// token-estimate strings (e.g. "48.2K") — the `~` marker is added by the
+    /// i18n format string, not by the caller.
+    CompactMarkDrain { messages: usize, before: &'a str, after: &'a str },
+    /// Scrollback marker for a committed in-place stub fold (tool results
+    /// collapsed, no messages dropped). `saved` = raw token-estimate string;
+    /// the `~` marker is added by the i18n format string, not by the caller.
+    CompactMarkStub { saved: &'a str },
 
     // ── /goal ──
     /// The full `/goal help` usage block (header + Usage + Notes).
@@ -808,6 +822,12 @@ pub enum Msg<'a> {
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing
     /// newline are part of the template.
     CtrlCAgainToExit,
+
+    /// Discovery hint after the first bare Esc on an empty idle buffer.
+    /// A second Esc within the window rolls the conversation back a turn.
+    /// "  (press Esc again to undo last turn)\n" — leading indent +
+    /// trailing newline are part of the template.
+    EscAgainToUndo,
 
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the
@@ -961,8 +981,21 @@ pub enum Msg<'a> {
 
     // ── streaming liveness (atomcode-tuix spinner) ──
     /// Spinner hint shown when a streaming response has gone silent past the stall
-    /// threshold. The cause is UNKNOWN (slow first byte, a slow gateway, or a
-    /// dropped connection), so the text does NOT blame the network — it just notes
-    /// the slow response and that esc cancels. Reassures the user it isn't frozen.
+    /// threshold. A silent stretch is OFTEN legitimate (slow first-byte prefill or
+    /// long high-effort reasoning at large context), so the text makes NO judgment
+    /// about speed — labelling it "slow" reads as a malfunction ("is it stuck?")
+    /// when it usually isn't. The elapsed timer already conveys duration; this adds
+    /// only the one thing not otherwise surfaced mid-stream — that esc cancels.
     StreamStalled,
+
+    // ── legacy Windows console (conhost) one-shot hint ──
+    /// Shown once at startup ONLY on the classic Windows console host
+    /// (`TerminalCaps::legacy_conhost`), never on Windows Terminal or any
+    /// other terminal. Legacy conhost snaps the viewport back to the bottom
+    /// on every write, so the live footer repaint during a running task
+    /// makes scrolling up to read history impossible until the task ends.
+    /// This is a conhost limitation we don't fix in-app — the hint tells the
+    /// user that scrolling resumes when the task finishes, and that Windows
+    /// Terminal has no such limitation.
+    ConhostScrollHint,
 }

@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    ProxyPicker, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -40,6 +41,37 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
         bg_runtime::RuntimeState::Running
     } else {
         bg_runtime::RuntimeState::Idle
+    }
+}
+
+pub(super) fn dispatch_undo(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if state.phase != crate::state::UiPhase::Idle {
+        renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
+        renderer.flush();
+        return;
+    }
+
+    let a = arg.trim();
+    // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
+    let parsed: Result<Option<usize>, ()> = if a.is_empty() {
+        Ok(None)
+    } else {
+        match a.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(()),
+        }
+    };
+    match parsed {
+        Ok(nth) => {
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::UndoToPrompt { nth })
+                .ok();
+        }
+        Err(()) => {
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBadArg).into_owned()));
+            renderer.flush();
+        }
     }
 }
 
@@ -311,6 +343,70 @@ pub(crate) fn attach_live_session(
     ));
 }
 
+/// 同步模式下，TUI 本地切换会话（/new、/session、/resume 选择历史会话等）后，把这次
+/// 切换双向同步：既让所有 webui tab 跟随，也把进程内共享 LiveSession 重绑到新会话。
+/// 与 webui 侧栏切换（postLiveSwitchSession → /live/switch_session）方向对称——补齐了
+/// 此前只有 webui→TUI、没有 TUI→webui 的单向同步缺口。
+///
+/// 顺序要点：必须**先**在「当前（旧）」LiveSession 上广播 SessionSwitched，**再**替换它。
+/// webui 的 /live SSE 是 fetch 流、不会自动重连——只有先收到 session_switched 事件，它才
+/// 会主动停旧流、按新 session_id 重连（见 webui Chat.tsx 的 session_switched 分支）；若反过来
+/// 先替换旧 LiveSession，旧广播通道一关就直接掐断 webui 的流且不再恢复。
+///
+/// 自回声无害：广播经 live_sync 转发器回流成 AgentEvent::SessionSwitched，但此时本地切换
+/// 已完成、`ctx.current_session.id` 已等于目标 id，被该事件臂顶部的守卫 no-op（不重复
+/// 清场/回放/重挂）。与 ProviderChanged / apply_cd 的自回声去重同款。
+///
+/// 非同步模式（`sync_session` 为 None）直接跳过——没有视图需要跟随。
+pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if ctx.sync_session.is_none() {
+        return;
+    }
+    // 1. 在旧 LiveSession 上广播，使每个 webui tab 的 SSE 重连到新会话（含其历史）。
+    atomcode_daemon::live_switch_session(ctx.current_session.id.clone());
+    // 2. 用新会话（id + 历史）替换共享 LiveSession，并把 TUI 转发器重挂到它上面，
+    //    使 TUI 之后的输入落到正确的会话（否则仍写进旧会话的 LiveSession）。
+    //    render_snapshot=false：历史已由切换入口（reset_to_new_session / 选择器）回放过。
+    let session = atomcode_daemon::ensure_live_session(
+        ctx.working_dir.clone(),
+        ctx.telemetry.clone(),
+        Some(ctx.current_session.id.clone()),
+        ctx.current_session.messages.clone(),
+    );
+    attach_live_session(ctx, renderer, session, false);
+    renderer.flush();
+}
+
+/// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
+/// 模板）到当前生效的对话引擎。
+///
+/// 同步模式（`sync_session` 为 Some）下投递到共享 LiveSession——使这些命令展开出的回合像
+/// 普通输入一样跑在 daemon 执行器上并广播给 webui，补齐了「TUI 上 /skills 等命令不同步到
+/// webui」的缺口；否则走 TUI 本地 agent（原有行为）。统一收口，避免每个命令各写一遍
+/// sync 分支、再漏一个。
+///
+/// 这些命令的合成文本本身不在本地回显（命令各有自己的 CommandOutput 提示）；同步模式下
+/// LiveSession 会广播 UserMessage，经转发器回成 UserEcho 由两端统一渲染该回合的用户气泡，
+/// 与普通输入在同步模式下的回显路径一致。所有调用点均为纯文本（无图），故只收文本。
+pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String) {
+    if let Some(live) = &ctx.sync_session {
+        live.send_input(atomcode_core::live::UserInput {
+            text,
+            images: vec![],
+        });
+    } else {
+        ctx.agent
+            .cmd_tx
+            .send(AgentCommand::SendMessage {
+                text,
+                images: vec![],
+                image_markers: vec![],
+            })
+            .ok();
+    }
+    state.on_submit();
+}
+
 pub(super) fn execute_slash_command(
     cmd: &str,
     arg: &str,
@@ -444,15 +540,7 @@ pub(super) fn execute_slash_command(
             } else {
                 // Try expanding the "ask" skill inline first (fast path).
                 if let Some(rendered) = expand_skill(ctx, "ask", arg) {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     // "ask" skill is not installed — trigger async install
                     // and stash the topic so handle_plugin_job_event can
@@ -570,11 +658,7 @@ pub(super) fn execute_slash_command(
                      {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
                 )
             };
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage { text, images: vec![], image_markers: vec![] })
-                .ok();
-            state.on_submit();
+            submit_agent_turn(ctx, state, text);
         }
         "config" => {
             // Head: current active provider + config path so users know
@@ -777,6 +861,9 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "proxy" => {
+            *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
+        }
         "status" => {
             let mut txt = t(Msg::StatusBody {
                 model: &ctx.model_name,
@@ -785,6 +872,10 @@ pub(super) fn execute_slash_command(
                 tokens: state.total_tokens,
             })
             .into_owned();
+            txt.push_str(&format!(
+                "  Proxy:  {}\n",
+                ctx.config.network.proxy.summary()
+            ));
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
             txt.push('\n');
@@ -819,33 +910,7 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            if state.phase != crate::state::UiPhase::Idle {
-                renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
-                renderer.flush();
-            } else {
-                let a = arg.trim();
-                // None = bare /undo (last turn); Some(n) = /undo n; Err = bad arg.
-                let parsed: Result<Option<usize>, ()> = if a.is_empty() {
-                    Ok(None)
-                } else {
-                    match a.parse::<usize>() {
-                        Ok(n) if n >= 1 => Ok(Some(n)),
-                        _ => Err(()),
-                    }
-                };
-                match parsed {
-                    Ok(nth) => {
-                        ctx.agent
-                            .cmd_tx
-                            .send(AgentCommand::UndoToPrompt { nth })
-                            .ok();
-                    }
-                    Err(()) => {
-                        renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBadArg).into_owned()));
-                        renderer.flush();
-                    }
-                }
-            }
+            dispatch_undo(arg, state, ctx, renderer);
         }
         "cost" => {
             let total = state.prompt_tokens + state.completion_tokens;
@@ -1841,9 +1906,7 @@ pub(super) fn execute_slash_command(
             let provider = ctx.config.providers.get_mut(&provider_name);
             match provider {
                 None => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdNoActiveProvider).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
                     renderer.flush();
                 }
                 Some(p) => {
@@ -2021,15 +2084,7 @@ pub(super) fn execute_slash_command(
                 // prefix here. A user-typed qualified name (`foo:bar`) still
                 // works because exact match runs first.
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(
                         t(Msg::SkillUnknown { name: skill_name }).into_owned(),
@@ -2055,16 +2110,8 @@ pub(super) fn execute_slash_command(
                         t(Msg::CmdSetupRunningSkill).into_owned(),
                     ));
                     renderer.flush();
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: rendered,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
                     *setup_pending = true;
-                    state.on_submit();
+                    submit_agent_turn(ctx, state, rendered);
                 } else {
                     renderer.render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                     renderer.flush();
@@ -2109,16 +2156,8 @@ pub(super) fn execute_slash_command(
                                 t(Msg::CmdSetupRunningSkill).into_owned(),
                             ));
                             renderer.flush();
-                            ctx.agent
-                                .cmd_tx
-                                .send(AgentCommand::SendMessage {
-                                    text: rendered,
-                                    images: vec![],
-                                    image_markers: vec![],
-                                })
-                                .ok();
                             *setup_pending = true;
-                            state.on_submit();
+                            submit_agent_turn(ctx, state, rendered);
                         } else {
                             renderer
                                 .render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
@@ -2143,25 +2182,9 @@ pub(super) fn execute_slash_command(
             // .atomcode/skills, etc.). Both expand to a prompt and dispatch
             // as a regular user message.
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: rendered,
-                        images: vec![],
-                        image_markers: vec![],
-                    })
-                    .ok();
-                state.on_submit();
+                submit_agent_turn(ctx, state, rendered);
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: rendered,
-                        images: vec![],
-                        image_markers: vec![],
-                    })
-                    .ok();
-                state.on_submit();
+                submit_agent_turn(ctx, state, rendered);
             } else {
                 // Unknown command — emit failure telemetry
                 let available_commands: Vec<&str> = vec![
@@ -2918,28 +2941,19 @@ fn render_codingplan_status_for_status_cmd() -> String {
     })
     .into_owned();
     // Prefer the per-window `rate_limit_windows` schema when present, mirroring
-    // `/login` (setup.rs). When the monthly cap is exhausted the server flags it
-    // via `quota_exhausted` while hiding the window (`show_enable=0`) and leaving
-    // the 5h rolling window visible at a misleading 0% — so we detect exhaustion
-    // via `blocking_exhausted_window` and suppress the rolling-window usage line.
+    // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
     if !status.rate_limit_windows.is_empty() {
-        use atomcode_core::coding_plan::setup::{blocking_exhausted_window, format_duration_secs};
-        if let Some(w) = blocking_exhausted_window(&status.rate_limit_windows) {
-            out.push_str(&t(Msg::StatusCpMonthlyExhausted {
+        use atomcode_core::coding_plan::setup::format_duration_secs;
+        for w in status
+            .rate_limit_windows
+            .iter()
+            .filter(|w| w.show_enable == 1)
+        {
+            out.push_str(&t(Msg::StatusCpUsage {
+                usage: &w.usage_status_desc,
+                reset_at: &w.reset_at_display,
                 duration: &format_duration_secs(w.seconds_until_reset),
             }));
-        } else {
-            for w in status
-                .rate_limit_windows
-                .iter()
-                .filter(|w| w.show_enable == 1)
-            {
-                out.push_str(&t(Msg::StatusCpUsage {
-                    usage: &w.usage_status_desc,
-                    reset_at: &w.reset_at_display,
-                    duration: &format_duration_secs(w.seconds_until_reset),
-                }));
-            }
         }
     } else if status.window_quota_exhausted {
         // Legacy backward-compat path (old server, no `rate_limit_windows`):
@@ -3226,8 +3240,7 @@ pub(crate) fn reset_to_new_session(
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.
-    ctx.current_session =
-        atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+    ctx.current_session = atomcode_core::session::Session::default_session(ctx.working_dir.clone());
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
     // Bind telemetry + agent session id to the new session's UUID (the
@@ -3248,6 +3261,8 @@ pub(crate) fn reset_to_new_session(
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
     renderer.flush();
     renderer.end_sync();
+    // 同步模式：把这次「本地新建会话」双向同步到 webui，并把共享 LiveSession 重绑到新会话。
+    sync_local_session_switch(ctx, renderer);
 }
 
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
@@ -3626,6 +3641,137 @@ pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(text);
     format!("\x1b]52;{};{}\x1b\\", buffer, b64)
+}
+
+/// Build the non-error rate-limit pause body line. Two branches:
+/// - `reset_at_display` non-empty → user must wait (Pause); shows reset
+///   time and remaining duration.
+/// - `reset_at_display` empty + small `secs_until_reset` → kernel is
+///   auto-retrying (WaitAndRetry); shows a countdown.
+///
+/// Kept as a pure function so it is unit-testable without a renderer.
+pub(crate) fn format_rate_limited_line(
+    reset_at_display: &str,
+    _reset_label: &str,
+    secs_until_reset: Option<u64>,
+    auto_resuming: bool,
+) -> String {
+    if auto_resuming {
+        // WaitAndRetry: kernel is sleeping then will retry automatically.
+        let n = secs_until_reset.unwrap_or(0);
+        return format!("⏳ 限流，{n}s 后自动继续…");
+    }
+    // Pause: kernel stopped, user must act.
+    if reset_at_display.is_empty() {
+        // Pause with no wall-clock reset time (e.g. from_hint fallback). Still show the
+        // remaining duration when the gateway gave one (secs_until_reset) instead of
+        // silently dropping it.
+        let tail = match secs_until_reset {
+            Some(s) => format!("（还有 {}）", fmt_dur(s)),
+            None => String::new(),
+        };
+        return format!(
+            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+        );
+    }
+    let tail = match secs_until_reset {
+        Some(s) => format!("（还有 {}）", fmt_dur(s)),
+        None => String::new(),
+    };
+    format!(
+        "⏸ 5小时窗口已用尽，约 {reset_at_display} 恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+    )
+}
+
+/// Format a duration in seconds as a compact human string: "2h11m" / "45m" / "30s".
+fn fmt_dur(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod rate_limited_tests {
+    use super::*;
+
+    // Branch 1: auto_resuming=true → countdown line (WaitAndRetry)
+    #[test]
+    fn rate_limited_wait_shows_countdown() {
+        let line = format_rate_limited_line("", "", Some(45), true);
+        assert!(line.contains("45"), "should contain countdown seconds");
+        assert!(line.contains("自动继续"), "should mention auto-continue");
+        assert!(line.contains('⏳'), "must use clock glyph ⏳ for WaitAndRetry");
+        assert!(!line.contains('⏸'), "must not use pause glyph ⏸ for WaitAndRetry");
+    }
+
+    // Branch 2: auto_resuming=false, reset_at_display non-empty → pause with time (Pause)
+    #[test]
+    fn rate_limited_renders_non_error_pause_line() {
+        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false);
+        assert!(line.contains("18:09"), "should contain reset time");
+        assert!(
+            line.contains("可换模型") || line.contains("稍后重试"),
+            "should contain retry suggestion"
+        );
+        assert!(!line.starts_with('!'), "must not start with '!' prefix");
+        assert!(line.contains('⏸'), "must contain pause glyph ⏸");
+        assert!(line.contains("2h0m"), "should format 7200s as 2h0m");
+        assert!(!line.contains("自动继续"), "Pause must not say 自动继续");
+    }
+
+    // Branch 3: auto_resuming=false, reset_at_display empty → pause without time
+    #[test]
+    fn rate_limited_pause_no_time_shows_no_countdown_no_reset_time() {
+        let line = format_rate_limited_line("", "", None, false);
+        assert!(line.contains('⏸'), "must use pause glyph ⏸");
+        assert!(!line.contains("自动继续"), "must not say 自动继续");
+        assert!(!line.contains("约"), "must not say 约 _ 恢复 when no reset time");
+        assert!(!line.contains("还有"), "must not show countdown when no reset time");
+        assert!(
+            line.contains("稍后恢复") || line.contains("稍后重试"),
+            "should indicate to retry later"
+        );
+    }
+
+    #[test]
+    fn rate_limited_no_secs_shows_no_duration() {
+        let line = format_rate_limited_line("23:59", "", None, false);
+        assert!(line.contains("23:59"));
+        assert!(!line.contains("还有"));
+    }
+
+    #[test]
+    fn rate_limited_pause_no_reset_time_still_shows_remaining_secs() {
+        // Pause (auto_resuming=false) with no wall-clock display but a known
+        // remaining duration: the duration must NOT be dropped.
+        let line = format_rate_limited_line("", "", Some(7200), false);
+        assert!(line.contains('⏸'), "must use pause glyph");
+        assert!(!line.contains("自动继续"), "must not say auto-continue (this is a Pause)");
+        assert!(line.contains("还有"), "must surface the remaining duration");
+        assert!(line.contains("2h0m"), "7200s → 2h0m: {line}");
+    }
+
+    #[test]
+    fn fmt_dur_hours_and_minutes() {
+        assert_eq!(fmt_dur(7931), "2h12m"); // 2h 12m 11s → floor minutes
+        assert_eq!(fmt_dur(3600), "1h0m");
+    }
+
+    #[test]
+    fn fmt_dur_minutes_only() {
+        assert_eq!(fmt_dur(90), "1m");
+        assert_eq!(fmt_dur(120), "2m");
+    }
+
+    #[test]
+    fn fmt_dur_seconds() {
+        assert_eq!(fmt_dur(45), "45s");
+        assert_eq!(fmt_dur(0), "0s");
+    }
 }
 
 #[cfg(test)]

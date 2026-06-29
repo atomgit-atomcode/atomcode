@@ -66,6 +66,21 @@ and suggest improvements."""
     }
 
     @Test
+    fun `extractLastCodeBlock handles longer fence with inner backticks`() {
+        val markdown = fencedArtifactMarkdown("kotlin", "val fence = \"```\"")
+        assertEquals("val fence = \"```\"", extractLastCodeBlock(markdown))
+    }
+
+    @Test
+    fun `fencedArtifactMarkdown uses longer outer fence for standalone inner fence`() {
+        val content = "before\n```\nafter"
+        val markdown = fencedArtifactMarkdown("markdown", content)
+
+        assertEquals("````markdown\nbefore\n```\nafter\n````\n", markdown)
+        assertEquals(content, extractLastCodeBlock(markdown))
+    }
+
+    @Test
     fun `extractLastCodeBlock returns null for text without code blocks`() {
         assertNull(extractLastCodeBlock("Hello world"))
     }

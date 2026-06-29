@@ -151,11 +151,6 @@
   .me-badge{display:inline-flex;margin-left:8px;padding:2px 6px;border-radius:4px;background:rgba(47,140,255,.25);color:#8fb9ff;font-size:10px}
   .rate-bad{display:inline-flex;padding:4px 8px;border-radius:4px;border:1px solid rgba(255,110,110,.45);background:rgba(255,110,110,.12);color:#ff6868;font-family:var(--mono);font-size:12px}
   .status-ok{color:var(--muted)}.status-bad{color:#ff4f4f;font-size:12px}
-  .reward-cell{text-align:center}
-  .coding-reward{position:relative;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;border:1px solid rgba(232,160,80,.62);background:rgba(232,160,80,.16);color:var(--accent-2);font-family:var(--mono);font-size:12px;font-weight:800;box-shadow:0 0 18px rgba(232,160,80,.16)}
-  .reward-popover{position:fixed;z-index:5000;width:min(310px,calc(100vw - 28px));padding:10px 12px;border:1px solid rgba(232,160,80,.38);border-radius:8px;background:#101316;color:rgba(255,255,255,.88);font-size:12px;font-weight:500;line-height:1.6;text-align:left;box-shadow:0 18px 42px rgba(0,0,0,.55);pointer-events:none}
-  .reward-popover::after{content:"";position:absolute;left:var(--arrow-x,50%);bottom:-5px;width:9px;height:9px;background:#101316;border-right:1px solid rgba(232,160,80,.38);border-bottom:1px solid rgba(232,160,80,.38);transform:translateX(-50%) rotate(45deg)}
-  .reward-empty{color:var(--faint);font-family:var(--mono)}
   .sep-dots{text-align:center;padding:6px 0;color:var(--faint);font-size:16px;letter-spacing:6px}
   .empty{padding:30px;text-align:center;color:var(--muted);font-size:13px}
 
@@ -199,7 +194,6 @@
   html.light .metric-value{color:#0d0d0d}.metric-value.blue{color:#2f8cff}.metric-value.red{color:#ff4f4f}.metric-value.gold{color:var(--accent)}
   html.light .rank-table td{color:rgba(0,0,0,.72);border-bottom-color:rgba(0,0,0,.08)}
   html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
-  html.light .coding-reward{color:#805210;border-color:rgba(160,100,20,.65);background:rgba(160,100,20,.24);box-shadow:0 0 14px rgba(160,100,20,.18)}
   html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;border-color:#c87618;box-shadow:0 14px 36px rgba(0,0,0,.16)}
   html.light .toast.error{border-color:#d83d3d}
   html.light .mb-drawer{background:rgba(246,243,236,.97)}html.light .mb-drawer a{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.08)}html.light .mb-drawer a:hover{color:#0d0d0d}
@@ -209,7 +203,7 @@
     .hdr-nav{display:none}.hdr-right .btn-pill{display:none}.mb-toggle{display:inline-flex}
     .hdr{padding:0 18px}.main{padding:96px 18px 54px}
     h1{font-size:34px}.metrics{grid-template-columns:repeat(2,1fr)}
-    .rank-wrap{overflow-x:auto}.rank-table{min-width:920px}
+    .rank-wrap{overflow-x:auto}.rank-table{min-width:820px}
   }
   @media (max-width:640px){
     .panel-head,.section-bar{align-items:flex-start;flex-direction:column}
@@ -290,7 +284,7 @@
   <a class="hdr-logo" href="/index.html">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.25.6</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.25.7</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="/index.html#features" data-i18n="nav.features">功能</a>
@@ -504,17 +498,14 @@ const T = {
   'board.rate': { zh: '转化率 (R)', en: 'Rate (R)' },
   'board.amount': { zh: '预估结算金额', en: 'Estimated settlement' },
   'board.status': { zh: '状态', en: 'Status' },
-  'board.reward': { zh: '榜单奖励', en: 'Reward' },
   'board.me': { zh: '我', en: 'Me' },
   'status.blocked': { zh: '触发熔断，仅结算活跃', en: 'Quality guard triggered; active only' },
   'status.normal': { zh: '正常结算', en: 'Normal settlement' },
   'status.pending': { zh: '审核中', en: 'Under review' },
-  'reward.tip': { zh: '每周榜单 Top5 赠送 CodingPlan Pro 套餐 30 天，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly Top 5 receive 30 days of CodingPlan Pro, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
   'rules.title': { zh: '结算规则与防刷熔断说明', en: 'Settlement Rules and Quality Guard' },
   'rules.desc': { zh: '为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。', en: 'To keep the community healthy, the system calculates conversion automatically (R = active / installs).' },
   'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
   'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
-  'rules.reward': { zh: '每周邀请风云榜 Top5 额外赠送 <code>CodingPlan Pro 30 天</code>，包含 GLM-5.1、Deepseek-v4 flash、Qwen3.6。', en: 'Weekly leaderboard Top 5 also receive <code>30 days of CodingPlan Pro</code>, including GLM-5.1, Deepseek-v4 flash, and Qwen3.6.' },
   'rules.cash': { zh: '所有京东E卡奖励每月（4周）汇总结算，请及时填写接收信息。', en: 'All JD E-Card rewards are summarized and settled monthly (4 weeks). Please fill in your receipt details promptly.' },
   'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
   'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
@@ -913,9 +904,9 @@ function renderBoard(targetId, data) {
   const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
   var body = rows.length
     ? rows.map(rowHtml).join('')
-    : '<tr><td colspan="8"><div class="empty">' + esc(t('board.empty')) + '</div></td></tr>';
+    : '<tr><td colspan="7"><div class="empty">' + esc(t('board.empty')) + '</div></td></tr>';
   if (meRow) {
-    body += '<tr class="sep"><td colspan="8"><div class="sep-dots">···</div></td></tr>';
+    body += '<tr class="sep"><td colspan="7"><div class="sep-dots">···</div></td></tr>';
     body += rowHtml(meRow);
   }
 
@@ -923,7 +914,7 @@ function renderBoard(targetId, data) {
     '<div><div class="section-title"><span class="mark">▣</span>' + esc(t('board.title')) + '</div><div class="section-hint">' + esc(t('board.hint')) + '</div></div>' +
     '<div class="period">' + prevControl + '<b>' + esc(weekLabel) + '</b>' + nextControl + '</div></div>' +
     '<section class="leaderboard"><div class="rank-wrap"><table class="rank-table"><thead><tr>' +
-    '<th>' + esc(t('board.rank')) + '</th><th>' + esc(t('board.promoter')) + '</th><th>' + esc(t('board.devices')) + '</th><th>' + esc(t('board.active')) + '</th><th>' + esc(t('board.rate')) + '</th><th>' + esc(t('board.amount')) + '</th><th>' + esc(t('board.status')) + '</th><th>' + esc(t('board.reward')) + '</th>' +
+    '<th>' + esc(t('board.rank')) + '</th><th>' + esc(t('board.promoter')) + '</th><th>' + esc(t('board.devices')) + '</th><th>' + esc(t('board.active')) + '</th><th>' + esc(t('board.rate')) + '</th><th>' + esc(t('board.amount')) + '</th><th>' + esc(t('board.status')) + '</th>' +
     '</tr></thead><tbody>' + body + '</tbody></table></div></section>';
   target.innerHTML = html;
 }
@@ -931,10 +922,6 @@ function rowHtml(row) {
   const blocked = Number(row.rate) < .25;
   const rankClass = row.rank === 1 ? ' top1' : row.rank === 2 ? ' top2' : row.rank === 3 ? ' top3' : '';
   const statusText = row.status || t('status.pending');
-  const rewardTip = t('reward.tip');
-  const rewardHtml = Number(row.rank) <= 5
-    ? '<span class="coding-reward" data-tip="' + escAttr(rewardTip) + '" onmouseenter="showRewardTip(this)" onmouseleave="hideRewardTip()" onfocus="showRewardTip(this)" onblur="hideRewardTip()" tabindex="0" aria-label="' + escAttr(rewardTip) + '">C</span>'
-    : '<span class="reward-empty">-</span>';
   return '<tr class="' + (row.me ? 'me ' : '') + (blocked ? 'blocked' : '') + '">' +
     '<td><span class="rank' + rankClass + '">' + esc(row.rank) + '</span></td>' +
     '<td><b>' + esc(maskDisplayName(row.username)) + '</b>' + (row.me ? '<span class="me-badge">' + esc(t('board.me')) + '</span>' : '') + '</td>' +
@@ -942,37 +929,8 @@ function rowHtml(row) {
     '<td class="mono num-blue">' + row.active + '</td>' +
     '<td>' + (blocked ? '<span class="rate-bad">' + pct(row.rate) + '</span>' : '<span class="num-green">' + pct(row.rate) + '</span>') + '</td>' +
     '<td class="money">￥' + Number(row.amount).toFixed(2) + '</td>' +
-    '<td class="' + (blocked ? 'status-bad' : 'status-ok') + '">' + esc(statusText) + '</td>' +
-    '<td class="reward-cell">' + rewardHtml + '</td></tr>';
+    '<td class="' + (blocked ? 'status-bad' : 'status-ok') + '">' + esc(statusText) + '</td></tr>';
 }
-
-function showRewardTip(anchor) {
-  hideRewardTip();
-  const text = anchor.getAttribute('data-tip') || '';
-  if (!text) return;
-  const tip = document.createElement('div');
-  tip.className = 'reward-popover';
-  tip.textContent = text;
-  document.body.appendChild(tip);
-  const gap = 10;
-  const rect = anchor.getBoundingClientRect();
-  const tipRect = tip.getBoundingClientRect();
-  const margin = 14;
-  let left = rect.left + rect.width / 2 - tipRect.width / 2;
-  left = Math.max(margin, Math.min(left, window.innerWidth - tipRect.width - margin));
-  let top = rect.top - tipRect.height - gap;
-  if (top < margin) top = rect.bottom + gap;
-  const arrowX = rect.left + rect.width / 2 - left;
-  tip.style.left = left + 'px';
-  tip.style.top = top + 'px';
-  tip.style.setProperty('--arrow-x', arrowX + 'px');
-  window.__rewardTip = tip;
-}
-function hideRewardTip() {
-  if (window.__rewardTip) { window.__rewardTip.remove(); window.__rewardTip = null; }
-}
-window.addEventListener('scroll', hideRewardTip, true);
-window.addEventListener('resize', hideRewardTip);
 
 function renderRules(targetId) {
   const target = document.getElementById(targetId);
@@ -982,7 +940,6 @@ function renderRules(targetId) {
     '<p>' + esc(t('rules.desc')) + '</p>' +
     '<ul><li>' + t('rules.good') + '</li>' +
     '<li>' + t('rules.bad') + '</li>' +
-    '<li>' + t('rules.reward') + '</li>' +
     '<li>' + t('rules.cash') + '</li></ul>' +
     '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#e8a050">￥</span>' + esc(t('rules.jd.title')) + '</div>' +
     '<ul><li>' + t('rules.jd.cycle') + '</li>' +

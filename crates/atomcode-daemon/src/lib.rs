@@ -200,6 +200,11 @@ pub struct CreateSessionRequest {
     /// Optional session title
     #[serde(default)]
     pub title: Option<String>,
+    /// Whether the caller (webui) has sync enabled. Only when true do we broadcast
+    /// the new session to other views (sync-mode TUI / other webui tabs) so they follow.
+    /// Defaults to false so sync-off webui新建对话不会牵连 TUI 新建（issue #850）。
+    #[serde(default)]
+    pub sync: bool,
 }
 
 /// Response for created session
@@ -1180,9 +1185,7 @@ async fn serve_webui_index(
                         .header(header::SET_COOKIE, cookie)
                         .body(axum::body::Body::empty())
                         .map(IntoResponse::into_response)
-                        .unwrap_or_else(|_| {
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        });
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             }
         }
@@ -1502,8 +1505,11 @@ async fn create_session(
     };
 
     // Broadcast new session creation to other views (sync-mode TUI / other webui tabs)
-    // so they follow: create new session with the same ID.
-    crate::live_api::live_switch_session(session.id.clone());
+    // so they follow: create new session with the same ID. Only when the caller has
+    // sync enabled — sync-off webui新建对话不应牵连 TUI 新建（issue #850）。
+    if req.sync {
+        crate::live_api::live_switch_session(session.id.clone());
+    }
 
     (StatusCode::CREATED, Json(response)).into_response()
 }
@@ -1919,6 +1925,18 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
+    /// time and label so the client can render a countdown notice.
+    #[serde(rename = "rate_limited")]
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
+    },
 }
 
 /// Artifact detector for code blocks and HTML in streaming text
@@ -2288,6 +2306,7 @@ async fn process_chat_request(
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // Determine provider
     let provider_name = req
@@ -2903,6 +2922,19 @@ async fn process_chat_request(
                     reason,
                     call_id: call.id,
                     arguments: call.arguments,
+                });
+            }
+            TurnEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+            } => {
+                let _ = event_tx.send(ChatEvent::RateLimited {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                    auto_resuming,
                 });
             }
         }
@@ -3536,7 +3568,11 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
     let sync_suffix = if sync { "&sync=1" } else { "" };
     let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::";
     // 通配绑定（用户意在暴露到网络）时探测本机局域网 IP。
-    let lan_ip = if is_wildcard { primary_lan_ipv4() } else { None };
+    let lan_ip = if is_wildcard {
+        primary_lan_ipv4()
+    } else {
+        None
+    };
     // 选择自动打开浏览器 + 主显示用的地址：
     // - 回环绑定：127.0.0.1。
     // - 通配绑定（0.0.0.0/::）：优先用局域网 IP —— 它在本机和其它设备上都可访问，
@@ -4116,6 +4152,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
+        .route("/live/switch_session", post(live_api::live_switch_session_endpoint))
         .route(
             "/live/reasoning_effort",
             post(live_api::live_reasoning_effort),
@@ -4360,6 +4397,25 @@ mod tests {
         );
     }
 
+    // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），
+    // 携带 reset_at_display/reset_label/secs_until_reset，供 webui 渲染倒计时提示。
+    #[test]
+    fn chat_rate_limited_serializes_as_its_own_type() {
+        let json = serde_json::to_string(&ChatEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+            auto_resuming: false,
+        })
+        .unwrap();
+        // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
+        assert!(json.contains(r#""type":"rate_limited""#), "wrong type: {json}");
+        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
+        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
+        assert!(json.contains(r#""auto_resuming":false"#), "{json}");
+    }
+
     #[test]
     fn first_query_value_extracts_token() {
         assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));
@@ -4376,10 +4432,7 @@ mod tests {
     #[test]
     fn strip_query_key_preserves_other_params() {
         assert_eq!(strip_query_key("token=abc", "token"), "");
-        assert_eq!(
-            strip_query_key("token=abc&session=Y", "token"),
-            "session=Y"
-        );
+        assert_eq!(strip_query_key("token=abc&session=Y", "token"), "session=Y");
         assert_eq!(
             strip_query_key("session=Y&token=abc&sync=1", "token"),
             "session=Y&sync=1"

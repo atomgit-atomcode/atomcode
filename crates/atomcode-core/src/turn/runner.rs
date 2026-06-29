@@ -1561,10 +1561,11 @@ impl TurnRunner {
         });
 
         // Emit ToolCall telemetry event for both success and failure.
+        let scrub_home = crate::tool::real_home_dir();
         let output_tail = atomcode_telemetry::scrub::truncate_head(
             &atomcode_telemetry::scrub::scrub_path(
                 &tool_result.output,
-                None,
+                scrub_home.as_deref(),
                 Some(&self.context.working_dir.read().await.clone()),
             ),
             200,
@@ -2817,8 +2818,8 @@ pub(crate) fn build_llm_error_data(
 
     // ── Build a concise, scrubbed error message ───────────────────
     // Strip the raw JSON body that some providers append after a colon.
-    let home = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h));
-    let cwd = std::env::var("PWD").ok().map(|c| std::path::PathBuf::from(c));
+    let home = crate::tool::real_home_dir();
+    let cwd = std::env::current_dir().ok();
     let message_raw = scrub::scrub_path(
         reason,
         home.as_deref(),

@@ -285,7 +285,7 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
             })
         }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: "12:00 (noon)".into(), is_error: false }
+            ToolResult { call_id: String::new(), content: "12:00 (noon)".into(), is_error: false, images: vec![] }
         }
     }
 

@@ -15,6 +15,8 @@ pub mod modals;
 pub mod platform;
 pub mod render;
 pub mod sanitize;
+#[cfg(unix)]
+mod signal_restore;
 pub mod state;
 pub mod terminal;
 pub mod terminal_bg;
@@ -96,6 +98,11 @@ impl TerminalGuard {
             kbd_flags_pushed: false,
         };
         if caps.raw_mode {
+            // Capture the cooked termios and install fatal-signal terminal-restore
+            // handlers BEFORE flipping to raw mode, so a SIGTERM/SIGHUP kill (which
+            // runs no Drop) still leaves the shell a usable terminal. Unix-only.
+            #[cfg(unix)]
+            crate::signal_restore::arm();
             crossterm::terminal::enable_raw_mode()?;
             g.raw_enabled = true;
         }
@@ -228,11 +235,17 @@ impl Drop for TerminalGuard {
 /// CSI-u report (the reported crash artefact).
 ///
 /// Mirrors `RetainedRenderer::Drop` (mouse-mode off, Kitty pop, cursor
-/// show, autowrap on, DECSTBM release) and appends a CRLF so the panic
-/// backtrace prints on a fresh line below the last painted TUI row
-/// instead of on top of it. Every sequence is idempotent, so emitting
-/// it after a graceful shutdown that already sent the same bytes is a
-/// harmless no-op.
+/// show, autowrap on, DECSTBM release), then disables bracketed paste
+/// (`?2004l`) and appends a CRLF so the panic backtrace prints on a fresh
+/// line below the last painted TUI row instead of on top of it. Every
+/// sequence is idempotent, so emitting it after a graceful shutdown that
+/// already sent the same bytes is a harmless no-op.
+///
+/// Bracketed paste is armed by `TerminalGuard`, not the renderer, so it is
+/// NOT in `RetainedRenderer::Drop` — but the abrupt-exit paths that lean on
+/// this sequence (panic hook, signal-restore handler) DO need it off, else
+/// the shell wraps every paste in literal `200~`/`201~`. It is the single
+/// source of truth for "undo everything the TUI armed".
 ///
 /// The Kitty pop uses the `<` introducer (`\x1b[<1u`), never `>`: `>`
 /// would *arm* the protocol on the way out — the very bug this fixes.
@@ -240,7 +253,7 @@ impl Drop for TerminalGuard {
 /// stack), so this stays unconditional and we needn't thread the
 /// `kbd_flags_pushed` state out of `TerminalGuard`.
 pub(crate) fn panic_restore_sequence() -> &'static [u8] {
-    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\r\n"
+    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\x1b[?2004l\r\n"
 }
 
 /// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
@@ -616,6 +629,52 @@ pub async fn run(
         agent_client.clone(),
     );
 
+    // ── Askpass server startup (unix-only, TUI path) ────────────────────────
+    // Start the Unix-socket askpass server so that child processes (sudo, ssh)
+    // can forward password prompts to the TUI instead of reading from the tty.
+    // On failure we degrade gracefully: askpass simply isn't available, sudo
+    // will use its own fallback and the TUI will not crash.
+    //
+    // The guard MUST outlive run_loop — its Drop removes the socket file.
+    // We bind it in the outer `run()` scope and explicitly reference it after
+    // `run_loop` returns so the compiler does not drop it early.
+    #[cfg(unix)]
+    let _askpass_guard: Option<atomcode_askpass::server::AskpassServerGuard>;
+    #[cfg(unix)]
+    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>;
+
+    #[cfg(unix)]
+    {
+        let cache = std::sync::Arc::new(
+            atomcode_askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
+        );
+        match atomcode_askpass::server::start(cache) {
+            Ok((mut env, rx, guard)) => {
+                // Write the wrapper script next to the socket.  On failure,
+                // degrade (no askpass) rather than crashing the TUI.
+                let script_result = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| {
+                        env.sock_path
+                            .parent()
+                            .and_then(|dir| {
+                                atomcode_askpass::wrapper::write_askpass_script(&exe, dir).ok()
+                            })
+                    });
+                if let Some(script) = script_result {
+                    env.askpass_script = script;
+                    atomcode_askpass::set_env(env);
+                }
+                askpass_rx = Some(rx);
+                _askpass_guard = Some(guard);
+            }
+            Err(_) => {
+                askpass_rx = None;
+                _askpass_guard = None;
+            }
+        }
+    }
+
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
@@ -681,6 +740,8 @@ pub async fn run(
         sync_forwarder: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        #[cfg(unix)]
+        askpass_rx,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
@@ -781,5 +842,6 @@ mod panic_restore_tests {
         assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
         assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
         assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
+        assert!(text.contains("\x1b[?2004l"), "must disable bracketed paste: {text:?}");
     }
 }

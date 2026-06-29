@@ -767,8 +767,12 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     std::process::Command::new("cmd")
         .raw_arg(format!("/C start \"\" \"{}\"", url))
+        // Suppress cmd.exe's own window flash; the browser it launches is unaffected
+        // (parity with the capabilities/v2 oauth twin).
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }

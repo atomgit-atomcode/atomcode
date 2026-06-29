@@ -5,7 +5,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -704,6 +703,13 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
+    /// Not intended for direct user invocation.
+    #[command(name = "__askpass", hide = true)]
+    Askpass {
+        /// The prompt string forwarded by sudo/ssh (e.g. "[sudo] password:").
+        prompt: String,
+    },
 }
 
 /// Subcommands for hooks management
@@ -1030,6 +1036,39 @@ async fn run() -> Result<i32> {
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
 
+    // ── Askpass early exit ────────────────────────────────────────────────────
+    // Handle `atomcode __askpass <prompt>` before ANY TUI/telemetry setup.
+    // sudo/ssh invoke this helper synchronously; it must not spawn async
+    // runtimes, connect to telemetry, or open a terminal.
+    if let Some(Commands::Askpass { prompt }) = &cli.command {
+        #[cfg(unix)]
+        {
+            use std::path::Path;
+            let sock = std::env::var("ATOMCODE_ASKPASS_SOCK").ok();
+            let token = std::env::var("ATOMCODE_ASKPASS_TOKEN").ok();
+            match (sock, token) {
+                (Some(s), Some(t)) => {
+                    match atomcode::askpass::run_askpass(prompt, Path::new(&s), &t) {
+                        Some(pw) => {
+                            use std::io::Write;
+                            print!("{pw}");
+                            let _ = std::io::stdout().flush();
+                            return Ok(0);
+                        }
+                        None => return Ok(1),
+                    }
+                }
+                _ => return Ok(1),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = prompt;
+            return Ok(1);
+        }
+    }
+    // ── End askpass early exit ────────────────────────────────────────────────
+
     let is_admin = atomcode_core::process_utils::is_running_as_admin();
 
     // ── Telemetry init ────────────────────────────────────────────────────────
@@ -1273,46 +1312,13 @@ async fn run() -> Result<i32> {
     let mut config = if config_path.exists() {
         Config::load(&config_path).unwrap_or_else(|e| {
             eprintln!("Warning: failed to load config ({}), using defaults", e);
-            Config {
-                default_provider: String::new(),
-                evaluator_provider: None,
-                default_workdir: None,
-                providers: HashMap::new(),
-                datalog: Default::default(),
-                notifications: Default::default(),
-                auto_update: true,
-                telemetry: Default::default(),
-                lsp: Default::default(),
-                auto_commit: false,
-                subagent: Default::default(),
-                vision_preprocessor_provider: None,
-                language: None,
-                ui: Default::default(),
-                plugin: Default::default(),
-                web_search: Default::default(),
-            }
+            Config::default()
         })
     } else {
         // No config yet — TUI Welcome screen will guide first-run setup
-        Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: Default::default(),
-            notifications: Default::default(),
-            auto_update: true,
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        Config::default()
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // ── i18n locale ──
     // Locale was already pre-resolved above (before clap parse) so --help
@@ -1987,6 +1993,7 @@ fn bridge_config_from(
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
         dangerously_skip_permissions,
         interactive,
+        keep_interrupted_context: config.keep_interrupted_context,
     }
 }
 
@@ -2295,6 +2302,30 @@ async fn run_headless(
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
             }
+            AgentEvent::RateLimited { reset_at_display, secs_until_reset, auto_resuming, .. } => {
+                // 429 rate-limit PAUSE/auto-wait notice. Headless: loud to
+                // stderr, no exit-code change, no shutdown — a Pause ends the
+                // turn via the upcoming TurnComplete(RateLimited); a WaitAndRetry
+                // keeps the turn running and resumes on its own.
+                close_thinking_line(&mut thinking_line_open);
+                if auto_resuming {
+                    eprintln!(
+                        "[rate-limited] auto-continuing in {}s…",
+                        secs_until_reset.unwrap_or(0)
+                    );
+                } else if !reset_at_display.is_empty() {
+                    eprintln!(
+                        "[rate-limited] 5h window exhausted — resets around {}",
+                        reset_at_display
+                    );
+                } else if let Some(s) = secs_until_reset {
+                    // Pause with no wall-clock time but a known remaining duration:
+                    // surface the seconds instead of dropping them.
+                    eprintln!("[rate-limited] 5h window exhausted — resets in {}s, retry later", s);
+                } else {
+                    eprintln!("[rate-limited] 5h window exhausted — paused, retry later");
+                }
+            }
             AgentEvent::HookWarningHint(msg) => {
                 eprintln!("[hook-warning] {}", msg);
             }
@@ -2414,6 +2445,13 @@ async fn run_headless(
             }
             AgentEvent::GoalUpdate { .. } => {
                 // Goal progress — headless mode ignores for now.
+            }
+            AgentEvent::CompactionUi(kind) => {
+                // Headless: no spinner / scrollback. Echo a committed marker to
+                // stderr so non-interactive runs still note the compaction.
+                if let atomcode_core::agent::CompactionUiKind::Mark(label) = kind {
+                    eprintln!("[compact] {}", label);
+                }
             }
         }
     }
@@ -2627,6 +2665,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             Ok(())
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+        Commands::Askpass { .. } => {
+            unreachable!("__askpass is handled early in run() before handle_command")
+        }
     }
 }
 
@@ -3068,25 +3109,9 @@ fn run_codingplan_core(
     // so the flow can still add AtomGit providers to a fresh config.toml.
     let mut config = match Config::load(&path) {
         Ok(c) => c,
-        Err(_) => Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: std::collections::HashMap::new(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        },
+        Err(_) => Config::default(),
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token

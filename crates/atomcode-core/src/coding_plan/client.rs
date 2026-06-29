@@ -122,7 +122,7 @@ impl Client {
         // error. `builder().build()` returns the same failure as a catchable
         // `Err`, so propagate it and let the orchestrator render a clean
         // "status fetch failed" line.
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(crate::ATOMCODE_USER_AGENT)
@@ -314,10 +314,9 @@ mod tests {
         let raw = anyhow::Error::new(AuthExpired { status: 401 });
         assert!(is_auth_expired(&raw));
 
-        let wrapped: anyhow::Error =
-            Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
-                .context("list models-v2")
-                .unwrap_err();
+        let wrapped: anyhow::Error = Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
+            .context("list models-v2")
+            .unwrap_err();
         assert!(is_auth_expired(&wrapped));
 
         let unrelated = anyhow!("some other failure");

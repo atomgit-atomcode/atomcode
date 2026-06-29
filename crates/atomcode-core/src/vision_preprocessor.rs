@@ -184,30 +184,9 @@ pub async fn maybe_preprocess(
 mod tests {
     use super::*;
     use crate::config::provider::ProviderConfig;
-    use std::collections::HashMap;
 
     fn blank_config() -> Config {
-        // Mirrors `coding_plan::setup::tests::blank_config` but kept local
-        // so this test module does not reach into another module's private test
-        // helpers. If new mandatory fields are added to Config, update both.
-        Config {
-            default_provider: String::new(),
-            evaluator_provider: None,
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: Default::default(),
-            auto_update: true,
-            notifications: Default::default(),
-            telemetry: Default::default(),
-            lsp: Default::default(),
-            auto_commit: false,
-            subagent: Default::default(),
-            vision_preprocessor_provider: None,
-            language: None,
-            ui: Default::default(),
-            plugin: Default::default(),
-            web_search: Default::default(),
-        }
+        Config::default()
     }
 
     fn sample_image() -> ImagePart {

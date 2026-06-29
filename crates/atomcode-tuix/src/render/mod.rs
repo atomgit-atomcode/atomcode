@@ -129,6 +129,18 @@ pub enum UiLine {
     /// know" apart from "the turn died." Currently used by the OpenAI
     /// provider's truncation detector.
     Warning(String),
+    /// Dim, non-bold informational line with no forced prefix. Used for
+    /// notable but non-alarming status lines that should not read as
+    /// warnings or errors — e.g. a rate-limit pause announcement. Rendered
+    /// in DarkGrey (same palette as `CompactionMark`) so it recedes into
+    /// the scrollback without grabbing attention.
+    Muted(String),
+    /// A compaction occurred here — a dim, left-aligned dash rule marking the
+    /// scrollback point where history was folded/summarized. Unified across
+    /// auto-compaction and manual `/compact`. Payload is the localized label
+    /// (e.g. "已压缩 · 摘要 12 条 · ~48.2K→~9.1K"); renderers wrap it in a dash
+    /// rule honoring the terminal's unicode caps. Permanent (enters scrollback).
+    CompactionMark(String),
     TurnCancelled,
     TurnComplete,
     /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).
@@ -502,19 +514,67 @@ pub struct ToolGroupChild {
     pub text: String,
 }
 
-/// Convert a Duration to a short label like "1.2s" or "340ms".
+/// Wrap a compaction marker label in a dash rule: `─── {label} ───` (unicode)
+/// or `--- {label} ---` (ASCII fallback for fonts lacking box-drawing — the
+/// same `unicode_symbols` gate the spinner `◐`→`|/-\` and ellipsis `…`→`...`
+/// use). Pure, so the wrapping is unit-tested independent of a renderer.
+pub fn compaction_rule(label: &str, unicode: bool) -> String {
+    let dash = if unicode { "───" } else { "---" };
+    format!("{dash} {label} {dash}")
+}
+
+/// Convert a Duration to a short label, scaling the unit with magnitude:
+/// `340ms` (< 1s) → `23.1s` (< 1min) → `2m9s` (< 1h) → `1h5m9s` (≥ 1h).
+/// Sub-minute keeps one decimal; at minute scale and above the sub-second
+/// part is dropped (it's noise next to whole minutes/hours).
 pub fn fmt_dur(d: Duration) -> String {
     let ms = d.as_millis();
     if ms < 1000 {
-        format!("{}ms", ms)
+        return format!("{}ms", ms);
+    }
+    let total = d.as_secs();
+    if total < 60 {
+        return format!("{:.1}s", d.as_secs_f64());
+    }
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h == 0 {
+        format!("{m}m{s}s")
     } else {
-        format!("{:.1}s", d.as_secs_f64())
+        format!("{h}h{m}m{s}s")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_rule_wraps_label_unicode() {
+        assert_eq!(compaction_rule("已压缩 · 摘要 2 条", true), "─── 已压缩 · 摘要 2 条 ───");
+    }
+
+    #[test]
+    fn compaction_rule_wraps_label_ascii_fallback() {
+        assert_eq!(compaction_rule("done", false), "--- done ---");
+    }
+
+    #[test]
+    fn fmt_dur_scales_unit_with_magnitude() {
+        assert_eq!(fmt_dur(Duration::from_millis(340)), "340ms");
+        assert_eq!(fmt_dur(Duration::from_millis(999)), "999ms");
+        // sub-minute keeps one decimal (the screenshot's `23.1s`)
+        assert_eq!(fmt_dur(Duration::from_secs_f64(23.1)), "23.1s");
+        assert_eq!(fmt_dur(Duration::from_secs_f64(59.4)), "59.4s");
+        // minute scale drops the decimal (`129.8s` → `2m9s`)
+        assert_eq!(fmt_dur(Duration::from_secs_f64(129.8)), "2m9s");
+        assert_eq!(fmt_dur(Duration::from_secs(60)), "1m0s");
+        assert_eq!(fmt_dur(Duration::from_secs(3599)), "59m59s");
+        // hour scale shows all three components
+        assert_eq!(fmt_dur(Duration::from_secs(3600)), "1h0m0s");
+        assert_eq!(fmt_dur(Duration::from_secs(3661)), "1h1m1s");
+    }
 
     fn two_column() -> MenuKind {
         MenuKind::TwoColumn {

@@ -30,9 +30,10 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools, ApprovalMiddleware, OpenFileWorkspaceGate, SensitivePathGate, WebFetchTool,
-    WebSearchTool, WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate, ReadFileTool,
+    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
+use atomcode_core::provider::model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
@@ -163,8 +164,13 @@ pub async fn prepare_with_plugin_hooks(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
 
-    // Always-on core: neutral fs/bash toolset + codeintel.
-    register_coding_tools(&mut registry);
+    // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
+    // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
+    // SAME canonical detector as the user-paste path (`model_name_suggests_vision`) so one
+    // model can't accept a pasted image yet refuse a read_file image. NOTE: this is the
+    // PREPARE-time flag; `assemble` re-registers read_file on every model swap (see there)
+    // so a `/model` change to/from a VL model can't leave it stale.
+    register_coding_tools_with_vision(&mut registry, model_name_suggests_vision(&cfg.model));
     names.extend(atomcode_capabilities::tools::coding_tool_names().iter().map(|s| s.to_string()));
     register_codeintel_tools(&mut registry);
     names.extend(
@@ -298,6 +304,11 @@ pub async fn prepare_with_plugin_hooks(
     // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
+    // right wait-vs-pause decision (decide_from_windows). Returns None for
+    // non-CodingPlan providers / fetch failures so the kernel falls back to its
+    // hint-based default with zero behavior change.
+    hooks.push(Arc::new(crate::rate_limit::RateLimitHook::new()) as Arc<dyn LifecycleHooks>);
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
     // (`plugin_cc_hooks`, resolved by the driver) on the kernel seams — the port of core's
     // CC-parity hook engine onto the v2 engine. ONE instance serves both seams: pushed here
@@ -387,6 +398,16 @@ pub fn assemble(
     cfg: &CodingAgentConfig,
     provider: Arc<dyn LlmProvider>,
 ) -> io::Result<Agent> {
+    // Model swap (e.g. `/model`) routes here via the bridge WITHOUT re-running `prepare`,
+    // so re-register `read_file` with the CURRENT model's vision capability — otherwise the
+    // PREPARE-time flag goes stale and a text-only model could receive a base64 image (or a
+    // VL model none). `register` overwrites by name, so this idempotently refreshes the one
+    // tool whose behavior depends on the model. Same model-swap-refresh pattern as the
+    // `review_provider` slot below.
+    parts
+        .registry
+        .register(Arc::new(ReadFileTool::new(model_name_suggests_vision(&cfg.model))));
+
     // Session-bound: reload the LATEST snapshot (turn 1 of a fresh session: none
     // yet → NotFound → start empty). Anything else unreadable is a real failure.
     if let Some(b) = &mut parts.session {
@@ -524,7 +545,9 @@ pub fn assemble(
         )))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
-        .max_continuations(cfg.max_continuations);
+        .max_continuations(cfg.max_continuations)
+        // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
+        .keep_interrupted_context(cfg.keep_interrupted_context);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
     // to unbounded when `.request_timeout` is never set, so None = park.

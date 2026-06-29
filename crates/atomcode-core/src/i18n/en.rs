@@ -38,10 +38,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  × CodingPlan tier setup failed — {}\n", error).into(),
         Msg::CpClaimFailedBare =>
             "  × CodingPlan tier setup failed\n".into(),
-        Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} active\n", tier).into(),
-        Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} active\n", tier).into(),
+        Msg::CpClaimTierSucceeded { plan } =>
+            format!("  ✓ {} active\n", plan).into(),
+        Msg::CpClaimTierAlreadyHeld { plan } =>
+            format!("  ✓ {} active\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
@@ -81,8 +81,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
-        Msg::CpMonthlyQuotaExhausted { duration } =>
-            format!("      Usage: monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ Current window quota exhausted\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -155,8 +153,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::StatusCpUsage { usage, reset_at, duration } =>
             format!("  Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
-        Msg::StatusCpMonthlyExhausted { duration } =>
-            format!("  ⚠ Monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ Current window quota exhausted\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -201,6 +197,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
+    Esc Esc                          Undo the previous turn
     Ctrl+D                           Exit AtomCode
     Ctrl+L                           Clear screen
     Ctrl+O                           Toggle tool real-time output
@@ -928,6 +925,14 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             let plural = if messages == 1 { "" } else { "s" };
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
+        Msg::Compacting => "Compacting…".into(),
+        Msg::CompactingSlow => "Compacting… (slow)".into(),
+        Msg::CompactMarkDrain { messages, before, after } => {
+            let plural = if messages == 1 { "" } else { "s" };
+            format!("Compacted · {} message{} summarized · ~{}→~{} tok", messages, plural, before, after).into()
+        }
+        Msg::CompactMarkStub { saved } =>
+            format!("Tool output folded · saved ~{} tok", saved).into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \
@@ -969,6 +974,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[warning] Running with Administrator privileges — model may have access to system files.".into(),
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
+        Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
@@ -1092,7 +1098,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  authenticate against. Use the official binary, or point the provider at a \
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
-        Msg::StreamStalled => "slow response · esc to cancel".into(),
+        Msg::StreamStalled => "esc to cancel".into(),
+        Msg::ConhostScrollHint =>
+            "Tip: in the classic Windows console, scrolling up to view history is \
+             unavailable while a task is running (scrolling resumes once it finishes). \
+             To scroll during a task, use \x1b[1;96mWindows Terminal\x1b[0m."
+                .into(),
     }
 }
 
@@ -1130,5 +1141,12 @@ mod codingplan_crypto_tests {
     fn en_upgrade_required_is_non_empty() {
         let s = en(Msg::CpUpgradeRequired);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn en_conhost_scroll_hint_recommends_windows_terminal() {
+        let s = en(Msg::ConhostScrollHint);
+        assert!(s.contains("Windows Terminal"));
+        assert!(s.to_lowercase().contains("scroll"));
     }
 }

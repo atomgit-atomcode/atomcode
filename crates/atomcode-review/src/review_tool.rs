@@ -177,10 +177,10 @@ impl Tool for ReviewTool {
 // ---------------------------------------------------------------------------
 
 fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
 }
 fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
 }
 
 /// `git diff` for the requested scope, run in `dir`. `base` wins over `staged`; with neither

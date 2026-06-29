@@ -140,8 +140,8 @@ pub(crate) fn display_path(p: &Path, root: &Path) -> String {
 }
 
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
 }
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
 }

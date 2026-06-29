@@ -22,6 +22,7 @@ distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-askpass = { path = "../atomcode-askpass" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-tuix = { path = "../atomcode-tuix" }

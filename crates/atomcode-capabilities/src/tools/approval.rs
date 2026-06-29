@@ -304,7 +304,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let mw = ApprovalMiddleware::in_memory();
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call = safe_call();
         // Safe → Proceed without ever awaiting the driver (which never responds here).
         assert!(!mw.before(&mut call, &tool, &rt).await.is_deny());

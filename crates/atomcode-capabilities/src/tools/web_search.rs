@@ -133,7 +133,7 @@ impl Tool for WebSearchTool {
 
 impl WebSearchTool {
     fn client() -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
+        crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)")
             .build()

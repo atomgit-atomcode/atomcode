@@ -198,7 +198,11 @@ export function App() {
     setSessionId(null);
     setActiveSession(null);
     setOptimisticSession(null);
-    createSession(targetCwd || undefined)
+    // 仅在同步开启（?sync=1）时让后端广播新建，使 sync 模式 TUI 跟随；
+    // 关闭同步时 webui 新建对话不应牵连 TUI 新建（issue #850）。
+    let sync = false;
+    try { sync = new URLSearchParams(location.search).get('sync') === '1'; } catch { /* ignore */ }
+    createSession(targetCwd || undefined, undefined, sync)
       .then((data) => {
         setSessionId(data.id);
         setActiveSession({

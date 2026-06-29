@@ -34,6 +34,11 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
+    /// Goal-mode round cap (0 = unbounded). Override via `ATOMCODE_GOAL_MAX_ROUNDS`.
+    pub goal_max_rounds: u32,
+    /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
+    /// `ATOMCODE_GOAL_MAX_DURATION_SECS`.
+    pub goal_max_duration_secs: u64,
     /// Per-call provider options (reasoning effort / max_tokens / temperature).
     /// Default = no opinion. A respawn (re-`assemble` on the same parts) picks up
     /// changes — how a driver implements `/effort`.
@@ -76,6 +81,11 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// On Ctrl-C / cancel: `false` (default) ⇒ CANCEL = UNDO (roll back the interrupted
+    /// turn). `true` ⇒ PRESERVE the partial turn + backfill dangling tool_calls + inject
+    /// an interruption marker, forwarded to the kernel `Agent` builder
+    /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
+    pub keep_interrupted_context: bool,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -87,6 +97,18 @@ fn default_stream_timeout() -> Duration {
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
+}
+fn default_goal_max_rounds() -> u32 {
+    std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(200)
+}
+fn default_goal_max_duration_secs() -> u64 {
+    std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(7200)
 }
 
 impl CodingAgentConfig {
@@ -106,6 +128,8 @@ impl CodingAgentConfig {
             stream_timeout: default_stream_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
+            goal_max_rounds: default_goal_max_rounds(),
+            goal_max_duration_secs: default_goal_max_duration_secs(),
             chat_options: Default::default(),
             telemetry: None,
             reasoning_history: None,
@@ -115,7 +139,20 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            keep_interrupted_context: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_caps_have_generous_defaults() {
+        let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
+        assert_eq!(c.goal_max_rounds, 200);
+        assert_eq!(c.goal_max_duration_secs, 7200);
     }
 }
 
@@ -131,6 +168,8 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("stream_timeout", &self.stream_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("max_continuations", &self.max_continuations)
+            .field("goal_max_rounds", &self.goal_max_rounds)
+            .field("goal_max_duration_secs", &self.goal_max_duration_secs)
             .field("chat_options", &self.chat_options)
             .field("telemetry", &self.telemetry.is_some())
             .finish_non_exhaustive()
