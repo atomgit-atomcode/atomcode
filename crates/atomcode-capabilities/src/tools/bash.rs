@@ -89,14 +89,24 @@ impl Tool for BashTool {
             Err(reason) => return err(reason),
         };
         // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
-        // defaults its `subprocess` text pipes AND stdio to the console code page and
-        // CRASHES with UnicodeDecodeError on any non-GBK byte (binary / UTF-8 output) — see
-        // #876. Force Python UTF-8 mode for everything we spawn so the model's Python never
-        // hits this. `PYTHONUTF8=1` (PEP 540) is the one that actually fixes the reported
-        // crash: it flips `locale.getpreferredencoding()` to utf-8, which is what `subprocess`
-        // text pipes use; `PYTHONIOENCODING` alone only covers Python's OWN stdio, not the
-        // child pipes. Set HERE (not in build_command) so it covers BOTH the cmd.exe and the
-        // Git Bash shells. Mirrors AtomCode's own decode_output UTF-8-first policy.
+        // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
+        // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
+        // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
+        // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
+        // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
+        // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
+        // AtomCode's own decode_output UTF-8-first policy.
+        //
+        // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
+        //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
+        //      pipe over real binary still crashes — just with a utf-8 codec error. The real
+        //      fix there is the model using bytes mode / `errors=` (its code, not ours).
+        //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
+        //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
+        //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
+        //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
+        //      this one — they cannot be decoupled. Accepted because modern files/output are
+        //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
         #[cfg(windows)]
         {
             cmd.env("PYTHONUTF8", "1");
