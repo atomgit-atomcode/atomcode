@@ -1561,10 +1561,11 @@ impl TurnRunner {
         });
 
         // Emit ToolCall telemetry event for both success and failure.
+        let scrub_home = crate::tool::real_home_dir();
         let output_tail = atomcode_telemetry::scrub::truncate_head(
             &atomcode_telemetry::scrub::scrub_path(
                 &tool_result.output,
-                None,
+                scrub_home.as_deref(),
                 Some(&self.context.working_dir.read().await.clone()),
             ),
             200,
