@@ -29,6 +29,8 @@
 //    for in-process integration tests without spawning a binary.
 //    Exposed publicly in the crate root (re-exported from jsonrpc).
 
+pub mod translate;
+
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, InitializeRequest, InitializeResponse, PromptCapabilities,
 };
