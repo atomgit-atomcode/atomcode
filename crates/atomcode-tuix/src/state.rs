@@ -318,6 +318,14 @@ pub struct UiState {
     /// event arrives. Mirrors `active_tool_batches` membership; cleared
     /// together.
     pub call_id_to_batch: std::collections::HashMap<String, String>,
+    /// Session map of todo task id → content, learned by parsing the full
+    /// list every `todo` result returns. `todo update` calls only carry
+    /// `id`+`status` in their arguments, so this is the only place the
+    /// task NAME is available at render time — used to upgrade an update
+    /// row from `#4 → completed` to `#4 Write tests → completed`. Never
+    /// cleared: ids are monotonic within a session, so a stale title is
+    /// harmless and a known title outlives the batch that revealed it.
+    pub todo_titles: std::collections::HashMap<u64, String>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -440,6 +448,7 @@ impl UiState {
             sub_agent_started_at: None,
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
+            todo_titles: std::collections::HashMap::new(),
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,

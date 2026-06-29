@@ -10,7 +10,7 @@ html, body {
 
 body {
   font-family: var(--app-sans-font-family);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--app-primary-foreground);
   background: var(--app-primary-background);
   -webkit-font-smoothing: antialiased;
@@ -307,7 +307,7 @@ body {
   max-width: 85%;
   width: auto;
   user-select: text;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.5;
   font-weight: 400;
 }
@@ -396,7 +396,7 @@ body {
 
 /* === Assistant Message === */
 .assistant-message-content {
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.6;
   width: 100%;
   min-width: 0;
@@ -407,7 +407,7 @@ body {
 
 .error-message-content {
   color: var(--app-error-foreground);
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -434,7 +434,7 @@ body {
   border-radius: 6px;
   padding: 4px 10px;
   margin: 6px 0;
-  font-size: 12.5px;
+  font-size: 13.5px;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -481,7 +481,7 @@ body {
   display: flex;
   align-items: baseline;
   gap: 7px;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.5;
   color: var(--app-primary-foreground);
 }
@@ -785,7 +785,7 @@ body {
   resize: none;
   color: var(--app-input-foreground);
   font-family: inherit;
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1.5;
   min-height: 3em;
   max-height: 200px;
@@ -1188,9 +1188,9 @@ body {
   text-align: left;
 }
 
-.session-item-name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.session-item-name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .session-item.active .session-item-name { font-weight: 600; }
-.session-item-meta { font-size: 10px; color: var(--app-secondary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+.session-item-meta { font-size: 11px; color: var(--app-secondary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 
 /* Kebab (⋮) button — appears on hover or while its menu is open. */
 .session-item-kebab {

@@ -25,7 +25,7 @@
   --app-sans-font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
   --app-serif-font-family:'Tiempos Text','Source Serif 4','Songti SC',ui-serif,Georgia,Cambria,'Times New Roman',serif;
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
-  --app-monospace-font-size:12px; --app-monospace-font-size-small:11px;
+  --app-monospace-font-size:13px; --app-monospace-font-size-small:12px;
 }
 /* Light palette — claude.ai warm ivory paper. Shared by the explicit-light
    and system-light selectors. Accent (clay) is inherited from :root. */
