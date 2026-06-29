@@ -232,13 +232,19 @@ async fn subagent_working_dir_isolation() {
                     StreamEvent::ToolCall(tool_call("c_probe", "working_dir_probe", "{}")),
                     StreamEvent::Done { truncated: false },
                 ],
-                // Round 2: the child stops after the probe. It streams REASONING (not
-                // text), so the provider produced content (NOT an empty-200 — which
-                // would now be retried inside the child) while leaving the final
-                // assistant TEXT empty — so SubAgentTool falls back to the probe tool
-                // RESULT (the working_dir), which is what this test asserts.
+                // Round 2: the child stops after the probe as a TRUE tool-only child —
+                // no answer text AND no reasoning. It streams an EMPTY reasoning delta
+                // purely to mark the provider as having responded (sets
+                // `saw_stream_content`, so it is NOT an empty-200 that the child would
+                // retry), while leaving BOTH the final assistant text and the reasoning
+                // empty. That matters because the loop PROMOTES a reasoning-only final
+                // round to the answer (recovering a gateway that misroutes the answer
+                // into the reasoning channel); a NON-empty reasoning here would be
+                // promoted to the child's text and SubAgentTool would return that instead
+                // of falling back to the probe tool RESULT (the working_dir) this test
+                // asserts. Empty reasoning ⇒ nothing to promote ⇒ the fallback stands.
                 vec![
-                    StreamEvent::Reasoning("(probe complete)".into()),
+                    StreamEvent::Reasoning(String::new()),
                     StreamEvent::Done { truncated: false },
                 ],
             ])) as Arc<_>

@@ -1522,6 +1522,25 @@ impl RunningAgent {
                 session_id: self.session_id.as_deref().map(str::to_string),
                 finish_reason,
             };
+            // RECOVER a MISROUTED answer. Some gateways/serving layers put the model's
+            // ACTUAL answer into the reasoning channel and leave `content` empty — observed
+            // with Qwen3-VL via a gateway whose reasoning-parser never sees a closing
+            // `</think>`, so the whole answer lands in `reasoning_content`. The turn would
+            // otherwise render BLANK (the driver hides reasoning by default). When a turn
+            // ends with NO content, NO tool calls, and a real (stop) finish but NON-empty
+            // reasoning, PROMOTE the reasoning to be the body: emit it live (so the driver
+            // shows the answer, not a blank) and let it ride the stored message as `content`
+            // so it persists for the next turn's context. GATED TIGHTLY so a normal model is
+            // never affected: a turn with ANY content, or any tool-call turn, is excluded —
+            // a model that legitimately separates reasoning from its answer keeps both.
+            if assistant_text.trim().is_empty()
+                && !reasoning.trim().is_empty()
+                && pending_calls.is_empty()
+                && !truncated
+            {
+                assistant_text = std::mem::take(&mut reasoning);
+                self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+            }
             let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
             // STORE the accumulated reasoning losslessly: Some(..) iff the model
