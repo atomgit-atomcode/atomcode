@@ -280,7 +280,7 @@ TOML ScriptHook 通过 stdin 接收上下文 JSON：
 
 ```bash
 # 构造测试上下文
-echo '{"tool_name":"read_file","event":"post_tool"}' | bash path/to/hook.sh
+echo '{"tool_name":"read_file","event":"post_tool_use"}' | bash path/to/hook.sh
 ```
 
 JSON CC 兼容 Hook 通过环境变量接收：
@@ -296,7 +296,7 @@ python path/to/hook.py
 ### 配置文件语法校验
 
 ```bash
-# TOML 格式校验
+# TOML 格式校验（需要 Python ≥ 3.11；旧版请 pip install tomli 并将 tomllib 替换为 tomli）
 python -c "import tomllib; tomllib.load(open('path/to/hooks.toml','rb'))"
 
 # JSON 格式校验
