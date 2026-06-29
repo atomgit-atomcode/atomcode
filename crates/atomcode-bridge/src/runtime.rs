@@ -232,6 +232,14 @@ struct Bridge {
     /// `wakeup_rx`). Taken by the turn-end Snapshot hook to schedule the next
     /// continuation; `None` at turn end ⇒ the model didn't reschedule ⇒ the loop ends.
     pending_wakeup: Option<WakeupRequest>,
+    /// Loop hold-open tracking (the `/loop` analogue of `pending_goal`). Between rounds
+    /// the turn-end Snapshot hook holds the driver turn open (it `return`s WITHOUT
+    /// `finish_turn`, so the footer stays busy during the sleep). `Some` ⇒ a turn is held
+    /// open awaiting the next continuation; the stop paths (ClearLoop / Cancel /
+    /// round-limit) `take()` it and `finish_turn` so the UI leaves Streaming. Without it,
+    /// stopping a SLEEPING loop strands the driver in Streaming forever (the kernel turn
+    /// already completed, so the forwarded KCmd::Cancel is a no-op).
+    loop_pending_finish: Option<Vec<atomcode_core::conversation::message::Message>>,
     /// The bridge end of the channel the kernel-side [`ScheduleWakeupTool`] sends on.
     /// Drained by the select loop (a wakeup arriving mid-turn is recorded into
     /// `pending_wakeup`). The matching sender is mounted into the kernel via the tool.
@@ -389,6 +397,7 @@ impl Bridge {
             loop_state: None,
             loop_cancel: CancellationToken::new(),
             pending_wakeup: None,
+            loop_pending_finish: None,
             wakeup_rx,
             wakeup_tx,
             loop_fire_tx,
@@ -602,8 +611,17 @@ impl Bridge {
         let ev = loop_update_ev(self.loop_state.as_ref().unwrap());
         self.emit(ev);
         if hit_limit {
+            // The previous round's turn is held open (the turn-end hook `return`ed without
+            // finish_turn). The loop ends here WITHOUT injecting another turn, so nothing
+            // downstream will close it — we must, or the UI stays stuck in Streaming.
+            let messages = self.loop_pending_finish.take().unwrap_or_default();
+            self.finish_turn(StopReason::Stopped, messages);
             return; // loop ended — do NOT inject another turn
         }
+        // A fresh continuation turn starts now → the prior hold-open is superseded by this
+        // turn's own lifecycle. Drop the stale snapshot so a later stop can't finish an
+        // already-replaced turn.
+        self.loop_pending_finish = None;
         self.start_turn_stats();
         let _ = self
             .handle
@@ -785,6 +803,12 @@ impl Bridge {
                 if let Some((_, messages)) = self.pending_goal.take() {
                     self.finish_turn(StopReason::Cancelled, messages);
                 }
+                // Same for a held-open /loop turn (goal/loop are mutually exclusive → at
+                // most one fires): a sleeping loop's kernel turn already completed, so the
+                // KCmd::Cancel above is a no-op and WE must close the held-open turn.
+                if let Some(messages) = self.loop_pending_finish.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
             }
             CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
             CoreCmd::ApproveToolAlways => {
@@ -899,6 +923,10 @@ impl Bridge {
                 // fresh agent re-triggers on the next prompt.
                 if self.turn_running || self.pending_approval.is_some() {
                     self.settle_in_flight_turn().await;
+                } else if let Some(messages) = self.loop_pending_finish.take() {
+                    // A loop sleeping between rounds holds the turn open (turn_running=false);
+                    // finish it so the post-swap UI returns to Idle instead of stuck Streaming.
+                    self.finish_turn(StopReason::Cancelled, messages);
                 }
                 if let Some(p) = config.providers.get(&config.default_provider) {
                     apply_reload_provider(&mut self.coding_cfg, p);
@@ -934,6 +962,7 @@ impl Bridge {
                                     self.loop_cancel.cancel();
                                     self.loop_state = None;
                                     self.pending_wakeup = None;
+                                    self.loop_pending_finish = None;
                                 }
                                 Err(e) => {
                                     self.emit(CoreEv::Error {
@@ -1118,6 +1147,9 @@ impl Bridge {
                 self.loop_cancel.cancel();
                 self.loop_cancel = CancellationToken::new();
                 self.pending_wakeup = None;
+                // Drop any hold-open snapshot from a prior loop; the new loop's first turn
+                // (the prompt sent alongside SetLoop) takes over the driver lifecycle.
+                self.loop_pending_finish = None;
                 let state = LoopState::new(prompt);
                 let ev = loop_update_ev(&state);
                 self.emit(ev);
@@ -1138,6 +1170,13 @@ impl Bridge {
                 // while a round is mid-tool (e.g. a long bash) must interrupt it, exactly
                 // like the goal ClearGoal / Cancel arms (which forward KCmd::Cancel).
                 let _ = self.handle.commands.send(KCmd::Cancel);
+                // If the loop was SLEEPING between rounds, its turn is held open and the
+                // kernel turn already completed → the KCmd::Cancel above is a no-op. WE
+                // must emit the terminal so the TUI leaves Streaming. (Mid-round stop:
+                // loop_pending_finish is None and KCmd::Cancel drives the terminal.)
+                if let Some(messages) = self.loop_pending_finish.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
             }
             CoreCmd::Shutdown => {
                 self.goal_cancel.cancel();
@@ -1208,6 +1247,11 @@ impl Bridge {
         if self.turn_running || self.pending_approval.is_some() {
             self.pending_approval = None;
             self.finish_turn(StopReason::Cancelled, Vec::new());
+        } else if let Some(messages) = self.loop_pending_finish.take() {
+            // A loop sleeping between rounds holds the driver turn open with
+            // turn_running=false, so the branch above misses it — finish it here or the
+            // post-respawn UI stays stuck in Streaming.
+            self.finish_turn(StopReason::Cancelled, messages);
         }
         let _ = self.handle.commands.send(KCmd::Shutdown);
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
@@ -1658,7 +1702,11 @@ impl Bridge {
                                 });
                                 // Hold the turn open (like goal) — do NOT finish_turn: the
                                 // driver stays "busy" until the continuation turn ends or
-                                // the loop is cleared.
+                                // the loop is cleared. Record the snapshot so the stop paths
+                                // (ClearLoop / Cancel / round-limit) can finish_turn and
+                                // return the UI to Idle — otherwise stopping a sleeping loop
+                                // strands the driver in Streaming forever.
+                                self.loop_pending_finish = Some(messages);
                                 return;
                             }
                             None => {
