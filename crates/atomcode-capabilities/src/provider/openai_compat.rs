@@ -278,6 +278,9 @@ async fn open_stream(
                         attempt += 1;
                         continue;
                     }
+                    // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
+                    // authoritative rate-limit countdown for the self-heal (vs scraping text).
+                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
                     // Parse the error envelope ONCE for both the readable detail and
                     // the STRUCTURED provider code.
@@ -290,6 +293,7 @@ async fn open_stream(
                         message: format!("HTTP {code}: {detail}"),
                         http_status: Some(code),
                         code: provider_code,
+                        retry_after_secs,
                     });
                 }
                 return Ok(resp);
@@ -678,6 +682,7 @@ impl SseDecoder {
                 message: format!("provider error: {}", parse_error_obj(err)),
                 http_status: None,
                 code: error_code(err),
+                retry_after_secs: None, // mid-stream error: no response headers
             }));
             self.done = true;
             return;

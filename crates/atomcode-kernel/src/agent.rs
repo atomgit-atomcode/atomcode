@@ -116,6 +116,14 @@ fn parse_retry_after_secs(msg: &str) -> Option<u64> {
     num.parse::<u64>().ok()
 }
 
+/// Authoritative Retry-After seconds for a 429's rate-limit hint. PREFERS the provider's
+/// real `Retry-After` response header (`ProviderError::retry_after_secs`, populated by the
+/// provider open path), falling back to the "try again in N seconds" text that some
+/// gateways (e.g. LiteLLM) embed only in the BODY when they send no header.
+fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
+    e.retry_after_secs.or_else(|| parse_retry_after_secs(&e.message))
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -1056,7 +1064,7 @@ impl RunningAgent {
                 Err(e) if e.http_status == Some(429) => {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
-                        retry_after_secs: parse_retry_after_secs(&e.message),
+                        retry_after_secs: effective_retry_after(&e),
                     };
                     let decision = self
                         .hooks
@@ -1298,7 +1306,7 @@ impl RunningAgent {
                     StreamEvent::Error(e) if e.http_status == Some(429) => {
                         let hint = crate::hook::RateLimitHint {
                             http_status: e.http_status,
-                            retry_after_secs: parse_retry_after_secs(&e.message),
+                            retry_after_secs: effective_retry_after(&e),
                         };
                         let decision = self
                             .hooks
@@ -2227,6 +2235,44 @@ impl AgentBuilder {
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
         }
+    }
+}
+
+#[cfg(test)]
+mod effective_retry_after_tests {
+    use super::effective_retry_after;
+    use crate::stream::ProviderError;
+
+    fn err(message: &str, retry_after_secs: Option<u64>) -> ProviderError {
+        ProviderError {
+            retryable: true,
+            message: message.into(),
+            http_status: Some(429),
+            code: None,
+            retry_after_secs,
+        }
+    }
+
+    #[test]
+    fn prefers_real_header() {
+        // Header present → used verbatim, body text ignored.
+        assert_eq!(effective_retry_after(&err("429 rate limited", Some(42))), Some(42));
+        // Header wins even when the body ALSO carries a "try again in N" hint.
+        assert_eq!(effective_retry_after(&err("Try again in 30 seconds", Some(5))), Some(5));
+    }
+
+    #[test]
+    fn falls_back_to_body_text_when_no_header() {
+        // Gateways (e.g. LiteLLM) that put the hint only in the BODY, no Retry-After header.
+        assert_eq!(
+            effective_retry_after(&err("No deployments available. Try again in 30 seconds.", None)),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn none_when_neither_header_nor_body_hint() {
+        assert_eq!(effective_retry_after(&err("429 Too Many Requests", None)), None);
     }
 }
 

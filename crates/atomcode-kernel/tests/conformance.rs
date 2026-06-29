@@ -330,6 +330,7 @@ async fn provider_doubles_are_conformant() {
         message: "401 unauthorized".into(),
         http_status: Some(401),
         code: Some("auth".into()),
+        retry_after_secs: None,
     };
     conformance::provider::check(Arc::new(ScriptedProvider::open_error(err))).await.assert_conformant();
 }
@@ -385,6 +386,7 @@ fn stream_wellformed_contract() {
         message: "mid-stream".into(),
         http_status: Some(500),
         code: None,
+        retry_after_secs: None,
     })];
     assert_check_failed(&check_stream_wellformed(&bad_err), "midstream_error_has_no_http_status");
 }

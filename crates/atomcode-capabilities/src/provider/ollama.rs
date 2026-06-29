@@ -216,6 +216,9 @@ async fn open_stream(
                         attempt += 1;
                         continue;
                     }
+                    // Capture the real `Retry-After` BEFORE `text()` consumes `resp` — the
+                    // authoritative rate-limit countdown for the self-heal (vs scraping text).
+                    let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
                     // Ollama errors are `{"error":"..."}` (a STRING).
                     let detail = serde_json::from_str::<Value>(&text)
@@ -227,6 +230,7 @@ async fn open_stream(
                         message: format!("HTTP {code}: {detail}"),
                         http_status: Some(code),
                         code: None,
+                        retry_after_secs,
                     });
                 }
                 return Ok(resp);
@@ -443,6 +447,7 @@ impl OllamaNdjsonDecoder {
                 message: format!("provider error: {}", truncate_msg(err)),
                 http_status: None,
                 code: None,
+                retry_after_secs: None, // mid-stream error: no response headers
             }));
             self.done = true;
             return;
