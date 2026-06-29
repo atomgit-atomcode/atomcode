@@ -59,6 +59,20 @@ pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
 }
 
 use agent_client_protocol::schema::v1::ToolCallContent;
+use agent_client_protocol::schema::v1::StopReason as AcpStop;
+use atomcode_kernel::event::StopReason as KStop;
+
+pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
+    match r {
+        KStop::Stopped => Ok(AcpStop::EndTurn),
+        KStop::MaxRounds | KStop::MaxContinuations => Ok(AcpStop::MaxTurnRequests),
+        KStop::Cancelled => Ok(AcpStop::Cancelled),
+        KStop::PromptRejected => Ok(AcpStop::Refusal),
+        KStop::ProviderError => Err("provider error"),
+        KStop::Timeout => Err("turn timed out"),
+        _ => Err("turn ended abnormally"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -119,5 +133,18 @@ mod tests {
         assert_eq!(tool_kind("grep"), ToolKind::Search);
         assert_eq!(tool_kind("web_fetch"), ToolKind::Fetch);
         assert_eq!(tool_kind("totally_unknown"), ToolKind::Other);
+    }
+
+    #[test]
+    fn stop_reason_mapping() {
+        use agent_client_protocol::schema::v1::StopReason as Acp;
+        use atomcode_kernel::event::StopReason as K;
+        assert_eq!(stop_reason(K::Stopped).unwrap(), Acp::EndTurn);
+        assert_eq!(stop_reason(K::MaxRounds).unwrap(), Acp::MaxTurnRequests);
+        assert_eq!(stop_reason(K::MaxContinuations).unwrap(), Acp::MaxTurnRequests);
+        assert_eq!(stop_reason(K::Cancelled).unwrap(), Acp::Cancelled);
+        assert_eq!(stop_reason(K::PromptRejected).unwrap(), Acp::Refusal);
+        assert!(stop_reason(K::ProviderError).is_err());
+        assert!(stop_reason(K::Timeout).is_err());
     }
 }
