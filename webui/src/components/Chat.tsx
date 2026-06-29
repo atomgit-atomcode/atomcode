@@ -908,7 +908,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         } else if (time) {
           text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
         } else {
-          text = `${t('chat.rateLimited.pausedNoTime')} · ${t('chat.rateLimited.hint')}`;
+          // Pause with no wall-clock time but a known remaining duration: show it
+          // (compact h/m/s, matching the TUI) instead of dropping secs_until_reset.
+          const secs = event.secs_until_reset;
+          const dur = secs == null ? '' :
+            secs >= 3600 ? `（还有 ${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m）` :
+            secs >= 60 ? `（还有 ${Math.floor(secs / 60)}m）` : `（还有 ${secs}s）`;
+          text = `${t('chat.rateLimited.pausedNoTime')}${dur} · ${t('chat.rateLimited.hint')}`;
         }
         pushRateLimitedToLastAssistant(text);
         break;

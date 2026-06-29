@@ -3649,8 +3649,16 @@ pub(crate) fn format_rate_limited_line(
     }
     // Pause: kernel stopped, user must act.
     if reset_at_display.is_empty() {
-        // Pause but no reset time available.
-        return "⏸ 5小时窗口已用尽，稍后恢复 · 已保留已完成内容 · 可换模型或稍后重试".to_string();
+        // Pause with no wall-clock reset time (e.g. from_hint fallback). Still show the
+        // remaining duration when the gateway gave one (secs_until_reset) instead of
+        // silently dropping it.
+        let tail = match secs_until_reset {
+            Some(s) => format!("（还有 {}）", fmt_dur(s)),
+            None => String::new(),
+        };
+        return format!(
+            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+        );
     }
     let tail = match secs_until_reset {
         Some(s) => format!("（还有 {}）", fmt_dur(s)),
@@ -3720,6 +3728,17 @@ mod rate_limited_tests {
         let line = format_rate_limited_line("23:59", "", None, false);
         assert!(line.contains("23:59"));
         assert!(!line.contains("还有"));
+    }
+
+    #[test]
+    fn rate_limited_pause_no_reset_time_still_shows_remaining_secs() {
+        // Pause (auto_resuming=false) with no wall-clock display but a known
+        // remaining duration: the duration must NOT be dropped.
+        let line = format_rate_limited_line("", "", Some(7200), false);
+        assert!(line.contains('⏸'), "must use pause glyph");
+        assert!(!line.contains("自动继续"), "must not say auto-continue (this is a Pause)");
+        assert!(line.contains("还有"), "must surface the remaining duration");
+        assert!(line.contains("2h0m"), "7200s → 2h0m: {line}");
     }
 
     #[test]

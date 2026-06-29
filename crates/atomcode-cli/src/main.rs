@@ -2317,6 +2317,10 @@ async fn run_headless(
                         "[rate-limited] 5h window exhausted — resets around {}",
                         reset_at_display
                     );
+                } else if let Some(s) = secs_until_reset {
+                    // Pause with no wall-clock time but a known remaining duration:
+                    // surface the seconds instead of dropping them.
+                    eprintln!("[rate-limited] 5h window exhausted — resets in {}s, retry later", s);
                 } else {
                     eprintln!("[rate-limited] 5h window exhausted — paused, retry later");
                 }

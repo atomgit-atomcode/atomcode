@@ -1226,6 +1226,12 @@ impl Bridge {
                     StopReason::MaxRounds => TurnStopReason::TurnLimit,
                     StopReason::MaxContinuations => TurnStopReason::StepLimit,
                     StopReason::Cancelled => TurnStopReason::Cancelled,
+                    // A 429 rate-limit Pause is NOT a failure — the user already saw the
+                    // ⏸ RateLimited pause line. Classify as Natural (not Error) so the turn
+                    // summary isn't flagged red and telemetry doesn't count it as a failed
+                    // turn. No dedicated TurnStopReason variant to avoid cascading across
+                    // the 60+ existing match sites.
+                    StopReason::RateLimited => TurnStopReason::Natural,
                     _ => TurnStopReason::Error,
                 };
                 // NOTE: a provider/stream error already surfaced as a `CoreEv::Error`
@@ -1650,6 +1656,11 @@ fn goal_turn_disposition(
             GoalDisposition::ReinjectNoEval
         }
         StopReason::Cancelled | StopReason::PromptRejected => GoalDisposition::EndTurn,
+        // A 429 rate-limit Pause: stop the goal WITH a user-facing notice instead of the
+        // silent `_ => EndTurn`. Re-injecting (ReinjectNoEval) would immediately 429 again
+        // and busy-loop through pauses; StopGoal emits "goal stopped: rate limited …" so
+        // the user knows to re-run /goal after the 5h window resets.
+        StopReason::RateLimited => GoalDisposition::StopGoal("rate limited (5h window)"),
         _ => GoalDisposition::EndTurn,
     }
 }
@@ -2512,6 +2523,12 @@ mod goal_disposition_tests {
         // terminal → end the goal/turn
         assert!(matches!(goal_turn_disposition(Cancelled, None, false), GoalDisposition::EndTurn));
         assert!(matches!(goal_turn_disposition(PromptRejected, None, false), GoalDisposition::EndTurn));
+        // 429 rate-limit Pause → StopGoal WITH a notice (not the silent EndTurn that would
+        // kill the goal invisibly, nor ReinjectNoEval that would busy-loop on 429s)
+        assert!(matches!(
+            goal_turn_disposition(RateLimited, None, false),
+            GoalDisposition::StopGoal("rate limited (5h window)")
+        ));
         // caps / exhaustion override the reason
         assert!(matches!(goal_turn_disposition(Stopped, Some("round limit"), false), GoalDisposition::StopGoal("round limit")));
         assert!(matches!(goal_turn_disposition(Stopped, None, true), GoalDisposition::StopGoal(_)));
