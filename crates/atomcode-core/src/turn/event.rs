@@ -69,6 +69,9 @@ pub enum TurnEvent {
         reset_at_display: String,
         reset_label: String,
         secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        auto_resuming: bool,
     },
     /// Token usage update
     TokenUsage {

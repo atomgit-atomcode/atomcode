@@ -9147,14 +9147,15 @@ fn handle_agent_event(
                 attach_live_session(ctx, renderer, session, false);
             }
         }
-        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
             // Non-error pause line: dim/plain body row, never red.
-            // WaitAndRetry (empty reset_at_display, small secs): "⏳ 限流，Ns 后自动继续…"
-            // Pause (reset_at_display non-empty, >2 min): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
+            // auto_resuming=true  (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
+            // auto_resuming=false (Pause, has time): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
+            // auto_resuming=false (Pause, no time):  "⏸ 5小时窗口已用尽，稍后恢复…"
             // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
             // Rate-limit is a pause, not an error/warning — it must not
             // render with the yellow `! ` prefix that Warning applies.
-            let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset);
+            let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset, auto_resuming);
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }

@@ -1932,6 +1932,10 @@ pub enum ChatEvent {
         reset_at_display: String,
         reset_label: String,
         secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
     },
 }
 
@@ -2924,11 +2928,13 @@ async fn process_chat_request(
                 reset_at_display,
                 reset_label,
                 secs_until_reset,
+                auto_resuming,
             } => {
                 let _ = event_tx.send(ChatEvent::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
+                    auto_resuming,
                 });
             }
         }
@@ -4399,12 +4405,15 @@ mod tests {
             reset_at_display: "18:09".into(),
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
+            auto_resuming: false,
         })
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"rate_limited","reset_at_display":"18:09","reset_label":"5h","secs_until_reset":7200}"#
-        );
+        // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
+        assert!(json.contains(r#""type":"rate_limited""#), "wrong type: {json}");
+        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
+        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
+        assert!(json.contains(r#""auto_resuming":false"#), "{json}");
     }
 
     #[test]

@@ -2301,22 +2301,24 @@ async fn run_headless(
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
             }
-            AgentEvent::RateLimited { reset_at_display, secs_until_reset, .. } => {
+            AgentEvent::RateLimited { reset_at_display, secs_until_reset, auto_resuming, .. } => {
                 // 429 rate-limit PAUSE/auto-wait notice. Headless: loud to
                 // stderr, no exit-code change, no shutdown — a Pause ends the
                 // turn via the upcoming TurnComplete(RateLimited); a WaitAndRetry
                 // keeps the turn running and resumes on its own.
                 close_thinking_line(&mut thinking_line_open);
-                if reset_at_display.is_empty() {
+                if auto_resuming {
                     eprintln!(
                         "[rate-limited] auto-continuing in {}s…",
                         secs_until_reset.unwrap_or(0)
                     );
-                } else {
+                } else if !reset_at_display.is_empty() {
                     eprintln!(
                         "[rate-limited] 5h window exhausted — resets around {}",
                         reset_at_display
                     );
+                } else {
+                    eprintln!("[rate-limited] 5h window exhausted — paused, retry later");
                 }
             }
             AgentEvent::HookWarningHint(msg) => {

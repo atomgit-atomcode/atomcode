@@ -1516,8 +1516,8 @@ impl Bridge {
                 }
             }
             KEv::Warning(w) => self.emit(CoreEv::Warning(w)),
-            KEv::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
-                self.emit(CoreEv::RateLimited { reset_at_display, reset_label, secs_until_reset });
+            KEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+                self.emit(CoreEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming });
             }
             KEv::Error { message, http_status, .. } => {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
@@ -2527,6 +2527,7 @@ mod ratelimited_mapping_tests {
             reset_at_display: "18:09".into(),
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
+            auto_resuming: false,
         };
     }
 }

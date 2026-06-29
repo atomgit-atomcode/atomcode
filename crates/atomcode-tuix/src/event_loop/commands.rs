@@ -3640,10 +3640,17 @@ pub(crate) fn format_rate_limited_line(
     reset_at_display: &str,
     _reset_label: &str,
     secs_until_reset: Option<u64>,
+    auto_resuming: bool,
 ) -> String {
-    if reset_at_display.is_empty() {
+    if auto_resuming {
+        // WaitAndRetry: kernel is sleeping then will retry automatically.
         let n = secs_until_reset.unwrap_or(0);
         return format!("⏳ 限流，{n}s 后自动继续…");
+    }
+    // Pause: kernel stopped, user must act.
+    if reset_at_display.is_empty() {
+        // Pause but no reset time available.
+        return "⏸ 5小时窗口已用尽，稍后恢复 · 已保留已完成内容 · 可换模型或稍后重试".to_string();
     }
     let tail = match secs_until_reset {
         Some(s) => format!("（还有 {}）", fmt_dur(s)),
@@ -3669,9 +3676,20 @@ fn fmt_dur(secs: u64) -> String {
 mod rate_limited_tests {
     use super::*;
 
+    // Branch 1: auto_resuming=true → countdown line (WaitAndRetry)
+    #[test]
+    fn rate_limited_wait_shows_countdown() {
+        let line = format_rate_limited_line("", "", Some(45), true);
+        assert!(line.contains("45"), "should contain countdown seconds");
+        assert!(line.contains("自动继续"), "should mention auto-continue");
+        assert!(line.contains('⏳'), "must use clock glyph ⏳ for WaitAndRetry");
+        assert!(!line.contains('⏸'), "must not use pause glyph ⏸ for WaitAndRetry");
+    }
+
+    // Branch 2: auto_resuming=false, reset_at_display non-empty → pause with time (Pause)
     #[test]
     fn rate_limited_renders_non_error_pause_line() {
-        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200));
+        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false);
         assert!(line.contains("18:09"), "should contain reset time");
         assert!(
             line.contains("可换模型") || line.contains("稍后重试"),
@@ -3680,13 +3698,28 @@ mod rate_limited_tests {
         assert!(!line.starts_with('!'), "must not start with '!' prefix");
         assert!(line.contains('⏸'), "must contain pause glyph ⏸");
         assert!(line.contains("2h0m"), "should format 7200s as 2h0m");
+        assert!(!line.contains("自动继续"), "Pause must not say 自动继续");
+    }
+
+    // Branch 3: auto_resuming=false, reset_at_display empty → pause without time
+    #[test]
+    fn rate_limited_pause_no_time_shows_no_countdown_no_reset_time() {
+        let line = format_rate_limited_line("", "", None, false);
+        assert!(line.contains('⏸'), "must use pause glyph ⏸");
+        assert!(!line.contains("自动继续"), "must not say 自动继续");
+        assert!(!line.contains("约"), "must not say 约 _ 恢复 when no reset time");
+        assert!(!line.contains("还有"), "must not show countdown when no reset time");
+        assert!(
+            line.contains("稍后恢复") || line.contains("稍后重试"),
+            "should indicate to retry later"
+        );
     }
 
     #[test]
-    fn rate_limited_wait_shows_countdown() {
-        let line = format_rate_limited_line("", "", Some(45));
-        assert!(line.contains("45"), "should contain countdown seconds");
-        assert!(line.contains("自动继续"), "should mention auto-continue");
+    fn rate_limited_no_secs_shows_no_duration() {
+        let line = format_rate_limited_line("23:59", "", None, false);
+        assert!(line.contains("23:59"));
+        assert!(!line.contains("还有"));
     }
 
     #[test]
@@ -3705,13 +3738,6 @@ mod rate_limited_tests {
     fn fmt_dur_seconds() {
         assert_eq!(fmt_dur(45), "45s");
         assert_eq!(fmt_dur(0), "0s");
-    }
-
-    #[test]
-    fn rate_limited_no_secs_shows_no_duration() {
-        let line = format_rate_limited_line("23:59", "", None);
-        assert!(line.contains("23:59"));
-        assert!(!line.contains("还有"));
     }
 }
 

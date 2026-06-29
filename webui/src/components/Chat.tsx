@@ -586,7 +586,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
-      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset };
+      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
       default: return null;
     }
   }
@@ -898,10 +898,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       case 'rate_limited': {
         // 限流暂停：渲染成暗色中性卡片，非红色 error 样式；保留已完成内容，不结束回合。
+        // auto_resuming=true → WaitAndRetry (kernel will sleep then retry)
+        // auto_resuming=false + reset_at_display → Pause with known reset time
+        // auto_resuming=false + empty reset_at_display → Pause with unknown reset time
         const time = event.reset_at_display;
-        const text = time
-          ? `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`
-          : t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        let text: string;
+        if (event.auto_resuming) {
+          text = t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        } else if (time) {
+          text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
+        } else {
+          text = `${t('chat.rateLimited.pausedNoTime')} · ${t('chat.rateLimited.hint')}`;
+        }
         pushRateLimitedToLastAssistant(text);
         break;
       }

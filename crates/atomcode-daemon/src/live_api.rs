@@ -1005,8 +1005,8 @@ impl TurnExecutor for KernelTurnExecutor {
                     // NEXT turn. Surface the error and keep draining to the real end.
                     emit(TurnEvent::Error(error));
                 }
-                AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
-                    emit(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset })
+                AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+                    emit(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming })
                 }
                 AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
                 AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
@@ -1095,8 +1095,8 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
         },
         AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
         AgentEvent::Warning(w) => TurnEvent::Warning(w),
-        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
-            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset }
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming }
         }
         AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
             TurnEvent::Warning(label)
@@ -1320,6 +1320,10 @@ pub(crate) enum LiveWireEvent {
         reset_at_display: String,
         reset_label: String,
         secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
     },
 }
 
@@ -1405,10 +1409,12 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 reset_at_display,
                 reset_label,
                 secs_until_reset,
+                auto_resuming,
             } => LiveWireEvent::RateLimited {
                 reset_at_display,
                 reset_label,
                 secs_until_reset,
+                auto_resuming,
             },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
@@ -1871,12 +1877,14 @@ mod tests {
             reset_at_display: "18:09".into(),
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
+            auto_resuming: false,
         });
         match result {
-            Some(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset }) => {
+            Some(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming }) => {
                 assert_eq!(reset_at_display, "18:09");
                 assert_eq!(reset_label, "5h");
                 assert_eq!(secs_until_reset, Some(7200));
+                assert!(!auto_resuming);
             }
             other => panic!("expected Some(TurnEvent::RateLimited{{..}}), got {:?}", other),
         }
@@ -1890,6 +1898,7 @@ mod tests {
             reset_at_display: "18:09".into(),
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
+            auto_resuming: false,
         }))
         .expect("should map");
         let json = serde_json::to_string(&wire).unwrap();

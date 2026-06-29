@@ -161,6 +161,10 @@ pub enum AgentEvent {
         reset_label: String,
         #[serde(default)]
         secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
     },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a

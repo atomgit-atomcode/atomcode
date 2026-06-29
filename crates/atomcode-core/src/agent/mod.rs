@@ -332,6 +332,9 @@ pub enum AgentEvent {
         reset_at_display: String,
         reset_label: String,
         secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        auto_resuming: bool,
     },
     /// Unified compaction UI lifecycle, decoupled from the kernel's byte-level
     /// `Compacted` audit. Drives the TUI's spinner takeover (`Begin`/`End`) and
@@ -2817,11 +2820,12 @@ impl AgentLoop {
                                     *phase = AgentPhase::WaitingApproval;
                                     let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
                                 }
-                                TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+                                TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
                                     let _ = event_tx.send(AgentEvent::RateLimited {
                                         reset_at_display,
                                         reset_label,
                                         secs_until_reset,
+                                        auto_resuming,
                                     });
                                 }
                             }

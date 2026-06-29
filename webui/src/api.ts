@@ -28,7 +28,7 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null };
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean };
 
 export interface ModelInfo {
   provider: string;

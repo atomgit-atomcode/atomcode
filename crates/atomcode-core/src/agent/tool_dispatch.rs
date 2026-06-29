@@ -260,11 +260,12 @@ impl AgentLoop {
                 // mid-turn persistence; the approval flow itself is
                 // managed by the `approval_req_rx` channel.
             }
-            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset } => {
+            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
                 let _ = self.event_tx.send(AgentEvent::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
+                    auto_resuming,
                 });
             }
         }

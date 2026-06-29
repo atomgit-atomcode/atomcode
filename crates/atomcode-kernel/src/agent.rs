@@ -1031,6 +1031,7 @@ impl RunningAgent {
                                     reset_at_display: String::new(),
                                     reset_label: String::new(),
                                     secs_until_reset: None,
+                                    auto_resuming: false, // livelock fuse → forced Pause
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                 return;
@@ -1039,6 +1040,7 @@ impl RunningAgent {
                                 reset_at_display: String::new(),
                                 reset_label: String::new(),
                                 secs_until_reset: Some(secs),
+                                auto_resuming: true, // WaitAndRetry: kernel will sleep then retry
                             });
                             tokio::select! {
                                 biased;
@@ -1061,6 +1063,7 @@ impl RunningAgent {
                                 reset_at_display,
                                 reset_label,
                                 secs_until_reset,
+                                auto_resuming: false, // Pause: kernel stops, user must act
                             });
                             self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                             return;
@@ -1268,6 +1271,7 @@ impl RunningAgent {
                                         reset_at_display: String::new(),
                                         reset_label: String::new(),
                                         secs_until_reset: None,
+                                        auto_resuming: false, // livelock fuse → forced Pause
                                     });
                                     self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                     return;
@@ -1276,6 +1280,7 @@ impl RunningAgent {
                                     reset_at_display: String::new(),
                                     reset_label: String::new(),
                                     secs_until_reset: Some(secs),
+                                    auto_resuming: true, // WaitAndRetry mid-stream: kernel will retry
                                 });
                                 tokio::select! {
                                     biased;
@@ -1324,6 +1329,7 @@ impl RunningAgent {
                                     reset_at_display,
                                     reset_label,
                                     secs_until_reset,
+                                    auto_resuming: false, // Pause mid-stream: kernel stops, user must act
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
                                 return;
