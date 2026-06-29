@@ -921,6 +921,35 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn wsl_launcher_excluded_git_bash_and_msys_allowed() {
+        use std::path::Path;
+        // WSL launcher (System32 / SysWOW64 / Sysnative) — must be rejected.
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\SysWOW64\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\Sysnative\bash.exe")));
+        // Git Bash / MSYS2 are real shells we CAN use — must NOT be rejected.
+        assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
+        assert!(!is_wsl_launcher(Path::new(r"C:\msys64\usr\bin\bash.exe")));
+    }
+
+    #[test]
+    fn unsupported_construct_flags_real_bashisms() {
+        assert!(unsupported_bash_construct("echo $(date)").is_some());
+        assert!(unsupported_bash_construct("cat <<< hi").is_some());
+        assert!(unsupported_bash_construct("wc -l < <(ls)").is_some());
+        assert!(unsupported_bash_construct("tee >(cat)").is_some());
+    }
+
+    #[test]
+    fn unsupported_construct_no_false_positive_on_valid_cmd() {
+        // All RUN fine under cmd.exe — the over-broad pre-fix guard wrongly blocked these.
+        assert!(unsupported_bash_construct(r#"echo "price is $5""#).is_none()); // bare $
+        assert!(unsupported_bash_construct("git commit -m \"use `x`\"").is_none()); // backtick
+        assert!(unsupported_bash_construct(r#"python -c "print(1<<4)""#).is_none()); // << bit-shift
+        assert!(unsupported_bash_construct("dir && echo ok").is_none()); // && chain
+    }
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
