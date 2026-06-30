@@ -60,6 +60,9 @@ pub struct AcpServeOptions {
     /// When `Some`, forwarded to each `spawn_session` call verbatim.
     /// When `None`, `engine::build_provider` builds a fallback per session.
     pub provider: Option<Arc<dyn LlmProvider>>,
+    /// When `true` (`--dangerously-skip-permissions`), kernel approval requests are
+    /// auto-allowed in the turn loop WITHOUT round-tripping to the ACP client.
+    pub auto_approve: bool,
 }
 
 impl Default for AcpServeOptions {
@@ -67,6 +70,7 @@ impl Default for AcpServeOptions {
         Self {
             engine: None,
             provider: None,
+            auto_approve: false,
         }
     }
 }
@@ -100,6 +104,7 @@ where
     let counter = Arc::new(AtomicU64::new(0));
     let engine = Arc::new(opts.engine);
     let provider = opts.provider;
+    let auto_approve = opts.auto_approve;
 
     Agent
         .builder()
@@ -158,7 +163,7 @@ where
                         let cx = cx.clone();
                         async move {
                             dispatch::run_prompt_turn(
-                                cx, sessions, sid, text, images, responder,
+                                cx, sessions, sid, text, images, responder, auto_approve,
                             )
                             .await
                         }

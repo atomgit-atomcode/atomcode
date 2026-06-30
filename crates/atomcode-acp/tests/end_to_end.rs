@@ -26,7 +26,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
 use atomcode_acp::engine::EngineConfig;
 use atomcode_acp::{serve_over, AcpServeOptions};
-use atomcode_kernel::stream::StreamEvent;
+use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::MockProvider;
 
 /// A dummy, non-routable engine config. The provider is injected, so none of
@@ -65,6 +65,7 @@ async fn initialize_new_prompt_streams_and_stops() {
     let opts = AcpServeOptions {
         engine: Some(dummy_engine()),
         provider: Some(Arc::new(stub)),
+        auto_approve: false,
     };
     let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
 
@@ -147,5 +148,122 @@ async fn initialize_new_prompt_streams_and_stops() {
     // 5. Clean shutdown: connect_with already returned (client connection closed),
     //    which drops the client endpoint; the agent connection then ends. Abort
     //    the agent task defensively so the test process exits promptly.
+    agent_task.abort();
+}
+
+/// Regression for FIX #1: the kernel emits a trailing `TurnComplete` AFTER an
+/// `Error` event. The turn loop must DRAIN that `TurnComplete` (not return on the
+/// `Error`), otherwise it stays buffered in the session's events channel and
+/// poisons the NEXT prompt on the same session (the second prompt would read the
+/// stale `TurnComplete` first and finish instantly with no streamed content).
+///
+/// Turn 1 scripts a mid-stream `StreamEvent::Error` (cleanly fails the turn → an
+/// `AgentEvent::Error` followed by `TurnComplete{ProviderError}`). Turn 2 on the
+/// SAME session scripts a normal `"hello"` + end_turn. The test asserts turn 2 is
+/// NOT poisoned: it ends `end_turn` AND streams the "hello" chunk.
+#[tokio::test]
+async fn error_turn_does_not_poison_next_prompt_on_same_session() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    // Turn 1: a mid-stream provider error (non-retryable). Turn 2: a normal stop.
+    let stub = MockProvider::new(vec![
+        vec![StreamEvent::Error(ProviderError {
+            retryable: false,
+            message: "scripted mid-stream failure".into(),
+            http_status: None,
+            code: None,
+        })],
+        vec![
+            StreamEvent::TextDelta("hello".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ])
+    .with_ctx_window(200_000);
+
+    let (agent_channel, client_channel) = Channel::duplex();
+    let opts = AcpServeOptions {
+        engine: Some(dummy_engine()),
+        provider: Some(Arc::new(stub)),
+        auto_approve: false,
+    };
+    let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
+
+    // Collect notifications from the SECOND prompt to prove it streamed content.
+    let updates: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cwd_path = cwd.path().to_path_buf();
+    let updates_for_handler = Arc::clone(&updates);
+
+    let client_run = Client
+        .builder()
+        .on_receive_notification(
+            move |notif: SessionNotification, _cx| {
+                let updates = Arc::clone(&updates_for_handler);
+                async move {
+                    updates
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(&notif.update).unwrap());
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(client_channel, |conn: ConnectionTo<_>| async move {
+            let _init = conn
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let new = conn
+                .send_request(NewSessionRequest::new(cwd_path))
+                .block_task()
+                .await?;
+            let sid = new.session_id.clone();
+            // Prompt 1: expected to fail (the scripted mid-stream error). The ACP
+            // server answers this with a JSON-RPC error; tolerate either form.
+            let first = conn
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("first"))],
+                ))
+                .block_task()
+                .await;
+            // Prompt 2 on the SAME session: must succeed and stream "hello".
+            let second = conn
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("second"))],
+                ))
+                .block_task()
+                .await?;
+            Ok((first.is_err(), second))
+        });
+
+    let (first_errored, second) = tokio::time::timeout(Duration::from_secs(30), client_run)
+        .await
+        .expect("client interaction timed out")
+        .expect("client run failed");
+
+    assert!(
+        first_errored,
+        "first prompt (scripted mid-stream error) should respond with a JSON-RPC error"
+    );
+
+    // The crux: prompt 2 is NOT poisoned by turn 1's trailing TurnComplete.
+    let second_json = serde_json::to_value(&second).unwrap();
+    assert_eq!(
+        second_json["stopReason"], "end_turn",
+        "second prompt must end with end_turn (not be poisoned by stale TurnComplete): {second_json}"
+    );
+    let got = updates.lock().unwrap().clone();
+    let hello = got.iter().find(|u| u["sessionUpdate"] == "agent_message_chunk");
+    let hello = hello.unwrap_or_else(|| panic!("no agent_message_chunk from second prompt: {got:?}"));
+    assert_eq!(
+        hello["content"]["text"], "hello",
+        "second prompt must stream 'hello': {hello}"
+    );
+
     agent_task.abort();
 }

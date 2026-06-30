@@ -149,6 +149,7 @@ pub async fn run_prompt_turn(
     text: String,
     images: Vec<ImageContent>,
     responder: Responder<PromptResponse>,
+    auto_approve: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     // Take what the turn needs (clonable command sender + the events mutex Arc),
     // then release the map lock so it is never held across the turn.
@@ -160,17 +161,34 @@ pub async fn run_prompt_turn(
         }
     };
 
+    // Lock the receiver BEFORE enqueuing this turn's message: one prompt runs per
+    // session at a time, so a concurrent same-session prompt blocks here on the
+    // events mutex and cannot interleave its `SendMessage` into the kernel ahead of
+    // this turn's recv loop. Locking is therefore serialized; enqueue follows.
+    let mut rx = events.lock().await;
     cmd_tx
         .send(AgentCommand::SendMessage { text, images })
         .ok();
 
-    // One prompt runs per session at a time, so locking the receiver for the
-    // whole turn is safe and uncontended.
-    let mut rx = events.lock().await;
+    // The kernel ALWAYS emits a trailing `TurnComplete` after an `Error` (see
+    // kernel `finish_turn`). We must DRAIN that `TurnComplete` rather than return on
+    // the `Error`, otherwise it stays buffered in the session's events channel and
+    // poisons the NEXT prompt (which would read the stale `TurnComplete` first).
+    // Capture the error message and decide the response AFTER the loop.
+    let mut last_error: Option<String> = None;
     let stop = loop {
         match rx.recv().await {
             Some(AgentEvent::Request { id, kind, payload }) if kind == "approval" => {
-                crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await?;
+                if auto_approve {
+                    // `--dangerously-skip-permissions`: auto-allow without round-tripping
+                    // to the client (which would otherwise make the flag a no-op).
+                    let _ = cmd_tx.send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({"decision": "allow"}),
+                    });
+                } else {
+                    crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await?;
+                }
             }
             Some(AgentEvent::Request { id, .. }) => {
                 // Unknown (non-approval) kernel request kind: we cannot satisfy it.
@@ -184,7 +202,9 @@ pub async fn run_prompt_turn(
             }
             Some(AgentEvent::TurnComplete { reason }) => break reason,
             Some(AgentEvent::Error { message, .. }) => {
-                return responder.respond_with_internal_error(message);
+                // Do NOT return — keep looping so the trailing `TurnComplete` is
+                // consumed and cannot poison the next prompt on this session.
+                last_error = Some(message);
             }
             Some(other) => {
                 if let Some(update) = crate::translate::event_to_update(&other) {
@@ -195,9 +215,13 @@ pub async fn run_prompt_turn(
         }
     };
 
-    match crate::translate::stop_reason(stop) {
-        Ok(sr) => responder.respond(PromptResponse::new(sr)),
-        Err(msg) => responder.respond_with_internal_error(msg),
+    if let Some(msg) = last_error {
+        responder.respond_with_internal_error(msg)
+    } else {
+        match crate::translate::stop_reason(stop) {
+            Ok(sr) => responder.respond(PromptResponse::new(sr)),
+            Err(msg) => responder.respond_with_internal_error(msg),
+        }
     }
 }
 

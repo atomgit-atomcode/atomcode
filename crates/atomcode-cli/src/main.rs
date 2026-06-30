@@ -1267,11 +1267,22 @@ async fn run() -> Result<i32> {
                 // Load config the same way the TUI path does so provider/model resolution
                 // is identical (honors --provider, --model, and config.toml).
                 let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
-                let config = if config_path.exists() {
+                let mut config = if config_path.exists() {
                     Config::load(&config_path).unwrap_or_default()
                 } else {
                     Config::default()
                 };
+                // Apply the `--model` override the SAME way the TUI path does
+                // (see the default TUI branch below): mutate the active provider's
+                // model in `config` BEFORE resolving it, so both the EngineConfig
+                // and the built provider pick up the override.
+                if let Some(ref model) = cli.model {
+                    let provider_name =
+                        cli.provider.as_deref().unwrap_or(&config.default_provider);
+                    if let Some(p) = config.providers.get_mut(provider_name) {
+                        p.model = model.clone();
+                    }
+                }
                 let working_dir = resolve_working_dir(cli.dir.clone());
                 let bridge_cfg = bridge_config_from(
                     &config,
@@ -1284,6 +1295,10 @@ async fn run() -> Result<i32> {
                     // client answers (not fail-closed like headless -p).
                     true,
                 );
+                // Honor `--dangerously-skip-permissions`: auto-approve kernel approval
+                // requests in the turn loop instead of round-tripping to the client.
+                // Capture before the fields below are moved into the EngineConfig.
+                let auto_approve = bridge_cfg.dangerously_skip_permissions;
                 // Build an authenticated provider (includes the AtomGit gateway HMAC
                 // signer for the default endpoint; falls through to plain OpenAI-compat
                 // or Anthropic for user-configured endpoints).
@@ -1312,6 +1327,7 @@ async fn run() -> Result<i32> {
                 return atomcode_acp::serve_stdio(atomcode_acp::AcpServeOptions {
                     engine: Some(engine),
                     provider: Some(provider),
+                    auto_approve,
                 })
                 .await
                 .map(|_| 0);
