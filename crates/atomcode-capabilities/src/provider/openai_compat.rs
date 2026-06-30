@@ -377,13 +377,31 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
                         .tool_calls
                         .iter()
                         .map(|tc| {
+                            // `arguments` is a RAW json string. VALID json passes through
+                            // VERBATIM (OpenAI expects a string here; no re-parse keeps the
+                            // request prefix byte-stable across turns for the prefix cache).
+                            // Only INVALID json is repaired here — e.g. a weak model's
+                            // unescaped Windows path (`C:\Users\…`, where `\U` is not a legal
+                            // JSON escape) that got stored into history. Without this, replaying
+                            // that history to a strict gateway (`json.loads(arguments)`) 400s the
+                            // ENTIRE request, every turn. Mirrors v1 core's openai.rs guard:
+                            // repair, then wrap-as-`{"input":…}` if still unsalvageable, so we
+                            // never put non-JSON on the wire.
+                            let args = if serde_json::from_str::<Value>(&tc.arguments).is_ok() {
+                                tc.arguments.clone()
+                            } else {
+                                let repaired =
+                                    crate::tools::repair::repair_tool_args(&tc.name, &tc.arguments);
+                                if serde_json::from_str::<Value>(&repaired).is_ok() {
+                                    repaired
+                                } else {
+                                    json!({ "input": tc.arguments }).to_string()
+                                }
+                            };
                             json!({
                                 "id": tc.id,
                                 "type": "function",
-                                // `arguments` is a RAW json string, passed through
-                                // verbatim (OpenAI expects a string here). No re-parse,
-                                // so the prefix stays byte-stable across turns.
-                                "function": { "name": tc.name, "arguments": tc.arguments },
+                                "function": { "name": tc.name, "arguments": args },
                             })
                         })
                         .collect();
@@ -976,6 +994,62 @@ mod tests {
         assert_eq!(a["tool_calls"][0]["type"], "function");
         assert_eq!(a["tool_calls"][0]["function"]["name"], "read");
         assert_eq!(a["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn assistant_tool_call_invalid_json_args_repaired_before_send() {
+        // A weak model emitted an unescaped Windows path, so the stored arguments
+        // string is INVALID JSON (`\U` is not a legal JSON escape). v1 repaired such
+        // args before re-sending them in history; v2 must too — otherwise a strict
+        // gateway (vLLM `json.loads(arguments)`) 400s the whole request on replay.
+        let m = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                // raw string: contains a single backslash before each segment.
+                arguments: r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
+                    .into(),
+            }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(args)
+            .unwrap_or_else(|e| panic!("outgoing arguments must be valid JSON ({e}): {args}"));
+        // Repair preserves the path the model meant (backslashes survive a round-trip).
+        assert_eq!(parsed["file_path"], "C:\\Users\\fgv70\\Downloads\\deepseek.yaml");
+    }
+
+    #[test]
+    fn assistant_tool_call_valid_json_args_stay_byte_verbatim() {
+        // The cache-stability invariant: VALID arguments must pass through unchanged
+        // (no re-encode), so the request prefix stays byte-stable across turns.
+        let m = Message::assistant(
+            "",
+            vec![ToolCall { id: "c1".into(), name: "read".into(), arguments: "{\"path\":\"a\"}".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn assistant_tool_call_unsalvageable_args_wrapped_as_valid_json() {
+        // If repair can't recover valid JSON, wrap the raw text in a valid object so the
+        // request still parses downstream — never put non-JSON on the wire.
+        let m = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "not json at all <tool_result>".into(),
+            }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(args).is_ok(),
+            "even unsalvageable args must serialize as valid JSON, got: {args}"
+        );
     }
 
     #[test]
