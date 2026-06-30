@@ -12,3 +12,9 @@ anyhow = { workspace = true }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }
 atomcode-capabilities = { path = "../atomcode-capabilities" }
+
+[dev-dependencies]
+# `atomcode_kernel::testkit::MockProvider` (a scriptable stub LlmProvider) drives
+# the end-to-end test with no network. The testkit module is exported
+# unconditionally by the kernel, so no extra feature is required.
+tempfile = "3"

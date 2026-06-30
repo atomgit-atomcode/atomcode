@@ -355,6 +355,7 @@ dependencies = [
  "atomcode-coding",
  "atomcode-kernel",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

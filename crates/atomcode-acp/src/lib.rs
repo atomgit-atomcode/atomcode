@@ -41,7 +41,7 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
     NewSessionRequest, PromptCapabilities, PromptRequest,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Dispatch, Stdio};
 use atomcode_kernel::provider::LlmProvider;
 
 use crate::dispatch::{handle_cancel, handle_new_session, Sessions};
@@ -76,6 +76,25 @@ impl Default for AcpServeOptions {
 /// **stdout is reserved exclusively for the ACP JSON-RPC stream.**
 /// All diagnostics must go to stderr.
 pub async fn serve_stdio(opts: AcpServeOptions) -> anyhow::Result<()> {
+    serve_over(opts, Stdio::new()).await
+}
+
+/// Build the fully-wired ACP agent and run it over an arbitrary transport.
+///
+/// This is the transport-agnostic core that [`serve_stdio`] wraps with
+/// [`Stdio`].  The handler wiring (initialize / session·new / session·prompt /
+/// session·cancel / fallback dispatch) lives here ONCE; the integration test
+/// (Task 11) reuses the exact same wired agent over an in-process
+/// [`agent_client_protocol::Channel`] instead of stdio, so the test exercises
+/// the real handlers with no subprocess and no network.
+///
+/// `transport` must connect *to* the [`Agent`] role — `Stdio`, a `Channel`
+/// endpoint, etc.  The connection runs until it closes (or the client end is
+/// dropped).
+pub async fn serve_over<T>(opts: AcpServeOptions, transport: T) -> anyhow::Result<()>
+where
+    T: ConnectTo<Agent> + 'static,
+{
     // Shared state for all session handlers (Tasks 6-9).
     let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let counter = Arc::new(AtomicU64::new(0));
@@ -168,7 +187,7 @@ pub async fn serve_stdio(opts: AcpServeOptions) -> anyhow::Result<()> {
             },
             agent_client_protocol::on_receive_dispatch!(),
         )
-        .connect_to(Stdio::new())
+        .connect_to(transport)
         .await
         .map_err(|e| anyhow::anyhow!("acp serve failed: {e}"))
 }
