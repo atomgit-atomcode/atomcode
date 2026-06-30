@@ -640,7 +640,7 @@ body {
 /* === Markdown Root === */
 .markdown-root {
   text-wrap: auto;
-  overflow-x: hidden;
+  overflow-x: clip;
   width: 100%;
   /* Container must NOT be pre-wrap (the .assistant-message-content class on the
      wrapper sets pre-wrap, which would render inter-block newlines as gaps). */
