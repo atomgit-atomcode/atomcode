@@ -125,10 +125,15 @@ const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
 const MAX_SUMMARY_TOKENS: u32 = 16_000;
 
-/// System prompt for the tier-2 overflow summary LLM call.
+/// System prompt for the anchored compaction summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
-    "You compress conversation history. Produce a faithful, compact summary that another \
-     instance can resume from. No preamble, no meta-commentary — just the summary.";
+    "You are an anchored context summarization assistant for a coding session. Summarize \
+     only the conversation history you are given. If a <previous-summary> block is present, \
+     treat it as the current anchored summary and UPDATE it: preserve still-true details, \
+     remove stale ones, and merge in new facts — do not rewrite unchanged sections from \
+     scratch. Always output the exact section structure requested, keeping every section \
+     (write \"(none)\" when empty). Do not answer the conversation. Do not mention that you \
+     are summarizing or compacting. Respond in the same language as the conversation.";
 
 /// Wraps [`StubCompaction`] with a hard-OVERFLOW escalation ladder. `Auto`/`Manual`
 /// delegate to the inner gentle policy verbatim (normal path unchanged). `Overflow`
@@ -208,13 +213,20 @@ impl OverflowCompaction {
                 CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
             }
             _ => {
-                // Tier 2: drain old turns; summarize (LLM) if a provider is available.
                 let drain_to = active_turn_start(msgs, 1).max(floor);
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the active turn
                 }
-                let summary = self.summarize(&msgs[floor..drain_to], None).await;
                 let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
+                if !span_has_non_anchor(&msgs[floor..drain_to]) {
+                    // Only a prior anchor is drainable — don't re-drain/summarize it; still
+                    // apply the aggressive stub rewrites to the kept span.
+                    if rewrites.is_empty() {
+                        return CompactionPlan::noop();
+                    }
+                    return CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None };
+                }
+                let summary = self.summarize(&msgs[floor..drain_to], None).await;
                 CompactionPlan { drain_from: floor, drain_to, summary, rewrites, resume_note: None }
             }
         }
@@ -233,8 +245,10 @@ impl OverflowCompaction {
         let msgs = view.messages;
         let floor = view.sacred_floor;
         let drain_to = active_turn_start(msgs, 1).max(floor);
-        if drain_to <= floor {
-            // Nothing older than the active turn — fall back to the gentle stub policy.
+        if drain_to <= floor || !span_has_non_anchor(&msgs[floor..drain_to]) {
+            // Nothing older than the active turn, OR the only drainable content is a prior
+            // anchor (re-summarizing it alone is wasteful and only degrades it) — fall back
+            // to the gentle stub policy.
             return self.inner.plan(view).await;
         }
         let summary = self.summarize(&msgs[floor..drain_to], focus).await;
@@ -247,49 +261,46 @@ impl OverflowCompaction {
     /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
     async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
         let provider = self.summary_provider.as_ref()?;
-        let transcript = render_transcript(span);
-        let focus_line = match focus.map(str::trim).filter(|f| !f.is_empty()) {
-            Some(f) => format!(" Pay special attention to anything related to: {f}."),
-            None => String::new(),
-        };
+        // Split: the prior anchor (if any) is the UPDATE base; everything else is the new
+        // transcript to fold in. The anchor is NEVER re-rendered as transcript (erosion fix).
+        let previous_anchor = find_prior_anchor(span);
+        let new_events: Vec<Message> =
+            span.iter().filter(|m| !is_anchor_message(m)).cloned().collect();
+        let transcript = render_transcript(&new_events);
         let prompt = vec![
             Message::system(SUMMARY_SYSTEM_PROMPT),
-            Message::user(format!(
-                "Summarize the following conversation span. Preserve decisions made, file \
-                 paths touched, and any unresolved threads.{focus_line} Be concise.\n\n{transcript}"
-            )),
+            Message::user(build_summary_prompt(previous_anchor, &transcript, focus)),
         ];
         // Soft-cap the generation (`max_tokens`); the byte loop below is the hard backstop.
         let opts = ChatOptions { max_tokens: Some(MAX_SUMMARY_TOKENS), ..ChatOptions::default() };
         let mut stream = provider.chat_stream(&prompt, &[], &opts).await.ok()?;
         let mut out = String::new();
+        // Reserve room for the sentinel + newline prepended below, so the FINAL summary
+        // (sentinel + body) still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
+        let body_budget = MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + 1);
         while let Some(ev) = stream.next().await {
             if let StreamEvent::TextDelta(t) = ev {
-                // Hard byte ceiling (#747): a summary larger than the drained span is refused by
-                // the net-loss guard anyway, but a merely-large one bloats every later turn — and
-                // we don't want even a transient huge `out` for a single giant delta. So push only
-                // up to the remaining budget (walked back to a char boundary IN `t`) and stop;
-                // `out` is thus bounded by MAX_SUMMARY_BYTES at all times. (max_tokens is the soft
-                // cap; this is the hard backstop if the gateway ignores it.) Invariant on entry:
-                // out.len() < MAX_SUMMARY_BYTES (we break the moment it would reach the cap).
-                let remaining = MAX_SUMMARY_BYTES - out.len();
+                let remaining = body_budget.saturating_sub(out.len());
                 if t.len() <= remaining {
                     out.push_str(&t);
                 } else {
                     let mut cut = remaining;
                     while !t.is_char_boundary(cut) {
-                        cut -= 1; // is_char_boundary(0) == true, so this always terminates
+                        cut -= 1; // is_char_boundary(0) == true, so this terminates
                     }
                     out.push_str(&t[..cut]);
                     break;
                 }
             }
         }
-        let out = out.trim().to_string();
-        if out.is_empty() {
+        // Strip any leading sentinel the model may have echoed, then stamp exactly ONE so the
+        // NEXT compaction recognizes this as the anchor.
+        let body = out.trim();
+        let body = body.strip_prefix(ANCHOR_SENTINEL).map(str::trim_start).unwrap_or(body);
+        if body.is_empty() {
             None
         } else {
-            Some(out)
+            Some(format!("{ANCHOR_SENTINEL}\n{body}"))
         }
     }
 }
@@ -310,6 +321,95 @@ fn render_transcript(span: &[Message]) -> String {
         s.push('\n');
     }
     s
+}
+
+/// Sentinel first line stamped on every anchored compaction summary. Used to find the
+/// prior anchor in a drained span. Bumping the version invalidates older anchors (they
+/// are simply treated as plain history → re-summarized once, which is safe).
+pub(crate) const ANCHOR_SENTINEL: &str = "<!-- atomcode:anchor v1 -->";
+
+/// True iff `m` is an anchored compaction summary: a kernel-injected (`synthetic`)
+/// user-role message whose text starts with [`ANCHOR_SENTINEL`].
+fn is_anchor_message(m: &Message) -> bool {
+    m.role == Role::User && m.synthetic && m.text.starts_with(ANCHOR_SENTINEL)
+}
+
+/// The body of the LAST anchor in `span` (sentinel stripped + trimmed), or `None` if the
+/// span has no anchor OR the anchor body is empty (an empty body must NOT drive an UPDATE).
+fn find_prior_anchor(span: &[Message]) -> Option<&str> {
+    span.iter()
+        .rev()
+        .find(|m| is_anchor_message(m))
+        .map(|m| m.text.strip_prefix(ANCHOR_SENTINEL).unwrap_or(&m.text).trim())
+        .filter(|s| !s.is_empty())
+}
+
+/// True iff `span` has at least one NON-anchor message (i.e. real content to summarize).
+/// When false, the only drainable thing is a prior anchor — re-summarizing it alone is
+/// wasteful and would only degrade it, so callers must NOT drain/summarize.
+fn span_has_non_anchor(span: &[Message]) -> bool {
+    span.iter().any(|m| !is_anchor_message(m))
+}
+
+/// Fixed Markdown structure for the anchored summary. English section headers; bullet
+/// CONTENT follows the conversation's language (instructed in the system prompt).
+const SUMMARY_TEMPLATE: &str = "\
+Output exactly this Markdown structure, in this order, every section present:
+
+## Goal
+- [single-sentence task summary, or (none)]
+
+## Constraints & Preferences
+- [user constraints/preferences/specs, or (none)]
+
+## Progress
+### Done
+- [completed work, or (none)]
+### In Progress
+- [current work, or (none)]
+### Blocked
+- [blockers, or (none)]
+
+## Key Decisions
+- [decision and why, or (none)]
+
+## Next Steps
+- [ordered next actions, or (none)]
+
+## Critical Context
+- [important technical facts, errors, open questions, or (none)]
+
+## Relevant Files
+- [path: why it matters, or (none)]
+
+Rules: terse bullets, never prose paragraphs. Preserve exact file paths, commands, error \
+strings, and identifiers. Keep every section even when empty.";
+
+/// Build the USER-message text for the summary call. With a `previous_anchor` it instructs
+/// an UPDATE and embeds the prior anchor as a `<previous-summary>` block; otherwise a fresh
+/// CREATE. `focus` appends a steer. The new `transcript` (events to fold in) is appended last.
+fn build_summary_prompt(previous_anchor: Option<&str>, transcript: &str, focus: Option<&str>) -> String {
+    let mut p = String::new();
+    match previous_anchor {
+        Some(anchor) => {
+            p.push_str(
+                "Update the anchored summary below using the new conversation history. \
+                 Preserve the decisions, constraints, and file paths it records, removing \
+                 only details the new history supersedes; merge in new facts.\n\
+                 <previous-summary>\n",
+            );
+            p.push_str(anchor);
+            p.push_str("\n</previous-summary>\n\n");
+        }
+        None => p.push_str("Create a new anchored summary from the conversation history.\n\n"),
+    }
+    p.push_str(SUMMARY_TEMPLATE);
+    if let Some(f) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        p.push_str(&format!("\n\nPay special attention to anything related to: {f}."));
+    }
+    p.push_str("\n\nConversation history to summarize:\n\n");
+    p.push_str(transcript);
+    p
 }
 
 #[async_trait]
@@ -735,16 +835,23 @@ mod tests {
         );
         let plan = strat.plan(&overflow_view(&conv.messages, floor, 2, 8000)).await;
         let summary = plan.summary.expect("tier 2 produces a summary");
-        // Hard byte ceiling enforced (provider streamed ~96 KiB).
+        // Hard byte ceiling enforced (provider streamed ~96 KiB). The total is
+        // sentinel + "\n" + body, all ≤ MAX_SUMMARY_BYTES.
         assert!(
             summary.len() <= MAX_SUMMARY_BYTES,
             "summary {} bytes exceeds cap {MAX_SUMMARY_BYTES}",
             summary.len()
         );
-        // Cut landed right at the cap (walked back to the nearest char boundary, not far).
+        // The body budget is MAX_SUMMARY_BYTES - ANCHOR_SENTINEL.len() - 1 (for "\n").
+        // The total fills essentially to MAX_SUMMARY_BYTES (body truncated at a char
+        // boundary just at the budget, then the sentinel + "\n" are prepended). The
+        // lower bound is still well within 4 bytes of the cap.
         assert!(summary.len() > MAX_SUMMARY_BYTES - 4, "should truncate near the cap, got {}", summary.len());
-        // Char-boundary-safe: the String is intact (no panic) and content is preserved.
-        assert!(summary.chars().all(|c| c == '你'), "truncation must not corrupt multibyte chars");
+        // Output is anchor-prefixed.
+        assert!(summary.starts_with(ANCHOR_SENTINEL), "summary must carry the sentinel");
+        // Char-boundary-safe: the body (after sentinel + newline) is intact and all 你.
+        let body_part = summary.strip_prefix(ANCHOR_SENTINEL).unwrap().trim_start_matches('\n');
+        assert!(body_part.chars().all(|c| c == '你'), "truncation must not corrupt multibyte chars");
         // SOFT cap was actually forwarded (not masked by the byte hard-cap / dropped like the
         // historical v2 max_tokens regression).
         assert_eq!(
@@ -771,12 +878,13 @@ mod tests {
         let floor = conv.sacred_floor();
         let strat = OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
         let plan = strat.plan(&overflow_view(&conv.messages, floor, 2, 8000)).await;
-        assert_eq!(plan.summary.as_deref(), Some("PRIOR CONTEXT SUMMARY"), "tier 2 attaches the LLM summary");
+        let s = plan.summary.as_deref().expect("tier 2 attaches the LLM summary");
+        assert!(s.starts_with(ANCHOR_SENTINEL) && s.contains("PRIOR CONTEXT SUMMARY"));
         assert!(plan.drain_from == floor && plan.drain_to > floor, "drains the old span");
         let report = conv.apply_plan(plan, floor);
         assert!(report.committed);
-        // The drained span is replaced by ONE synthetic_user summary message.
-        assert!(conv.messages.iter().any(|m| m.text == "PRIOR CONTEXT SUMMARY" && m.synthetic));
+        // The drained span is replaced by ONE synthetic_user anchor message.
+        assert!(conv.messages.iter().any(|m| is_anchor_message(m) && m.text.contains("PRIOR CONTEXT SUMMARY")));
     }
 
     #[tokio::test]
@@ -798,12 +906,13 @@ mod tests {
         let strat =
             OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
         let plan = strat.plan(&manual_view(&conv.messages, floor, Some("the auth refactor"))).await;
-        assert_eq!(plan.summary.as_deref(), Some("PRIOR CONTEXT SUMMARY"), "focused manual compaction summarizes");
+        let s = plan.summary.as_deref().expect("focused manual compaction summarizes");
+        assert!(s.starts_with(ANCHOR_SENTINEL) && s.contains("PRIOR CONTEXT SUMMARY"));
         assert!(plan.drain_from == floor && plan.drain_to > floor, "drains the old span");
         assert!(plan.rewrites.is_empty(), "manual focus keeps the active span untouched");
         let report = conv.apply_plan(plan, floor);
         assert!(report.committed);
-        assert!(conv.messages.iter().any(|m| m.synthetic && m.text == "PRIOR CONTEXT SUMMARY"));
+        assert!(conv.messages.iter().any(|m| is_anchor_message(m) && m.text.contains("PRIOR CONTEXT SUMMARY")));
     }
 
     #[tokio::test]
@@ -826,11 +935,8 @@ mod tests {
             OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
         for focus in [None, Some("   ")] {
             let plan = strat.plan(&manual_view(&conv.messages, floor, focus)).await;
-            assert_eq!(
-                plan.summary.as_deref(),
-                Some("PRIOR CONTEXT SUMMARY"),
-                "plain/blank manual summarizes (focus={focus:?})"
-            );
+            let s = plan.summary.as_deref().expect(&format!("plain/blank manual summarizes (focus={focus:?})"));
+            assert!(s.starts_with(ANCHOR_SENTINEL) && s.contains("PRIOR CONTEXT SUMMARY"));
             assert!(plan.drain_from == floor && plan.drain_to > floor, "drains the old span");
             assert!(plan.rewrites.is_empty(), "manual keeps the active span untouched");
         }
@@ -889,11 +995,8 @@ mod tests {
         let v = auto_view(&conv.messages, floor, 0.95);
         assert!(strat.will_summarize(&v), "auto at high pressure must announce a summarize");
         let plan = strat.plan(&v).await;
-        assert_eq!(
-            plan.summary.as_deref(),
-            Some("PRIOR CONTEXT SUMMARY"),
-            "auto-high drains old turns into an LLM summary, like manual /compact"
-        );
+        let s = plan.summary.as_deref().expect("auto-high drains old turns into an LLM summary, like manual /compact");
+        assert!(s.starts_with(ANCHOR_SENTINEL) && s.contains("PRIOR CONTEXT SUMMARY"));
         assert!(plan.drain_from == floor && plan.drain_to > floor, "auto-high drains the old span");
     }
 
@@ -1012,6 +1115,136 @@ mod tests {
             !strat.will_summarize(&manual_view(&sc.messages, sfloor, None)),
             "short manual /compact is a no-op → must NOT announce"
         );
+    }
+
+    #[test]
+    fn find_prior_anchor_matches_only_sentineled_synthetic_user() {
+        let body = "## Goal\n- ship it";
+        let anchor = Message::synthetic_user(format!("{ANCHOR_SENTINEL}\n{body}"));
+        // A non-synthetic message that happens to contain the sentinel is NOT an anchor.
+        let mut decoy = Message::user(format!("{ANCHOR_SENTINEL}\nnot an anchor"));
+        decoy.synthetic = false;
+        // A synthetic_user WITHOUT the sentinel (e.g. a resume note) is NOT an anchor.
+        let resume_note = Message::synthetic_user("just resuming".to_string());
+
+        // Directly exercise the predicate's rejections — `find_prior_anchor` below stops at
+        // the real anchor, so without these the negative cases would never be evaluated and
+        // a too-loose predicate (dropping the synthetic or sentinel guard) would pass.
+        assert!(is_anchor_message(&anchor), "the real anchor matches");
+        assert!(!is_anchor_message(&decoy), "non-synthetic with sentinel must NOT match");
+        assert!(!is_anchor_message(&resume_note), "synthetic without sentinel must NOT match");
+
+        let span = vec![
+            Message::user("u1"),
+            resume_note,
+            decoy,
+            anchor,
+            Message::assistant("a1", vec![]),
+        ];
+        assert_eq!(find_prior_anchor(&span), Some(body));
+
+        let none = vec![Message::user("u1"), Message::assistant("a1", vec![])];
+        assert_eq!(find_prior_anchor(&none), None);
+    }
+
+    #[test]
+    fn build_summary_prompt_update_vs_create_and_focus() {
+        // UPDATE path: prior anchor present → instruct update + embed <previous-summary>.
+        let p = build_summary_prompt(Some("## Goal\n- old goal"), "USER: hi", Some("auth"));
+        assert!(p.contains("<previous-summary>"), "must embed the prior anchor block");
+        assert!(p.contains("## Goal\n- old goal"), "prior anchor body is carried in");
+        assert!(p.to_lowercase().contains("update"), "must instruct an update");
+        assert!(p.contains("auth"), "focus steer is appended");
+        assert!(p.contains("USER: hi"), "new transcript is included");
+        // Every template section is requested.
+        for s in ["## Goal", "## Constraints & Preferences", "## Progress", "### Done",
+                  "### In Progress", "### Blocked", "## Key Decisions", "## Next Steps",
+                  "## Critical Context", "## Relevant Files"] {
+            assert!(p.contains(s), "template must request section {s}");
+        }
+
+        // CREATE path: no prior anchor → no <previous-summary>, instruct create.
+        let c = build_summary_prompt(None, "USER: hi", None);
+        assert!(!c.contains("<previous-summary>"), "no prior block when no anchor");
+        assert!(c.to_lowercase().contains("create"), "must instruct a fresh create");
+    }
+
+    use std::sync::Mutex;
+
+    struct CapturingSummaryProvider {
+        seen: Arc<Mutex<Vec<Message>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for CapturingSummaryProvider {
+        fn model_name(&self) -> &str { "capturing" }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("## Goal\n- updated".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_updates_prior_anchor_and_does_not_re_render_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CapturingSummaryProvider { seen: seen.clone() })),
+        );
+        // Span: a prior anchor (sentinel synthetic_user) followed by new events.
+        let span = vec![
+            Message::synthetic_user(format!("{ANCHOR_SENTINEL}\n## Goal\n- OLD GOAL")),
+            Message::user("please also handle errors"),
+            Message::assistant("done", vec![]),
+        ];
+        let out = strat.summarize(&span, Some("errors")).await.expect("returns a summary");
+
+        // Output is anchored.
+        assert!(out.starts_with(ANCHOR_SENTINEL), "output carries the sentinel: {out:?}");
+
+        // The provider's user prompt embeds the prior anchor as <previous-summary>, and the
+        // prior anchor is NOT re-rendered into the transcript (it appears once, in the block).
+        let msgs = seen.lock().unwrap().clone();
+        let user_prompt = &msgs.last().unwrap().text;
+        assert!(user_prompt.contains("<previous-summary>"));
+        assert!(user_prompt.contains("OLD GOAL"), "prior anchor body carried as the base");
+        assert_eq!(user_prompt.matches("OLD GOAL").count(), 1, "anchor not duplicated into transcript");
+        assert!(!user_prompt.contains(ANCHOR_SENTINEL), "sentinel line itself is stripped from the base");
+        assert!(user_prompt.contains("please also handle errors"), "new events are folded in");
+        assert!(user_prompt.contains("errors"), "focus steer present");
+    }
+
+    #[tokio::test]
+    async fn successive_compactions_keep_exactly_one_anchor() {
+        // Big old turns so the net-loss guard commits both compactions.
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("p"),
+            Message::user(big("u1")),
+            Message::assistant(big("a1"), vec![]),
+            Message::user("u-active"),
+        ];
+        let floor = conv.sacred_floor();
+        let strat = OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+
+        // Compaction #1: creates the first anchor.
+        let p1 = strat.plan(&manual_view(&conv.messages, floor, None)).await;
+        assert!(conv.apply_plan(p1, floor).committed);
+        assert_eq!(conv.messages.iter().filter(|m| is_anchor_message(m)).count(), 1, "one anchor after #1");
+
+        // Add more bulk, then Compaction #2: must UPDATE (drain old anchor, insert new) — still ONE.
+        conv.messages.push(Message::assistant(big("a2"), vec![]));
+        conv.messages.push(Message::user("u-active-2"));
+        let p2 = strat.plan(&manual_view(&conv.messages, floor, None)).await;
+        assert!(conv.apply_plan(p2, floor).committed);
+        assert_eq!(conv.messages.iter().filter(|m| is_anchor_message(m)).count(), 1, "still one anchor after #2");
     }
 }
 
