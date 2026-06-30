@@ -28,6 +28,7 @@ interface WorkspacePath {
 const MAX_IMAGES = 6;
 const MAX_IMAGE_MB = 2;
 const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
+const MAX_INPUT_HISTORY = 100;
 
 function fileToImageData(file: File): Promise<ImageData | null> {
   return new Promise((resolve) => {
@@ -78,6 +79,14 @@ export function InputArea() {
   const fileSearchRef = useRef<HTMLInputElement>(null);
   const atListRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const inputHistoryRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1); // -1 = not navigating history; 0 = newest entry; increases going back
+  const originalTextRef = useRef('');
+  const textRef = useRef(text);
+  const updateText = useCallback((next: string) => {
+    textRef.current = next;
+    setText(next);
+  }, []);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -100,8 +109,14 @@ export function InputArea() {
         setSlashSkills(e.data.skills || []);
         setSlashLoading(false);
       }
-      if (e.data?.type === 'setDraft') setText(e.data.text);
-      if (e.data?.type === 'insertText') insertAtCursor(e.data.text);
+      if (e.data?.type === 'setDraft') {
+        historyIndexRef.current = -1;
+        updateText(e.data.text);
+      }
+      if (e.data?.type === 'insertText') {
+        historyIndexRef.current = -1;
+        insertAtCursor(e.data.text);
+      }
     }
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
@@ -182,8 +197,12 @@ export function InputArea() {
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
-    setText(val);
+    updateText(val);
     const cursor = e.target.selectionStart ?? val.length;
+    // User manually edited — exit history navigation mode
+    if (historyIndexRef.current >= 0) {
+      historyIndexRef.current = -1;
+    }
     if (/^\/\S*$/.test(val)) {
       setSlashFilter(val.slice(1).split(/\s/)[0]);
       setShowSlash(true);
@@ -211,10 +230,14 @@ export function InputArea() {
 
   const insertAtCursor = useCallback((value: string) => {
     const el = textareaRef.current;
-    const start = el?.selectionStart ?? text.length;
-    const end = el?.selectionEnd ?? text.length;
-    const next = text.slice(0, start) + value + text.slice(end);
-    setText(next);
+    if (!el) return;
+    const currentText = textRef.current;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const next = currentText.slice(0, start) + value + currentText.slice(end);
+    updateText(next);
+    // Exit history navigation mode (caller may have already reset, but guard here too)
+    historyIndexRef.current = -1;
     requestAnimationFrame(() => {
       const current = textareaRef.current;
       if (!current) return;
@@ -222,7 +245,7 @@ export function InputArea() {
       current.focus();
       current.setSelectionRange(pos, pos);
     });
-  }, [text]);
+  }, []);
 
   const addImageFiles = useCallback(async (files: File[] | FileList) => {
     const images = Array.from(files).filter((file) => file.type.startsWith('image/'));
@@ -238,14 +261,21 @@ export function InputArea() {
   }, [t]);
 
   const handleSend = useCallback(() => {
-    const trimmed = text.trim();
+    const value = textRef.current;
+    const trimmed = value.trim();
     if (!trimmed && pendingImages.length === 0) return;
     send(trimmed, pendingImages.length > 0 ? pendingImages : undefined);
-    setText('');
+    updateText('');
     setPendingImages([]);
     setAttachError(null);
     setShowSlash(false);
-  }, [pendingImages, text, send]);
+    // Save to input history (skip duplicates of the last entry, cap at 100)
+    const history = inputHistoryRef.current;
+    if (trimmed && (history.length === 0 || history[history.length - 1] !== trimmed)) {
+      inputHistoryRef.current = [...history, trimmed].slice(-MAX_INPUT_HISTORY);
+    }
+    historyIndexRef.current = -1;
+  }, [pendingImages, send]);
 
   const selectAtItem = useCallback((item: WorkspacePath) => {
     const el = textareaRef.current;
@@ -253,7 +283,7 @@ export function InputArea() {
     const range = detectAtMentionRange(text, el.selectionStart ?? text.length);
     if (!range) return;
     const next = replaceAtMention(text, range, item.relativePath);
-    setText(next.text);
+    updateText(next.text);
     setShowAtPicker(false);
     setAtQuery('');
     setAtItems([]);
@@ -290,13 +320,68 @@ export function InputArea() {
         }
       }
       if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+        return;
+      }
+
+      // Arrow Up/Down: navigate input history
+      const history = inputHistoryRef.current;
+      if (history.length === 0) return;
+
+      if (e.key === 'ArrowUp') {
+        const el = textareaRef.current;
+        if (!el) return;
+
+        const cursorPos = el.selectionStart ?? 0;
+        const onFirstLine = el.value.slice(0, cursorPos).indexOf('\n') === -1;
+
+        if (!onFirstLine) {
+          // Multi-line text: let browser move cursor up within the text
+          return;
+        }
+
+        if (cursorPos !== 0) {
+          // On first line but not at start: move cursor to beginning of line
+          e.preventDefault();
+          el.setSelectionRange(0, 0);
+          return;
+        }
+
+        // Cursor at start of first line: navigate history
+        e.preventDefault();
+        // Save original text on first history navigation
+        if (historyIndexRef.current === -1) {
+          originalTextRef.current = textRef.current;
+        }
+        const cur = historyIndexRef.current;
+        const newIndex = cur < history.length - 1 ? cur + 1 : history.length - 1;
+        historyIndexRef.current = newIndex;
+        updateText(history[history.length - 1 - newIndex]);
+      } else if (e.key === 'ArrowDown') {
+        // Don't intercept ArrowDown when not navigating history
+        if (historyIndexRef.current < 0) return;
+        const el = textareaRef.current;
+        if (!el) return;
+        // If cursor is not on the last line (has \n after it), let browser handle it
+        if (el.value.slice(el.selectionEnd ?? el.value.length).indexOf('\n') !== -1) return;
+        e.preventDefault();
+        const newIndex = historyIndexRef.current - 1;
+        historyIndexRef.current = newIndex;
+        if (newIndex < 0) {
+          updateText(originalTextRef.current);
+        } else {
+          updateText(history[history.length - 1 - newIndex]);
+        }
+      }
     },
+    // history refs intentionally excluded from deps — refs don't trigger re-renders
     [atIndex, atItems, handleSend, selectAtItem, showAtPicker, showSlash],
   );
 
   const handleSlashSelect = useCallback((command: string) => {
-    setText(command + ' ');
+    updateText(command + ' ');
     setShowSlash(false);
     textareaRef.current?.focus();
   }, []);
@@ -307,8 +392,8 @@ export function InputArea() {
       return fp;
     });
     setShowSlash((open) => {
-      if (open) { setText(''); return false; }
-      setText('/');
+      if (open) { updateText(''); return false; }
+      updateText('/');
       setSlashFilter('');
       ensureSlashSkills();
       return true;
