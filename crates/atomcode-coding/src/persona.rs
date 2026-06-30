@@ -33,6 +33,13 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // Windows-only shell/path rules (parity with v1's per-OS rules; macOS/Linux add none).
     #[cfg(windows)]
     p.push_str(WINDOWS_PLATFORM);
+    // Models with weaker soft-instruction adherence (observed: GLM, DeepSeek shell out
+    // `ls`/`grep` despite the persona preference) get an extra, blunt restatement of the
+    // tool-preference rules. Keyed only on the model name (frozen per session), so it is
+    // prompt-cache-stable; frontier models that already comply skip the extra tokens.
+    if model_needs_firm_tool_steering(model) {
+        p.push_str(FIRM_TOOL_DISCIPLINE);
+    }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
     // cache-stable AND present on EVERY round, including a turn's first round which the
@@ -46,6 +53,29 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     ));
     p
 }
+
+/// Whether `model` belongs to a family with weaker soft-instruction adherence (GLM,
+/// DeepSeek) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`] restatement. Substring
+/// match on the lower-cased name so version suffixes (`glm-5.2`, `deepseek-v4-flash`) all
+/// hit. Frontier models (Claude, GPT) follow the soft `## TOOLS:` preferences and are
+/// excluded to keep their prompt lean and cache-stable.
+fn model_needs_firm_tool_steering(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("glm") || m.contains("deepseek")
+}
+
+/// Blunt, point-of-decision restatement of the file-tool preference, appended only for
+/// models flagged by [`model_needs_firm_tool_steering`]. The soft `## TOOLS:` guidance
+/// already says this once; weak models need it stated as a hard rule. The aggregation
+/// carve-out keeps audit-style shell pipelines legitimate.
+const FIRM_TOOL_DISCIPLINE: &str = "\n\n## TOOL DISCIPLINE (MANDATORY):\n\
+Do NOT shell out for file work:\n\
+- List a directory → list_directory (NOT `bash ls`).\n\
+- Find files by name → glob (NOT `bash find`).\n\
+- Search file contents → grep (NOT `bash grep` / `rg`).\n\
+- Read a file → read_file (NOT `bash cat`).\n\
+Use bash ONLY for git, builds, package managers, running commands, and pipelines / \
+aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -89,7 +119,7 @@ MANDATORY parallel scenarios (must be ONE turn):
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
-To list directories, use `list_directory` instead of `bash ls` / `find` when a tree view is enough; it is gitignore-aware and skips build/cache directories.
+To list directories, default to `list_directory` instead of `bash ls` / `find` — it is gitignore-aware and skips build/cache directories. Fall back to `bash ls -la` ONLY when you specifically need file sizes, permissions, or timestamps, which `list_directory` omits.
 To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
@@ -322,5 +352,57 @@ mod tests {
                 "persona must preserve tool preference: {phrase}"
             );
         }
+    }
+
+    #[test]
+    fn list_directory_guidance_drops_the_vague_escape_hatch() {
+        // The old wording ("when a tree view is enough") let weak models justify
+        // `bash ls -la` for almost anything. Replace the vague condition with one
+        // concrete exception (sizes/permissions/timestamps) so the default is
+        // unambiguous, while still preferring list_directory over `bash ls`.
+        let p = coding_persona("m");
+        assert!(
+            !p.contains("when a tree view is enough"),
+            "the vague escape hatch must be gone: {p}"
+        );
+        assert!(
+            p.contains("instead of `bash ls`"),
+            "must still prefer list_directory over `bash ls`"
+        );
+        assert!(
+            p.contains("file sizes, permissions, or timestamps"),
+            "must name the single concrete fallback case: {p}"
+        );
+    }
+
+    #[test]
+    fn weak_instruction_models_get_a_firm_tool_discipline_block() {
+        // GLM / DeepSeek follow soft prompt preferences less reliably than frontier
+        // models (observed: GLM-5.2 shells out `ls -la` despite the persona preference).
+        // Give them an extra, blunt restatement at the model's decision point. Models
+        // that already comply don't need the extra tokens.
+        for weak in ["glm-5.2", "GLM-4.6", "deepseek-v4-flash"] {
+            let p = coding_persona(weak);
+            assert!(
+                p.contains("## TOOL DISCIPLINE"),
+                "{weak} must get the firm tool-discipline block: {p}"
+            );
+        }
+        for strong in ["claude-opus-4-8", "gpt-5", "m"] {
+            let p = coding_persona(strong);
+            assert!(
+                !p.contains("## TOOL DISCIPLINE"),
+                "{strong} must not carry the extra firm block"
+            );
+        }
+    }
+
+    #[test]
+    fn model_needs_firm_tool_steering_matches_weak_families() {
+        assert!(model_needs_firm_tool_steering("glm-5.2"));
+        assert!(model_needs_firm_tool_steering("GLM-4.6"));
+        assert!(model_needs_firm_tool_steering("deepseek-chat"));
+        assert!(!model_needs_firm_tool_steering("claude-opus-4-8"));
+        assert!(!model_needs_firm_tool_steering("gpt-5"));
     }
 }

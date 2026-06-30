@@ -183,7 +183,14 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
             "Run a shell command in the working directory and return its combined \
              stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
              commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
-             risky and may require approval."
+             risky and may require approval.\n\
+             Prefer the dedicated tools over bash for file operations — they are \
+             gitignore-aware, cross-platform, and cheaper: read_file to read a file (NOT \
+             cat/head/tail), grep to search file contents (NOT grep/rg), glob to find \
+             files by name (NOT find/fd), list_directory for a directory tree (NOT ls). \
+             Reserve bash for real shell work — git, builds, package managers, running \
+             commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
+             the dedicated tools can't do."
         };
     }
     if is_windows {
@@ -200,10 +207,8 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
              cmd.exe builtin. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
-             Prefer the dedicated tools over shell file operations: read_file to read a file, \
-             grep to search file contents, glob to list or find files by pattern — instead of \
-             cmd's type/find/dir. They are cross-platform and avoid all the cmd.exe quoting \
-             pitfalls above."
+             The dedicated file tools above (read_file / grep / glob / list_directory) also \
+             sidestep cmd's type/find/dir and all the quoting pitfalls here."
         )
     } else {
         base!()
@@ -1147,6 +1152,26 @@ mod tests {
         // The unix description stays lean (no Windows shell noise).
         let unix = shell_tool_description(false);
         assert!(!unix.contains("PowerShell") && !unix.contains("//c"), "unix desc unchanged: {unix}");
+    }
+
+    // Previously the unix description said NOTHING about preferring the dedicated file
+    // tools, so on macOS/Linux the only steering lived in the persona — far from the
+    // model's tool-choice decision point. Weak models (GLM-5.2) shell out `ls`/`grep`
+    // anyway. Mirror opencode: put the "don't shell out for file ops" guidance in the
+    // bash tool's OWN description, on EVERY platform — and keep an explicit carve-out so
+    // audit-style pipelines (wc/sort/uniq/git log) still legitimately use bash.
+    #[test]
+    fn unix_description_steers_file_ops_to_native_tools() {
+        let unix = shell_tool_description(false);
+        for tool in ["read_file", "grep", "glob", "list_directory"] {
+            assert!(unix.contains(tool), "unix desc must steer to {tool}: {unix}");
+        }
+        let lc = unix.to_lowercase();
+        assert!(
+            lc.contains("aggregation") || lc.contains("pipeline"),
+            "must carve out shell pipelines/aggregation for bash: {unix}"
+        );
+        assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
     }
 
     #[test]
