@@ -710,6 +710,14 @@ enum Commands {
         /// The prompt string forwarded by sudo/ssh (e.g. "[sudo] password:").
         prompt: String,
     },
+    /// Run as an Agent Client Protocol (ACP) agent over stdio.
+    ///
+    /// stdout is reserved exclusively for the ACP JSON-RPC stream.
+    /// Provider and model are taken from the active configuration
+    /// (same as the TUI/headless path); per-session cwd comes from
+    /// the ACP client's `session/new` request.
+    #[command(hide = true)]
+    Acp,
 }
 
 /// Subcommands for hooks management
@@ -1291,6 +1299,77 @@ async fn run() -> Result<i32> {
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
                 return Ok(exit_code);
+            }
+            Commands::Acp => {
+                // stdout is the ACP JSON-RPC channel — no banner or diagnostic output here.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                // Load config the same way the TUI path does so provider/model resolution
+                // is identical (honors --provider, --model, and config.toml).
+                let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+                let mut config = if config_path.exists() {
+                    Config::load(&config_path).unwrap_or_default()
+                } else {
+                    Config::default()
+                };
+                // Apply the `--model` override the SAME way the TUI path does
+                // (see the default TUI branch below): mutate the active provider's
+                // model in `config` BEFORE resolving it, so both the EngineConfig
+                // and the built provider pick up the override.
+                if let Some(ref model) = cli.model {
+                    let provider_name =
+                        cli.provider.as_deref().unwrap_or(&config.default_provider);
+                    if let Some(p) = config.providers.get_mut(provider_name) {
+                        p.model = model.clone();
+                    }
+                }
+                let working_dir = resolve_working_dir(cli.dir.clone());
+                let bridge_cfg = bridge_config_from(
+                    &config,
+                    &working_dir,
+                    cli.provider.as_deref(),
+                    // No telemetry injection into ACP sessions (each is independent).
+                    None,
+                    cli.dangerously_skip_permissions,
+                    // ACP sessions are interactive: approval prompts park until the
+                    // client answers (not fail-closed like headless -p).
+                    true,
+                );
+                // Honor `--dangerously-skip-permissions`: auto-approve kernel approval
+                // requests in the turn loop instead of round-tripping to the client.
+                // Capture before the fields below are moved into the EngineConfig.
+                let auto_approve = bridge_cfg.dangerously_skip_permissions;
+                // Build an authenticated provider (includes the AtomGit gateway HMAC
+                // signer for the default endpoint; falls through to plain OpenAI-compat
+                // or Anthropic for user-configured endpoints).
+                let provider = match atomcode_bridge::build_provider_for_acp(&bridge_cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("acp: failed to initialize provider: {:#}", e);
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
+                        return Ok(1);
+                    }
+                };
+                let engine = atomcode_acp::engine::EngineConfig {
+                    api_key: bridge_cfg.api_key,
+                    base_url: bridge_cfg.base_url,
+                    model: bridge_cfg.model,
+                    provider_type: bridge_cfg.provider_type,
+                    context_window: bridge_cfg.context_window,
+                    max_tokens: bridge_cfg.max_tokens,
+                };
+                // Flush telemetry before the long-running stdio loop.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return atomcode_acp::serve_stdio(atomcode_acp::AcpServeOptions {
+                    engine: Some(engine),
+                    provider: Some(provider),
+                    auto_approve,
+                })
+                .await
+                .map(|_| 0);
             }
             other => {
                 let result = handle_command(other, &telemetry).await.map(|_| 0);
@@ -2663,6 +2742,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                 println!("  No saved OAuth token found for MCP server {:?}", name);
             }
             Ok(())
+        }
+        Commands::Acp => {
+            unreachable!("Acp is handled inline in run() before handle_command")
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
         Commands::Askpass { .. } => {
