@@ -866,13 +866,15 @@ impl TurnExecutor for KernelTurnExecutor {
 
         // `conv` already has the just-typed user message appended (coordinator).
         // Split it off: the prefix seeds the bridge (first turn only), the last
-        // message is sent as this turn's input.
-        let (prefix, user_text, user_images) = {
+        // message is sent as this turn's input. `turn_base` keeps the FULL message
+        // list (incl. the user message) for the crash-durable in-progress saves below.
+        let (prefix, user_text, user_images, turn_base) = {
             let c = conv.lock().await;
+            let turn_base = c.messages.clone();
             let mut msgs = c.messages.clone();
             let last = msgs.pop();
             let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-            (msgs, text, images)
+            (msgs, text, images, turn_base)
         };
 
         // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
@@ -895,6 +897,40 @@ impl TurnExecutor for KernelTurnExecutor {
             images: user_images,
             image_markers: Vec::new(),
         });
+
+        // DURABILITY — fix A: persist the user message to the stable `.json` NOW, before
+        // the (possibly long, possibly laggy) turn runs. A hard kill / window-close
+        // mid-turn otherwise loses the WHOLE unfinished turn, since the webui loads from
+        // `.json` and the terminal save below never runs. Best-effort: a write miss must
+        // not block the turn (and the terminal save is authoritative). See
+        // `save_live_session_json`.
+        let _ = save_live_session_json(&self.working_dir, &self.session_id, turn_base.clone());
+
+        // DURABILITY — fix B: accumulate streamed assistant TEXT and re-persist on a
+        // throttle, so a crash while the model is still answering preserves how far it
+        // got. The provisional message is text-only (NO tool_calls) so the on-disk
+        // conversation is always resume- and display-safe; the terminal writeback below
+        // replaces it with the authoritative snapshot on a clean finish.
+        let mut assistant_buf = String::new();
+        let mut last_progress_persist = std::time::Instant::now();
+        // Bytes of `assistant_buf` already on disk — skip a re-save when the text hasn't
+        // grown (e.g. a tool BATCH fires many ToolCallStarted with identical preceding
+        // narration, which would otherwise rewrite the same file N times).
+        let mut persisted_len: usize = 0;
+        const PROGRESS_PERSIST_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(1500);
+        // Build [turn_base + provisional assistant(text)] and persist it (best-effort).
+        let persist_progress = |text: &str| {
+            if text.is_empty() {
+                return;
+            }
+            let mut msgs = turn_base.clone();
+            msgs.push(atomcode_core::conversation::message::Message::new(
+                atomcode_core::conversation::message::Role::Assistant,
+                text,
+            ));
+            let _ = save_live_session_json(&self.working_dir, &self.session_id, msgs);
+        };
 
         // Interactive approval: register the response sender so any view's
         // `LiveSession.approve()` delivers the decision here.
@@ -924,12 +960,31 @@ impl TurnExecutor for KernelTurnExecutor {
                 break None;
             };
             match ev {
-                AgentEvent::TextDelta(t) => emit(TurnEvent::TextDelta(t)),
+                AgentEvent::TextDelta(t) => {
+                    // fix B: accumulate, then throttle a crash-durable progress save.
+                    assistant_buf.push_str(&t);
+                    emit(TurnEvent::TextDelta(t));
+                    if last_progress_persist.elapsed() >= PROGRESS_PERSIST_INTERVAL
+                        && assistant_buf.len() != persisted_len
+                    {
+                        persist_progress(&assistant_buf);
+                        last_progress_persist = std::time::Instant::now();
+                        persisted_len = assistant_buf.len();
+                    }
+                }
                 AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
                 AgentEvent::ToolCallStreaming { name, hint } => {
                     emit(TurnEvent::ToolCallStreaming { name, hint })
                 }
                 AgentEvent::ToolCallStarted { id, name, arguments } => {
+                    // A tool can run long; flush the assistant narration that preceded it
+                    // so a crash DURING the tool still shows what the model just said.
+                    // Skip when nothing new accumulated (batched tool calls share text).
+                    if assistant_buf.len() != persisted_len {
+                        persist_progress(&assistant_buf);
+                        last_progress_persist = std::time::Instant::now();
+                        persisted_len = assistant_buf.len();
+                    }
                     emit(TurnEvent::ToolCallStarted { id, name, arguments })
                 }
                 AgentEvent::ToolOutputChunk { call_id, chunk } => {
@@ -1018,31 +1073,26 @@ impl TurnExecutor for KernelTurnExecutor {
         // The approval slot is per-turn; clear it so a stale sender can't leak.
         *approver.lock().await = None;
 
-        // Writeback: the engine's snapshot becomes the conversation of record.
-        // (Empty/None never reaches here for a real turn — Error is non-terminal and
-        // channel-close breaks with None — so this never clobbers `conv`.)
+        // Writeback + AUTHORITATIVE terminal persist — the engine's snapshot becomes the
+        // conversation of record, and we overwrite the stable `<id>.json` with it (so
+        // /resume + the webui see the conversation after a quit). This replaces any
+        // provisional in-progress save (fix A/B above) with the engine's final messages.
+        // LOAD-MERGE-SAVE preserves `user_renamed` / accumulated fields — see
+        // `save_live_session_json`.
+        //
+        // CRITICAL: only when the engine actually delivered a terminal snapshot. If the
+        // bridge died mid-turn (`final_messages == None`), `conv` was never updated this
+        // turn, so persisting it would CLOBBER the richer in-progress save (fix A/B) with
+        // a staler `[.., user]` list — losing the partial turn the user should still see.
+        // (Empty/None never reaches here for a real terminal — Error is non-terminal and
+        // channel-close breaks with None.)
         if let Some(msgs) = final_messages {
-            let mut c = conv.lock().await;
-            c.messages = msgs;
-        }
-
-        // Persist (stable session id → one file per session). Mirrors the legacy
-        // executor so /resume sees the conversation after a quit.
-        // Load the existing session from disk (if any) instead of creating a
-        // fresh one, so that `user_renamed` and other accumulated fields
-        // (turn_stats, cold_summaries, etc.) are preserved.
-        {
-            use atomcode_core::session::{Session, SessionManager};
-            let conv_guard = conv.lock().await;
-            let manager = SessionManager::new(&self.working_dir);
-            let mut session = manager
-                .load(&self.session_id)
-                .unwrap_or_else(|_| Session::new(self.working_dir.clone()));
-            session.id = self.session_id.clone();
-            session.messages = conv_guard.messages.clone();
-            session.auto_name_from_messages();
-            session.touch();
-            if let Err(e) = manager.save(&session) {
+            let messages = {
+                let mut c = conv.lock().await;
+                c.messages = msgs;
+                c.messages.clone()
+            };
+            if let Err(e) = save_live_session_json(&self.working_dir, &self.session_id, messages) {
                 eprintln!("Warning: failed to save live session (v2): {e}");
             }
         }
@@ -1053,6 +1103,34 @@ impl TurnExecutor for KernelTurnExecutor {
             *guard = None;
         }
     }
+}
+
+/// Persist the live conversation to the stable `<session_id>.json` (LOAD-MERGE-SAVE so
+/// `user_renamed` and other accumulated fields survive — not a blind overwrite). Called at
+/// THREE points across a v2 live turn: (1) turn START — so an interrupted / hard-killed
+/// turn's user message is durable and the unfinished turn stays VISIBLE on reopen (the
+/// webui loads from `.json`); (2) throttled MID-turn — so partial assistant text survives a
+/// crash; (3) the TERMINAL — the authoritative final snapshot.
+///
+/// Before this existed, only (3) ran, so a hard kill mid-turn lost the whole unfinished
+/// turn (the webui showed only prior completed turns — user-reported bug). Returns the
+/// IO result so the terminal caller can log a failure; the best-effort in-progress
+/// callers ignore it (a transient write miss must never break the turn).
+fn save_live_session_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) -> std::io::Result<()> {
+    use atomcode_core::session::{Session, SessionManager};
+    let manager = SessionManager::new(working_dir);
+    let mut session = manager
+        .load(session_id)
+        .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
+    session.id = session_id.clone();
+    session.messages = messages;
+    session.auto_name_from_messages();
+    session.touch();
+    manager.save(&session)
 }
 
 /// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
@@ -1928,5 +2006,136 @@ mod tests {
             json,
             r#"{"type":"warning","message":"conversation compacted"}"#
         );
+    }
+
+    // ── In-progress (crash-durable) persistence ───────────────────────────────
+    // Regression: a v2 live turn used to persist `<id>.json` ONLY at the terminal
+    // (TurnComplete/TurnCancelled). A hard kill mid-turn (computer too laggy, window
+    // closed) therefore lost the WHOLE unfinished turn — the webui loads from .json
+    // and showed only prior completed turns (user-reported bug). `save_live_session_json`
+    // is the helper the executor now also calls at turn start (user message durable) and
+    // throttled mid-turn (partial assistant text durable).
+
+    use std::sync::Mutex as TestMutex;
+
+    /// Process-global env lock so ATOMCODE_HOME-mutating tests in THIS binary never race.
+    fn env_lock() -> &'static TestMutex<()> {
+        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TestMutex::new(()))
+    }
+
+    /// Point ATOMCODE_HOME (→ sessions root) at a tempdir for the duration of a test,
+    /// restoring the previous value on drop. Mirrors core's `ScopedHome` pattern.
+    struct ScopedHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        _dir: tempfile::TempDir,
+    }
+    impl ScopedHome {
+        fn new() -> Self {
+            let guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("ATOMCODE_HOME").ok();
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("ATOMCODE_HOME", dir.path());
+            Self { _guard: guard, prev, _dir: dir }
+        }
+    }
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
+    }
+
+    fn user_msg(text: &str) -> atomcode_core::conversation::message::Message {
+        atomcode_core::conversation::message::Message::new(
+            atomcode_core::conversation::message::Role::User,
+            text,
+        )
+    }
+    fn assistant_msg(text: &str) -> atomcode_core::conversation::message::Message {
+        atomcode_core::conversation::message::Message::new(
+            atomcode_core::conversation::message::Role::Assistant,
+            text,
+        )
+    }
+
+    // Fix A: persisting just the user message mid-turn makes the unfinished turn
+    // durable — load() reads it straight back. Before the fix the .json was never
+    // written until the terminal, so a hard kill lost it entirely.
+    #[test]
+    fn save_live_session_json_persists_user_message_for_reopen() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/a");
+        let id = SessionId::new();
+
+        save_live_session_json(&dir, &id, vec![user_msg("cd d:")]).expect("save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), Some("cd d:"));
+    }
+
+    // Fix B: a throttled mid-turn save carries the partial assistant text too, so a
+    // crash while the model was still answering preserves how far it got.
+    #[test]
+    fn save_live_session_json_persists_partial_assistant_progress() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/b");
+        let id = SessionId::new();
+
+        save_live_session_json(&dir, &id, vec![user_msg("hello"), assistant_msg("partial ans")])
+            .expect("save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[1].text(), Some("partial ans"));
+    }
+
+    // The helper LOAD-MERGE-SAVEs (not blind overwrite) so a user `/rename` and other
+    // accumulated fields survive an in-progress save — same contract as the terminal save.
+    #[test]
+    fn save_live_session_json_preserves_user_rename() {
+        use atomcode_core::session::{Session, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/c");
+        let mgr = SessionManager::new(&dir);
+
+        // A pre-existing, user-renamed session on disk.
+        let mut existing = Session::new(dir.clone());
+        let id = existing.id.clone();
+        existing.rename("我的会话".to_string());
+        mgr.save(&existing).expect("seed save");
+
+        // An in-progress save with new messages must NOT clobber the custom name.
+        save_live_session_json(&dir, &id, vec![user_msg("继续")]).expect("save");
+
+        let loaded = mgr.load(&id).expect("load");
+        assert_eq!(loaded.name, "我的会话", "user rename must survive an in-progress save");
+        assert!(loaded.user_renamed);
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), Some("继续"));
+    }
+
+    // Fix A is idempotent with the terminal save: persisting the same id repeatedly
+    // (turn-start → throttled → terminal) overwrites the one file, never duplicates it.
+    #[test]
+    fn save_live_session_json_overwrites_same_file() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/d");
+        let id = SessionId::new();
+
+        save_live_session_json(&dir, &id, vec![user_msg("q")]).expect("turn start");
+        save_live_session_json(&dir, &id, vec![user_msg("q"), assistant_msg("a1")]).expect("mid");
+        save_live_session_json(&dir, &id, vec![user_msg("q"), assistant_msg("a1 a2")]).expect("end");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(loaded.messages.len(), 2, "one session, latest snapshot — not appended copies");
+        assert_eq!(loaded.messages[1].text(), Some("a1 a2"));
     }
 }
