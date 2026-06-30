@@ -7151,11 +7151,7 @@ fn cancel_active_turn(ctx: &LoopCtx) -> bool {
 /// as before.
 fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     if ctx.sync_forwarder.is_some() {
-        let decision = match cmd {
-            AgentCommand::ApproveTool => atomcode_core::tool::PermissionDecision::Allow,
-            AgentCommand::ApproveToolAlways => atomcode_core::tool::PermissionDecision::AllowAlways,
-            _ => atomcode_core::tool::PermissionDecision::Deny,
-        };
+        let decision = approval_command_to_decision(&cmd);
         if let Some(session) = atomcode_daemon::current_live_session() {
             let _ = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(session.approve(decision))
@@ -7163,6 +7159,92 @@ fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
         }
     } else {
         ctx.agent.cmd_tx.send(cmd).ok();
+    }
+}
+
+/// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
+/// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
+/// the command↔decision contract (notably that an auto-approve sends `Allow`,
+/// not `Deny`/`Ask`) is unit-testable without building a `LoopCtx`.
+fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::PermissionDecision {
+    use atomcode_core::tool::PermissionDecision;
+    match cmd {
+        AgentCommand::ApproveTool => PermissionDecision::Allow,
+        AgentCommand::ApproveToolAlways => PermissionDecision::AllowAlways,
+        _ => PermissionDecision::Deny,
+    }
+}
+
+/// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
+/// of surfaced as a prompt (false), given the TUI's bypass flag.
+///
+/// In LOCAL mode the core decider short-circuits and never emits the event, so
+/// this only bites in SYNC mode, where the daemon's LiveSession always asks.
+/// Honoring bypass here is what keeps `--dangerously-skip-permissions` working
+/// for daemon-backed turns (e.g. a `/skills` expansion that drives tool calls).
+fn approval_needed_is_auto_bypassed(dangerously_skip_permissions: bool) -> bool {
+    dangerously_skip_permissions
+}
+
+/// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
+/// auto-resolves. A named function so the `handle_agent_event` short-circuit
+/// and its test share one source of truth.
+fn bypass_approval_command() -> AgentCommand {
+    AgentCommand::ApproveTool
+}
+
+#[cfg(test)]
+mod bypass_approval_tests {
+    use super::{
+        approval_command_to_decision, approval_needed_is_auto_bypassed, bypass_approval_command,
+        AgentCommand,
+    };
+    use atomcode_core::tool::PermissionDecision;
+
+    // The fix's core invariant: with `--dangerously-skip-permissions` on, an
+    // incoming `ApprovalNeeded` is auto-approved rather than prompted. This is
+    // what was broken in SYNC mode — the daemon always asks, and the TUI used
+    // to show the prompt regardless of bypass (e.g. on `/skills` tool calls).
+    #[test]
+    fn bypass_on_auto_approves() {
+        assert!(approval_needed_is_auto_bypassed(true));
+    }
+
+    // Without bypass, the event must NOT be short-circuited — the normal
+    // prompt path runs. Guards against an accidental inversion of the flag.
+    #[test]
+    fn bypass_off_still_prompts() {
+        assert!(!approval_needed_is_auto_bypassed(false));
+    }
+
+    // End-to-end on the pure seam: the command BYPASS issues must resolve to a
+    // genuine `Allow`. If either the issued command or the mapping drifts so
+    // that bypass yields `Deny`/`Ask`, the tool would stall/deny instead of
+    // sailing through — exactly the regression this test pins.
+    #[test]
+    fn bypass_command_resolves_to_allow() {
+        let decision = approval_command_to_decision(&bypass_approval_command());
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "BYPASS must auto-approve with Allow, got {decision:?}"
+        );
+    }
+
+    // The full command↔decision contract used by sync-mode `deliver_approval`.
+    #[test]
+    fn approval_command_decision_mapping() {
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::ApproveTool),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::ApproveToolAlways),
+            PermissionDecision::AllowAlways
+        ));
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::DenyTool),
+            PermissionDecision::Deny
+        ));
     }
 }
 
@@ -8122,6 +8204,22 @@ fn handle_agent_event(
         AgentEvent::ApprovalNeeded {
             tool_name, call, snapshot, ..
         } => {
+            // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
+            // skip the prompt entirely. In LOCAL mode the core decider already
+            // short-circuits, so this event never fires there. But in SYNC mode
+            // the daemon's LiveSession runs an InteractivePermissionDecider
+            // (auto_approve=false, see live_api.rs) that ALWAYS asks and forwards
+            // ApprovalRequested → here (live_sync.rs); the TUI's bypass flag would
+            // otherwise be ignored, surfacing prompts whenever a turn drives tool
+            // calls — e.g. a `/skills` expansion. Honor bypass at the TUI seam
+            // rather than flipping the shared daemon executor (which would leak
+            // bypass to webui peers attached to the same LiveSession).
+            // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
+            // and to the local agent otherwise.
+            if approval_needed_is_auto_bypassed(ctx.dangerously_skip_permissions) {
+                deliver_approval(ctx, bypass_approval_command());
+                return;
+            }
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
             if !snapshot.messages.is_empty() {
