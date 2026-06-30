@@ -368,6 +368,29 @@ fn is_wsl_launcher(path: &std::path::Path) -> bool {
         || s.contains(r"\windows\sysnative\")
 }
 
+/// Derive a Git for Windows `bash.exe` from a `git.exe` path. Git ships `git.exe` in
+/// `<root>\cmd\` (and `<root>\bin\`) and `bash.exe` in `<root>\bin\`, so bash is the
+/// grandparent of `git.exe` joined with `bin\bash.exe` (works for both layouts since `cmd`
+/// and `bin` are siblings under the install root). This is how a Git install on a non-`C:`
+/// drive is found when only `git` (not `bash`) is on PATH. Pure path arithmetic (no fs) so
+/// it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bash_beside_git(git_exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = git_exe.parent()?.parent()?;
+    Some(root.join("bin").join("bash.exe"))
+}
+
+/// Parse the install root out of `reg query HKLM\SOFTWARE\GitForWindows /v InstallPath`
+/// output. The value line is `    InstallPath    REG_SZ    <path>`; everything after the
+/// `REG_SZ` type token is the path (so paths containing spaces survive). Pure — testable
+/// off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reg_install_path(reg_stdout: &str) -> Option<&str> {
+    reg_stdout
+        .lines()
+        .find_map(|l| l.split("REG_SZ").nth(1).map(str::trim).filter(|s| !s.is_empty()))
+}
+
 /// Detect a Git Bash / MSYS2 bash on Windows. Checks PATH (`where bash`) then common
 /// install locations. Deliberately EXCLUDES the WSL launcher (see `is_wsl_launcher`) —
 /// only shells that inherit the Windows PATH and honor a Windows cwd are usable here.
@@ -394,7 +417,46 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
                 }
             }
         }
-        // 2. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
+        // 2. Derive from `git.exe` on PATH. Git for Windows installed ANYWHERE (incl. a
+        // non-`C:` drive like `D:\program\git`) is found here even when its `bin\bash.exe`
+        // is not on PATH — as long as `git` is (the common case). `bash.exe` lives beside
+        // git under `<root>\bin`.
+        if let Ok(o) = std::process::Command::new("where").arg("git").output() {
+            if o.status.success() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for line in txt.lines() {
+                    if let Some(b) = bash_beside_git(&std::path::PathBuf::from(line.trim())) {
+                        if b.is_file() && !is_wsl_launcher(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        // 3. `GIT_INSTALL_ROOT` env var (some setups export it) → `<root>\bin\bash.exe`.
+        if let Ok(root) = std::env::var("GIT_INSTALL_ROOT") {
+            let b = std::path::Path::new(&root).join("bin").join("bash.exe");
+            if b.is_file() && !is_wsl_launcher(&b) {
+                return Some(b);
+            }
+        }
+        // 4. Git for Windows registry `InstallPath` (a registered install on any drive).
+        for key in [r"HKLM\SOFTWARE\GitForWindows", r"HKLM\SOFTWARE\WOW6432Node\GitForWindows"] {
+            if let Ok(o) =
+                std::process::Command::new("reg").args(["query", key, "/v", "InstallPath"]).output()
+            {
+                if o.status.success() {
+                    let txt = String::from_utf8_lossy(&o.stdout);
+                    if let Some(root) = parse_reg_install_path(&txt) {
+                        let b = std::path::Path::new(root).join("bin").join("bash.exe");
+                        if b.is_file() && !is_wsl_launcher(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        // 5. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
         // `System32\bash.exe` (WSL): see `is_wsl_launcher`.
         let candidates = [
             r"C:\Program Files\Git\bin\bash.exe",
@@ -956,6 +1018,36 @@ mod tests {
         // Git Bash / MSYS2 are real shells we CAN use — must NOT be rejected.
         assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
         assert!(!is_wsl_launcher(Path::new(r"C:\msys64\usr\bin\bash.exe")));
+    }
+
+    #[test]
+    fn bash_derived_from_git_exe_on_any_drive() {
+        use std::path::{Path, PathBuf};
+        // Forward slashes so `Path` treats them as separators on the (non-Windows) test host;
+        // on real Windows the `where git` input uses backslashes, handled natively.
+        // git.exe in `<root>/cmd` (Git for Windows default layout).
+        assert_eq!(
+            bash_beside_git(Path::new("D:/program/git/cmd/git.exe")),
+            Some(PathBuf::from("D:/program/git/bin/bash.exe")),
+        );
+        // git.exe in `<root>/bin` (alternate layout) → same `bin/bash.exe`.
+        assert_eq!(
+            bash_beside_git(Path::new("D:/program/git/bin/git.exe")),
+            Some(PathBuf::from("D:/program/git/bin/bash.exe")),
+        );
+        // Too shallow (no grandparent) → None, not a panic.
+        assert_eq!(bash_beside_git(Path::new("git.exe")), None);
+    }
+
+    #[test]
+    fn parse_reg_install_path_extracts_path_with_spaces() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows\r\n    InstallPath    REG_SZ    D:\\program\\git\r\n";
+        assert_eq!(parse_reg_install_path(out), Some(r"D:\program\git"));
+        // Path containing a space survives (everything after REG_SZ is taken).
+        let spaced = "    InstallPath    REG_SZ    D:\\my apps\\Git\r\n";
+        assert_eq!(parse_reg_install_path(spaced), Some(r"D:\my apps\Git"));
+        // No value line → None.
+        assert_eq!(parse_reg_install_path("ERROR: key not found\r\n"), None);
     }
 
     #[test]
