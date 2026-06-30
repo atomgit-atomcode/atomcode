@@ -1951,6 +1951,34 @@ fn build_provider(
     }
 }
 
+/// Build an authenticated [`LlmProvider`] directly from a [`BridgeConfig`].
+///
+/// Thin public entry point for the `atomcode acp` CLI subcommand: the CLI needs
+/// a gateway-signed provider (with the AtomGit HMAC signer when the endpoint is
+/// the AtomGit gateway) but cannot reach the private [`build_provider`] directly
+/// and does not depend on `atomcode-coding`'s `CodingAgentConfig`.
+///
+/// The `working_dir` field of the interim `CodingAgentConfig` is unused by the
+/// provider builder; the process working directory is used as a placeholder.
+pub fn build_provider_for_acp(
+    cfg: &BridgeConfig,
+) -> anyhow::Result<std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider>> {
+    let mut coding_cfg = CodingAgentConfig::new(
+        &cfg.api_key,
+        &cfg.base_url,
+        &cfg.model,
+        // working_dir is not used by build_provider; placeholder is fine.
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    coding_cfg.context_window = cfg.context_window;
+    coding_cfg.provider_type = cfg.provider_type.clone();
+    coding_cfg.reasoning_history = cfg.reasoning_history.clone();
+    coding_cfg.thinking_enabled = cfg.thinking_enabled;
+    coding_cfg.thinking_type = cfg.thinking_type.clone();
+    coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+    build_provider(&coding_cfg)
+}
+
 /// Map a raw provider error to a user-actionable one before it reaches the UI.
 ///
 /// An atomgit-gateway **401** means the free-quota token was rejected or

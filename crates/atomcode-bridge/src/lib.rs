@@ -23,4 +23,4 @@ pub mod convert;
 mod runtime;
 mod sign;
 
-pub use runtime::{spawn_bridged_runtime, BridgeConfig};
+pub use runtime::{build_provider_for_acp, spawn_bridged_runtime, BridgeConfig};
