@@ -7246,11 +7246,16 @@ pub(super) fn handle_plugin_job_event(
             // left edge regardless of which subsystem owns it.
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
+            // Adding a marketplace does NOT install its plugins — list them + the install
+            // command so the user isn't left thinking a plugin command (e.g. /wechat) is
+            // already usable (a common confusion: `marketplace add` ≠ install).
+            let plugin_list = info.plugins.join(", ");
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
                     name: &info.name,
                     commit: short_commit,
                     count: info.plugins.len(),
+                    plugins: &plugin_list,
                 })
                 .into_owned(),
             ));
