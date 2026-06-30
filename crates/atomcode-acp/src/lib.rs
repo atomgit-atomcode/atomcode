@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
-    PromptCapabilities,
+    PromptCapabilities, PromptRequest,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
 use atomcode_kernel::provider::LlmProvider;
@@ -118,6 +118,33 @@ pub async fn serve_stdio(opts: AcpServeOptions) -> anyhow::Result<()> {
                     )
                     .await?;
                     responder.respond(resp)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                    // The turn MUST run off the dispatch loop: a handler that
+                    // awaited the whole turn inline would block the single-task
+                    // loop, so a mid-turn `session/cancel` (Task 9) and the
+                    // client's permission responses could never be processed.
+                    // Spawn the turn, hand it the deferred `responder`, and
+                    // return immediately so the loop stays free.
+                    let (text, images) = dispatch::prompt_text(&req);
+                    let sid = req.session_id.clone();
+                    let sessions = Arc::clone(&sessions);
+                    cx.spawn({
+                        let cx = cx.clone();
+                        async move {
+                            dispatch::run_prompt_turn(
+                                cx, sessions, sid, text, images, responder,
+                            )
+                            .await
+                        }
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
