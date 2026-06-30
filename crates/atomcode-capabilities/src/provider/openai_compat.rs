@@ -59,6 +59,15 @@ pub struct OpenAiCompatConfig {
     /// Optional per-request auth seam. `None` (default) ⇒ plain
     /// `bearer_auth(api_key)`. See [`RequestSigner`].
     pub request_signer: Option<std::sync::Arc<dyn RequestSigner>>,
+    /// User-Agent sent on every request. `None` ⇒ the generic [`super::DEFAULT_USER_AGENT`]
+    /// fallback; the driver (bridge) sets this to `atomcode/<version>` so a forwarding
+    /// gateway can attribute traffic by product version (analytics + per-version cache-hit
+    /// slicing). This crate is versioned independently of the product, so the real version
+    /// MUST be injected here rather than read from a local `CARGO_PKG_VERSION`.
+    pub user_agent: Option<String>,
+    /// Disable TLS certificate verification (self-signed / internal gateways).
+    /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
+    pub skip_tls_verify: bool,
 }
 
 impl OpenAiCompatConfig {
@@ -80,6 +89,8 @@ impl OpenAiCompatConfig {
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             request_signer: None,
+            user_agent: None,
+            skip_tls_verify: false,
         }
     }
 }
@@ -89,6 +100,13 @@ pub struct OpenAiCompatProvider {
     policy: ReasoningPolicy,
     client: reqwest::Client,
     url: String,
+    /// Stable per-conversation id, bound ONCE via [`bind_session_id`] when the kernel
+    /// spawns the owning Agent. Forwarded as the `x-atomcode-session-id` header so a
+    /// gateway can pin the conversation to one upstream for prefix-cache affinity.
+    /// `OnceLock` (not a lock-on-read mutex) because the id is constant for the
+    /// provider's life — a `/session` switch rebuilds the provider, never re-binds.
+    /// Unset ⇒ header omitted (session-less sub-agent / summary).
+    session_id: std::sync::OnceLock<String>,
 }
 
 impl OpenAiCompatProvider {
@@ -96,12 +114,20 @@ impl OpenAiCompatProvider {
         let policy = cfg
             .reasoning_policy
             .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
-        let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .connect_timeout(cfg.connect_timeout)
             // Drop idle keep-alive connections before the gateway LB does, so
             // we don't reuse a server-closed socket (the "error sending
             // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+            // Product UA so the gateway can attribute/slice traffic by version
+            // (parity with core's `build_http_client`). Driver injects the real
+            // `atomcode/<version>`; bare fallback when unset.
+            .user_agent(cfg.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+        if cfg.skip_tls_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder
             .build()
             .map_err(|e| ProviderError {
                 retryable: false,
@@ -109,7 +135,7 @@ impl OpenAiCompatProvider {
                 ..Default::default()
             })?;
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        Ok(Self { cfg, policy, client, url })
+        Ok(Self { cfg, policy, client, url, session_id: std::sync::OnceLock::new() })
     }
 }
 
@@ -121,6 +147,12 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn context_window(&self) -> u32 {
         self.cfg.context_window
+    }
+
+    fn bind_session_id(&self, session_id: &str) {
+        // One-shot: the kernel binds exactly once at spawn. Ignore a redundant
+        // re-bind (OnceLock keeps the first value) rather than panicking.
+        let _ = self.session_id.set(session_id.to_string());
     }
 
     async fn chat_stream(
@@ -152,8 +184,12 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = self.url.clone();
         let signer = self.cfg.request_signer.clone();
         let api_key = self.cfg.api_key.clone();
+        // Read the bound session id (unset ⇒ empty ⇒ header omitted); reused across
+        // the initial open and any mid-stream reopen.
+        let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp = open_stream(&client, &url, &body_bytes, &signer, &api_key, &policy).await?;
+        let resp =
+            open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await?;
 
         let s = async_stream::stream! {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
@@ -202,7 +238,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // cancelled with the turn.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &policy).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -249,6 +285,7 @@ async fn open_stream(
     body_bytes: &[u8],
     signer: &Option<std::sync::Arc<dyn RequestSigner>>,
     api_key: &str,
+    session_id: &str,
     policy: &RetryPolicy,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
@@ -266,6 +303,11 @@ async fn open_stream(
                 }
             }
             None => req = req.bearer_auth(api_key),
+        }
+        // Stable session id → lets the forwarding gateway pin this conversation to
+        // one upstream for prefix-cache affinity. Empty ⇒ omitted (sub-agent/summary).
+        if !session_id.is_empty() {
+            req = req.header("x-atomcode-session-id", session_id);
         }
         match req.send().await {
             Ok(resp) => {
@@ -1677,5 +1719,119 @@ mod tests {
         );
 
         let _ = handle.join();
+    }
+
+    // ---- gateway identity headers (session affinity + product UA) ----
+
+    /// Capture the raw request head (everything before the blank line) so a test can
+    /// assert on outbound headers, then drain the declared body so the client's
+    /// `send()` resolves cleanly.
+    fn capture_request_head(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                let clen = head
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
+                while remaining > 0 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => remaining = remaining.saturating_sub(n),
+                    }
+                }
+                return head;
+            }
+        }
+    }
+
+    /// Spin up a one-shot mock gateway that captures the first request's head and
+    /// answers with a complete SSE body. Returns (port, captured-head handle, join handle).
+    fn spawn_capture_gateway() -> (
+        u16,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            *cap.lock().unwrap() = capture_request_head(&mut s);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            s.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s.flush().unwrap();
+            drop(s);
+        });
+        (port, captured, handle)
+    }
+
+    #[tokio::test]
+    async fn forwards_session_id_and_product_ua_headers() {
+        let (port, captured, handle) = spawn_capture_gateway();
+
+        let mut cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        cfg.user_agent = Some("atomcode/9.9.9".to_string());
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        provider.bind_session_id("sess-abc-123");
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let _: Vec<StreamEvent> = stream.collect().await;
+        let _ = handle.join();
+
+        let head = captured.lock().unwrap().to_lowercase();
+        assert!(
+            head.contains("x-atomcode-session-id: sess-abc-123"),
+            "session-affinity header must be forwarded: {head}"
+        );
+        assert!(
+            head.contains("user-agent: atomcode/9.9.9"),
+            "product UA must be sent, not the reqwest default: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_session_header_when_unset_but_keeps_ua() {
+        let (port, captured, handle) = spawn_capture_gateway();
+
+        // No bind_session_id ⇒ unset ⇒ header omitted; UA falls back to the bare default.
+        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let _: Vec<StreamEvent> = stream.collect().await;
+        let _ = handle.join();
+
+        let head = captured.lock().unwrap().to_lowercase();
+        assert!(
+            !head.contains("x-atomcode-session-id"),
+            "no session id ⇒ affinity header must be omitted: {head}"
+        );
+        assert!(
+            head.contains("user-agent: atomcode"),
+            "UA fallback must still be present: {head}"
+        );
     }
 }

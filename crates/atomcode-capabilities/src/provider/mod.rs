@@ -32,6 +32,13 @@ pub use sign::{RequestSigner, SignedAuth};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Fallback User-Agent when a provider config carries no explicit `user_agent`.
+/// Bare (no version) on purpose: this crate is versioned independently of the
+/// product (`0.0.0`), so a local `CARGO_PKG_VERSION` would be MISLEADING. The
+/// driver (bridge) injects the real `atomcode/<version>` via `*Config::user_agent`;
+/// this fallback only applies to direct/test construction.
+pub(crate) const DEFAULT_USER_AGENT: &str = "atomcode";
+
 /// Process-local sequence so dumps sort in call order even when two land in the same
 /// nanosecond (the timestamp alone isn't a tiebreaker under concurrency).
 static WIRE_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);

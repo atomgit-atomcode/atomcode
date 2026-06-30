@@ -379,6 +379,18 @@ impl Agent {
             }
             _ => (0, 0),
         };
+        // Bind the session id onto the provider before the turn loop starts so an
+        // adapter can forward it as the gateway prefix-cache-affinity header
+        // (`x-atomcode-session-id`). This is the ONE place every driver's Agent is
+        // spawned — bridge, native tuix, ACP, headless all route through
+        // `coding::assemble` → here — so no driver re-wires it and there is no
+        // divergence. Mirrors core v1, which set the id on its provider at startup.
+        // A respawn (model swap / resume) rebuilds the Agent, re-binding automatically;
+        // `None` (e.g. a session-less sub-agent) leaves the provider's empty default,
+        // so the header is omitted.
+        if let Some(sid) = self.session_id.as_deref() {
+            self.provider.bind_session_id(sid);
+        }
         let running = RunningAgent {
             provider: self.provider,
             tools: self.tools,
@@ -2446,5 +2458,74 @@ mod cap_tests {
         cap_tool_result(&mut a, 333);
         cap_tool_result(&mut b, 333);
         assert_eq!(a.content, b.content, "same content + same cap must yield byte-identical truncation");
+    }
+}
+
+#[cfg(test)]
+mod session_affinity_tests {
+    use super::*;
+    use crate::stream::ProviderError;
+    use crate::tool::{ToolDef, ToolRegistry};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::{Arc, Mutex};
+
+    /// Records the session id the kernel binds onto its provider at spawn time, so the
+    /// test can prove the binding happens HERE (covering every driver) rather than in a
+    /// driver. `chat_stream` is never exercised — `bind_session_id` runs at spawn.
+    struct SessionIdRecorder {
+        seen: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SessionIdRecorder {
+        fn model_name(&self) -> &str {
+            "recorder"
+        }
+        fn bind_session_id(&self, session_id: &str) {
+            *self.seen.lock().unwrap() = Some(session_id.to_string());
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done { truncated: false }])))
+        }
+    }
+
+    fn agent_with(session: Option<&str>, seen: Arc<Mutex<Option<String>>>) -> Agent {
+        let mut b = Agent::builder()
+            .provider(Arc::new(SessionIdRecorder { seen }))
+            .tools(ToolRegistry::new().mount(&[]))
+            .persona("p");
+        if let Some(s) = session {
+            b = b.session_id(s);
+        }
+        b.build()
+    }
+
+    #[tokio::test]
+    async fn kernel_binds_session_id_onto_provider_at_spawn() {
+        let seen = Arc::new(Mutex::new(None));
+        // spawn() binds the id synchronously before the session loop task starts.
+        let _handle = agent_with(Some("sess-xyz"), seen.clone()).spawn();
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("sess-xyz"),
+            "the kernel must forward the bound session id to the provider — this is the one \
+             wiring point shared by every driver (bridge / native / acp / headless)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_id_leaves_provider_unbound() {
+        let seen = Arc::new(Mutex::new(None));
+        let _handle = agent_with(None, seen.clone()).spawn();
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "without a session id the provider must stay unbound so the affinity header is omitted"
+        );
     }
 }
