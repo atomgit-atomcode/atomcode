@@ -1706,18 +1706,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
-        // Hide the terminal cursor while EITHER a live spinner OR an
-        // inflight-tool row is animating. The inflight branch was added
-        // when `render_inflight_tool` switched to direct cursor-position
-        // writes (to fix the scrollback-leak bug): those writes leave
-        // the real terminal cursor at end-of-row, but `screen` doesn't
-        // know that since it bypasses the cell-diff path. Without
-        // hiding, the user sees a blinking caret floating at the right
-        // edge of the active `▸ Bash(...)` row in addition to the input
-        // box's caret. `inflight_tool.is_none()` flips back as soon as
+        // Hide the terminal cursor ONLY while an inflight-tool row is
+        // animating. `render_inflight_tool`'s in-place path writes raw
+        // cursor-position bytes via `self.out.write_all` to overwrite each
+        // row, leaving the terminal cursor at end-of-row. `paint_footer`
+        // repositions the cell-model cursor to the input box but
+        // `set_cursor_visible(true)` keeps the terminal blinking — so for
+        // every 5ms paint window before the next CUP lands, the user saw
+        // two carets. `inflight_tool.is_none()` flips back as soon as
         // the call commits, so the cursor reappears at the input box on
         // the very next 5ms paint tick.
-        let suppress_cursor = self.live_spinner_active || self.inflight_tool.is_some();
+        //
+        // The live spinner is NOT a reason to hide the input cursor: the
+        // spinner lives in the BODY now (not the footer), and the input
+        // box stays editable during streaming (type-ahead message queue),
+        // so hiding the caret would leave the user typing blind — the
+        // "no cursor while replying" bug.
+        let suppress_cursor = self.inflight_tool.is_some();
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 
@@ -2243,8 +2248,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
-        // The cursor will be re-shown on the next paint_footer (which
-        // sees live_spinner_active=false and calls set_cursor_visible(true)).
+        // (Cursor visibility is no longer coupled to the spinner — the
+        // input box stays editable during streaming, so the caret is
+        // always shown at the input position. See `paint_footer`.)
         // After pop, the spinner row's screen slot is `next_body_emit_row`
         // (1-indexed) — that's where the spinner was and where the next
         // body emit will land. EL it now for immediate visual feedback;
@@ -2396,11 +2402,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.push_body_row(row_cells);
             self.live_spinner_active = true;
         }
-        // Cursor visibility is driven by `paint_footer` reading
-        // `live_spinner_active` — see set_cursor_visible call there.
-        // No direct DECTCEM write here, otherwise the next render_diff
-        // would re-emit \x1b[?25h based on screen.cursor_visible and
-        // visually undo our hide on a 5ms cadence.
+        // (Cursor visibility is driven by `paint_footer` reading
+        // `inflight_tool` only — the spinner no longer hides the input
+        // caret. No direct DECTCEM write here, otherwise the next
+        // render_diff would re-emit \x1b[?25h based on
+        // screen.cursor_visible and visually undo our hide on a 5ms
+        // cadence.)
     }
 
     /// Freeze the current inflight_tool row into the body transcript
@@ -6353,10 +6360,11 @@ mod tests {
     /// keeps the terminal blinking — so for every 5ms paint window
     /// before the next CUP lands, the user saw two carets.
     ///
-    /// Fix: hide the cursor whenever an inflight tool is active, in
-    /// addition to the existing live-spinner gate. `inflight_tool.is_none()`
-    /// flips back at commit time, so the cursor reappears at the input
-    /// box on the next paint without a leftover blink.
+    /// Fix: hide the cursor whenever an inflight tool is active.
+    /// `inflight_tool.is_none()` flips back at commit time, so the
+    /// cursor reappears at the input box on the next paint without a
+    /// leftover blink. (The live spinner was removed from this gate —
+    /// see `retained_spinner_keeps_input_cursor_visible`.)
     #[test]
     fn retained_inflight_tool_hides_terminal_cursor() {
         let term_w: u16 = 80;
@@ -6409,6 +6417,51 @@ mod tests {
             vterm.cursor_visible(),
             "terminal cursor must be visible again after the inflight tool \
              commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
+    /// Regression: user reported "no cursor" (没有光标) while typing
+    /// into the input box DURING a reply — the caret disappears as soon
+    /// as the streaming spinner starts animating. Root cause: the live
+    /// spinner used to live in the FOOTER and `paint_footer` hid the
+    /// terminal cursor while `live_spinner_active` was true. But the
+    /// spinner moved to the BODY (see `push_or_update_live_spinner`)
+    /// and the input box stayed editable during streaming (type-ahead
+    /// message queue), so hiding the caret left the user typing blind.
+    ///
+    /// Fix: only `inflight_tool.is_some()` suppresses the cursor now —
+    /// the spinner is in the body and the input caret must stay visible
+    /// so the user sees where they're typing while queuing the next
+    /// message.
+    #[test]
+    fn retained_spinner_keeps_input_cursor_visible() {
+        let term_w: u16 = 80;
+        let (mut r, buf) = new_capturing(term_w, 24);
+
+        // Seed input prompt so the footer has a cursor position.
+        r.render(UiLine::InputPrompt {
+            buf: "meiyouguangbiao".into(),
+            cursor_byte: 16,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        // Spinner ticks (simulating streaming) — the caret must NOT
+        // disappear.
+        for frame in ["⠋", "⠙", "⠹", "⠸"] {
+            r.render(UiLine::Spinner {
+                frame: frame.into(),
+                label: "thinking".into(),
+            });
+        }
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "input cursor must stay visible during spinner activity — \
+             the input box is editable during streaming (type-ahead), \
+             hiding it leaves the user typing blind"
         );
     }
 
