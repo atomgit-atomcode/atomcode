@@ -704,7 +704,12 @@ fn remove_tag_content(html: &str, tag: &str) -> String {
     let close = format!("</{tag}>");
     let mut result = String::with_capacity(html.len());
     let mut pos = 0;
-    let lower = html.to_lowercase();
+    // ASCII-only lowercase: tag names are ASCII, and `to_ascii_lowercase` is
+    // byte-length-preserving (1 byte → 1 byte, non-ASCII untouched), so offsets found in
+    // `lower` stay valid for slicing `html`. Full `to_lowercase()` is NOT length-preserving
+    // (e.g. `İ`→`i̇` grows a byte), which drifts the two strings' offsets apart and panics
+    // with "byte index out of bounds" on a page containing such a character.
+    let lower = html.to_ascii_lowercase();
     loop {
         let Some(rel) = lower[pos..].find(&open) else {
             result.push_str(&html[pos..]);
@@ -731,7 +736,12 @@ fn remove_tag_content(html: &str, tag: &str) -> String {
 fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
     let open = format!("<{tag}");
     let mut result = String::with_capacity(html.len());
-    let lower = html.to_lowercase();
+    // ASCII-only lowercase: tag names are ASCII, and `to_ascii_lowercase` is
+    // byte-length-preserving (1 byte → 1 byte, non-ASCII untouched), so offsets found in
+    // `lower` stay valid for slicing `html`. Full `to_lowercase()` is NOT length-preserving
+    // (e.g. `İ`→`i̇` grows a byte), which drifts the two strings' offsets apart and panics
+    // with "byte index out of bounds" on a page containing such a character.
+    let lower = html.to_ascii_lowercase();
     let mut pos = 0;
     loop {
         let Some(rel) = lower[pos..].find(&open) else {
@@ -759,6 +769,23 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_removal_does_not_panic_on_length_changing_lowercase() {
+        // REGRESSION (web_fetch.rs:710 panic): `İ` (U+0130) lowercases to `i̇` (2 bytes →
+        // 3) under full `to_lowercase()`, so offsets found in the lowercased copy drift PAST
+        // the end of the original `html` → "byte index out of bounds". A page full of such
+        // chars before a tag reproduces it. With the ASCII-lowercase fix, `İ` is untouched
+        // and offsets stay aligned. Assert no panic AND correct removal.
+        let prefix = "İ".repeat(1000); // 2000 bytes in html, 3000 in full-lowercase
+        let html = format!("{prefix}<script>x=1;</script>{prefix}");
+        let out = remove_tag_content(&html, "script");
+        assert_eq!(out, format!("{prefix}{prefix}"), "script removed, İ text preserved");
+
+        let html2 = format!("{prefix}<br>{prefix}");
+        let out2 = replace_tag_with(&html2, "br", "\n");
+        assert_eq!(out2, format!("{prefix}\n{prefix}"), "br replaced, İ text preserved");
+    }
 
     #[test]
     fn strips_forge_chrome_to_dominant_code_block() {
