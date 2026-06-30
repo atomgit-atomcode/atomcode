@@ -27,7 +27,8 @@ export type SSEEvent =
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string };
+  | { type: 'warning'; message: string }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean };
 
 export interface ModelInfo {
   provider: string;
@@ -220,10 +221,16 @@ export interface CreateSessionResponse {
   created_at: number;
 }
 
-export async function createSession(workingDir?: string, title?: string): Promise<CreateSessionResponse> {
-  const body: Record<string, string> = {};
+export async function createSession(
+  workingDir?: string,
+  title?: string,
+  sync?: boolean,
+): Promise<CreateSessionResponse> {
+  const body: Record<string, string | boolean> = {};
   if (workingDir) body.working_dir = workingDir;
   if (title) body.title = title;
+  // 仅在 webui 开启同步时让后端广播会话切换，使 sync 模式 TUI 跟随新建（issue #850）。
+  if (sync) body.sync = true;
   const resp = await fetch('/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -510,6 +517,7 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'session_switched'; session_id: string }
   | { type: 'working_dir'; working_dir: string };
@@ -565,6 +573,18 @@ export async function postLiveStop(): Promise<void> {
     headers: authHeaders(),
   });
   if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
+}
+
+/** Sync-mode session switch: notify the daemon when the user selects a
+ *  different (existing) session in the sidebar, so the same-process TUI
+ *  follows — loading that session's history. Broadcasts via the same path
+ *  as new-session creation; a no-op server-side when no view is attached. */
+export async function postLiveSwitchSession(sessionId: string): Promise<void> {
+  await fetch('/live/switch_session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown

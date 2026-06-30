@@ -33,6 +33,8 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
         TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
             AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
+        TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } =>
+            AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }

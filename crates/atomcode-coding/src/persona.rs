@@ -130,7 +130,7 @@ Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pr
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
 ## CONTENT-TRANSFORMATION:
-When the user asks you to translate, format, convert, rewrite, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. If the full output would exceed your token budget, write it to a file with `write_file` and report the path; never inline-abbreviate. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
+When the user asks you to translate, format, convert, rewrite, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. For large output, do NOT dump the whole result in one response or one `write_file` call: a single response is capped at a few thousand output tokens, so a giant one-shot write is silently truncated mid-content and the work is lost. Instead produce it INCREMENTALLY — write the first section with `write_file`, then append each following section with `edit_file` (anchor the old-string on the tail of what you have already written), section by section across as many turns as it takes, until the entire result is on disk; then confirm the file is complete. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
 
 ## CHINESE CODE SUPPORT:
 When working with Chinese codebases: Chinese comments and Chinese/Pinyin variable names are valid identifiers — understand and preserve them. Use Unicode-aware patterns when searching for Chinese content. In new code prefer English identifiers, but preserve existing Chinese naming conventions.";
@@ -223,6 +223,35 @@ mod tests {
         assert!(
             !atomcode_capabilities::tools::coding_tool_names().contains(&"change_dir"),
             "change_dir is intentionally unregistered; if that changes, update the persona too"
+        );
+    }
+
+    #[test]
+    fn content_transformation_steers_to_incremental_writes_not_one_shot() {
+        // A large translate/rewrite must NOT be dumped in one response or one
+        // write_file call — that hits the OUTPUT-token cap and truncates mid-content
+        // (the reported "I'll write it in one go" → finish_reason=length failure).
+        // The persona must steer toward INCREMENTAL file writes instead. Guard the
+        // exact failure mode so nobody re-introduces the one-shot advice.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("## CONTENT-TRANSFORMATION:"),
+            "content-transformation section must exist"
+        );
+        assert!(
+            p.contains("INCREMENTALLY"),
+            "large transforms must be steered to incremental writes: {p}"
+        );
+        assert!(
+            p.contains("edit_file"),
+            "the incremental path must name edit_file for appending sections"
+        );
+        // The old, harmful advice ("write it to a file with write_file" as the
+        // escape hatch for over-budget output) must be gone — a single write_file
+        // is subject to the SAME output cap, so it does not escape truncation.
+        assert!(
+            !p.contains("write it to a file with `write_file` and report the path"),
+            "must not advise a one-shot whole-file write for over-budget output"
         );
     }
 

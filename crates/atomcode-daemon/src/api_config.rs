@@ -1,7 +1,6 @@
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use axum::{response::IntoResponse, Json};
-use std::collections::HashMap;
 
 use crate::{json_error, ConfigResponse, ProviderInfo};
 
@@ -26,24 +25,7 @@ pub(crate) fn load_config() -> Result<Config, String> {
 }
 
 fn empty_config() -> Config {
-    Config {
-        default_provider: String::new(),
-        evaluator_provider: None,
-        default_workdir: None,
-        providers: HashMap::new(),
-        datalog: Default::default(),
-        notifications: Default::default(),
-        auto_update: true,
-        telemetry: Default::default(),
-        lsp: Default::default(),
-        auto_commit: false,
-        subagent: Default::default(),
-        vision_preprocessor_provider: None,
-        language: None,
-        ui: Default::default(),
-        plugin: Default::default(),
-        web_search: Default::default(),
-    }
+    Config::default()
 }
 
 /// Build a sanitized ConfigResponse from a loaded Config.

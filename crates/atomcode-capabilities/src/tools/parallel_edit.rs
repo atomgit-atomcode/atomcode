@@ -430,8 +430,14 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
+        // Isolated EMPTY working dir. Pointing at the *shared* std::env::temp_dir()
+        // let the post-edit build-verification probe (find_build_command scans
+        // working_dir + its immediate subdirs) pick up a stray sibling
+        // package.json/Cargo.toml left by another test/tool and run a real, failing
+        // build — spuriously flipping is_error. A dedicated empty dir keeps it inert.
+        let dir = tempfile::tempdir().expect("tempdir").keep();
         ToolContext {
-            working_dir: std::env::temp_dir(),
+            working_dir: dir,
             cancel: CancellationToken::new(),
             progress: ProgressSink::noop(),
         }
@@ -456,7 +462,8 @@ mod tests {
             ProgressSink::new(Arc::new(move |m| c.lock().unwrap().push(m)))
         };
         let ctx = ToolContext {
-            working_dir: std::env::temp_dir(),
+            // Isolated empty dir — see `ctx()` for why the shared temp dir is unsafe.
+            working_dir: tempfile::tempdir().expect("tempdir").keep(),
             cancel: CancellationToken::new(),
             progress: sink,
         };

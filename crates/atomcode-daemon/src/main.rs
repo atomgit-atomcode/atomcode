@@ -95,9 +95,18 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     // 0 = disabled; non-zero values are clamped to a minimum of 60s to prevent
     // accidental rapid cycling from misconfigured environments.
     let raw_timeout = idle_timeout
-        .or_else(|| std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT").ok()?.parse().ok())
+        .or_else(|| {
+            std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
+                .ok()?
+                .parse()
+                .ok()
+        })
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-    let timeout = if raw_timeout == 0 { 0 } else { raw_timeout.max(60) };
+    let timeout = if raw_timeout == 0 {
+        0
+    } else {
+        raw_timeout.max(60)
+    };
 
     let mode = match client_mode.as_deref() {
         Some("vscode") => SessionMode::Vscode,
@@ -106,7 +115,13 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
         _ => SessionMode::Ide,
     };
 
-    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout, mode)
+    (
+        host.unwrap_or_else(|| DEFAULT_HOST.to_string()),
+        port.unwrap_or(DEFAULT_PORT),
+        cli_override,
+        timeout,
+        mode,
+    )
 }
 
 #[tokio::main]
@@ -117,7 +132,9 @@ async fn main() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
 
     // Used by IDE packaging to reject a daemon compiled after the private

@@ -3,7 +3,7 @@
 use crate::agent::{Agent, AutoRespond};
 use crate::event::AgentCommand;
 use crate::event::StopReason;
-use crate::hook::{LifecycleHooks, TurnCtx};
+use crate::hook::{LifecycleHooks, RateLimitDecision, RateLimitHint, TurnCtx};
 use crate::tool::MountedTools;
 use crate::message::{
     CompactionPlan, CompactionStrategy, CompactionView, Conversation, Message,
@@ -275,7 +275,7 @@ impl Tool for EchoTool {
         serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("echo: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -303,7 +303,7 @@ impl Tool for CountingTool {
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("count#{n} args={args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -355,7 +355,7 @@ impl Tool for InjectCommandTool {
                 tokio::task::yield_now().await;
             }
         }
-        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "injected".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -373,7 +373,7 @@ impl Tool for RiskyWriteTool {
         RiskLevel::Risky
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("wrote: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -573,7 +573,7 @@ impl Tool for DangerousBashTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false }
+        ToolResult { call_id: String::new(), content: format!("ran: {args}"), is_error: false, images: vec![] }
     }
 }
 
@@ -1003,6 +1003,7 @@ impl Tool for SubAgentTool {
             call_id: String::new(),
             content,
             is_error,
+            images: vec![],
         }
     }
 }
@@ -1028,6 +1029,7 @@ impl Tool for WorkingDirProbeTool {
             call_id: String::new(),
             content: ctx.working_dir.display().to_string(),
             is_error: false,
+            images: vec![],
         }
     }
 }
@@ -1067,6 +1069,42 @@ impl Tool for BlockUntilCancelTool {
             call_id: String::new(),
             content: "observed cancel".into(),
             is_error: false,
+            images: vec![],
         }
+    }
+}
+
+/// A `LifecycleHooks` that returns a FIXED `on_rate_limit` verdict — lets tests
+/// drive the kernel's 429 branch (wait-and-retry vs pause) without any network
+/// or usage data.
+pub struct ScriptedRateLimitHook {
+    decision: RateLimitDecision,
+}
+
+impl ScriptedRateLimitHook {
+    pub fn new(decision: RateLimitDecision) -> Self {
+        Self { decision }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for ScriptedRateLimitHook {
+    async fn on_rate_limit(&self, _hint: &RateLimitHint) -> Option<RateLimitDecision> {
+        Some(self.decision.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hook::{RateLimitDecision, RateLimitHint};
+
+    #[tokio::test]
+    async fn scripted_rate_limit_hook_returns_programmed_decision() {
+        let hook = ScriptedRateLimitHook::new(RateLimitDecision::WaitAndRetry { secs: 7 });
+        let got = hook
+            .on_rate_limit(&RateLimitHint { http_status: Some(429), retry_after_secs: None })
+            .await;
+        assert_eq!(got, Some(RateLimitDecision::WaitAndRetry { secs: 7 }));
     }
 }

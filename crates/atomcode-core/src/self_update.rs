@@ -226,7 +226,7 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
 /// fast at startup); here the user explicitly asked for an upgrade, so
 /// waiting 30s for a slow mirror is acceptable.
 pub async fn fetch_manifest() -> Result<Manifest> {
-    let client = reqwest::Client::builder()
+    let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()?;
@@ -276,7 +276,7 @@ async fn download_and_verify(
         let _ = std::fs::remove_file(dest);
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(600))
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()?;

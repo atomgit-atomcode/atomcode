@@ -115,7 +115,7 @@ pub trait LlmProvider: Send + Sync {
 /// `skip_tls_verify` disables TLS certificate verification when true.
 pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(30))
         // Total request timeout. Long edit_file / write_file generations
         // on self-hosted GLM/Qwen NPU clusters can stream for 5-15 min on
@@ -553,7 +553,7 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     // Same 5s/10s budget as `auth::oauth::blocking_client` — this runs on
     // the TUI thread via `get_valid_token`, so an unreachable OAuth host
     // must never hang the UI.
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -698,7 +698,12 @@ mod tests {
     /// This prevents regressions where OAuth login token persistence breaks
     /// after program restart due to path mismatch.
     #[test]
+    #[serial_test::serial]
     fn test_auth_token_path_consistency() {
+        // `#[serial]`: `auth_file_path()` honours the process-global `ATOMCODE_HOME`,
+        // which other (serial) tests set to a tempdir and clear on drop. Without
+        // serialising, this test can observe their value and see a temp path instead
+        // of `~/.atomcode/auth.toml`.
         // Both paths should resolve to the same location: ~/.atomcode/auth.toml
         let auth_module_path = crate::auth::auth_file_path();
         let expected_path = crate::tool::real_home_dir()

@@ -38,10 +38,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  × CodingPlan 套餐配置失败 — {}\n", error).into(),
         Msg::CpClaimFailedBare =>
             "  × CodingPlan 套餐配置失败\n".into(),
-        Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
-        Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
+        Msg::CpClaimTierSucceeded { plan } =>
+            format!("  ✓ {} 生效\n", plan).into(),
+        Msg::CpClaimTierAlreadyHeld { plan } =>
+            format!("  ✓ {} 生效\n", plan).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
             format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
@@ -77,8 +77,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
-        Msg::CpMonthlyQuotaExhausted { duration } =>
-            format!("      用量：本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -147,8 +145,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::StatusCpUsage { usage, reset_at, duration } =>
             format!("  用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
-        Msg::StatusCpMonthlyExhausted { duration } =>
-            format!("  ⚠ 本月用量已耗尽，等 {} 后再使用\n", duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::StatusCpWindowHint { hint } =>
@@ -192,6 +188,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 会话 ──
     Ctrl+C                           取消当前轮 / 关闭弹层
+    Esc Esc                          撤销上一轮
     Ctrl+D                           退出 atomcode
     Ctrl+L                           清屏
     Ctrl+O                           切换工具实时输出
@@ -913,6 +910,12 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::Compacting => "正在压缩…".into(),
+        Msg::CompactingSlow => "正在压缩…（较慢）".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("已压缩 · 摘要 {} 条 · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("已折叠工具输出 · 节省 ~{} tok", saved).into(),
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
              用法：\n  \
@@ -952,6 +955,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
+        Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \
@@ -1074,7 +1078,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
-        Msg::StreamStalled => "响应较慢 · esc 取消".into(),
+        Msg::StreamStalled => "按 esc 可取消".into(),
+        Msg::ConhostScrollHint =>
+            "提示：当前为经典 Windows 控制台，任务执行中无法上滚查看历史（任务结束后即可正常滚动）。\
+             如需在执行过程中滚动，建议改用 \x1b[1;96mWindows Terminal\x1b[0m。"
+                .into(),
     }
 }
 
@@ -1112,5 +1120,12 @@ mod codingplan_crypto_tests {
     fn zh_upgrade_required_is_non_empty() {
         let s = zh_cn(Msg::CpUpgradeRequired);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn zh_conhost_scroll_hint_recommends_windows_terminal() {
+        let s = zh_cn(Msg::ConhostScrollHint);
+        assert!(s.contains("Windows Terminal"));
+        assert!(s.contains("滚"));
     }
 }

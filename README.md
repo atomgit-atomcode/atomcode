@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.7-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -111,6 +111,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Real-time streaming** with markdown rendering and syntax highlighting
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
+- **Task completion notifications** — long-running tasks trigger terminal-native notifications first (kitty / WezTerm / iTerm2), falling back to OS-native alerts
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
 - **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
@@ -293,6 +294,7 @@ Then just type what you want:
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
+| `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept suggestion |
 | `Ctrl+U` | Clear line |

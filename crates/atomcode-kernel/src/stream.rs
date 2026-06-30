@@ -43,6 +43,11 @@ pub struct ProviderError {
     /// `type` when no `code` is given. `None` if the provider surfaced neither. Lets a
     /// consumer branch on the code instead of string-matching `message`.
     pub code: Option<String>,
+    /// Seconds from the response's real `Retry-After` header on a 429 OPEN failure, when
+    /// the provider supplied one. Authoritative countdown for the rate-limit self-heal —
+    /// preferred over scraping the error text. `None` for transport / mid-stream errors
+    /// (no headers) or a 429 whose response carried no parseable `Retry-After`.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl ProviderError {
@@ -172,7 +177,7 @@ mod overflow_tests {
     use super::ProviderError;
 
     fn err(http: Option<u16>, code: Option<&str>, msg: &str) -> ProviderError {
-        ProviderError { retryable: false, message: msg.into(), http_status: http, code: code.map(Into::into) }
+        ProviderError { retryable: false, message: msg.into(), http_status: http, code: code.map(Into::into), retry_after_secs: None }
     }
 
     #[test]

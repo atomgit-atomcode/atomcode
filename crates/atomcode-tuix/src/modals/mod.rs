@@ -26,8 +26,10 @@ pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
 pub mod plugin_manager;
-mod qr;
+pub mod password;
 pub mod provider_wizard;
+pub mod proxy_picker;
+mod qr;
 pub mod session_picker;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
@@ -37,6 +39,7 @@ pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
 pub use plugin_manager::PluginManager;
 pub use provider_wizard::ProviderWizard;
+pub use proxy_picker::ProxyPicker;
 pub use session_picker::SessionPicker;
 
 /// Result of a modal consuming one key event.
@@ -90,6 +93,17 @@ pub trait Modal: Send {
         buf.insert_paste(text.to_string());
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
+    }
+
+    /// Whether this modal must receive ALL key/paste events regardless of the
+    /// current `UiPhase`. The default Idle-only modal routing assumes the modal
+    /// was opened from the prompt while idle; but the password modal installs
+    /// mid-turn (phase == `Streaming`) when sudo/ssh asks for a password, so it
+    /// must capture keys even while a tool runs — otherwise the typed password
+    /// leaks into the type-ahead buffer and Esc cancels the turn instead of the
+    /// modal. Default: `false` (preserve existing Idle-only behavior).
+    fn captures_all_keys(&self) -> bool {
+        false
     }
 
     /// Notify the modal that an async plugin job finished, so it can refresh

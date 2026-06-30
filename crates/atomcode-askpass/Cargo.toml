@@ -1,0 +1,13 @@
+[package]
+name = "atomcode-askpass"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["net", "rt", "sync", "io-util", "macros", "time"] }
+libc = "0.2"

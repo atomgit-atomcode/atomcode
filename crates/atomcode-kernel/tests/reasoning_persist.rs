@@ -71,3 +71,60 @@ async fn final_answer_reasoning_is_persisted_on_the_stored_message() {
         "the final-answer reasoning must be PERSISTED on the stored message (no v1 placeholder bug)"
     );
 }
+
+/// A model/gateway that MISROUTES the answer into the reasoning channel (observed with
+/// Qwen3-VL via a gateway whose reasoning-parser never sees a closing `</think>`, so the
+/// whole answer lands in `reasoning_content` and `content` is empty). The turn would
+/// otherwise render BLANK. The kernel must PROMOTE the reasoning to the body: surface it
+/// live (a TextDelta) AND store it as `content` so it persists for context — gated tightly
+/// to empty-content + no-tool-calls + a real stop, so a normal model is never affected.
+#[tokio::test]
+async fn reasoning_only_turn_is_promoted_to_the_answer() {
+    let provider = Arc::new(RecordingProvider::new(vec![
+        // Turn 1: ONLY reasoning, NO content body, NO tool calls — the misrouted answer.
+        vec![
+            StreamEvent::Reasoning("目录下有 2 个文件：a.png 和 b.png。".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
+    ]));
+    let calls = provider.calls();
+
+    let mut h = Agent::builder()
+        .provider(provider)
+        .tools(ToolRegistry::new().mount(&[]))
+        .build()
+        .spawn();
+
+    // Drive turn 1, collecting the live text the driver (TUI) would render as the body.
+    h.commands.send(AgentCommand::SendMessage { text: "目录里有啥".into(), images: vec![] }).unwrap();
+    let mut live_text = String::new();
+    while let Some(ev) = h.events.recv().await {
+        match ev {
+            AgentEvent::TextDelta(t) => live_text.push_str(&t),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drive(&mut h, "thanks").await;
+    h.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = h.task.await;
+
+    // (1) LIVE: the answer must reach the driver as body text (TextDelta), not stay hidden
+    // in the reasoning channel — otherwise the user sees a blank turn.
+    assert!(
+        live_text.contains("目录下有 2 个文件"),
+        "misrouted reasoning must be surfaced as live body text; got {live_text:?}"
+    );
+
+    // (2) STORED: the promoted answer must be the assistant message's CONTENT (persisted
+    // for the next turn's context), and no longer dangling in the reasoning channel.
+    let calls = calls.lock().unwrap();
+    let turn2 = &calls[1].0;
+    let answer = turn2
+        .iter()
+        .find(|m| m.role == Role::Assistant && m.text.contains("目录下有 2 个文件"))
+        .expect("the promoted answer must be the stored assistant CONTENT");
+    assert!(answer.tool_calls.is_empty());
+    assert_eq!(answer.reasoning, None, "after promotion the answer is content, not reasoning");
+}

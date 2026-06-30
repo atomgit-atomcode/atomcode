@@ -199,6 +199,7 @@ impl Tool for RecallTool {
                     call_id: String::new(),
                     content: format!("invalid recall arguments: {e}"),
                     is_error: true,
+                    images: vec![],
                 }
             }
         };
@@ -213,7 +214,7 @@ impl Tool for RecallTool {
             a.before.as_deref(),
             a.limit.unwrap_or(DEFAULT_LIMIT),
         );
-        ToolResult { call_id: String::new(), content, is_error: false }
+        ToolResult { call_id: String::new(), content, is_error: false, images: vec![] }
     }
 }
 

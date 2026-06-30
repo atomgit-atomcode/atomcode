@@ -139,24 +139,40 @@ async fn reasoning_is_emitted() {
     );
 }
 
-// A Done { truncated: true } must surface a Warning, and the turn still finishes
-// the round normally (no continuation — that is a separate follow-up task).
+// A Done { truncated: true } with no tool call (output cut off at the token
+// limit) auto-continues: inject a synthetic "resume" nudge and make a follow-up
+// LLM call rather than silently ending the turn (v1 parity —
+// atomcode-core/src/agent/mod.rs:3064). When that recovery happens, the scary
+// "response truncated" warning is SUPPRESSED — the work is being finished, so a
+// red alarm would be misleading. (The warning is reserved for the unrecoverable
+// case; see `repeated_truncation_is_bounded`.)
 #[tokio::test]
-async fn truncated_done_emits_warning() {
+async fn recovered_truncation_continues_without_warning() {
     let reg = ToolRegistry::new();
-    let provider = Arc::new(ScriptedProvider::events(vec![
-        StreamEvent::TextDelta("a long cut-off answer".into()),
-        StreamEvent::Done { truncated: true },
+    let provider = Arc::new(MockProvider::new(vec![
+        // round 1: output is cut off at the token limit
+        vec![
+            StreamEvent::TextDelta("a long cut-off answer".into()),
+            StreamEvent::Done { truncated: true },
+        ],
+        // round 2: the model wraps up cleanly after the resume nudge
+        vec![
+            StreamEvent::TextDelta("the rest, finished".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
-    let recorder = Arc::new(RecorderHook::new());
+    let received = provider.received.clone();
 
-    let handle = spawn_agent(provider, reg, recorder);
-    handle.commands.send(send("go")).unwrap();
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .build()
+        .spawn();
+    handle.commands.send(send("translate the whole file")).unwrap();
 
-    let mut events = handle.events;
     let mut warning: Option<String> = None;
     let mut completed = false;
-    while let Some(ev) = events.recv().await {
+    while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Warning(w) => warning = Some(w),
             AgentEvent::TurnComplete { .. } => {
@@ -166,12 +182,85 @@ async fn truncated_done_emits_warning() {
             _ => {}
         }
     }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
 
     assert!(
-        warning.as_deref().is_some_and(|w| w.contains("truncated")),
-        "a truncated Done must surface an AgentEvent::Warning; got {warning:?}"
+        warning.is_none(),
+        "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
-    assert!(completed, "a truncated response still finishes the round normally");
+    assert!(completed, "the turn still completes after the continuation");
+
+    let calls = received.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "truncation must drive a continuation round (a 2nd LLM call); got {} calls",
+        calls.len()
+    );
+    // The follow-up call's LAST message is the synthetic resume nudge.
+    let nudge = &calls[1].last().unwrap().1;
+    let n = nudge.to_lowercase();
+    assert!(
+        n.contains("output limit") || n.contains("resume") || n.contains("cut off"),
+        "the 2nd call must carry a resume nudge; got {nudge:?}"
+    );
+}
+
+// The truncation auto-continuation MUST be bounded: a model that truncates on
+// every round (never wrapping up) cannot livelock the turn. After the bound the
+// turn terminates instead of re-prompting forever.
+#[tokio::test]
+async fn repeated_truncation_is_bounded() {
+    let reg = ToolRegistry::new();
+    // Every scripted round truncates; the queue is deep enough that the STOP must
+    // come from the kernel's own bound, not from the provider running dry.
+    let turns: Vec<Vec<StreamEvent>> = (0..20)
+        .map(|_| {
+            vec![
+                StreamEvent::TextDelta("cut".into()),
+                StreamEvent::Done { truncated: true },
+            ]
+        })
+        .collect();
+    let provider = Arc::new(MockProvider::new(turns));
+    let received = provider.received.clone();
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+
+    let mut completed = false;
+    let mut warning: Option<String> = None;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warning = Some(w),
+            AgentEvent::TurnComplete { .. } => {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert!(completed, "the turn must terminate despite endless truncation");
+    let calls = received.lock().unwrap();
+    assert!(
+        calls.len() <= 4,
+        "truncation continuations must be tightly bounded; got {} LLM calls",
+        calls.len()
+    );
+    // UNRECOVERABLE truncation (budget exhausted, turn actually stops) MUST warn —
+    // this is the one case the user needs to see, and the only case that should.
+    assert!(
+        warning.as_deref().is_some_and(|w| w.contains("truncated")),
+        "an exhausted, turn-ending truncation must surface the warning; got {warning:?}"
+    );
 }
 
 // --- local helpers (keep each test terse; mirror spike_claims.rs style) ---

@@ -53,7 +53,7 @@ impl Tool for GetTimeTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "12:00".into(), is_error: false, images: vec![] }
     }
 }
 

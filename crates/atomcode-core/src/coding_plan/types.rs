@@ -80,6 +80,13 @@ pub struct ClaimResponse {
     pub duplicate: bool,
     #[serde(default)]
     pub message: String,
+    /// The user's actual plan name as the server sees it (e.g.
+    /// "CodingPlan Pro"), already carrying the "CodingPlan " prefix.
+    /// Newer gateways return this on every claim outcome; older ones
+    /// omit it, so it defaults to empty and the renderer falls back to
+    /// the requested cascade tier.
+    #[serde(default)]
+    pub plan_name: String,
 }
 
 /// `GET /api/v5/coding-plan/models-v2` element. Wire shape:
@@ -478,6 +485,25 @@ mod tests {
         let c: ClaimResponse = serde_json::from_str(body).unwrap();
         assert!(!c.success);
         assert!(c.duplicate);
+    }
+
+    /// Newer gateway returns the user's actual plan name alongside the
+    /// claim booleans — captured so the renderer can show the real plan
+    /// ("CodingPlan Pro") rather than the requested cascade tier ("Max").
+    #[test]
+    fn claim_response_parses_plan_name() {
+        let body = r#"{"success":true,"duplicate":false,"message":"领取成功。","plan_type":"Max","plan_name":"CodingPlan Pro"}"#;
+        let c: ClaimResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(c.plan_name, "CodingPlan Pro");
+    }
+
+    /// Legacy gateway omits `plan_name` — must default to empty (not a
+    /// deserialize error), so old servers keep working.
+    #[test]
+    fn claim_response_plan_name_defaults_empty_on_legacy_gateway() {
+        let body = r#"{"success":true,"duplicate":false,"message":"领取成功。"}"#;
+        let c: ClaimResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(c.plan_name, "");
     }
 
     #[test]

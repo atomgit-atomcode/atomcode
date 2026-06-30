@@ -144,6 +144,16 @@ pub struct UiState {
     pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// A compaction's slow LLM summary is currently running — the footer
+    /// spinner shows "Compacting…" instead of a thinking label and the stall
+    /// hint is compaction-specific. Set by `AgentEvent::CompactionUi(Begin)`,
+    /// cleared on `End`/`Mark`.
+    pub compacting: bool,
+    /// Whether `CompactionUi(Begin)` forced `phase = Streaming` (a standalone
+    /// manual `/compact` started from Idle, which otherwise animates no
+    /// spinner). If so, completion restores Idle; an auto-compaction runs
+    /// mid-turn and leaves the phase to the turn's own lifecycle.
+    pub compaction_forced_streaming: bool,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -308,6 +318,14 @@ pub struct UiState {
     /// event arrives. Mirrors `active_tool_batches` membership; cleared
     /// together.
     pub call_id_to_batch: std::collections::HashMap<String, String>,
+    /// Session map of todo task id → content, learned by parsing the full
+    /// list every `todo` result returns. `todo update` calls only carry
+    /// `id`+`status` in their arguments, so this is the only place the
+    /// task NAME is available at render time — used to upgrade an update
+    /// row from `#4 → completed` to `#4 Write tests → completed`. Never
+    /// cleared: ids are monotonic within a session, so a stale title is
+    /// harmless and a known title outlives the batch that revealed it.
+    pub todo_titles: std::collections::HashMap<u64, String>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -393,6 +411,8 @@ impl UiState {
             agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
+            compacting: false,
+            compaction_forced_streaming: false,
             unicode_symbols,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -428,6 +448,7 @@ impl UiState {
             sub_agent_started_at: None,
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
+            todo_titles: std::collections::HashMap::new(),
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
@@ -557,8 +578,40 @@ impl UiState {
         stream_stalled_for(awaiting_model, self.last_stream_activity.map(|t| t.elapsed()))
     }
 
+    /// Whether a running compaction's summary has stalled past
+    /// [`STREAM_STALL_HINT`]. Mirrors [`Self::stream_stalled`] but gates on
+    /// `compacting` instead of a THINKING_LABEL (the spinner shows
+    /// "Compacting…", not a thinking label, during a compaction).
+    pub fn compaction_stalled(&self) -> bool {
+        stream_stalled_for(self.compacting, self.last_stream_activity.map(|t| t.elapsed()))
+    }
+
     fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
+    }
+
+    /// The thinking word for the CURRENT turn — the one `on_thinking` re-displays.
+    /// `on_submit` bumps `thinking_idx` AFTER showing the word, so the active word
+    /// sits at `thinking_idx - 1` (mirrors the index `on_thinking` computes).
+    fn active_thinking_word(&self) -> &'static str {
+        let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
+        THINKING_LABELS[idx]
+    }
+
+    /// The spinner word to DISPLAY. Tool-execution labels (`Running X`,
+    /// `Preparing X`) are mapped back to the turn's thinking word so the footer
+    /// spinner never flashes tool names — tool progress is shown by the body
+    /// `▸ Tool(detail)` rows instead. Every other label (`Sub-agents N/M`,
+    /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
+    /// `spinner_label` and all phase-clock timing logic are untouched.
+    pub(crate) fn display_spinner_label(&self) -> &str {
+        if self.spinner_label.starts_with("Running ")
+            || self.spinner_label.starts_with("Preparing ")
+        {
+            self.active_thinking_word()
+        } else {
+            &self.spinner_label
+        }
     }
 
     pub fn on_submit(&mut self) {
@@ -581,6 +634,9 @@ impl UiState {
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        // Defensive: never carry a compaction spinner state into the next turn.
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
@@ -601,6 +657,8 @@ impl UiState {
     pub fn on_turn_cancelled(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         self.turn_prompt_tokens = 0;
@@ -613,6 +671,8 @@ impl UiState {
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.compacting = false;
+        self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
@@ -637,8 +697,15 @@ impl UiState {
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
+        // The kernel emits a ToolCallStreaming per streamed argument delta, so this is
+        // called repeatedly while a single tool call's args stream in (and again as the
+        // name fills in). Anchor the spinner clock ONLY on the transition INTO the
+        // preparing phase — resetting it on every delta made the elapsed ping-pong
+        // 0ms↔Nms (reported "Preparing … · 7ms" snapping back to 0, reading as a stuck
+        // loop). Mirrors the parallel-batch anchor (`on_tool_batch_started`).
+        let entering = !self.spinner_label.starts_with("Preparing");
         self.spinner_label = format!("Preparing {}", name);
-        if self.active_tool_batches.is_empty() {
+        if entering && self.active_tool_batches.is_empty() {
             self.phase_started_at = Some(std::time::Instant::now());
         }
     }
@@ -897,6 +964,37 @@ mod tests {
         assert!(s.stream_stalled(), "silent model stream past threshold must warn");
         s.on_tool_call_started("Bash"); // spinner = "Running Bash" — not a thinking label
         assert!(!s.stream_stalled(), "a slow tool must NOT trip the network warning");
+    }
+
+    #[test]
+    fn streaming_tool_args_anchor_the_clock_once_not_per_delta() {
+        // The kernel emits a ToolCallStreaming per streamed argument delta. Resetting
+        // the phase clock on each made the spinner elapsed ping-pong 0ms↔Nms (user
+        // report: "Preparing … · 7ms" snapping back to 0, looking like a stuck loop).
+        // The clock must anchor ONCE when the tool-call streaming BEGINS and then tick
+        // steadily across the remaining deltas — mirroring the parallel-batch anchor.
+        let mut s = UiState::new();
+        s.on_submit(); // spinner = a THINKING label
+        s.on_tool_call_streaming(""); // first delta: name unknown yet → "Preparing …"
+        let anchored = s
+            .phase_started_at
+            .expect("clock anchored on the first streaming delta");
+        s.on_tool_call_streaming(""); // more arg deltas of the SAME call …
+        s.on_tool_call_streaming("Bash"); // … then the name fills in
+        assert_eq!(
+            s.phase_started_at,
+            Some(anchored),
+            "the phase clock must NOT reset on each streamed delta (would flicker 0ms)"
+        );
+
+        // A genuinely new tool call (after the prior one ran) DOES re-anchor.
+        s.on_tool_call_started("Bash"); // "Running Bash"
+        s.on_tool_call_streaming(""); // a new call begins streaming
+        assert_ne!(
+            s.phase_started_at,
+            Some(anchored),
+            "a new tool call must re-anchor the clock"
+        );
     }
 
     #[test]
@@ -1356,5 +1454,20 @@ mod tests {
         };
         assert_eq!(q.images.len(), 1);
         assert_eq!(q.image_markers, vec![1]);
+    }
+
+    #[test]
+    fn compaction_stalled_only_when_compacting_and_silent() {
+        let mut s = UiState::new();
+        // Not compacting → never "compaction stalled" regardless of silence.
+        s.compacting = false;
+        s.last_stream_activity = Some(std::time::Instant::now() - STREAM_STALL_HINT);
+        assert!(!s.compaction_stalled());
+        // Compacting + silent past the threshold → stalled.
+        s.compacting = true;
+        assert!(s.compaction_stalled());
+        // Compacting but fresh activity → not stalled.
+        s.last_stream_activity = Some(std::time::Instant::now());
+        assert!(!s.compaction_stalled());
     }
 }

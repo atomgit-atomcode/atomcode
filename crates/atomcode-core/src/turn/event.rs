@@ -63,6 +63,16 @@ pub enum TurnEvent {
     /// TUI renders this as a one-line yellow banner; no turn failure.
     /// Currently used for "provider may be truncating input" detection.
     Warning(String),
+    /// A 429 rate-limit PAUSE — driver renders a non-error pause line with the
+    /// reset time. Empty strings / None when no usage data was available.
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        auto_resuming: bool,
+    },
     /// Token usage update
     TokenUsage {
         prompt_tokens: usize,

@@ -3,7 +3,6 @@ package com.atomcode.jetbrains.ui.message;
 import com.atomcode.jetbrains.ui.jcef.JBCefQueryHandlers;
 import com.intellij.ui.jcef.JBCefApp;
 import com.intellij.ui.jcef.JBCefBrowser;
-import com.intellij.ui.jcef.JBCefJSQuery;
 import org.cef.browser.CefBrowser;
 import org.cef.browser.CefFrame;
 import org.cef.handler.CefLoadHandlerAdapter;
@@ -21,13 +20,13 @@ import java.util.function.Consumer;
  */
 final class JBCefMessageBridge {
     private final JBCefBrowser browser;
-    private final JBCefJSQuery query;
+    private final Object query;
 
     static boolean isSupported() {
         return JBCefApp.isSupported();
     }
 
-    JBCefMessageBridge(Consumer<String> onHostMessage, Runnable onReady) {
+    JBCefMessageBridge(Consumer<String> onHostMessage, Runnable onReady) throws ReflectiveOperationException {
         browser = new JBCefBrowser();
         query = JBCefQueryHandlers.create(browser, message -> {
             if ("js:ready".equals(message)) {
@@ -41,12 +40,15 @@ final class JBCefMessageBridge {
             @Override
             public void onLoadEnd(CefBrowser cefBrowser, CefFrame frame, int httpStatusCode) {
                 if (frame != null && frame.isMain()) {
-                    cefBrowser.executeJavaScript(
-                        "window.atomcodeHost = function(msg) { " + query.inject("msg") + " }",
-                        cefBrowser.getURL(),
-                        0
-                    );
-                    onReady.run();
+                    try {
+                        cefBrowser.executeJavaScript(
+                            "window.atomcodeHost = function(msg) { " + JBCefQueryHandlers.inject(query, "msg") + " }",
+                            cefBrowser.getURL(),
+                            0
+                        );
+                        onReady.run();
+                    } catch (ReflectiveOperationException ignored) {
+                    }
                 }
             }
         }, browser.getCefBrowser());
@@ -68,7 +70,10 @@ final class JBCefMessageBridge {
     }
 
     void dispose() {
-        query.dispose();
+        try {
+            JBCefQueryHandlers.dispose(query);
+        } catch (ReflectiveOperationException ignored) {
+        }
         browser.dispose();
     }
 }

@@ -46,6 +46,50 @@ pub struct TurnCtx {
     pub used_tokens: u32,
 }
 
+/// Threshold: a 429 whose window resets within this many seconds is worth
+/// waiting out in-place (auto-resume); beyond it the turn pauses and hands back
+/// to the user. Mirrors the spec's `RATE_LIMIT_AUTO_WAIT_SECS`.
+pub const RATE_LIMIT_AUTO_WAIT_SECS: u64 = 120;
+
+/// What the kernel knows about a 429 at the moment it fires. The kernel cannot
+/// see CodingPlan usage windows (that lives in `atomcode-core`, off-limits here)
+/// so this carries only its own best-effort signal: the status and any
+/// `Retry-After`-style seconds parsed from the error text.
+#[derive(Debug, Clone)]
+pub struct RateLimitHint {
+    pub http_status: Option<u16>,
+    pub retry_after_secs: Option<u64>,
+}
+
+/// The host's verdict on a 429. `WaitAndRetry` => kernel sleeps (cancellably)
+/// then re-issues the round; `Pause` => kernel emits `RateLimited` and ends the
+/// turn cleanly (no red error), preserving already-produced content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RateLimitDecision {
+    WaitAndRetry { secs: u64 },
+    Pause {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+    },
+}
+
+impl RateLimitDecision {
+    /// Conservative fallback when NO host hook supplies a verdict (non-CodingPlan,
+    /// or usage data unavailable): wait only if the kernel's own hint says the
+    /// reset is imminent, otherwise pause with whatever little we know.
+    pub fn from_hint(hint: &RateLimitHint) -> Self {
+        match hint.retry_after_secs {
+            Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => RateLimitDecision::WaitAndRetry { secs: s },
+            _ => RateLimitDecision::Pause {
+                reset_at_display: String::new(),
+                reset_label: String::new(),
+                secs_until_reset: hint.retry_after_secs,
+            },
+        }
+    }
+}
+
 /// TURN-level lifecycle seam (session / turn / request / response / error). The
 /// "inject into the loop" side, distinct from the read-only AgentEvent stream.
 /// TOOL-level concerns (gate/rewrite/transform a tool call) live in
@@ -174,6 +218,13 @@ pub trait LifecycleHooks: Send + Sync {
     /// was called. PURE OBSERVATION — cannot alter flow. (Provider/stream errors
     /// are not routed here in this build.)
     async fn on_error(&self, _error: &str) {}
+
+    /// Called when the provider returns a 429. The host (which CAN see usage
+    /// windows) returns `Some(decision)`; `None` means "no opinion" and the kernel
+    /// falls back to `RateLimitDecision::from_hint`. Default: `None`.
+    async fn on_rate_limit(&self, _hint: &RateLimitHint) -> Option<RateLimitDecision> {
+        None
+    }
 
     /// Session ends (any exit path). Read-only conversation for cleanup / telemetry.
     async fn session_end(&self, _convo: &Conversation) {}
@@ -316,6 +367,15 @@ impl LifecycleHooks for HookChain {
         }
     }
 
+    async fn on_rate_limit(&self, hint: &RateLimitHint) -> Option<RateLimitDecision> {
+        for h in &self.hooks {
+            if let Some(d) = h.on_rate_limit(hint).await {
+                return Some(d);
+            }
+        }
+        None
+    }
+
     async fn session_end(&self, convo: &Conversation) {
         for h in &self.hooks {
             h.session_end(convo).await;
@@ -335,5 +395,37 @@ mod tests {
         assert_eq!(text, "hi", "empty chain must not mutate the prompt");
         let convo = Conversation::new();
         assert_eq!(chain.offer_continuation(&convo).await, None, "empty chain offer_continuation must be None");
+    }
+
+    #[test]
+    fn from_hint_waits_when_reset_imminent() {
+        let d = RateLimitDecision::from_hint(&RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: Some(45),
+        });
+        assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 45 });
+    }
+
+    #[test]
+    fn from_hint_pauses_when_reset_far_or_unknown() {
+        let far = RateLimitDecision::from_hint(&RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: Some(600),
+        });
+        assert!(matches!(far, RateLimitDecision::Pause { .. }));
+        let unknown = RateLimitDecision::from_hint(&RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: None,
+        });
+        assert!(matches!(unknown, RateLimitDecision::Pause { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_hook_on_rate_limit_returns_none() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl LifecycleHooks for Bare {}
+        let hint = RateLimitHint { http_status: Some(429), retry_after_secs: Some(10) };
+        assert!(Bare.on_rate_limit(&hint).await.is_none());
     }
 }

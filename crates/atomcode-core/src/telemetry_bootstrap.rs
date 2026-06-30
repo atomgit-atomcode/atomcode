@@ -5,11 +5,12 @@ use std::path::Path;
 use std::process::Command;
 
 pub fn detect_repo_origin(cwd: &Path) -> RepoOrigin {
-    let output = Command::new("git")
-        .args(["-C"])
-        .arg(cwd)
-        .args(["remote", "get-url", "origin"])
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.args(["-C"]).arg(cwd).args(["remote", "get-url", "origin"]);
+    // Suppress the console-window flash: this runs from the console-less daemon on
+    // every /chat turn, so a bare git spawn pops (and flickers) a window. No-op off Windows.
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    let output = cmd.output();
     match output {
         Ok(o) if o.status.success() => {
             let url = String::from_utf8_lossy(&o.stdout).trim().to_string();

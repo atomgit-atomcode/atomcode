@@ -5,3 +5,5 @@
 //! modules that need to be reachable from `tests/` belong here.
 
 pub mod uninstall;
+#[cfg(unix)]
+pub mod askpass;

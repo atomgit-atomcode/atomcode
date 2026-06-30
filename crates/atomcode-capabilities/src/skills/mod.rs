@@ -32,8 +32,8 @@ pub fn register_skill_tools(reg: &mut ToolRegistry, registry: Arc<SkillRegistry>
 }
 
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
 }
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true }
+    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
 }

@@ -38,6 +38,7 @@ impl LlmProvider for OverflowOnce {
                 message: "maximum context length exceeded".into(),
                 http_status: Some(400),
                 code: Some("context_length_exceeded".into()),
+                retry_after_secs: None,
             });
         }
         Ok(Box::pin(futures::stream::iter(vec![

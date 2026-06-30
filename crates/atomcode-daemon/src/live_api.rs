@@ -760,6 +760,7 @@ impl KernelTurnExecutor {
             // Keep the fail-closed approval timeout for the daemon (current behavior); the
             // interactive PARK behavior is wired for the cli TUI path for now.
             interactive: false,
+            keep_interrupted_context: config.keep_interrupted_context,
         })
     }
 }
@@ -959,6 +960,9 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
                 AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
+                AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
+                    emit(TurnEvent::Warning(label))
+                }
                 AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot } => {
                     emit(TurnEvent::ApprovalRequested {
                         tool_name,
@@ -1001,6 +1005,9 @@ impl TurnExecutor for KernelTurnExecutor {
                     // leave the bridge's later terminal events to be mis-read by the
                     // NEXT turn. Surface the error and keep draining to the real end.
                     emit(TurnEvent::Error(error));
+                }
+                AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+                    emit(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming })
                 }
                 AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
                 AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
@@ -1089,6 +1096,12 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
         },
         AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
         AgentEvent::Warning(w) => TurnEvent::Warning(w),
+        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming }
+        }
+        AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
+            TurnEvent::Warning(label)
+        }
         _ => return None,
     })
 }
@@ -1121,6 +1134,7 @@ pub(crate) fn chat_bridge_config(
         dangerously_skip_permissions: false,
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
+        keep_interrupted_context: config.keep_interrupted_context,
     }
 }
 
@@ -1305,6 +1319,18 @@ pub(crate) enum LiveWireEvent {
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
     WorkingDir { working_dir: String },
+    /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
+    /// time and label so the webui can render a countdown notice instead of a generic error.
+    #[serde(rename = "rate_limited")]
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
+    },
 }
 
 /// Map one LiveEvent → 0/1 wire events (variants the frontend doesn't need → None).
@@ -1387,6 +1413,17 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 reason,
                 call_id: call.id,
                 arguments: call.arguments,
+            },
+            TE::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+            } => LiveWireEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
             },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
@@ -1620,6 +1657,27 @@ pub(crate) async fn live_stop() -> impl IntoResponse {
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct LiveSwitchSessionReq {
+    pub session_id: String,
+}
+
+/// POST /live/switch_session — webui 切到「已存在」的会话时广播会话切换，
+/// 让同进程 sync 模式的 TUI 跟随加载该会话（含历史）。
+///
+/// 与新建会话（create_session）走同一条广播：仅带 session_id；TUI 侧按 id
+/// 跨项目定位会话文件（SessionManager::load_any），据其 working_dir 切目录、
+/// 回放历史。无活动 LiveSession（如 headless daemon 无 TUI 附着，或 TUI 未开
+/// sync）时静默 no-op——没有视图需要跟随。不在此处 ensure_live_session：避免
+/// 在无人跟随时凭空建一个新的 LiveSession。
+pub(crate) async fn live_switch_session_endpoint(
+    Json(req): Json<LiveSwitchSessionReq>,
+) -> impl IntoResponse {
+    let sid = atomcode_core::session::SessionId::from_string(req.session_id);
+    live_switch_session(sid);
+    Json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveProviderReq {
     pub provider: String,
 }
@@ -1842,6 +1900,63 @@ mod tests {
     async fn preprocess_live_caption_is_passthrough_without_images() {
         let out = preprocess_live_caption("看下这个图片", &[], None).await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    #[test]
+    fn compaction_mark_maps_to_warning_wire_event() {
+        // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
+        // drivers. The bridge now emits CompactionUi(Mark) instead of the old
+        // Warning("conversation compacted"); the daemon must translate it to a warning
+        // wire event so /webui + /chat clients still see the notice. Begin/End are TUI
+        // spinner lifecycle and are intentionally dropped (web has no compaction spinner).
+        use atomcode_core::agent::{AgentEvent, CompactionUiKind};
+        let label = "已压缩 · 摘要 3 条 · ~40K→~10K".to_string();
+        assert!(matches!(
+            agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Mark(label.clone()))),
+            Some(TurnEvent::Warning(w)) if w == label
+        ));
+        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
+        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+    }
+
+    // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
+    // 字段透传——历史上该臂缺失导致事件被 `_ => return None` 静默丢弃（dead code）。
+    #[test]
+    fn agent_to_turn_rate_limited_is_forwarded_not_dropped() {
+        use atomcode_core::agent::AgentEvent;
+        let result = agent_to_turn(AgentEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+            auto_resuming: false,
+        });
+        match result {
+            Some(TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming }) => {
+                assert_eq!(reset_at_display, "18:09");
+                assert_eq!(reset_label, "5h");
+                assert_eq!(secs_until_reset, Some(7200));
+                assert!(!auto_resuming);
+            }
+            other => panic!("expected Some(TurnEvent::RateLimited{{..}}), got {:?}", other),
+        }
+    }
+
+    // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
+    // secs_until_reset 字段，供 webui 渲染倒计时提示而非普通错误。
+    #[test]
+    fn rate_limited_serializes_as_its_own_type() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+            auto_resuming: false,
+        }))
+        .expect("should map");
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains(r#""type":"rate_limited""#), "wire type must be rate_limited: {json}");
+        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
+        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
+        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，

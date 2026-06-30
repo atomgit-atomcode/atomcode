@@ -2,6 +2,7 @@
 //! → parent dir fsync. POSIX durability + Windows MoveFileEx semantics.
 
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -50,8 +51,22 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("atomic_write: persist({}): {}", path.display(), e.error))?;
 
     // POSIX durability: fsync the directory entry so dirent survives crash.
+    // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory handle.
+    #[cfg(not(windows))]
     let dir = File::open(parent)
         .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?;
+    #[cfg(windows)]
+    let dir = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(parent)
+            .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?
+    };
+    // POSIX durability: fsync the directory entry so dirent survives crash.
+    // Windows FlushFileBuffers does not support directory handles (ERROR_INVALID_HANDLE).
+    #[cfg(unix)]
     dir.sync_all()
         .with_context(|| format!("atomic_write: fsync parent {}", parent.display()))?;
 
@@ -97,5 +112,48 @@ mod tests {
         let path = dir.path().join("a/b/c/file.txt");
         atomic_write(&path, b"deep", 0o644).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"deep");
+    }
+
+    #[test]
+    fn atomic_write_overwrite_shorter_content_leaves_no_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.txt");
+
+        // Write 1000 bytes of 'A'
+        let long = vec![b'A'; 1000];
+        atomic_write(&path, &long, 0o644).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1000);
+
+        // Overwrite with 10 bytes of 'B' — shorter than old content
+        let short = b"BBBBBBBBBB";
+        atomic_write(&path, short, 0o644).unwrap();
+
+        // File must be exactly 10 bytes, no trailing 'A' bytes
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 10, "file size must match new content exactly");
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(&read, short);
+        // Explicitly no old bytes
+        assert!(!read.iter().any(|&b| b == b'A'), "no trailing old bytes");
+    }
+
+    #[test]
+    fn atomic_write_overwrite_longer_content_leaves_no_stale_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+
+        // Write 10 bytes
+        atomic_write(&path, b"0123456789", 0o644).unwrap();
+
+        // Overwrite with 1000 bytes of 'X'
+        let long = vec![b'X'; 1000];
+        atomic_write(&path, &long, 0o644).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1000);
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(&read, &long[..]);
+        assert!(!read.windows(10).any(|w| w == b"0123456789"));
     }
 }

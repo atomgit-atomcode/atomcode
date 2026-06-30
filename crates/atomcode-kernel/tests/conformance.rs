@@ -69,7 +69,7 @@ impl Tool for EmptyNameTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -86,7 +86,7 @@ impl Tool for EmptyDescriptionTool {
         json!({"type": "object"})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -106,7 +106,7 @@ impl Tool for UnstableSchemaTool {
         json!({"type": "object", "rev": rev})
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -132,7 +132,7 @@ impl Tool for FlakyRiskTool {
         }
     }
     async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
-        ToolResult { call_id: String::new(), content: "x".into(), is_error: false }
+        ToolResult { call_id: String::new(), content: "x".into(), is_error: false, images: vec![] }
     }
 }
 
@@ -330,6 +330,7 @@ async fn provider_doubles_are_conformant() {
         message: "401 unauthorized".into(),
         http_status: Some(401),
         code: Some("auth".into()),
+        retry_after_secs: None,
     };
     conformance::provider::check(Arc::new(ScriptedProvider::open_error(err))).await.assert_conformant();
 }
@@ -385,6 +386,7 @@ fn stream_wellformed_contract() {
         message: "mid-stream".into(),
         http_status: Some(500),
         code: None,
+        retry_after_secs: None,
     })];
     assert_check_failed(&check_stream_wellformed(&bad_err), "midstream_error_has_no_http_status");
 }

@@ -135,6 +135,50 @@ async fn on_text_delta_redacts_streamed_output() {
     assert_eq!(streamed, assistant.text, "streamed text and stored text must be identical");
 }
 
+// CLAIM 33a': the reasoning→content PROMOTION (recovering a misrouted answer) must pass
+// the promoted body through the SAME on_text_delta scrub seam — otherwise the recovery
+// would re-open exactly the redaction leak the seam closes.
+#[tokio::test]
+async fn promoted_reasoning_passes_through_the_text_delta_redaction_seam() {
+    let reg = ToolRegistry::new();
+    // The gateway misroutes the answer (carrying a secret) into the REASONING channel and
+    // leaves content empty — the case the promotion recovers.
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::Reasoning("the answer is SECRET data".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[]))
+        .persona(PERSONA)
+        .hook(Arc::new(DeltaRedactHook))
+        .build()
+        .spawn();
+    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+
+    let mut streamed = String::new();
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            AgentEvent::TextDelta(t) => streamed.push_str(&t),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    // The promoted body reached the driver as TEXT, REDACTED by on_text_delta (not the raw
+    // secret) — proving the promotion does not bypass the content-scrub seam.
+    assert!(streamed.contains("[REDACTED]"), "promoted body must be emitted as text; got {streamed:?}");
+    assert!(!streamed.contains("SECRET"), "promoted body must be scrubbed by on_text_delta; got {streamed:?}");
+
+    let snapshot = capture_snapshot(&mut handle).await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+    let assistant =
+        snapshot.messages.iter().find(|m| m.role == Role::Assistant).expect("an assistant message");
+    assert!(!assistant.text.contains("SECRET"), "stored promoted content must be scrubbed; got {:?}", assistant.text);
+    assert!(assistant.text.contains("[REDACTED]"), "stored content must show the redaction; got {:?}", assistant.text);
+}
+
 // ── Item 1b: on_reasoning_delta closes the reasoning redaction leak ───────────
 
 /// A hook whose `on_reasoning_delta` scrubs "SECRET" → "[REDACTED]" in each

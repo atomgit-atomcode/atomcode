@@ -2,9 +2,11 @@
 //! slicing. Non-destructive ⇒ always `Safe`. Neutral core ported from the production
 //! reader, minus the coding enrichments (semantic skeleton, read_cache, file_store).
 
-use super::{err, looks_binary, ok, resolve_path};
+use super::{err, looks_binary, ok, ok_with_images, resolve_path};
 use async_trait::async_trait;
+use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -17,7 +19,45 @@ const MAX_LINE_LEN: usize = 2000;
 #[cfg(feature = "codeintel")]
 const SKELETON_THRESHOLD: usize = 300;
 
-pub struct ReadFileTool;
+/// `vision` = the active model can SEE images. When true, reading an image file
+/// returns the picture itself (base64) for the model instead of the "binary,
+/// cannot display" text dead-end. The capability is decided at the coding layer
+/// and passed in as a plain flag — this crate stays model-agnostic (and core-free).
+/// Default `false` (text-only).
+#[derive(Default)]
+pub struct ReadFileTool {
+    vision: bool,
+}
+
+impl ReadFileTool {
+    pub fn new(vision: bool) -> Self {
+        Self { vision }
+    }
+}
+
+/// Cap on an image read back to a vision model: base64 inflates ~33% and every image
+/// costs ~1600 tokens, so refuse an oversized one (it would blow the result-size cap /
+/// context) and fall back to the binary-text hint. Generous enough for book covers,
+/// screenshots, diagrams (the real use cases).
+const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// MIME type for an image file by extension, or `None` if not a recognized raster image.
+/// Gates which binaries `read_file` hands to a vision model — only true images, never a
+/// PDF / archive / executable (those keep the text recovery hint). The set matches what
+/// the providers actually accept AND the user-paste path (png/jpg/jpeg/gif/webp); BMP is
+/// deliberately EXCLUDED — neither the OpenAI nor Anthropic vision wire format accepts it,
+/// so handing one over would be a hard gateway rejection, strictly worse than the
+/// binary-text dead-end it would replace.
+fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    })
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -148,6 +188,24 @@ impl Tool for ReadFileTool {
             Err(e) => return err(format!("read_file: failed to read {}: {e}", path.display())),
         };
         if looks_binary(&bytes) {
+            // VISION path: an image file read by a model that can SEE → hand back the
+            // picture itself (base64) so it reaches the model on a follow-up user
+            // message, instead of the "cannot display" text dead-end. Gated on
+            // `self.vision` (model capability) AND a recognized image type AND a sane
+            // size; anything else keeps the existing binary-text + recovery hint.
+            if self.vision && meta.len() <= MAX_IMAGE_BYTES {
+                if let Some(media_type) = image_media_type(&path) {
+                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    return ok_with_images(
+                        format!(
+                            "[Image: {} ({} bytes) — attached below for the vision model]",
+                            a.file_path,
+                            bytes.len()
+                        ),
+                        vec![ImageContent { media_type: media_type.to_string(), data }],
+                    );
+                }
+            }
             return ok(format!(
                 "Binary file ({} bytes), cannot display as text.{}",
                 bytes.len(),
@@ -348,17 +406,63 @@ mod tests {
     async fn reads_with_line_numbers() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "first\nsecond\nthird\n").unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"a.txt"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"a.txt"}"#, &ctx(d.path())).await;
         assert!(!r.is_error);
         assert!(r.content.contains("     1\tfirst"), "{}", r.content);
         assert!(r.content.contains("     3\tthird"), "{}", r.content);
     }
 
     #[tokio::test]
+    async fn image_file_returns_base64_for_vision_model() {
+        // A vision-capable model must SEE the image: read_file base64-encodes the
+        // bytes into the result's `images` instead of the "Binary file" text dead-end.
+        let d = tempfile::tempdir().unwrap();
+        // Minimal JPEG-ish blob (SOI marker + a NUL so `looks_binary` flags it).
+        let bytes: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00];
+        std::fs::write(d.path().join("cover.jpg"), bytes).unwrap();
+        let r = ReadFileTool::new(true).execute(r#"{"file_path":"cover.jpg"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.images.len(), 1, "vision model must receive the image");
+        assert_eq!(r.images[0].media_type, "image/jpeg");
+        assert_eq!(
+            r.images[0].data,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            "image bytes must be base64-encoded losslessly"
+        );
+        assert!(!r.content.starts_with("Binary file"), "{}", r.content);
+        assert!(r.content.contains("cover.jpg"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn image_file_stays_binary_text_for_text_only_model() {
+        // A text-only model would reject a base64 image / waste tokens → keep the
+        // existing "Binary file" text and attach NO image.
+        let d = tempfile::tempdir().unwrap();
+        let bytes: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        std::fs::write(d.path().join("cover.jpg"), bytes).unwrap();
+        let r = ReadFileTool::new(false).execute(r#"{"file_path":"cover.jpg"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error);
+        assert!(r.images.is_empty(), "text-only model must NOT receive an image");
+        assert!(r.content.starts_with("Binary file"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn non_image_binary_stays_text_even_for_vision_model() {
+        // A vision model reading a NON-image binary (e.g. a PDF) still gets the text
+        // dead-end + recovery hint — only true images become `images`.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("report.pdf"), b"%PDF-1.4\0\0\0binary blob").unwrap();
+        let r = ReadFileTool::new(true).execute(r#"{"file_path":"report.pdf"}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.images.is_empty(), "non-image binary must not be sent as an image");
+        assert!(r.content.starts_with("Binary file"), "{}", r.content);
+    }
+
+    #[tokio::test]
     async fn offset_and_limit_slice() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"a.txt","offset":2,"limit":2}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"a.txt","offset":2,"limit":2}"#, &ctx(d.path())).await;
         assert!(r.content.contains("     2\tl2"), "{}", r.content);
         assert!(r.content.contains("     3\tl3"), "{}", r.content);
         assert!(!r.content.contains("\tl1"), "{}", r.content);
@@ -370,7 +474,7 @@ mod tests {
     async fn binary_file_is_reported() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("b.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"b.bin"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"b.bin"}"#, &ctx(d.path())).await;
         assert!(!r.is_error);
         assert!(r.content.starts_with("Binary file"), "{}", r.content);
     }
@@ -384,7 +488,7 @@ mod tests {
         let (gbk, _, had_err) = encoding_rs::GB18030.encode("你好，世界");
         assert!(!had_err);
         std::fs::write(d.path().join("notes.txt"), &gbk).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"notes.txt"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"notes.txt"}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("你好，世界"), "GBK should decode, got: {}", r.content);
     }
@@ -395,7 +499,7 @@ mod tests {
         // external converter on the first failure, not leave it cycling offset/limit.
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("report.pdf"), b"%PDF-1.4\0\0\0binary blob").unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"report.pdf"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"report.pdf"}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.starts_with("Binary file"), "{}", r.content);
         assert!(r.content.contains("pdftotext"), "pdf recovery hint, got: {}", r.content);
@@ -406,7 +510,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("x.txt"), "hi").unwrap();
         std::fs::create_dir(d.path().join("sub")).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"."}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"."}"#, &ctx(d.path())).await;
         assert!(r.content.contains("is a directory"), "{}", r.content);
         assert!(r.content.contains("sub/"), "{}", r.content);
         assert!(r.content.contains("x.txt"), "{}", r.content);
@@ -415,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn missing_file_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"nope.txt"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"nope.txt"}"#, &ctx(d.path())).await;
         assert!(r.is_error);
         assert!(r.content.contains("no such file"), "{}", r.content);
     }
@@ -425,7 +529,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "l1\nl2\nl3\nl4\n").unwrap();
         // Weak models send "2.0" / "2.0" instead of integers.
-        let r = ReadFileTool
+        let r = ReadFileTool::default()
             .execute(r#"{"file_path":"a.txt","offset":"2.0","limit":"2.0"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -444,7 +548,7 @@ mod tests {
         }
         src.push_str("}\nfn beta() {}\n");
         std::fs::write(d.path().join("big.rs"), &src).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"big.rs"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"big.rs"}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("alpha") && r.content.contains("beta"), "{}", r.content);
@@ -460,7 +564,7 @@ mod tests {
             src.push_str(&format!("// line {i}\n"));
         }
         std::fs::write(d.path().join("big.rs"), &src).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"big.rs","offset":1,"limit":3}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"big.rs","offset":1,"limit":3}"#, &ctx(d.path())).await;
         assert!(!r.content.contains("File skeleton"), "offset/limit must bypass skeleton: {}", r.content);
         assert!(r.content.contains("     1\tfn f"), "{}", r.content);
     }
@@ -475,7 +579,7 @@ mod tests {
             at.push_str("// x\n");
         }
         std::fs::write(d.path().join("at.rs"), &at).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"at.rs"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"at.rs"}"#, &ctx(d.path())).await;
         assert!(!r.content.contains("File skeleton"), "300 lines must NOT skeleton: {}", r.content);
         // 301 lines → skeleton
         let mut over = String::from("fn f() {}\n");
@@ -483,7 +587,7 @@ mod tests {
             over.push_str("// x\n");
         }
         std::fs::write(d.path().join("over.rs"), &over).unwrap();
-        let r2 = ReadFileTool.execute(r#"{"file_path":"over.rs"}"#, &ctx(d.path())).await;
+        let r2 = ReadFileTool::default().execute(r#"{"file_path":"over.rs"}"#, &ctx(d.path())).await;
         assert!(r2.content.contains("File skeleton"), "301 lines must skeleton: {}", r2.content);
     }
 
@@ -497,7 +601,7 @@ mod tests {
             src.push_str(&format!("// comment {i}\n"));
         }
         std::fs::write(d.path().join("c.rs"), &src).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"c.rs"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"c.rs"}"#, &ctx(d.path())).await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("comment 0"), "{}", r.content);
     }
@@ -512,7 +616,7 @@ mod tests {
             src.push_str(&format!("line {i}\n"));
         }
         std::fs::write(d.path().join("big.txt"), &src).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"big.txt"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"big.txt"}"#, &ctx(d.path())).await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("line 0"), "{}", r.content);
     }
@@ -521,7 +625,7 @@ mod tests {
     async fn long_line_is_truncated() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("long.txt"), "x".repeat(5000)).unwrap();
-        let r = ReadFileTool.execute(r#"{"file_path":"long.txt"}"#, &ctx(d.path())).await;
+        let r = ReadFileTool::default().execute(r#"{"file_path":"long.txt"}"#, &ctx(d.path())).await;
         assert!(r.content.contains("line truncated to 2000 chars"), "{}", r.content);
     }
 }
