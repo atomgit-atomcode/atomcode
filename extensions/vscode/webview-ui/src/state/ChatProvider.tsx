@@ -109,6 +109,21 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             }
           }
           break;
+        case 'artifactStart':
+          dispatch({
+            type: 'ARTIFACT_START',
+            id: msg.id,
+            artifactType: msg.artifactType,
+            language: msg.language,
+            title: msg.title,
+          });
+          break;
+        case 'artifactContent':
+          dispatch({ type: 'ARTIFACT_CONTENT', id: msg.id, content: msg.content });
+          break;
+        case 'artifactEnd':
+          dispatch({ type: 'ARTIFACT_END', id: msg.id });
+          break;
         case 'tokens':
           dispatch({ type: 'SET_TOKENS', prompt: msg.prompt, completion: msg.completion, total: msg.total });
           break;

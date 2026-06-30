@@ -84,6 +84,15 @@ export interface ToolCallData {
   status: 'queued' | 'running' | 'done' | 'error';
 }
 
+export interface ArtifactData {
+  id: string;
+  artifactType: string;
+  title?: string;
+  language?: string;
+  content: string;
+  status: 'streaming' | 'complete';
+}
+
 export interface PermissionRequestData {
   id: string;
   toolName: string;
@@ -92,13 +101,21 @@ export interface PermissionRequestData {
   status: 'pending' | 'allowed' | 'denied';
 }
 
+export type MessageBlock =
+  | { id: string; type: 'text'; content: string }
+  | { id: string; type: 'tool'; tool: ToolCallData }
+  | { id: string; type: 'artifact'; artifact: ArtifactData }
+  | { id: string; type: 'permission'; request: PermissionRequestData };
+
 /** A single chat message (user or assistant) */
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'error';
   text: string;
+  blocks?: MessageBlock[];
   queued?: boolean;
   toolCalls?: ToolCallData[];
+  artifacts?: ArtifactData[];
   permissionRequest?: PermissionRequestData;
   contextFiles?: ContextFile[];
   images?: ImageData[];
@@ -146,9 +163,12 @@ export type ChatAction =
   | { type: 'TOOL_BATCH_START'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'ARTIFACT_START'; id: string; artifactType: string; language?: string; title?: string }
+  | { type: 'ARTIFACT_CONTENT'; id: string; content: string }
+  | { type: 'ARTIFACT_END'; id: string }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
   | { type: 'GENERATION_DONE'; tokens?: number }
-  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
   | { type: 'CLEAR_CHAT' }
@@ -186,9 +206,12 @@ export type ExtensionMessage =
   | { type: 'toolBatchStart'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'toolStart'; id?: string; name: string; args: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'artifactStart'; id: string; artifactType: string; language?: string; title?: string }
+  | { type: 'artifactContent'; id: string; content: string }
+  | { type: 'artifactEnd'; id: string }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
-  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number } }> }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'generationStopped' }

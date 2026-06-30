@@ -32,7 +32,7 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
     data: any;
   }>;
 }
@@ -704,12 +704,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'tokens', data: { prompt, completion, total } });
         this._postMessageToPanel(streamSessionId, { type: 'tokens', prompt, completion, total });
       },
-      onArtifactStart: (id, artifactType, language, title) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title }),
-      onArtifactContent: (id, content) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content }),
-      onArtifactEnd: (id) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id }),
+      onArtifactStart: (id, artifactType, language, title) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactStart', data: { id, artifactType, language, title } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title });
+      },
+      onArtifactContent: (id, content) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactContent', data: { id, content } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content });
+      },
+      onArtifactEnd: (id) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactEnd', data: { id } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id });
+      },
       onDone: (tokens, toolCalls, sessionId) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -736,8 +748,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         this._postMessageToPanel(sessionId || streamSessionId, { type: 'done', tokens, toolCalls, sessionId });
-        void this._refreshSessions();
-        setTimeout(() => void this._sendNextQueuedMessage(), 75);
+        void this._reloadFinishedSessionHistory(sessionId || streamSessionId)
+          .finally(() => {
+            void this._refreshSessions();
+            setTimeout(() => void this._sendNextQueuedMessage(), 75);
+          });
       },
       onStopped: () => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -770,6 +785,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt2 = this._sessionRuntimes.get(sid);
     if (rt2 && !rt2.isGenerating) {
       void this._sendNextQueuedMessage();
+    }
+  }
+
+  private async _reloadFinishedSessionHistory(sessionId: string) {
+    const info = this._panelSessions.get(sessionId);
+    const projectHash = info?.projectHash ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+    if (!projectHash) return;
+
+    try {
+      const detail = await this._client.getSession(projectHash, sessionId);
+      const messages = detail?.messages;
+      if (!messages) return;
+
+      this._panelSessions.set(sessionId, {
+        ...(info ?? { sessionId }),
+        sessionId,
+        projectHash,
+        messages,
+        messagesPromise: undefined,
+      });
+      this._postOrQueueToPanel(sessionId, { type: 'sessionMessages', messages });
+    } catch {
+      // The already-delivered stream remains visible if history refresh fails.
     }
   }
 
@@ -1204,6 +1242,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
+          break;
+        case 'artifactStart':
+          post({ type: 'artifactStart', id: evt.data.id, artifactType: evt.data.artifactType, language: evt.data.language, title: evt.data.title });
+          break;
+        case 'artifactContent':
+          post({ type: 'artifactContent', id: evt.data.id, content: evt.data.content });
+          break;
+        case 'artifactEnd':
+          post({ type: 'artifactEnd', id: evt.data.id });
           break;
         case 'tokens':
           post({ type: 'tokens', prompt: evt.data.prompt, completion: evt.data.completion, total: evt.data.total });
