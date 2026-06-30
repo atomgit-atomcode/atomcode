@@ -520,6 +520,7 @@ pub(super) fn execute_slash_command(
 ///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
 /// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
 ///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
+/// 4. 以上都没有 → 自动从 GitCode Release 下载到 ~/.atomcode/bin/。
 fn resolve_relay_client_bin() -> String {
     const BARE: &str = "atomcode-relay-client";
 
@@ -546,6 +547,186 @@ fn resolve_relay_client_bin() -> String {
 
     // 3) PATH 兜底。
     BARE.to_string()
+}
+
+/// 中继客户端 oss 下载地址。
+/// 对应 gitcode.com/atomgit_atomcode/atomcode-relay-release 仓库的 Release。
+const RELAY_CLIENT_DOWNLOAD_BASE: &str =
+    "https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases/download";
+
+/// 当前 release 版本（与仓库 tag 对应）。
+const RELAY_CLIENT_VERSION: &str = "v0.1.0";
+
+/// 检测当前平台对应的 target triple，用于构建下载文件名。
+fn relay_client_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("windows", "x86_64") => "x86_64-pc-windows-gnu",
+        _ => "unknown",
+    }
+}
+
+/// 确保 relay-client 二进制可用。
+/// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
+fn ensure_relay_client_bin() -> Result<String, String> {
+    // 跳过下载标志
+    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
+        let local = resolve_relay_client_bin();
+        // 查找本地
+        if local != "atomcode-relay-client" || std::path::Path::new(&local).is_file() {
+            return Ok(local);
+        }
+        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+                    请手动将 relay-client 放入 PATH 或与 atomcode 同目录".to_string());
+    }
+
+    // 1-3: 先尝试本地查找
+    let local = resolve_relay_client_bin();
+    let bare_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+
+    // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
+    if local != bare_name {
+        return Ok(local);
+    }
+    // 裸名也可能是 PATH 上的文件
+    if std::path::Path::new(&local).is_file() {
+        return Ok(local);
+    }
+
+    // 4) 检查缓存目录 ~/.atomcode/bin/
+    let cache_dir = dirs::home_dir()
+        .map(|h| h.join(".atomcode").join("bin"))
+        .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
+    let cache_path = cache_dir.join(bare_name);
+    if cache_path.is_file() {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
+
+    // 5) 检测平台
+    let target = relay_client_target();
+    if target == "unknown" {
+        return Err(format!(
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 PATH 中",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    }
+
+    // 6) 自动下载
+    let url = format!(
+        "{}/{}/atomcode-relay-client-{}",
+        RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION, target
+    );
+
+    // 使用 block_in_place 执行异步下载（当前在同步上下文中）
+    let download_result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(download_relay_client(&url, &cache_path))
+    });
+
+    match download_result {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
+            }
+            Ok(cache_path.to_string_lossy().into_owned())
+        }
+        Err(e) => {
+            let platform = relay_client_target();
+            let download_url = format!(
+                "{}/{}/atomcode-relay-client-{}",
+                RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION, platform
+            );
+            let bin_name = if cfg!(windows) {
+                "atomcode-relay-client.exe"
+            } else {
+                "atomcode-relay-client"
+            };
+            let msg = format!(
+                "自动下载 relay-client 失败：{}\n\
+                 请手动下载到本地缓存目录：\n\
+                 mkdir -p ~/.atomcode/bin/ \\\n\
+                 && curl -fsSL -o ~/.atomcode/bin/{} {} \\\n\
+                 && chmod +x ~/.atomcode/bin/{} \\\n\
+                 && /app 重试",
+                e, bin_name, download_url, bin_name
+            );
+            Err(msg)
+        }
+    }
+}
+
+/// 从指定 URL 下载 relay-client 二进制到缓存路径。
+/// 使用 GitCode OAuth token 进行鉴权。
+async fn download_relay_client(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    // SHA256 计算
+    use sha2::{Digest, Sha256};
+
+    // 确保缓存目录存在
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建缓存目录失败：{e}"))?;
+    }
+
+    // 获取 GitCode OAuth token（用户需先 /login）
+    let token = atomcode_core::auth::oauth::get_valid_token()
+        .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
+
+    // 构建 HTTP 客户端 + 添加鉴权头
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("atomcode/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+
+    let resp = client
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败：{e}（请检查网络连接）"))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("GitCode 鉴权失败，token 可能已过期。请重新执行 /login 登录".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "下载返回 HTTP {}（Release 可能不存在或无权访问）",
+            resp.status().as_u16()
+        ));
+    }
+
+    // 流式下载 + SHA256 校验
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("创建文件失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取下载流失败：{e}"))?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入文件失败：{e}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("刷盘失败：{e}"))?;
+    drop(file);
+
+    let _ = hasher.finalize(); // 完成 hash（当前未做 checksum 比对，留作后续扩展）
+
+    Ok(())
 }
 
 fn execute_slash_command_impl(
@@ -1306,80 +1487,79 @@ fn execute_slash_command_impl(
                                 let machine = std::env::var("HOSTNAME")
                                     .ok()
                                     .or_else(|| std::env::var("COMPUTERNAME").ok());
-                                // 4) 拉起 relay-client 子进程；自身即 daemon，故
+                                // 4) 确保 relay-client 二进制可用（查找本地或自动下载），
+                                //    然后拉起子进程。自身即 daemon，故
                                 //    --no-supervise-daemon。kill_on_drop：TUI 退出随之清理。
-                                let bin = resolve_relay_client_bin();
                                 let daemon_url = format!("http://127.0.0.1:{port}");
-                                let mut cmd = tokio::process::Command::new(&bin);
-                                cmd.arg("run")
-                                    .arg("--relay")
-                                    .arg(&ws_url)
-                                    .arg("--token")
-                                    .arg(&token)
-                                    .arg("--daemon")
-                                    .arg(&daemon_url)
-                                    // relay-client 自己别再拉 daemon —— 我们(atomcode)
-                                    // 就是 daemon。注意是带值的 `--supervise-daemon false`，
-                                    // 不存在 `--no-supervise-daemon`（clap ArgAction::Set）。
-                                    .arg("--supervise-daemon")
-                                    .arg("false")
-                                    .kill_on_drop(true)
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null());
-                                if let Some(m) = &machine {
-                                    cmd.arg("--machine-name").arg(m);
-                                }
-                                // 全局接入口令:中继开启 admin_secret 时必须带匹配值才能注册隧道。
-                                // 优先读 ATOMCODE_APP_RELAY_SECRET,回落 relay-client 原生
-                                // ATOM_RELAY_REGISTER_SECRET。子进程本会继承环境变量,这里显式
-                                // 透传是为了用 ATOMCODE_ 前缀的名字、且行为可见。中继未开启则不传。
-                                if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
-                                    .ok()
-                                    .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
-                                    .filter(|s| !s.is_empty())
-                                {
-                                    cmd.arg("--register-secret").arg(secret);
-                                }
-                                match cmd.spawn() {
-                                    Err(e) => format!(
-                                        "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                         relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
-                                         请确认它在 PATH 中或与 atomcode 同目录，\
-                                         也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
-                                    ),
-                                    Ok(child) => {
-                                        if let Some(mut old) = ctx.app_relay_child.take() {
-                                            let _ = old.start_kill();
+                                let spawn_result = match ensure_relay_client_bin() {
+                                    Err(e) => format!("启动 relay-client 失败：{e}"),
+                                    Ok(bin) => {
+                                        let mut cmd = tokio::process::Command::new(&bin);
+                                        cmd.arg("run")
+                                            .arg("--relay")
+                                            .arg(&ws_url)
+                                            .arg("--token")
+                                            .arg(&token)
+                                            .arg("--daemon")
+                                            .arg(&daemon_url)
+                                            .arg("--supervise-daemon")
+                                            .arg("false")
+                                            .kill_on_drop(true)
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null());
+                                        if let Some(m) = &machine {
+                                            cmd.arg("--machine-name").arg(m);
                                         }
-                                        ctx.app_relay_child = Some(child);
-                                        // 5) 配对 URI（App 扫码解析 r= / t= / m=）。
-                                        let m_param = machine
-                                            .as_deref()
-                                            .map(|m| format!("&m={}", pct(m)))
-                                            .unwrap_or_default();
-                                        let pair_uri = format!(
-                                            "atomcode-link://pair?r={}&t={}{}",
-                                            pct(&https_base),
-                                            token,
-                                            m_param
-                                        );
-                                        // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
-                                        attach_live_session(ctx, renderer, session, false);
-                                        match crate::render::qr::render_login_qr(
-                                            &pair_uri,
-                                            crate::render::qr::QrStyle::Dense1x2,
-                                        ) {
-                                            Some(q) => format!(
-                                                "用 AtomCode App 扫码连接（手机需能访问中继 \
-                                                 {https_base}）：\n\n{q}\n配对链接：{pair_uri}\n\
-                                                 （/app stop 断开）"
+                                        if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
+                                            .ok()
+                                            .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            cmd.arg("--register-secret").arg(secret);
+                                        }
+                                        match cmd.spawn() {
+                                            Err(e) => format!(
+                                                "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
+                                                 relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
+                                                 请确认它在 PATH 中或与 atomcode 同目录，\
+                                                 也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
                                             ),
-                                            None => format!(
-                                                "配对链接（二维码生成失败，手动填）：{pair_uri}"
-                                            ),
+                                            Ok(child) => {
+                                                if let Some(mut old) = ctx.app_relay_child.take() {
+                                                    let _ = old.start_kill();
+                                                }
+                                                ctx.app_relay_child = Some(child);
+                                                // 5) 配对 URI（App 扫码解析 r= / t= / m=）。
+                                                let m_param = machine
+                                                    .as_deref()
+                                                    .map(|m| format!("&m={}", pct(m)))
+                                                    .unwrap_or_default();
+                                                let pair_uri = format!(
+                                                    "atomcode-link://pair?r={}&t={}{}",
+                                                    pct(&https_base),
+                                                    token,
+                                                    m_param
+                                                );
+                                                // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
+                                                attach_live_session(ctx, renderer, session, false);
+                                                match crate::render::qr::render_login_qr(
+                                                    &pair_uri,
+                                                    crate::render::qr::QrStyle::Dense1x2,
+                                                ) {
+                                                    Some(q) => format!(
+                                                        "用 AtomCode App 扫码连接（手机需能访问中继 \
+                                                         {https_base}）：\n\n{q}\n配对链接：{pair_uri}\n\
+                                                         （/app stop 断开）"
+                                                    ),
+                                                    None => format!(
+                                                        "配对链接（二维码生成失败，手动填）：{pair_uri}"
+                                                    ),
+                                                }
+                                            }
                                         }
                                     }
-                                }
+                                };
+                                spawn_result
                             }
                         }
                     }

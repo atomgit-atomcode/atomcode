@@ -33,6 +33,8 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 urlencoding = "2"
+futures = "0.3"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
