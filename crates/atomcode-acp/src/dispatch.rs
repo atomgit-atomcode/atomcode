@@ -40,11 +40,18 @@ pub struct SessionState {
     pub commands: UnboundedSender<AgentCommand>,
     /// The kernel event stream, locked by the in-flight turn.
     pub events: Arc<Mutex<UnboundedReceiver<AgentEvent>>>,
-    /// Kept alive for the session's lifetime; aborted on drop.
+    /// Kernel agent task. Dropping this `JoinHandle` detaches the task (it is NOT
+    /// aborted); the kernel agent is shut down by dropping its `commands` sender.
     pub _task: tokio::task::JoinHandle<()>,
 }
 
-/// The shared session table: `session_id string → state`.
+/// Live ACP sessions, keyed by session id.
+///
+/// KNOWN LIMITATION (v1): sessions are never individually pruned — ACP has no
+/// `session/close`, so each `session/new` adds a kernel agent that lives until
+/// the whole connection ends (all are freed when the process exits / the client
+/// disconnects). Per-session teardown (e.g. dropping a session when its kernel
+/// task completes) is deferred to a later phase.
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 
 // ── ID helper ─────────────────────────────────────────────────────────────────
@@ -164,6 +171,16 @@ pub async fn run_prompt_turn(
         match rx.recv().await {
             Some(AgentEvent::Request { id, kind, payload }) if kind == "approval" => {
                 crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await?;
+            }
+            Some(AgentEvent::Request { id, .. }) => {
+                // Unknown (non-approval) kernel request kind: we cannot satisfy it.
+                // Respond with null (fail-closed) so the kernel unparks and the turn
+                // cannot hang waiting for a reply we will never produce.
+                eprintln!("acp: unhandled kernel request kind; responding null");
+                let _ = cmd_tx.send(AgentCommand::Respond {
+                    id,
+                    value: serde_json::Value::Null,
+                });
             }
             Some(AgentEvent::TurnComplete { reason }) => break reason,
             Some(AgentEvent::Error { message, .. }) => {
