@@ -170,7 +170,10 @@ impl Tool for WebFetchTool {
         if buf.is_empty() {
             return err(format!("web_fetch: empty response from {final_url}"));
         }
-        let body = String::from_utf8_lossy(&buf).to_string();
+        // Decode honoring the page's charset (HTTP header → HTML <meta> → UTF-8), so a
+        // legacy-encoded page (GBK/Big5/Shift_JIS/…) is not mangled into mojibake by a blind
+        // UTF-8 read. `ct_header` is already lowercased.
+        let body = decode_body(&buf, ct_header.as_deref());
 
         // Shape-sniff only when no Content-Type was sent (don't misread JSON starting with '<').
         let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
@@ -678,6 +681,44 @@ fn strip_to_dominant_code_block(md: &str) -> Option<String> {
     }
 }
 
+/// Extract the `charset=` label from a Content-Type header value, e.g.
+/// `text/html; charset=gbk` → `gbk`. Caller passes the (lowercased) header.
+fn charset_from_content_type(ct: &str) -> Option<&str> {
+    let after = &ct[ct.find("charset=")? + "charset=".len()..];
+    let label = after
+        .trim_start_matches(['"', '\'', ' '])
+        .split(|c: char| c == ';' || c == '"' || c == '\'' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    (!label.is_empty()).then_some(label)
+}
+
+/// Sniff the charset from an HTML `<meta charset=…>` or `<meta http-equiv="Content-Type"
+/// content="…; charset=…">` in the document head. Scans the RAW bytes (the charset
+/// declaration is ASCII, so this is valid before decoding). Returns a label like `gbk`.
+fn charset_from_meta(buf: &[u8]) -> Option<String> {
+    let head = &buf[..buf.len().min(4096)];
+    let lower = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let after = &lower[lower.find("charset=")? + "charset=".len()..];
+    let label: String = after
+        .trim_start_matches(['"', '\'', ' '])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// Decode the response body honoring its charset: HTTP `Content-Type` charset first, then an
+/// HTML `<meta>` charset, else UTF-8. Fixes mojibake on legacy-encoded pages (GBK/Big5/…).
+fn decode_body(buf: &[u8], content_type: Option<&str>) -> String {
+    let enc = content_type
+        .and_then(charset_from_content_type)
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+        .or_else(|| charset_from_meta(buf).and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes())))
+        .unwrap_or(encoding_rs::UTF_8);
+    enc.decode(buf).0.into_owned()
+}
+
 fn decode_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -769,6 +810,30 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_body_honors_charset_to_avoid_gbk_mojibake() {
+        // Real GBK bytes (the gxeea.cn case): a blind UTF-8 read mangles these into mojibake.
+        let (gbk, _, _) = encoding_rs::GBK.encode("广西考试院 2026");
+
+        // 1. via HTML <meta charset> (page sets no HTTP charset).
+        let mut page = b"<html><head><meta charset=\"gbk\"><title>".to_vec();
+        page.extend_from_slice(&gbk);
+        page.extend_from_slice(b"</title></head></html>");
+        let d1 = decode_body(&page, Some("text/html"));
+        assert!(d1.contains("广西考试院 2026"), "GBK <meta> decoded: {d1}");
+
+        // 2. via HTTP Content-Type charset (authoritative; body has no meta).
+        let d2 = decode_body(&gbk, Some("text/html; charset=gbk"));
+        assert_eq!(d2, "广西考试院 2026");
+
+        // 3. default UTF-8 when nothing declares a charset.
+        let d3 = decode_body("héllo 世界".as_bytes(), Some("text/html"));
+        assert_eq!(d3, "héllo 世界");
+
+        assert_eq!(charset_from_content_type("text/html; charset=GBK".to_ascii_lowercase().as_str()), Some("gbk"));
+        assert_eq!(charset_from_meta(b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=big5\">"), Some("big5".to_string()));
+    }
 
     #[test]
     fn tag_removal_does_not_panic_on_length_changing_lowercase() {
