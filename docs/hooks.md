@@ -1,100 +1,100 @@
 # AtomCode Hooks
 
-Hooks 系统允许你在 AtomCode 的关键执行点插入自定义逻辑，实现灵活的扩展能力。
+The Hooks system allows you to insert custom logic at key execution points in AtomCode, enabling flexible extensibility.
 
-## 快速开始
+## Quick Start
 
-### 三步配置：目录 → 脚本 → TOML
+### Three-step setup: Directory → Script → TOML
 
-**步骤 1**：创建 hooks 目录
+**Step 1**: Create the hooks directory
 
 ```bash
-# 全局 hooks（对所有项目生效）
+# Global hooks (apply to all projects)
 mkdir -p ~/.atomcode/hooks
 
-# 项目级 hooks（仅当前项目生效，可覆盖同名全局 hook）
+# Project-level hooks (only apply to current project, override same-name global hook)
 mkdir -p .atomcode/hooks
 ```
 
-**步骤 2**：编写 hook 脚本
+**Step 2**: Write a hook script
 
-创建 `~/.atomcode/hooks/my_hook.sh`：
+Create `~/.atomcode/hooks/my_hook.sh`:
 
 ```bash
 #!/bin/bash
-# 通 过 stdin 接收上下文 JSON
+# Receive context JSON via stdin
 INPUT=$(cat)
 
-# 解析关键信息（推荐安装 jq：brew install jq / apt-get install jq）
+# Parse key info (install jq recommended: brew install jq / apt-get install jq)
 if command -v jq &> /dev/null; then
     TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
     echo "Hook saw tool: $TOOL" >&2
 else
-    # 无 jq 时可用 python 替代：
+    # Without jq, use python instead:
     # TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null)
     echo "Hook: raw input received" >&2
 fi
 
-# 返回执行结果
+# Return execution result
 echo "ok"
 ```
 
-赋予执行权限：
+Make it executable:
 
 ```bash
 chmod +x ~/.atomcode/hooks/my_hook.sh
 ```
 
-**步骤 3**：配置 `hooks.toml`
+**Step 3**: Configure `hooks.toml`
 
-创建 `~/.atomcode/hooks/hooks.toml`：
+Create `~/.atomcode/hooks/hooks.toml`:
 
 ```toml
 [[hooks]]
 name = "my-hook"
 description = "My custom hook"
-trigger = "post_tool"      # 触发时机
+trigger = "post_tool"      # Trigger timing
 script = "my_hook.sh"
 script_type = "shell"       # shell | python
 enabled = true
 timeout_secs = 2
 ```
 
-完成！启动 AtomCode 后 hook 会自动加载。
+Done! Hooks are automatically loaded when AtomCode starts.
 
 ---
 
-## 配置方式总览
+## Configuration Overview
 
-AtomCode 支持 **三种** hook 实现，通过两个配置文件管理：
+AtomCode supports **three** hook implementations, managed via two config files:
 
-| 方式 | 配置文件 | 实现 | 适用场景 |
+| Method | Config file | Implementation | Use case |
 |------|---------|------|---------|
-| **TOML ScriptHook** | `hooks.toml` → `[[hooks]]` | 本地脚本（shell/python） | 本地定制、快速原型 |
-| **TOML Webhook** | `hooks.toml` → `[[webhooks]]` / `[[async_webhooks]]` | HTTP 远程调用 | 云端服务、外部集成 |
-| **JSON CC 兼容** | `.hooks.json` / `hooks.json` | Shell 命令（旧协议） | 兼容 CC 插件 |
+| **TOML ScriptHook** | `hooks.toml` → `[[hooks]]` | Local script (shell/python) | Local customization, rapid prototyping |
+| **TOML Webhook** | `hooks.toml` → `[[webhooks]]` / `[[async_webhooks]]` | HTTP remote call | Cloud services, external integrations |
+| **JSON CC Compatible** | `.hooks.json` / `hooks.json` | Shell command (legacy protocol) | CC plugin compatibility |
 
-> 三种方式可以共存。实际上都是通过 `HookEngine::load_all()` 统一加载：
+> All three methods can coexist. They are loaded uniformly via `HookEngine::load_all()`:
 > 1. JSON hooks（`hooks.json`）
-> 2. TOML hooks（ScriptHook + WebhookHook，来自 `hooks.toml`）
-> 3. 内置 Hook（Rust 原生，自动注册）
+> 2. TOML hooks (ScriptHook + WebhookHook, from `hooks.toml`)
+> 3. Built-in Hooks (native Rust, auto-registered)
 >
-> 全局 hooks 先加载，项目 hooks 后加载。项目级同名 hook **覆盖**全局同名 hook（后加载优先）。
+> Global hooks load first, project hooks load after. Same-name project hooks **override** global hooks (last-loaded wins).
 
 ---
 
-## TOML ScriptHook（推荐）
+## TOML ScriptHook (Recommended)
 
-### 支持的 trigger 值
+### Supported trigger values
 
-| trigger 值 | 别名 | 触发时机 | 可影响流程 |
+| trigger value | Alias | When triggered | Can affect flow |
 |-----------|------|---------|:--:|
-| `pre_tool` | `pre_tool_execution` | 工具执行前 | ✅ 可阻止/修改参数 |
-| `post_tool` | `post_tool_execution` | 工具执行后 | ❌ fire-and-forget |
-| `post_turn` | — | Turn 完成后 | ❌ fire-and-forget |
-| `system_prompt` | — | 构建系统 prompt 时 | ✅ 追加指令 |
+| `pre_tool` | `pre_tool_execution` | Before tool execution | ✅ Can block/modify args |
+| `post_tool` | `post_tool_execution` | After tool execution | ❌ fire-and-forget |
+| `post_turn` | — | After turn completes | ❌ fire-and-forget |
+| `system_prompt` | — | When building system prompt | ✅ Can append instructions |
 
-### 脚本输入（stdin JSON）
+### Script input (stdin JSON)
 
 ```json
 {
@@ -106,7 +106,7 @@ AtomCode 支持 **三种** hook 实现，通过两个配置文件管理：
 }
 ```
 
-`post_tool` 会额外包含 `result_context`：
+`post_tool` additionally includes `result_context`:
 
 ```json
 {
@@ -120,18 +120,18 @@ AtomCode 支持 **三种** hook 实现，通过两个配置文件管理：
 }
 ```
 
-`system_prompt` 的 stdin 输入与 `post_turn` 一致（包含基础上下文，无 `tool_args`/`result_context`）。脚本应将追加的系统 Prompt 内容输出到 stdout（纯文本或 JSON 的 `message` 字段）。
+`system_prompt` stdin input is the same as `post_turn` (includes base context, no `tool_args`/`result_context`). The script should output appended system prompt content to stdout (plain text or JSON `message` field).
 
-### 脚本输出格式
+### Script output format
 
 ```
-ok                    # 继续（默认）
-deny: <reason>        # 阻止（仅 pre_tool 有效）
-modify: <new_args>    # 替换参数（仅 pre_tool 有效）
-warning: <message>    # 继续但打印警告
+ok                    # Continue (default)
+deny: <reason>        # Block (only effective for pre_tool)
+modify: <new_args>    # Replace args (only effective for pre_tool)
+warning: <message>    # Continue but print warning
 ```
 
-也可以输出 JSON（推荐）：
+JSON output is also supported (recommended):
 
 ```json
 {"result": "ok", "message": "checked"}
@@ -140,12 +140,12 @@ warning: <message>    # 继续但打印警告
 {"result": "warning", "message": "file is large, review carefully"}
 ```
 
-### 完整配置示例
+### Full configuration example
 
 ```toml
 [[hooks]]
 name = "pre-check"
-description = "阻止危险的 write 操作"
+description = "Block dangerous write operations"
 trigger = "pre_tool"
 script = "check_write.sh"
 script_type = "shell"
@@ -157,33 +157,33 @@ timeout_secs = 3
 
 ## TOML Webhook
 
-### 支持的 trigger 值（逗号分隔多个）
+### Supported trigger values (comma-separated for multiple)
 
-| trigger 值（规范） | 别名 | 触发时机 |
+| trigger value (canonical) | Alias | When triggered |
 |-----------|------|---------|
-| `turn_start` | — | Turn 开始前 |
-| `tool_call_start` | — | 工具调用开始时 |
-| `pre_tool` | `before_tool` | 工具执行前 |
-| `post_tool` | `after_tool` | 工具执行后 |
-| `turn_complete` | `after_turn` | Turn 完成后（详细统计） |
-| `post_turn` | — | Turn 完成后（旧版兼容） |
-| `session_start` | — | 会话启动时 |
-| `session_end` | — | 会话结束时 |
-| `error` | — | 错误发生时 |
-| `model_response` | — | 模型响应完成后 |
-| `system_prompt` | — | 系统 Prompt 构建时 |
-| `message`² | `message_received` | 用户消息接收时 |
+| `turn_start` | — | Before turn starts |
+| `tool_call_start` | — | When tool call starts |
+| `pre_tool` | `before_tool` | Before tool execution |
+| `post_tool` | `after_tool` | After tool execution |
+| `turn_complete` | `after_turn` | After turn completes (detailed stats) |
+| `post_turn` | — | After turn completes (legacy compat) |
+| `session_start` | — | On session start |
+| `session_end` | — | On session end |
+| `error` | — | On error |
+| `model_response` | — | After model response |
+| `system_prompt` | — | When building system prompt |
+| `message`² | `message_received` | On user message received |
 
-> 使用 **contains 匹配**（逗号分隔多个 trigger）。例如 `trigger = "pre_tool,post_tool"` 会在两个时机都触发。
+> Uses **contains matching** (comma-separated triggers). E.g. `trigger = "pre_tool,post_tool"` fires on both occasions.
 >
-> ² `message`：WebhookHook 已实现对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
+> ² `message`: WebhookHook has implemented the corresponding trait, but the engine has not registered a trigger slot yet; currently not functional.
 
-### 同步 Webhook
+### Synchronous Webhook
 
 ```toml
 [[webhooks]]
 name = "slack-notify"
-description = "发送工具调用通知到 Slack"
+description = "Send tool call notifications to Slack"
 trigger = "pre_tool,post_tool"
 url = "https://hooks.slack.com/services/XXX"
 method = "POST"
@@ -195,7 +195,7 @@ enabled = true
 Authorization = "Bearer YOUR_TOKEN"
 ```
 
-### 异步批量 Webhook（高频场景推荐）
+### Async Batch Webhook (recommended for high-frequency scenarios)
 
 ```toml
 [[async_webhooks]]
@@ -203,8 +203,8 @@ name = "audit-log"
 trigger = "post_tool"
 url = "https://log.example.com/batch"
 timeout_secs = 10
-batch_size = 20            # 默认 10，达到后发送
-flush_interval_ms = 1000   # 默认 1000ms，定时刷新
+batch_size = 20            # default 10, send when reached
+flush_interval_ms = 1000   # default 1000ms, periodic flush
 retries = 2
 enabled = true
 
@@ -212,16 +212,16 @@ enabled = true
 Authorization = "Bearer AUDIT_TOKEN"
 ```
 
-> 异步 Webhook 不阻塞主流程。详细用法见 [Webhook 指南](./webhook-guide.md) 和 [异步 Webhook 指南](./async-webhook-guide.md)。
+> Async webhooks do not block the main flow. See [Webhook Guide](./webhook-guide.md) and [Async Webhook Guide](./async-webhook-guide.md).
 
 ---
 
-## JSON CC 兼容配置
+## JSON CC Compatible Configuration
 
-兼容 Claude Code 插件的 `.hooks.json`。加载路径：
+Compatible with Claude Code plugin's `.hooks.json`. Load paths:
 
-- `~/.atomcode/hooks.json` — 全局
-- `<project>/.hooks.json` — 项目（覆盖同名全局）
+- `~/.atomcode/hooks.json` — Global
+- `<project>/.hooks.json` — Project (overrides same-name global)
 
 ```json
 {
@@ -237,56 +237,56 @@ Authorization = "Bearer AUDIT_TOKEN"
 }
 ```
 
-支持的 `event` 值：`pre_tool_use`、`post_tool_use`、`session_start`、`session_end`、`user_prompt_submit`。
+Supported `event` values: `pre_tool_use`, `post_tool_use`, `session_start`, `session_end`, `user_prompt_submit`.
 
-Hook 通过环境变量接收上下文（`ATOMCODE_HOOK_EVENT`、`ATOMCODE_HOOK_CONTEXT`、`ATOMCODE_TOOL_NAME` 等），stdout 需输出 `{"action": "allow" | "block" | "modify"}` JSON。
+Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.), and must output `{"action": "allow" | "block" | "modify"}` JSON to stdout.
 
 ---
 
-## 内置 Hook（无需配置，自动启用）
+## Built-in Hooks (no configuration needed, auto-enabled)
 
-| Hook | 触发时机 | 功能 |
+| Hook | When triggered | Function |
 |------|---------|------|
-| `ToolAuditLogHook` | 工具调用时 | 记录调用到审计日志（tracing） |
-| `TurnStatsHook` | Turn 开始+完成 | 统计 Turn 耗时和操作 |
-| `AutoCommitHook` | Turn 完成 | 每 N 个 Turn 自动 `git commit` |
-| `SessionSummaryHook` | 会话开始+结束 | 打印会话摘要 |
-| `ErrorReportHook` | 错误发生时 | 记录错误详情 |
-| `ResponseValidationHook` | 模型响应后 | 检测敏感信息 |
+| `ToolAuditLogHook` | On tool call | Log calls to audit log (tracing) |
+| `TurnStatsHook` | Turn start + complete | Track turn duration and operations |
+| `AutoCommitHook` | Turn complete | Auto `git commit` every N turns |
+| `SessionSummaryHook` | Session start + end | Print session summary |
+| `ErrorReportHook` | On error | Log error details |
+| `ResponseValidationHook` | After model response | Detect sensitive information |
 
-内置 Hook 自动注册，暂不支持通过配置禁用（后续 CLI 会提供 enable/disable 开关）。同名项目级 hook 无法覆盖内置 Hook（内置 Hook 是 Rust 原生，不在 TOML 配置体系内）。
+Built-in hooks auto-register and cannot be disabled via configuration yet (future CLI will provide enable/disable switches). Same-name project-level hooks cannot override built-in hooks (built-in hooks are native Rust, outside the TOML configuration system).
 
 ---
 
-## CLI 命令
+## CLI Commands
 
 ```bash
-# 列出已加载的 hooks
+# List loaded hooks
 atomcode hooks list
 
-# 查看配置路径
+# View config paths
 atomcode hooks paths
 
-# 测试单个 hook
+# Test a single hook
 atomcode hooks test my-hook
 ```
 
 ---
 
-## 安全注意事项
+## Security Notes
 
-1. **项目 hooks 可覆盖全局 hooks 同名项**（项目 hooks 后加载）
-2. **Hooks 不能绕过权限系统** — `pre_tool` deny 不覆盖用户的 `always_allow` 设置
-3. **脚本执行有超时** — TOML ScriptHook 默认 2 秒，JSON 默认 10 秒，Webhook 默认 10 秒
-4. **脚本在用户权限下运行** — 注意脚本本身的安全性
-5. **超时/崩溃 fail-open** — 脚本超时或崩溃时视为 `ok`，不阻塞流程
+1. **Project hooks override same-name global hooks**（project hooks load after global hooks）
+2. **Hooks cannot bypass the permission system** — `pre_tool` deny does not override user's always_allow settings
+3. **Script execution has timeouts** — TOML ScriptHook default 2s, JSON default 10s, Webhook default 10s
+4. **Scripts run under user permissions** — be mindful of script security itself
+5. **Timeout/crash is fail-open** — Script timeout or crash is treated as ok, not blocking the flow
 
 ---
 
-## 相关文档
+## Related Docs
 
-- [CLI 使用指南](./hook-cli-guide.md) — `atomcode hooks` 命令详解
-- [完整时机列表](./hook-timing-complete.md) — 所有 hook 时机、可用配置方式
-- [Webhook 指南](./webhook-guide.md) — HTTP 远程调用
-- [异步 Webhook 指南](./async-webhook-guide.md) — 批量异步发送
-- [技术架构](./hook-architecture.md) — 面向开发者的架构参考
+- [CLI Guide](./hook-cli-guide.md) — `atomcode hooks` command reference
+- [Complete Timing List](./hook-timing-complete.md) — all hook timings and available configurations
+- [Webhook Guide](./webhook-guide.md) — HTTP remote calls
+- [Async Webhook Guide](./async-webhook-guide.md) — batch async delivery
+- [Architecture](./hook-architecture.md) — developer-oriented architecture reference
