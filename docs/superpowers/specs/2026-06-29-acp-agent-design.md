@@ -25,12 +25,23 @@ In scope:
 - `initialize`, `session/new`, `session/prompt`, `session/cancel`
 - streaming `session/update` notifications (text, reasoning, tool calls)
 - `session/request_permission` wired to atomcode's existing approval flow
-- tool-call updates carry structured diff content for edit tools (so Zed renders
-  diffs) — this is presentation only, NOT full filesystem delegation
+- tool-call updates carry `raw_input` + plain-text result content and a
+  `ToolKind` (read/edit/execute/…) so the client renders sensible affordances
+
+> **Implementation note (deferred):** structured `ToolCallContent::Diff { path,
+> old_text, new_text }` for edit tools — so Zed renders a rich diff view — was
+> scoped here originally but **deferred to Phase 2**: producing it requires
+> parsing each edit tool's arguments into old/new text, which is closer to the
+> filesystem-delegation work than to the v1 translation layer. v1 ships the
+> plain-text baseline above; the diff content lands with Phase 2.
 
 Out of scope (future phases, each its own spec):
 - Phase 2: filesystem delegation (`fs/read_text_file`, `fs/write_text_file`) so the
-  editor's unsaved buffers are respected
+  editor's unsaved buffers are respected, **and** structured edit-tool `Diff`
+  content for rich client-side diff rendering
+- Per-session teardown: v1 frees all sessions only when the connection ends
+  (ACP has no `session/close`); dropping a session when its kernel task completes
+  is deferred
 - Phase 3: terminal delegation (`terminal/*`), `plan` updates, `available_commands`
   (slash commands), `authenticate`
 - `session/load` (session resume) — advertised as unsupported in v1
