@@ -284,7 +284,7 @@
   <a class="hdr-logo" href="/index.html">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.25.7</span>
+    <span class="ver" id="verBadge" title="当前版本" data-i18n-title="brand.version.title">v4.25.7</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="/index.html#features" data-i18n="nav.features">功能</a>
@@ -308,7 +308,7 @@
 </header>
 
 <!-- mobile drawer -->
-<nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航">
+<nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航" data-i18n-aria-label="mobile.nav.label">
   <a href="/index.html#features" data-i18n="nav.features">功能</a>
   <a href="/index.html#editor-plugins" data-i18n="nav.plugins">编辑器插件</a>
   <a href="/index.html#install" data-i18n="nav.install">安装</a>
@@ -453,6 +453,12 @@ const T = {
   'nav.referral': { zh: '邀请推荐', en: 'Referral' },
   'nav.codingplan': { zh: 'Coding Plan', en: 'Coding Plan' },
   'btn.repo': { zh: '开源仓库', en: 'Repository' },
+  'brand.version.title': { zh: '当前版本', en: 'Current version' },
+  'mobile.nav.label': { zh: '移动端导航', en: 'Mobile navigation' },
+  'theme.to.dark': { zh: '切换到深色模式', en: 'Switch to dark' },
+  'theme.to.light': { zh: '切换到浅色模式', en: 'Switch to light' },
+  'lang.to.en': { zh: '切换到 English', en: 'Switch to English' },
+  'lang.to.zh': { zh: '切换到 简体中文', en: 'Switch to Chinese' },
   'hero.badge': { zh: '长期进行中 · 每月（4周）结算发放京东E卡', en: 'Ongoing · JD E-Card issued monthly (4 weeks)' },
   'hero.title': { zh: '邀请有礼：AtomCode 星推官计划', en: 'Referral Rewards: AtomCode Star Promoter Program' },
   'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍京东E卡奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns double JD E-Card rewards, with weekly leaderboard updates.' },
@@ -473,7 +479,7 @@ const T = {
   'metric.devices': { zh: '本周新增设备安装', en: 'New installs this week' },
   'metric.active': { zh: '本周新增账号活跃', en: 'New active accounts this week' },
   'metric.rate': { zh: '当前活跃转化率', en: 'Current active conversion' },
-  'metric.amount': { zh: '本周预计结算金额', en: 'Estimated settlement this week period' },
+  'metric.amount': { zh: '本周预计结算金额', en: 'Estimated settlement this week' },
   'unit.devices': { zh: '台', en: '' },
   'unit.people': { zh: '人', en: '' },
   'note.healthy': { zh: '已达质量线，安装与活跃双项结算', en: 'Quality line reached; installs and active accounts both count' },
@@ -506,7 +512,7 @@ const T = {
   'rules.desc': { zh: '为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。', en: 'To keep the community healthy, the system calculates conversion automatically (R = active / installs).' },
   'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
   'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
-  'rules.cash': { zh: '所有京东E卡奖励每月（4周）汇总结算，请及时填写接收信息。', en: 'All JD E-Card rewards are summarized and settled monthly (4 weeks). Please fill in your receipt details promptly.' },
+  'rules.cash': { zh: '所有京东E卡奖励每月（4周）汇总结算，并于第五周统一完成上一周期的京东E卡发放，请及时填写接收信息。', en: 'All JD E-Card rewards are summarized and settled monthly (4 weeks), and JD E-Cards for the previous cycle will be issued together in the fifth week. Please fill in your receipt details promptly.' },
   'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
   'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
   'rules.anti.2': { zh: '批量注册虚假账号、使用自动化脚本刷量。', en: 'Registering fake accounts in bulk or using automated scripts to inflate numbers.' },
@@ -528,6 +534,7 @@ const T = {
   'payment.phone.required': { zh: '请输入手机号', en: 'Please enter your phone number' },
   'payment.phone.invalid': { zh: '请输入有效的大陆手机号，或以 +国家码 开头的国际手机号', en: 'Enter a valid mainland China number or an international number starting with +country code' },
   'payment.close': { zh: '关闭', en: 'Close' },
+  'payment.close.aria': { zh: '关闭', en: 'Close' },
   'payment.cancel': { zh: '取消', en: 'Cancel' },
   'payment.edit': { zh: '修改', en: 'Edit' },
   'payment.save': { zh: '保存', en: 'Save' },
@@ -545,11 +552,17 @@ function applyI18n() {
   document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
   document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(el => { el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel)); });
   document.querySelectorAll('[data-copy-label="short"]').forEach(el => { el.textContent = t('cmd.copy'); });
   const langBtn = document.getElementById('langBtn');
   if (langBtn) {
     langBtn.textContent = LANG === 'zh' ? 'EN' : '中';
-    langBtn.setAttribute('aria-label', LANG === 'zh' ? 'Switch to English' : '切换到 中文');
+    langBtn.setAttribute('aria-label', LANG === 'zh' ? t('lang.to.en') : t('lang.to.zh'));
+  }
+  const themeBtn = document.getElementById('themeBtn');
+  if (themeBtn) {
+    themeBtn.setAttribute('aria-label', document.documentElement.classList.contains('light') ? t('theme.to.dark') : t('theme.to.light'));
   }
 }
 
@@ -616,6 +629,9 @@ let currentSid = null;
 let currentCode = null;
 let currentUser = null;
 let currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 0 };
+let lastLeaderboardRefreshedAt = null;
+const boardRenderState = {};
+const renderedRuleTargets = new Set();
 
 function getSid() {
   if (currentSid) return currentSid;
@@ -841,8 +857,8 @@ async function loadLeaderboard(weekStart, targetId, rulesId) {
       weekStart: resolvedWeekStart,
     });
     if (data.refreshed_at) {
-      const t = timeAgo(data.refreshed_at);
-      document.querySelectorAll('.js-updated-at').forEach(el => el.textContent = t);
+      lastLeaderboardRefreshedAt = data.refreshed_at;
+      updateLeaderboardRefreshedText();
     }
   } catch (e) {
     console.error('Failed to load leaderboard', e);
@@ -850,6 +866,18 @@ async function loadLeaderboard(weekStart, targetId, rulesId) {
     renderBoard(targetId, { items: [], meRow: null, weekLabel: weekLabelFromStart(resolvedWeekStart), weekStart: resolvedWeekStart });
   }
   renderRules(rulesId);
+}
+function updateLeaderboardRefreshedText() {
+  if (!lastLeaderboardRefreshedAt) return;
+  const text = timeAgo(lastLeaderboardRefreshedAt);
+  document.querySelectorAll('.js-updated-at').forEach(el => el.textContent = text);
+}
+function rerenderDynamicSections() {
+  Object.keys(boardRenderState).forEach(targetId => {
+    renderBoard(targetId, boardRenderState[targetId]);
+  });
+  renderedRuleTargets.forEach(targetId => renderRules(targetId));
+  updateLeaderboardRefreshedText();
 }
 
 function changeWeek(delta, targetId, rulesId) {
@@ -897,8 +925,10 @@ function renderBoard(targetId, data) {
   if (!target) return;
   const rows = data.items || [];
   const meRow = data.meRow || null;
-  const weekLabel = data.weekLabel || currentWeekLabel();
-  target.dataset.weekStart = data.weekStart || '';
+  const weekStart = data.weekStart || '';
+  const weekLabel = weekStart ? weekLabelFromStart(weekStart) : (data.weekLabel || currentWeekLabel());
+  target.dataset.weekStart = weekStart;
+  boardRenderState[targetId] = { items: rows, meRow: meRow, weekStart: weekStart, readonly: !!data.readonly };
   const rulesTargetId = targetId === 'no-code-board' ? 'no-code-rules' : targetId === 'public-board' ? 'public-rules' : 'rules-content';
   const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.prev')) + '">◂</button>';
   const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
@@ -935,6 +965,7 @@ function rowHtml(row) {
 function renderRules(targetId) {
   const target = document.getElementById(targetId);
   if (!target) return;
+  renderedRuleTargets.add(targetId);
   target.innerHTML = '<section class="rules">' +
     '<div class="rules-title"><span class="info">i</span>' + esc(t('rules.title')) + '</div>' +
     '<p>' + esc(t('rules.desc')) + '</p>' +
@@ -1089,7 +1120,7 @@ function reloadVisibleLeaderboard() {
     const light=theme==='light';
     html.classList.toggle('light',light);
     btn.innerHTML=light?SUN:MOON;
-    btn.setAttribute('aria-label',light?'Switch to dark':'Switch to light');
+    btn.setAttribute('aria-label',light?t('theme.to.dark'):t('theme.to.light'));
     try{localStorage.setItem('atomcode_theme',theme)}catch(e){}
     if(announce) showToast(t(light?'toast.theme.light':'toast.theme.dark'));
   }
@@ -1102,12 +1133,13 @@ function reloadVisibleLeaderboard() {
 /* ========== language toggle ========== */
 (function(){
   const btn=document.getElementById('langBtn');
-  function syncBtn(){btn.textContent=LANG==='zh'?'EN':'中';btn.setAttribute('aria-label',LANG==='zh'?'Switch to English':'切换到 中文');}
+  function syncBtn(){btn.textContent=LANG==='zh'?'EN':'中';btn.setAttribute('aria-label',LANG==='zh'?t('lang.to.en'):t('lang.to.zh'));}
   function applyAll(){
     applyI18n();
     syncBtn();
     renderInviteLink();
     renderSummary(currentSummary);
+    rerenderDynamicSections();
   }
   applyAll();
   btn.addEventListener('click',()=>{
@@ -1318,6 +1350,7 @@ document.addEventListener('keydown', function(e) {
 });
 
 initPage();
+document.addEventListener('DOMContentLoaded', applyI18n);
 </script>
 
 <!-- payment-info modal -->
@@ -1325,7 +1358,7 @@ initPage();
   <div class="modal-panel">
     <div class="modal-head">
       <span class="modal-head-title" data-i18n="payment.title">收款信息</span>
-      <button class="modal-close" onclick="closePaymentModal()" aria-label="关闭">✕</button>
+      <button class="modal-close" onclick="closePaymentModal()" aria-label="关闭" data-i18n-aria-label="payment.close.aria">✕</button>
     </div>
     <div class="modal-body">
 
