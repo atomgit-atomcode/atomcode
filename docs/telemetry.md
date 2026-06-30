@@ -32,8 +32,8 @@ Exactly 7 event types, each with a common "envelope" of identifiers/metadata.
 |---|---|---|---|
 | `open_atomcode` | / | AtomCode launch (non-meta command) | none |
 | `llm_chat` | — | After each LLM turn completes | `duration_ms, tool_calls_count, input_tokens, output_tokens, cached_tokens, had_error` |
-| `use_command` | command string | Each slash command execution | — |
-| `login_success` | / | OAuth login succeeded | none |
+| `use_command` | Specific command string | Each time a slash command is executed | — |
+| `login_success` | / | OAuth login succeeds | none |
 | `take_codingplan` | `success` / `fail` | `atomcode login` / `/login` (including hidden `atomcode codingplan` alias) finishes | — |
 | `panic` | / | Program crash | `location, message_head, thread, backtrace_top_5` (scrubbed) |
 | `telemetry_disabled` | / | User runs `atomcode telemetry disable` (only if previously enabled) | none |
