@@ -184,6 +184,22 @@ pub async fn run_prompt_turn(
     }
 }
 
+// ── session/cancel handler ────────────────────────────────────────────────────
+
+/// Send [`AgentCommand::Cancel`] to the named session's kernel.
+///
+/// If `session_id` is unknown the function is a deliberate no-op — the client
+/// may race a cancel against a turn that has already completed and the session
+/// removed; silently ignoring that case is correct protocol behaviour.
+///
+/// The map lock is held only for the synchronous `.get` + `.send` pair; it is
+/// released before any `await`, satisfying the hard constraint in the task brief.
+pub async fn handle_cancel(sessions: &Sessions, session_id: &str) {
+    if let Some(st) = sessions.lock().await.get(session_id) {
+        let _ = st.commands.send(AgentCommand::Cancel);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -214,5 +230,32 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].media_type, "image/png");
         assert_eq!(images[0].data, "BASE64");
+    }
+
+    #[tokio::test]
+    async fn cancel_sends_cancel_command() {
+        use atomcode_kernel::event::{AgentCommand, AgentEvent};
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        let (_ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let state = SessionState {
+            commands: cmd_tx,
+            events: std::sync::Arc::new(tokio::sync::Mutex::new(ev_rx)),
+            _task: tokio::spawn(async {}),
+        };
+        let sessions: Sessions =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        sessions.lock().await.insert("acp-1".into(), state);
+
+        handle_cancel(&sessions, "acp-1").await;
+
+        assert!(matches!(cmd_rx.recv().await, Some(AgentCommand::Cancel)));
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_session_is_noop() {
+        // Cancelling a session that doesn't exist must not panic or return an error.
+        let sessions: Sessions =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        handle_cancel(&sessions, "acp-nonexistent").await; // must not panic
     }
 }

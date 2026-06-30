@@ -38,13 +38,13 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
-    PromptCapabilities, PromptRequest,
+    AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
+    NewSessionRequest, PromptCapabilities, PromptRequest,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
 use atomcode_kernel::provider::LlmProvider;
 
-use crate::dispatch::{handle_new_session, Sessions};
+use crate::dispatch::{handle_cancel, handle_new_session, Sessions};
 
 /// Options for the ACP stdio server.
 ///
@@ -148,6 +148,16 @@ pub async fn serve_stdio(opts: AcpServeOptions) -> anyhow::Result<()> {
                 }
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |notif: CancelNotification, _cx: ConnectionTo<Client>| {
+                    handle_cancel(&sessions, notif.session_id.0.as_ref()).await;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
