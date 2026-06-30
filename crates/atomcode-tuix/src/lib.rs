@@ -277,7 +277,7 @@ pub async fn run(
         atomcode_core::config::UiTheme::Light => true,
         atomcode_core::config::UiTheme::Dark => false,
         atomcode_core::config::UiTheme::Auto => {
-            if caps.colors {
+            if caps.colors && !force_plain {
                 crate::terminal_bg::detect_light(
                     std::time::Duration::from_millis(60),
                 )
