@@ -42,6 +42,11 @@ pub struct ReviewAgentConfig {
     /// mid-stream (keepalive bytes keep `stream_timeout`'s idle timer reset). Engineering
     /// callers set it (e.g. `--max-duration 900`); a bare CLI run stays unbounded.
     pub max_turn_duration: Option<std::time::Duration>,
+    /// Disable the `web_search` tool for this review. `false` (default) ⇒ web_search is
+    /// mounted as before (behavior unchanged). `true` ⇒ the tool is registered but NOT
+    /// mounted, so the model cannot call it — used by runtimes where web egress is blocked
+    /// or undesirable, so a web_search attempt can't fail and abort the whole review.
+    pub no_web: bool,
 }
 
 impl ReviewAgentConfig {
@@ -64,6 +69,7 @@ impl ReviewAgentConfig {
             persona_append: None,
             max_rounds: None,
             max_turn_duration: None,
+            no_web: false,
         }
     }
 

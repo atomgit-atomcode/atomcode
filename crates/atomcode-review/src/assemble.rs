@@ -16,8 +16,14 @@ use std::sync::Arc;
 /// The READ-ONLY tools the reviewer sees. Deliberately NO write/edit/bash/change_dir — a
 /// reviewer investigates and reports, it never mutates. (The diff itself is injected as
 /// the task by the caller, so the agent needs no shell to obtain it.)
-fn review_tool_names() -> Vec<&'static str> {
-    let mut names = vec!["read_file", "grep", "glob", "list_directory", "ast_grep", "web_search", "report_finding"];
+fn review_tool_names(no_web: bool) -> Vec<&'static str> {
+    let mut names = vec!["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"];
+    // web_search is mounted by default; `no_web` drops it (the tool stays registered but
+    // unmounted), so a blocked/unreachable web egress can't make the model's web_search
+    // call abort the whole review.
+    if !no_web {
+        names.push("web_search");
+    }
     names.extend(codeintel_tool_names().iter().copied());
     names
 }
@@ -44,7 +50,7 @@ pub fn build_review_agent_with(
 ) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
-    let tools = mount_review_tools(&report);
+    let tools = mount_review_tools(&report, cfg.no_web);
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
         .provider(provider)
@@ -83,14 +89,14 @@ pub fn build_review_agent_with(
 /// Register the read-only review toolset (+ the shared `report_finding` instance) and
 /// mount only the read-only subset — write/edit/bash are registered by
 /// `register_coding_tools` but NEVER mounted, so the model cannot mutate.
-fn mount_review_tools(report: &ReportFindingTool) -> MountedTools {
+fn mount_review_tools(report: &ReportFindingTool, no_web: bool) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
     register_codeintel_tools(&mut reg);
     reg.register(Arc::new(AstGrepTool));
-    reg.register(Arc::new(WebSearchTool::new()));
+    reg.register(Arc::new(WebSearchTool::new())); // registered always; mounted only when !no_web
     reg.register(Arc::new(report.clone())); // shares state with the returned handle
-    reg.mount(&review_tool_names())
+    reg.mount(&review_tool_names(no_web))
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the
@@ -248,10 +254,24 @@ mod tests {
     #[test]
     fn review_mounts_readonly_set_only() {
         // The mounted names are read-only — no mutation tools.
-        let names = review_tool_names();
+        let names = review_tool_names(false);
         assert!(names.contains(&"read_file") && names.contains(&"report_finding") && names.contains(&"ast_grep"));
         for forbidden in ["write_file", "edit_file", "bash", "change_dir", "search_replace", "parallel_edit_files"] {
             assert!(!names.contains(&forbidden), "reviewer must not mount `{forbidden}`");
+        }
+    }
+
+    #[test]
+    fn no_web_drops_web_search_only() {
+        // 默认挂 web_search；no_web=true 时仅去掉 web_search，其余只读工具不变。
+        let with_web = review_tool_names(false);
+        assert!(with_web.contains(&"web_search"), "默认应挂 web_search");
+
+        let without_web = review_tool_names(true);
+        assert!(!without_web.contains(&"web_search"), "no_web 应去掉 web_search");
+        // 其它只读工具仍在
+        for keep in ["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"] {
+            assert!(without_web.contains(&keep), "no_web 不应误伤 `{keep}`");
         }
     }
 }
