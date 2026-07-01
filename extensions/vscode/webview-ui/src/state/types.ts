@@ -148,6 +148,7 @@ export interface ChatState {
   settingsOpen: boolean;
   searchQuery: string;
   searchOpen: boolean;
+  locale?: string;
 }
 
 // ─── Actions dispatched by the reducer ──────────────────────────
@@ -192,12 +193,12 @@ export type ChatAction =
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean };
+  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean }
+  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string }
   | { type: 'userMessage'; text: string; images?: ImageData[] }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }

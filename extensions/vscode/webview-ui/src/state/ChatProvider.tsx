@@ -2,6 +2,7 @@ import React, { createContext, useContext, useReducer, useEffect, useCallback, u
 import { ChatState, ChatAction, ExtensionMessage, ImageData } from './types';
 import { chatReducer, initialState } from './reducer';
 import { postMessage, getVSCodeApi } from '../vscode';
+import { createTranslator } from '../i18n';
 
 // ─── Context ────────────────────────────────────────────────────
 
@@ -57,6 +58,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             activeSessionId: msg.activeSessionId,
             projectHash: msg.projectHash,
             isSessionList: msg.isSessionList,
+            locale: msg.locale,
           });
           // Persist session binding so tabs survive VS Code restart
           if (msg.activeSessionId) {
@@ -172,13 +174,13 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           });
           break;
         case 'loginStarted':
-          dispatch({ type: 'SET_SETUP_STATUS', status: 'Waiting for browser authorization...', loginUrl: msg.url });
+          dispatch({ type: 'SET_SETUP_STATUS', status: createTranslator(stateRef.current.locale)('setup.waitingForBrowser'), loginUrl: msg.url });
           break;
         case 'loginPending':
-          dispatch({ type: 'SET_SETUP_STATUS', status: 'Waiting for browser authorization...' });
+          dispatch({ type: 'SET_SETUP_STATUS', status: createTranslator(stateRef.current.locale)('setup.waitingForBrowser') });
           break;
         case 'loginAuthorized':
-          dispatch({ type: 'SET_SETUP_STATUS', status: 'Signed in. Sync CodingPlan models or add a provider.' });
+          dispatch({ type: 'SET_SETUP_STATUS', status: createTranslator(stateRef.current.locale)('setup.signedInNextStep') });
           break;
         case 'setupWorking':
           dispatch({ type: 'SET_SETUP_STATUS', status: msg.message });

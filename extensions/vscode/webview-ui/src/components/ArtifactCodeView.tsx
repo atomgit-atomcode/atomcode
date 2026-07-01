@@ -4,6 +4,7 @@ import { ArtifactData } from '../state/types';
 import { renderCodeBlockHtml } from './codeBlockRendering';
 import { DiffView } from './DiffView';
 import { classifyArtifactRenderKind, normalizeCodeArtifactContent } from './artifactRendering';
+import { useT } from '../i18n';
 
 function looksLikeUnifiedPatch(content: string): boolean {
   return /^diff --git /m.test(content) || /^@@ /m.test(content) || /^--- /m.test(content) || /^\+\+\+ /m.test(content);
@@ -11,6 +12,7 @@ function looksLikeUnifiedPatch(content: string): boolean {
 
 export function ArtifactCodeView({ artifact }: { artifact: ArtifactData }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const t = useT();
   const showDiffView = classifyArtifactRenderKind(artifact) === 'diff' && looksLikeUnifiedPatch(artifact.content);
 
   const handleActions = useCallback((event: MouseEvent) => {
@@ -23,10 +25,10 @@ export function ArtifactCodeView({ artifact }: { artifact: ArtifactData }) {
     if (!codeEl) return;
     const code = wrapper.dataset.rawCode ?? codeEl.textContent ?? '';
     navigator.clipboard.writeText(code).then(() => {
-      btn.title = 'Copied!';
-      setTimeout(() => { btn.title = 'Copy'; }, 2000);
+      btn.title = t('tool.copied');
+      setTimeout(() => { btn.title = t('assistant.copy'); }, 2000);
     });
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -37,8 +39,8 @@ export function ArtifactCodeView({ artifact }: { artifact: ArtifactData }) {
 
   const html = useMemo(() => {
     const normalized = normalizeCodeArtifactContent(artifact.content, artifact.language);
-    return DOMPurify.sanitize(renderCodeBlockHtml(normalized.content, normalized.language));
-  }, [artifact.content, artifact.language]);
+    return DOMPurify.sanitize(renderCodeBlockHtml(normalized.content, normalized.language, { copy: t('assistant.copy') }));
+  }, [artifact.content, artifact.language, t]);
 
   if (showDiffView) {
     return (

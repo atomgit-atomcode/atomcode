@@ -404,7 +404,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             canSelectFiles: true,
             canSelectFolders: true,
             canSelectMany: false,
-            openLabel: 'Insert Path',
+            openLabel: vscode.l10n.t('Insert Path'),
           });
           const picked = uris?.[0]?.fsPath;
           if (picked) {
@@ -417,7 +417,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             canSelectFiles: true,
             canSelectFolders: false,
             canSelectMany: true,
-            openLabel: 'Attach File',
+            openLabel: vscode.l10n.t('Attach File'),
           });
           for (const uri of uris ?? []) {
             this._postMessage({
@@ -900,6 +900,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       activeSessionId: sid,
       projectHash,
       isSessionList: mode === 'sidebar',
+      locale: vscode.env.language,
     }, webview);
   }
 
@@ -979,7 +980,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this._loginStartedFromCommand) {
         this._postMessage({
           type: 'assistantMessage',
-          text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+          text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
         });
         this._loginStartedFromCommand = false;
       }
@@ -1020,10 +1021,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (announceInChat) {
         this._postMessage({
           type: 'assistantMessage',
-          text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
+          text: vscode.l10n.t('Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.'),
         });
       }
-      this._broadcastMessage({ type: 'setupWorking', message: 'Waiting for AtomGit sign-in...' });
+      this._broadcastMessage({ type: 'setupWorking', message: vscode.l10n.t('Waiting for AtomGit sign-in...') });
 
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
@@ -1043,7 +1044,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (announceInChat) {
           this._postMessage({
             type: 'assistantMessage',
-            text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+            text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
           });
         }
         await this._sendSetupState();
@@ -1077,10 +1078,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (options.announceInChat) {
         this._postMessage({
           type: 'assistantMessage',
-          text: 'Syncing CodingPlan models...',
+          text: vscode.l10n.t('Syncing CodingPlan models...'),
         });
       }
-      this._broadcastMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
+      this._broadcastMessage({ type: 'setupWorking', message: vscode.l10n.t('Syncing CodingPlan models...') });
       const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
       this._broadcastMessage({ type: 'codingPlanResult', result });
       await this._sendSetupState();
@@ -1188,7 +1189,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (!hash) {
-      vscode.window.showErrorMessage('Unable to open session: missing project hash.');
+      vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
       return;
     }
 
@@ -1262,16 +1263,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _renameSession(sessionId: string, projectHash?: string, currentName?: string) {
     const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
     if (!hash) {
-      this._postMessage({ type: 'error', message: 'Unable to rename session: missing project hash.' });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to rename session: missing project hash.') });
       return;
     }
 
     const nextName = await vscode.window.showInputBox({
-      title: 'Rename AtomCode session',
-      prompt: 'Enter a new session name',
+      title: vscode.l10n.t('Rename AtomCode session'),
+      prompt: vscode.l10n.t('Enter a new session name'),
       value: currentName || '',
       ignoreFocusOut: true,
-      validateInput: (value) => value.trim() ? undefined : 'Session name cannot be empty',
+      validateInput: (value) => value.trim() ? undefined : vscode.l10n.t('Session name cannot be empty'),
     });
     if (nextName === undefined) return;
 
@@ -1279,29 +1280,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._client.renameSession(hash, sessionId, nextName.trim());
       await this._refreshSessions();
     } catch (e) {
-      this._postMessage({ type: 'error', message: `Unable to rename session: ${this._messageFromError(e)}` });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to rename session: {message}', { message: this._messageFromError(e) }) });
     }
   }
 
   private async _deleteSession(sessionId: string, projectHash?: string, currentName?: string) {
     const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
     if (!hash) {
-      this._postMessage({ type: 'error', message: 'Unable to delete session: missing project hash.' });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to delete session: missing project hash.') });
       return;
     }
 
     const label = currentName || sessionId;
+    const deleteLabel = vscode.l10n.t('Delete');
     const choice = await vscode.window.showWarningMessage(
-      `Delete AtomCode session "${label}"?`,
-      { modal: true, detail: 'This removes the session from local history.' },
-      'Delete',
+      vscode.l10n.t('Delete AtomCode session "{label}"?', { label }),
+      { modal: true, detail: vscode.l10n.t('This removes the session from local history.') },
+      deleteLabel,
     );
-    if (choice !== 'Delete') return;
+    if (choice !== deleteLabel) return;
 
     try {
       await this._deleteSessionInternal(sessionId, hash);
     } catch (e) {
-      this._postMessage({ type: 'error', message: `Unable to delete session: ${this._messageFromError(e)}` });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to delete session: {message}', { message: this._messageFromError(e) }) });
     }
   }
 
@@ -1356,15 +1358,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const count = sessions.length;
     const label = count === 1
-      ? `Delete AtomCode session "${sessions[0].name || sessions[0].sessionId}"?`
-      : `确定删除 ${count} 个会话？`;
+      ? vscode.l10n.t('Delete AtomCode session "{label}"?', { label: sessions[0].name || sessions[0].sessionId })
+      : vscode.l10n.t('Delete {count} sessions?', { count });
+    const deleteLabel = vscode.l10n.t('Delete');
 
     const choice = await vscode.window.showWarningMessage(
       label,
-      { modal: true, detail: '此操作不可撤销，会话将从本地历史中移除。' },
-      'Delete',
+      { modal: true, detail: vscode.l10n.t('This cannot be undone. Sessions will be removed from local history.') },
+      deleteLabel,
     );
-    if (choice !== 'Delete') return;
+    if (choice !== deleteLabel) return;
 
     let succeeded = 0;
     let failed = 0;
@@ -1408,7 +1411,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (failed > 0) {
-      const errMsg = { type: 'error', message: `已删除 ${succeeded}/${count} 个会话，${failed} 个失败` };
+      const errMsg = { type: 'error', message: vscode.l10n.t('Deleted {succeeded}/{count} sessions, {failed} failed', { succeeded, count, failed }) };
       if (sourceWebview) {
         this._postMessage(errMsg, sourceWebview);
       } else {
@@ -1434,7 +1437,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _applyCode(code: string, _language: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
-      vscode.window.showInformationMessage('No active editor to apply code to');
+      vscode.window.showInformationMessage(vscode.l10n.t('No active editor to apply code to'));
       return;
     }
     const selection = editor.selection;
@@ -1488,9 +1491,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
           const auth = await this._client.logout();
           this._broadcastMessage({ type: 'authStatus', auth });
-          this._postSlashInfo('Signed out of AtomGit.', sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Signed out of AtomGit.'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to sign out: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to sign out: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/whoami':
@@ -1500,7 +1503,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const name = auth.user.name || auth.user.username || auth.user.email || auth.user.id;
             const lines = [
               `${name} (${auth.user.username || auth.user.id})`,
-              auth.user.email || 'Email: not provided',
+              auth.user.email || vscode.l10n.t('Email: not provided'),
               `User ID: ${auth.user.id}`,
               `Auth: ${auth.auth_path}`,
             ];
@@ -1510,14 +1513,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               if (auth.token.expires_in !== undefined) {
                 lines.push(`Expires in: ${auth.token.expires_in}s`);
               }
-              lines.push(`Refresh token: ${auth.token.has_refresh_token ? 'yes' : 'no'}`);
+              lines.push(`Refresh token: ${auth.token.has_refresh_token ? vscode.l10n.t('yes') : vscode.l10n.t('no')}`);
             }
             this._postSlashInfo(lines.join('\n'), sessionId, text);
           } else {
-            this._postSlashInfo('Not signed in.', sessionId, text);
+            this._postSlashInfo(vscode.l10n.t('Not signed in.'), sessionId, text);
           }
         } catch (e) {
-          this._postSlashInfo(`Unable to read auth status: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read auth status: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/status':
@@ -1530,11 +1533,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const provider = providers?.providers.find((p) => p.name === providers.default_provider || p.is_default);
           this._postSlashInfo([
             `Daemon: ${health.service} ${health.version}`,
-            `Auth: ${auth?.logged_in ? 'signed in' : 'not signed in'}`,
-            `Provider: ${provider ? `${provider.name} (${provider.model})` : 'not configured'}`,
+            `Auth: ${auth?.logged_in ? vscode.l10n.t('signed in') : vscode.l10n.t('not signed in')}`,
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : vscode.l10n.t('not configured')}`,
           ].join('\n'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to read status: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read status: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/config':
@@ -1542,10 +1545,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const config = await this._client.getConfig();
           const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
           this._postSlashInfo([
-            `Provider: ${provider ? `${provider.name} (${provider.model})` : config.default_provider || 'not configured'}`,
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : config.default_provider || vscode.l10n.t('not configured')}`,
             `Config: ${config.path}`,
             '',
-            'Example:',
+            vscode.l10n.t('Example:'),
             '',
             '```toml',
             'default_provider = "deepseek"',
@@ -1558,11 +1561,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             'context_window = 64000',
             '```',
             '',
-            'Full reference: docs/config.example.toml',
-            'Edit the file, then run /reload. No restart needed.',
+            vscode.l10n.t('Full reference: docs/config.example.toml'),
+            vscode.l10n.t('Edit the file, then run /reload. No restart needed.'),
           ].join('\n'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to read config: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read config: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/reload':
@@ -1571,12 +1574,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
           await this._sendSetupState();
           this._postSlashInfo(
-            `Reloaded config. Default provider: ${provider?.name || config.default_provider || 'none'}.`,
+            vscode.l10n.t('Reloaded config. Default provider: {provider}.', { provider: provider?.name || config.default_provider || 'none' }),
             sessionId,
             text,
           );
         } catch (e) {
-          this._postSlashInfo(`Unable to reload config: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to reload config: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       default:
@@ -1661,7 +1664,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!existingIds.has(info.sessionId)) {
           sessions.unshift({
             id: info.sessionId,
-            name: 'New session',
+            name: vscode.l10n.t('New session'),
             created_at: Date.now(),
             updated_at: Date.now(),
             isGenerating: this._sessionRuntimes.get(info.sessionId)?.isGenerating ?? false,
@@ -1785,6 +1788,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\{\{nonce\}\}/g, nonce);
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
     html = html.replace(/\{\{viewMode\}\}/g, mode);
+    html = html.replace(/\{\{locale\}\}/g, vscode.env.language || 'en');
 
     return html;
   }

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { ChatMessage } from '../state/types';
 import { Markdown } from './Markdown';
+import { useT } from '../i18n';
 
 interface UserMessageProps {
   message: ChatMessage;
@@ -9,6 +10,7 @@ interface UserMessageProps {
 
 export function UserMessage({ message, className = '' }: UserMessageProps) {
   const [expanded, setExpanded] = useState(false);
+  const t = useT();
   const shouldCollapse = useMemo(() => {
     const lineCount = message.text.split('\n').length;
     return message.text.length > 1200 || lineCount > 18;
@@ -17,12 +19,12 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
   return (
     <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}`}>
       <div className="user-message-bubble">
-        {message.queued && <div className="user-message-status">Queued</div>}
+        {message.queued && <div className="user-message-status">{t('user.queued')}</div>}
         {message.contextFiles && message.contextFiles.length > 0 && (
           <div className="user-message-attachments">
             {message.contextFiles.map((file) => (
               <span key={file.path} className="user-message-attachment" title={file.path}>
-                <span className="user-message-attachment-icon">{file.type === 'selection' ? 'Selection' : 'File'}</span>
+                <span className="user-message-attachment-icon">{file.type === 'selection' ? t('user.selection') : t('user.file')}</span>
                 <span className="user-message-attachment-name">{file.fileName}</span>
               </span>
             ))}
@@ -49,7 +51,7 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
             className="user-message-toggle"
             onClick={() => setExpanded((value) => !value)}
           >
-            {expanded ? 'Collapse' : 'Expand'}
+            {expanded ? t('user.collapse') : t('user.expand')}
           </button>
         )}
       </div>

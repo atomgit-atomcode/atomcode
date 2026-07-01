@@ -5,6 +5,7 @@ import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
+import { useT } from '../i18n';
 
 interface WorkspaceFile {
   path: string;
@@ -42,6 +43,7 @@ function imageDataUrl(img: ImageData): string {
 
 export function InputArea() {
   const { state, send, stop, dispatch } = useChatContext();
+  const t = useT();
   const [text, setText] = useState('');
   const [showSlash, setShowSlash] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
@@ -176,14 +178,14 @@ export function InputArea() {
     const images = Array.from(files).filter((file) => file.type.startsWith('image/'));
     if (images.length === 0) return;
     const oversized = images.some((file) => file.size > MAX_IMAGE_BYTES);
-    setAttachError(oversized ? `Images must be under ${MAX_IMAGE_MB} MB.` : null);
+    setAttachError(oversized ? t('input.imageTooLarge', { mb: MAX_IMAGE_MB }) : null);
     const allowed = images.filter((file) => file.size <= MAX_IMAGE_BYTES);
     if (allowed.length === 0) return;
     const parsed = (await Promise.all(allowed.map(fileToImageData))).filter(
       (img): img is ImageData => img !== null,
     );
     setPendingImages((prev) => [...prev, ...parsed].slice(0, MAX_IMAGES));
-  }, []);
+  }, [t]);
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
@@ -300,19 +302,19 @@ export function InputArea() {
           <div className="attach-menu-popover" ref={attachMenuRef}>
             <button type="button" className="attach-menu-item" onClick={pickPath}>
               <span className="attach-menu-icon">#</span>
-              <span>Insert path</span>
+              <span>{t('input.insertPath')}</span>
             </button>
             <button type="button" className="attach-menu-item" onClick={pickContextFile}>
               <span className="attach-menu-icon">+</span>
-              <span>Choose file</span>
+              <span>{t('input.chooseFile')}</span>
             </button>
             <button type="button" className="attach-menu-item" onClick={openFilePicker}>
               <span className="attach-menu-icon">@</span>
-              <span>Search workspace</span>
+              <span>{t('input.searchWorkspace')}</span>
             </button>
             <button type="button" className="attach-menu-item" onClick={openImagePicker}>
               <span className="attach-menu-icon">□</span>
-              <span>Upload image</span>
+              <span>{t('input.uploadImage')}</span>
             </button>
           </div>
         )}
@@ -322,14 +324,14 @@ export function InputArea() {
               ref={fileSearchRef}
               className="file-picker-search"
               type="text"
-              placeholder="Search project files..."
+              placeholder={t('input.searchProjectFiles')}
               value={fileQuery}
               onChange={(e) => handleFileSearch(e.target.value)}
             />
             <div className="file-picker-list">
               {workspaceFiles.length === 0 ? (
                 <div className="file-picker-empty">
-                  {fileQuery ? 'No matching files' : 'Type to search workspace files'}
+                  {fileQuery ? t('input.noMatchingFiles') : t('input.typeToSearchFiles')}
                 </div>
               ) : (
                 workspaceFiles.map((f) => (
@@ -353,7 +355,7 @@ export function InputArea() {
         {attachError && (
           <div className="input-attach-error" role="alert">
             <span>{attachError}</span>
-            <button type="button" onClick={() => setAttachError(null)} aria-label="Dismiss">×</button>
+            <button type="button" onClick={() => setAttachError(null)} aria-label={t('input.dismiss')}>×</button>
           </div>
         )}
         {pendingImages.length > 0 && (
@@ -363,8 +365,8 @@ export function InputArea() {
                 <img src={imageDataUrl(img)} alt="" />
                 <button
                   type="button"
-                  aria-label="Remove image"
-                  title="Remove image"
+                  aria-label={t('input.removeImage')}
+                  title={t('input.removeImage')}
                   onClick={() => setPendingImages((prev) => prev.filter((_, i) => i !== index))}
                 >
                   ×
@@ -404,7 +406,7 @@ export function InputArea() {
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          placeholder="Type a message..."
+          placeholder={t('input.placeholder')}
           rows={1}
         />
         <input
@@ -419,32 +421,32 @@ export function InputArea() {
           }}
         />
         <div className="input-footer">
-          <button className="footer-slash-btn" onClick={handleSlashButton} title="Commands">
+          <button className="footer-slash-btn" onClick={handleSlashButton} title={t('input.commands')}>
             /
           </button>
-          <button className="footer-attach-btn" onClick={handleAttachClick} title="Attach file">
+          <button className="footer-attach-btn" onClick={handleAttachClick} title={t('input.attachFile')}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
           <span className="footer-spacer" />
-          {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total)}</span>}
+          {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total, t)}</span>}
           <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
           {state.isGenerating ? (
             <>
               {hasText && (
-                <button className="btn-send" onClick={handleSend} title="Queue message">
+                <button className="btn-send" onClick={handleSend} title={t('input.queueMessage')}>
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                     <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
                   </svg>
                 </button>
               )}
-              <button className="btn-stop" onClick={stop} title="Stop">
+              <button className="btn-stop" onClick={stop} title={t('input.stop')}>
                 <div style={{ width: 8, height: 8, background: 'currentColor', borderRadius: 1 }} />
               </button>
             </>
           ) : (
-            <button className="btn-send" onClick={handleSend} disabled={!hasText} title="Send">
+            <button className="btn-send" onClick={handleSend} disabled={!hasText} title={t('input.send')}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
               </svg>

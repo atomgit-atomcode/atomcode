@@ -4,17 +4,12 @@ import DOMPurify from 'dompurify';
 import { postMessage } from '../vscode';
 import { renderCodeBlockHtml } from './codeBlockRendering';
 import { prepareMarkdownForRender } from './streamingMarkdown';
+import { useT } from '../i18n';
 
 marked.setOptions({
   gfm: true,
   breaks: false,
 });
-
-const renderer = new marked.Renderer();
-
-renderer.code = function (code: string, infostring?: string) {
-  return renderCodeBlockHtml(code, infostring);
-};
 
 interface MarkdownProps {
   content: string;
@@ -23,6 +18,7 @@ interface MarkdownProps {
 
 export function Markdown({ content, streaming = false }: MarkdownProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const t = useT();
 
   const handleActions = useCallback((e: MouseEvent) => {
     const target = e.target as HTMLElement;
@@ -37,8 +33,8 @@ export function Markdown({ content, streaming = false }: MarkdownProps) {
 
     if (action === 'copy') {
       navigator.clipboard.writeText(code).then(() => {
-        btn.title = 'Copied!';
-        setTimeout(() => { btn.title = 'Copy'; }, 2000);
+        btn.title = t('tool.copied');
+        setTimeout(() => { btn.title = t('assistant.copy'); }, 2000);
       });
     } else if (action === 'apply') {
       postMessage({ type: 'applyCode', code });
@@ -55,10 +51,14 @@ export function Markdown({ content, streaming = false }: MarkdownProps) {
   }, [handleActions]);
 
   const html = useMemo(() => {
+    const renderer = new marked.Renderer();
+    renderer.code = function (code: string, infostring?: string) {
+      return renderCodeBlockHtml(code, infostring, { copy: t('assistant.copy') });
+    };
     const source = prepareMarkdownForRender(content, streaming);
     const raw = marked.parse(source, { renderer }) as string;
     return DOMPurify.sanitize(raw);
-  }, [content, streaming]);
+  }, [content, streaming, t]);
 
   return (
     <div ref={containerRef} className="markdown-root" dangerouslySetInnerHTML={{ __html: html }} />

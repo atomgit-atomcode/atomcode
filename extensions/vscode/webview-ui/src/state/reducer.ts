@@ -261,6 +261,7 @@ export const initialState: ChatState = {
   settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
+  locale: document.body.dataset.locale,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -811,6 +812,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         activeSessionId: action.activeSessionId ?? state.activeSessionId,
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
+        locale: action.locale ?? state.locale,
       };
 
     default:

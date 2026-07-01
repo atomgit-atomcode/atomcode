@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { postMessage } from '../vscode';
+import { useT } from '../i18n';
 
 export function ProviderSettings() {
   const { state, dispatch, setDefaultProvider, refreshSetupState } = useChatContext();
+  const t = useT();
   const [providerName, setProviderName] = useState('');
   const [providerType, setProviderType] = useState('openai');
   const [model, setModel] = useState('');
@@ -36,25 +38,25 @@ export function ProviderSettings() {
       <aside className="settings-panel" onClick={(e) => e.stopPropagation()}>
         <div className="settings-header">
           <div>
-            <h3>AtomCode Settings</h3>
-            <p>{state.auth?.logged_in ? `Signed in as ${state.auth.user?.username}` : 'Not signed in'}</p>
+            <h3>{t('provider.settingsTitle')}</h3>
+            <p>{state.auth?.logged_in ? t('setup.signedInAs', { name: state.auth.user?.username || t('setup.atomgitUser') }) : t('provider.notSignedIn')}</p>
           </div>
           <button className="ghost-btn" onClick={() => dispatch({ type: 'TOGGLE_SETTINGS' })}>×</button>
         </div>
 
         <section className="settings-section">
-          <div className="settings-section-title">Providers</div>
-          {state.providers.length === 0 && <div className="settings-empty">No providers configured.</div>}
+          <div className="settings-section-title">{t('provider.providers')}</div>
+          {state.providers.length === 0 && <div className="settings-empty">{t('provider.noneConfigured')}</div>}
           {state.providers.map((p) => (
             <div className="provider-row" key={p.name}>
               <div className="provider-row-main">
                 <span>{p.model}</span>
-                <small>{p.name} · {p.type}{p.has_api_key ? ' · key set' : ''}</small>
+                <small>{p.name} · {p.type}{p.has_api_key ? ` · ${t('provider.keySet')}` : ''}</small>
               </div>
               {p.is_default ? (
-                <span className="model-default-badge">default</span>
+                <span className="model-default-badge">{t('model.defaultBadge')}</span>
               ) : (
-                <button className="setup-secondary" onClick={() => setDefaultProvider(p.name)}>Use</button>
+                <button className="setup-secondary" onClick={() => setDefaultProvider(p.name)}>{t('provider.use')}</button>
               )}
               <button
                 className="setup-secondary"
@@ -67,25 +69,25 @@ export function ProviderSettings() {
                   },
                 })}
               >
-                {p.thinking_enabled ? 'Think on' : 'Think off'}
+                {p.thinking_enabled ? t('provider.thinkOn') : t('provider.thinkOff')}
               </button>
               <button className="setup-secondary" onClick={() => postMessage({ type: 'providerDelete', name: p.name })}>
-                Delete
+                {t('provider.delete')}
               </button>
             </div>
           ))}
-          <button className="setup-secondary setup-wide" onClick={refreshSetupState}>Refresh</button>
+          <button className="setup-secondary setup-wide" onClick={refreshSetupState}>{t('provider.refresh')}</button>
         </section>
 
         <section className="settings-section">
-          <div className="settings-section-title">Add Provider</div>
+          <div className="settings-section-title">{t('provider.addProvider')}</div>
           <form className="provider-form" onSubmit={submitProvider}>
-            <input value={providerName} onChange={(e) => setProviderName(e.target.value)} placeholder="Provider name" required />
-            <input value={providerType} onChange={(e) => setProviderType(e.target.value)} placeholder="Type, e.g. openai" required />
-            <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="Model" required />
-            <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="Base URL" />
-            <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="API key" type="password" />
-            <button className="setup-primary" type="submit">Save provider</button>
+            <input value={providerName} onChange={(e) => setProviderName(e.target.value)} placeholder={t('setup.providerName')} required />
+            <input value={providerType} onChange={(e) => setProviderType(e.target.value)} placeholder={t('provider.typePlaceholder')} required />
+            <input value={model} onChange={(e) => setModel(e.target.value)} placeholder={t('setup.model')} required />
+            <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={t('setup.baseUrl')} />
+            <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={t('setup.apiKey')} type="password" />
+            <button className="setup-primary" type="submit">{t('provider.saveProvider')}</button>
           </form>
         </section>
 

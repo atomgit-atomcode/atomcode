@@ -193,7 +193,11 @@ function diffCodeToHtml(text: string, language: string): string {
   }).join('');
 }
 
-export function renderCodeBlockHtml(code: string, infostring?: string): string {
+export function renderCodeBlockHtml(
+  code: string,
+  infostring?: string,
+  labels: { copy?: string } = {},
+): string {
   const text = code ?? '';
   if (!text.trim()) {
     return '';
@@ -226,7 +230,7 @@ export function renderCodeBlockHtml(code: string, infostring?: string): string {
   return (
     `<div class="${classes}" data-code-id="${id}" data-raw-code="${escapeHtml(text)}">` +
     `<pre><code class="${codeClass}">${highlighted}</code></pre>` +
-    `<button class="copy-button" data-action="copy" title="Copy">` +
+    `<button class="copy-button" data-action="copy" title="${escapeHtml(labels.copy ?? 'Copy')}">` +
     `<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">` +
     `<path d="M4 4v8h8V4H4zm7 7H5V5h6v6zM2 2v8h1V3h7V2H2z"/>` +
     `</svg></button>` +

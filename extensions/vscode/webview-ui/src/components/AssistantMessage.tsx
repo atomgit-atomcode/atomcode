@@ -6,6 +6,7 @@ import { PermissionRequest } from './PermissionRequest';
 import { ArtifactCodeView } from './ArtifactCodeView';
 import { blocksFromLegacyMessage } from '../state/blocks';
 import { classifyArtifactRenderKind, normalizeMarkdownArtifactContent, shouldRenderArtifactChrome } from './artifactRendering';
+import { useT } from '../i18n';
 
 interface AssistantMessageProps {
   message: ChatMessage;
@@ -13,7 +14,8 @@ interface AssistantMessageProps {
 }
 
 function ArtifactBlock({ artifact }: { artifact: ArtifactData }) {
-  const label = artifact.title || artifact.language || artifact.artifactType || 'artifact';
+  const t = useT();
+  const label = artifact.title || artifact.language || artifact.artifactType || t('assistant.artifact');
   const isStreaming = artifact.status === 'streaming';
 
   return (
@@ -21,7 +23,7 @@ function ArtifactBlock({ artifact }: { artifact: ArtifactData }) {
       <div className="artifact-header">
         <span className="artifact-title">{label}</span>
         {artifact.language && <span className="artifact-meta">{artifact.language}</span>}
-        {isStreaming && <span className="artifact-status">streaming</span>}
+        {isStreaming && <span className="artifact-status">{t('assistant.streaming')}</span>}
       </div>
       <ArtifactCodeView artifact={artifact} />
     </div>
@@ -65,6 +67,7 @@ function getDotClass(isStreaming: boolean, hasError: boolean): string {
 }
 
 export function AssistantMessage({ message, className = '' }: AssistantMessageProps) {
+  const t = useT();
   const blocks = message.blocks && message.blocks.length > 0 ? message.blocks : blocksFromLegacyMessage(message);
   const hasError = blocks.some((block) => block.type === 'tool' && block.tool.status === 'error')
     || message.toolCalls?.some((t) => t.status === 'error');
@@ -92,7 +95,7 @@ export function AssistantMessage({ message, className = '' }: AssistantMessagePr
         {isStreaming && hasContent && <span className="streaming-cursor" />}
         {hasContent && !isStreaming && (
           <button className="msg-copy-btn" onClick={handleCopy}>
-            {copied ? '✓ Copied' : 'Copy'}
+            {copied ? `✓ ${t('assistant.copied')}` : t('assistant.copy')}
           </button>
         )}
       </div>
