@@ -129,6 +129,13 @@ struct ReviewArgs {
     /// On the cap the run stops and reports findings gathered so far. E.g. `--max-duration 900`.
     #[arg(long)]
     max_duration: Option<u64>,
+    /// Model context window in tokens — how much history the reviewer keeps before compacting.
+    /// Overrides the config provider's `context_window` and the 128k built-in default. Set it to
+    /// the REAL window of the provider behind `--base-url`/`--model` (e.g. a 1M custom LLM), so a
+    /// wide-impact diff doesn't force the agent to re-read files it already saw. Omit ⇒ config
+    /// value, else 128000.
+    #[arg(long)]
+    context_window: Option<u32>,
     /// Emit findings as JSON instead of a human-readable report.
     #[arg(long)]
     json: bool,
@@ -268,7 +275,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
         entry.and_then(|e| e.api_key.clone()).map(|k| expand_env(&k)),
     ])
     .unwrap_or_default();
-    let context_window = entry.and_then(|e| e.context_window).unwrap_or(128_000);
+    let context_window = resolve_context_window(args.context_window, entry.and_then(|e| e.context_window));
 
     let mut cfg = ReviewAgentConfig::new(api_key, base_url, model, &repo);
     cfg.context_window = context_window;
@@ -567,6 +574,12 @@ fn default_config_path() -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(".atomcode").join("config.toml"))
+}
+
+/// Resolve the effective model context window: explicit `--context-window` flag wins, else the
+/// config provider's `context_window`, else the 128k built-in default. Kept pure for testing.
+fn resolve_context_window(flag: Option<u32>, entry: Option<u32>) -> u32 {
+    flag.or(entry).unwrap_or(128_000)
 }
 
 /// Load the selected provider entry from the config file.
@@ -1045,6 +1058,16 @@ base_url = "https://openrouter.ai/api/v1"
         assert_eq!(expand_env("sk-literal"), "sk-literal", "non-$ passes through");
         assert_eq!(expand_env("$NOPE_UNSET_VAR_XYZ"), "", "unset $VAR → empty");
         assert_eq!(expand_env("${unclosed"), "${unclosed", "malformed brace ref passes through");
+    }
+
+    #[test]
+    fn resolve_context_window_flag_wins_then_entry_then_default() {
+        // --context-window flag overrides everything.
+        assert_eq!(resolve_context_window(Some(1_000_000), Some(128_000)), 1_000_000);
+        // No flag → config provider's context_window.
+        assert_eq!(resolve_context_window(None, Some(200_000)), 200_000);
+        // Neither → 128k built-in default.
+        assert_eq!(resolve_context_window(None, None), 128_000);
     }
 
     #[test]
