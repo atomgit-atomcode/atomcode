@@ -568,6 +568,7 @@ const FALLBACK_BINARIES: &[(&str, &str, u64)] = &[
     ("x86_64-macos", "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03", 4916448),
     ("x86_64-linux", "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94", 5263216),
     ("aarch64-linux", "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d", 4661464),
+    ("aarch64-ohos", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
     ("x86_64-win", "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e", 5683344),
 ];
 
@@ -653,6 +654,25 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// 解析 semver 版本号 `vMAJOR.MINOR.PATCH`，返回 (major, minor, patch)。
+/// 无法解析时返回 None。
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().strip_prefix('v')?.split('-').next()?;
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+}
+
+/// 判断 latest 是否比 current 新（semver 比较）。
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => latest.trim() != current.trim(),
+    }
+}
+
 /// 确保 relay-client 二进制可用。
 /// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
 fn ensure_relay_client_bin() -> Result<String, String> {
@@ -707,14 +727,14 @@ fn ensure_relay_client_bin() -> Result<String, String> {
     });
     let manifest = match manifest {
         Ok(m) => m,
-        Err(e) => {
+        Err(_) => {
             // 清单获取失败 → 使用兜底版本
             // 有缓存且版本不低于兜底版本 → 直接用缓存
             if cache_path.is_file() {
                 if let Ok(ref ver) = std::fs::read_to_string(&version_path) {
                     let ver = ver.trim();
-                    // 简单版本比对：兜底版本作为最低要求
-                    if ver == FALLBACK_RELAY_VERSION || ver > FALLBACK_RELAY_VERSION {
+                    // 兜底版本作为最低要求，用 semver 比对
+                    if !is_newer_version(FALLBACK_RELAY_VERSION, ver) {
                         return Ok(cache_path.to_string_lossy().into_owned());
                     }
                 }
@@ -739,17 +759,12 @@ fn ensure_relay_client_bin() -> Result<String, String> {
     };
 
     // 7) 检查缓存版本是否最新
-    let mut version_log = format!("远端最新版本: {}", manifest.version);
     let cached_version = std::fs::read_to_string(&version_path).ok();
     if let Some(ref ver) = cached_version {
         let ver = ver.trim();
-        version_log.push_str(&format!("\n本地缓存版本: {}", ver));
-        if ver == manifest.version && cache_path.is_file() {
+        if !is_newer_version(&manifest.version, ver) && cache_path.is_file() {
             return Ok(cache_path.to_string_lossy().into_owned());
         }
-        version_log.push_str(&format!("\n需要更新: {} → {}", ver, manifest.version));
-    } else {
-        version_log.push_str("\n无本地缓存");
     }
 
     // 8) 获取当前平台的 binary entry
@@ -788,24 +803,12 @@ fn ensure_relay_client_bin() -> Result<String, String> {
             Ok(cache_path.to_string_lossy().into_owned())
         }
         Err(e) => {
-            let download_url = format!(
-                "{}/{}/{}",
-                RELAY_CLIENT_DOWNLOAD_BASE, manifest.version,
-                relay_client_filename(&target, &manifest.version)
-            );
-            let bin_name = if cfg!(windows) {
-                "atomcode-relay-client.exe"
-            } else {
-                "atomcode-relay-client"
-            };
             let msg = format!(
                 "自动下载 relay-client 失败：{}\n\
-                 请手动下载到本地缓存目录：\n\
-                 mkdir -p ~/.atomcode/bin/ \\\n\
-                 && curl -fsSL -o ~/.atomcode/bin/{} {} \\\n\
-                 && chmod +x ~/.atomcode/bin/{} \\\n\
+                 请手动安装：\n\
+                 curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh\n\
                  && /app 重试",
-                e, bin_name, download_url, bin_name
+                e
             );
             Err(msg)
         }
