@@ -2710,11 +2710,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ) {
                 completed.push(rendered);
             }
-            // Auto-copy code block to clipboard when the close fence just
-            // flushed (issue #699). Delegates to `maybe_auto_copy_hint`.
-            if let Some(hint) = self.maybe_auto_copy_hint() {
-                completed.push(hint);
-            }
+            // NOTE: auto-copy is DELIBERATELY not done here (per-close-fence).
+            // A reply may contain several ``` blocks; copying each as its fence
+            // flushes would clobber the clipboard (last block wins) and spam a
+            // "copied" hint per block. The decision is deferred to the turn
+            // boundary (`flush_assistant_remainder` → `maybe_auto_copy_hint`),
+            // which copies ONLY when the whole reply held exactly ONE block.
         }
         for rendered in completed {
             self.push_markdown_body(&rendered);
@@ -2761,6 +2762,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // must not overwrite the user's clipboard or inject stale
         // "Copied" hints into replayed output (issue #699 P1).
         if self.suppress_auto_copy {
+            return None;
+        }
+        // SINGLE-BLOCK gate: auto-copy only when the whole reply was essentially
+        // ONE fenced code block. For a multi-block reply (`!= 1`) we neither copy
+        // nor hint — copying each block would clobber the clipboard and the hint
+        // would repeat, the user-reported side-effect. `== 0` (no closed block,
+        // e.g. an unclosed/interrupted fence) also declines. `take()` past the
+        // gate so a declined reply leaves no stale source for a later flush.
+        if self.md_state.code_block_count != 1 {
             return None;
         }
         let source = self.md_state.last_code_block_source.take()?;
@@ -11767,6 +11777,70 @@ mod tests {
     /// a regression net so any future addition of `\x1b[7m` upstream
     /// of `parse_markdown_to_cells` trips here instead of silently
     /// rendering reverse-video on every code-block cell.
+    // Auto-copy should fire ONLY when the whole reply is essentially a SINGLE
+    // fenced code block. A long answer that happens to contain several
+    // illustrative ``` blocks must NOT auto-copy: each per-block copy clobbers
+    // the system clipboard (last block wins) and spams a "代码块已复制" hint —
+    // the user-reported side-effect. The copy tier tries arboard first (so OSC52
+    // is not always emitted); the locale-independent signal that a copy DID
+    // happen is the "📋" hint row pushed into the body on success (both the zh
+    // and en `CodeBlockCopied` strings start with 📋).
+    fn copy_hint_count(r: &RetainedRenderer<CapturingSink>) -> usize {
+        r.body_lines
+            .iter()
+            .filter(|row| row.iter().any(|c| c.ch == '📋'))
+            .count()
+    }
+
+    #[test]
+    fn auto_copy_skips_multi_code_block_reply() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let stream = "intro\n\
+                      ```\nblock one\n```\n\
+                      middle\n\
+                      ```\nblock two\n```\n\
+                      end\n\
+                      ```\nblock three\n```\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "a reply with 3 fenced code blocks must NOT auto-copy any of them"
+        );
+    }
+
+    #[test]
+    fn auto_copy_fires_for_single_code_block_reply() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let stream = "here is the snippet:\n\
+                      ```\nthe only block\n```\n\
+                      thanks\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            1,
+            "a reply with exactly ONE fenced code block must auto-copy it exactly once"
+        );
+    }
+
+    #[test]
+    fn auto_copy_skips_unclosed_code_block() {
+        // Latent bug: an unclosed fence (model never wrote the closing ```), or a
+        // block prematurely finalized mid-stream (tool interleave), must NOT be
+        // auto-copied — it's incomplete. Only a properly-CLOSED fence counts.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let stream = "text\n```\nunclosed block content\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "an unclosed (incomplete) code block must NOT auto-copy"
+        );
+    }
+
     #[test]
     fn retained_java_code_block_has_no_reverse_video_cells() {
         let (mut r, _buf) = new_capturing(80, 24);
