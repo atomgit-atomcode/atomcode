@@ -1611,31 +1611,64 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           </div>
         )}
 
-        {messages.map((msg, idx) => {
-          const isLast = idx === lastIdx;
-          if (msg.role === 'user') {
-            return <UserMessageView key={idx} msg={msg} />;
+        {(() => {
+          // Pre-compute per-turn text for assistant messages: collect all text
+          // from consecutive assistant messages between two user messages, so
+          // the copy button can copy the entire LLM turn (not just one chunk).
+          const turnTexts = new Map<number, string>();
+          {
+            let start = -1;
+            let parts: string[] = [];
+            for (let i = 0; i < messages.length; i++) {
+              if (messages[i].role === 'assistant') {
+                if (start < 0) start = i;
+                const t = messageText(messages[i]);
+                if (t) parts.push(t);
+              } else {
+                if (start >= 0) {
+                  for (let j = start; j < i; j++) {
+                    turnTexts.set(j, parts.join('\n\n'));
+                  }
+                  start = -1;
+                  parts = [];
+                }
+              }
+            }
+            // Flush the last turn
+            if (start >= 0) {
+              for (let j = start; j < messages.length; j++) {
+                turnTexts.set(j, parts.join('\n\n'));
+              }
+            }
           }
 
-          // Determine if this assistant message is the last one in the current
-          // turn (i.e. the next message is a user message, or this is the very
-          // last message in the list). Only the last assistant message in a turn
-          // gets the copy button, so one user turn → one copy button.
-          const isLastInTurn =
-            idx === lastIdx ||
-            messages[idx + 1]?.role === 'user';
+          return messages.map((msg, idx) => {
+            const isLast = idx === lastIdx;
+            if (msg.role === 'user') {
+              return <UserMessageView key={idx} msg={msg} />;
+            }
 
-          return (
-            <AssistantMessageView
-              key={idx}
-              msg={msg}
-              isLast={isLast}
-              busy={busy}
-              lastIdx={lastIdx}
-              isLastInTurn={isLastInTurn}
-            />
-          );
-        })}
+            // Determine if this assistant message is the last one in the current
+            // turn (i.e. the next message is a user message, or this is the very
+            // last message in the list). Only the last assistant message in a turn
+            // gets the copy button, so one user turn → one copy button.
+            const isLastInTurn =
+              idx === lastIdx ||
+              messages[idx + 1]?.role === 'user';
+
+            return (
+              <AssistantMessageView
+                key={idx}
+                msg={msg}
+                isLast={isLast}
+                busy={busy}
+                lastIdx={lastIdx}
+                isLastInTurn={isLastInTurn}
+                turnText={turnTexts.get(idx) ?? ''}
+              />
+            );
+          });
+        })()}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {queued.map((q) => (
@@ -1685,7 +1718,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -1706,16 +1739,17 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn }: { msg: Messag
     (terse ? ' is-terse' : '');
 
   // Copy button: only shown on the last assistant message in a turn.
+  // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
 
   function handleCopy() {
-    navigator.clipboard.writeText(text).then(() => {
+    navigator.clipboard.writeText(turnText).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }).catch(() => {});
   }
 
-  const copyBtn = isLastInTurn && !isError && !streaming && text ? (
+  const copyBtn = isLastInTurn && !isError && !streaming && turnText ? (
     <div class="msg-actions msg-actions-left">
       <button
         class={'msg-copy-btn' + (copied ? ' copied' : '')}
