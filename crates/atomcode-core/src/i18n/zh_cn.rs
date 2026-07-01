@@ -262,6 +262,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModel => "模型？".into(),
         Msg::ProviderStepModelWithHint { current } =>
             format!("模型？[{current}]（留空保持不变）").into(),
+        Msg::ProviderStepContextWindow { default } =>
+            format!("上下文窗口？[{default}] tokens（留空使用默认值；支持如 128000 或 128k）").into(),
+        Msg::ProviderStepContextWindowWithHint { current } =>
+            format!("上下文窗口？[{current}] tokens（留空保持不变）").into(),
+        Msg::ProviderContextWindowInvalid =>
+            "上下文窗口必须是正整数 tokens，例如 128000 或 128k。".into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
