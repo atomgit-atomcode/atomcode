@@ -30,6 +30,30 @@ function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
 }
 
+/** Format all parts of a message as readable text (including tool calls and their
+ *  output), matching what is displayed on the page. Used by the copy button to
+ *  copy the full visible content of an assistant turn. */
+function messageFullText(m: Message): string {
+  const lines: string[] = [];
+  for (const p of m.parts) {
+    if (p.kind === 'text') {
+      lines.push(p.text);
+    } else if (p.kind === 'tool') {
+      const tool = p.tool;
+      lines.push(`🔧 ${displayToolName(tool.name)}`);
+      const detail = formatToolDetail(tool.name, tool.args);
+      if (detail) lines.push(`   ${detail}`);
+      if (tool.args) lines.push(`   参数: ${tool.args}`);
+      if (tool.output) lines.push(`   输出: ${tool.output}`);
+    } else if (p.kind === 'notice') {
+      lines.push(p.text);
+    } else if (p.kind === 'rate_limited') {
+      lines.push(p.text);
+    }
+  }
+  return lines.join('\n');
+}
+
 /** Whether a message contains any tool segments. */
 function messageHasTools(m: Message): boolean {
   return m.parts.some((p) => p.kind === 'tool');
@@ -1622,7 +1646,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             for (let i = 0; i < messages.length; i++) {
               if (messages[i].role === 'assistant') {
                 if (start < 0) start = i;
-                const t = messageText(messages[i]);
+                const t = messageFullText(messages[i]);
                 if (t) parts.push(t);
               } else {
                 if (start >= 0) {
