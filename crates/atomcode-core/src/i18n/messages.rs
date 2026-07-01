@@ -604,6 +604,10 @@ pub enum Msg<'a> {
     CmdDescCopy,
     /// `/copy`: confirmation after a code block lands on the clipboard.
     CopyOk { lines: usize, chars: usize },
+    /// `/copy msg`: confirmation after the full reply markdown lands on the
+    /// clipboard. Distinct from `CopyOk` so the hint says "reply" not "code
+    /// block" — the user copied the whole message, not a fenced block.
+    CopyOkMsg { lines: usize, chars: usize },
     /// `/copy`: the last reply has no fenced code block to copy.
     CopyNoCodeBlock,
     /// `/copy msg`: the reply is empty/whitespace-only, so there is no message
