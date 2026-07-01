@@ -11,7 +11,12 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
-import { detectAtMentionRange, replaceAtMention, splitAtToken } from '../lib/atMention';
+import {
+  detectAtMentionRange,
+  ensureActiveDescendantVisible,
+  replaceAtMention,
+  splitAtToken,
+} from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
@@ -479,6 +484,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   for (const it of atItems) {
     if (it.name.toLowerCase().startsWith(atFilter.toLowerCase())) atRows.push(it);
   }
+
+  useEffect(() => {
+    if (!atOpen) return;
+    requestAnimationFrame(() => {
+      const container = atRef.current;
+      const active = container?.querySelector<HTMLButtonElement>('.at-row.active');
+      if (container && active) ensureActiveDescendantVisible(container, active);
+    });
+  }, [atIndex, atOpen, atRows.length]);
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {

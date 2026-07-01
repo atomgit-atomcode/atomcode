@@ -6,7 +6,11 @@ import { ModelSelector } from './ModelSelector';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
-import { detectAtMentionRange, replaceAtMention } from '../utils/atMention';
+import {
+  detectAtMentionRange,
+  ensureActiveDescendantVisible,
+  replaceAtMention,
+} from '../utils/atMention';
 
 interface WorkspaceFile {
   path: string;
@@ -72,6 +76,7 @@ export function InputArea() {
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileSearchRef = useRef<HTMLInputElement>(null);
+  const atListRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -159,6 +164,15 @@ export function InputArea() {
     document.addEventListener('mousedown', closePickers, true);
     return () => document.removeEventListener('mousedown', closePickers, true);
   }, [showAtPicker, showAttachMenu, showFilePicker, showSlash]);
+
+  useEffect(() => {
+    if (!showAtPicker) return;
+    requestAnimationFrame(() => {
+      const container = atListRef.current;
+      const active = container?.querySelector<HTMLButtonElement>('.file-picker-item.active');
+      if (container && active) ensureActiveDescendantVisible(container, active);
+    });
+  }, [atIndex, atItems.length, showAtPicker]);
 
   const ensureSlashSkills = useCallback(() => {
     if (slashSkills !== null || slashLoading) return;
@@ -375,7 +389,7 @@ export function InputArea() {
         )}
         {showAtPicker && (
           <div className="file-picker at-mention-picker">
-            <div className="file-picker-list">
+            <div className="file-picker-list" ref={atListRef}>
               {atItems.length === 0 ? (
                 <div className="file-picker-empty">
                   {atQuery ? t('input.noMatchingFiles') : t('input.typeToSearchFiles')}

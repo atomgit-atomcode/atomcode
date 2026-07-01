@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { detectAtMentionRange, replaceAtMention, splitAtToken } from './atMention.ts';
+import {
+  detectAtMentionRange,
+  ensureActiveDescendantVisible,
+  replaceAtMention,
+  splitAtToken,
+} from './atMention.ts';
 
 test('detects an @ mention at the beginning of the input', () => {
   assert.deepEqual(detectAtMentionRange('@cra', 4), {
@@ -38,4 +43,14 @@ test('replaces the active @ token with the selected relative path and trailing s
     text: 'check @webui/src/app.tsx ',
     cursor: 'check @webui/src/app.tsx '.length,
   });
+});
+
+test('scrolls the active @ menu row into the visible container', () => {
+  const container = { scrollTop: 0, clientHeight: 100 };
+
+  ensureActiveDescendantVisible(container, { offsetTop: 120, offsetHeight: 24 });
+  assert.equal(container.scrollTop, 44);
+
+  ensureActiveDescendantVisible(container, { offsetTop: 12, offsetHeight: 24 });
+  assert.equal(container.scrollTop, 12);
 });

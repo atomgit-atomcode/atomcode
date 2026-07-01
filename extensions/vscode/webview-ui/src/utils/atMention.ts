@@ -9,6 +9,16 @@ export interface SplitAtToken {
   filter: string;
 }
 
+export interface ScrollContainerMetrics {
+  scrollTop: number;
+  clientHeight: number;
+}
+
+export interface ScrollDescendantMetrics {
+  offsetTop: number;
+  offsetHeight: number;
+}
+
 export function detectAtMentionRange(text: string, cursor: number): AtMentionRange | null {
   const prefix = text.slice(0, cursor);
   const start = prefix.lastIndexOf('@');
@@ -39,4 +49,20 @@ export function replaceAtMention(
   const replacement = `@${selectedPath} `;
   const next = text.slice(0, range.start) + replacement + text.slice(range.end);
   return { text: next, cursor: range.start + replacement.length };
+}
+
+export function ensureActiveDescendantVisible(
+  container: ScrollContainerMetrics,
+  active: ScrollDescendantMetrics,
+) {
+  const viewTop = container.scrollTop;
+  const viewBottom = viewTop + container.clientHeight;
+  const activeTop = active.offsetTop;
+  const activeBottom = activeTop + active.offsetHeight;
+
+  if (activeTop < viewTop) {
+    container.scrollTop = activeTop;
+  } else if (activeBottom > viewBottom) {
+    container.scrollTop = activeBottom - container.clientHeight;
+  }
 }
