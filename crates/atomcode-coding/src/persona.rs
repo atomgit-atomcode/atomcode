@@ -98,7 +98,7 @@ Install tools with winget/choco; locate executables with `where` (not `which`); 
 tools live under `Scripts\\` (not `bin/`).";
 
 const RULES: &str = "\
-Solve tasks efficiently with minimal tool calls. Act decisively — go straight to tool calls or answers.
+Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
 ## SYSTEM REMINDERS:
 Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
@@ -106,10 +106,10 @@ Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYST
 ## WORKFLOW:
 For simple changes (rename, one-line fix, config tweak): just do it — search, edit, verify, done.
 For non-trivial features or multi-file changes: SEARCH → PLAN (one sentence) → EDIT → VERIFY → SUMMARIZE.
-For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command first) → DIAGNOSE → FIX → VERIFY.
+For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command if one exists) → DIAGNOSE → FIX → VERIFY.
 
 Guidelines:
-- REPRODUCE: run the failing command with bash BEFORE reading code. See the real error first.
+- REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
@@ -140,6 +140,7 @@ Use the code-intelligence tools (list_symbols / read_symbol / find_references / 
 - Prefer editing existing files over creating new ones.
 - If an approach fails, diagnose WHY before switching tactics. Read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.
 - Don't add features, refactor code, or make improvements beyond what was asked. A bug fix doesn't need surrounding code cleaned up.
+- Match the surrounding file's comment density; don't narrate obvious code with line-by-line comments. This limits the VOLUME of NEW comments — existing comments, including Chinese ones, are preserved per CHINESE CODE SUPPORT below.
 - Don't add error handling or validation for scenarios that can't happen. Only validate at system boundaries.
 - Be careful not to introduce security vulnerabilities (command injection, XSS, SQL injection).
 - Don't guess library APIs. Read the source or documentation first.
@@ -259,6 +260,55 @@ mod tests {
         assert!(
             p.contains("CARRY IT THROUGH"),
             "carry-to-completion guardrail (WORKFLOW)"
+        );
+    }
+
+    #[test]
+    fn persona_keeps_the_soft_comment_density_rule() {
+        // v1 `prompt_sections.rs` carries a comment-density rule (weak / Chinese-RLHF
+        // models like GLM over-comment with line-by-line narration); the initial v2 port
+        // dropped it. Restore parity and cross-ref CHINESE CODE SUPPORT so the volume
+        // limit applies to NEW comments only, never to existing (incl. Chinese) ones.
+        let p = coding_persona("glm-5.2");
+        assert!(
+            p.contains("comment density"),
+            "must keep the soft comment-density rule: {p}"
+        );
+        assert!(
+            p.contains("VOLUME of NEW comments"),
+            "the rule must scope to NEW comments, not existing ones"
+        );
+    }
+
+    #[test]
+    fn persona_frames_efficiency_as_round_trips_not_fewer_tool_calls() {
+        // "minimal tool calls" contradicts the `## TOOLS:` section (which urges maximal
+        // parallel calls) and can push weak models to under-read / guess. The real cost is
+        // round-trip latency, so the opening line must target round-trips, not tool count.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("minimizing round-trips"),
+            "opening line must frame efficiency as round-trips: {p}"
+        );
+        assert!(
+            !p.contains("minimal tool calls"),
+            "must not tell the model to minimize tool calls (contradicts ## TOOLS:)"
+        );
+    }
+
+    #[test]
+    fn reproduce_step_is_conditional_on_a_runnable_repro() {
+        // Many bugs (UI/rendering, intermittent, state-dependent) have no single runnable
+        // command; the old absolute "run the failing command BEFORE reading code" made weak
+        // models burn a round or fabricate a repro. The step must be conditional.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("when a runnable reproduction exists"),
+            "REPRODUCE must be conditional on a runnable repro: {p}"
+        );
+        assert!(
+            p.contains("skip straight to DIAGNOSE"),
+            "must give an explicit out when there is no runnable command"
         );
     }
 
