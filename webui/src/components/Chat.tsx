@@ -1617,41 +1617,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             return <UserMessageView key={idx} msg={msg} />;
           }
 
-          const text = messageText(msg);
-          const isError =
-            text.includes('[错误:') ||
-            text.includes('[连接错误:') ||
-            text.includes('[Error:') ||
-            text.includes('[Connection error:');
-          const streaming = isLast && busy;
-          // 终条且简短（无工具、单行）时，去掉多余的“时间线末端”橙点，只留一个起始点。
-          const terse =
-            isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
-          const dotClass = isError ? 'dot-error' : 'dot-brand';
-          const cls =
-            'timeline-message ' +
-            dotClass +
-            (streaming ? ' dot-blink' : '') +
-            (isLast ? ' is-last' : '') +
-            (terse ? ' is-terse' : '');
+          // Determine if this assistant message is the last one in the current
+          // turn (i.e. the next message is a user message, or this is the very
+          // last message in the list). Only the last assistant message in a turn
+          // gets the copy button, so one user turn → one copy button.
+          const isLastInTurn =
+            idx === lastIdx ||
+            messages[idx + 1]?.role === 'user';
 
           return (
-            <div key={idx} class={cls}>
-              {/* Error turns are pure injected text — render flat. */}
-              {isError ? (
-                <div class="error-message-content">
-                  {text}
-                  {streaming && <span class="streaming-cursor" />}
-                </div>
-              ) : (
-                <>
-                  {/* Segments in chronological order: text→tool→text→tool,
-                      matching the TUI. Consecutive tools share one tool-list. */}
-                  {renderAssistantParts(msg.parts)}
-                  {streaming && <span class="streaming-cursor" />}
-                </>
-              )}
-            </div>
+            <AssistantMessageView
+              key={idx}
+              msg={msg}
+              isLast={isLast}
+              busy={busy}
+              lastIdx={lastIdx}
+              isLastInTurn={isLastInTurn}
+            />
           );
         })}
 
@@ -1703,6 +1685,79 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean }) {
+  const t = useT();
+  const text = messageText(msg);
+  const isError =
+    text.includes('[错误:') ||
+    text.includes('[连接错误:') ||
+    text.includes('[Error:') ||
+    text.includes('[Connection error:');
+  const streaming = isLast && busy;
+  // 终条且简短（无工具、单行）时，去掉多余的"时间线末端"橙点，只留一个起始点。
+  const terse =
+    isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
+  const dotClass = isError ? 'dot-error' : 'dot-brand';
+  const cls =
+    'timeline-message ' +
+    dotClass +
+    (streaming ? ' dot-blink' : '') +
+    (isLast ? ' is-last' : '') +
+    (terse ? ' is-terse' : '');
+
+  // Copy button: only shown on the last assistant message in a turn.
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }
+
+  const copyBtn = isLastInTurn && !isError && !streaming && text ? (
+    <div class="msg-actions msg-actions-left">
+      <button
+        class={'msg-copy-btn' + (copied ? ' copied' : '')}
+        onClick={handleCopy}
+        title={copied ? t('copy.copied') : t('copy.copy')}
+        aria-label={copied ? t('copy.copied') : t('copy.copy')}
+      >
+        {copied ? (
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+            <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+          </svg>
+        )}
+      </button>
+    </div>
+  ) : null;
+
+  return (
+    <div class={cls}>
+      {/* Error turns are pure injected text — render flat. */}
+      {isError ? (
+        <div class="error-message-content">
+          {text}
+          {streaming && <span class="streaming-cursor" />}
+        </div>
+      ) : (
+        <>
+          {/* Segments in chronological order: text→tool→text→tool,
+              matching the TUI. Consecutive tools share one tool-list. */}
+          {renderAssistantParts(msg.parts)}
+          {streaming && <span class="streaming-cursor" />}
+        </>
+      )}
+      {copyBtn}
+    </div>
+  );
+}
+
 function renderAssistantParts(parts: MsgPart[]): VNode[] {
   const out: VNode[] = [];
   let i = 0;
@@ -1752,6 +1807,14 @@ function UserMessageView({ msg }: { msg: Message }) {
   const text = messageText(msg);
   const skillTitle = detectSkillContent(text);
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }
 
   const images = msg.images && msg.images.length > 0 && (
     <div class="msg-images">
@@ -1759,6 +1822,26 @@ function UserMessageView({ msg }: { msg: Message }) {
         <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
       ))}
     </div>
+  );
+
+  const copyBtn = (
+    <button
+      class={'msg-copy-btn' + (copied ? ' copied' : '')}
+      onClick={handleCopy}
+      title={copied ? t('copy.copied') : t('copy.copy')}
+      aria-label={copied ? t('copy.copied') : t('copy.copy')}
+    >
+      {copied ? (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+        </svg>
+      )}
+    </button>
   );
 
   if (skillTitle && !expanded) {
@@ -1790,6 +1873,9 @@ function UserMessageView({ msg }: { msg: Message }) {
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
         {skillTitle ? <Markdown content={text} /> : text}
+      </div>
+      <div class="msg-actions">
+        {copyBtn}
       </div>
     </div>
   );

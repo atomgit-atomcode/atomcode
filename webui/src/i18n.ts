@@ -223,6 +223,10 @@ const zh = {
   'sync.on': '已同步（多端实时）',
   'sync.off': '独立会话',
 
+  // Copy button
+  'copy.copy': '复制',
+  'copy.copied': '已复制',
+
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
@@ -435,6 +439,10 @@ const en: Record<MsgKey, string> = {
   'sync.toggle': 'Sync current session',
   'sync.on': 'Synced (live)',
   'sync.off': 'Independent',
+
+  // Copy button
+  'copy.copy': 'Copy',
+  'copy.copied': 'Copied',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',
