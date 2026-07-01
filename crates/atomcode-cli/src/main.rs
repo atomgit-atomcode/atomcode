@@ -299,6 +299,18 @@ fn should_try_sync_upgrade() -> bool {
         return false;
     }
 
+    // PlainRenderer 模式（ATOMCODE_PLAIN=1）：跳过同步自更新检查。
+    // 自更新用 eprintln! 直接写 stderr，和 PlainRenderer 的 stdout
+    // 流式输出交错，破坏启动体验。后台异步自更新不受影响，用户仍可
+    // 手动 /upgrade。
+    if std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return false;
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let any = |needle: &[&str]| {
         args.iter().skip(1).any(|a| {
