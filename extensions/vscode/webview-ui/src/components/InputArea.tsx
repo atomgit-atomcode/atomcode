@@ -384,7 +384,12 @@ export function InputArea() {
     updateText(command + ' ');
     setShowSlash(false);
     textareaRef.current?.focus();
-  }, []);
+const handleSlashSelect = useCallback((command: string) => {
+    updateText(command + ' ');
+    historyIndexRef.current = -1;
+    setShowSlash(false);
+    textareaRef.current?.focus();
+}, []);
 
   const handleSlashButton = useCallback(() => {
     setShowFilePicker((fp) => {
