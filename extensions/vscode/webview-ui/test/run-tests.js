@@ -11,6 +11,7 @@ async function main() {
     'rendering-regression.test.ts',
     'i18n-regression.test.ts',
     'quick-actions-regression.test.ts',
+    'contextual-prompt-regression.test.ts',
     'at-mention.test.ts',
     'daemon-client-error.test.ts',
   ];

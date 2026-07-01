@@ -95,19 +95,19 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('atomcode.explain', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt(getQuickActionPrompt('explain', vscode.env.language), ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('explain', vscode.env.language), ctx, vscode.env.language);
       await runCommand(vscode.l10n.t('explain the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.fix', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt(getQuickActionPrompt('fix', vscode.env.language), ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('fix', vscode.env.language), ctx, vscode.env.language);
       await runCommand(vscode.l10n.t('fix the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.optimize', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt(getQuickActionPrompt('optimize', vscode.env.language), ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('optimize', vscode.env.language), ctx, vscode.env.language);
       await runCommand(vscode.l10n.t('optimize the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 

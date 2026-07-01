@@ -214,6 +214,46 @@ function testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion() {
   assert.equal(state.messages[0].contextFiles?.[0]?.endLine, 38);
 }
 
+function testHistoryMissingImagePlaceholderIsPreserved() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [{
+      role: 'user',
+      content: '识别图片内容',
+      images: [{ media_type: 'image/png', data: '', missing: true }],
+    }],
+  });
+
+  assert.equal(state.messages[0].text, '识别图片内容');
+  assert.equal(state.messages[0].images?.[0]?.missing, true);
+}
+
+function testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [{
+      role: 'user',
+      content: [
+        '识别图片内容',
+        '',
+        '[图片内容（由 AtomGit-Qwen-Qwen3-VL-8B-Instruct 识别）]',
+        '这是一张应用程序图标。',
+      ].join('\n'),
+    }],
+  });
+
+  assert.equal(state.messages[0].text, '识别图片内容');
+  assert.equal(state.messages[0].images?.[0]?.missing, true);
+}
+
 function testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact() {
   const kind = classifyArtifactRenderKind({
     id: 'artifact-markdown',
@@ -444,6 +484,13 @@ function testPreCodeDoesNotUseInlineCodePillStyling() {
   assert.match(css, /\.markdown-root pre code\s*\{[^}]*padding:\s*0;/s);
 }
 
+function testMissingUserImagePlaceholderHasStableThumbnailSizing() {
+  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+
+  assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*width:\s*min\(180px,\s*100%\);/s);
+  assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*height:\s*120px;/s);
+}
+
 function testStreamingMarkdownRepairsUnclosedCodeFence() {
   const repaired = repairStreamingMarkdown([
     '说明：',
@@ -510,6 +557,8 @@ testTypedCodeArtifactDoesNotStripDifferentLanguageLookingCodeLine();
 testPlainCodeFenceArtifactDoesNotRenderArtifactChrome();
 testToolBlocksStayBetweenTextChunks();
 testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion();
+testHistoryMissingImagePlaceholderIsPreserved();
+testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput();
 testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact();
 testTextArtifactWithDiffContentIsStillRenderedAsDiff();
 testMarkdownArtifactLanguageSentinelBecomesFencedCodeBlock();
@@ -521,6 +570,7 @@ testDiffSingleLineCssLetsBackgroundFillTheBlock();
 testUserMessageContainerDoesNotForceMarkdownPreWrap();
 testInlineArtifactCodeKeepsCodeBlockBorder();
 testPreCodeDoesNotUseInlineCodePillStyling();
+testMissingUserImagePlaceholderHasStableThumbnailSizing();
 testStreamingMarkdownRepairsUnclosedCodeFence();
 testStreamingMarkdownLeavesClosedCodeFenceUnchanged();
 testFinalMarkdownProtectsFenceInsideInlineCodeSpan();

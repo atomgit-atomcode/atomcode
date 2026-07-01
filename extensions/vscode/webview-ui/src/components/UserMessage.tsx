@@ -33,12 +33,25 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
         {message.images && message.images.length > 0 && (
           <div className="user-message-images">
             {message.images.map((img, index) => (
-              <img
-                key={`${img.media_type}-${index}`}
-                className="user-message-image"
-                src={`data:${img.media_type};base64,${img.data}`}
-                alt=""
-              />
+              img.missing || !img.data ? (
+                <div
+                  key={`${img.media_type}-${index}`}
+                  className="user-message-image-placeholder"
+                  role="img"
+                  aria-label={t('user.imageUnavailable')}
+                  title={t('user.imageUnavailable')}
+                >
+                  <span aria-hidden="true" className="user-message-image-placeholder-icon">▧</span>
+                  <span>{t('user.imageUnavailable')}</span>
+                </div>
+              ) : (
+                <img
+                  key={`${img.media_type}-${index}`}
+                  className="user-message-image"
+                  src={`data:${img.media_type};base64,${img.data}`}
+                  alt=""
+                />
+              )
             ))}
           </div>
         )}

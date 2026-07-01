@@ -115,6 +115,7 @@ const zh = {
   'user.queued': '排队中',
   'user.selection': '选区',
   'user.file': '文件',
+  'user.imageUnavailable': '图片不可用',
   'user.expand': '展开',
   'user.collapse': '收起',
 
@@ -255,6 +256,7 @@ const en: Record<MsgKey, string> = {
   'user.queued': 'Queued',
   'user.selection': 'Selection',
   'user.file': 'File',
+  'user.imageUnavailable': 'Image unavailable',
   'user.expand': 'Expand',
   'user.collapse': 'Collapse',
 

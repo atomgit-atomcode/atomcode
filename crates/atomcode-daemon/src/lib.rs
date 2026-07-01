@@ -424,6 +424,53 @@ pub struct MessageInfo {
 pub struct ImageData {
     pub media_type: String,
     pub data: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+}
+
+impl ImageData {
+    fn missing_placeholder() -> Self {
+        Self {
+            media_type: "image/png".to_string(),
+            data: String::new(),
+            missing: true,
+        }
+    }
+}
+
+fn strip_vision_marker(raw: &str) -> (String, bool) {
+    match raw
+        .find("[图片内容（由")
+        .or_else(|| raw.find("[图片识别失败]"))
+    {
+        Some(i) => (raw[..i].trim_end().to_string(), true),
+        None => (raw.to_string(), false),
+    }
+}
+
+fn restore_submitted_user_images_before_save(
+    messages: &mut [atomcode_core::conversation::message::Message],
+    submitted_text: &str,
+    submitted_images: &[atomcode_core::conversation::message::ImagePart],
+) {
+    if submitted_images.is_empty() {
+        return;
+    }
+
+    let Some(idx) = messages.iter().rposition(|msg| {
+        matches!(msg.role, atomcode_core::conversation::message::Role::User) && !msg.synthetic
+    }) else {
+        return;
+    };
+
+    messages[idx].content = atomcode_core::conversation::message::MessageContent::MultiPart {
+        text: if submitted_text.is_empty() {
+            None
+        } else {
+            Some(submitted_text.to_string())
+        },
+        images: submitted_images.to_vec(),
+    };
 }
 
 impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
@@ -487,28 +534,19 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, images } => {
+            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
                 // 图片走下面的 images 字段渲染缩略图；文本里若拼接了 VL 识别结果
                 // （[图片内容（由 … 识别）] / [图片识别失败]，仅用于喂给非视觉模型），
                 // 展示时剥离，只保留用户原始输入，避免历史里出现一大段识别文字。
                 let raw = text.clone().unwrap_or_default();
-                let display = if images.is_empty() {
-                    raw
-                } else {
-                    match raw
-                        .find("[图片内容（由")
-                        .or_else(|| raw.find("[图片识别失败]"))
-                    {
-                        Some(i) => raw[..i].trim_end().to_string(),
-                        None => raw,
-                    }
-                };
+                let (display, _) = strip_vision_marker(&raw);
                 (display, None, None, None)
             }
         };
+        let mut content = content;
 
         // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let images =
+        let mut images =
             match &msg.content {
                 atomcode_core::conversation::message::MessageContent::MultiPart {
                     images, ..
@@ -518,11 +556,21 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                         .map(|i| ImageData {
                             media_type: i.media_type.clone(),
                             data: i.data.clone(),
+                            missing: false,
                         })
                         .collect(),
                 ),
                 _ => None,
             };
+        if matches!(msg.role, atomcode_core::conversation::message::Role::User) {
+            let (display, had_vision_marker) = strip_vision_marker(&content);
+            if had_vision_marker {
+                content = display;
+                if images.is_none() {
+                    images = Some(vec![ImageData::missing_placeholder()]);
+                }
+            }
+        }
 
         Self {
             role: role.to_string(),
@@ -911,7 +959,8 @@ fn channel_interactive_permission(
     enforce_token: bool,
     bind_host: &str,
 ) -> bool {
-    enforce_token || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
+    enforce_token
+        || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
 }
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -921,7 +970,8 @@ pub(crate) fn hash_path(path: &std::path::Path) -> String {
     // - Different path separators (Windows: `\` vs `/`)
     // - Case sensitivity (Windows paths are case-insensitive)
     // - Trailing slashes
-    let normalized = atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
+    let normalized =
+        atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
     // Remove trailing slash (but keep root "/" or "C:/")
@@ -1176,8 +1226,7 @@ async fn serve_webui_index(
                     };
                     let cookie = format!(
                         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        state.webui_cookie_name,
-                        token
+                        state.webui_cookie_name, token
                     );
                     return axum::response::Response::builder()
                         .status(StatusCode::FOUND)
@@ -1403,10 +1452,16 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
-fn merge_session_messages_for_display(session: &atomcode_core::session::Session) -> Vec<MessageInfo> {
+fn merge_session_messages_for_display(
+    session: &atomcode_core::session::Session,
+) -> Vec<MessageInfo> {
     let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
 
-    for display in session.display_messages.iter().filter(|d| d.after_message == 0) {
+    for display in session
+        .display_messages
+        .iter()
+        .filter(|d| d.after_message == 0)
+    {
         messages.push(MessageInfo::from(&display.message));
     }
 
@@ -1548,10 +1603,12 @@ async fn append_session_messages(
                 return (StatusCode::BAD_REQUEST, Json(err)).into_response();
             }
         };
-        session.display_messages.push(atomcode_core::session::DisplayMessage {
-            after_message,
-            message: atomcode_core::conversation::message::Message::new(role, msg.content),
-        });
+        session
+            .display_messages
+            .push(atomcode_core::session::DisplayMessage {
+                after_message,
+                message: atomcode_core::conversation::message::Message::new(role, msg.content),
+            });
     }
 
     session.touch();
@@ -2456,7 +2513,11 @@ async fn process_chat_request(
             conv.messages.push(Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if req.message.is_empty() { None } else { Some(req.message.clone()) },
+                    text: if req.message.is_empty() {
+                        None
+                    } else {
+                        Some(req.message.clone())
+                    },
                     images,
                 },
                 synthetic: false,
@@ -2631,28 +2692,30 @@ async fn process_chat_request(
     // plumbing. The standalone daemon (VSCode extension, no browser) has no
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if interactive_permission {
-        let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-        let (perm_resp_tx, perm_resp_rx) =
-            tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-        let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-            atomcode_core::tool::PermissionStore::new(),
-        ));
-        pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-        (
-            Box::new(InteractivePermissionDecider::new(
-                perm_req_tx,
-                perm_resp_rx,
-                perm_store,
-            )),
-            Some(perm_req_rx),
-        )
-    } else {
-        (
-            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-            None,
-        )
-    };
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) =
+        if interactive_permission {
+            let (perm_req_tx, perm_req_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+            let (perm_resp_tx, perm_resp_rx) =
+                tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                atomcode_core::tool::PermissionStore::new(),
+            ));
+            pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+            (
+                Box::new(InteractivePermissionDecider::new(
+                    perm_req_tx,
+                    perm_resp_rx,
+                    perm_store,
+                )),
+                Some(perm_req_rx),
+            )
+        } else {
+            (
+                Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+                None,
+            )
+        };
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider (the one actually selected for this turn,
     // not config.default_provider), fallback to synthetic 128K config if absent.
@@ -2792,10 +2855,8 @@ async fn process_chat_request(
                             .iter()
                             .rev()
                             .find(|m| {
-                                matches!(
-                                    m.role,
-                                    atomcode_core::conversation::message::Role::User
-                                ) && !m.synthetic
+                                matches!(m.role, atomcode_core::conversation::message::Role::User)
+                                    && !m.synthetic
                             })
                             .and_then(|m| m.text())
                             .map(|text| {
@@ -3028,6 +3089,19 @@ async fn process_chat_request(
         if was_stopped {
             conv.cancel_current_turn();
         }
+        let submitted_images: Vec<atomcode_core::conversation::message::ImagePart> = req
+            .images
+            .iter()
+            .map(|i| atomcode_core::conversation::message::ImagePart {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+            })
+            .collect();
+        restore_submitted_user_images_before_save(
+            &mut conv.messages,
+            &req.message,
+            &submitted_images,
+        );
         session.update_from_conversation(&conv);
     }
     session.auto_name_from_messages();
@@ -4224,7 +4298,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
-        .route("/live/switch_session", post(live_api::live_switch_session_endpoint))
+        .route(
+            "/live/switch_session",
+            post(live_api::live_switch_session_endpoint),
+        )
         .route(
             "/live/reasoning_effort",
             post(live_api::live_reasoning_effort),
@@ -4481,11 +4558,60 @@ mod tests {
         })
         .unwrap();
         // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
-        assert!(json.contains(r#""type":"rate_limited""#), "wrong type: {json}");
+        assert!(
+            json.contains(r#""type":"rate_limited""#),
+            "wrong type: {json}"
+        );
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
         assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
         assert!(json.contains(r#""auto_resuming":false"#), "{json}");
+    }
+
+    #[test]
+    fn message_info_user_text_with_vl_marker_renders_missing_image_placeholder() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        let msg = Message::new(
+            Role::User,
+            "识别图片内容\n\n[图片内容（由 AtomGit-Qwen-Qwen3-VL-8B-Instruct 识别）]\n这是一张图片",
+        );
+
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.content, "识别图片内容");
+        assert!(matches!(
+            info.images.as_deref(),
+            Some([ImageData { missing: true, .. }])
+        ));
+    }
+
+    #[test]
+    fn restore_submitted_user_images_before_save_repairs_text_only_v2_snapshot() {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+
+        let mut messages = vec![
+            Message::new(Role::System, "session context"),
+            Message::new(
+                Role::User,
+                "分析图片内容\n\n[图片内容（由 vl-provider 识别）]\n图片描述",
+            ),
+            Message::new(Role::Assistant, "done"),
+        ];
+        let images = vec![ImagePart {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }];
+
+        restore_submitted_user_images_before_save(&mut messages, "分析图片内容", &images);
+
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::MultiPart { text, images }
+                if text.as_deref() == Some("分析图片内容")
+                    && images.len() == 1
+                    && images[0].data == "aW1hZ2U="
+        ));
     }
 
     #[test]
@@ -4762,9 +4888,25 @@ mod channel_mode_tests {
 
     #[test]
     fn channel_interactive_only_on_loopback() {
-        assert!(channel_interactive_permission(SessionMode::Ide, true, "0.0.0.0"));
-        assert!(channel_interactive_permission(SessionMode::Channel, false, "127.0.0.1"));
-        assert!(!channel_interactive_permission(SessionMode::Channel, false, "0.0.0.0"));
-        assert!(!channel_interactive_permission(SessionMode::Ide, false, "127.0.0.1"));
+        assert!(channel_interactive_permission(
+            SessionMode::Ide,
+            true,
+            "0.0.0.0"
+        ));
+        assert!(channel_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(!channel_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!channel_interactive_permission(
+            SessionMode::Ide,
+            false,
+            "127.0.0.1"
+        ));
     }
 }

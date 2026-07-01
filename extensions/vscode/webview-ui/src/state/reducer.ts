@@ -237,6 +237,20 @@ function parseAttachedMessage(rawText: string): { displayText: string; contextFi
   return { displayText: userQuestion, contextFiles };
 }
 
+function stripVisionPreprocessText(rawText: string): { displayText: string; hadVisionMarker: boolean } {
+  const markerIndex = rawText.indexOf('[图片内容（由');
+  const failureIndex = rawText.indexOf('[图片识别失败]');
+  const indexes = [markerIndex, failureIndex].filter((index) => index >= 0);
+  if (indexes.length === 0) {
+    return { displayText: rawText, hadVisionMarker: false };
+  }
+
+  return {
+    displayText: rawText.slice(0, Math.min(...indexes)).trimEnd(),
+    hadVisionMarker: true,
+  };
+}
+
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
@@ -735,13 +749,21 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
 
         const rawText = textFromContent(m.content);
+        const { displayText: userVisibleText, hadVisionMarker } = role === 'user'
+          ? stripVisionPreprocessText(rawText)
+          : { displayText: rawText, hadVisionMarker: false };
 
         // User messages may contain inline file content from the send path.
         // Parse it out into contextFiles so the UI shows attachment pills
         // instead of dumping the file body into the message bubble.
         const { displayText, contextFiles } = role === 'user'
-          ? parseAttachedMessage(rawText)
-          : { displayText: rawText, contextFiles: [] as ContextFile[] };
+          ? parseAttachedMessage(userVisibleText)
+          : { displayText: userVisibleText, contextFiles: [] as ContextFile[] };
+        const images = role === 'user' && m.images && m.images.length > 0
+          ? m.images
+          : role === 'user' && hadVisionMarker
+            ? [{ media_type: 'image/png', data: '', missing: true }]
+            : undefined;
 
         const message: ChatMessage = {
           id: nextId(),
@@ -752,7 +774,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             ? m.artifacts.map(mapHistoryArtifact)
             : undefined,
           contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
-          images: role === 'user' && m.images && m.images.length > 0 ? m.images : undefined,
+          images,
           streaming: false,
           timestamp: Date.now(),
         };

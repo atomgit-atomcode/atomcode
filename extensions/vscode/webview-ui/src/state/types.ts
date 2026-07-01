@@ -66,6 +66,7 @@ export interface ContextFile {
 export interface ImageData {
   media_type: string;
   data: string;
+  missing?: boolean;
 }
 
 export interface SkillInfo {
