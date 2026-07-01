@@ -85,11 +85,17 @@ fn date_anchor_line(today: &str) -> String {
 }
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
+///
+/// Deliberately SHELL-NEUTRAL: the actual shell (Git Bash when installed, else cmd.exe)
+/// varies per machine, so the `bash` tool's OWN description states which shell it uses and
+/// the syntax to write. Claiming a shell here would re-introduce the "told cmd, ran bash"
+/// contradiction. This keeps only Windows-general advice that holds under either shell.
 #[cfg(windows)]
 const WINDOWS_PLATFORM: &str = "\n\n## PLATFORM (Windows):\n\
-`bash` runs via cmd.exe — prefer Windows-native commands and quote forward-slash paths (or \
-use backslashes). Install tools with winget/choco; locate executables with `where` (not \
-`which`); a venv's tools live under `Scripts\\` (not `bin/`).";
+The `bash` tool's own description states which shell actually runs (Git Bash if installed, \
+else cmd.exe) and which syntax to use — follow it, and don't assume cmd.exe. \
+Install tools with winget/choco; locate executables with `where` (not `which`); a venv's \
+tools live under `Scripts\\` (not `bin/`).";
 
 const RULES: &str = "\
 Solve tasks efficiently with minimal tool calls. Act decisively — go straight to tool calls or answers.

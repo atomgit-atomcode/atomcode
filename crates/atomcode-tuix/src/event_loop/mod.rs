@@ -10012,6 +10012,16 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .map(|c| crate::width::truncate_with_ellipsis(&c, 500))
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
+        "code_review" => {
+            let base = get_str("base");
+            let staged = v.get("staged").and_then(|x| x.as_bool()).unwrap_or(false);
+            match (base, staged) {
+                (Some(b), true) => format!("base: \"{}\", staged: true", b),
+                (Some(b), false) => format!("base: \"{}\"", b),
+                (None, true) => "staged: true".to_string(),
+                (None, false) => String::new(),
+            }
+        }
         "web_fetch" => get_str("url")
             .map(|u| crate::width::truncate_with_ellipsis(&u, 150))
             .unwrap_or_default(),

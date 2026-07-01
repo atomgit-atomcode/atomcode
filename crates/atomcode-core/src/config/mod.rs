@@ -236,6 +236,13 @@ fn default_auto_copy_on_select() -> bool {
     !cfg!(windows)
 }
 
+fn default_auto_copy_code_blocks() -> bool {
+    // OFF by default. Auto-copying every rendered code block silently overwrote
+    // the user's clipboard on each reply (issue #699 feedback), so it is opt-in.
+    // Explicit `/copy` remains available regardless.
+    false
+}
+
 /// UI section of the config — currently just the theme switch driving
 /// the TUIX colour palette. Persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +259,14 @@ pub struct UiConfig {
     /// (conhost QuickEdit conflict).
     #[serde(default = "default_auto_copy_on_select")]
     pub auto_copy_on_select: bool,
+    /// Auto-copy a rendered code block's raw source to the clipboard when the
+    /// AI finishes emitting it. OFF by default — it silently overwrote the
+    /// user's clipboard on every code-block reply (issue #699 feedback). Env
+    /// `ATOMCODE_AUTO_COPY` overrides this when set. Explicit `/copy` is
+    /// always available regardless of this setting. Read once at startup (like
+    /// `theme`), so a change takes effect on restart, not via `/reload`.
+    #[serde(default = "default_auto_copy_code_blocks")]
+    pub auto_copy_code_blocks: bool,
 }
 
 impl Default for UiConfig {
@@ -259,6 +274,7 @@ impl Default for UiConfig {
         Self {
             theme: UiTheme::default(),
             auto_copy_on_select: default_auto_copy_on_select(),
+            auto_copy_code_blocks: default_auto_copy_code_blocks(),
         }
     }
 }
@@ -786,6 +802,16 @@ mod tests {
     fn auto_copy_on_select_defaults_per_platform() {
         let ui = UiConfig::default();
         assert_eq!(ui.auto_copy_on_select, !cfg!(windows));
+    }
+
+    #[test]
+    fn auto_copy_code_blocks_defaults_off() {
+        // Opt-in only: the code-block auto-copy must not hijack the clipboard
+        // unless the user explicitly turns it on (issue #699 feedback).
+        assert!(!UiConfig::default().auto_copy_code_blocks);
+        // A config that omits the key (older configs) also lands OFF.
+        let ui: UiConfig = toml::from_str("theme = \"dark\"").unwrap();
+        assert!(!ui.auto_copy_code_blocks, "missing key → default off");
     }
 
     /// Migration: on-disk config that looks like it was auto-written by
