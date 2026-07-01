@@ -5224,10 +5224,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 
 #[cfg(test)]
 mod copy_tests {
-    use super::{
-        default_save_filename, extract_code_blocks, render_save_markdown, resolve_copy,
-        resolve_save, CopyResolve, SaveOutcome,
-    };
+    use super::{extract_code_blocks, resolve_copy, CopyResolve};
 
     const REPLY: &str = "Run cmake + build:\n\
         ```\n\
@@ -5323,12 +5320,16 @@ mod copy_tests {
         assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
     }
+}
 
-    // ── /save unit tests ──
-    // All filesystem-touching tests pass absolute paths inside a tempdir so
-    // they never mutate the process-wide cwd and can run in parallel.
+#[cfg(test)]
+mod save_tests {
+    use super::{
+        default_save_filename, render_save_markdown, resolve_save, SaveOutcome,
+    };
     use atomcode_core::conversation::message::{Message, Role};
 
+    /// Build a Vec<Message> from (role, text) pairs for test fixtures.
     fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
         msgs.iter()
             .map(|(role, text)| Message::new(match *role {
