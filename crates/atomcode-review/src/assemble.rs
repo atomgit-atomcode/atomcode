@@ -60,9 +60,13 @@ pub fn build_review_agent_with(
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
     // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
-    // CLI run unbounded; engineering callers pass `--max-rounds`).
+    // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
+    // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
+    // instead of dying empty in a read-exploration loop (see `round_budget`).
     if let Some(n) = cfg.max_rounds {
-        builder = builder.max_rounds(n);
+        builder = builder
+            .max_rounds(n)
+            .hook(Arc::new(crate::round_budget::RoundBudgetHook::new()));
     }
     // Turn total-time cap via the kernel's cancel seam (no kernel change): inject a cancel
     // token and fire it after the deadline. This trips run_turn's stream-select cancel arm
@@ -242,6 +246,66 @@ mod tests {
             outcome.stop,
             atomcode_kernel::event::StopReason::Cancelled,
             "a stalled stream must be cut by the turn-duration cancel"
+        );
+    }
+
+    /// Records the messages of the LAST request it received, then stops (text-only round).
+    /// Lets a test observe what `pre_request` hooks projected onto the wire.
+    #[derive(Clone)]
+    struct CapturingProvider {
+        seen: Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _t: &[ToolDef],
+            _o: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            let evs = vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ];
+            Ok(stream::iter(evs).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn round_budget_reminder_injected_when_bounded() {
+        // max_rounds=1 → round 1 IS the final round → the budget hook fires this request.
+        let mut c = cfg();
+        c.max_rounds = Some(1);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider { seen: seen.clone() };
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(provider));
+        let _ = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        assert!(
+            text.contains("[review budget]"),
+            "bounded run must project the round-budget reminder onto the wire: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_round_budget_reminder_when_unbounded() {
+        // No max_rounds → no fuse, no budget hook mounted → clean wire.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider { seen: seen.clone() };
+        let (agent, _report) = build_review_agent_with(&cfg(), Arc::new(provider));
+        let _ = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        assert!(
+            !text.contains("[review budget]"),
+            "unbounded run must not inject the reminder: {text}"
         );
     }
 

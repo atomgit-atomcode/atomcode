@@ -173,6 +173,9 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // Changed-file set of the diff (diff mode only) — used to drop findings anchored to
     // files OUTSIDE the diff (a common hallucination: judging un-changed code as broken).
     let mut changed_files: Vec<String> = Vec::new();
+    // The line-annotated diff (diff mode only) — kept so the coverage backstop can slice out
+    // hunks for files the first pass left unreviewed and re-review just those.
+    let mut annotated_diff = String::new();
     let (task, trace_label) = match custom_task {
         Some(t) => {
             let label = format!("custom task ({} chars)", t.len());
@@ -228,14 +231,16 @@ async fn review(args: ReviewArgs) -> Result<()> {
             };
             // Prefix every hunk line with its REAL file line number so the model anchors
             // findings precisely instead of counting lines itself.
+            let impact_plan = atomcode_review::render_review_impact_plan(&diff);
             let diff = atomcode_review::annotate_diff_line_numbers(&diff);
             let t = format!(
                 "Review the following diff. Each hunk line is prefixed with its real file \
                  line number (`N: `) — use these numbers for `line_start`/`line_end`. \
                  Investigate the surrounding code with your read-only tools, then report \
                  each issue via `report_finding`. Report only real issues, each anchored \
-                 to a concrete file and line.{file_checklist}\n\n```diff\n{diff}\n```"
+                 to a concrete file and line.{file_checklist}\n\n{impact_plan}\n\n```diff\n{diff}\n```"
             );
+            annotated_diff = diff;
             (t, label)
         }
     };
@@ -303,14 +308,12 @@ async fn review(args: ReviewArgs) -> Result<()> {
     tel::maybe_show_notice(telemetry.is_enabled());
     let provider = tel::build_review_provider(&cfg).map_err(|e| anyhow::anyhow!(e))?;
     let provider = tel::meter_provider(provider, &telemetry, &cfg.base_url, &cfg.model);
-    let (agent, report) = build_review_agent_with(&cfg, provider);
+    let (agent, report) = build_review_agent_with(&cfg, provider.clone());
 
     // Live trace on stderr (stdout stays clean for findings / --json). The run is one LLM
     // turn loop — without this the terminal looks frozen while the model thinks + calls tools.
     eprintln!("Running {trace_label} with {model_label} …");
     let run = run_review_streaming(agent, task).await;
-    // All per-round LlmChat events were emitted during the run; drain them to disk before exit.
-    telemetry.shutdown(tel::FLUSH_TIMEOUT).await;
 
     // Trace summary: tool-usage profile + token spend — exactly what you need to optimize.
     if run.tool_calls > 0 {
@@ -331,6 +334,39 @@ async fn review(args: ReviewArgs) -> Result<()> {
     if dropped > 0 {
         eprintln!("[scope] dropped {dropped} finding(s) anchored outside the {} changed file(s)", changed_files.len());
     }
+
+    // Coverage backstop: on a wide diff the model sometimes declares "done" having reported on
+    // only some changed files (observed: umi-ocr left 3/10 files unreviewed). Re-review JUST the
+    // files that got zero findings (scoped sub-diff) once and merge — a deterministic guard the
+    // model can't skip. Gated to diff mode with a known changed set (annotated_diff empty ⇒
+    // task/custom mode, nothing to backstop). Lockfiles are already excluded by uncovered_files.
+    if !annotated_diff.is_empty() {
+        let uncovered = uncovered_files(&changed_files, &findings);
+        let sub = sub_diff_for_files(&annotated_diff, &uncovered);
+        if !sub.trim().is_empty() {
+            eprintln!("[coverage] {} changed file(s) had no findings; re-reviewing: {}", uncovered.len(), uncovered.join(", "));
+            let scoped_task = format!(
+                "A prior review pass did NOT report on the changed file(s) below. Review EACH \
+                 one thoroughly and report every real issue via `report_finding`; if a file is \
+                 genuinely clean, that is fine. Each hunk line is prefixed with its real file \
+                 line number (`N: `) — use these for `line_start`/`line_end`.\n\n```diff\n{sub}\n```"
+            );
+            let (agent2, report2) = build_review_agent_with(&cfg, provider.clone());
+            let run2 = run_review_streaming(agent2, scoped_task).await;
+            if run2.tool_calls > 0 {
+                let profile: Vec<String> = run2.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect();
+                eprintln!("— coverage trace — {} tool call(s): {}", run2.tool_calls, profile.join(", "));
+            }
+            let mut extra = report2.findings();
+            drop_out_of_scope(&mut extra, &changed_files);
+            let added = merge_findings(&mut findings, extra);
+            eprintln!("[coverage] recovered {added} finding(s) from the re-review");
+        }
+    }
+
+    // Drain telemetry to disk AFTER all LLM work (first pass + any coverage re-review).
+    telemetry.shutdown(tel::FLUSH_TIMEOUT).await;
+
     sort_findings(&mut findings);
 
     if args.json {
@@ -783,6 +819,85 @@ fn drop_out_of_scope(findings: &mut Vec<Finding>, changed_files: &[String]) -> u
     before - findings.len()
 }
 
+/// Lockfiles / dependency manifests where "no finding" is the expected outcome — a coverage
+/// re-review pass over them would burn a round for nothing. Kept narrow on purpose.
+fn is_low_signal_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".lock")
+        || p.ends_with("package-lock.json")
+        || p.ends_with("pnpm-lock.yaml")
+        || p.ends_with("yarn.lock")
+        || p.ends_with("go.sum")
+}
+
+/// Changed files that received ZERO findings and are worth a focused second look. Drives the
+/// coverage backstop: on a wide diff the reviewer sometimes declares "done" having only
+/// reported on some files (observed: umi-ocr left 3/10 files unreviewed). Re-reviewing just
+/// these recovers the gap. Lockfiles/manifests are excluded (a clean lockfile is expected).
+///
+/// Expects `findings` already scope-filtered to `changed_files` (see [`drop_out_of_scope`]),
+/// so a finding's `file_path` equals its changed-file entry. Empty `changed_files` (task mode,
+/// unknown set) yields none — nothing to backstop.
+fn uncovered_files(changed_files: &[String], findings: &[Finding]) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter(|c| !is_low_signal_path(c))
+        .filter(|c| !findings.iter().any(|f| &f.file_path == *c))
+        .cloned()
+        .collect()
+}
+
+/// Fold `extra` findings into `findings`, skipping duplicates (same file + start line +
+/// title). Returns how many were actually added. Used by the coverage backstop so a re-review
+/// that re-flags an issue the first pass already caught does not double-report it.
+fn merge_findings(findings: &mut Vec<Finding>, extra: Vec<Finding>) -> usize {
+    let mut added = 0;
+    for e in extra {
+        let dup = findings.iter().any(|f| {
+            f.file_path == e.file_path && f.line_start == e.line_start && f.title == e.title
+        });
+        if !dup {
+            findings.push(e);
+            added += 1;
+        }
+    }
+    added
+}
+
+/// Extract from a unified diff only the file sections for `files` (paths as returned by
+/// [`changed_files_from_diff`](atomcode_review::changed_files_from_diff), i.e. `b/`-stripped).
+/// Preserves each kept section verbatim so the scoped re-review sees real hunks + line context.
+fn sub_diff_for_files(full_diff: &str, files: &[String]) -> String {
+    let wanted = |path: &Option<String>| {
+        path.as_ref()
+            .is_some_and(|p| files.iter().any(|f| f == p))
+    };
+    let mut out = String::new();
+    let mut section = String::new();
+    let mut section_path: Option<String> = None;
+    for line in full_diff.lines() {
+        if line.starts_with("diff --git ") && !section.is_empty() {
+            if wanted(&section_path) {
+                out.push_str(&section);
+            }
+            section.clear();
+            section_path = None;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            if p != "/dev/null" {
+                section_path = Some(p.strip_prefix("b/").unwrap_or(p).to_string());
+            }
+        }
+        section.push_str(line);
+        section.push('\n');
+    }
+    if wanted(&section_path) {
+        out.push_str(&section);
+    }
+    out
+}
+
 /// Structured `--json` payload: findings plus the agent's final prose and token usage,
 /// so an embedder gets the whole review from stdout (stderr stays human-only trace).
 #[derive(Serialize)]
@@ -882,6 +997,80 @@ mod tests {
         let mut fs = vec![finding_in("x.go"), finding_in("y.go")];
         assert_eq!(drop_out_of_scope(&mut fs, &[]), 0);
         assert_eq!(fs.len(), 2, "nothing dropped when the changed set is unknown");
+    }
+
+    #[test]
+    fn uncovered_reports_changed_files_with_no_findings() {
+        // 3 changed files, findings only on one → the other two are uncovered.
+        let changed = vec!["a.go".to_string(), "b.go".to_string(), "c.go".to_string()];
+        let fs = vec![finding_in("a.go")];
+        let mut got = uncovered_files(&changed, &fs);
+        got.sort();
+        assert_eq!(got, vec!["b.go".to_string(), "c.go".to_string()]);
+    }
+
+    #[test]
+    fn uncovered_empty_when_every_file_covered() {
+        let changed = vec!["a.go".to_string(), "b.go".to_string()];
+        let fs = vec![finding_in("a.go"), finding_in("b.go")];
+        assert!(uncovered_files(&changed, &fs).is_empty());
+    }
+
+    #[test]
+    fn uncovered_skips_lockfiles_and_manifests() {
+        // A lockfile with no finding is NOT "uncovered" — re-reviewing it wastes a pass.
+        let changed = vec![
+            "Cargo.lock".to_string(),
+            "go.sum".to_string(),
+            "web/package-lock.json".to_string(),
+            "real.go".to_string(),
+        ];
+        let fs: Vec<Finding> = vec![];
+        assert_eq!(uncovered_files(&changed, &fs), vec!["real.go".to_string()]);
+    }
+
+    #[test]
+    fn uncovered_empty_when_changed_set_unknown() {
+        // No changed set (task mode) → nothing to backstop.
+        assert!(uncovered_files(&[], &[finding_in("x.go")]).is_empty());
+    }
+
+    const TWO_FILE_DIFF: &str = "diff --git a/a.go b/a.go\n\
+--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-old\n+newA\n\
+diff --git a/pkg/b.go b/pkg/b.go\n\
+--- a/pkg/b.go\n+++ b/pkg/b.go\n@@ -1 +1 @@\n-old\n+newB\n";
+
+    #[test]
+    fn sub_diff_extracts_only_requested_file() {
+        let got = sub_diff_for_files(TWO_FILE_DIFF, &["pkg/b.go".to_string()]);
+        assert!(got.contains("diff --git a/pkg/b.go b/pkg/b.go"), "keeps b.go section: {got}");
+        assert!(got.contains("+newB"), "keeps b.go hunk: {got}");
+        assert!(!got.contains("a.go"), "drops the a.go section entirely: {got}");
+    }
+
+    #[test]
+    fn sub_diff_empty_when_no_file_matches() {
+        assert!(sub_diff_for_files(TWO_FILE_DIFF, &["nope.go".to_string()]).is_empty());
+        assert!(sub_diff_for_files(TWO_FILE_DIFF, &[]).is_empty());
+    }
+
+    #[test]
+    fn sub_diff_keeps_all_when_all_requested() {
+        let got = sub_diff_for_files(TWO_FILE_DIFF, &["a.go".to_string(), "pkg/b.go".to_string()]);
+        assert!(got.contains("+newA") && got.contains("+newB"), "both hunks kept: {got}");
+    }
+
+    #[test]
+    fn merge_adds_new_and_skips_duplicates() {
+        let mut base = vec![finding_in("a.go")]; // a.go:1 "t"
+        // one genuine new finding, one exact duplicate of the existing one.
+        let mut dup = finding_in("a.go"); // same file+line+title as base[0]
+        dup.body = "different body but same identity".into();
+        let extra = vec![finding_in("qrcode.go"), dup];
+        let added = merge_findings(&mut base, extra);
+        assert_eq!(added, 1, "only the qrcode.go finding is new");
+        assert_eq!(base.len(), 2);
+        assert!(base.iter().any(|f| f.file_path == "qrcode.go"), "new file folded in");
     }
 
     #[test]
