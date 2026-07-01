@@ -559,12 +559,21 @@ const RELAY_CLIENT_VERSION: &str = "v0.1.0";
 
 /// 检测当前平台对应的 target triple，用于构建下载文件名。
 fn relay_client_target() -> &'static str {
+    // HarmonyOS / OpenHarmony 在运行时 OS 显示为 "linux"，
+    // 用编译时 cfg 区分
+    #[cfg(any(target_os = "ohos", target_env = "ohos"))]
+    {
+        return match std::env::consts::ARCH {
+            "aarch64" | "arm64" => "ohos-arm64",
+            _ => "unknown",
+        };
+    }
+    #[cfg(not(any(target_os = "ohos", target_env = "ohos")))]
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("windows", "x86_64") => "x86_64-pc-windows-gnu",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         _ => "unknown",
     }
 }
