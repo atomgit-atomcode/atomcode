@@ -557,7 +557,8 @@ const RELAY_CLIENT_DOWNLOAD_BASE: &str =
 /// 当前 release 版本（与仓库 tag 对应）。
 const RELAY_CLIENT_VERSION: &str = "v0.1.0";
 
-/// 检测当前平台对应的 target triple，用于构建下载文件名。
+/// 检测当前平台对应的简化平台名，用于构建下载文件名。
+/// 命名规则与 atomcode latest.json 一致。
 fn relay_client_target() -> &'static str {
     // HarmonyOS / OpenHarmony 在运行时 OS 显示为 "linux"，
     // 用编译时 cfg 区分
@@ -570,11 +571,21 @@ fn relay_client_target() -> &'static str {
     }
     #[cfg(not(any(target_os = "ohos", target_env = "ohos")))]
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("windows", "x86_64") => "windows-x64",
         _ => "unknown",
+    }
+}
+
+/// 根据平台名构建下载文件名（Windows 加 .exe 后缀）。
+fn relay_client_filename(target: &str) -> String {
+    if target.starts_with("windows") {
+        format!("atomcode-relay-client-{}.exe", target)
+    } else {
+        format!("atomcode-relay-client-{}", target)
     }
 }
 
@@ -629,9 +640,10 @@ fn ensure_relay_client_bin() -> Result<String, String> {
     }
 
     // 6) 自动下载
+    let filename = relay_client_filename(target);
     let url = format!(
-        "{}/{}/atomcode-relay-client-{}",
-        RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION, target
+        "{}/{}/{}",
+        RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION, filename
     );
 
     // 使用 block_in_place 执行异步下载（当前在同步上下文中）
@@ -649,10 +661,10 @@ fn ensure_relay_client_bin() -> Result<String, String> {
             Ok(cache_path.to_string_lossy().into_owned())
         }
         Err(e) => {
-            let platform = relay_client_target();
             let download_url = format!(
-                "{}/{}/atomcode-relay-client-{}",
-                RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION, platform
+                "{}/{}/{}",
+                RELAY_CLIENT_DOWNLOAD_BASE, RELAY_CLIENT_VERSION,
+                relay_client_filename(relay_client_target())
             );
             let bin_name = if cfg!(windows) {
                 "atomcode-relay-client.exe"
