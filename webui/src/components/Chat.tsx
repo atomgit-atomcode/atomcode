@@ -11,6 +11,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
+import { detectAtMentionRange, replaceAtMention, splitAtToken } from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
@@ -445,9 +446,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // @ 文件菜单：把 @ 后文本拆成「目录段 + 过滤词」，以支持进入子目录 / 返回上级。
   // 例如 "examples/fo" → 列 cwd/examples 的内容，并按前缀 "fo" 过滤。
-  const atSlash = atQuery.lastIndexOf('/');
-  const atDirPart = atSlash >= 0 ? atQuery.slice(0, atSlash + 1) : '';
-  const atFilter = atSlash >= 0 ? atQuery.slice(atSlash + 1) : atQuery;
+  const { scopeDir: atDirPart, filter: atFilter } = splitAtToken(atQuery);
   const atTargetDir =
     atDirPart === ''
       ? cwd
@@ -1122,44 +1121,48 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
-  // 把光标前的 @ 段替换为相对路径 rel。keepOpen=true 用于进入目录（保留菜单、继续浏览），
-  // false 用于最终选定文件（补空格、关闭菜单）。
-  function setAtMention(rel: string, keepOpen: boolean) {
+  // 把当前 @ 段替换为相对路径 rel，并以空格终止；与 TUI 一致，目录也只是插入
+  // `@dir/ `，用户可 Backspace 删除空格后继续触发补全。
+  function setAtMention(rel: string) {
     const ta = textareaRef.current;
     if (!ta) return;
     const pos = ta.selectionStart ?? ta.value.length;
-    const before = ta.value.slice(0, pos);
-    const after = ta.value.slice(pos);
-    const atIdx = before.lastIndexOf('@');
-    if (atIdx < 0) return;
-    const suffix = keepOpen ? '' : ' ';
-    const next = before.slice(0, atIdx) + `@${rel}${suffix}` + after;
-    setInput(next);
-    if (keepOpen) {
-      setAtQuery(rel);
-      setAtIndex(0);
-    } else {
-      setAtOpen(false);
-    }
+    const range = detectAtMentionRange(ta.value, pos);
+    if (!range) return;
+    const next = replaceAtMention(ta.value, range, rel);
+    setInput(next.text);
+    setAtOpen(false);
+    setAtQuery('');
+    setAtIndex(0);
     requestAnimationFrame(() => {
       ta.focus();
-      const newPos = atIdx + 1 + rel.length + suffix.length;
-      ta.setSelectionRange(newPos, newPos);
+      ta.setSelectionRange(next.cursor, next.cursor);
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
     });
   }
 
-  // 选择 @ 菜单某一行：「..」→返回上级；目录→进入；文件→插入完整相对路径并关闭。
+  // 选择 @ 菜单某一行：「..」仍用于返回上级；目录/文件都插入完整相对路径并关闭。
   function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean }) {
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
       const idx = trimmed.lastIndexOf('/');
-      setAtMention(idx >= 0 ? trimmed.slice(0, idx + 1) : '', true);
-    } else if (row.is_dir) {
-      setAtMention(atDirPart + row.name + '/', true);
+      const parent = idx >= 0 ? trimmed.slice(0, idx + 1) : '';
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const range = detectAtMentionRange(ta.value, ta.selectionStart ?? ta.value.length);
+      if (!range) return;
+      const nextText = ta.value.slice(0, range.start) + `@${parent}` + ta.value.slice(range.end);
+      setInput(nextText);
+      setAtQuery(parent);
+      setAtIndex(0);
+      requestAnimationFrame(() => {
+        ta.focus();
+        const cursor = range.start + 1 + parent.length;
+        ta.setSelectionRange(cursor, cursor);
+      });
     } else {
-      setAtMention(atDirPart + row.name, false);
+      setAtMention(atDirPart + row.name + (row.is_dir ? '/' : ''));
     }
   }
 
@@ -1196,10 +1199,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 检测光标前是否有 @（行首 或 空格后）。@ 后文本可含 "/" 以进入子目录；
     // 实际列目录/过滤由派生的 atTargetDir + useEffect 处理（见上）。
-    const atIdx = before.lastIndexOf('@');
-    if (atIdx >= 0 && (atIdx === 0 || before[atIdx - 1] === ' ')) {
-      const query = before.slice(atIdx + 1);
-      if (!query.includes(' ') && query.length <= 120) {
+    const atRange = detectAtMentionRange(val, pos);
+    if (atRange) {
+      const query = atRange.token;
+      if (query.length <= 120) {
         setSlashOpen(false);
         setAtQuery(query);
         setAtIndex(0);
@@ -1362,10 +1365,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               onMouseDown={(e) => { e.preventDefault(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.up ? '..' : atDirPart + item.name}
+              title={item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}
             >
               <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.up ? '..' : item.name}</span>
+              <span class="at-name">{item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}</span>
             </button>
           ))}
           {!atLoading && atRows.length === 0 && (

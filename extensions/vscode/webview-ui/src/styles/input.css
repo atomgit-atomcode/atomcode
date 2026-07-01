@@ -431,6 +431,14 @@
   background: var(--app-menu-selection-background);
 }
 
+.file-picker-item.active {
+  background: var(--app-menu-selection-background);
+}
+
+.at-mention-picker {
+  padding: 4px;
+}
+
 .file-picker-item-icon {
   flex-shrink: 0;
   font-size: 13px;

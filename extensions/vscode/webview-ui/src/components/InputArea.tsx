@@ -6,11 +6,19 @@ import { ModelSelector } from './ModelSelector';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
+import { detectAtMentionRange, replaceAtMention } from '../utils/atMention';
 
 interface WorkspaceFile {
   path: string;
   fileName: string;
   relativePath: string;
+}
+
+interface WorkspacePath {
+  path: string;
+  fileName: string;
+  relativePath: string;
+  isDir: boolean;
 }
 
 const MAX_IMAGES = 6;
@@ -51,8 +59,12 @@ export function InputArea() {
   const [slashLoading, setSlashLoading] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showFilePicker, setShowFilePicker] = useState(false);
+  const [showAtPicker, setShowAtPicker] = useState(false);
   const [fileQuery, setFileQuery] = useState('');
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
+  const [atQuery, setAtQuery] = useState('');
+  const [atItems, setAtItems] = useState<WorkspacePath[]>([]);
+  const [atIndex, setAtIndex] = useState(0);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const inputBoxRef = useRef<HTMLDivElement>(null);
@@ -74,6 +86,10 @@ export function InputArea() {
       if (e.data?.type === 'focusInput') textareaRef.current?.focus();
       if (e.data?.type === 'workspaceFiles') {
         setWorkspaceFiles(e.data.files || []);
+      }
+      if (e.data?.type === 'workspacePaths') {
+        setAtItems(e.data.paths || []);
+        setAtIndex(0);
       }
       if (e.data?.type === 'skills') {
         setSlashSkills(e.data.skills || []);
@@ -111,7 +127,7 @@ export function InputArea() {
   // Close pickers when clicking outside their relevant areas
   // Capture phase so no child handler can stop this from firing
   useEffect(() => {
-    if (!showFilePicker && !showSlash && !showAttachMenu) return;
+    if (!showFilePicker && !showSlash && !showAttachMenu && !showAtPicker) return;
     if (showFilePicker) {
       requestAnimationFrame(() => fileSearchRef.current?.focus());
     }
@@ -133,13 +149,16 @@ export function InputArea() {
       if (showSlash && inputBoxRef.current && !inputBoxRef.current.contains(target)) {
         setShowSlash(false);
       }
+      if (showAtPicker && inputBoxRef.current && !inputBoxRef.current.contains(target)) {
+        setShowAtPicker(false);
+      }
       if (showAttachMenu && attachMenuRef.current && !attachMenuRef.current.contains(target)) {
         setShowAttachMenu(false);
       }
     }
     document.addEventListener('mousedown', closePickers, true);
     return () => document.removeEventListener('mousedown', closePickers, true);
-  }, [showAttachMenu, showFilePicker, showSlash]);
+  }, [showAtPicker, showAttachMenu, showFilePicker, showSlash]);
 
   const ensureSlashSkills = useCallback(() => {
     if (slashSkills !== null || slashLoading) return;
@@ -150,12 +169,29 @@ export function InputArea() {
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setText(val);
+    const cursor = e.target.selectionStart ?? val.length;
     if (/^\/\S*$/.test(val)) {
       setSlashFilter(val.slice(1).split(/\s/)[0]);
       setShowSlash(true);
+      setShowAtPicker(false);
       ensureSlashSkills();
     } else {
-      setShowSlash(false);
+      const range = detectAtMentionRange(val, cursor);
+      if (!range) {
+        setShowSlash(false);
+        setShowAtPicker(false);
+        return;
+      }
+      const query = range.token;
+      if (query.length <= 120) {
+        setShowSlash(false);
+        setShowAtPicker(true);
+        setAtQuery(query);
+        setAtIndex(0);
+        postMessage({ type: 'searchWorkspacePaths', query });
+      } else {
+        setShowAtPicker(false);
+      }
     }
   }, [ensureSlashSkills]);
 
@@ -197,13 +233,52 @@ export function InputArea() {
     setShowSlash(false);
   }, [pendingImages, text, send]);
 
+  const selectAtItem = useCallback((item: WorkspacePath) => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const range = detectAtMentionRange(text, el.selectionStart ?? text.length);
+    if (!range) return;
+    const next = replaceAtMention(text, range, item.relativePath);
+    setText(next.text);
+    setShowAtPicker(false);
+    setAtQuery('');
+    setAtItems([]);
+    requestAnimationFrame(() => {
+      const current = textareaRef.current;
+      if (!current) return;
+      current.focus();
+      current.setSelectionRange(next.cursor, next.cursor);
+    });
+  }, [text]);
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (showSlash) return;
+      if (showAtPicker) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setAtIndex((index) => Math.min(index + 1, atItems.length - 1));
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setAtIndex((index) => Math.max(index - 1, 0));
+          return;
+        }
+        if ((e.key === 'Enter' || e.key === 'Tab') && atItems.length > 0) {
+          e.preventDefault();
+          selectAtItem(atItems[Math.min(atIndex, atItems.length - 1)]);
+          return;
+        }
+        if (e.key === 'Escape') {
+          setShowAtPicker(false);
+          return;
+        }
+      }
       if (e.nativeEvent.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
     },
-    [handleSend, showSlash],
+    [atIndex, atItems, handleSend, selectAtItem, showAtPicker, showSlash],
   );
 
   const handleSlashSelect = useCallback((command: string) => {
@@ -297,6 +372,36 @@ export function InputArea() {
             onSelect={handleSlashSelect}
             onClose={() => setShowSlash(false)}
           />
+        )}
+        {showAtPicker && (
+          <div className="file-picker at-mention-picker">
+            <div className="file-picker-list">
+              {atItems.length === 0 ? (
+                <div className="file-picker-empty">
+                  {atQuery ? t('input.noMatchingFiles') : t('input.typeToSearchFiles')}
+                </div>
+              ) : (
+                atItems.map((item, index) => (
+                  <button
+                    key={item.relativePath}
+                    type="button"
+                    className={`file-picker-item ${index === atIndex ? 'active' : ''}`}
+                    onMouseEnter={() => setAtIndex(index)}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      selectAtItem(item);
+                    }}
+                  >
+                    <span className="file-picker-item-icon">{item.isDir ? '📁' : '📄'}</span>
+                    <span className="file-picker-item-body">
+                      <span className="file-picker-item-name">{item.relativePath}</span>
+                      <span className="file-picker-item-path">{item.isDir ? t('input.folder') : item.fileName}</span>
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
         )}
         {showAttachMenu && (
           <div className="attach-menu-popover" ref={attachMenuRef}>

@@ -18,6 +18,7 @@ import {
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
 type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
+type WorkspacePathItem = { path: string; fileName: string; relativePath: string; isDir: boolean; depth: number };
 type PanelSessionInfo = {
   sessionId: string;
   projectHash?: string;
@@ -50,6 +51,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
+  private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
   public onModelSelected?: (model: string) => void;
 
   constructor(
@@ -452,8 +454,102 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this._postMessage({ type: 'workspaceFiles', files, query });
           break;
         }
+        case 'searchWorkspacePaths': {
+          const query = String(msg.query || '');
+          const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+          if (!workspaceFolder) {
+            this._postMessage({ type: 'workspacePaths', paths: [], query });
+            break;
+          }
+          try {
+            const paths = await this._searchWorkspacePaths(workspaceFolder, query);
+            this._postMessage({ type: 'workspacePaths', paths, query });
+          } catch {
+            this._postMessage({ type: 'workspacePaths', paths: [], query });
+          }
+          break;
+        }
       }
     });
+  }
+
+  private async _workspacePathItems(workspaceFolder: vscode.WorkspaceFolder): Promise<WorkspacePathItem[]> {
+    const root = workspaceFolder.uri.fsPath;
+    const now = Date.now();
+    if (this._workspacePathCache
+      && this._workspacePathCache.root === root
+      && now - this._workspacePathCache.builtAt < 3000) {
+      return this._workspacePathCache.items;
+    }
+
+    const excludePattern = '{**/node_modules/**,**/.git/**,**/target/**,**/dist/**,**/build/**,**/__pycache__/**,**/*.d.ts,**/*.map}';
+    const uris = await vscode.workspace.findFiles('**/*', excludePattern, 50000);
+    const byRelativePath = new Map<string, WorkspacePathItem>();
+    const toRelative = (fsPath: string) => path.relative(root, fsPath).split(path.sep).join('/');
+    const addDir = (relativeDir: string) => {
+      const clean = relativeDir.replace(/\/+$/, '');
+      if (!clean || clean.includes(' ') || clean === '.git' || clean.startsWith('.git/')) return;
+      const relativePath = `${clean}/`;
+      if (byRelativePath.has(relativePath)) return;
+      byRelativePath.set(relativePath, {
+        path: path.join(root, clean),
+        fileName: path.basename(clean),
+        relativePath,
+        isDir: true,
+        depth: clean.split('/').filter(Boolean).length,
+      });
+    };
+
+    for (const uri of uris) {
+      const relative = toRelative(uri.fsPath);
+      if (!relative || relative.includes(' ') || relative === '.git' || relative.startsWith('.git/')) {
+        continue;
+      }
+      const parts = relative.split('/');
+      for (let i = 1; i < parts.length; i += 1) {
+        addDir(parts.slice(0, i).join('/'));
+      }
+      byRelativePath.set(relative, {
+        path: uri.fsPath,
+        fileName: path.basename(uri.fsPath),
+        relativePath: relative,
+        isDir: false,
+        depth: parts.length,
+      });
+    }
+
+    const items = Array.from(byRelativePath.values());
+    this._workspacePathCache = { root, builtAt: now, items };
+    return items;
+  }
+
+  private async _searchWorkspacePaths(
+    workspaceFolder: vscode.WorkspaceFolder,
+    token: string,
+  ): Promise<Array<Omit<WorkspacePathItem, 'depth'>>> {
+    const slash = token.lastIndexOf('/');
+    const scopeDir = slash >= 0 ? token.slice(0, slash + 1) : '';
+    const filter = slash >= 0 ? token.slice(slash + 1) : token;
+    const filterLower = filter.toLowerCase();
+    const scopeDepth = scopeDir ? scopeDir.split('/').filter(Boolean).length : 0;
+    const items = await this._workspacePathItems(workspaceFolder);
+
+    return items
+      .filter((item) => item.relativePath.startsWith(scopeDir))
+      .filter((item) => item.relativePath !== scopeDir)
+      .filter((item) => {
+        if (!filterLower) return item.depth === scopeDepth + 1;
+        return item.relativePath.slice(scopeDir.length).toLowerCase().includes(filterLower);
+      })
+      .sort((a, b) => {
+        const aDirect = a.depth === scopeDepth + 1;
+        const bDirect = b.depth === scopeDepth + 1;
+        if (aDirect !== bDirect) return aDirect ? -1 : 1;
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.relativePath.localeCompare(b.relativePath);
+      })
+      .slice(0, 30)
+      .map(({ depth, ...item }) => item);
   }
 
   // Public API for commands
