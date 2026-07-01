@@ -120,7 +120,7 @@ export function InputArea() {
     }
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [text]);
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
