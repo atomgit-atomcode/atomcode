@@ -4510,7 +4510,16 @@ fn resolve_save(
     }
 
     match std::fs::write(&path, content) {
-        Ok(()) => SaveOutcome::Ok(path),
+        Ok(()) => {
+            // Canonicalize so SaveOutcome::Ok carries an absolute path as
+            // documented (matches the "resolved absolute path" doc comment).
+            // On the rare canonicalize failure (e.g. the file was removed
+            // between write and canonicalize on some platforms), fall back
+            // to the as-written path so the success isn't turned into an
+            // error by a post-success race.
+            let resolved = path.canonicalize().unwrap_or(path);
+            SaveOutcome::Ok(resolved)
+        }
         Err(e) => SaveOutcome::IoError(e.to_string()),
     }
 }
@@ -5394,8 +5403,11 @@ mod copy_tests {
         let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
         match resolve_save(&msgs, path.to_str().unwrap()) {
             SaveOutcome::Ok(got) => {
-                assert_eq!(got, path);
-                let content = std::fs::read_to_string(&path).expect("read");
+                // canonicalize() may add a platform-specific prefix
+                // (e.g. \\?\ on Windows), so compare by file name + read-back
+                // rather than exact path equality.
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
                 assert!(content.contains("## User\nping"));
                 assert!(content.contains("## Assistant\npong"));
             }
@@ -5411,8 +5423,8 @@ mod copy_tests {
         let msgs = conv(&[("user", "new turn")]);
         match resolve_save(&msgs, path.to_str().unwrap()) {
             SaveOutcome::Ok(got) => {
-                assert_eq!(got, path);
-                let content = std::fs::read_to_string(&path).expect("read");
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
                 assert!(content.contains("## User\nnew turn"));
                 assert!(!content.contains("OLD CONTENT"));
             }
