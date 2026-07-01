@@ -10,6 +10,7 @@ async function main() {
   const tests = [
     'rendering-regression.test.ts',
     'i18n-regression.test.ts',
+    'quick-actions-regression.test.ts',
     'at-mention.test.ts',
   ];
 

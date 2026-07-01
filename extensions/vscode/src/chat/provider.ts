@@ -14,6 +14,7 @@ import {
   ProvidersResponse,
   ImageInput,
 } from '../daemon/types';
+import { getQuickActionPrompt } from './quickActions';
 
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
@@ -1547,23 +1548,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleQuickAction(action: string) {
-    const ctx = this._getEditorContext();
-    const prompts: Record<string, string> = {
-      explain: 'Please explain this code. What does it do and why?',
-      fix: 'Please fix any bugs or issues in this code.',
-      test: 'Please generate unit tests for this code.',
-      refactor: 'Please refactor this code for better readability and maintainability.',
-      docs: 'Please add documentation comments to this code.',
-      review: 'Please review this code for issues, improvements, and best practices.',
-      optimize: 'Please optimize this code for performance while preserving behavior.',
-    };
-    const prompt = prompts[action] || action;
-    const text = ctx.selection
-      ? `File: ${ctx.fileName} (${ctx.language})\nSelected code:\n\`\`\`${ctx.language}\n${ctx.selection}\n\`\`\`\n\n${prompt}`
-      : prompt;
+    const prompt = getQuickActionPrompt(action, vscode.env.language);
 
     this._postMessage({ type: 'userMessage', text: prompt });
-    await this._handleSend(text);
+    await this._handleSend(prompt);
   }
 
   private async _handleSlashCommand(command: string) {

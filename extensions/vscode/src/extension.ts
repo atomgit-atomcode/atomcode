@@ -7,6 +7,7 @@ import { AtomCodeActionProvider } from './editor/actions';
 import { DiffContentProvider } from './editor/diff';
 import { getEditorContext, buildContextualPrompt } from './editor/context';
 import { getConfig, DEFAULT_PORT } from './config';
+import { getQuickActionPrompt } from './chat/quickActions';
 
 class ExtensionState {
   client!: DaemonClient;
@@ -94,19 +95,19 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('atomcode.explain', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please explain this code. What does it do, and why?', ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('explain', vscode.env.language), ctx);
       await runCommand(vscode.l10n.t('explain the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.fix', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please fix any bugs or issues in this code.', ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('fix', vscode.env.language), ctx);
       await runCommand(vscode.l10n.t('fix the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.optimize', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please optimize this code for better performance and readability.', ctx);
+      const prompt = buildContextualPrompt(getQuickActionPrompt('optimize', vscode.env.language), ctx);
       await runCommand(vscode.l10n.t('optimize the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
