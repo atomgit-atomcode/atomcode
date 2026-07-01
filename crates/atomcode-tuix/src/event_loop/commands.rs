@@ -3551,6 +3551,7 @@ fn extract_code_blocks(md: &str) -> Vec<String> {
 }
 
 /// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+#[derive(Debug)]
 enum CopyResolve {
     /// The text to place on the clipboard.
     Text(String),
@@ -3562,13 +3563,22 @@ enum CopyResolve {
 
 /// Map `/copy [arg]` to the text to copy. `""` → last block (the common
 /// "copy the command just shown" case); `all` → every block joined by a blank
-/// line; `N` (1-based) → the Nth block.
+/// line; `N` (1-based) → the Nth block; `msg` → the full reply markdown
+/// (prose + code, useful for pasting the whole answer elsewhere).
 fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let arg = arg.trim();
+    // `/copy msg` → full reply markdown (skip code-block extraction entirely).
+    if arg.eq_ignore_ascii_case("msg") {
+        let trimmed = md.trim();
+        if trimmed.is_empty() {
+            return CopyResolve::NoBlocks;
+        }
+        return CopyResolve::Text(trimmed.to_string());
+    }
     let blocks = extract_code_blocks(md);
     if blocks.is_empty() {
         return CopyResolve::NoBlocks;
     }
-    let arg = arg.trim();
     if arg.is_empty() {
         return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
     }
@@ -4595,5 +4605,71 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}",
             out
         );
+    }
+
+    // ── /copy msg ────────────────────────────────────────────────────
+    // `/copy msg` copies the full reply markdown (prose + code), not just
+    // the fenced code blocks. This is useful for pasting the whole answer
+    // into another document or chat.
+
+    #[test]
+    fn copy_msg_returns_full_markdown_when_reply_has_prose_and_code() {
+        let md = "Here is the plan:\n\n```rust\nfn main() {}\n```\n\nDone.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s) => assert_eq!(s, md),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_prose_only_reply_without_code_blocks() {
+        // A reply with no fenced code block still has a meaningful body.
+        // `/copy msg` should return it; `/copy` (no arg) would return NoBlocks.
+        let md = "Just a plain explanation with no code.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s) => assert_eq!(s, md),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_trims_leading_trailing_whitespace() {
+        let md = "\n\n  Hello world  \n\n";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s) => assert_eq!(s, "Hello world"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_no_blocks_when_reply_is_empty() {
+        // Empty/whitespace-only reply: nothing meaningful to copy.
+        for empty in ["", "   ", "\n\n"] {
+            match resolve_copy(empty, "msg") {
+                CopyResolve::NoBlocks => {}
+                other => panic!("expected NoBlocks for {:?}, got {:?}", empty, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_is_case_insensitive() {
+        let md = "Some text.";
+        for variant in ["msg", "MSG", "Msg", "mSg"] {
+            match resolve_copy(md, variant) {
+                CopyResolve::Text(_) => {}
+                other => panic!("case {:?} should match, got {:?}", variant, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_does_not_break_existing_copy_no_arg() {
+        // Regression: `/copy` (no arg) still returns last code block.
+        let md = "intro\n```js\na()\n```\n```py\nb()\n```";
+        match resolve_copy(md, "") {
+            CopyResolve::Text(s) => assert_eq!(s, "b()"),
+            other => panic!("expected last block, got {:?}", other),
+        }
     }
 }
