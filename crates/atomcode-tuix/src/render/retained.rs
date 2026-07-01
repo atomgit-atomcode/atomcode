@@ -34,19 +34,6 @@ use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
 
-/// When `ATOMCODE_AUTO_COPY=0` or `=false`, the renderer skips automatic
-/// clipboard copy after code-block flushes. Default is on (enabled).
-/// Result is cached in a `OnceLock` — environment is read once per process.
-fn auto_copy_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ATOMCODE_AUTO_COPY")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
-
 const PAD_COL: usize = 2;
 
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
@@ -411,6 +398,12 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// and "Copied" hint lines so replay doesn't overwrite the user's
     /// clipboard or inject stale annotations (issue #699).
     suppress_auto_copy: bool,
+    /// Master switch for the code-block auto-copy feature (issue #699).
+    /// Default OFF: auto-copy silently overwrote the user's clipboard on every
+    /// code-block reply, so it is now opt-in via `config.ui.auto_copy_code_blocks`
+    /// (or `ATOMCODE_AUTO_COPY`), plumbed in at startup via `set_auto_copy_enabled`.
+    /// Explicit `/copy` stays available regardless.
+    auto_copy_enabled: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -667,6 +660,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
             suppress_auto_copy: false,
+            auto_copy_enabled: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
@@ -2755,13 +2749,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// If the markdown parser just finished a code block, copy its raw
     /// source to the system clipboard and return a muted hint line for
     /// display. Returns `None` when no block was finished or auto-copy
-    /// is disabled (see [`auto_copy_enabled`]).
+    /// is disabled (see `auto_copy_enabled` field / `set_auto_copy_enabled`).
     fn maybe_auto_copy_hint(&mut self) -> Option<String> {
-        // Never auto-copy during history replay (/resume, /undo, atomcode -c).
-        // The markdown events are identical to live streaming, but we
-        // must not overwrite the user's clipboard or inject stale
-        // "Copied" hints into replayed output (issue #699 P1).
-        if self.suppress_auto_copy {
+        // Gate BEFORE consuming the source, so a disabled renderer never
+        // touches the clipboard. Two reasons to bail:
+        //   - auto-copy is off (the default now — opt-in via
+        //     `config.ui.auto_copy_code_blocks` / `ATOMCODE_AUTO_COPY`; it used to
+        //     silently clobber the user's clipboard on every code-block reply);
+        //   - history replay (/resume, /undo, atomcode -c): the markdown events are
+        //     identical to live streaming, but replay must not overwrite the
+        //     clipboard or inject stale "Copied" hints (issue #699 P1).
+        if !self.auto_copy_enabled || self.suppress_auto_copy {
             return None;
         }
         // SINGLE-BLOCK gate: auto-copy only when the whole reply was essentially
@@ -2774,7 +2772,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return None;
         }
         let source = self.md_state.last_code_block_source.take()?;
-        if !auto_copy_enabled() || source.trim().is_empty() {
+        if source.trim().is_empty() {
             return None;
         }
         // Write through `self.out` so the escape sequence stays ordered
@@ -4432,6 +4430,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
         self.suppress_auto_copy = suppress;
+    }
+
+    fn set_auto_copy_enabled(&mut self, enabled: bool) {
+        self.auto_copy_enabled = enabled;
     }
 
     fn clear_screen(&mut self) {
@@ -11759,6 +11761,50 @@ mod tests {
         );
     }
 
+    /// Auto-copy is OFF by default: a completed code block must NOT hijack the
+    /// clipboard nor emit the "copied" hint unless the user opted in. The gate
+    /// short-circuits BEFORE consuming the code-block source, so the source is
+    /// left untouched — a deterministic, clipboard-independent proof no copy was
+    /// attempted. Regression guard for the #699 auto-copy that silently clobbered
+    /// the user's clipboard on every code-block reply.
+    #[test]
+    fn auto_copy_off_by_default_makes_no_copy_attempt() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.md_state.last_code_block_source = Some("cargo build --release".into());
+        assert!(
+            r.maybe_auto_copy_hint().is_none(),
+            "auto-copy OFF by default → no hint"
+        );
+        assert!(
+            r.md_state.last_code_block_source.is_some(),
+            "OFF must not even consume the source — no clipboard write attempted"
+        );
+    }
+
+    /// End-to-end companion to `auto_copy_fires_for_single_code_block_reply`:
+    /// the SAME single-block reply that WOULD be copy-eligible must produce NO
+    /// copy when auto-copy is off (the default). This is the exact user-reported
+    /// scenario — a single-block reply silently clobbering the clipboard — now
+    /// suppressed by default.
+    #[test]
+    fn auto_copy_off_by_default_single_block_not_copied() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // No set_auto_copy_enabled → default OFF.
+        let stream = "here is the snippet:\n\
+                      ```\nthe only block\n```\n\
+                      thanks\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "default-OFF must not auto-copy even a single-block reply"
+        );
+    }
+
+    // (The "enabled → single block copies" case is covered end-to-end by
+    // `auto_copy_fires_for_single_code_block_reply` below, which opts in first.)
+
     /// Defense-in-depth: no cell in a Java code block (after the full
     /// `AssistantText` → `flush_assistant_remainder` →
     /// `push_markdown_body` → `parse_markdown_to_cells` pipeline) may
@@ -11795,6 +11841,7 @@ mod tests {
     #[test]
     fn auto_copy_skips_multi_code_block_reply() {
         let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in, so this tests the block-COUNT gate
         let stream = "intro\n\
                       ```\nblock one\n```\n\
                       middle\n\
@@ -11813,6 +11860,7 @@ mod tests {
     #[test]
     fn auto_copy_fires_for_single_code_block_reply() {
         let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in (#699: auto-copy is OFF by default)
         let stream = "here is the snippet:\n\
                       ```\nthe only block\n```\n\
                       thanks\n";
@@ -11831,6 +11879,7 @@ mod tests {
         // block prematurely finalized mid-stream (tool interleave), must NOT be
         // auto-copied — it's incomplete. Only a properly-CLOSED fence counts.
         let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in, so this tests the CLOSED-fence gate
         let stream = "text\n```\nunclosed block content\n";
         r.render(UiLine::AssistantText(stream.into()));
         r.render(UiLine::TurnComplete);
