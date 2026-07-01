@@ -284,6 +284,7 @@ export function InputArea() {
     if (!range) return;
     const next = replaceAtMention(text, range, item.relativePath);
     updateText(next.text);
+    historyIndexRef.current = -1;
     setShowAtPicker(false);
     setAtQuery('');
     setAtItems([]);
@@ -382,10 +383,6 @@ export function InputArea() {
 
   const handleSlashSelect = useCallback((command: string) => {
     updateText(command + ' ');
-    setShowSlash(false);
-    textareaRef.current?.focus();
-const handleSlashSelect = useCallback((command: string) => {
-    updateText(command + ' ');
     historyIndexRef.current = -1;
     setShowSlash(false);
     textareaRef.current?.focus();
@@ -397,8 +394,9 @@ const handleSlashSelect = useCallback((command: string) => {
       return fp;
     });
     setShowSlash((open) => {
-      if (open) { updateText(''); return false; }
+      if (open) { updateText(''); historyIndexRef.current = -1; return false; }
       updateText('/');
+      historyIndexRef.current = -1;
       setSlashFilter('');
       ensureSlashSkills();
       return true;
