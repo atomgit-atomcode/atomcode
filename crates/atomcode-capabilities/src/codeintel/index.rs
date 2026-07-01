@@ -36,6 +36,9 @@ fn classify_symbol_kind(ts: &str) -> SymbolKind {
 
 struct RawCall {
     caller_name: String,
+    /// caller's start_line — lets the build reconstruct the caller's exact id via `make_id`
+    /// instead of a name lookup (removes a scan and fixes wrong-caller attribution).
+    caller_line: usize,
     callee_name: String,
     line: usize,
 }
@@ -84,7 +87,12 @@ fn extract_calls(source: &str, lang: Lang, syms: &[Symbol]) -> Vec<RawCall> {
                 .max_by_key(|s| s.start_line);
             if let Some(caller) = caller {
                 if caller.name != callee_name {
-                    calls.push(RawCall { caller_name: caller.name.clone(), callee_name, line });
+                    calls.push(RawCall {
+                        caller_name: caller.name.clone(),
+                        caller_line: caller.start_line,
+                        callee_name,
+                        line,
+                    });
                 }
             }
         }
@@ -232,9 +240,11 @@ fn build_from_files(root: &Path, files: Vec<Walked>) -> CodeGraph {
     }
     // Resolve after ALL symbols are inserted (a call may target a not-yet-seen file).
     for (caller_file, rc) in raw_calls {
-        let Some(caller) = g.find_by_name(&rc.caller_name).first().map(|n| n.id) else {
+        // Exact caller id: same make_id inputs as when the caller symbol was inserted.
+        let caller = CodeGraph::make_id(&caller_file, &rc.caller_name, rc.caller_line);
+        if g.node(caller).is_none() {
             continue;
-        };
+        }
         if let Some(callee) = resolve_callee(&g, &rc.callee_name, &caller_file, root) {
             g.add_edge(caller, Edge { to: callee, kind: EdgeKind::Calls, line: rc.line });
         }
@@ -361,5 +371,37 @@ mod tests {
         let g3 = idx.get(d.path());
         assert!(!Arc::ptr_eq(&g1, &g3), "changed repo → rebuilt");
         assert!(!g3.find_by_name("two").is_empty(), "rebuilt graph sees new symbol");
+    }
+
+    #[test]
+    fn caller_attribution_is_per_file() {
+        // Two files each define a function named `handler`, each calling a DISTINCT callee.
+        // The old resolver picked the first same-named symbol as caller, so both edges hung
+        // off ONE handler. Caller id must be reconstructed exactly, per file.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn handler() {\n    alpha();\n}\nfn alpha() {}\n").unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn handler() {\n    beta();\n}\nfn beta() {}\n").unwrap();
+        let g = build_graph(d.path());
+
+        let a_handler = g
+            .find_by_name("handler")
+            .into_iter()
+            .find(|n| n.file.ends_with("a.rs"))
+            .expect("a.rs handler");
+        let b_handler = g
+            .find_by_name("handler")
+            .into_iter()
+            .find(|n| n.file.ends_with("b.rs"))
+            .expect("b.rs handler");
+        let alpha = g.find_by_name("alpha").into_iter().next().expect("alpha");
+        let beta = g.find_by_name("beta").into_iter().next().expect("beta");
+
+        let a_callees = g.callees(a_handler.id).cloned().unwrap_or_default();
+        let b_callees = g.callees(b_handler.id).cloned().unwrap_or_default();
+
+        assert!(a_callees.iter().any(|e| e.to == alpha.id), "a.rs::handler → alpha");
+        assert!(!a_callees.iter().any(|e| e.to == beta.id), "a.rs::handler must NOT call beta");
+        assert!(b_callees.iter().any(|e| e.to == beta.id), "b.rs::handler → beta");
+        assert!(!b_callees.iter().any(|e| e.to == alpha.id), "b.rs::handler must NOT call alpha");
     }
 }
