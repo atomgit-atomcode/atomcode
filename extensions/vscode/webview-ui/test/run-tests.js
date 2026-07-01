@@ -12,6 +12,7 @@ async function main() {
     'i18n-regression.test.ts',
     'quick-actions-regression.test.ts',
     'at-mention.test.ts',
+    'daemon-client-error.test.ts',
   ];
 
   try {
