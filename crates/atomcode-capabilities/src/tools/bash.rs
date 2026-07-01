@@ -414,12 +414,20 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
 /// filesystem (`/mnt/c` vs `C:\`), Linux `python`/`node` (not the user's Windows ones),
 /// and a Windows `working_dir` it cannot `cd` into. Excluded from bash detection. Pure
 /// path check so it is unit-testable off Windows.
+///
+/// ALSO excludes the App-Execution-Alias form: Win10/11 exposes WSL's `bash` as a 0-byte
+/// reparse stub under `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`. `where bash` often
+/// returns THAT first (WindowsApps sits on the user PATH ahead of System32) and it
+/// `is_file()`, so without this it would be picked and launch WSL. Installing Docker
+/// Desktop (WSL2 backend) enables the alias; a machine with no working distro then fails
+/// every `bash -c`. A genuine Git Bash / MSYS2 is never under WindowsApps, so this is safe.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_wsl_launcher(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy().to_ascii_lowercase();
     s.contains(r"\windows\system32\")
         || s.contains(r"\windows\syswow64\")
         || s.contains(r"\windows\sysnative\")
+        || s.contains(r"\windowsapps\")
 }
 
 /// Derive a Git for Windows `bash.exe` from a `git.exe` path. Git ships `git.exe` in
@@ -1082,6 +1090,14 @@ mod tests {
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\SysWOW64\bash.exe")));
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\Sysnative\bash.exe")));
+        // App-execution-alias: Win10/11 exposes WSL's `bash` as a 0-byte reparse stub
+        // under `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`. `where bash` often returns
+        // THIS first (WindowsApps is on the user PATH ahead of System32), it `is_file()`,
+        // and it launches WSL — so it MUST be rejected too. Installing Docker Desktop
+        // (WSL2 backend) enables the alias; if WSL has no working distro, `bash -c` fails.
+        assert!(is_wsl_launcher(Path::new(
+            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        )));
         // Git Bash / MSYS2 are real shells we CAN use — must NOT be rejected.
         assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
         assert!(!is_wsl_launcher(Path::new(r"C:\msys64\usr\bin\bash.exe")));
