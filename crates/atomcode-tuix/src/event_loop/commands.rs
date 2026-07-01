@@ -463,6 +463,9 @@ pub(super) fn execute_slash_command(
                 CopyResolve::NoBlocks => {
                     renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
                 }
+                CopyResolve::EmptyMsg => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyMsgEmpty).into_owned()));
+                }
                 CopyResolve::BadIndex(count) => {
                     renderer.render(UiLine::Warning(
                         t(Msg::CopyBadIndex { count }).into_owned(),
@@ -3557,6 +3560,10 @@ enum CopyResolve {
     Text(String),
     /// The reply has no fenced code block (or there's no reply yet).
     NoBlocks,
+    /// `/copy msg` was used but the reply is empty/whitespace-only.
+    /// Distinct from `NoBlocks` so the caller can surface a "reply is empty"
+    /// hint rather than the misleading "no code block" wording.
+    EmptyMsg,
     /// `/copy N` referenced an out-of-range index; carries the block count.
     BadIndex(usize),
 }
@@ -3571,7 +3578,7 @@ fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
     if arg.eq_ignore_ascii_case("msg") {
         let trimmed = md.trim();
         if trimmed.is_empty() {
-            return CopyResolve::NoBlocks;
+            return CopyResolve::EmptyMsg;
         }
         return CopyResolve::Text(trimmed.to_string());
     }
@@ -4642,12 +4649,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_msg_returns_no_blocks_when_reply_is_empty() {
+    fn copy_msg_returns_empty_msg_when_reply_is_empty() {
         // Empty/whitespace-only reply: nothing meaningful to copy.
+        // Distinct from NoBlocks so the caller can show a "reply is empty"
+        // hint instead of the misleading "no code block" wording.
         for empty in ["", "   ", "\n\n"] {
             match resolve_copy(empty, "msg") {
-                CopyResolve::NoBlocks => {}
-                other => panic!("expected NoBlocks for {:?}, got {:?}", empty, other),
+                CopyResolve::EmptyMsg => {}
+                other => panic!("expected EmptyMsg for {:?}, got {:?}", empty, other),
             }
         }
     }

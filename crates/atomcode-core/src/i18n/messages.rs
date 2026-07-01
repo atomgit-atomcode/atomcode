@@ -600,12 +600,16 @@ pub enum Msg<'a> {
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
     /// Description for the `/copy` slash command — copies a code block from the
-    /// last reply to the clipboard.
+    /// last reply to the clipboard, or with `/copy msg` the full reply markdown.
     CmdDescCopy,
     /// `/copy`: confirmation after a code block lands on the clipboard.
     CopyOk { lines: usize, chars: usize },
     /// `/copy`: the last reply has no fenced code block to copy.
     CopyNoCodeBlock,
+    /// `/copy msg`: the reply is empty/whitespace-only, so there is no message
+    /// body to copy. Distinct from `CopyNoCodeBlock` so the hint can say
+    /// "reply is empty" rather than "no code block".
+    CopyMsgEmpty,
     /// `/copy N`: the requested index is out of range; `count` blocks exist.
     CopyBadIndex { count: usize },
     /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
