@@ -617,6 +617,19 @@ pub enum Msg<'a> {
     CopyBadIndex { count: usize },
     /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
     CopyFailed,
+    /// Description for the `/save` slash command — exports the current
+    /// conversation to a local markdown file.
+    CmdDescSave,
+    /// `/save`: the conversation was written to a file; `path` is the resolved
+    /// path (display-only).
+    SaveOk { path: &'a str },
+    /// `/save`: there are no conversation turns to export yet.
+    SaveEmpty,
+    /// `/save`: the filesystem write failed; `error` carries the underlying
+    /// error message.
+    SaveIoError { error: &'a str },
+    /// `/save`: the requested path's parent directory does not exist.
+    SaveInvalidPath { path: &'a str },
     /// Hint shown after a code block is auto-copied to clipboard (issue #699).
     CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.

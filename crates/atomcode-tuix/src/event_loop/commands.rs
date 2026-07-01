@@ -988,6 +988,36 @@ fn execute_slash_command_impl(
             }
             renderer.flush();
         }
+        "save" => {
+            // Export the full current conversation (every real user prompt +
+            // assistant reply, in order) to a local markdown file.
+            //   /save            → ./atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → ./report.md (relative to cwd)
+            //   /save /abs/x.md  → absolute path
+            // Existing files are overwritten; missing parent dirs are an error.
+            match resolve_save(&ctx.current_session.messages, arg) {
+                SaveOutcome::Ok(path) => {
+                    let path_str = path.to_string_lossy();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::SaveOk { path: &path_str }).into_owned(),
+                    ));
+                }
+                SaveOutcome::EmptyHistory => {
+                    renderer.render(UiLine::Warning(t(Msg::SaveEmpty).into_owned()));
+                }
+                SaveOutcome::IoError(e) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveIoError { error: &e }).into_owned(),
+                    ));
+                }
+                SaveOutcome::InvalidPath(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveInvalidPath { path: &p }).into_owned(),
+                    ));
+                }
+            }
+            renderer.flush();
+        }
         "help" => {
             if arg.trim() == "commands" {
                 let config_dir = Config::config_dir();
@@ -4401,6 +4431,90 @@ enum CopyResolve {
     BadIndex(usize),
 }
 
+/// Outcome of `/save [filename]` — either the conversation was written to a
+/// file (carrying the resolved path for display) or it failed for one of three
+/// reasons: nothing to export, an I/O error, or an invalid/unsafe path.
+#[derive(Debug)]
+enum SaveOutcome {
+    /// File written successfully; carries the resolved absolute path.
+    Ok(std::path::PathBuf),
+    /// The session has no exportable conversation turns yet.
+    EmptyHistory,
+    /// The underlying filesystem write failed; carries the error message.
+    IoError(String),
+    /// The requested path is invalid or its parent directory does not exist.
+    InvalidPath(String),
+}
+
+/// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
+/// Extracted from [`resolve_save`] so unit tests can check the naming scheme
+/// without touching the filesystem (where parallel chdir would race).
+fn default_save_filename() -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    format!("atomcode-session-{stamp}.md")
+}
+
+/// Render the session's exportable turns as a markdown transcript. Pure /
+/// side-effect-free so it can be unit-tested independently of file I/O.
+fn render_save_markdown(messages: &[atomcode_core::conversation::message::Message]) -> Option<String> {
+    use atomcode_core::conversation::message::Role;
+    let turns: Vec<(&Role, &str)> = messages
+        .iter()
+        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
+        .filter_map(|m| m.text().map(|t| (&m.role, t)))
+        .filter(|(_, t)| !t.trim().is_empty())
+        .collect();
+    if turns.is_empty() {
+        return None;
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut out = String::new();
+    out.push_str(&format!("# AtomCode Session - {now}\n\n"));
+    for (role, text) in &turns {
+        let label = match role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            _ => continue,
+        };
+        out.push_str(&format!("## {label}\n{text}\n\n"));
+    }
+    Some(out)
+}
+
+/// Map `/save [filename]` to a written file. `""` → a timestamped default
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the current working directory;
+/// a bare name or relative path resolves against the current working dir;
+/// an absolute path is used as-is. Existing files are overwritten.
+fn resolve_save(
+    messages: &[atomcode_core::conversation::message::Message],
+    arg: &str,
+) -> SaveOutcome {
+    let Some(content) = render_save_markdown(messages) else {
+        return SaveOutcome::EmptyHistory;
+    };
+
+    let arg = arg.trim();
+    let path = if arg.is_empty() {
+        std::path::PathBuf::from(default_save_filename())
+    } else {
+        std::path::PathBuf::from(arg)
+    };
+
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
+    // so a typo can't silently scatter directories. An empty parent (writing
+    // to the cwd, the common relative-name case) always "exists".
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
+        }
+    }
+
+    match std::fs::write(&path, content) {
+        Ok(()) => SaveOutcome::Ok(path),
+        Err(e) => SaveOutcome::IoError(e.to_string()),
+    }
+}
+
 /// Map `/copy [arg]` to the text to copy. `""` → last block (the common
 /// "copy the command just shown" case); `all` → every block joined by a blank
 /// line; `N` (1-based) → the Nth block.
@@ -5101,7 +5215,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 
 #[cfg(test)]
 mod copy_tests {
-    use super::{extract_code_blocks, resolve_copy, CopyResolve};
+    use super::{
+        default_save_filename, extract_code_blocks, render_save_markdown, resolve_copy,
+        resolve_save, CopyResolve, SaveOutcome,
+    };
 
     const REPLY: &str = "Run cmake + build:\n\
         ```\n\
@@ -5196,6 +5313,122 @@ mod copy_tests {
     fn resolve_no_blocks_when_reply_has_none() {
         assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+
+    // ── /save unit tests ──
+    // All filesystem-touching tests pass absolute paths inside a tempdir so
+    // they never mutate the process-wide cwd and can run in parallel.
+    use atomcode_core::conversation::message::{Message, Role};
+
+    fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
+        msgs.iter()
+            .map(|(role, text)| Message::new(match *role {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => Role::System,
+            }, *text))
+            .collect()
+    }
+
+    #[test]
+    fn save_empty_history_when_no_messages() {
+        assert!(matches!(resolve_save(&[], ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_tool_messages() {
+        let msgs = vec![Message::new(Role::Tool, "tool output")];
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_whitespace() {
+        let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_default_filename_format() {
+        // Pure naming check — no I/O, safe to run in parallel.
+        let name = default_save_filename();
+        assert!(name.starts_with("atomcode-session-"), "got: {name}");
+        assert!(name.ends_with(".md"), "got: {name}");
+        // atomcode-session-YYYYMMDD-HHMMSS.md → 17 + 15 + 3 = 35 chars
+        assert_eq!(name.len(), "atomcode-session-YYYYMMDD-HHMMSS.md".len());
+    }
+
+    #[test]
+    fn save_render_markdown_formats_turns() {
+        let msgs = conv(&[("user", "hello"), ("assistant", "hi there")]);
+        let md = render_save_markdown(&msgs).expect("non-empty renders");
+        assert!(md.starts_with("# AtomCode Session - "));
+        assert!(md.contains("## User\nhello\n\n"));
+        assert!(md.contains("## Assistant\nhi there\n\n"));
+    }
+
+    #[test]
+    fn save_render_skips_synthetic_and_tool_messages() {
+        let msgs = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::synthetic_user("synthetic injection"),
+            Message::new(Role::Tool, "tool noise"),
+            Message::new(Role::Assistant, "reply"),
+        ];
+        let md = render_save_markdown(&msgs).expect("renders");
+        assert!(md.contains("## User\nreal prompt"));
+        assert!(md.contains("## Assistant\nreply"));
+        assert!(!md.contains("synthetic injection"));
+        assert!(!md.contains("tool noise"));
+    }
+
+    #[test]
+    fn save_render_returns_none_for_empty() {
+        assert!(render_save_markdown(&[]).is_none());
+        assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+    }
+
+    #[test]
+    fn save_writes_custom_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("report.md");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got, path);
+                let content = std::fs::read_to_string(&path).expect("read");
+                assert!(content.contains("## User\nping"));
+                assert!(content.contains("## Assistant\npong"));
+            }
+            _ => panic!("expected Ok, got {:?}", resolve_save(&msgs, path.to_str().unwrap())),
+        }
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("old.md");
+        std::fs::write(&path, "OLD CONTENT").expect("seed");
+        let msgs = conv(&[("user", "new turn")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got, path);
+                let content = std::fs::read_to_string(&path).expect("read");
+                assert!(content.contains("## User\nnew turn"));
+                assert!(!content.contains("OLD CONTENT"));
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn save_invalid_path_when_parent_dir_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent_dir").join("out.md");
+        let msgs = conv(&[("user", "hi")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
     }
 }
 
