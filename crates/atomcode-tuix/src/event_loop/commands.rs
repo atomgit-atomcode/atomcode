@@ -1378,6 +1378,9 @@ fn execute_slash_command_impl(
                 tokens: state.total_tokens,
             })
             .into_owned();
+            // Login line: signed-in account (display name → username) or a /login
+            // prompt — shows at a glance whether you're logged in and as whom.
+            txt.push_str(&render_login_line_from_stored_auth());
             txt.push_str(&format!(
                 "  Proxy:  {}\n",
                 ctx.config.network.proxy.summary()
@@ -3552,6 +3555,43 @@ pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt:
     format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
 }
 
+/// `/status` login line: the signed-in account's display name (falling back to the
+/// username), or a not-signed-in prompt. Pure over the resolved name for testability.
+fn render_login_line(username: Option<&str>) -> String {
+    match username {
+        Some(u) => t(Msg::StatusLoginLoggedIn { user: u }).into_owned(),
+        None => t(Msg::StatusLoginNotSignedIn).into_owned(),
+    }
+}
+
+/// The `/status` login line sourced from stored auth: display name → username, with an
+/// empty name treated as absent. Shared by both `/status` renderers so the interactive
+/// and remote outputs can't drift.
+fn render_login_line_from_stored_auth() -> String {
+    let stored = atomcode_core::auth::get_stored_auth();
+    let username = stored.as_ref().map(|a| {
+        a.user
+            .name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(a.user.username.as_str())
+    });
+    render_login_line(username)
+}
+
+/// Render a CodingPlan auth failure. An EXPIRED login (`is_auth_expired` on the error
+/// chain — dead local token, or a 401 from the server) → a clear localized "run
+/// /login" prompt; otherwise `fallback()` (a genuine not-signed-in hint, or the raw
+/// fetch-failure line). `from_stored_auth` returns `AuthExpired` for a dead token but a
+/// PLAIN error when never logged in, so the two stay distinguishable.
+fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
+    if atomcode_core::coding_plan::is_auth_expired(e) {
+        t(Msg::StatusCpAuthExpired).into_owned()
+    } else {
+        fallback()
+    }
+}
+
 /// Fetch + format the CodingPlan section appended to `/status`. Runs a
 /// blocking HTTP call (~100–500ms) against `/coding-plan/status` — same
 /// endpoint as the `/codingplan` flow's step 4. Falls back to a one-line
@@ -3564,17 +3604,20 @@ fn render_codingplan_status_for_status_cmd() -> String {
 
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
-        Err(_) => {
-            return t(Msg::StatusCpNotSignedIn).into_owned();
-        }
+        // Expired login → clear re-login prompt; genuinely not signed in → the
+        // not-signed-in hint. Without this split a dead token showed "not signed in"
+        // while the Login line above said "signed in as X" — contradictory.
+        Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
     };
     let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
-            return t(Msg::StatusCpFetchFailed {
-                error: &format!("{:#}", e),
+            return render_cp_auth_error(&e, || {
+                t(Msg::StatusCpFetchFailed {
+                    error: &format!("{:#}", e),
+                })
+                .into_owned()
             })
-            .into_owned();
         }
     };
     let plan = match &status.codingplan_free {
@@ -3882,6 +3925,9 @@ pub(super) fn build_status_text(ctx: &LoopCtx, state: &UiState) -> String {
         tokens: state.total_tokens,
     })
     .into_owned();
+    // Login line: signed-in account (display name → username) or a /login prompt, so
+    // `/status` shows at a glance whether you're logged in and as whom.
+    txt.push_str(&render_login_line_from_stored_auth());
     txt.push_str(&render_codingplan_status_for_status_cmd());
     txt.push('\n');
     txt.push_str(&render_instruction_status_block(&ctx.working_dir));
@@ -4434,6 +4480,47 @@ fn fmt_dur(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod status_login_tests {
+    use super::*;
+
+    #[test]
+    fn login_line_shows_username_when_signed_in() {
+        let line = render_login_line(Some("张三"));
+        assert!(line.contains("张三"), "signed-in line must show the username: {line:?}");
+    }
+
+    #[test]
+    fn login_line_prompts_login_when_not_signed_in() {
+        let line = render_login_line(None);
+        assert!(line.contains("/login"), "not-signed-in line must point to /login: {line:?}");
+        assert!(!line.contains("张三"));
+    }
+
+    #[test]
+    fn cp_auth_error_expired_ignores_fallback_and_prompts_relogin() {
+        use atomcode_core::coding_plan::AuthExpired;
+        let err = anyhow::Error::new(AuthExpired { status: 401 });
+        let line = render_cp_auth_error(&err, || "FALLBACK".to_string());
+        assert!(line.contains("/login"), "auth-expired must prompt /login: {line:?}");
+        assert!(!line.contains("FALLBACK"), "expired must not use the fallback: {line:?}");
+        // Must NOT bury it as the raw error text.
+        assert!(
+            !line.contains("authentication failed (401)"),
+            "auth-expired should be a clean localized message, not the raw error: {line:?}"
+        );
+    }
+
+    #[test]
+    fn cp_auth_error_non_auth_uses_fallback() {
+        // A genuine not-signed-in / network error falls through to the caller's
+        // fallback (not-signed-in hint, or the raw fetch-failure line).
+        let err = anyhow::anyhow!("network boom");
+        let line = render_cp_auth_error(&err, || format!("fetch failed — {err:#}"));
+        assert!(line.contains("network boom"), "non-auth errors fall through to the fallback: {line:?}");
     }
 }
 

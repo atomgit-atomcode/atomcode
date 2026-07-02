@@ -132,10 +132,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 "  模型：    {}\n  目录：    {}\n  配置文件：{}\n  Token：   {}\n",
                 model, dir, config, tokens,
             ).into(),
+        Msg::StatusLoginLoggedIn { user } =>
+            format!("  登录：  {}\n", user).into(),
+        Msg::StatusLoginNotSignedIn =>
+            "  登录：  未登录（运行 /login）\n".into(),
         Msg::StatusCpNotSignedIn =>
             "  CodingPlan：（未登录 — 运行 /login 进行配置）\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan：（状态获取失败 — {}）\n", error).into(),
+        Msg::StatusCpAuthExpired =>
+            "  CodingPlan：（登录已过期 — 运行 /login 重新登录）\n".into(),
         Msg::StatusCpNoActive =>
             "  CodingPlan：（无激活套餐 — 运行 /login）\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>

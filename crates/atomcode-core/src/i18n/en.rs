@@ -140,10 +140,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
                 model, dir, config, tokens,
             ).into(),
+        Msg::StatusLoginLoggedIn { user } =>
+            format!("  Login:  {}\n", user).into(),
+        Msg::StatusLoginNotSignedIn =>
+            "  Login:  not signed in (run /login)\n".into(),
         Msg::StatusCpNotSignedIn =>
             "  CodingPlan: (not signed in — run /login to set up)\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan: (status fetch failed — {})\n", error).into(),
+        Msg::StatusCpAuthExpired =>
+            "  CodingPlan: (login expired — run /login to sign in again)\n".into(),
         Msg::StatusCpNoActive =>
             "  CodingPlan: (no active plan — run /login)\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
