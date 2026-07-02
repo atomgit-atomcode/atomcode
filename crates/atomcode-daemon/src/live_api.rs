@@ -1225,7 +1225,10 @@ impl TurnExecutor for KernelTurnExecutor {
                     // value that was never persisted.
                     match ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
                         Ok(true) => {
-                            let _ = events.send(LiveEvent::SessionRenamed(name));
+                            let _ = events.send(LiveEvent::SessionRenamed {
+                                session_id: self.session_id.to_string(),
+                                name,
+                            });
                         }
                         Ok(false) => {}
                         Err(e) => {
@@ -1670,10 +1673,12 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
-    /// AI auto-renamed the session (daemon AI namer). Every browser tab
-    /// updates its session display / tab title to the new name.
+    /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
+    /// tab only updates its title when IT is viewing that session — the live
+    /// broadcast reaches every subscribed tab, so an unscoped update would flip
+    /// the title of tabs viewing other sessions.
     #[serde(rename = "session_renamed")]
-    SessionRenamed { name: String },
+    SessionRenamed { session_id: String, name: String },
     /// Working directory switched (any view's `/cd`). Every webui tab updates its
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
@@ -1720,7 +1725,9 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         // 会话切换：通知所有 webui tab 跟随切换到新会话。
         LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
         // AI 自动命名：通知所有 webui tab 更新标签/标题。
-        LiveEvent::SessionRenamed(name) => LiveWireEvent::SessionRenamed { name },
+        LiveEvent::SessionRenamed { session_id, name } => {
+            LiveWireEvent::SessionRenamed { session_id, name }
+        }
         // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
         LiveEvent::RemoteCommand(_) => return None,
         LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },

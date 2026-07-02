@@ -125,7 +125,10 @@ pub(crate) fn spawn_live_forwarder(
                 }
                 // Another end (daemon AI namer) renamed the live session — forward
                 // so the mirroring TUI reflects the new name via its SessionRenamed handler.
-                Ok(LiveEvent::SessionRenamed(name)) => {
+                // `session_id` is dropped here: the mirroring TUI routes by
+                // `runtime_id` (this forwarder is bound to one live session's
+                // runtime), which already scopes the rename to the right session.
+                Ok(LiveEvent::SessionRenamed { name, .. }) => {
                     crate::tuix_trace!("FWD", "SessionRenamed: {}", name);
                     if fan_tx
                         .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionRenamed { name } })

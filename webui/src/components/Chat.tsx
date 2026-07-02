@@ -662,10 +662,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       onCwdChanged?.(e.working_dir);
       return;
     }
-    // AI 自动命名了当前会话：通知 App 直接更新标题头，无需拉取列表。
-    // 与查看哪个会话无关（进程级广播），不门控。
+    // AI 自动命名了某个会话：通知 App 更新标题头，无需拉取列表。
+    // 实时流是进程级广播，会到达所有 tab；仅当被改名的正是本 tab 正在
+    // 查看的会话时才应用，否则会把别的会话的名字盖到当前标题头上。
     if (e.type === 'session_renamed') {
-      onSessionRenamed?.(e.name);
+      if (e.session_id === liveSessionIdRef.current) {
+        onSessionRenamed?.(e.name);
+      }
       return;
     }
     // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
