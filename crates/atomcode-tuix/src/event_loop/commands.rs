@@ -1662,11 +1662,19 @@ fn execute_slash_command_impl(
                             Err(e) => format!("App server 启动失败：{e}"),
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
-                                let token = format!(
-                                    "{}{}",
-                                    uuid::Uuid::new_v4().simple(),
-                                    uuid::Uuid::new_v4().simple()
-                                );
+                                // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
+                                let token = match atomcode_core::auth::oauth::get_stored_auth() {
+                                    Some(auth) => format!(
+                                        "{}.{}",
+                                        auth.user.id,
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                    None => format!(
+                                        "{}{}",
+                                        uuid::Uuid::new_v4().simple(),
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                };
                                 let (ws_url, https_base) = derive_relay_urls(&relay);
                                 let machine = std::env::var("HOSTNAME")
                                     .ok()
