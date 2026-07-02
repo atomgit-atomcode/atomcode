@@ -8,15 +8,13 @@ use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_
 use std::path::Path;
 use std::process::Command;
 
-/// Above this many git-tracked indexable source files, the code-graph tools are NOT mounted:
-/// building their O(repo) tree-sitter call graph would blow the review's wall-clock budget for
-/// no measured quality gain (kernel A/B: graph off ≥ on, 1080s CPU → 3.94s). Small repos keep
-/// the graph (it's cheap there, and may occasionally help cross-file reasoning).
-const GRAPH_MAX_INDEXED_FILES: usize = 8000;
-
-/// Whether to mount the code-graph tools for a repo with `indexed_file_count` indexable sources.
-fn should_mount_graph(indexed_file_count: usize) -> bool {
-    indexed_file_count <= GRAPH_MAX_INDEXED_FILES
+/// Whether to mount the code-graph tools: only when the repo has AT MOST `max` indexable
+/// source files. `max = usize::MAX` (the config default) ⇒ always mount (bare-CLI behavior);
+/// engineering callers pass a bound (e.g. 8000) so a kernel-scale repo degrades to grep — its
+/// O(repo) tree-sitter graph build would otherwise blow the wall-clock budget for no measured
+/// quality gain (kernel A/B: graph off ≥ on, 1080s CPU → 3.94s).
+fn should_mount_graph(indexed_file_count: usize, max: usize) -> bool {
+    indexed_file_count <= max
 }
 
 /// Count git-tracked source files codeintel would parse, via `git ls-files` (reads the git
@@ -90,12 +88,20 @@ pub fn build_review_agent_with(
 ) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
-    // Auto-degrade the code-graph on huge repos (cheap git-index count, NFS-friendly).
-    let indexed = count_indexed_sources(&cfg.working_dir);
-    let mount_graph = should_mount_graph(indexed);
-    if !mount_graph {
-        eprintln!("[codeintel] {indexed} indexed source file(s) > {GRAPH_MAX_INDEXED_FILES} — code-graph tools disabled (grep only)");
-    }
+    // Auto-degrade the code-graph on huge repos when the caller set a bound. Default
+    // (usize::MAX) ⇒ always mount, skip the git-index count entirely (bare-CLI: no overhead,
+    // behavior unchanged). Engineering callers set `graph_max_indexed_files` to enable it.
+    let max_graph_files = cfg.graph_max_indexed_files;
+    let mount_graph = if max_graph_files == usize::MAX {
+        true
+    } else {
+        let indexed = count_indexed_sources(&cfg.working_dir); // cheap: reads git index, no tree walk
+        let mount = should_mount_graph(indexed, max_graph_files);
+        if !mount {
+            eprintln!("[codeintel] {indexed} indexed source file(s) > {max_graph_files} — code-graph tools disabled (grep only)");
+        }
+        mount
+    };
     let tools = mount_review_tools(&report, cfg.no_web, mount_graph);
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
@@ -402,10 +408,14 @@ mod tests {
 
     #[test]
     fn should_mount_graph_thresholds() {
-        assert!(should_mount_graph(0), "empty/unknown repo → mount (safe default)");
-        assert!(should_mount_graph(GRAPH_MAX_INDEXED_FILES), "at threshold → still mount");
-        assert!(!should_mount_graph(GRAPH_MAX_INDEXED_FILES + 1), "over threshold → degrade");
-        assert!(!should_mount_graph(85_000), "kernel-scale → degrade");
+        // Unlimited (bare-CLI default) → always mount, even kernel-scale.
+        assert!(should_mount_graph(85_000, usize::MAX), "unlimited → always mount");
+        // Bounded (engineering caller, e.g. service sets 8000).
+        assert!(should_mount_graph(0, 8000), "empty/unknown repo → mount");
+        assert!(should_mount_graph(8000, 8000), "at threshold → still mount");
+        assert!(!should_mount_graph(8001, 8000), "over threshold → degrade");
+        assert!(!should_mount_graph(85_000, 8000), "kernel-scale → degrade");
+        assert!(!should_mount_graph(1, 0), "max=0 → never mount");
     }
 
     #[test]

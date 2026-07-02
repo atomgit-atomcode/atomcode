@@ -144,6 +144,13 @@ struct ReviewArgs {
     /// tools are unaffected. Default: web_search stays available.
     #[arg(long)]
     no_web: bool,
+    /// Mount the code-graph tools (find_references/trace_callers/…) only when the repo has AT
+    /// MOST this many git-tracked indexable source files; above it they're dropped (grep-only),
+    /// since their O(repo) tree-sitter graph build blows the wall-clock budget on huge repos for
+    /// no measured quality gain. Omit ⇒ UNLIMITED (always mount — bare-CLI default). Engineering
+    /// callers reviewing huge repos (e.g. a kernel on NFS) set e.g. `--graph-max-files 8000`.
+    #[arg(long)]
+    graph_max_files: Option<u32>,
 }
 
 #[tokio::main]
@@ -293,6 +300,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.max_rounds = args.max_rounds;
     cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
     cfg.no_web = args.no_web;
+    // Omit ⇒ keep the config default (usize::MAX = never degrade). A bound enables auto-degrade.
+    if let Some(n) = args.graph_max_files {
+        cfg.graph_max_indexed_files = n as usize;
+    }
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,
