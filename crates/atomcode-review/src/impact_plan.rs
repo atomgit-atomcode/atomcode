@@ -87,7 +87,7 @@ fn extract_targets(diff: &str) -> Vec<Target> {
             };
             continue;
         }
-        if current_file.is_empty() || low_signal_file(&current_file) {
+        if current_file.is_empty() || crate::rules::is_low_signal_file(&current_file) {
             continue;
         }
 
@@ -158,7 +158,7 @@ fn lifecycle_contract_checks(diff: &str) -> Vec<String> {
             flush_lifecycle_hunk(&current_file, &hunk_lines, &mut checks);
             hunk_lines.clear();
         }
-        if !current_file.is_empty() && !low_signal_file(&current_file) {
+        if !current_file.is_empty() && !crate::rules::is_low_signal_file(&current_file) {
             hunk_lines.push(line);
         }
     }
@@ -208,22 +208,6 @@ fn terminal_event_line(code: &str) -> bool {
     lower.contains("finish_turn")
         || lower.contains("turncomplete")
         || lower.contains("phasechange(agentphase::idle")
-}
-
-fn low_signal_file(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".lock")
-        || lower.ends_with("cargo.lock")
-        || lower.ends_with("package-lock.json")
-        || lower.ends_with("pnpm-lock.yaml")
-        || lower.ends_with("yarn.lock")
-fn low_signal_file(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".lock")
-        || lower.ends_with("package-lock.json")
-        || lower.ends_with("pnpm-lock.yaml")
-        || lower.ends_with("yarn.lock")
-        || lower.ends_with("go.sum")
 }
 
 fn changed_code_line(line: &str) -> Option<&str> {

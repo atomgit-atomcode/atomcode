@@ -836,17 +836,6 @@ fn drop_out_of_scope(findings: &mut Vec<Finding>, changed_files: &[String]) -> u
     before - findings.len()
 }
 
-/// Lockfiles / dependency manifests where "no finding" is the expected outcome — a coverage
-/// re-review pass over them would burn a round for nothing. Kept narrow on purpose.
-fn is_low_signal_path(path: &str) -> bool {
-    let p = path.to_ascii_lowercase();
-    p.ends_with(".lock")
-        || p.ends_with("package-lock.json")
-        || p.ends_with("pnpm-lock.yaml")
-        || p.ends_with("yarn.lock")
-        || p.ends_with("go.sum")
-}
-
 /// Changed files that received ZERO findings and are worth a focused second look. Drives the
 /// coverage backstop: on a wide diff the reviewer sometimes declares "done" having only
 /// reported on some files (observed: umi-ocr left 3/10 files unreviewed). Re-reviewing just
@@ -858,7 +847,7 @@ fn is_low_signal_path(path: &str) -> bool {
 fn uncovered_files(changed_files: &[String], findings: &[Finding]) -> Vec<String> {
     changed_files
         .iter()
-        .filter(|c| !is_low_signal_path(c))
+        .filter(|c| !atomcode_review::is_low_signal_file(c))
         .filter(|c| !findings.iter().any(|f| &f.file_path == *c))
         .cloned()
         .collect()

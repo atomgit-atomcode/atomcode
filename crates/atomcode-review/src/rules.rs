@@ -263,9 +263,32 @@ fn wildcard_match(pattern: &str, s: &str) -> bool {
     true
 }
 
+/// A lockfile / dependency manifest — low review value (formatters/tools own it, "no finding"
+/// is expected). Single source of truth reused by the impact plan (skip as a review target)
+/// and the CLI coverage backstop (don't re-review). Union of the common ecosystems.
+pub fn is_low_signal_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".lock")            // Cargo.lock, poetry.lock, Gemfile.lock, …
+        || lower.ends_with("cargo.lock")
+        || lower.ends_with("go.sum")
+        || lower.ends_with("package-lock.json")
+        || lower.ends_with("pnpm-lock.yaml")
+        || lower.ends_with("yarn.lock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_signal_file_covers_common_lockfiles() {
+        for p in ["Cargo.lock", "go.sum", "web/package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock"] {
+            assert!(is_low_signal_file(p), "{p} should be low-signal");
+        }
+        for p in ["src/main.rs", "pkg/a.go", "go.mod", "README.md"] {
+            assert!(!is_low_signal_file(p), "{p} should NOT be low-signal");
+        }
+    }
 
     #[test]
     fn matcher_order_specific_before_generic() {
