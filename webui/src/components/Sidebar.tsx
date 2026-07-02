@@ -9,6 +9,7 @@ import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
+import { mergeOptimisticSession } from '../lib/sessionList';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -787,12 +788,12 @@ export function Sidebar({
         )
       : null;
 
-  // 乐观会话并入列表：仅当后端列表尚无同 id 条目时置顶插入。后端落盘后列表刷新带出
-  // 真实会话（同 id），此处便不再插入，真实条目（含自动命名标题）自然取而代之。
-  const merged =
-    optimisticSession && !sessions.some((s) => s.id === optimisticSession.id)
-      ? [optimisticSession, ...sessions]
-      : sessions;
+  // 乐观会话并入列表：仅当后端列表尚无对应条目时置顶插入。后端落盘后列表刷新带出
+  // 真实会话，此处便不再插入，真实条目（含自动命名标题）自然取而代之。注意乐观条目
+  // 与落盘条目的 id 可能不同（live 快照的会话 id ≠ /sessions 列出的 core .json id），
+  // 故 mergeOptimisticSession 在 id 不匹配时按「同目录 + 名字互为前缀」兜底去重，
+  // 避免出现两条相同会话（刷新才消失）。
+  const merged = mergeOptimisticSession(optimisticSession ?? null, sessions);
 
   // 先按当前工作目录收窄，再按搜索词过滤。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
