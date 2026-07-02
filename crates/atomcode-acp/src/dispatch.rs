@@ -166,9 +166,22 @@ pub async fn run_prompt_turn(
     // events mutex and cannot interleave its `SendMessage` into the kernel ahead of
     // this turn's recv loop. Locking is therefore serialized; enqueue follows.
     let mut rx = events.lock().await;
-    cmd_tx
+    if cmd_tx
         .send(AgentCommand::SendMessage { text, images })
-        .ok();
+        .is_err()
+    {
+        // The kernel agent is gone (panicked / cancelled / session torn down): the
+        // prompt will NEVER reach it. We must NOT fall through into the recv loop —
+        // a dead kernel drops the events channel, so `rx.recv()` yields `None`, the
+        // loop breaks with `StopReason::Stopped`, and the client gets a FALSE
+        // `end_turn` success while the prompt silently vanished. Answer the deferred
+        // responder with an error exactly once (mirrors the "unknown session" path
+        // above). Deliberately NOT an `Err` return: that tears down the whole ACP
+        // connection, which is reserved for genuine transport failures — here the
+        // client transport is healthy and only the kernel side died.
+        return responder
+            .respond_with_internal_error("acp: kernel agent is no longer running");
+    }
 
     // The kernel ALWAYS emits a trailing `TurnComplete` after an `Error` (see
     // kernel `finish_turn`). We must DRAIN that `TurnComplete` rather than return on
