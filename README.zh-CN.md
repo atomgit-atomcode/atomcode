@@ -612,7 +612,6 @@ cargo install --path crates/atomcode-cli
 
 
 ## 许可证
----
 MIT License。详见 [LICENSE](LICENSE)。
 
 ---
