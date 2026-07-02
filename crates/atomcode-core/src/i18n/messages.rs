@@ -143,8 +143,15 @@ pub enum Msg<'a> {
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
+    /// `/status` login line — signed in, showing the account display name/username.
+    StatusLoginLoggedIn { user: &'a str },
+    /// `/status` login line — not signed in.
+    StatusLoginNotSignedIn,
     StatusCpNotSignedIn,
     StatusCpFetchFailed { error: &'a str },
+    /// `/status` CodingPlan line when the fetch failed specifically because auth
+    /// expired (`is_auth_expired`) — a clear re-login prompt instead of the raw error.
+    StatusCpAuthExpired,
     StatusCpNoActive,
     StatusCpLine {
         plan: &'a str,
