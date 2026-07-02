@@ -928,6 +928,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             let plural = if messages == 1 { "" } else { "s" };
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
+        Msg::SpinnerThinking { count } => format!("thinking {count}").into(),
         Msg::Compacting => "Compacting…".into(),
         Msg::CompactingSlow => "Compacting… (slow)".into(),
         Msg::CompactMarkDrain { messages, before, after } => {
