@@ -203,6 +203,14 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     diff.trim_end().to_string()
 }
 
+/// Number of leading whitespace **characters** in `s`. Counts Unicode
+/// whitespace consistently with `chars().take(n)` — both operate on
+/// characters, not bytes. This is the correct unit for indent arithmetic:
+/// `" ".repeat(n)` and `chars().take(n)` both count characters.
+fn leading_ws_chars(s: &str) -> usize {
+    s.chars().take_while(|c| c.is_whitespace()).count()
+}
+
 /// Whitespace-normalized fuzzy replace (faithful port of the v1 editor's
 /// `try_fuzzy_replace`). Matches `old_string` against `content` line-by-line with each
 /// line `.trim()`-ed, so a model that reproduced indentation with the wrong whitespace
@@ -268,7 +276,7 @@ fn try_fuzzy_replace(
     let new_base_indent = new_lines
         .iter()
         .find(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| leading_ws_chars(l))
         .unwrap_or(0);
 
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
@@ -276,7 +284,7 @@ fn try_fuzzy_replace(
     let to_replace = if replace_all { &matches[..] } else { &matches[..1] };
     for &(start, end) in to_replace.iter().rev() {
         let original_line = content_lines[start];
-        let file_indent = original_line.len() - original_line.trim_start().len();
+        let file_indent = leading_ws_chars(original_line);
         let file_indent_str: String = original_line.chars().take(file_indent).collect();
 
         let replacement: Vec<String> = new_lines
@@ -285,7 +293,7 @@ fn try_fuzzy_replace(
                 if l.trim().is_empty() {
                     String::new()
                 } else {
-                    let line_indent = l.len() - l.trim_start().len();
+                    let line_indent = leading_ws_chars(l);
                     let signed_relative = line_indent as isize - new_base_indent as isize;
                     let total_indent = if signed_relative >= 0 {
                         // Same/deeper than anchor: keep the file's indent prefix
