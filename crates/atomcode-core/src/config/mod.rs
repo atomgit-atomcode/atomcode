@@ -496,13 +496,23 @@ fn default_notification_min_duration_secs() -> u64 {
     8
 }
 
+/// Resolve the effective AI-naming flag from the env override (if any) and the
+/// config value. Env values "0"/"false"/"off" (case-insensitive, trimmed) disable;
+/// any other env value enables; `None` ⇒ use the config value.
+fn ai_session_naming_from_parts(env_val: Option<&str>, config_val: bool) -> bool {
+    match env_val {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => config_val,
+    }
+}
+
 /// True when AI session naming should run. Env `ATOMCODE_AI_SESSION_NAMING`
 /// ("0"/"false"/"off" ⇒ disabled) overrides the config value.
 pub fn ai_session_naming_enabled(cfg: &Config) -> bool {
-    match std::env::var("ATOMCODE_AI_SESSION_NAMING") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
-        Err(_) => cfg.ui.ai_session_naming,
-    }
+    ai_session_naming_from_parts(
+        std::env::var("ATOMCODE_AI_SESSION_NAMING").ok().as_deref(),
+        cfg.ui.ai_session_naming,
+    )
 }
 
 impl Default for DatalogConfig {
@@ -842,6 +852,33 @@ mod tests {
     fn ai_session_naming_enabled_respects_config() {
         let cfg = Config::default();
         assert!(ai_session_naming_enabled(&cfg));
+    }
+
+    #[test]
+    fn ai_naming_env_disables_case_insensitively() {
+        for v in ["0", "false", "off", "FALSE", "  Off  ", "OFF"] {
+            assert!(
+                !super::ai_session_naming_from_parts(Some(v), true),
+                "{v} should disable"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_naming_env_enables_for_other_values() {
+        for v in ["1", "true", "on", "yes", ""] {
+            assert!(
+                super::ai_session_naming_from_parts(Some(v), true),
+                "{v} should enable"
+            );
+        }
+        // empty string trims to empty, not a disable token → enable
+    }
+
+    #[test]
+    fn ai_naming_falls_through_to_config_when_env_unset() {
+        assert!(super::ai_session_naming_from_parts(None, true));
+        assert!(!super::ai_session_naming_from_parts(None, false));
     }
 
     /// Migration: on-disk config that looks like it was auto-written by
