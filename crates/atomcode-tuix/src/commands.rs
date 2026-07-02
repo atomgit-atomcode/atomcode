@@ -205,6 +205,11 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "paste" => Msg::CmdDescPaste,
         "copy" => Msg::CmdDescCopy,
         "view" => Msg::CmdDescView,
+        "app" => Msg::CmdDescApp,
+        "sync" => Msg::CmdDescSync,
+        "review" => Msg::CmdDescReview,
+        "goal" => Msg::CmdDescGoal,
+        "proxy" => Msg::CmdDescProxy,
         _ => return None,
     };
     Some(t(msg))
@@ -402,6 +407,29 @@ mod tests {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("zzzzz");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn every_builtin_command_has_an_i18n_description_in_both_locales() {
+        // A built-in without a cmd_desc_i18n arm silently falls back to the
+        // English static `desc` even under zh_CN — the /app regression, which
+        // also affected /sync, /review, /goal. Guard the WHOLE table so a
+        // newly-added command can't ship without a translation in any locale.
+        use crate::i18n::{current_locale, set_locale, Locale};
+        let prev = current_locale();
+        for locale in [Locale::En, Locale::ZhCn] {
+            set_locale(locale);
+            for c in CommandRegistry::builtin().all() {
+                let desc = cmd_desc_i18n(c.name);
+                assert!(
+                    desc.as_ref().map(|d| !d.trim().is_empty()).unwrap_or(false),
+                    "command /{} has no i18n description ({:?})",
+                    c.name,
+                    locale
+                );
+            }
+        }
+        set_locale(prev);
     }
 
     #[test]
