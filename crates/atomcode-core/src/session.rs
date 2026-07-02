@@ -227,7 +227,7 @@ impl Session {
     }
 }
 
-fn should_auto_name_session(name: &str) -> bool {
+pub(crate) fn should_auto_name_session(name: &str) -> bool {
     // Names starting with `[` are legacy auto-names derived from a
     // synthetic user message (pre-`Message.synthetic`-field heuristic).
     // Treat them like default / session-<ts>: candidates for re-naming
