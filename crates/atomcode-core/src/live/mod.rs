@@ -53,7 +53,7 @@ pub enum LiveEvent {
     /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
     /// 参数为新会话 ID。
     SessionSwitched(String),
-    /// daemon AI 给当前活动会话改了名（via `/rename`）。其余视图据此同步显示新名。
+    /// daemon AI 给当前活动会话改了名（AI 自动命名 / `/rename`）。其余视图据此同步显示新名。
     SessionRenamed(String),
     /// 手机 App 请求在桌面 TUI 执行一条斜杠命令（如 `/status`）。仅进程内广播
     /// （to_wire 跳过）；TUI 侧白名单校验后执行，输出经

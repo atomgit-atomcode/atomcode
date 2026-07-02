@@ -141,6 +141,9 @@ interface ChatProps {
   /** 另一端（TUI /cd、worktree、其他 webui tab）切了工作目录：实时流送来 working_dir
    *  事件时上报新路径，供 App 更新 cwd 面包屑 + 侧栏目录过滤。 */
   onCwdChanged?: (dir: string) => void;
+  /** AI 自动命名了当前会话：实时流送来 session_renamed 事件时上报新名称，
+   *  供 App 更新顶部标题头，无需再发请求拉取会话列表。 */
+  onSessionRenamed?: (name: string) => void;
   /** 上报是否处于落地（空对话）态，供 App 决定是否显示会话标题头。 */
   onLanding?: (landing: boolean) => void;
   /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
@@ -311,7 +314,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -657,6 +660,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 让 App 更新 cwd 面包屑 + 侧栏目录过滤。会话本身不变（对话保留）。
     if (e.type === 'working_dir') {
       onCwdChanged?.(e.working_dir);
+      return;
+    }
+    // AI 自动命名了当前会话：通知 App 直接更新标题头，无需拉取列表。
+    // 与查看哪个会话无关（进程级广播），不门控。
+    if (e.type === 'session_renamed') {
+      onSessionRenamed?.(e.name);
       return;
     }
     // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
