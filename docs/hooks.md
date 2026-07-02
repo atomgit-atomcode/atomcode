@@ -106,10 +106,17 @@ AtomCode supports **three** hook implementations, managed via two config files:
 }
 ```
 
-`post_tool` additionally includes `result_context`:
+`post_tool`'s stdin is a nested structure that additionally includes `result_context` (a sibling of `hook_context`):
 
 ```json
 {
+  "hook_context": {
+    "tool_name": "edit_file",
+    "tool_args": "{...}",
+    "working_dir": "/path/to/project",
+    "session_id": "session-123",
+    "turn_number": 5
+  },
   "result_context": {
     "tool_name": "edit_file",
     "tool_args": "{...}",
@@ -239,7 +246,11 @@ Compatible with Claude Code plugin's `.hooks.json`. Load paths:
 
 Supported `event` values: `pre_tool_use`, `post_tool_use`, `session_start`, `session_end`, `user_prompt_submit`.
 
-Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.), and must output `{"action": "allow" | "block" | "modify"}` JSON to stdout.
+Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.). The stdout protocol varies by event:
+
+- **`pre_tool_use`** — output `{"action":"allow"}` / `{"action":"block","reason":"..."}` / `{"action":"modify","args":{...}}` (`args` replaces the tool-call arguments)
+- **`user_prompt_submit`** — output `{"decision":"block","reason":"..."}` to block submission, or `{"hookSpecificOutput":{"additionalContext":"..."}}` to inject extra context; plain-text stdout is treated as an additionalContext injection
+- **`post_tool_use` / `session_start` / `session_end`** — fire-and-forget; stdout does not affect the flow
 
 ---
 
@@ -270,16 +281,76 @@ atomcode hooks paths
 # Test a single hook
 atomcode hooks test my-hook
 ```
+---
+
+## 调试技巧
+
+### 手动测试 hook 脚本
+
+TOML ScriptHook 通过 stdin 接收上下文 JSON（字段对应 `HookCtx`：`tool_name` / `tool_args` / `working_dir` / `session_id` / `turn_number`，无 `event` 字段）：
+
+```bash
+# pre_tool 测试上下文（扁平结构）
+echo '{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1}' | bash path/to/hook.sh
+
+# post_tool 测试上下文（嵌套结构，含 result_context）
+echo '{"hook_context":{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1},"result_context":{"tool_name":"read_file","tool_args":"{}","result":"File content here","success":true,"duration_ms":12}}' | bash path/to/hook.sh
+```
+
+JSON CC 兼容 Hook 通过环境变量接收（TOML ScriptHook 不适用，TOML 用 stdin）：
+
+```bash
+# 导出环境变量模拟运行环境（仅 JSON CC 格式）
+export ATOMCODE_HOOK_EVENT="post_tool_use"
+export ATOMCODE_TOOL_NAME="read_file"
+export ATOMCODE_HOOK_CONTEXT='{"tool_name":"read_file"}'
+python path/to/hook.py
+```
+
+### 配置文件语法校验
+
+```bash
+# TOML 格式校验（需要 Python ≥ 3.11；旧版请 pip install tomli 并将 tomllib 替换为 tomli）
+python -c "from pathlib import Path; import tomllib; tomllib.load(Path('path/to/hooks.toml').open('rb'))"
+
+# JSON 格式校验
+python -c "from pathlib import Path; import json; json.load(Path('path/to/hooks.json').open('rb'))"
+```
+
+### CLI 排查命令
+
+```bash
+# 查看当前加载的所有 hook
+atomcode hooks list
+
+# 查看 hook 配置路径
+atomcode hooks paths
+
+# 测试单个 hook 是否正常触发
+atomcode hooks test <hook-name>
+```
+
+### Hook 不触发的 6 步排查清单
+
+| 步骤 | 检查项 | 常见问题 |
+|------|--------|---------|
+| 1 | 文件路径是否存在 | `~` 不会自动展开，需用绝对路径（如 `C:\Users\you\...` 或 `/home/you/...`） |
+| 2 | `enabled = true` | 默认 `true`，检查是否意外设为 `false` |
+| 3 | `trigger` / `event` 拼写正确 | 参考上方事件表，大小写敏感 |
+| 4 | 脚本有执行权限 | Linux/macOS 需 `chmod +x` |
+| 5 | 脚本没有超时 | TOML 默认 2s，JSON 默认 10s |
+| 6 | 项目级 hook 覆盖了全局 hook | 项目 hook 优先级更高 |
 
 ---
 
 ## Security Notes
 
-1. **Project hooks override same-name global hooks**（project hooks load after global hooks）
-2. **Hooks cannot bypass the permission system** — `pre_tool` deny does not override user's always_allow settings
+1. **Project hooks override same-name global hooks** (project hooks load after global hooks)
+2. **Hooks cannot bypass the permission system** — `pre_tool` deny does not override the user's `always_allow` settings
 3. **Script execution has timeouts** — TOML ScriptHook default 2s, JSON default 10s, Webhook default 10s
 4. **Scripts run under user permissions** — be mindful of script security itself
-5. **Timeout/crash is fail-open** — Script timeout or crash is treated as ok, not blocking the flow
+5. **Timeout/crash is fail-open** — a script timeout or crash is treated as `ok`, not blocking the flow
+6. **Windows compatibility** — `~` is not auto-expanded; use absolute paths (e.g. `C:\Users\you\...` or `/home/you/...`); use `\\` or `/` as the path separator; for Python scripts, specify the interpreter path explicitly
 
 ---
 
