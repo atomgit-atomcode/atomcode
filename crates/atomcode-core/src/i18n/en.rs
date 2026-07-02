@@ -135,10 +135,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
-        Msg::StatusBody { model, dir, config, tokens } =>
+        Msg::StatusBody { model, dir, config } =>
             format!(
-                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
-                model, dir, config, tokens,
+                "  Model:  {}\n  Dir:    {}\n  Config: {}\n",
+                model, dir, config,
             ).into(),
         Msg::StatusLoginLoggedIn { user } =>
             format!("  Login:  {}\n", user).into(),
@@ -1101,6 +1101,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
+        Msg::ProviderInitNeedsLogin =>
+            "Not signed in — model unavailable. Run /login to continue.".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url '{base_url}' is an AtomGit gateway this build can't \

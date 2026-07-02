@@ -127,10 +127,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
 
         // ── /status 命令主体 ──
-        Msg::StatusBody { model, dir, config, tokens } =>
+        Msg::StatusBody { model, dir, config } =>
             format!(
-                "  模型：    {}\n  目录：    {}\n  配置文件：{}\n  Token：   {}\n",
-                model, dir, config, tokens,
+                "  模型：    {}\n  目录：    {}\n  配置文件：{}\n",
+                model, dir, config,
             ).into(),
         Msg::StatusLoginLoggedIn { user } =>
             format!("  登录：  {}\n", user).into(),
@@ -1082,6 +1082,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
+        Msg::ProviderInitNeedsLogin =>
+            "尚未登录，模型暂不可用；运行 /login 后可继续对话。".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\

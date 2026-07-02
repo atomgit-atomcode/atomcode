@@ -312,13 +312,7 @@ impl Bridge {
         let provider = match build_provider(&coding_cfg) {
             Ok(p) => Some(p),
             Err(e) => {
-                let _ = ev_tx.send(CoreEv::Error {
-                    error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
-                        detail: &e.to_string(),
-                    })
-                    .into_owned(),
-                    snapshot: ConversationSnapshot::default(),
-                });
+                let _ = ev_tx.send(provider_init_event(&e));
                 None
             }
         };
@@ -835,15 +829,7 @@ impl Bridge {
                                 }
                             }
                         }
-                        Err(e) => self.emit(CoreEv::Error {
-                            error: atomcode_core::i18n::t(
-                                atomcode_core::i18n::Msg::ProviderInitFailed {
-                                    detail: &e.to_string(),
-                                },
-                            )
-                            .into_owned(),
-                            snapshot: ConversationSnapshot::default(),
-                        }),
+                        Err(e) => self.emit(provider_init_event(&e)),
                     }
                 }
             }
@@ -1963,6 +1949,38 @@ fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
 }
 
+/// Decide how a `build_provider` failure should surface, given whether the user
+/// is logged in. Pure over `logged_in` so the branch is unit-testable without
+/// touching `auth.toml`; the wrapper [`provider_init_event`] supplies the real
+/// login state.
+///
+/// Not-logged-in is the EXPECTED state right after `/logout` (and on a fresh
+/// launch before `/login`): the gateway signer simply has no token, so the red
+/// "模型初始化失败 / provider init failed" line is noise that looks like a crash.
+/// Surface a calm, localized "run /login" advisory (yellow `Warning`) instead.
+/// A genuine init failure WHILE logged in stays a red `Error`. Keying on
+/// `is_logged_in()` rather than string-matching the signer error keeps this robust.
+fn provider_init_event_for(logged_in: bool, e: &anyhow::Error) -> CoreEv {
+    if logged_in {
+        CoreEv::Error {
+            error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+                detail: &e.to_string(),
+            })
+            .into_owned(),
+            snapshot: ConversationSnapshot::default(),
+        }
+    } else {
+        CoreEv::Warning(
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitNeedsLogin).into_owned(),
+        )
+    }
+}
+
+/// [`provider_init_event_for`] with the real login state from disk.
+fn provider_init_event(e: &anyhow::Error) -> CoreEv {
+    provider_init_event_for(atomcode_core::auth::is_logged_in(), e)
+}
+
 fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
@@ -2173,6 +2191,37 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod provider_init_event_tests {
+    use super::{provider_init_event_for, CoreEv};
+
+    #[test]
+    fn not_logged_in_yields_calm_login_advisory_not_red_error() {
+        // After /logout (or before /login) the signer just has no token — the
+        // failure must surface as a yellow "run /login" Warning, not a red Error.
+        let e = anyhow::anyhow!("AtomGit gateway requires login — run `/login` first");
+        match provider_init_event_for(false, &e) {
+            CoreEv::Warning(msg) => {
+                assert!(msg.contains("/login"), "advisory must point at /login: {msg}");
+            }
+            other => panic!("expected calm Warning when not logged in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logged_in_keeps_the_red_init_failure() {
+        // A genuine build failure WHILE logged in is a real error and stays red,
+        // carrying the underlying detail for diagnosis.
+        let e = anyhow::anyhow!("some real init failure");
+        match provider_init_event_for(true, &e) {
+            CoreEv::Error { error, .. } => {
+                assert!(error.contains("some real init failure"), "must carry detail: {error}");
+            }
+            other => panic!("expected red Error when logged in, got {other:?}"),
+        }
     }
 }
 

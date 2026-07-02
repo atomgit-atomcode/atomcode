@@ -142,7 +142,7 @@ pub enum Msg<'a> {
     StatusWebuiHint,
 
     // ── /status command body ──
-    StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
+    StatusBody { model: &'a str, dir: &'a str, config: &'a str },
     /// `/status` login line — signed in, showing the account display name/username.
     StatusLoginLoggedIn { user: &'a str },
     /// `/status` login line — not signed in.
@@ -981,6 +981,10 @@ pub enum Msg<'a> {
     /// Frame for a provider/engine init failure surfaced to the driver.
     /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
     ProviderInitFailed { detail: &'a str },
+    /// Calm advisory (yellow) when a provider build fails purely because the
+    /// user isn't logged in — the expected state right after `/logout` or on a
+    /// fresh launch before `/login`. Replaces the alarming red init-failure line.
+    ProviderInitNeedsLogin,
     /// The configured `base_url` is an AtomGit gateway that this (open-source)
     /// build can't sign requests for. Points the user at the official binary
     /// or a plain OpenAI-compatible endpoint.

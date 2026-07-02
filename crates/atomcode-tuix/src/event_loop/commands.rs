@@ -1371,27 +1371,11 @@ fn execute_slash_command_impl(
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
         }
         "status" => {
-            let mut txt = t(Msg::StatusBody {
-                model: &ctx.model_name,
-                dir: &ctx.working_dir.display().to_string(),
-                config: &Config::default_path().display().to_string(),
-                tokens: state.total_tokens,
-            })
-            .into_owned();
-            // Login line: signed-in account (display name → username) or a /login
-            // prompt — shows at a glance whether you're logged in and as whom.
-            txt.push_str(&render_login_line_from_stored_auth());
-            txt.push_str(&format!(
-                "  Proxy:  {}\n",
-                ctx.config.network.proxy.summary()
-            ));
-            txt.push_str(&render_codingplan_status_for_status_cmd());
-
-            txt.push('\n');
-            txt.push_str(&render_instruction_status_block(&ctx.working_dir));
-
+            // Interactive `/status` shows the Proxy line (after CodingPlan); the
+            // remote/phone view omits it. Order is owned by `assemble_status`.
+            let proxy = format!("  Proxy:  {}\n", ctx.config.network.proxy.summary());
+            let txt = build_status_text(ctx, Some(&proxy));
             renderer.render(UiLine::CommandOutput(txt));
-
             renderer.flush();
         }
         "diff" => {
@@ -3903,35 +3887,49 @@ pub(crate) fn launch_fixissue(
     }
 }
 
-/// Commit a new working-directory choice: notify the agent, update cwd +
-/// previous_dir on the shared context, push the new entry into the
-/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
-/// DirPicker modal's Enter handler so both paths keep state coherent.
-/// Drop the current conversation and start a brand-new session in the current
-/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
-/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
-/// screen so it behaves like a fresh launch.
-///
-/// Shared by the `/session` command and the webui-driven project switch
-/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
-/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
-/// `Session` is bound to it.
+/// Assemble the `/status` body in canonical display order: the login line FIRST
+/// (so you see who you're signed in as at a glance), then the model/dir/config
+/// block, the CodingPlan section, an optional Proxy line (interactive `/status`
+/// only — the remote/phone view omits it), a blank separator, then the
+/// instruction-files block. Pure over its already-rendered pieces so the order is
+/// unit-testable and the interactive + remote renderers can't drift apart.
+fn assemble_status(
+    login: &str,
+    body: &str,
+    codingplan: &str,
+    proxy: Option<&str>,
+    instructions: &str,
+) -> String {
+    let mut txt = String::with_capacity(
+        login.len() + body.len() + codingplan.len() + instructions.len() + 16,
+    );
+    txt.push_str(login);
+    txt.push_str(body);
+    txt.push_str(codingplan);
+    if let Some(p) = proxy {
+        txt.push_str(p);
+    }
+    txt.push('\n');
+    txt.push_str(instructions);
+    txt
+}
+
 /// `/status` 的报告文本。TUI arm 与手机远程执行（run_remote_command）共用。
-pub(super) fn build_status_text(ctx: &LoopCtx, state: &UiState) -> String {
-    let mut txt = t(Msg::StatusBody {
+/// `proxy` = 交互式 `/status` 传入的 Proxy 行；远程视图传 `None` 省略。
+pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
+    let body = t(Msg::StatusBody {
         model: &ctx.model_name,
         dir: &ctx.working_dir.display().to_string(),
         config: &Config::default_path().display().to_string(),
-        tokens: state.total_tokens,
     })
     .into_owned();
-    // Login line: signed-in account (display name → username) or a /login prompt, so
-    // `/status` shows at a glance whether you're logged in and as whom.
-    txt.push_str(&render_login_line_from_stored_auth());
-    txt.push_str(&render_codingplan_status_for_status_cmd());
-    txt.push('\n');
-    txt.push_str(&render_instruction_status_block(&ctx.working_dir));
-    txt
+    assemble_status(
+        &render_login_line_from_stored_auth(),
+        &body,
+        &render_codingplan_status_for_status_cmd(),
+        proxy,
+        &render_instruction_status_block(&ctx.working_dir),
+    )
 }
 
 /// `/cost` 的用量报告文本。TUI arm 与手机远程执行共用。
@@ -4003,7 +4001,7 @@ pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
 /// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
 pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
     match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
-        "status" => Some(build_status_text(ctx, state)),
+        "status" => Some(build_status_text(ctx, None)),
         "cost" => Some(build_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
@@ -4011,6 +4009,15 @@ pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> O
     }
 }
 
+/// Drop the current conversation and start a brand-new session in the current
+/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
+/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
+/// screen so it behaves like a fresh launch.
+///
+/// Shared by the `/session` command and the webui-driven project switch
+/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
+/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
+/// `Session` is bound to it.
 pub(crate) fn reset_to_new_session(
     ctx: &mut LoopCtx,
     state: &mut UiState,
@@ -4054,6 +4061,10 @@ pub(crate) fn reset_to_new_session(
 
 }
 
+/// Commit a new working-directory choice: notify the agent, update cwd +
+/// previous_dir on the shared context, push the new entry into the
+/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
+/// DirPicker modal's Enter handler so both paths keep state coherent.
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     ctx.agent
         .cmd_tx
@@ -4498,6 +4509,51 @@ mod status_login_tests {
         let line = render_login_line(None);
         assert!(line.contains("/login"), "not-signed-in line must point to /login: {line:?}");
         assert!(!line.contains("张三"));
+    }
+
+    #[test]
+    fn status_order_is_login_first_then_body_codingplan_proxy() {
+        // Reorder spec: login line at the very top; Proxy AFTER CodingPlan.
+        let s = assemble_status(
+            "LOGIN\n",
+            "BODY\n",
+            "CODINGPLAN\n",
+            Some("PROXY\n"),
+            "INSTRUCTIONS",
+        );
+        assert!(s.starts_with("LOGIN\n"), "login must be first: {s:?}");
+        let (login, body, cp, proxy, instr) = (
+            s.find("LOGIN").unwrap(),
+            s.find("BODY").unwrap(),
+            s.find("CODINGPLAN").unwrap(),
+            s.find("PROXY").unwrap(),
+            s.find("INSTRUCTIONS").unwrap(),
+        );
+        // login < body < codingplan < proxy < instructions
+        assert!(login < body && body < cp, "body sits between login and codingplan: {s:?}");
+        assert!(cp < proxy, "Proxy must come AFTER CodingPlan: {s:?}");
+        assert!(proxy < instr, "instructions come last: {s:?}");
+    }
+
+    #[test]
+    fn status_omits_proxy_line_when_none() {
+        // The remote/phone view passes None → no Proxy line at all.
+        let s = assemble_status("LOGIN\n", "BODY\n", "CODINGPLAN\n", None, "INSTRUCTIONS");
+        assert!(!s.contains("PROXY"), "proxy must be absent when None: {s:?}");
+        assert!(s.starts_with("LOGIN\n"), "login still first: {s:?}");
+    }
+
+    #[test]
+    fn status_body_no_longer_shows_a_token_line() {
+        // /status is a quick-glance state view; per-session token count is /cost's job.
+        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
+            model: "m", dir: "/d", config: "/c",
+        });
+        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
+            model: "m", dir: "/d", config: "/c",
+        });
+        assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
+        assert!(!zh.contains("Token"), "zh StatusBody must not carry a Token line: {zh}");
     }
 
     #[test]
