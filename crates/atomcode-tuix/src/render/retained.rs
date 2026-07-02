@@ -4436,6 +4436,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.auto_copy_enabled = enabled;
     }
 
+    fn set_title(&mut self, title: String) {
+        // Route through `self.out` so the OSC bytes stay ordered with the
+        // BufWriter's body writes (no raw-stdout interleave). `execute!`
+        // flushes. crossterm's `SetTitle` emits an OSC sequence on unix and
+        // calls `SetConsoleTitleW` on Windows, so this reaches conhost /
+        // Windows Terminal tabs too — the whole point of owning the title.
+        // Not wrapped in a DECSET-2026 envelope: a title update touches no
+        // cell of the display rect, so it's safe to land any time.
+        let _ = crossterm::execute!(&mut self.out, crossterm::terminal::SetTitle(title));
+    }
+
     fn clear_screen(&mut self) {
         // Same as reset for retained mode — Screen IS our model, so
         // wiping the terminal requires wiping the model too. The

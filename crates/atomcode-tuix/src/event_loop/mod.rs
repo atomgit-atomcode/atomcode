@@ -3807,7 +3807,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
     sync_reasoning_effort_from_provider(&mut ctx);
 
+    // Terminal tab/window title mirrors the current session name. Tracked
+    // here so we only emit an OSC title write when it actually changes
+    // (startup, first-message auto-name, `/rename`, `/resume`, `/new`) rather
+    // than every loop iteration. `None` forces the first pass to emit.
+    let mut last_terminal_title: Option<String> = None;
+
     loop {
+        sync_terminal_title(&ctx, renderer, &mut last_terminal_title);
+
         #[cfg(unix)]
         tokio::select! {
             // Biased ordering: spinner first so whenever a tick is
@@ -6523,6 +6531,24 @@ pub(crate) fn sync_recalled_attachments(
                 .pending_recalled_attachments
                 .retain(|r| buf.text.contains(&format!("[Image #{}]", r.n)));
         }
+    }
+}
+
+/// Emit the terminal tab/window title for the current session, but only when
+/// it differs from what was last emitted (`last`). Called at the top of every
+/// event-loop iteration; `last` starts as `None` so the first pass always
+/// emits (startup fallback), and each session-name change (auto-name, `/rename`,
+/// `/resume`, `/new`) is picked up on the next iteration.
+///
+/// Fallback for un-named / brand-new sessions is `atomcode v<version>`, so a
+/// fresh tab shows the running version instead of whatever stale string the
+/// launcher/shortcut left behind (the original `atomcode-v4.25.6`-lingering bug).
+fn sync_terminal_title(ctx: &LoopCtx, renderer: &mut dyn Renderer, last: &mut Option<String>) {
+    const VERSION_FALLBACK: &str = concat!("atomcode v", env!("CARGO_PKG_VERSION"));
+    let title = crate::title::session_terminal_title(&ctx.current_session.name, VERSION_FALLBACK);
+    if last.as_deref() != Some(title.as_str()) {
+        renderer.set_title(title.clone());
+        *last = Some(title);
     }
 }
 
