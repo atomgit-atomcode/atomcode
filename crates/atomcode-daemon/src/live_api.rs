@@ -67,6 +67,19 @@ fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
         .unwrap_or_else(|| fallback.to_path_buf())
 }
 
+fn send_agent_command(
+    client: &AgentClient,
+    command: AgentCommand,
+    action: &str,
+) -> Result<(), TurnEvent> {
+    client.cmd_tx.send(command).map_err(|_| {
+        TurnEvent::Error(format!(
+            "engine v2：{}失败，kernel 命令通道已关闭，请重试本轮会话",
+            action
+        ))
+    })
+}
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -882,37 +895,39 @@ impl TurnExecutor for KernelTurnExecutor {
         // and context strategy. Without this, a webui dropdown switch updates
         // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
         // model name — the agent mis-identifies itself (issue #659).
-        let current_provider = self.resolve_provider_name();
-        let state = guard.as_mut().unwrap();
-        if current_provider != state.provider_name {
-            if let Ok(new_config) = Config::load(&Config::default_path()) {
+        let (client, should_seed) = {
+            let current_provider = self.resolve_provider_name();
+            let state = guard.as_mut().unwrap();
+            if current_provider != state.provider_name {
+                if let Ok(new_config) = Config::load(&Config::default_path()) {
+                    let _ = state
+                        .client
+                        .cmd_tx
+                        .send(atomcode_core::agent::AgentCommand::ReloadConfig(new_config));
+                }
+                state.provider_name = current_provider;
+            }
+
+            // Detect working-dir switch: a sync-mode `/cd` updated LIVE_WORKING_DIR but the
+            // persistent bridge is still rooted at the old project (its session context is
+            // frozen at prepare time). Send ChangeDir so the bridge respawn(Fresh)es into the
+            // new dir — the SAME mechanism the TUI uses — rebinding persona/context/cwd.
+            // Mirrors the model-switch detection above (issue #755). NOTE: respawn(Fresh)
+            // starts the new project's conversation empty; `seeded` stays true so we do NOT
+            // re-push the old project's history (matches /cd = a fresh session in the new dir).
+            let current_dir = live_current_working_dir(&self.working_dir);
+            if current_dir != state.working_dir {
                 let _ = state
                     .client
                     .cmd_tx
-                    .send(atomcode_core::agent::AgentCommand::ReloadConfig(new_config));
+                    .send(atomcode_core::agent::AgentCommand::ChangeDir(
+                        current_dir.to_string_lossy().into_owned(),
+                    ));
+                state.working_dir = current_dir;
             }
-            state.provider_name = current_provider;
-        }
 
-        // Detect working-dir switch: a sync-mode `/cd` updated LIVE_WORKING_DIR but the
-        // persistent bridge is still rooted at the old project (its session context is
-        // frozen at prepare time). Send ChangeDir so the bridge respawn(Fresh)es into the
-        // new dir — the SAME mechanism the TUI uses — rebinding persona/context/cwd.
-        // Mirrors the model-switch detection above (issue #755). NOTE: respawn(Fresh)
-        // starts the new project's conversation empty; `seeded` stays true so we do NOT
-        // re-push the old project's history (matches /cd = a fresh session in the new dir).
-        let current_dir = live_current_working_dir(&self.working_dir);
-        if current_dir != state.working_dir {
-            let _ = state
-                .client
-                .cmd_tx
-                .send(atomcode_core::agent::AgentCommand::ChangeDir(
-                    current_dir.to_string_lossy().into_owned(),
-                ));
-            state.working_dir = current_dir;
-        }
-
-        let client = state.client.clone();
+            (state.client.clone(), !state.seeded)
+        };
 
         // `conv` already has the just-typed user message appended (coordinator).
         // Split it off: the prefix seeds the bridge (first turn only), the last
@@ -937,20 +952,36 @@ impl TurnExecutor for KernelTurnExecutor {
             user_images
         };
 
-        if !state.seeded {
-            let _ = client
-                .cmd_tx
-                .send(AgentCommand::SetConversation(ConversationSnapshot {
+        if should_seed {
+            if let Err(event) = send_agent_command(
+                &client,
+                AgentCommand::SetConversation(ConversationSnapshot {
                     messages: prefix,
                     cold_summaries: vec![],
-                }));
-            state.seeded = true;
+                }),
+                "初始化桥接会话",
+            ) {
+                *guard = None;
+                emit(event);
+                return;
+            }
         }
-        let _ = client.cmd_tx.send(AgentCommand::SendMessage {
-            text: user_text,
-            images: user_images,
-            image_markers: Vec::new(),
-        });
+        if let Err(event) = send_agent_command(
+            &client,
+            AgentCommand::SendMessage {
+                text: user_text,
+                images: user_images,
+                image_markers: Vec::new(),
+            },
+            "发送用户消息",
+        ) {
+            *guard = None;
+            emit(event);
+            return;
+        }
+        if should_seed {
+            guard.as_mut().unwrap().seeded = true;
+        }
 
         // DURABILITY — fix A: persist the user message to the stable `.json` NOW, before
         // the (possibly long, possibly laggy) turn runs. A hard kill / window-close
@@ -996,6 +1027,7 @@ impl TurnExecutor for KernelTurnExecutor {
             Some(rx)
         };
 
+        let state = guard.as_mut().unwrap();
         let mut cancelled = false;
         let mut bridge_dead = false;
         let final_messages = loop {
@@ -1422,17 +1454,29 @@ pub(crate) async fn run_chat_turn_v2(
     } else {
         user_images
     };
-    let _ = client
-        .cmd_tx
-        .send(AgentCommand::SetConversation(ConversationSnapshot {
+    if let Err(event) = send_agent_command(
+        &client,
+        AgentCommand::SetConversation(ConversationSnapshot {
             messages: prefix,
             cold_summaries: vec![],
-        }));
-    let _ = client.cmd_tx.send(AgentCommand::SendMessage {
-        text: user_text,
-        images: user_images,
-        image_markers: Vec::new(),
-    });
+        }),
+        "初始化桥接会话",
+    ) {
+        let _ = turn_tx.send(event);
+        return;
+    }
+    if let Err(event) = send_agent_command(
+        &client,
+        AgentCommand::SendMessage {
+            text: user_text,
+            images: user_images,
+            image_markers: Vec::new(),
+        },
+        "发送用户消息",
+    ) {
+        let _ = turn_tx.send(event);
+        return;
+    }
 
     let mut cancelled = false;
     let final_messages = loop {
