@@ -3,7 +3,41 @@
 
 use crate::config::ReviewAgentConfig;
 use crate::persona::review_persona;
+use atomcode_capabilities::codeintel::lang::Lang;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
+use std::path::Path;
+use std::process::Command;
+
+/// Above this many git-tracked indexable source files, the code-graph tools are NOT mounted:
+/// building their O(repo) tree-sitter call graph would blow the review's wall-clock budget for
+/// no measured quality gain (kernel A/B: graph off ≥ on, 1080s CPU → 3.94s). Small repos keep
+/// the graph (it's cheap there, and may occasionally help cross-file reasoning).
+const GRAPH_MAX_INDEXED_FILES: usize = 8000;
+
+/// Whether to mount the code-graph tools for a repo with `indexed_file_count` indexable sources.
+fn should_mount_graph(indexed_file_count: usize) -> bool {
+    indexed_file_count <= GRAPH_MAX_INDEXED_FILES
+}
+
+/// Count git-tracked source files codeintel would parse, via `git ls-files` (reads the git
+/// index — NO working-tree walk, so it stays cheap even on an NFS workdir). Returns 0 when git
+/// is unavailable / not a repo ⇒ treated as small ⇒ graph mounted (the safe default).
+fn count_indexed_sources(working_dir: &Path) -> usize {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(working_dir)
+        .args(["ls-files", "-z"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 0,
+    };
+    out.split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .filter(|p| Lang::detect(Path::new(p)).is_some_and(|l| l.is_indexed()))
+        .count()
+}
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::tools::{
     register_coding_tools, AstGrepTool, ReportFindingTool, WebSearchTool,
@@ -16,7 +50,7 @@ use std::sync::Arc;
 /// The READ-ONLY tools the reviewer sees. Deliberately NO write/edit/bash/change_dir — a
 /// reviewer investigates and reports, it never mutates. (The diff itself is injected as
 /// the task by the caller, so the agent needs no shell to obtain it.)
-fn review_tool_names(no_web: bool) -> Vec<&'static str> {
+fn review_tool_names(no_web: bool, mount_graph: bool) -> Vec<&'static str> {
     let mut names = vec!["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"];
     // web_search is mounted by default; `no_web` drops it (the tool stays registered but
     // unmounted), so a blocked/unreachable web egress can't make the model's web_search
@@ -24,7 +58,13 @@ fn review_tool_names(no_web: bool) -> Vec<&'static str> {
     if !no_web {
         names.push("web_search");
     }
-    names.extend(codeintel_tool_names().iter().copied());
+    // Code-graph tools (find_references/trace_callers/blast_radius/read_symbol/…) build an
+    // O(repo) tree-sitter call graph — only mount them when the repo is small enough to index
+    // cheaply (see `should_mount_graph`). On a huge repo they blow the wall-clock budget for
+    // ~zero quality gain (measured on the 85k-file kernel: 1080s CPU → 3.94s with them off).
+    if mount_graph {
+        names.extend(codeintel_tool_names().iter().copied());
+    }
     names
 }
 
@@ -50,7 +90,13 @@ pub fn build_review_agent_with(
 ) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
-    let tools = mount_review_tools(&report, cfg.no_web);
+    // Auto-degrade the code-graph on huge repos (cheap git-index count, NFS-friendly).
+    let indexed = count_indexed_sources(&cfg.working_dir);
+    let mount_graph = should_mount_graph(indexed);
+    if !mount_graph {
+        eprintln!("[codeintel] {indexed} indexed source file(s) > {GRAPH_MAX_INDEXED_FILES} — code-graph tools disabled (grep only)");
+    }
+    let tools = mount_review_tools(&report, cfg.no_web, mount_graph);
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
         .provider(provider)
@@ -93,14 +139,14 @@ pub fn build_review_agent_with(
 /// Register the read-only review toolset (+ the shared `report_finding` instance) and
 /// mount only the read-only subset — write/edit/bash are registered by
 /// `register_coding_tools` but NEVER mounted, so the model cannot mutate.
-fn mount_review_tools(report: &ReportFindingTool, no_web: bool) -> MountedTools {
+fn mount_review_tools(report: &ReportFindingTool, no_web: bool, mount_graph: bool) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
-    register_codeintel_tools(&mut reg);
+    register_codeintel_tools(&mut reg); // registered always; mounted only when `mount_graph`
     reg.register(Arc::new(AstGrepTool));
     reg.register(Arc::new(WebSearchTool::new())); // registered always; mounted only when !no_web
     reg.register(Arc::new(report.clone())); // shares state with the returned handle
-    reg.mount(&review_tool_names(no_web))
+    reg.mount(&review_tool_names(no_web, mount_graph))
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the
@@ -318,7 +364,7 @@ mod tests {
     #[test]
     fn review_mounts_readonly_set_only() {
         // The mounted names are read-only — no mutation tools.
-        let names = review_tool_names(false);
+        let names = review_tool_names(false, true);
         assert!(names.contains(&"read_file") && names.contains(&"report_finding") && names.contains(&"ast_grep"));
         for forbidden in ["write_file", "edit_file", "bash", "change_dir", "search_replace", "parallel_edit_files"] {
             assert!(!names.contains(&forbidden), "reviewer must not mount `{forbidden}`");
@@ -328,15 +374,63 @@ mod tests {
     #[test]
     fn no_web_drops_web_search_only() {
         // 默认挂 web_search；no_web=true 时仅去掉 web_search，其余只读工具不变。
-        let with_web = review_tool_names(false);
+        let with_web = review_tool_names(false, true);
         assert!(with_web.contains(&"web_search"), "默认应挂 web_search");
 
-        let without_web = review_tool_names(true);
+        let without_web = review_tool_names(true, true);
         assert!(!without_web.contains(&"web_search"), "no_web 应去掉 web_search");
         // 其它只读工具仍在
         for keep in ["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"] {
             assert!(without_web.contains(&keep), "no_web 不应误伤 `{keep}`");
         }
+    }
+
+    #[test]
+    fn graph_tools_gated_by_mount_flag() {
+        // mount_graph=false drops the code-graph tools; the base read-only set stays.
+        let with_graph = review_tool_names(true, true);
+        let without_graph = review_tool_names(true, false);
+        // codeintel names present with the flag on, absent with it off.
+        let graph_names = atomcode_capabilities::codeintel::codeintel_tool_names();
+        assert!(graph_names.iter().all(|g| with_graph.contains(g)), "graph tools mounted when on");
+        assert!(graph_names.iter().all(|g| !without_graph.contains(g)), "graph tools dropped when off");
+        // Base tools unaffected either way.
+        for keep in ["read_file", "grep", "report_finding"] {
+            assert!(without_graph.contains(&keep), "base tool `{keep}` must survive");
+        }
+    }
+
+    #[test]
+    fn should_mount_graph_thresholds() {
+        assert!(should_mount_graph(0), "empty/unknown repo → mount (safe default)");
+        assert!(should_mount_graph(GRAPH_MAX_INDEXED_FILES), "at threshold → still mount");
+        assert!(!should_mount_graph(GRAPH_MAX_INDEXED_FILES + 1), "over threshold → degrade");
+        assert!(!should_mount_graph(85_000), "kernel-scale → degrade");
+    }
+
+    #[test]
+    fn count_indexed_sources_counts_only_source_files() {
+        // Skip cleanly if git isn't on PATH.
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git").current_dir(root).args(args).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        for f in ["a.rs", "b.go", "c.py", "d.md", "e.lock", "sub/f.ts"] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // Only indexable sources counted: a.rs, b.go, c.py, sub/f.ts = 4 (md/lock excluded).
+        assert_eq!(count_indexed_sources(root), 4);
     }
 }
 
