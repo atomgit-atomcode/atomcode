@@ -9420,6 +9420,15 @@ fn handle_agent_event(
                 attach_live_session(ctx, renderer, session, false);
             }
         }
+        AgentEvent::SessionRenamed { name } => {
+            // daemon AI 给当前活动会话改了名（via `/rename` or auto-namer）。
+            // 更新会话对象，保存到磁盘，选择器等 UI 看到新名。
+            crate::tuix_trace!("TUI", "SessionRenamed: name={}", name);
+            ctx.current_session.name = name.clone();
+            ctx.current_session.touch();
+            // 同步保存失败无碍（用户只是看不到最新名字直到重启）。
+            let _ = ctx.session_manager.save(&ctx.current_session);
+        }
         AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
             // Non-error pause line: dim/plain body row, never red.
             // auto_resuming=true  (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"

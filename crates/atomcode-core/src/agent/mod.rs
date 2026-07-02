@@ -478,6 +478,8 @@ pub enum AgentEvent {
     ProviderChanged(String),
     /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
     SessionSwitched(String),
+    /// daemon 给当前活动会话改名。TUI 据此更新会话选择器与头部显示。
+    SessionRenamed { name: String },
 }
 
 /// The current phase of the agent (for UI display).

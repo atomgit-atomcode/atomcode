@@ -123,6 +123,17 @@ pub(crate) fn spawn_live_forwarder(
                         break;
                     }
                 }
+                // Another end (daemon AI namer) renamed the live session — forward
+                // so the mirroring TUI reflects the new name via its SessionRenamed handler.
+                Ok(LiveEvent::SessionRenamed(name)) => {
+                    crate::tuix_trace!("FWD", "SessionRenamed: {}", name);
+                    if fan_tx
+                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionRenamed { name } })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 // 手机 App 请求执行斜杠命令（如 /status）→ TUI 白名单校验后执行，
                 // 输出经 CommandOutput 广播回去。
                 Ok(LiveEvent::RemoteCommand(line)) => {

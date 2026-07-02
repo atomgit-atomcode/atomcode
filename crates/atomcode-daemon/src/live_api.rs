@@ -1620,6 +1620,10 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
+    /// Session was renamed (via daemon AI namer). All webui tabs update their
+    /// session display to reflect the new name.
+    #[serde(rename = "session_renamed")]
+    SessionRenamed { name: String },
     /// Working directory switched (any view's `/cd`). Every webui tab updates its
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
@@ -1665,6 +1669,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         },
         // 会话切换：通知所有 webui tab 跟随切换到新会话。
         LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
+        // daemon AI 改了会话名：通知所有 webui tab 更新会话显示。
+        LiveEvent::SessionRenamed(name) => LiveWireEvent::SessionRenamed { name },
         // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
         LiveEvent::RemoteCommand(_) => return None,
         LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },

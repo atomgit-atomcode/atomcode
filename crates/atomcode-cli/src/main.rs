@@ -2534,6 +2534,7 @@ async fn run_headless(
             | AgentEvent::ProviderChanged(_)
             | AgentEvent::ProjectSwitched(_)
             | AgentEvent::SessionSwitched(_)
+            | AgentEvent::SessionRenamed { .. }
             | AgentEvent::RemoteSlashCommand(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
