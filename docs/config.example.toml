@@ -1,37 +1,139 @@
+# =============================================================================
+# AtomCode 配置模板
+#
+# 复制到 ~/.atomcode/config.toml 后按需修改。Provider 可声明多个，
+# 在 TUI 中用 /provider 或 /model 切换。
+# =============================================================================
+
+# ---- 默认 provider（必须匹配下方某个 [providers.*] 的键名）----
 default_provider = "deepseek"
- 
+
+# =============================================================================
+# Provider 示例
+# =============================================================================
+
+# -------- DeepSeek ----------
 [providers.deepseek]
 type = "openai"
 api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000
-# Override the reasoning_content history-echo policy. Unset = auto-detect
-# from model name (deepseek-v4* → include, deepseek-reasoner/r1 → exclude,
-# kimi-* / moonshot → include, rest → exclude). Set explicitly when hitting
-# a 400 like "reasoning_content ... must be passed back to the API" or
-# "reasoning_content is missing in assistant tool call message".
-# reasoning_history = "include"  # or "exclude"
+
+# DeepSeek V4 专属：推理历史回显策略
+# (unset = auto-detect: deepseek-v4* → include, deepseek-reasoner/r1 → exclude)
+# reasoning_history = "include"  # 或 "exclude"
 # reasoning_effort = "high"
 
-# Per-turn datalog. Each turn writes a markdown summary; each LLM
-# round writes a JSON request/response pair under `<dir>/<project>/llm/`.
-# A per-project subdirectory is always appended under `dir` so multiple
-# projects never share a bucket.
-# - enabled = false        -> disable logging entirely
-# - dir = "~/.atomcode/datalog" -> default (follows $HOME, ignores /cd)
-# - dir = "/abs/path"      -> absolute, fixed (unaffected by /cd)
-# - dir = "rel/path"       -> joined with current working_dir, follows /cd
+# -------- 智谱 GLM-5.2（通过 Zhipu API）----------
+[providers.glm]
+type = "openai"
+api_key = "sk-..."
+model = "glm-5.2"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+context_window = 1000000
+max_tokens = 131072
+
+# 推理强度调节（high / max）
+# 参考：https://docs.z.ai/guides/llm/glm-5.2
+
+# -------- 智谱 GLM-5.2 1M 上下文（显式启用）----------
+# [providers."glm-5.2-1m"]
+# type = "openai"
+# api_key = "sk-..."
+# model = "glm-5.2[1m]"
+# base_url = "https://open.bigmodel.cn/api/paas/v4"
+# context_window = 1000000
+
+# -------- Claude（Anthropic）----------
+[providers.claude]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+base_url = "https://api.anthropic.com/v1"
+context_window = 200000
+
+# -------- OpenAI ----------
+[providers.openai]
+type = "openai"
+api_key = "sk-proj-..."
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+context_window = 128000
+
+# -------- Ollama（本地）----------
+[providers.ollama]
+type = "ollama"
+model = "qwen3:14b"
+base_url = "http://localhost:11434"
+context_window = 32000
+
+# -------- 通义千问 Qwen ----------
+[providers.qwen]
+type = "openai"
+api_key = "sk-..."
+model = "qwen-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+context_window = 131072
+
+# -------- SiliconFlow ----------
+[providers.siliconflow]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-ai/DeepSeek-V3"
+base_url = "https://api.siliconflow.cn/v1"
+context_window = 64000
+
+# -------- AtomGit CodingPlan（OAuth 自动配置）----------
+# /login 命令会自动写入，无需手动填写 api_key
+# 以下仅为展示格式，实际由系统自动生成。
+# [providers."AtomGit-GLM-5.2"]
+# type = "openai"
+# model = "GLM-5.2"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 1000000
+# max_tokens = 131072
+#
+# [providers."AtomGit-deepseek-v4-flash"]
+# type = "openai"
+# model = "deepseek-v4-flash"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 1000000
+#
+# [providers."AtomGit-Qwen-Qwen3-VL-8B-Instruct"]
+# type = "openai"
+# model = "Qwen/Qwen3-VL-8B-Instruct"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 64000
+
+# =============================================================================
+# 视觉预处理（当主 provider 不支持图片时，用此 provider 代为识别）
+# =============================================================================
+# vision_preprocessor_provider = "qwen-vl"
+
+# [providers."qwen-vl"]
+# type = "openai"
+# api_key = "sk-..."
+# model = "Qwen/Qwen3-VL-8B-Instruct"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 64000
+
+# =============================================================================
+# 多 provider 切换快捷键
+# =============================================================================
+# 在 TUI 中输入 /provider 打开 provider 管理界面
+# 输入 /model 在当前 provider 下切换模型
+
+# =============================================================================
+# 数据日志（每轮对话写入 Markdown 摘要 + JSON 请求/响应）
+# =============================================================================
 [datalog]
 enabled = true
 dir = "~/.atomcode/datalog"
 
-# Long-running task completion notifications.
-# Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),
-# then OS-native fallback when available (macOS osascript, Linux notify-send).
-# Windows mainly relies on BEL + terminal attention/taskbar flash.
-# `background_only` is best-effort: focus-aware terminal protocols honor it,
-# while some OS fallbacks may still notify even if AtomCode is focused.
+# =============================================================================
+# 通知
+# =============================================================================
 [notifications]
 enabled = true
 min_duration_secs = 8
@@ -40,13 +142,50 @@ system = true
 bell = true
 background_only = true
 
-# Network proxy policy shared by every outbound HTTP client.
-# - "follow_system" -> follow the launch environment / system proxy state
-# - "default_proxy" -> pin the values below and reuse them on later launches
-# - "no_proxy"      -> disable proxy resolution entirely
+# =============================================================================
+# 网络代理
+# =============================================================================
 [network.proxy]
 mode = "no_proxy"
 # http = "http://127.0.0.1:7890"
 # https = "http://127.0.0.1:7890"
 # all = "socks5://127.0.0.1:7890"
 # no_proxy = "localhost,127.0.0.1"
+
+# =============================================================================
+# Subagent 设置（并行子代理）
+# =============================================================================
+[subagent]
+enabled = true
+initial_turns = 4
+max_turns = 12
+max_concurrent = 3
+timeout_secs = 300
+
+# =============================================================================
+# LSP（语言服务器协议）
+# =============================================================================
+[lsp]
+enabled = false
+auto_detect = false
+diagnostics_settle_delay_ms = 150
+
+# =============================================================================
+# 插件
+# =============================================================================
+[plugin]
+auto_install_default_skills = true
+auto_update_marketplaces = true
+
+# =============================================================================
+# UI
+# =============================================================================
+[ui]
+theme = "auto"
+auto_copy_on_select = true
+
+# =============================================================================
+# 自动更新
+# =============================================================================
+auto_update = true
+auto_commit = false
