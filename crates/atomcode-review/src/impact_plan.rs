@@ -217,6 +217,13 @@ fn low_signal_file(path: &str) -> bool {
         || lower.ends_with("package-lock.json")
         || lower.ends_with("pnpm-lock.yaml")
         || lower.ends_with("yarn.lock")
+fn low_signal_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".lock")
+        || lower.ends_with("package-lock.json")
+        || lower.ends_with("pnpm-lock.yaml")
+        || lower.ends_with("yarn.lock")
+        || lower.ends_with("go.sum")
 }
 
 fn changed_code_line(line: &str) -> Option<&str> {
