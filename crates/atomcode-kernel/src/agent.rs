@@ -84,6 +84,10 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
+// "·" here mirrors atomcode-core's `provider::REASONING_PLACEHOLDER`. kernel is a
+// standalone crate with no dependency on atomcode-core (deliberate: core is the
+// retiring v1 stack), so the value is duplicated rather than imported. If that
+// placeholder ever changes, update this literal too.
 const REASONING_FILLER_MARKERS: &[&str] = &[
     "·",
     "(no reasoning detected)",
@@ -92,6 +96,10 @@ const REASONING_FILLER_MARKERS: &[&str] = &[
     "no reasoning recorded",
 ];
 
+// KEEP IN SYNC WITH crates/atomcode-core/src/turn/runner.rs `strip_reasoning_filler`
+// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
+// These are intentionally duplicated because kernel takes no dependency on core;
+// any bugfix here must be applied to the core copy as well.
 fn strip_reasoning_filler(reasoning: &str) -> String {
     let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
     for marker in REASONING_FILLER_MARKERS {

@@ -1670,6 +1670,10 @@ fn is_only_placeholder_filler(reasoning: &str) -> bool {
     strip_reasoning_filler(reasoning).trim().is_empty()
 }
 
+// KEEP IN SYNC WITH crates/atomcode-kernel/src/agent.rs `strip_reasoning_filler`
+// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
+// These are intentionally duplicated because kernel takes no dependency on core;
+// any bugfix here must be applied to the kernel copy as well.
 fn strip_reasoning_filler(reasoning: &str) -> String {
     const LEGACY_REASONING_FILLERS: &[&str] = &[
         crate::provider::REASONING_PLACEHOLDER,
