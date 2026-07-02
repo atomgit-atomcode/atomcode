@@ -676,11 +676,16 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
 /// 确保 relay-client 二进制可用。
 /// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
 fn ensure_relay_client_bin() -> Result<String, String> {
+    let bare_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+
     // 跳过下载标志
     if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
         let local = resolve_relay_client_bin();
-        // 查找本地
-        if local != "atomcode-relay-client" || std::path::Path::new(&local).is_file() {
+        if local != bare_name || std::path::Path::new(&local).is_file() {
             return Ok(local);
         }
         return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
@@ -689,11 +694,6 @@ fn ensure_relay_client_bin() -> Result<String, String> {
 
     // 1-3: 先尝试本地查找
     let local = resolve_relay_client_bin();
-    let bare_name = if cfg!(windows) {
-        "atomcode-relay-client.exe"
-    } else {
-        "atomcode-relay-client"
-    };
 
     // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
     if local != bare_name {
@@ -805,7 +805,16 @@ fn ensure_relay_client_bin() -> Result<String, String> {
         Err(e) => {
             let msg = format!(
                 "自动下载 relay-client 失败：{}\n\
-                 请手动安装：\n\
+                 \n\
+                 安全下载：\n\
+                 1. 打开浏览器访问\n\
+                    https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases\n\
+                 2. 下载对应平台的 binary\n\
+                 3. 保存到 ~/.atomcode/bin/atomcode-relay-client\n\
+                 4. chmod +x ~/.atomcode/bin/atomcode-relay-client\n\
+                 5. /app 重试\n\
+                 \n\
+                 快速安装：\n\
                  curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh\n\
                  && /app 重试",
                 e
