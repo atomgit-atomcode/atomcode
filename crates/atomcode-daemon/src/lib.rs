@@ -173,6 +173,11 @@ pub struct ChangeDirRequest {
     /// rewrite the configured default.
     #[serde(default)]
     pub set_default: bool,
+    /// 可选：切换目录的同时恢复该项目下的指定会话（手机 App 点开历史对话）。
+    /// Some 时广播 SessionSwitched（TUI 跟随 cd + 恢复该会话）而非
+    /// WorkingDirChanged（cd + 开新会话）。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Response after changing directory
@@ -1389,11 +1394,21 @@ async fn change_dir(
             error_data: None,
         });
 
-        // Broadcast to other in-process views (sync-mode TUI) so they follow the
-        // switch: change cwd + open a fresh session in the new dir. No-op when no
-        // LiveSession is attached (headless daemon). Cross-process clients are not
-        // covered — that would need a /live SSE wire event + client subscription.
+        // 广播工作目录变更给同进程视图（sync 模式 TUI 跟随切目录）。无 LiveSession
+        // 附着（headless daemon）时静默跳过。
         crate::live_api::live_set_working_dir(new_path.clone());
+        // 手机点开历史对话时带 session_id：再用官方的会话切换原语广播切到该会话，
+        // 配合 App 侧 /live?session_id= 重连，两端落到同一会话。空则只切目录。
+        if let Some(sid) = req
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            crate::live_api::live_switch_session(
+                atomcode_core::session::SessionId::from_string(sid.to_string()),
+            );
+        }
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -3783,6 +3798,89 @@ pub fn stop_server() -> String {
 }
 
 // ============================================================================
+// App 远程访问：进程内 server（无 token / 不开浏览器），配合 TUI `/app` 命令
+// ============================================================================
+
+/// `/app` 进程内 server 的默认端口。刻意错开 webui(13457)与独立守护(13456)，
+/// 三者各占一端口、互不踩；被占时由 [bind_scanning] 向上扫描。
+pub const APP_DEFAULT_PORT: u16 = 13458;
+
+struct AppServerHandle {
+    port: u16,
+    host: String,
+    abort: tokio::task::AbortHandle,
+}
+
+static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex::new(None);
+
+/// 起一个进程内 server 供移动端 App 经中继访问，返回 `(bound_host, actual_port)`。
+///
+/// 与 `/webui` 的关键区别：
+/// - **daemon 模式**（`webui_tokens=None` → `enforce_token=false`）：App 的 Cloud 模式
+///   只发 `X-Atom-Token`（中继路由用），不发 `Authorization: Bearer`；鉴权边界落在
+///   中继的 route token + 本机回环绑定（server 只听 127.0.0.1，仅本机隧道可达）。
+/// - **不开浏览器**：App 用二维码配对，不需要打开网页。
+///
+/// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session]），所以
+/// TUI / 浏览器 / App 看到的是**同一段对话**，双向实时同步。
+pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), String> {
+    // 复用仍在运行的实例（含其绑定地址/端口）。
+    let reuse = {
+        let guard = APP_SERVER.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|h| !h.abort.is_finished())
+            .map(|h| (h.port, h.host.clone()))
+    };
+    if let Some((p, h)) = reuse {
+        return Ok((h, p));
+    }
+
+    let (listener, actual_port) = bind_scanning(host, port, 100)
+        .await
+        .map_err(|e| format!("绑定 {host}:{port} 失败（{e}）"))?;
+    let opts = ServerOpts {
+        host: host.to_string(),
+        port: actual_port,
+        cli_override: CliOverride::default(),
+        // 随主程序常驻，关闭 idle 看门狗。
+        idle_timeout_secs: 0,
+        startup_mode: SessionMode::Webui,
+        // None → enforce_token=false（daemon 模式，不要 Bearer）。
+        webui_tokens: None,
+        // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
+        quiet: true,
+        working_dir_override: std::env::current_dir().ok(),
+        prebound_listener: Some(listener),
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = run_server(opts).await {
+            eprintln!("app server error: {e}");
+        }
+    });
+    {
+        let mut guard = APP_SERVER.lock().unwrap();
+        *guard = Some(AppServerHandle {
+            port: actual_port,
+            host: host.to_string(),
+            abort: task.abort_handle(),
+        });
+    }
+    Ok((host.to_string(), actual_port))
+}
+
+/// 停止 `/app` 进程内 server（若在运行）。返回是否确实停了一个。
+pub fn stop_app_server() -> bool {
+    let mut guard = APP_SERVER.lock().unwrap();
+    if let Some(handle) = guard.take() {
+        handle.abort.abort();
+        true
+    } else {
+        false
+    }
+}
+
+// ============================================================================
 // GET /tunnel/status — 远程访问探测（蒲公英 Oray PGY + 绑定可达性 + 二维码）
 // ============================================================================
 
@@ -4298,6 +4396,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
+        .route("/live/cancel", post(live_api::live_cancel))
+        .route("/live/command", post(live_api::live_command))
         .route(
             "/live/switch_session",
             post(live_api::live_switch_session_endpoint),

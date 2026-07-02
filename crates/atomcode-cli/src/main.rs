@@ -2533,7 +2533,8 @@ async fn run_headless(
             | AgentEvent::PeerBusy(_)
             | AgentEvent::ProviderChanged(_)
             | AgentEvent::ProjectSwitched(_)
-            | AgentEvent::SessionSwitched(_) => {
+            | AgentEvent::SessionSwitched(_)
+            | AgentEvent::RemoteSlashCommand(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
             AgentEvent::GoalUpdate { .. } => {

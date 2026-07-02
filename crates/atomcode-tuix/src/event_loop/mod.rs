@@ -913,6 +913,9 @@ pub struct LoopCtx {
     pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
     /// live 转发任务句柄（分离同步时 abort）。
     pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
+    /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
+    pub app_relay_child: Option<tokio::process::Child>,
     /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
     /// / non-TTY). The onboarding wizard checks this — plain mode can't
     /// run interactive multi-step flows, so first-run falls through to
@@ -8870,8 +8873,38 @@ fn handle_agent_event(
             // `cd`, conversation preserved). No-op when already there to avoid
             // resetting on a redundant broadcast.
             if ctx.working_dir != new_dir {
-                commands::apply_cd(ctx, new_dir);
+                commands::apply_cd(ctx, new_dir.clone());
+                // 新项目的会话要存进新项目的 hash 目录。session_manager 只在启动
+                // 时按初始目录构建，不重建的话切项目后的新会话会写进旧项目，
+                // /resume 与手机端项目列表都会在错误的项目下看到它。
+                ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
                 commands::reset_to_new_session(ctx, state, renderer);
+            }
+        }
+        AgentEvent::RemoteSlashCommand(line) => {
+            // 手机端发来的斜杠命令：只放行只读信息类白名单（status/cost/whoami/
+            // diff），在桌面同样渲染一份（让桌面用户知道手机做了什么），输出经
+            // CommandOutput 广播回手机。交互式/桌面专属命令礼貌拒绝。
+            let display = format!("/{}", line.trim().trim_start_matches('/'));
+            match commands::run_remote_command(ctx, state, &line) {
+                Some(txt) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "（手机端执行 {display}）"
+                    )));
+                    renderer.render(UiLine::CommandOutput(txt.clone()));
+                    renderer.flush();
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!("{display}\n{txt}"));
+                    }
+                }
+                None => {
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!(
+                            "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
+                             /status /cost /whoami /diff）"
+                        ));
+                    }
+                }
             }
         }
         AgentEvent::ContextStats {
@@ -9295,16 +9328,10 @@ fn handle_agent_event(
             if running {
                 state.on_submit();
             } else {
-                // Peer's turn finished. In sync mode this is the ONLY
-                // turn-completion signal we get (the forwarder never sends
-                // AgentEvent::TurnComplete), so do the stream finalization
-                // TurnComplete normally performs:
-                //  1. Flush the buffered assistant line. A short reply with no
-                //     trailing newline (e.g. "在的！") otherwise stays parked in
-                //     the renderer's assistant_line_buf and never reaches
-                //     scrollback — the blank-assistant-bubble bug in sync mode.
-                //  2. Reset the <think> stripper between turns so a model that
-                //     left it inside=true can't swallow the next turn's text.
+                // 对端轮次结束:把流式累积的助手行收尾落地(等价本地 TurnComplete
+                // 的第一步 AssistantLineBreak),否则短回复(如"在的!")一直挂在
+                // 流式当前行不提交,要等下一轮才一起刷出 —— sync 模式下的空助手气泡
+                // bug。同时 reset think-stripper,避免上一轮残留吞掉下一轮文本。
                 renderer.render(UiLine::AssistantLineBreak);
                 renderer.flush();
                 think.reset();

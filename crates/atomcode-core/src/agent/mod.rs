@@ -436,6 +436,11 @@ pub enum AgentEvent {
     /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
     /// so an agent-driven `cd` mid-task never wipes the conversation.
     ProjectSwitched(PathBuf),
+    /// The mobile app asked the desktop TUI to run a slash command (e.g.
+    /// `/status`). Whitelist-checked on the TUI side; the textual output is
+    /// broadcast back via `LiveEvent::CommandOutput`. Delivered over the
+    /// live-sync channel (`LiveEvent::RemoteCommand` → here).
+    RemoteSlashCommand(String),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.

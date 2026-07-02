@@ -53,6 +53,13 @@ pub enum LiveEvent {
     /// 任一视图（webui）创建了新会话并切换到它。其余视图据此同步创建新会话。
     /// 参数为新会话 ID。
     SessionSwitched(String),
+    /// 手机 App 请求在桌面 TUI 执行一条斜杠命令（如 `/status`）。仅进程内广播
+    /// （to_wire 跳过）；TUI 侧白名单校验后执行，输出经
+    /// [`LiveEvent::CommandOutput`] 广播回所有视图。
+    RemoteCommand(String),
+    /// 斜杠命令的文本输出（如 `/status` 的状态报告）。TUI 执行命令时广播，
+    /// 手机/webui 据此显示一条系统消息。不进 turn 回放缓冲（非对话内容）。
+    CommandOutput(String),
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
@@ -86,11 +93,20 @@ pub struct LiveSession {
     events: broadcast::Sender<LiveEvent>,
     input_tx: mpsc::UnboundedSender<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
-    /// Cancellation token for the turn currently owned by the coordinator.
-    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
     /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    /// 当前运行中 turn 的取消令牌。协调器在 turn 开始时填入、结束时清空；
+    /// 任一视图调用 [`LiveSession::cancel_turn`] 即可中断正在跑的回合(停止生成)。
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// 进行中 turn 的事件回放缓冲：`StateChanged(Running)` + 本回合全部 Turn 事件
+    /// （文本增量/工具/审批…）。turn 边界清空——此时内容已并入 `snapshot`。
+    /// 供晚加入的视图（手机回前台重连、新开 webui tab）在 snapshot 之后重放，
+    /// 恢复进行中回合的执行过程；snapshot 只在 turn 边界更新，没有这个缓冲，
+    /// 中途断开重连就会丢掉当前回合已发生的一切。
+    /// 不含 `UserMessage`（用户消息在投递时即写入 snapshot，重放会重复）。
+    /// 锁序：`conversation` → `snapshot` → `turn_buffer`。
+    turn_buffer: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
 }
 
 impl LiveSession {
@@ -113,6 +129,7 @@ impl LiveSession {
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
         let current_cancel = Arc::new(Mutex::new(None));
         let approver = Arc::new(Mutex::new(None));
+        let turn_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let session = Arc::new(Self {
             snapshot: snapshot.clone(),
@@ -121,6 +138,7 @@ impl LiveSession {
             turn_state: turn_state.clone(),
             current_cancel: current_cancel.clone(),
             approver: approver.clone(),
+            turn_buffer: turn_buffer.clone(),
         });
 
         tokio::spawn(coordinator(
@@ -132,6 +150,7 @@ impl LiveSession {
             turn_state,
             current_cancel,
             approver,
+            turn_buffer,
         ));
 
         session
@@ -149,6 +168,27 @@ impl LiveSession {
         let snap = self.snapshot.lock().await.clone();
         let rx = self.events.subscribe();
         (snap, rx)
+    }
+
+    /// 晚加入（带回放）：原子地拿「已提交快照 + 进行中回合的事件回放 + 实时订阅」。
+    /// 回放区只含 snapshot 里没有的部分（当前回合的 `StateChanged(Running)` 与
+    /// Turn 事件）；视图按 snapshot → replay → rx 顺序消费即可无缝恢复进行中的
+    /// 回合（工具卡片、流式文本、待审批请求）。无进行中回合时 replay 为空。
+    ///
+    /// 不丢不重的保证：转发器「入缓冲+上广播」与这里「订阅+克隆缓冲」持同一把
+    /// `turn_buffer` 锁——任一事件要么已在克隆里、要么会从 rx 收到，二者互斥。
+    pub async fn join_with_replay(
+        &self,
+    ) -> (Vec<Message>, Vec<LiveEvent>, broadcast::Receiver<LiveEvent>) {
+        let snap = self.snapshot.lock().await.clone();
+        let buf = self
+            .turn_buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let rx = self.events.subscribe();
+        let replay = buf.clone();
+        drop(buf);
+        (snap, replay, rx)
     }
 
     /// 已提交消息快照（turn 边界更新）。
@@ -201,6 +241,18 @@ impl LiveSession {
         self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
     }
 
+    /// 广播「请在桌面 TUI 执行这条斜杠命令」（手机 App 发起）。返回 false 表示
+    /// 无订阅者——通常意味着没有 TUI 附着（headless daemon），命令无人执行。
+    pub fn notify_remote_command(&self, line: String) -> bool {
+        self.events.send(LiveEvent::RemoteCommand(line)).is_ok()
+    }
+
+    /// 广播一条斜杠命令的文本输出给所有视图（TUI 执行 `/status` 等命令时调用）。
+    /// 返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_command_output(&self, text: String) -> bool {
+        self.events.send(LiveEvent::CommandOutput(text)).is_ok()
+    }
+
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
     ///
     /// 通道在整个回合内保持注册（**不**取走 sender）：同一回合里 TurnRunner 可能
@@ -218,6 +270,19 @@ impl LiveSession {
             false
         }
     }
+
+    /// 取消当前正在运行的 turn(停止生成)。无运行中 turn 时返回 false。
+    /// 真正的中断由协调器为本回合登记的 [`CancellationToken`] 驱动 —— 执行器
+    /// 的 `run_turn` 把它透传给 TurnRunner,模型流随之中止。任一视图(手机 /
+    /// webui / TUI)都可调用,先到先停。
+    pub async fn cancel_turn(&self) -> bool {
+        if let Some(tok) = self.current_cancel.lock().await.as_ref() {
+            tok.cancel();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// 协调器：单写者跑 turn。
@@ -230,6 +295,7 @@ async fn coordinator(
     turn_state: Arc<Mutex<TurnState>>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    turn_buffer: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
 ) {
     // Diagnostics via `ctrace!` (file sink, gated by ATOMCODE_TRACE), never
     // eprintln: under /webui this coordinator runs in the TUI process, so a
@@ -251,9 +317,14 @@ async fn coordinator(
             *st = TurnState::Running;
         }
         crate::ctrace!("LIVE", "coordinator ACCEPTED input, broadcasting StateChanged(Running)");
-        let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
-        let cancel = CancellationToken::new();
-        *current_cancel.lock().await = Some(cancel.clone());
+        // 回合开始：清回放缓冲并记入 Running——锁内一并广播，与
+        // join_with_replay 的「订阅+克隆」互斥，保证晚加入者不丢不重。
+        {
+            let mut buf = turn_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.clear();
+            buf.push(LiveEvent::StateChanged(TurnState::Running));
+            let _ = events.send(LiveEvent::StateChanged(TurnState::Running));
+        }
 
         // 先即时回显用户消息（原始文本 + 原图），让发送方立刻看到自己的输入，不被随后
         // 可能较慢的 VL 预处理阻塞——否则带图发送会「发出后很久没反应」。
@@ -305,19 +376,50 @@ async fn coordinator(
         }
 
         // 跑一次 turn（执行器内部持 conv 锁修改并广播 Turn 事件）。
+        // 为本回合建取消令牌并登记,供 cancel_turn 中断;turn 结束后清空。
+        //
+        // 执行器的事件经 tap 通道转发：先记入回放缓冲、再上公共广播——与
+        // join_with_replay 持同一把 turn_buffer 锁，晚加入者拿到的「缓冲克隆 +
+        // 订阅」不丢不重。run_turn 返回前会排干自己的内部转发（见
+        // DaemonTurnExecutor），届时 tap 发送端全部释放、本转发器随之退出。
+        let (tap_tx, mut tap_rx) = broadcast::channel::<LiveEvent>(BROADCAST_CAPACITY);
+        let fwd_buffer = turn_buffer.clone();
+        let fwd_events = events.clone();
+        let forwarder = tokio::spawn(async move {
+            loop {
+                match tap_rx.recv().await {
+                    Ok(ev) => {
+                        let mut buf = fwd_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        buf.push(ev.clone());
+                        let _ = fwd_events.send(ev);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let cancel = CancellationToken::new();
+        *current_cancel.lock().await = Some(cancel.clone());
         executor
-            .run_turn(&conversation, events.clone(), approver.clone(), cancel)
+            .run_turn(&conversation, tap_tx.clone(), approver.clone(), cancel)
             .await;
-
         *current_cancel.lock().await = None;
+        // 关闭 tap 并等转发器排干：保证本回合事件都已入缓冲/广播，
+        // 再做下面的边界清空，否则迟到事件会留在缓冲里被永远重放。
+        drop(tap_tx);
+        let _ = forwarder.await;
 
         // turn 结束：清空审批槽（防止旧通道被下一个 turn 误用）。
         *approver.lock().await = None;
 
-        // turn 结束：刷新已提交快照、置 Idle。
+        // turn 结束：刷新已提交快照、清回放缓冲（同临界区——回合内容此刻起
+        // 由 snapshot 承载，晚加入者拿到「全量快照 + 空回放」，不会重复）。
         {
             let conv = conversation.lock().await;
-            *snapshot.lock().await = conv.messages.clone();
+            let mut snap = snapshot.lock().await;
+            let mut buf = turn_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            *snap = conv.messages.clone();
+            buf.clear();
         }
         // 排空 turn 执行期间堆积的输入（不排队，避免乱序）；逐条给出忽略提示，
         // 与运行中守卫的反馈一致，避免静默丢弃。
@@ -483,6 +585,47 @@ mod tests {
         let (snap, _rx) = session.join().await;
         assert_eq!(snap.len(), 1, "晚加入应拿到既有快照");
         assert_eq!(snap[0].text(), Some("seed"));
+    }
+
+    /// 中途加入（手机退后台回来重连）：join_with_replay 必须能补回当前回合
+    /// 已发生的执行过程（Running + 已广播的 Turn 事件），且回合结束后缓冲清空。
+    #[tokio::test]
+    async fn join_with_replay_recovers_in_flight_turn_and_clears_at_boundary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn TurnExecutor> =
+            Arc::new(FakeExecutor { calls: calls.clone(), reply: "hi".into(), delay_ms: 120 });
+        let session = LiveSession::new(exec, Vec::new());
+        let mut rx = session.subscribe();
+
+        assert!(session.send_input(UserInput { text: "你好".into(), images: vec![] }));
+        // 等 TextDelta 上广播（FakeExecutor 先发增量再 sleep），此刻回合仍在进行。
+        loop {
+            if let Ok(LiveEvent::Turn(TurnEvent::TextDelta(_))) = rx.recv().await {
+                break;
+            }
+        }
+
+        // 模拟断线后重连：此刻加入应拿到 Running + TextDelta 的回放。
+        let (snap, replay, _rx2) = session.join_with_replay().await;
+        assert_eq!(snap.len(), 1, "进行中：快照只含用户消息（turn 未到边界）");
+        assert!(
+            matches!(replay.first(), Some(LiveEvent::StateChanged(TurnState::Running))),
+            "回放首条应为 Running，让重连方恢复 streaming 状态"
+        );
+        assert!(
+            replay.iter().any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")),
+            "回放应包含已发生的文本增量"
+        );
+        assert!(
+            !replay.iter().any(|e| matches!(e, LiveEvent::UserMessage { .. })),
+            "用户消息已在快照里，回放不应重复携带"
+        );
+
+        // 回合收尾后：内容并入快照，回放缓冲应清空。
+        let _ = drain_until_idle(&mut rx).await;
+        let (snap, replay, _rx3) = session.join_with_replay().await;
+        assert_eq!(snap.len(), 2, "收尾后快照含完整回合");
+        assert!(replay.is_empty(), "边界处缓冲应已清空，避免重复回放");
     }
 
     #[tokio::test]

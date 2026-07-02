@@ -124,6 +124,17 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
 - **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
 
+### App Remote Access
+
+- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the AtomCode mobile app from any network to connect to your current session
+- **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
+- **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
+- **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
+- **Remote commands** — the phone can run `/status`, `/cost`, `/diff`, `/whoami` etc., which execute on the desktop and echo results back
+- **Switch projects / sessions** — switch projects or open a history session on the phone, and the desktop follows immediately
+- **Model sync** — switching models on either end keeps the other in sync
+- **`/app stop`** disconnects remote access
+
 ### Safety
 
 - **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval

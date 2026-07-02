@@ -76,6 +76,9 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
     Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
     Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
+    // needs_args=true：补全只到 `/app `，让用户可追加中继地址或 `stop` 再回车。
+    // 裸 `/app ` + 回车则用环境变量 ATOMCODE_APP_RELAY。
+    Command { name: "app",     desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
