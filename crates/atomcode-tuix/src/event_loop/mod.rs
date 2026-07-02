@@ -9447,13 +9447,13 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SessionRenamed { name } => {
-            // daemon AI 给当前活动会话改了名（via `/rename` or auto-namer）。
-            // 更新会话对象，保存到磁盘，选择器等 UI 看到新名。
+            // AI session-namer renamed the active session (fire-and-forget after
+            // the first turn, or mirrored from a daemon session). Apply only if
+            // the session is still auto-named and the user hasn't renamed it —
+            // never clobber an explicit `/rename`. The next loop iteration's
+            // `sync_terminal_title` picks up the new name for the tab title.
             crate::tuix_trace!("TUI", "SessionRenamed: name={}", name);
-            ctx.current_session.name = name.clone();
-            ctx.current_session.touch();
-            // 同步保存失败无碍（用户只是看不到最新名字直到重启）。
-            let _ = ctx.session_manager.save(&ctx.current_session);
+            apply_ai_session_name(ctx, name, renderer);
         }
         AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
             // Non-error pause line: dim/plain body row, never red.
@@ -9467,6 +9467,27 @@ fn handle_agent_event(
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
+    }
+}
+
+/// Apply an AI-generated session name if the session is still auto-named and
+/// not user-renamed. Saves directly (NOT via `apply_session_snapshot`, which
+/// would re-truncate the name). Auto-name semantics: does NOT set
+/// `user_renamed`, so a later explicit `/rename` still wins.
+fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Renderer) {
+    if !atomcode_core::agent::session_title::should_accept_ai_name(
+        &ctx.current_session.name,
+        ctx.current_session.user_renamed,
+    ) {
+        return;
+    }
+    ctx.current_session.name = name;
+    ctx.current_session.touch();
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+        renderer.render(UiLine::Error(format!("session save failed: {e}")));
+        renderer.flush();
     }
 }
 
@@ -9649,6 +9670,14 @@ mod session_naming_tests {
         assert!(!is_synthetic_user_text("Fix the auth bug in login.rs"));
         assert!(!is_synthetic_user_text("Continue."));
         assert!(!is_synthetic_user_text("(why does this break?)"));
+    }
+
+    #[test]
+    fn ai_rename_applies_only_when_still_placeholder_and_not_user_renamed() {
+        use atomcode_core::agent::session_title::should_accept_ai_name;
+        assert!(should_accept_ai_name("session-1", false));
+        assert!(!should_accept_ai_name("session-1", true));
+        assert!(!should_accept_ai_name("My name", false));
     }
 }
 
