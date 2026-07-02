@@ -1565,55 +1565,6 @@ mod buffer_tests {
     }
 
     #[test]
-    fn spinner_shows_reasoning_char_count_as_liveness_signal() {
-        // GLM-style models stream a long HIDDEN reasoning phase; the footer used to
-        // show only "Cogitating… · 12m22s", indistinguishable from a hang. A live
-        // count of streamed reasoning chars proves the model is actively producing.
-        let mut s = UiState::new();
-        s.on_submit(); // thinking label, no reasoning yet
-        let count_frag = crate::i18n::fmt_tokens(1234); // "1.23K"
-        assert!(
-            !format_spinner_label(&s, 0, None).contains(&count_frag),
-            "no reasoning yet → no thinking-count segment"
-        );
-
-        // Reasoning streams in.
-        s.note_reasoning_chars(1234);
-        let label = format_spinner_label(&s, 0, None);
-        assert!(label.contains(&count_frag), "want reasoning count in {label:?}");
-
-        // The elapsed time must stay dead LAST so the count's width changes never
-        // push it around (user: "时间应该放在后面，不然这行会跳跃").
-        let parts: Vec<&str> = label.split(" · ").collect();
-        let count_idx = parts
-            .iter()
-            .position(|p| p.contains(&count_frag))
-            .expect("count segment present");
-        assert!(
-            count_idx < parts.len() - 1,
-            "count must precede the trailing elapsed segment: {parts:?}"
-        );
-    }
-
-    #[test]
-    fn reasoning_count_hidden_during_tool_execution() {
-        // The count is a THINKING-phase liveness signal only. Once a tool call is
-        // being prepared/run, the body ▸ row carries progress — the footer must not
-        // keep flashing a stale reasoning count.
-        let mut s = UiState::new();
-        s.on_submit();
-        s.note_reasoning_chars(2000);
-        let count_frag = crate::i18n::fmt_tokens(2000);
-        assert!(format_spinner_label(&s, 0, None).contains(&count_frag));
-
-        s.on_tool_call_streaming("EditFile");
-        assert!(
-            !format_spinner_label(&s, 0, None).contains(&count_frag),
-            "reasoning count must vanish once a tool is being prepared"
-        );
-    }
-
-    #[test]
     fn small_paste_inserts_inline() {
         let mut b = Buffer::new();
         b.insert_paste("hi\n".to_string());
@@ -8015,10 +7966,6 @@ fn handle_agent_event(
             // visibility — the blank-turn notice uses it to say "only reasoning,
             // press Ctrl+O" vs "no output at all".
             state.turn_saw_reasoning = true;
-            // Accumulate a live char count for the footer liveness segment — even
-            // when reasoning is HIDDEN (show_reasoning off), so a long think shows
-            // "thinking N" ticking up instead of a silent, hang-looking spinner.
-            state.note_reasoning_chars(text.chars().count());
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -9969,19 +9916,6 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
-    }
-    // Reasoning liveness: during the HIDDEN reasoning phase, a live count of streamed
-    // reasoning chars proves the model is actively producing (a 12-minute GLM think
-    // otherwise reads as a hang). Gated to thinking labels only (see
-    // `reasoning_activity`), and placed BEFORE the elapsed so the ticking time stays
-    // dead last and the count's width changes never shift it.
-    if let Some(chars) = state.reasoning_activity() {
-        out.push_str(&format!(
-            " · {}",
-            crate::i18n::t(crate::i18n::Msg::SpinnerThinking {
-                count: &crate::i18n::fmt_tokens(chars),
-            })
-        ));
     }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall

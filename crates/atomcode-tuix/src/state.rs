@@ -179,10 +179,6 @@ pub struct UiState {
     /// regardless of `show_reasoning`. Reset at turn start/end. Lets the blank-
     /// turn notice say "only reasoning, press Ctrl+O" vs "no output at all".
     pub turn_saw_reasoning: bool,
-    /// Chars of reasoning streamed this turn (accumulates across rounds). Drives the
-    /// footer "thinking N" liveness segment during the HIDDEN reasoning phase, so a
-    /// long GLM-style think doesn't read as a hang. Display-only; reset per turn.
-    pub reasoning_chars: usize,
     /// Verbatim accumulation of the CURRENT/most-recent assistant reply's
     /// visible markdown (post think-strip), reassembled from `TextDelta`s.
     /// `/copy` extracts fenced code blocks from this — it must read the
@@ -427,7 +423,6 @@ impl UiState {
             turn_cached_tokens: 0,
             turn_rendered_visible_text: false,
             turn_saw_reasoning: false,
-            reasoning_chars: 0,
             last_assistant_response: String::new(),
             response_finalized: false,
             prior_phase: None,
@@ -619,24 +614,6 @@ impl UiState {
         }
     }
 
-    /// Accumulate streamed reasoning chars for the current turn (drives the footer
-    /// liveness segment). Called per `ReasoningDelta` regardless of `show_reasoning`.
-    pub fn note_reasoning_chars(&mut self, chars: usize) {
-        self.reasoning_chars = self.reasoning_chars.saturating_add(chars);
-    }
-
-    /// Reasoning chars to advertise in the footer, or `None` when the segment should
-    /// be hidden. Shown ONLY while the spinner is on a thinking label — during tool
-    /// prep/exec (`Preparing X`/`Running X`) the body `▸` row carries progress, so a
-    /// stale reasoning count must not linger in the footer.
-    pub(crate) fn reasoning_activity(&self) -> Option<usize> {
-        if self.reasoning_chars > 0 && THINKING_LABELS.contains(&self.spinner_label.as_str()) {
-            Some(self.reasoning_chars)
-        } else {
-            None
-        }
-    }
-
     pub fn on_submit(&mut self) {
         self.phase = UiPhase::Streaming;
         self.spinner_label = self.current_thinking().to_string();
@@ -649,7 +626,6 @@ impl UiState {
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.reasoning_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -670,7 +646,6 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.reasoning_chars = 0;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -691,7 +666,6 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.reasoning_chars = 0;
     }
 
     pub fn on_error(&mut self) {
@@ -705,7 +679,6 @@ impl UiState {
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.reasoning_chars = 0;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —

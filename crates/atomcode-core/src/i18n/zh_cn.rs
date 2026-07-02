@@ -913,7 +913,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
-        Msg::SpinnerThinking { count } => format!("思考 {count}字").into(),
         Msg::Compacting => "正在压缩…".into(),
         Msg::CompactingSlow => "正在压缩…（较慢）".into(),
         Msg::CompactMarkDrain { messages, before, after } =>
