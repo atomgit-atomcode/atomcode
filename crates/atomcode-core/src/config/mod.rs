@@ -243,6 +243,10 @@ fn default_auto_copy_code_blocks() -> bool {
     false
 }
 
+fn default_ai_session_naming() -> bool {
+    true
+}
+
 /// UI section of the config — currently just the theme switch driving
 /// the TUIX colour palette. Persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +271,10 @@ pub struct UiConfig {
     /// `theme`), so a change takes effect on restart, not via `/reload`.
     #[serde(default = "default_auto_copy_code_blocks")]
     pub auto_copy_code_blocks: bool,
+    /// AI-generate the session name from the first turn (default on). When
+    /// off, the session keeps the truncation name.
+    #[serde(default = "default_ai_session_naming")]
+    pub ai_session_naming: bool,
 }
 
 impl Default for UiConfig {
@@ -275,6 +283,7 @@ impl Default for UiConfig {
             theme: UiTheme::default(),
             auto_copy_on_select: default_auto_copy_on_select(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
+            ai_session_naming: default_ai_session_naming(),
         }
     }
 }
@@ -485,6 +494,15 @@ fn default_true() -> bool {
 }
 fn default_notification_min_duration_secs() -> u64 {
     8
+}
+
+/// True when AI session naming should run. Env `ATOMCODE_AI_SESSION_NAMING`
+/// ("0"/"false"/"off" ⇒ disabled) overrides the config value.
+pub fn ai_session_naming_enabled(cfg: &Config) -> bool {
+    match std::env::var("ATOMCODE_AI_SESSION_NAMING") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Err(_) => cfg.ui.ai_session_naming,
+    }
 }
 
 impl Default for DatalogConfig {
@@ -812,6 +830,18 @@ mod tests {
         // A config that omits the key (older configs) also lands OFF.
         let ui: UiConfig = toml::from_str("theme = \"dark\"").unwrap();
         assert!(!ui.auto_copy_code_blocks, "missing key → default off");
+    }
+
+    #[test]
+    fn ai_session_naming_defaults_true() {
+        let ui = UiConfig::default();
+        assert!(ui.ai_session_naming);
+    }
+
+    #[test]
+    fn ai_session_naming_enabled_respects_config() {
+        let cfg = Config::default();
+        assert!(ai_session_naming_enabled(&cfg));
     }
 
     /// Migration: on-disk config that looks like it was auto-written by
