@@ -7916,6 +7916,54 @@ mod tool_output_stream_gate_tests {
     }
 }
 
+/// Determine whether the Ctrl+O hint should be shown for a tool call.
+///
+/// The hint appears only for bash commands when real-time output is
+/// disabled and the call is not a local-shell (-prefixed) invocation.
+/// Extracted as a pure function so the gating logic can be unit-tested
+/// independently of 's rendering infrastructure.
+fn should_show_ctrl_o_hint(tool_name: &str, verbose: bool, call_id: &str) -> bool {
+    tool_name == "bash" && !verbose && !call_id.starts_with("local-shell-")
+}
+
+#[cfg(test)]
+mod ctrl_o_hint_gating_tests {
+    use super::should_show_ctrl_o_hint;
+
+    #[test]
+    fn shown_for_bash_without_verbose() {
+        // Normal case: bash command, verbose off → show hint
+        assert!(should_show_ctrl_o_hint("bash", false, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_when_verbose_on() {
+        // Verbose already on → hint not needed
+        assert!(!should_show_ctrl_o_hint("bash", true, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_for_non_bash_tools() {
+        // Non-bash tools don't stream output
+        assert!(!should_show_ctrl_o_hint("read_file", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("edit_file", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("grep", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("glob", false, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_for_local_shell() {
+        // Local shell () always streams — no hint needed
+        assert!(!should_show_ctrl_o_hint("bash", false, "local-shell-7"));
+    }
+
+    #[test]
+    fn suppressed_when_verbose_and_local_shell() {
+        // Both conditions simultaneously
+        assert!(!should_show_ctrl_o_hint("bash", true, "local-shell-3"));
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -8054,6 +8102,25 @@ fn handle_agent_event(
                 name: display.clone(),
                 detail: detail.clone(),
             });
+            // Show hint for bash commands if real-time output is disabled.
+            // Placed HERE (at ToolCallStarted) rather than at ToolCallResult
+            // (where it was before), so users see it WHILE the command is
+            // running — pressing Ctrl+O actually streams live chunks.
+            // The old placement after ToolCallResult meant the command had
+            // already finished and no more ToolOutputChunk events were coming,
+            // so pressing Ctrl+O showed the "enabled" banner but no output.
+            if should_show_ctrl_o_hint(&name, state.show_tool_output, &id) {
+                let reset = "[0m";
+                let mute = if crate::highlight::theme::is_light_for_render() {
+                    "[90m"
+                } else {
+                    "[2m"
+                };
+                renderer.render(UiLine::CommandOutput(format!(
+                    "{mute}  ○ Press Ctrl+o to show real-time output while running{reset}
+",
+                )));
+            }
             renderer.flush();
 
             // Mark as rendered so ToolCallResult doesn't emit it again.
@@ -8264,30 +8331,7 @@ fn handle_agent_event(
                     renderer.render(UiLine::DiffBlock(diff_entries));
                 }
             }
-            // Show hint for bash commands if real-time output is disabled.
-            // Display AFTER the result so user sees the command first.
-            // Trailing `\n` is intentional: `push_body_text` splits on
-            // `\n` and the empty chunk after the `\n` pushes ONE blank
-            // row, which becomes the breathing-room separator between
-            // consecutive bash blocks. Without it adjacent bash results
-            // visually run together (screenshot 47.png) and the eye
-            // can't tell where one block ends and the next begins.
-            // The previous over-correction (screenshot 44 → 47) showed
-            // that "looks like 2 blank lines" is just font line-height
-            // padding — the actual row count is 1, which is correct.
-            if name == "bash" && !state.show_tool_output && !call_id.starts_with("local-shell-") {
-                // Use muted style matching ToolResult's summary_style:
-                // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
-                let reset = "\x1b[0m";
-                let mute = if crate::highlight::theme::is_light_for_render() {
-                    "\x1b[90m"
-                } else {
-                    "\x1b[2m"
-                };
-                renderer.render(UiLine::CommandOutput(format!(
-                    "{mute}  ○ Press Ctrl+o to show real-time output{reset}\n",
-                )));
-            }
+            // Flush any pending diff renders before the next event.
             renderer.flush();
             let _ = name;
         }

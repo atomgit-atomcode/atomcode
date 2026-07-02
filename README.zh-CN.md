@@ -603,6 +603,7 @@ cargo install --path crates/atomcode-cli
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 
 ## 社区交流
+---
 
 用微信扫描下方二维码加入 AtomCode 用户群，反馈问题、分享使用心得，和其他用户、维护者一起交流：
 
@@ -610,8 +611,19 @@ cargo install --path crates/atomcode-cli
   <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode 微信用户群二维码" width="220">
 </p>
 
-## 许可证
 
+## 打赏
+---
+
+☕ AtomCode 免费用，Coding Plan 也不收费。如果它帮你省下了一点时间，欢迎请作者喝杯咖啡，让我们更有动力把它做下去。
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
+  <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
+</p>
+
+
+## 许可证
 MIT License。详见 [LICENSE](LICENSE)。
 
 ---

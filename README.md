@@ -607,11 +607,22 @@ Contributions are welcome! AtomCode is in active development.
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 
 ## Community
+---
 
 Scan the QR code below with WeChat to join the AtomCode community group — share feedback, report issues, and talk to other users and maintainers:
 
 <p align="center">
   <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode WeChat community QR code" width="220">
+</p>
+
+## Donate
+---
+
+☕ AtomCode is free, and the Coding Plan is free too. If it's saved you a bit of time, consider buying the author a coffee — it keeps us motivated to keep making it better.
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
+  <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
 </p>
 
 ## License
