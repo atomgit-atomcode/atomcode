@@ -10279,7 +10279,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 200);
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 450);
                     }
                 }
             }
