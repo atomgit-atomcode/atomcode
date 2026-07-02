@@ -2647,8 +2647,11 @@ body {
   text-align: left;
   font-family: inherit;
 }
-.slash-row.active { background: var(--app-ghost-button-hover-background); }
-.slash-row:hover { background: var(--app-ghost-button-hover-background); }
+.slash-row.active {
+  background: var(--app-command-menu-active-background);
+  box-shadow: inset 2px 0 0 var(--app-command-menu-active-accent);
+}
+.slash-row:hover { background: var(--app-command-menu-hover-background); }
 .slash-name {
   font-size: 12px;
   font-family: var(--app-monospace-font-family);
@@ -2701,8 +2704,11 @@ body {
   text-align: left;
   font-family: inherit;
 }
-.at-row.active { background: var(--app-ghost-button-hover-background); }
-.at-row:hover { background: var(--app-ghost-button-hover-background); }
+.at-row.active {
+  background: var(--app-command-menu-active-background);
+  box-shadow: inset 2px 0 0 var(--app-command-menu-active-accent);
+}
+.at-row:hover { background: var(--app-command-menu-hover-background); }
 .at-icon { flex-shrink: 0; font-size: 13px; }
 .at-name {
   font-size: 12px;
