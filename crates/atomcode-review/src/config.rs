@@ -47,6 +47,14 @@ pub struct ReviewAgentConfig {
     /// mounted, so the model cannot call it — used by runtimes where web egress is blocked
     /// or undesirable, so a web_search attempt can't fail and abort the whole review.
     pub no_web: bool,
+    /// Auto-degrade threshold for the code-graph tools: they are mounted only when the repo
+    /// has AT MOST this many git-tracked indexable source files. Above it, building the
+    /// O(repo) tree-sitter call graph would blow the review's wall-clock budget for no
+    /// measured quality gain, so the graph tools are dropped (grep-only). `usize::MAX`
+    /// (default) ⇒ NO degrade: the graph is always mounted, matching bare-CLI behavior.
+    /// Engineering callers (e.g. the service, which reviews huge repos on NFS) set a bound
+    /// like `8000` so a kernel-scale repo degrades automatically. `0` ⇒ never mount.
+    pub graph_max_indexed_files: usize,
 }
 
 impl ReviewAgentConfig {
@@ -70,6 +78,7 @@ impl ReviewAgentConfig {
             max_rounds: None,
             max_turn_duration: None,
             no_web: false,
+            graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
         }
     }
 

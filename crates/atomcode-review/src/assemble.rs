@@ -3,7 +3,39 @@
 
 use crate::config::ReviewAgentConfig;
 use crate::persona::review_persona;
+use atomcode_capabilities::codeintel::lang::Lang;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
+use std::path::Path;
+use std::process::Command;
+
+/// Whether to mount the code-graph tools: only when the repo has AT MOST `max` indexable
+/// source files. `max = usize::MAX` (the config default) ⇒ always mount (bare-CLI behavior);
+/// engineering callers pass a bound (e.g. 8000) so a kernel-scale repo degrades to grep — its
+/// O(repo) tree-sitter graph build would otherwise blow the wall-clock budget for no measured
+/// quality gain (kernel A/B: graph off ≥ on, 1080s CPU → 3.94s).
+fn should_mount_graph(indexed_file_count: usize, max: usize) -> bool {
+    indexed_file_count <= max
+}
+
+/// Count git-tracked source files codeintel would parse, via `git ls-files` (reads the git
+/// index — NO working-tree walk, so it stays cheap even on an NFS workdir). Returns 0 when git
+/// is unavailable / not a repo ⇒ treated as small ⇒ graph mounted (the safe default).
+fn count_indexed_sources(working_dir: &Path) -> usize {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(working_dir)
+        .args(["ls-files", "-z"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 0,
+    };
+    out.split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .filter(|p| Lang::detect(Path::new(p)).is_some_and(|l| l.is_indexed()))
+        .count()
+}
 use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::tools::{
     register_coding_tools, AstGrepTool, ReportFindingTool, WebSearchTool,
@@ -16,7 +48,7 @@ use std::sync::Arc;
 /// The READ-ONLY tools the reviewer sees. Deliberately NO write/edit/bash/change_dir — a
 /// reviewer investigates and reports, it never mutates. (The diff itself is injected as
 /// the task by the caller, so the agent needs no shell to obtain it.)
-fn review_tool_names(no_web: bool) -> Vec<&'static str> {
+fn review_tool_names(no_web: bool, mount_graph: bool) -> Vec<&'static str> {
     let mut names = vec!["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"];
     // web_search is mounted by default; `no_web` drops it (the tool stays registered but
     // unmounted), so a blocked/unreachable web egress can't make the model's web_search
@@ -24,7 +56,13 @@ fn review_tool_names(no_web: bool) -> Vec<&'static str> {
     if !no_web {
         names.push("web_search");
     }
-    names.extend(codeintel_tool_names().iter().copied());
+    // Code-graph tools (find_references/trace_callers/blast_radius/read_symbol/…) build an
+    // O(repo) tree-sitter call graph — only mount them when the repo is small enough to index
+    // cheaply (see `should_mount_graph`). On a huge repo they blow the wall-clock budget for
+    // ~zero quality gain (measured on the 85k-file kernel: 1080s CPU → 3.94s with them off).
+    if mount_graph {
+        names.extend(codeintel_tool_names().iter().copied());
+    }
     names
 }
 
@@ -50,7 +88,21 @@ pub fn build_review_agent_with(
 ) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
-    let tools = mount_review_tools(&report, cfg.no_web);
+    // Auto-degrade the code-graph on huge repos when the caller set a bound. Default
+    // (usize::MAX) ⇒ always mount, skip the git-index count entirely (bare-CLI: no overhead,
+    // behavior unchanged). Engineering callers set `graph_max_indexed_files` to enable it.
+    let max_graph_files = cfg.graph_max_indexed_files;
+    let mount_graph = if max_graph_files == usize::MAX {
+        true
+    } else {
+        let indexed = count_indexed_sources(&cfg.working_dir); // cheap: reads git index, no tree walk
+        let mount = should_mount_graph(indexed, max_graph_files);
+        if !mount {
+            eprintln!("[codeintel] {indexed} indexed source file(s) > {max_graph_files} — code-graph tools disabled (grep only)");
+        }
+        mount
+    };
+    let tools = mount_review_tools(&report, cfg.no_web, mount_graph);
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
         .provider(provider)
@@ -66,9 +118,13 @@ pub fn build_review_agent_with(
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
     // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
-    // CLI run unbounded; engineering callers pass `--max-rounds`).
+    // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
+    // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
+    // instead of dying empty in a read-exploration loop (see `round_budget`).
     if let Some(n) = cfg.max_rounds {
-        builder = builder.max_rounds(n);
+        builder = builder
+            .max_rounds(n)
+            .hook(Arc::new(crate::round_budget::RoundBudgetHook::new()));
     }
     // Turn total-time cap via the kernel's cancel seam (no kernel change): inject a cancel
     // token and fire it after the deadline. This trips run_turn's stream-select cancel arm
@@ -89,14 +145,14 @@ pub fn build_review_agent_with(
 /// Register the read-only review toolset (+ the shared `report_finding` instance) and
 /// mount only the read-only subset — write/edit/bash are registered by
 /// `register_coding_tools` but NEVER mounted, so the model cannot mutate.
-fn mount_review_tools(report: &ReportFindingTool, no_web: bool) -> MountedTools {
+fn mount_review_tools(report: &ReportFindingTool, no_web: bool, mount_graph: bool) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
-    register_codeintel_tools(&mut reg);
+    register_codeintel_tools(&mut reg); // registered always; mounted only when `mount_graph`
     reg.register(Arc::new(AstGrepTool));
     reg.register(Arc::new(WebSearchTool::new())); // registered always; mounted only when !no_web
     reg.register(Arc::new(report.clone())); // shares state with the returned handle
-    reg.mount(&review_tool_names(no_web))
+    reg.mount(&review_tool_names(no_web, mount_graph))
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the
@@ -251,10 +307,70 @@ mod tests {
         );
     }
 
+    /// Records the messages of the LAST request it received, then stops (text-only round).
+    /// Lets a test observe what `pre_request` hooks projected onto the wire.
+    #[derive(Clone)]
+    struct CapturingProvider {
+        seen: Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _t: &[ToolDef],
+            _o: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            let evs = vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ];
+            Ok(stream::iter(evs).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn round_budget_reminder_injected_when_bounded() {
+        // max_rounds=1 → round 1 IS the final round → the budget hook fires this request.
+        let mut c = cfg();
+        c.max_rounds = Some(1);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider { seen: seen.clone() };
+        let (agent, _report) = build_review_agent_with(&c, Arc::new(provider));
+        let _ = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        assert!(
+            text.contains("[review budget]"),
+            "bounded run must project the round-budget reminder onto the wire: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_round_budget_reminder_when_unbounded() {
+        // No max_rounds → no fuse, no budget hook mounted → clean wire.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider { seen: seen.clone() };
+        let (agent, _report) = build_review_agent_with(&cfg(), Arc::new(provider));
+        let _ = agent
+            .run_to_completion("Review this diff:\n+ x", AutoRespond::AllowAll)
+            .await;
+        let text: String = seen.lock().unwrap().iter().map(|m| m.text.clone()).collect();
+        assert!(
+            !text.contains("[review budget]"),
+            "unbounded run must not inject the reminder: {text}"
+        );
+    }
+
     #[test]
     fn review_mounts_readonly_set_only() {
         // The mounted names are read-only — no mutation tools.
-        let names = review_tool_names(false);
+        let names = review_tool_names(false, true);
         assert!(names.contains(&"read_file") && names.contains(&"report_finding") && names.contains(&"ast_grep"));
         for forbidden in ["write_file", "edit_file", "bash", "change_dir", "search_replace", "parallel_edit_files"] {
             assert!(!names.contains(&forbidden), "reviewer must not mount `{forbidden}`");
@@ -264,15 +380,67 @@ mod tests {
     #[test]
     fn no_web_drops_web_search_only() {
         // 默认挂 web_search；no_web=true 时仅去掉 web_search，其余只读工具不变。
-        let with_web = review_tool_names(false);
+        let with_web = review_tool_names(false, true);
         assert!(with_web.contains(&"web_search"), "默认应挂 web_search");
 
-        let without_web = review_tool_names(true);
+        let without_web = review_tool_names(true, true);
         assert!(!without_web.contains(&"web_search"), "no_web 应去掉 web_search");
         // 其它只读工具仍在
         for keep in ["read_file", "grep", "glob", "list_directory", "ast_grep", "report_finding"] {
             assert!(without_web.contains(&keep), "no_web 不应误伤 `{keep}`");
         }
+    }
+
+    #[test]
+    fn graph_tools_gated_by_mount_flag() {
+        // mount_graph=false drops the code-graph tools; the base read-only set stays.
+        let with_graph = review_tool_names(true, true);
+        let without_graph = review_tool_names(true, false);
+        // codeintel names present with the flag on, absent with it off.
+        let graph_names = atomcode_capabilities::codeintel::codeintel_tool_names();
+        assert!(graph_names.iter().all(|g| with_graph.contains(g)), "graph tools mounted when on");
+        assert!(graph_names.iter().all(|g| !without_graph.contains(g)), "graph tools dropped when off");
+        // Base tools unaffected either way.
+        for keep in ["read_file", "grep", "report_finding"] {
+            assert!(without_graph.contains(&keep), "base tool `{keep}` must survive");
+        }
+    }
+
+    #[test]
+    fn should_mount_graph_thresholds() {
+        // Unlimited (bare-CLI default) → always mount, even kernel-scale.
+        assert!(should_mount_graph(85_000, usize::MAX), "unlimited → always mount");
+        // Bounded (engineering caller, e.g. service sets 8000).
+        assert!(should_mount_graph(0, 8000), "empty/unknown repo → mount");
+        assert!(should_mount_graph(8000, 8000), "at threshold → still mount");
+        assert!(!should_mount_graph(8001, 8000), "over threshold → degrade");
+        assert!(!should_mount_graph(85_000, 8000), "kernel-scale → degrade");
+        assert!(!should_mount_graph(1, 0), "max=0 → never mount");
+    }
+
+    #[test]
+    fn count_indexed_sources_counts_only_source_files() {
+        // Skip cleanly if git isn't on PATH.
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git").current_dir(root).args(args).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        for f in ["a.rs", "b.go", "c.py", "d.md", "e.lock", "sub/f.ts"] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // Only indexable sources counted: a.rs, b.go, c.py, sub/f.ts = 4 (md/lock excluded).
+        assert_eq!(count_indexed_sources(root), 4);
     }
 }
 

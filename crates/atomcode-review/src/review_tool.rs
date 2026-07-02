@@ -25,6 +25,7 @@ use serde_json::json;
 
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
+use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
 use crate::{build_review_agent_with, Finding};
 
@@ -132,10 +133,11 @@ impl Tool for ReviewTool {
         let annotated = annotate_diff_line_numbers(&diff);
         let files = changed_files_from_diff(&diff);
         let rules = render_rules_section(&files, self.cfg.rules_dir.as_deref());
+        let impact_plan = render_review_impact_plan(&diff);
         let task = format!(
             "Review the following changes. Report each issue via the `report_finding` tool \
              with an accurate file path and line range. Only flag issues in the CHANGED \
-             code.\n\n{rules}\n\n=== DIFF ===\n{annotated}"
+             code.\n\n{rules}\n\n{impact_plan}\n\n=== DIFF ===\n{annotated}"
         );
 
         // 3. Reuse the host's provider (set at assembly) so a signing gateway still works.
