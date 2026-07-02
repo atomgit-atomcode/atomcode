@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { SkillInfo } from '../state/types';
 import { MsgKey, useT } from '../i18n';
+import { ensureActiveDescendantVisible } from '../utils/atMention';
 
 interface SlashCommand {
   name: string;
@@ -26,6 +27,8 @@ interface SlashPickerProps {
 
 export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPickerProps) {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [allowHoverHighlight, setAllowHoverHighlight] = useState(true);
+  const listRef = useRef<HTMLDivElement>(null);
   const t = useT();
 
   const localNames = new Set(slashCommands.map((cmd) => cmd.name));
@@ -45,6 +48,7 @@ export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPic
 
   useEffect(() => {
     setActiveIndex(0);
+    setAllowHoverHighlight(true);
   }, [filter]);
 
   const handleKeyDown = useCallback(
@@ -55,9 +59,11 @@ export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPic
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
+        setAllowHoverHighlight(false);
         setActiveIndex((i) => (i + 1) % filtered.length);
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
+        setAllowHoverHighlight(false);
         setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
       } else if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
@@ -75,15 +81,26 @@ export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPic
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      const container = listRef.current;
+      const active = container?.querySelector<HTMLButtonElement>('.slash-item.active');
+      if (container && active) ensureActiveDescendantVisible(container, active);
+    });
+  }, [activeIndex, filtered.length]);
+
   if (filtered.length === 0) return null;
 
   return (
-    <div className="slash-picker">
+    <div className={`slash-picker${allowHoverHighlight ? ' allow-hover' : ''}`} ref={listRef}>
       {filtered.map((cmd, i) => (
         <button
           key={cmd.name}
           className={`slash-item${i === activeIndex ? ' active' : ''}`}
-          onMouseEnter={() => setActiveIndex(i)}
+          onMouseMove={() => {
+            setAllowHoverHighlight(true);
+            setActiveIndex(i);
+          }}
           onClick={() => onSelect(cmd.label)}
         >
           <span className="slash-item-label">{cmd.label}</span>

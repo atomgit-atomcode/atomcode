@@ -7,9 +7,9 @@ import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
 import {
+  applyAtMentionSelection,
   detectAtMentionRange,
   ensureActiveDescendantVisible,
-  replaceAtMention,
 } from '../utils/atMention';
 
 interface WorkspaceFile {
@@ -282,12 +282,18 @@ export function InputArea() {
     if (!el) return;
     const range = detectAtMentionRange(text, el.selectionStart ?? text.length);
     if (!range) return;
-    const next = replaceAtMention(text, range, item.relativePath);
+    const next = applyAtMentionSelection(text, range, item.relativePath, item.isDir);
     updateText(next.text);
     historyIndexRef.current = -1;
-    setShowAtPicker(false);
-    setAtQuery('');
-    setAtItems([]);
+    setShowAtPicker(next.keepOpen);
+    setAtQuery(next.query);
+    setAtIndex(0);
+    if (next.keepOpen) {
+      setAtItems([]);
+      postMessage({ type: 'searchWorkspacePaths', query: next.query });
+    } else {
+      setAtItems([]);
+    }
     requestAnimationFrame(() => {
       const current = textareaRef.current;
       if (!current) return;

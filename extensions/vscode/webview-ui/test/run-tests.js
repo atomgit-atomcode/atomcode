@@ -13,6 +13,7 @@ async function main() {
     'quick-actions-regression.test.ts',
     'contextual-prompt-regression.test.ts',
     'at-mention.test.ts',
+    'slash-picker-regression.test.ts',
     'daemon-client-error.test.ts',
   ];
 

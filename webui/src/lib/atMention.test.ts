@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
+  applyAtMentionSelection,
   detectAtMentionRange,
   ensureActiveDescendantVisible,
   replaceAtMention,
@@ -35,13 +36,42 @@ test('splits scoped @ mention tokens like the TUI file index', () => {
   });
 });
 
-test('replaces the active @ token with the selected relative path and trailing space', () => {
+test('replaces the active @ token without terminating the token', () => {
   const text = 'check @web';
   const range = detectAtMentionRange(text, text.length);
   assert.ok(range);
-  assert.deepEqual(replaceAtMention(text, range, 'webui/src/app.tsx'), {
-    text: 'check @webui/src/app.tsx ',
-    cursor: 'check @webui/src/app.tsx '.length,
+  const next = replaceAtMention(text, range, 'webui/src/app.tsx');
+
+  assert.deepEqual(next, {
+    text: 'check @webui/src/app.tsx',
+    cursor: 'check @webui/src/app.tsx'.length,
+  });
+  assert.deepEqual(detectAtMentionRange(next.text, next.cursor)?.token, 'webui/src/app.tsx');
+});
+
+test('keeps @ menu open after selecting a directory', () => {
+  const text = 'check @web';
+  const range = detectAtMentionRange(text, text.length);
+  assert.ok(range);
+
+  assert.deepEqual(applyAtMentionSelection(text, range, 'webui/src/', true), {
+    text: 'check @webui/src/',
+    cursor: 'check @webui/src/'.length,
+    keepOpen: true,
+    query: 'webui/src/',
+  });
+});
+
+test('closes @ menu after selecting a file', () => {
+  const text = 'check @web';
+  const range = detectAtMentionRange(text, text.length);
+  assert.ok(range);
+
+  assert.deepEqual(applyAtMentionSelection(text, range, 'webui/src/app.tsx', false), {
+    text: 'check @webui/src/app.tsx',
+    cursor: 'check @webui/src/app.tsx'.length,
+    keepOpen: false,
+    query: '',
   });
 });
 

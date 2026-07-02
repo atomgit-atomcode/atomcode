@@ -1996,6 +1996,56 @@ mod menu_tests {
         assert!(build_menu_items("/zzznomatch", 0, &reg, &custom, None, None).is_none());
     }
 
+    #[test]
+    fn at_directory_completion_can_build_child_menu() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let index = file_index::FileIndex::from_entries(
+            std::path::PathBuf::from("/tmp"),
+            vec![
+                file_index::Entry {
+                    rel_path: "crates/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/src/".into(),
+                    is_dir: true,
+                    depth: 3,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 3,
+                },
+            ],
+        );
+        let replacement = file_index::format_at_mention_replacement("crates/atomcode-bridge/");
+
+        let items = build_menu_items(
+            &replacement,
+            replacement.len(),
+            &reg,
+            &custom,
+            None,
+            Some(&index),
+        )
+        .expect("directory completion should immediately show child entries");
+
+        assert_eq!(
+            items.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
+            vec![
+                "crates/atomcode-bridge/src/",
+                "crates/atomcode-bridge/Cargo.toml",
+            ]
+        );
+    }
+
     fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
         atomcode_core::skill::Skill {
             name: name.to_string(),
@@ -5603,23 +5653,34 @@ fn handle_idle_key(
                 // modifier guard; crossterm reports Shift+Tab as
                 // `KeyCode::BackTab` so it doesn't match this arm.
                 //
-                // `@`-mention selection: insert `@<full_path> ` at the
-                // token range, with trailing space as terminator.
-                // Backspace on the trailing space lets the user re-open
-                // the menu for drill-down.
+                // `@`-mention selection: insert `@<full_path>` at the
+                // token range. Directory candidates keep their trailing
+                // slash so the token stays active for drill-down.
                 if !items.is_empty() {
                     if let Some((at_pos, end)) =
                         file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
                     {
                         // `items[selected].0` is the full relative path
-                        // (e.g. `crates/atomcode-cli/`); prepend `@` and a
-                        // trailing space terminator.
+                        // (e.g. `crates/atomcode-cli/`); prepend `@` without
+                        // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
-                        let replacement = format!("@{} ", selected_path);
+                        let replacement =
+                            file_index::format_at_mention_replacement(&selected_path);
                         app.buf.text.replace_range(at_pos..end, &replacement);
                         app.buf.cursor = at_pos + replacement.len();
                         app.menu.selected = 0;
-                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        if let Some(next_items) = build_menu_items(
+                            &app.buf.text,
+                            app.buf.cursor,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
+                        ) {
+                            redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
                         return Ok(());
                     }
                 }

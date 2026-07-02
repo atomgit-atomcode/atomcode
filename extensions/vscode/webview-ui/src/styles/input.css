@@ -329,7 +329,10 @@
   border: 1px solid var(--app-menu-border);
   border-radius: var(--corner-radius-medium);
   box-shadow: 0 4px 12px #0000004d;
-  overflow: hidden;
+  max-height: min(320px, calc(100vh - 120px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
   z-index: 30;
 }
 
@@ -347,15 +350,16 @@
   text-align: left;
 }
 
-.slash-item:hover, .slash-item.active {
+.slash-picker.allow-hover .slash-item:hover,
+.slash-item.active {
   background: var(--app-menu-selection-background);
   color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #fff));
 }
 .slash-item-label { color: var(--app-brand); font-weight: 600; }
 .slash-item-desc { color: var(--app-secondary-foreground); }
-.slash-item:hover .slash-item-label,
+.slash-picker.allow-hover .slash-item:hover .slash-item-label,
 .slash-item.active .slash-item-label,
-.slash-item:hover .slash-item-desc,
+.slash-picker.allow-hover .slash-item:hover .slash-item-desc,
 .slash-item.active .slash-item-desc {
   color: inherit;
 }

@@ -12,9 +12,9 @@ import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
 import {
+  applyAtMentionSelection,
   detectAtMentionRange,
   ensureActiveDescendantVisible,
-  replaceAtMention,
   splitAtToken,
 } from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
@@ -1159,18 +1159,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
-  // 把当前 @ 段替换为相对路径 rel，并以空格终止；与 TUI 一致，目录也只是插入
-  // `@dir/ `，用户可 Backspace 删除空格后继续触发补全。
-  function setAtMention(rel: string) {
+  // 把当前 @ 段替换为相对路径 rel，不自动追加空格，目录可继续下钻补全。
+  function setAtMention(rel: string, isDir: boolean) {
     const ta = textareaRef.current;
     if (!ta) return;
     const pos = ta.selectionStart ?? ta.value.length;
     const range = detectAtMentionRange(ta.value, pos);
     if (!range) return;
-    const next = replaceAtMention(ta.value, range, rel);
+    const next = applyAtMentionSelection(ta.value, range, rel, isDir);
     setInput(next.text);
-    setAtOpen(false);
-    setAtQuery('');
+    setAtOpen(next.keepOpen);
+    setAtQuery(next.query);
+    if (next.keepOpen) setAtItems([]);
     setAtIndex(0);
     requestAnimationFrame(() => {
       ta.focus();
@@ -1180,7 +1180,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
-  // 选择 @ 菜单某一行：「..」仍用于返回上级；目录/文件都插入完整相对路径并关闭。
+  // 选择 @ 菜单某一行：「..」仍用于返回上级；目录/文件都插入完整相对路径。
   function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean }) {
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
@@ -1200,7 +1200,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ta.setSelectionRange(cursor, cursor);
       });
     } else {
-      setAtMention(atDirPart + row.name + (row.is_dir ? '/' : ''));
+      setAtMention(atDirPart + row.name + (row.is_dir ? '/' : ''), row.is_dir);
     }
   }
 

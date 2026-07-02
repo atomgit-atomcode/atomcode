@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
+  applyAtMentionSelection,
   detectAtMentionRange,
   ensureActiveDescendantVisible,
   replaceAtMention,
@@ -28,13 +29,42 @@ test('splits @ mention tokens into scope directory and filter', () => {
   });
 });
 
-test('replaces the selected @ mention with an @relative/path token', () => {
+test('replaces the selected @ mention without terminating the token', () => {
   const input = 'read @ext';
   const range = detectAtMentionRange(input, input.length);
   assert.ok(range);
-  assert.deepEqual(replaceAtMention(input, range, 'extensions/vscode/'), {
-    text: 'read @extensions/vscode/ ',
-    cursor: 'read @extensions/vscode/ '.length,
+  const next = replaceAtMention(input, range, 'extensions/vscode/');
+
+  assert.deepEqual(next, {
+    text: 'read @extensions/vscode/',
+    cursor: 'read @extensions/vscode/'.length,
+  });
+  assert.deepEqual(detectAtMentionRange(next.text, next.cursor)?.token, 'extensions/vscode/');
+});
+
+test('keeps @ picker open after selecting a directory', () => {
+  const input = 'read @ext';
+  const range = detectAtMentionRange(input, input.length);
+  assert.ok(range);
+
+  assert.deepEqual(applyAtMentionSelection(input, range, 'extensions/vscode/', true), {
+    text: 'read @extensions/vscode/',
+    cursor: 'read @extensions/vscode/'.length,
+    keepOpen: true,
+    query: 'extensions/vscode/',
+  });
+});
+
+test('closes @ picker after selecting a file', () => {
+  const input = 'read @ext';
+  const range = detectAtMentionRange(input, input.length);
+  assert.ok(range);
+
+  assert.deepEqual(applyAtMentionSelection(input, range, 'extensions/vscode/package.json', false), {
+    text: 'read @extensions/vscode/package.json',
+    cursor: 'read @extensions/vscode/package.json'.length,
+    keepOpen: false,
+    query: '',
   });
 });
 
