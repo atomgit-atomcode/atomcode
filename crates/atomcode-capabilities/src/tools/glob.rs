@@ -141,15 +141,22 @@ fn split_absolute_base(pattern: &str) -> Option<(PathBuf, String)> {
     // The base ends at the last separator within that literal region.
     let sep = pattern[..scan_end].rfind(['/', '\\'])?;
     let dir = &pattern[..sep];
-    if dir.is_empty() || !is_absolute_path(dir) {
+    // A `~`-prefixed base is an absolute location too (parity with the `path` arg,
+    // which resolves `~` via resolve_path); expand it so `glob("~/proj/**/*.rs")`
+    // isn't silently walked relative to cwd.
+    let base = if let Some(home) = crate::pathutil::expand_tilde(dir) {
+        home
+    } else if !dir.is_empty() && is_absolute_path(dir) {
+        PathBuf::from(dir)
+    } else {
         return None;
-    }
+    };
     let rest = pattern[sep + 1..].replace('\\', "/");
     // A trailing separator (a pasted directory path) leaves no remainder — list the
     // directory's direct children rather than building an empty matcher that matches
     // nothing (which would falsely report "No files matching").
     let rest = if rest.is_empty() { "*".to_string() } else { rest };
-    Some((PathBuf::from(dir), rest))
+    Some((base, rest))
 }
 
 #[cfg(test)]
@@ -181,6 +188,21 @@ mod tests {
         // Relative patterns are left for base-relative matching.
         assert!(split_absolute_base("**/*.rs").is_none());
         assert!(split_absolute_base("src/**/*.ts").is_none());
+    }
+
+    #[test]
+    fn split_absolute_base_expands_leading_tilde() {
+        // A `~/…` base is absolute (home-relative), NOT a cwd-relative walk — parity
+        // with the `path` arg. Assert relative to the same home the code reads.
+        if let Some(home) = crate::pathutil::home_dir() {
+            let (base, rest) = split_absolute_base("~/proj/**/*.rs").unwrap();
+            assert_eq!(base, home.join("proj"));
+            assert_eq!(rest, "**/*.rs");
+            // Bare `~/` base lists the home dir's children.
+            let (base, rest) = split_absolute_base("~/*").unwrap();
+            assert_eq!(base, home);
+            assert_eq!(rest, "*");
+        }
     }
 
     fn ctx(dir: &std::path::Path) -> ToolContext {

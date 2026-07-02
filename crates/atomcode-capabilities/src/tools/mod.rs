@@ -123,9 +123,15 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
 /// local copy was deduped into that home, which also carries the `std` `_sync` variant).
 pub(crate) use crate::process_utils::suppress_console_window;
 
-/// Resolve a model-supplied path: absolute → as-is; relative → joined to
-/// `working_dir`. NO escape enforcement (see the module trust-model note).
+/// Resolve a model-supplied path: leading `~`/`~/` → home dir; absolute → as-is;
+/// relative → joined to `working_dir`. NO escape enforcement (see the module
+/// trust-model note). `~` expansion (via the crate-shared [`crate::pathutil`], so
+/// `tools` and `codeintel` agree) gives parity with the shell the `bash` tool relies
+/// on — fixing `read_file("~/.atomcode/x")` resolving to the broken `<cwd>/~/…`.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+    if let Some(home) = crate::pathutil::expand_tilde(raw) {
+        return home;
+    }
     if is_absolute_path(raw) {
         PathBuf::from(raw)
     } else {
