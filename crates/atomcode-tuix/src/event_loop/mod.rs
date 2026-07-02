@@ -9476,12 +9476,13 @@ fn handle_agent_event(
 /// `user_renamed`, so a later explicit `/rename` still wins.
 fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Renderer) {
     if !atomcode_core::agent::session_title::should_accept_ai_name(
-        &ctx.current_session.name,
         ctx.current_session.user_renamed,
+        ctx.current_session.ai_named,
     ) {
         return;
     }
     ctx.current_session.name = name;
+    ctx.current_session.ai_named = true;
     ctx.current_session.touch();
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
@@ -9673,11 +9674,15 @@ mod session_naming_tests {
     }
 
     #[test]
-    fn ai_rename_applies_only_when_still_placeholder_and_not_user_renamed() {
+    fn ai_rename_applies_unless_user_renamed_or_already_ai_named() {
         use atomcode_core::agent::session_title::should_accept_ai_name;
-        assert!(should_accept_ai_name("session-1", false));
-        assert!(!should_accept_ai_name("session-1", true));
-        assert!(!should_accept_ai_name("My name", false));
+        // Not user-renamed and not yet AI-named → accept (the AI title wins
+        // over the first-turn truncation the auto-namer set).
+        assert!(should_accept_ai_name(false, false));
+        // A deliberate /rename is never overwritten.
+        assert!(!should_accept_ai_name(true, false));
+        // Already AI-named → don't re-name on reconnect/resume.
+        assert!(!should_accept_ai_name(false, true));
     }
 }
 

@@ -19,8 +19,18 @@ pub fn session_title_prompt(convo: &str) -> String {
 
 /// Post-process raw model output into a usable title, or `None` if empty.
 pub fn sanitize_generated_title(raw: &str) -> Option<String> {
+    // Scrub ESC / control bytes FIRST. The model can echo user-supplied escape
+    // sequences (e.g. an OSC title-injection `\x1b]2;pwned\x07` pasted in a
+    // question); this name is persisted to disk and shown in the /resume picker
+    // and the webui header, none of which re-scrub — only the terminal-title
+    // path does. Map every control char to a space so no raw escape byte
+    // survives; the whitespace-collapse below folds the residue.
+    let scrubbed: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     // Strip a leading label the model may add.
-    let mut s = raw.trim();
+    let mut s = scrubbed.trim();
     for label in ["Title:", "title:", "标题:", "标题：", "主题:", "主题："] {
         if let Some(rest) = s.strip_prefix(label) {
             s = rest.trim();
@@ -63,10 +73,22 @@ pub fn first_exchange_text(messages: &[Message]) -> Option<String> {
     Some(out)
 }
 
-/// Authoritative host-side guard: accept an AI name only if the session is
-/// still auto-named (placeholder) and the user hasn't renamed it.
-pub fn should_accept_ai_name(current_name: &str, user_renamed: bool) -> bool {
-    !user_renamed && crate::session::should_auto_name_session(current_name)
+/// Authoritative host-side guard: accept an AI name only when the user hasn't
+/// explicitly renamed the session AND it hasn't already been AI-named.
+///
+/// It deliberately does NOT gate on `should_auto_name_session(name)`. By the
+/// time the async AI name arrives, the host has already run its first-turn
+/// auto-namer, which replaced the `session-<ts>` placeholder with the truncated
+/// first user message (a NON-placeholder). Gating on `should_auto_name_session`
+/// therefore rejected every AI name in the normal path and made the feature a
+/// silent no-op. The AI title is meant to WIN over that crude truncation.
+///
+/// - `user_renamed` → a deliberate `/rename`; always wins, never overwrite it.
+/// - `ai_named` → already AI-named (durable, persisted on the session); don't
+///   re-name on reconnect/restart/`/resume`, which would churn the name and
+///   waste an LLM call.
+pub fn should_accept_ai_name(user_renamed: bool, ai_named: bool) -> bool {
+    !user_renamed && !ai_named
 }
 
 #[cfg(test)]
@@ -83,12 +105,18 @@ mod tests {
 
     #[test]
     fn sanitize_strips_quotes_and_label_and_period() {
-        assert_eq!(sanitize_generated_title("Title: \"Fix login bug.\""), Some("Fix login bug".to_string()));
+        assert_eq!(
+            sanitize_generated_title("Title: \"Fix login bug.\""),
+            Some("Fix login bug".to_string())
+        );
     }
 
     #[test]
     fn sanitize_collapses_newlines() {
-        assert_eq!(sanitize_generated_title("fix\n  login\nbug"), Some("fix login bug".to_string()));
+        assert_eq!(
+            sanitize_generated_title("fix\n  login\nbug"),
+            Some("fix login bug".to_string())
+        );
     }
 
     #[test]
@@ -105,7 +133,10 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_cjk() {
-        assert_eq!(sanitize_generated_title("修复登录报错"), Some("修复登录报错".to_string()));
+        assert_eq!(
+            sanitize_generated_title("修复登录报错"),
+            Some("修复登录报错".to_string())
+        );
     }
 
     #[test]
@@ -125,7 +156,9 @@ mod tests {
             Message::synthetic_user("[context compressed]"),
             Message::new(Role::User, "real question"),
         ];
-        assert!(first_exchange_text(&msgs).unwrap().contains("real question"));
+        assert!(first_exchange_text(&msgs)
+            .unwrap()
+            .contains("real question"));
     }
 
     #[test]
@@ -135,10 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn accept_only_placeholder_and_not_user_renamed() {
-        assert!(should_accept_ai_name("session-123", false));
-        assert!(should_accept_ai_name("default", false));
-        assert!(!should_accept_ai_name("Fix login bug", false)); // already named
-        assert!(!should_accept_ai_name("session-123", true));    // user renamed
+    fn accept_unless_user_renamed_or_already_ai_named() {
+        // First naming: not user-renamed, not yet AI-named → accept. This is
+        // the normal path (host has already set the truncation name; the AI
+        // title must win over it) — the case the old placeholder-only guard
+        // wrongly rejected, silently killing the feature.
+        assert!(should_accept_ai_name(false, false));
+        // A deliberate /rename must survive.
+        assert!(!should_accept_ai_name(true, false));
+        // Already AI-named: don't re-name on reconnect/resume.
+        assert!(!should_accept_ai_name(false, true));
+        assert!(!should_accept_ai_name(true, true));
+    }
+
+    #[test]
+    fn sanitize_scrubs_escape_and_control_bytes() {
+        // An OSC title-injection echoed by the model must not survive into the
+        // persisted name (disk / picker / webui do not re-scrub).
+        let out = sanitize_generated_title("hi\x1b]2;pwned\x07there").unwrap();
+        assert!(!out.contains('\x1b'), "ESC survived: {out:?}");
+        assert!(!out.contains('\x07'), "BEL survived: {out:?}");
     }
 }

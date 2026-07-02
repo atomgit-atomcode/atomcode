@@ -826,17 +826,25 @@ impl KernelTurnExecutor {
 /// Persist an AI-generated session rename without setting `user_renamed`.
 /// Guards with `should_accept_ai_name` — silently no-ops if the session has
 /// already been user-renamed or has a non-default AI name.
+/// Returns `Ok(true)` when the AI name was actually applied+persisted, `Ok(false)`
+/// when the guard rejected it (already user-renamed / already AI-named) so the
+/// caller can skip the broadcast — otherwise browser tabs would flip to a name
+/// that was never persisted (and could contradict an explicit `/rename`).
 fn ai_rename_session_file(
     working_dir: &std::path::Path,
     session_id: &atomcode_core::session::SessionId,
     new_name: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     use atomcode_core::session::SessionManager;
     let mut session = SessionManager::load_any(session_id)?;
-    if !atomcode_core::agent::session_title::should_accept_ai_name(&session.name, session.user_renamed) {
-        return Ok(());
+    if !atomcode_core::agent::session_title::should_accept_ai_name(
+        session.user_renamed,
+        session.ai_named,
+    ) {
+        return Ok(false);
     }
     session.name = new_name.to_string();
+    session.ai_named = true;
     session.touch();
     // Save via the session's own working_dir (most accurate); fall back to the
     // executor working_dir only if the session's stored path is missing/wrong.
@@ -845,7 +853,8 @@ fn ai_rename_session_file(
     } else {
         session.working_dir.clone()
     };
-    SessionManager::new(&save_dir).save(&session)
+    SessionManager::new(&save_dir).save(&session)?;
+    Ok(true)
 }
 
 /// Pull the text + images out of the just-appended user message.
@@ -1209,12 +1218,20 @@ impl TurnExecutor for KernelTurnExecutor {
                 AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
                 AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
                 AgentEvent::SessionRenamed { name } => {
-                    // Persist on the daemon side (AI rename: name only, not user_renamed),
-                    // then broadcast to all browser tabs so they update the tab title.
-                    if let Err(e) = ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
-                        emit(TurnEvent::Warning(format!("session rename persist failed: {e}")));
+                    // Persist on the daemon side (AI rename: sets name + ai_named,
+                    // never user_renamed). Broadcast to browser tabs ONLY when the
+                    // rename was actually applied — a guard-rejected name (already
+                    // user-renamed / AI-named) must not flip every tab's title to a
+                    // value that was never persisted.
+                    match ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
+                        Ok(true) => {
+                            let _ = events.send(LiveEvent::SessionRenamed(name));
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            emit(TurnEvent::Warning(format!("session rename persist failed: {e}")));
+                        }
                     }
-                    let _ = events.send(LiveEvent::SessionRenamed(name));
                 }
                 _ => {}
             }

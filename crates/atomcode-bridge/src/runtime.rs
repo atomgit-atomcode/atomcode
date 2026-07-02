@@ -1061,6 +1061,12 @@ impl Bridge {
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
         await_kernel_or_abort(&mut task, Duration::from_secs(5)).await;
         let mut opts = self.opts_template.clone();
+        // Whether this respawn starts a genuinely NEW conversation. `Fresh` =
+        // /clear or /cd-into-new-project → a new session that should get an AI
+        // name. `Resume` = snapshot restore / ReloadHooks (/plugin, /mcp
+        // reload) / model swap → the SAME conversation continues; re-running the
+        // namer would just burn an LLM call whose result the host guard discards.
+        let want_fresh = matches!(session, SessionMode::Fresh);
         opts.session = session;
 
         // Try the requested session mode first; if that fails (e.g. Resume could
@@ -1129,7 +1135,13 @@ impl Bridge {
                 self.turn_running = false;
                 self.pending_approval = None;
                 self.degraded = false;
-                self.ai_name_attempted = false;
+                // Only re-arm the AI namer for a genuinely fresh conversation.
+                // On Resume the conversation (and any existing name) carries
+                // over, so leave `ai_name_attempted` latched to avoid a wasted
+                // naming round-trip on every /resume, model swap, or hook reload.
+                if want_fresh {
+                    self.ai_name_attempted = false;
+                }
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -1261,14 +1273,20 @@ impl Bridge {
                 // completed turn. The host re-checks the authoritative guard before
                 // applying, so here we only gate on feature + not-yet-attempted + a
                 // real first exchange existing.
-                let feature_on = atomcode_core::config::Config::load(
-                    &atomcode_core::config::Config::default_path(),
-                )
-                .map(|c| atomcode_core::config::ai_session_naming_enabled(&c))
-                .unwrap_or(false);
+                //
+                // Cheap gates FIRST — a real first exchange must exist and we must not
+                // have attempted yet — so the synchronous `Config::load` (disk read +
+                // TOML parse) does NOT run on every later TurnComplete, and never on the
+                // async loop's hot path once naming is done for this session.
                 if let Some(convo) = ai_convo_text {
-                    if should_attempt(feature_on, self.ai_name_attempted, true) {
-                        self.ai_name_attempted = true;
+                    if !self.ai_name_attempted {
+                        let feature_on = atomcode_core::config::Config::load(
+                            &atomcode_core::config::Config::default_path(),
+                        )
+                        .map(|c| atomcode_core::config::ai_session_naming_enabled(&c))
+                        .unwrap_or(false);
+                        if should_attempt(feature_on, self.ai_name_attempted, true) {
+                            self.ai_name_attempted = true;
                         let ev_tx = self.ev_tx.clone();
                         tokio::spawn(async move {
                             let Some(provider) = build_naming_provider() else {
@@ -1294,6 +1312,7 @@ impl Bridge {
                                 );
                             }
                         });
+                        }
                     }
                 }
             }
