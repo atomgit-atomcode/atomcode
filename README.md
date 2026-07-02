@@ -126,7 +126,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 ### App Remote Access
 
-- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the AtomCode mobile app from any network to connect to your current session
+- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
 - **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
 - **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
 - **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
