@@ -92,7 +92,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
 | DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
-| 智谱（GLM） | 支持 | GLM-4、GLM-5 |
+| 智谱（GLM） | 支持 | GLM-4、GLM-5、GLM-5.2 |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
 | Ollama（本地） | 部分支持 | Llama 3、Qwen2 等 |
