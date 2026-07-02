@@ -69,6 +69,25 @@ impl CommandRegistry {
     }
 }
 
+/// Whether the `/app` mobile-remote command is exposed. Hidden by default until
+/// the AtomCode mobile app launches: the full implementation (dispatch arm +
+/// relay plumbing) is kept intact, but the command is off the palette /
+/// completion / `/help` and reads as an unknown command when typed.
+///
+/// Internal testing (联调) can re-enable it WITHOUT a rebuild by setting
+/// `ATOMCODE_ENABLE_APP=1` (any non-empty value) — mirrors the existing
+/// `ATOMCODE_APP_RELAY` internal-override convention. Normal users never set
+/// this, so the feature stays invisible to the public.
+///
+/// At launch: delete this gate, uncomment the `/app` entry in `BUILTIN_COMMANDS`,
+/// and remove the guard in the dispatch `"app"` arm. (A `fn`, not a `const`, so
+/// the call site doesn't const-fold into an `unreachable_code` warning.)
+pub(crate) fn app_remote_enabled() -> bool {
+    std::env::var("ATOMCODE_ENABLE_APP")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
     // needs_args=true so selecting it only completes to `/webui ` (does NOT
@@ -76,6 +95,13 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
     Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
     Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
+    // HIDDEN until the mobile app launches — kept off the palette / completion /
+    // /help. Internal testing can still run /app by typing it with
+    // ATOMCODE_ENABLE_APP=1 set (see `app_remote_enabled()`); at launch, uncomment
+    // this entry and remove that gate.
+    // needs_args=true：补全只到 `/app `，让用户可追加中继地址或 `stop` 再回车。
+    // 裸 `/app ` + 回车则用环境变量 ATOMCODE_APP_RELAY。
+    // Command { name: "app",     desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
@@ -202,6 +228,11 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "paste" => Msg::CmdDescPaste,
         "copy" => Msg::CmdDescCopy,
         "view" => Msg::CmdDescView,
+        "app" => Msg::CmdDescApp,
+        "sync" => Msg::CmdDescSync,
+        "review" => Msg::CmdDescReview,
+        "goal" => Msg::CmdDescGoal,
+        "proxy" => Msg::CmdDescProxy,
         _ => return None,
     };
     Some(t(msg))
@@ -399,6 +430,29 @@ mod tests {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("zzzzz");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn every_builtin_command_has_an_i18n_description_in_both_locales() {
+        // A built-in without a cmd_desc_i18n arm silently falls back to the
+        // English static `desc` even under zh_CN — the /app regression, which
+        // also affected /sync, /review, /goal. Guard the WHOLE table so a
+        // newly-added command can't ship without a translation in any locale.
+        use crate::i18n::{current_locale, set_locale, Locale};
+        let prev = current_locale();
+        for locale in [Locale::En, Locale::ZhCn] {
+            set_locale(locale);
+            for c in CommandRegistry::builtin().all() {
+                let desc = cmd_desc_i18n(c.name);
+                assert!(
+                    desc.as_ref().map(|d| !d.trim().is_empty()).unwrap_or(false),
+                    "command /{} has no i18n description ({:?})",
+                    c.name,
+                    locale
+                );
+            }
+        }
+        set_locale(prev);
     }
 
     #[test]

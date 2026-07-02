@@ -135,15 +135,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tips: Use /webui to open AtomCode in your browser".into(),
 
         // ── /status command body ──
-        Msg::StatusBody { model, dir, config, tokens } =>
+        Msg::StatusBody { model, dir, config } =>
             format!(
-                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
-                model, dir, config, tokens,
+                "  Model:  {}\n  Dir:    {}\n  Config: {}\n",
+                model, dir, config,
             ).into(),
+        Msg::StatusLoginLoggedIn { user } =>
+            format!("  Login:  {}\n", user).into(),
+        Msg::StatusLoginNotSignedIn =>
+            "  Login:  not signed in (run /login)\n".into(),
         Msg::StatusCpNotSignedIn =>
             "  CodingPlan: (not signed in — run /login to set up)\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan: (status fetch failed — {})\n", error).into(),
+        Msg::StatusCpAuthExpired =>
+            "  CodingPlan: (login expired — run /login to sign in again)\n".into(),
         Msg::StatusCpNoActive =>
             "  CodingPlan: (no active plan — run /login)\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
@@ -755,8 +761,11 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
         Msg::PluginGitNotFound =>
             "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart AtomCode.".into(),
-        Msg::PluginMarketplaceAdded { name, commit, count } =>
-            format!("✓ marketplace `{name}` added at {commit} ({count} plugins)").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
+            format!(
+                "✓ marketplace `{name}` added at {commit} ({count} plugins)\n  \
+                 Plugins: {plugins} — run /plugin install <plugin>@{name} to install before using its commands"
+            ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
@@ -817,6 +826,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
+        Msg::CmdDescApp => "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)".into(),
+        Msg::CmdDescSync => "Attach to live webui session (/sync off to detach)".into(),
+        Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
+        Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
+        Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
         Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
@@ -1092,6 +1106,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
+        Msg::ProviderInitNeedsLogin =>
+            "Not signed in — model unavailable. Run /login to continue.".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url '{base_url}' is an AtomGit gateway this build can't \

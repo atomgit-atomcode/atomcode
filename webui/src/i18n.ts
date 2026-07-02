@@ -47,6 +47,9 @@ const zh = {
   'sidebar.itemMenu': '更多操作',
   'sidebar.rename': '重命名',
   'sidebar.delete': '删除',
+  'sidebar.exportMarkdown': '导出 Markdown',
+  'sidebar.exporting': '导出中…',
+  'sidebar.exportFailed': '导出失败',
 
   // Rename dialog
   'rename.title': '重命名会话',
@@ -220,6 +223,10 @@ const zh = {
   'sync.on': '已同步（多端实时）',
   'sync.off': '独立会话',
 
+  // Copy button
+  'copy.copy': '复制',
+  'copy.copied': '已复制',
+
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
@@ -269,6 +276,9 @@ const en: Record<MsgKey, string> = {
   'sidebar.itemMenu': 'More actions',
   'sidebar.rename': 'Rename',
   'sidebar.delete': 'Delete',
+  'sidebar.exportMarkdown': 'Export Markdown',
+  'sidebar.exporting': 'Exporting…',
+  'sidebar.exportFailed': 'Export failed',
 
   'rename.title': 'Rename session',
   'rename.placeholder': 'Session name',
@@ -429,6 +439,10 @@ const en: Record<MsgKey, string> = {
   'sync.toggle': 'Sync current session',
   'sync.on': 'Synced (live)',
   'sync.off': 'Independent',
+
+  // Copy button
+  'copy.copy': 'Copy',
+  'copy.copied': 'Copied',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',

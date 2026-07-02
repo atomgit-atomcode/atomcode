@@ -62,14 +62,12 @@ pub fn references_sensitive_path(args: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| a.contains(m))
 }
 
-/// The user's real home directory, dependency-free. Used to anchor `~/.ssh` / `~/.aws` /
-/// `~/.gnupg` so a project-local `./.ssh/` (benign) is not treated like the real keys.
+/// The user's real home directory. Used to anchor `~/.ssh` / `~/.aws` / `~/.gnupg`
+/// so a project-local `./.ssh/` (benign) is not treated like the real keys. Thin
+/// alias over the crate-shared [`crate::pathutil::home_dir`] (single source of the
+/// `HOME`/`USERPROFILE` logic).
 fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let var = std::env::var_os("USERPROFILE");
-    #[cfg(not(windows))]
-    let var = std::env::var_os("HOME");
-    var.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    crate::pathutil::home_dir()
 }
 
 /// True iff a RESOLVED (absolute, cwd-joined) `path` is sensitive — a system-protected

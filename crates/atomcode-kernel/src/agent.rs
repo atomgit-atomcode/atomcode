@@ -1,3 +1,4 @@
+use crate::clock::{Clock, SystemClock};
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
 use crate::message::{
@@ -10,11 +11,10 @@ use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ProgressSink, ToolContext, ToolResult};
 use futures::StreamExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use crate::clock::{Clock, SystemClock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Default kernel cap on a single tool result's `content` byte length.
@@ -84,6 +84,93 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
+// "·" here mirrors atomcode-core's `provider::REASONING_PLACEHOLDER`. kernel is a
+// standalone crate with no dependency on atomcode-core (deliberate: core is the
+// retiring v1 stack), so the value is duplicated rather than imported. If that
+// placeholder ever changes, update this literal too.
+const REASONING_FILLER_MARKERS: &[&str] = &[
+    "·",
+    "(no reasoning detected)",
+    "(no reasoning recorded)",
+    "no reasoning detected",
+    "no reasoning recorded",
+];
+
+// KEEP IN SYNC WITH crates/atomcode-core/src/turn/runner.rs `strip_reasoning_filler`
+// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
+// These are intentionally duplicated because kernel takes no dependency on core;
+// any bugfix here must be applied to the core copy as well.
+fn strip_reasoning_filler(reasoning: &str) -> String {
+    let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
+    for marker in REASONING_FILLER_MARKERS {
+        if cleaned.contains(marker) {
+            cleaned = cleaned.replace(marker, "");
+            changed = true;
+        }
+    }
+
+    if changed {
+        let (tail_cleaned, tail_changed) = strip_leading_parameter_tail(&cleaned);
+        if tail_changed {
+            cleaned = tail_cleaned;
+        }
+    }
+
+    if changed {
+        cleaned.trim().to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_dsml_parameter_fragments(input: &str) -> (String, bool) {
+    let mut rest = input;
+    let mut out = String::new();
+    let mut changed = false;
+
+    while let Some(dsml_idx) = rest.find("DSML") {
+        let before_dsml = &rest[..dsml_idx];
+        let after_dsml = &rest[dsml_idx..];
+        let start = before_dsml.rfind('<');
+        let end = after_dsml.find('>');
+
+        if let (Some(start), Some(end)) = (start, end) {
+            let end = dsml_idx + end + 1;
+            let fragment = &rest[start..end];
+            if fragment.to_ascii_lowercase().contains("parameter") {
+                out.push_str(&rest[..start]);
+                rest = &rest[end..];
+                changed = true;
+                continue;
+            }
+        }
+
+        let split = dsml_idx + "DSML".len();
+        out.push_str(&rest[..split]);
+        rest = &rest[split..];
+    }
+
+    out.push_str(rest);
+    (out, changed)
+}
+
+/// Strip a legacy tail left behind after removing `(no reasoning detected)`.
+/// Keep this deliberately narrow so real XML/code examples using
+/// `<parameter ...>` survive unchanged.
+fn strip_leading_parameter_tail(input: &str) -> (String, bool) {
+    let trimmed = input.trim_start();
+    if !trimmed
+        .get(.."</parameter>".len())
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("</parameter>"))
+    {
+        return (input.to_string(), false);
+    }
+
+    let skipped_ws = input.len() - trimmed.len();
+    let tail_start = skipped_ws + "</parameter>".len();
+    (input[tail_start..].to_string(), true)
+}
+
 /// Short, human reason for the visible "retrying" advisory. Branches on the
 /// STRUCTURED fields (`http_status`) where possible, falling back to a coarse
 /// message sniff for transport errors that carry no status. Mirrors v1's
@@ -121,7 +208,8 @@ fn parse_retry_after_secs(msg: &str) -> Option<u64> {
 /// provider open path), falling back to the "try again in N seconds" text that some
 /// gateways (e.g. LiteLLM) embed only in the BODY when they send no header.
 fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
-    e.retry_after_secs.or_else(|| parse_retry_after_secs(&e.message))
+    e.retry_after_secs
+        .or_else(|| parse_retry_after_secs(&e.message))
 }
 
 /// Build the user-facing message shown when the empty-response retry budget is
@@ -217,9 +305,9 @@ fn cap_tool_result(result: &mut ToolResult, max: usize) {
     }
     let elided = total - keep;
     result.content.truncate(keep);
-    result
-        .content
-        .push_str(&format!("\n…[truncated: {elided} of {total} bytes elided by kernel cap]"));
+    result.content.push_str(&format!(
+        "\n…[truncated: {elided} of {total} bytes elided by kernel cap]"
+    ));
 }
 
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
@@ -379,6 +467,18 @@ impl Agent {
             }
             _ => (0, 0),
         };
+        // Bind the session id onto the provider before the turn loop starts so an
+        // adapter can forward it as the gateway prefix-cache-affinity header
+        // (`x-atomcode-session-id`). This is the ONE place every driver's Agent is
+        // spawned — bridge, native tuix, ACP, headless all route through
+        // `coding::assemble` → here — so no driver re-wires it and there is no
+        // divergence. Mirrors core v1, which set the id on its provider at startup.
+        // A respawn (model swap / resume) rebuilds the Agent, re-binding automatically;
+        // `None` (e.g. a session-less sub-agent) leaves the provider's empty default,
+        // so the header is omitted.
+        if let Some(sid) = self.session_id.as_deref() {
+            self.provider.bind_session_id(sid);
+        }
         let running = RunningAgent {
             provider: self.provider,
             tools: self.tools,
@@ -397,10 +497,11 @@ impl Agent {
             // Resolve the effective working dir into a single shared handle: an explicit
             // `shared_cwd` wins; else wrap the immutable `working_dir` pin so the snapshot
             // path is uniform (a fresh Arc nothing else holds → still effectively pinned).
-            cwd: self
-                .shared_cwd
-                .clone()
-                .or_else(|| self.working_dir.clone().map(|d| std::sync::Arc::new(std::sync::RwLock::new(d)))),
+            cwd: self.shared_cwd.clone().or_else(|| {
+                self.working_dir
+                    .clone()
+                    .map(|d| std::sync::Arc::new(std::sync::RwLock::new(d)))
+            }),
             cancel_token: self.cancel_token,
             session_id: self.session_id,
             turn_counter: AtomicU64::new(turn_seed),
@@ -409,7 +510,11 @@ impl Agent {
             keep_interrupted_context: self.keep_interrupted_context,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
-        AgentHandle { commands: cmd_tx, events: ev_rx, task }
+        AgentHandle {
+            commands: cmd_tx,
+            events: ev_rx,
+            task,
+        }
     }
 
     /// One-shot adapter for batch/CI/CodeReview: send one message, auto-answer
@@ -427,7 +532,10 @@ impl Agent {
     /// tool that may itself be cancel-dropped degrades to hard teardown instead.
     pub async fn run_to_completion(self, input: impl Into<String>, policy: AutoRespond) -> Outcome {
         let mut handle = self.spawn();
-        let _ = handle.commands.send(AgentCommand::SendMessage { text: input.into(), images: vec![] });
+        let _ = handle.commands.send(AgentCommand::SendMessage {
+            text: input.into(),
+            images: vec![],
+        });
         let mut outcome = Outcome::default();
         while let Some(ev) = handle.events.recv().await {
             match ev {
@@ -440,7 +548,11 @@ impl Agent {
                 // FAILURE PERCEPTION: do NOT drop Error any more (the old `_ => {}`
                 // swallowed it → a failed run looked like an empty success). Capture
                 // it (last one wins) so the Outcome carries the cause.
-                AgentEvent::Error { message, http_status, code } => {
+                AgentEvent::Error {
+                    message,
+                    http_status,
+                    code,
+                } => {
                     outcome.error = Some(message);
                     outcome.http_status = http_status;
                     outcome.error_code = code;
@@ -575,7 +687,9 @@ impl RunningAgent {
             // to be a no-op (nothing older than the active turn) must NOT show a
             // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
             if self.compaction.will_summarize(&view) {
-                self.rt.emit(AgentEvent::CompactionStarted { trigger: trigger_for_event.clone() });
+                self.rt.emit(AgentEvent::CompactionStarted {
+                    trigger: trigger_for_event.clone(),
+                });
             }
             self.compaction.plan(&view).await
         };
@@ -596,7 +710,10 @@ impl RunningAgent {
             Some(snap) if snap.version == SNAPSHOT_VERSION => {
                 // Carry the snapshot's `cache_epoch` so a resume restores the same
                 // prefix generation (defaults to 0 for v1 snapshots via serde).
-                let mut c = Conversation { messages: snap.messages.clone(), cache_epoch: snap.cache_epoch };
+                let mut c = Conversation {
+                    messages: snap.messages.clone(),
+                    cache_epoch: snap.cache_epoch,
+                };
                 // An externally-supplied or mid-turn-persisted snapshot may be
                 // API-INVALID: a DANGLING assistant tool_call (a tool_use with no
                 // tool_result) OR an ORPHAN tool_result (a tool_result with no matching
@@ -675,13 +792,16 @@ impl RunningAgent {
                 AgentCommand::Cancel => self.rt.cancel_pending(),
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
                 AgentCommand::Snapshot => {
-                    self.rt.emit(AgentEvent::Snapshot { snapshot: self.capture_snapshot(&convo) });
+                    self.rt.emit(AgentEvent::Snapshot {
+                        snapshot: self.capture_snapshot(&convo),
+                    });
                 }
                 // MANUAL compaction (idle): run the injected strategy regardless of
                 // any auto threshold. `apply_plan` still refuses a net-loss/no-op
                 // plan (no epoch burn).
                 AgentCommand::Compact { focus } => {
-                    self.run_compaction(&mut convo, CompactTrigger::Manual { focus }).await;
+                    self.run_compaction(&mut convo, CompactTrigger::Manual { focus })
+                        .await;
                 }
                 AgentCommand::SendMessage { text, images } => {
                     let shutdown = self
@@ -705,7 +825,11 @@ impl RunningAgent {
                             AgentCommand::SendMessage { text, images } => {
                                 if self
                                     .process_send_message(
-                                        &mut convo, &mut cmd_rx, &mut pending, text, images,
+                                        &mut convo,
+                                        &mut cmd_rx,
+                                        &mut pending,
+                                        text,
+                                        images,
                                     )
                                     .await
                                 {
@@ -747,8 +871,14 @@ impl RunningAgent {
         images: Vec<ImageContent>,
     ) -> bool {
         if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
-            self.rt.emit(AgentEvent::Error { message: format!("prompt rejected: {reason}"), http_status: None, code: None });
-            self.rt.emit(AgentEvent::TurnComplete { reason: StopReason::PromptRejected });
+            self.rt.emit(AgentEvent::Error {
+                message: format!("prompt rejected: {reason}"),
+                http_status: None,
+                code: None,
+            });
+            self.rt.emit(AgentEvent::TurnComplete {
+                reason: StopReason::PromptRejected,
+            });
             return false;
         }
         // ── TASK BOUNDARY auto-compaction ──
@@ -887,9 +1017,12 @@ impl RunningAgent {
     /// from its `TurnCtx`).
     fn capture_snapshot(&self, convo: &Conversation) -> SessionSnapshot {
         let mut snap = SessionSnapshot::from_conversation(convo);
-        snap.turn_counter = snap.turn_counter.max(self.turn_counter.load(Ordering::Relaxed));
-        snap.request_counter =
-            snap.request_counter.max(self.request_counter.load(Ordering::Relaxed));
+        snap.turn_counter = snap
+            .turn_counter
+            .max(self.turn_counter.load(Ordering::Relaxed));
+        snap.request_counter = snap
+            .request_counter
+            .max(self.request_counter.load(Ordering::Relaxed));
         snap
     }
 
@@ -962,8 +1095,13 @@ impl RunningAgent {
             // Hard cap (safety fuse): stop before exceeding max_rounds.
             if let Some(max) = self.max_rounds {
                 if round > max {
-                    self.rt.emit(AgentEvent::Error { message: format!("max rounds ({max}) reached"), http_status: None, code: None });
-                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx).await;
+                    self.rt.emit(AgentEvent::Error {
+                        message: format!("max rounds ({max}) reached"),
+                        http_status: None,
+                        code: None,
+                    });
+                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                        .await;
                     return;
                 }
             }
@@ -979,9 +1117,7 @@ impl RunningAgent {
             // with a content-free 200.
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
-                if let Some(advisory) =
-                    over_window_advisory(est, self.provider.context_window())
-                {
+                if let Some(advisory) = over_window_advisory(est, self.provider.context_window()) {
                     over_window_warned = true;
                     self.rt.emit(AgentEvent::Warning(advisory));
                 }
@@ -1009,7 +1145,9 @@ impl RunningAgent {
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
-            self.hooks.on_request(&messages, &defs, &self.chat_options, &turn_ctx).await;
+            self.hooks
+                .on_request(&messages, &defs, &self.chat_options, &turn_ctx)
+                .await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
             // no empty-success illusion. The session-level `chat_options` (the
             // neutral SLOT) ride along as a sideband request param — NOT part of
@@ -1049,7 +1187,13 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::Warning(format!(
                         "context overflow on round {round} (attempt {overflow_attempt}); compacting and retrying"
                     )));
-                    self.run_compaction(convo, CompactTrigger::Overflow { attempt: overflow_attempt }).await;
+                    self.run_compaction(
+                        convo,
+                        CompactTrigger::Overflow {
+                            attempt: overflow_attempt,
+                        },
+                    )
+                    .await;
                     overflow_attempt += 1;
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
@@ -1085,7 +1229,8 @@ impl RunningAgent {
                                     secs_until_reset: None,
                                     auto_resuming: false,
                                 });
-                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                    .await;
                                 return;
                             }
                             self.rt.emit(AgentEvent::RateLimited {
@@ -1117,7 +1262,8 @@ impl RunningAgent {
                                 secs_until_reset,
                                 auto_resuming: false,
                             });
-                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                .await;
                             return;
                         }
                     }
@@ -1155,8 +1301,13 @@ impl RunningAgent {
                 }
                 Err(e) => {
                     self.hooks.on_error(&e.message).await;
-                    self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
-                    self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
+                    self.rt.emit(AgentEvent::Error {
+                        message: e.message,
+                        http_status: e.http_status,
+                        code: e.code,
+                    });
+                    self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                        .await;
                     return;
                 }
             };
@@ -1186,6 +1337,7 @@ impl RunningAgent {
             // empty 200), so it must NOT be retried as empty. Set true on the raw
             // arrival in each content arm below.
             let mut saw_stream_content = false;
+            let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
             // notice (malformed/garbled vs truly empty); it is NOT content.
@@ -1263,6 +1415,11 @@ impl RunningAgent {
                         saw_stream_content = true; // provider streamed reasoning (see TextDelta)
                         self.hooks.on_reasoning_delta(&mut t).await;
                         if !t.is_empty() {
+                            let t = strip_reasoning_filler(&t);
+                            if t.is_empty() {
+                                saw_suppressed_reasoning_filler = true;
+                                continue;
+                            }
                             reasoning.push_str(&t);
                             // Also buffer for the CURRENT signed block (finalized on the
                             // next ReasoningSignature). Uses the POST-hook bytes so a
@@ -1291,9 +1448,19 @@ impl RunningAgent {
                     // Live DISPLAY of a tool call as it streams; the WHOLE call is still
                     // collected via StreamEvent::ToolCall above for execution. Pure
                     // forward — never touches pending_calls or the executed call.
-                    StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                    StreamEvent::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments,
+                    } => {
                         saw_stream_content = true;
-                        self.rt.emit(AgentEvent::ToolCallStreaming { index, id, name, arguments });
+                        self.rt.emit(AgentEvent::ToolCallStreaming {
+                            index,
+                            id,
+                            name,
+                            arguments,
+                        });
                     }
                     // Fold MULTIPLE Usage events in one round field-wise (max), so a
                     // provider that SPLITS usage across events (input early, cumulative
@@ -1308,11 +1475,10 @@ impl RunningAgent {
                             http_status: e.http_status,
                             retry_after_secs: effective_retry_after(&e),
                         };
-                        let decision = self
-                            .hooks
-                            .on_rate_limit(&hint)
-                            .await
-                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                        let decision =
+                            self.hooks.on_rate_limit(&hint).await.unwrap_or_else(|| {
+                                crate::hook::RateLimitDecision::from_hint(&hint)
+                            });
                         match decision {
                             crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                                 rate_limit_waits += 1;
@@ -1325,7 +1491,8 @@ impl RunningAgent {
                                         secs_until_reset: None,
                                         auto_resuming: false,
                                     });
-                                    self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                    self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                        .await;
                                     return;
                                 }
                                 self.rt.emit(AgentEvent::RateLimited {
@@ -1355,16 +1522,20 @@ impl RunningAgent {
                                 // recalled from the UI — if the model re-generates identical
                                 // content the user will see it twice. Full rollback would
                                 // require a streaming-rewind mechanism beyond this scope.
+                                let partial_reasoning = strip_reasoning_filler(&reasoning);
                                 if !assistant_text.is_empty()
-                                    || !reasoning.is_empty()
+                                    || !partial_reasoning.is_empty()
                                     || !pending_calls.is_empty()
                                 {
                                     let mut partial = crate::message::Message::assistant(
                                         assistant_text.clone(),
                                         pending_calls.clone(),
                                     );
-                                    partial.reasoning =
-                                        if reasoning.is_empty() { None } else { Some(reasoning.clone()) };
+                                    partial.reasoning = if partial_reasoning.is_empty() {
+                                        None
+                                    } else {
+                                        Some(partial_reasoning)
+                                    };
                                     partial.reasoning_blocks = reasoning_blocks.clone();
                                     convo.push(partial);
                                 }
@@ -1383,15 +1554,21 @@ impl RunningAgent {
                                     secs_until_reset,
                                     auto_resuming: false,
                                 });
-                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx).await;
+                                self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                    .await;
                                 return;
                             }
                         }
                     }
                     StreamEvent::Error(e) => {
                         self.hooks.on_error(&e.message).await;
-                        self.rt.emit(AgentEvent::Error { message: e.message, http_status: e.http_status, code: e.code });
-                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
+                        self.rt.emit(AgentEvent::Error {
+                            message: e.message,
+                            http_status: e.http_status,
+                            code: e.code,
+                        });
+                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                            .await;
                         return;
                     }
                     // The adapter dropped an unparseable chunk. Note it (to flavor the
@@ -1429,7 +1606,14 @@ impl RunningAgent {
             // response, never empty. The two retry tiers in the `match opened` above
             // never catch this: an empty 200 OPENS successfully (`Ok`), so it is
             // neither a retryable `Err` nor a context overflow.
-            let empty_completion = !saw_stream_content && !truncated;
+            let mut cleaned_reasoning = strip_reasoning_filler(&reasoning);
+            let filler_only_reasoning = saw_stream_content
+                && assistant_text.trim().is_empty()
+                && pending_calls.is_empty()
+                && reasoning_blocks.is_empty()
+                && (saw_suppressed_reasoning_filler || !reasoning.trim().is_empty())
+                && cleaned_reasoning.trim().is_empty();
+            let empty_completion = (!saw_stream_content || filler_only_reasoning) && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
@@ -1478,8 +1662,13 @@ impl RunningAgent {
                     over_window_warned,
                 );
                 self.hooks.on_error(&msg).await;
-                self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
-                self.finish_turn(convo, StopReason::ProviderError, &turn_ctx).await;
+                self.rt.emit(AgentEvent::Error {
+                    message: msg,
+                    http_status: None,
+                    code: None,
+                });
+                self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                    .await;
                 return;
             }
             // Truncation (`finish_reason=length`) is recorded on the message meta
@@ -1542,7 +1731,7 @@ impl RunningAgent {
             // never affected: a turn with ANY content, or any tool-call turn, is excluded —
             // a model that legitimately separates reasoning from its answer keeps both.
             if assistant_text.trim().is_empty()
-                && !reasoning.trim().is_empty()
+                && !cleaned_reasoning.trim().is_empty()
                 && pending_calls.is_empty()
                 && !truncated
                 // Only the PLAIN-text reasoning path (OpenAI-compatible / Qwen). A turn that
@@ -1558,28 +1747,35 @@ impl RunningAgent {
                 // bypass the seam (its invariant: live stream AND storage are consistently
                 // transformed). Clone first so a hook that CLEARS the chunk leaves the
                 // reasoning intact to be STORED as reasoning (matching the no-promotion path).
-                let mut promoted = reasoning.clone();
+                let mut promoted = cleaned_reasoning.clone();
                 self.hooks.on_text_delta(&mut promoted).await;
                 if !promoted.is_empty() {
                     assistant_text = promoted;
-                    reasoning.clear(); // now the body; do not also store it as reasoning
+                    cleaned_reasoning.clear(); // now the body; do not also store it as reasoning
                     self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
                 }
             }
-            let mut assistant_msg = Message::assistant(assistant_text.clone(), pending_calls.clone());
+            let mut assistant_msg =
+                Message::assistant(assistant_text.clone(), pending_calls.clone());
             assistant_msg.meta = Some(meta);
             // STORE the accumulated reasoning losslessly: Some(..) iff the model
             // streamed any thinking this round, else None. It rides on the Message
             // (so it survives serde, resume, and compaction of surviving messages);
             // a provider adapter echoes it back next turn. Set after construction so
             // the `on_model_response` hook can observe/transform it.
-            assistant_msg.reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
+            assistant_msg.reasoning = if cleaned_reasoning.is_empty() {
+                None
+            } else {
+                Some(cleaned_reasoning)
+            };
             // STORE the signed reasoning blocks (empty unless the provider emitted
             // ReasoningSignature events). Set BEFORE on_model_response so the hook can
             // observe/transform them, mirroring `reasoning` above.
             assistant_msg.reasoning_blocks = reasoning_blocks;
             self.hooks.on_model_response(&mut assistant_msg).await;
-            self.rt.emit(AgentEvent::Usage(assistant_msg.meta.clone().unwrap_or_default()));
+            self.rt.emit(AgentEvent::Usage(
+                assistant_msg.meta.clone().unwrap_or_default(),
+            ));
             // Fix #5: the hook may have transformed the response (e.g. dropped a tool
             // call) — re-derive the calls to execute from the (possibly edited) message
             // so a dropped call is NOT executed.
@@ -1604,11 +1800,14 @@ impl RunningAgent {
                     if let Some(max) = self.max_continuations {
                         if continuations >= max {
                             self.rt.emit(AgentEvent::Error {
-                                message: format!("max offer_continuation continuations ({max}) reached"),
+                                message: format!(
+                                    "max offer_continuation continuations ({max}) reached"
+                                ),
                                 http_status: None,
                                 code: None,
                             });
-                            self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx).await;
+                            self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx)
+                                .await;
                             return;
                         }
                     }
@@ -1625,7 +1824,8 @@ impl RunningAgent {
                         "response truncated: finish_reason=length".into(),
                     ));
                 }
-                self.finish_turn(convo, StopReason::Stopped, &turn_ctx).await;
+                self.finish_turn(convo, StopReason::Stopped, &turn_ctx)
+                    .await;
                 return;
             }
             // ── Batch detection (pre-scan) ──
@@ -1650,7 +1850,11 @@ impl RunningAgent {
                 non_dup
             };
             let batch_start: Option<(String, Instant)> = if total_non_dup >= 2 {
-                let batch_id = format!("batch_{}_{}", self.turn_counter.load(Ordering::Relaxed), round);
+                let batch_id = format!(
+                    "batch_{}_{}",
+                    self.turn_counter.load(Ordering::Relaxed),
+                    round
+                );
                 let batch_calls: Vec<ToolBatchCall> = pending_calls
                     .iter()
                     .map(|c| ToolBatchCall {
@@ -1676,7 +1880,8 @@ impl RunningAgent {
             // `is_dup` scope (runner.rs:917-942) — duplicates ACROSS turns are a
             // separate concern (production's cross-turn loop_guard), out of scope
             // for the kernel here.
-            let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut result_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut seen_calls: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
             // VISION: images a tool produced this batch (e.g. read_file on a picture),
@@ -1740,8 +1945,14 @@ impl RunningAgent {
                         images: vec![],
                     };
                     result_ids.insert(call.id.clone());
-                    self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
-                    convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                    self.rt.emit(AgentEvent::ToolResult {
+                        result: result.clone(),
+                    });
+                    convo.push(Message::tool_result(
+                        &result.call_id,
+                        &result.content,
+                        result.is_error,
+                    ));
                     continue;
                 }
 
@@ -1798,10 +2009,9 @@ impl RunningAgent {
                             // reflected this call. Unset = prior process-cwd behavior.
                             let ctx = ToolContext {
                                 working_dir: match &self.cwd {
-                                    Some(c) => c
-                                        .read()
-                                        .map(|g| g.clone())
-                                        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
+                                    Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
+                                        std::env::current_dir().unwrap_or_default()
+                                    }),
                                     None => std::env::current_dir().unwrap_or_default(),
                                 },
                                 cancel: cancel.clone(),
@@ -1879,8 +2089,14 @@ impl RunningAgent {
                 if !result.images.is_empty() {
                     turn_images.append(&mut result.images);
                 }
-                self.rt.emit(AgentEvent::ToolResult { result: result.clone() });
-                convo.push(Message::tool_result(&result.call_id, &result.content, result.is_error));
+                self.rt.emit(AgentEvent::ToolResult {
+                    result: result.clone(),
+                });
+                convo.push(Message::tool_result(
+                    &result.call_id,
+                    &result.content,
+                    result.is_error,
+                ));
                 // CC PostToolUse `decision: "block"`: feed the reason back to the
                 // model so it can course-correct. Hard turn-termination (stop before
                 // the next model call) needs a dedicated StopReason and lands with the
@@ -2273,23 +2489,35 @@ mod effective_retry_after_tests {
     #[test]
     fn prefers_real_header() {
         // Header present → used verbatim, body text ignored.
-        assert_eq!(effective_retry_after(&err("429 rate limited", Some(42))), Some(42));
+        assert_eq!(
+            effective_retry_after(&err("429 rate limited", Some(42))),
+            Some(42)
+        );
         // Header wins even when the body ALSO carries a "try again in N" hint.
-        assert_eq!(effective_retry_after(&err("Try again in 30 seconds", Some(5))), Some(5));
+        assert_eq!(
+            effective_retry_after(&err("Try again in 30 seconds", Some(5))),
+            Some(5)
+        );
     }
 
     #[test]
     fn falls_back_to_body_text_when_no_header() {
         // Gateways (e.g. LiteLLM) that put the hint only in the BODY, no Retry-After header.
         assert_eq!(
-            effective_retry_after(&err("No deployments available. Try again in 30 seconds.", None)),
+            effective_retry_after(&err(
+                "No deployments available. Try again in 30 seconds.",
+                None
+            )),
             Some(30)
         );
     }
 
     #[test]
     fn none_when_neither_header_nor_body_hint() {
-        assert_eq!(effective_retry_after(&err("429 Too Many Requests", None)), None);
+        assert_eq!(
+            effective_retry_after(&err("429 Too Many Requests", None)),
+            None
+        );
     }
 }
 
@@ -2312,7 +2540,10 @@ mod empty_exhaustion_message_tests {
     #[test]
     fn upstream_framing_when_comfortably_within_window() {
         let m = empty_exhaustion_message(false, 5_000, 200_000, 5, false);
-        assert!(m.contains("与上下文长度无关"), "small request keeps upstream framing: {m}");
+        assert!(
+            m.contains("与上下文长度无关"),
+            "small request keeps upstream framing: {m}"
+        );
         assert!(!m.contains("请求过大"), "{m}");
     }
 
@@ -2320,14 +2551,20 @@ mod empty_exhaustion_message_tests {
     fn unknown_window_cannot_claim_over_size() {
         // window unknown (0) — never attribute to size even with a huge estimate.
         let m = empty_exhaustion_message(false, 999_999, 0, 5, false);
-        assert!(!m.contains("请求过大"), "unknown window cannot claim over-size: {m}");
+        assert!(
+            !m.contains("请求过大"),
+            "unknown window cannot claim over-size: {m}"
+        );
     }
 
     #[test]
     fn malformed_keeps_distinct_wording_and_no_size_blame() {
         let m = empty_exhaustion_message(true, 339_000, 200_000, 5, false);
         assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
-        assert!(!m.contains("请求过大"), "malformed is not size-attributed: {m}");
+        assert!(
+            !m.contains("请求过大"),
+            "malformed is not size-attributed: {m}"
+        );
     }
 
     #[test]
@@ -2336,8 +2573,14 @@ mod empty_exhaustion_message_tests {
         // exhaustion terminal must be SHORT and reference it — not repeat the
         // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
         let m = empty_exhaustion_message(false, 339_000, 200_000, 5, true);
-        assert!(m.contains("如开头"), "should point back to the earlier advisory: {m}");
-        assert!(!m.contains("约"), "must not restate the token estimate: {m}");
+        assert!(
+            m.contains("如开头"),
+            "should point back to the earlier advisory: {m}"
+        );
+        assert!(
+            !m.contains("约"),
+            "must not restate the token estimate: {m}"
+        );
         assert!(m.contains("/compact"), "still actionable: {m}");
     }
 }
@@ -2348,8 +2591,14 @@ mod over_window_advisory_tests {
 
     #[test]
     fn fires_at_or_over_window() {
-        assert!(over_window_advisory(200_000, 200_000).is_some(), "exactly at window must warn");
-        assert!(over_window_advisory(339_000, 200_000).is_some(), "over window must warn");
+        assert!(
+            over_window_advisory(200_000, 200_000).is_some(),
+            "exactly at window must warn"
+        );
+        assert!(
+            over_window_advisory(339_000, 200_000).is_some(),
+            "over window must warn"
+        );
     }
 
     #[test]
@@ -2366,7 +2615,10 @@ mod over_window_advisory_tests {
     fn advisory_is_actionable() {
         let m = over_window_advisory(339_000, 200_000).expect("over-window must warn");
         assert!(m.contains("/compact"), "must suggest /compact: {m}");
-        assert!(m.contains("上下文窗口"), "must name the context window: {m}");
+        assert!(
+            m.contains("上下文窗口"),
+            "must name the context window: {m}"
+        );
     }
 }
 
@@ -2376,7 +2628,12 @@ mod cap_tests {
     use crate::tool::ToolResult;
 
     fn res(content: &str) -> ToolResult {
-        ToolResult { call_id: "c1".into(), content: content.into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: "c1".into(),
+            content: content.into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 
     #[test]
@@ -2385,22 +2642,43 @@ mod cap_tests {
         let mut r = res(&original);
         cap_tool_result(&mut r, 100);
         // The marker is present.
-        assert!(r.content.contains("[truncated:"), "must carry a truncation marker: {}", r.content);
+        assert!(
+            r.content.contains("[truncated:"),
+            "must carry a truncation marker: {}",
+            r.content
+        );
         // The kept body (everything before the marker) is a valid byte prefix of
         // the original — deterministic, append-only-safe truncation.
         let body = r.content.split('\n').next().unwrap();
-        assert!(body.len() <= 100, "kept body must be <= cap; got {}", body.len());
-        assert!(original.as_bytes().starts_with(body.as_bytes()), "kept body must be a prefix of the original");
+        assert!(
+            body.len() <= 100,
+            "kept body must be <= cap; got {}",
+            body.len()
+        );
+        assert!(
+            original.as_bytes().starts_with(body.as_bytes()),
+            "kept body must be a prefix of the original"
+        );
         // Marker reports the right elided byte count: M=1000, kept=100 → 900.
-        assert!(r.content.contains("900 of 1000 bytes"), "marker math wrong: {}", r.content);
+        assert!(
+            r.content.contains("900 of 1000 bytes"),
+            "marker math wrong: {}",
+            r.content
+        );
     }
 
     #[test]
     fn does_not_touch_small_result() {
         let mut r = res("small output");
         cap_tool_result(&mut r, 65536);
-        assert_eq!(r.content, "small output", "content under cap must be byte-identical");
-        assert!(!r.content.contains("truncated"), "no marker on an un-capped result");
+        assert_eq!(
+            r.content, "small output",
+            "content under cap must be byte-identical"
+        );
+        assert!(
+            !r.content.contains("truncated"),
+            "no marker on an un-capped result"
+        );
     }
 
     #[test]
@@ -2415,9 +2693,19 @@ mod cap_tests {
         let body = r.content.split('\n').next().unwrap();
         assert!(body.len() <= 100, "body must be <= cap");
         // Valid UTF-8 prefix → re-validates and is a prefix of original.
-        assert!(std::str::from_utf8(body.as_bytes()).is_ok(), "kept body must be valid UTF-8");
-        assert!(s.as_bytes().starts_with(body.as_bytes()), "kept body must be a prefix of the original");
-        assert_eq!(body.len() % 3, 0, "must truncate on a '世' (3-byte) boundary, not mid-char");
+        assert!(
+            std::str::from_utf8(body.as_bytes()).is_ok(),
+            "kept body must be valid UTF-8"
+        );
+        assert!(
+            s.as_bytes().starts_with(body.as_bytes()),
+            "kept body must be a prefix of the original"
+        );
+        assert_eq!(
+            body.len() % 3,
+            0,
+            "must truncate on a '世' (3-byte) boundary, not mid-char"
+        );
 
         // Now a 4-byte char with a cap that lands mid-char → must not panic and
         // must stay a valid prefix.
@@ -2426,7 +2714,11 @@ mod cap_tests {
         cap_tool_result(&mut r2, 50); // 50 % 4 != 0 → mid-char
         let body2 = r2.content.split('\n').next().unwrap();
         assert!(std::str::from_utf8(body2.as_bytes()).is_ok(), "valid UTF-8");
-        assert_eq!(body2.len() % 4, 0, "must truncate on a '🦀' (4-byte) boundary");
+        assert_eq!(
+            body2.len() % 4,
+            0,
+            "must truncate on a '🦀' (4-byte) boundary"
+        );
         assert!(body2.len() <= 50);
     }
 
@@ -2435,7 +2727,11 @@ mod cap_tests {
         let huge = "x".repeat(5_000_000);
         let mut r = res(&huge);
         cap_tool_result(&mut r, 0);
-        assert_eq!(r.content.len(), 5_000_000, "cap=0 means unbounded — no truncation");
+        assert_eq!(
+            r.content.len(),
+            5_000_000,
+            "cap=0 means unbounded — no truncation"
+        );
     }
 
     #[test]
@@ -2445,6 +2741,80 @@ mod cap_tests {
         let mut b = res(&original);
         cap_tool_result(&mut a, 333);
         cap_tool_result(&mut b, 333);
-        assert_eq!(a.content, b.content, "same content + same cap must yield byte-identical truncation");
+        assert_eq!(
+            a.content, b.content,
+            "same content + same cap must yield byte-identical truncation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_affinity_tests {
+    use super::*;
+    use crate::stream::ProviderError;
+    use crate::tool::{ToolDef, ToolRegistry};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::{Arc, Mutex};
+
+    /// Records the session id the kernel binds onto its provider at spawn time, so the
+    /// test can prove the binding happens HERE (covering every driver) rather than in a
+    /// driver. `chat_stream` is never exercised — `bind_session_id` runs at spawn.
+    struct SessionIdRecorder {
+        seen: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SessionIdRecorder {
+        fn model_name(&self) -> &str {
+            "recorder"
+        }
+        fn bind_session_id(&self, session_id: &str) {
+            *self.seen.lock().unwrap() = Some(session_id.to_string());
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                truncated: false,
+            }])))
+        }
+    }
+
+    fn agent_with(session: Option<&str>, seen: Arc<Mutex<Option<String>>>) -> Agent {
+        let mut b = Agent::builder()
+            .provider(Arc::new(SessionIdRecorder { seen }))
+            .tools(ToolRegistry::new().mount(&[]))
+            .persona("p");
+        if let Some(s) = session {
+            b = b.session_id(s);
+        }
+        b.build()
+    }
+
+    #[tokio::test]
+    async fn kernel_binds_session_id_onto_provider_at_spawn() {
+        let seen = Arc::new(Mutex::new(None));
+        // spawn() binds the id synchronously before the session loop task starts.
+        let _handle = agent_with(Some("sess-xyz"), seen.clone()).spawn();
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("sess-xyz"),
+            "the kernel must forward the bound session id to the provider — this is the one \
+             wiring point shared by every driver (bridge / native / acp / headless)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_id_leaves_provider_unbound() {
+        let seen = Arc::new(Mutex::new(None));
+        let _handle = agent_with(None, seen.clone()).spawn();
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "without a session id the provider must stay unbound so the affinity header is omitted"
+        );
     }
 }

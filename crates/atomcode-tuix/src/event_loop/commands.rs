@@ -313,7 +313,7 @@ pub(crate) fn attach_live_session(
                     }
                     for tc in tool_calls {
                         renderer.render(UiLine::ToolCall {
-                            name: tc.name.clone(),
+                            name: super::display_tool_name(&tc.name),
                             detail: super::format_tool_detail(&tc.name, &tc.arguments),
                         });
                     }
@@ -342,6 +342,59 @@ pub(crate) fn attach_live_session(
         "已同步当前会话（与浏览器实时互通）".to_string(),
     ));
 }
+
+/// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
+/// 下执行时，文本输出经 LiveSession 广播给手机/webui（"电脑敲 /status，手机
+/// 也能看到"）。其余渲染行为全部透传给真实渲染器。
+struct CaptureRenderer<'a> {
+    inner: &'a mut dyn Renderer,
+    captured: String,
+}
+
+impl Renderer for CaptureRenderer<'_> {
+    fn render(&mut self, line: UiLine) {
+        if let UiLine::CommandOutput(s) | UiLine::Error(s) = &line {
+            if !self.captured.is_empty() {
+                self.captured.push('\n');
+            }
+            self.captured.push_str(s);
+        }
+        self.inner.render(line);
+    }
+    fn flush(&mut self) {
+        self.inner.flush();
+    }
+    fn shutdown(&mut self) {
+        self.inner.shutdown();
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn clear_screen(&mut self) {
+        self.inner.clear_screen();
+    }
+    fn suspend_for_external(&mut self) {
+        self.inner.suspend_for_external();
+    }
+    fn resume_from_external(&mut self) {
+        self.inner.resume_from_external();
+    }
+    fn flush_deferred(&mut self) {
+        self.inner.flush_deferred();
+    }
+    fn pop_approval_prompt(&mut self) {
+        self.inner.pop_approval_prompt();
+    }
+    fn on_resize(&mut self, cols: u16, rows: u16) {
+        self.inner.on_resize(cols, rows);
+    }
+}
+
+/// 同步模式下输出**不**镜像到手机的命令：它们的输出是桌面侧的接入引导
+/// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
+const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
+
+
 
 /// 同步模式下，TUI 本地切换会话（/new、/session、/resume 选择历史会话等）后，把这次
 /// 切换双向同步：既让所有 webui tab 跟随，也把进程内共享 LiveSession 重绑到新会话。
@@ -407,7 +460,460 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
+
 pub(super) fn execute_slash_command(
+    cmd: &str,
+    arg: &str,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) -> Result<()> {
+    // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
+    // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
+    let mirror = ctx
+        .sync_session
+        .clone()
+        .filter(|_| !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str()));
+    let Some(live) = mirror else {
+        return execute_slash_command_impl(
+            cmd,
+            arg,
+            state,
+            ctx,
+            renderer,
+            active_modal,
+            fixissue_pending,
+            fixissue_buffer,
+            setup_pending,
+        );
+    };
+    let mut cap = CaptureRenderer {
+        inner: renderer,
+        captured: String::new(),
+    };
+    let result = execute_slash_command_impl(
+        cmd,
+        arg,
+        state,
+        ctx,
+        &mut cap,
+        active_modal,
+        fixissue_pending,
+        fixissue_buffer,
+        setup_pending,
+    );
+    if !cap.captured.is_empty() {
+        live.notify_command_output(format!("/{}\n{}", cmd.trim_start_matches('/'), cap.captured));
+    }
+    result
+}
+
+/// 解析 `/app` 要拉起的 relay-client 二进制路径。优先级：
+///
+/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 显式覆盖（联调/特殊布局）。
+/// 2. **与 atomcode 自身可执行文件同目录** —— 同一机制同时覆盖两件事：
+///    捆绑分发（安装包/zip 把两个二进制放一起，解压到任意目录都能找到）
+///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
+/// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
+///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
+/// 4. 以上都没有 → 自动从 GitCode Release 下载到 ~/.atomcode/bin/。
+fn resolve_relay_client_bin() -> String {
+    const BARE: &str = "atomcode-relay-client";
+
+    // 1) 显式环境变量覆盖（非空才采纳）。
+    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+
+    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
+    let exe_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        BARE
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
+            if sibling.is_file() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    // 3) PATH 兜底。
+    BARE.to_string()
+}
+
+/// 中继客户端 oss 下载地址。
+/// 对应 gitcode.com/atomgit_atomcode/atomcode-relay-release 仓库的 Release。
+const RELAY_CLIENT_DOWNLOAD_BASE: &str =
+    "https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases/download";
+
+/// relay-client 版本清单地址。
+const RELAY_MANIFEST_URL: &str =
+    "https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/relay-latest.json";
+
+/// 兜底版本号（远端清单获取失败时使用，与 release 版本保持一致）。
+const FALLBACK_RELAY_VERSION: &str = "v0.1.0";
+
+/// 兜底版本的 sha256 和 size（远端清单获取失败时使用）。
+/// 各平台值从 relay-latest.json 同步。
+const FALLBACK_BINARIES: &[(&str, &str, u64)] = &[
+    ("aarch64-macos", "a3eb823821cc29526371aa11f0f03f08e0fe9089300d3d7e81b19d0d848ca78a", 4577584),
+    ("x86_64-macos", "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03", 4916448),
+    ("x86_64-linux", "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94", 5263216),
+    ("aarch64-linux", "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d", 4661464),
+    ("aarch64-ohos", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
+    ("x86_64-win", "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e", 5683344),
+];
+
+/// relay-client 版本清单结构。
+#[derive(serde::Deserialize)]
+struct RelayManifest {
+    version: String,
+    binaries: std::collections::BTreeMap<String, RelayBinaryEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct RelayBinaryEntry {
+    sha256: String,
+    size: u64,
+}
+
+/// 获取 relay-client 远端版本清单。
+async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
+    let token = atomcode_core::auth::oauth::get_valid_token()
+        .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("atomcode/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+
+    let resp = client
+        .get(RELAY_MANIFEST_URL)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("获取版本清单失败：{e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("获取版本清单返回 HTTP {}", resp.status().as_u16()));
+    }
+
+    let body = resp.text().await.map_err(|e| format!("读取版本清单失败：{e}"))?;
+    let manifest: RelayManifest =
+        serde_json::from_str(&body).map_err(|e| format!("解析版本清单失败：{e}"))?;
+
+    Ok(manifest)
+}
+
+/// 检测当前平台对应的目标标识，用于构建下载文件名。
+/// 格式：{arch}-{os}，与 Release 实际文件名一致。
+fn relay_client_target() -> &'static str {
+    // HarmonyOS / OpenHarmony 在运行时 OS 显示为 "linux"，
+    // 用编译时 cfg 区分
+    #[cfg(target_env = "ohos")]
+    {
+        return match std::env::consts::ARCH {
+            "aarch64" | "arm64" => "aarch64-ohos",
+            _ => "unknown",
+        };
+    }
+    #[cfg(not(target_env = "ohos"))]
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-macos",
+        ("macos", "x86_64") => "x86_64-macos",
+        ("linux", "x86_64") => "x86_64-linux",
+        ("linux", "aarch64") => "aarch64-linux",
+        ("windows", "x86_64") => "x86_64-win",
+        _ => "unknown",
+    }
+}
+
+/// 根据平台名构建下载文件名（含版本号，Windows 加 .exe 后缀）。
+fn relay_client_filename(target: &str, version: &str) -> String {
+    if target.starts_with("x86_64-win") {
+        format!("atomcode-relay-client-{}-{}.exe", version, target)
+    } else {
+        format!("atomcode-relay-client-{}-{}", version, target)
+    }
+}
+
+/// 字节数组转小写 hex 字符串。
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// 解析 semver 版本号 `vMAJOR.MINOR.PATCH`，返回 (major, minor, patch)。
+/// 无法解析时返回 None。
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().strip_prefix('v')?.split('-').next()?;
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+}
+
+/// 判断 latest 是否比 current 新（semver 比较）。
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => latest.trim() != current.trim(),
+    }
+}
+
+/// 确保 relay-client 二进制可用。
+/// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
+fn ensure_relay_client_bin() -> Result<String, String> {
+    let bare_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+
+    // 跳过下载标志
+    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
+        let local = resolve_relay_client_bin();
+        if local != bare_name || std::path::Path::new(&local).is_file() {
+            return Ok(local);
+        }
+        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+                    请手动将 relay-client 放入 PATH 或与 atomcode 同目录".to_string());
+    }
+
+    // 1-3: 先尝试本地查找
+    let local = resolve_relay_client_bin();
+
+    // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
+    if local != bare_name {
+        return Ok(local);
+    }
+    // 裸名也可能是 PATH 上的文件
+    if std::path::Path::new(&local).is_file() {
+        return Ok(local);
+    }
+
+    // 4) 检查缓存目录 ~/.atomcode/bin/
+    let cache_dir = dirs::home_dir()
+        .map(|h| h.join(".atomcode").join("bin"))
+        .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
+    let cache_path = cache_dir.join(bare_name);
+    let version_path = cache_dir.join(".version");
+
+    // 5) 检测平台
+    let target = relay_client_target();
+    if target == "unknown" {
+        return Err(format!(
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 PATH 中",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    }
+
+    // 6) 获取远端版本清单（含最新版本号 + sha256）
+    let manifest = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(fetch_relay_manifest())
+    });
+    let manifest = match manifest {
+        Ok(m) => m,
+        Err(_) => {
+            // 清单获取失败 → 使用兜底版本
+            // 有缓存且版本不低于兜底版本 → 直接用缓存
+            if cache_path.is_file() {
+                if let Ok(ref ver) = std::fs::read_to_string(&version_path) {
+                    let ver = ver.trim();
+                    // 兜底版本作为最低要求，用 semver 比对
+                    if !is_newer_version(FALLBACK_RELAY_VERSION, ver) {
+                        return Ok(cache_path.to_string_lossy().into_owned());
+                    }
+                }
+                // 缓存版本低于兜底版本 → 继续走兜底下载
+            }
+            // 构造兜底 manifest
+            let mut fallback_binaries = std::collections::BTreeMap::new();
+            for (platform, sha256, size) in FALLBACK_BINARIES {
+                fallback_binaries.insert(
+                    platform.to_string(),
+                    RelayBinaryEntry {
+                        sha256: sha256.to_string(),
+                        size: *size,
+                    },
+                );
+            }
+            RelayManifest {
+                version: FALLBACK_RELAY_VERSION.to_string(),
+                binaries: fallback_binaries,
+            }
+        }
+    };
+
+    // 7) 检查缓存版本是否最新
+    let cached_version = std::fs::read_to_string(&version_path).ok();
+    if let Some(ref ver) = cached_version {
+        let ver = ver.trim();
+        if !is_newer_version(&manifest.version, ver) && cache_path.is_file() {
+            return Ok(cache_path.to_string_lossy().into_owned());
+        }
+    }
+
+    // 8) 获取当前平台的 binary entry
+    let entry = match manifest.binaries.get(target) {
+        Some(e) => e,
+        None => {
+            return Err(format!(
+                "版本 {} 不支持当前平台 {}",
+                manifest.version, target
+            ));
+        }
+    };
+
+    // 9) 自动下载 + SHA256 校验
+    let filename = relay_client_filename(target, &manifest.version);
+    let url = format!(
+        "{}/{}/{}",
+        RELAY_CLIENT_DOWNLOAD_BASE, manifest.version, filename
+    );
+
+    // 使用 block_in_place 执行异步下载（当前在同步上下文中）
+    let download_result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(download_relay_client(&url, &cache_path, &entry.sha256, entry.size))
+    });
+
+    match download_result {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
+            }
+            // 写入缓存版本号
+            let _ = std::fs::write(&version_path, manifest.version.as_bytes());
+            Ok(cache_path.to_string_lossy().into_owned())
+        }
+        Err(e) => {
+            let msg = format!(
+                "自动下载 relay-client 失败：{}\n\
+                 \n\
+                 安全下载：\n\
+                 1. 打开浏览器访问\n\
+                    https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases\n\
+                 2. 下载对应平台的 binary\n\
+                 3. 保存到 ~/.atomcode/bin/atomcode-relay-client\n\
+                 4. chmod +x ~/.atomcode/bin/atomcode-relay-client\n\
+                 5. /app 重试\n\
+                 \n\
+                 快速安装：\n\
+                 curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh\n\
+                 && /app 重试",
+                e
+            );
+            Err(msg)
+        }
+    }
+}
+
+/// 从指定 URL 下载 relay-client 二进制到缓存路径。
+/// 使用 GitCode OAuth token 进行鉴权，下载完成后校验 SHA256 和文件大小。
+async fn download_relay_client(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    // SHA256 计算
+    use sha2::{Digest, Sha256};
+
+    // 确保缓存目录存在
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建缓存目录失败：{e}"))?;
+    }
+
+    // 获取 GitCode OAuth token（用户需先 /login）
+    let token = atomcode_core::auth::oauth::get_valid_token()
+        .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
+
+    // 构建 HTTP 客户端 + 添加鉴权头
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("atomcode/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+
+    let resp = client
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败：{e}（请检查网络连接）"))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("GitCode 鉴权失败，token 可能已过期。请重新执行 /login 登录".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "下载返回 HTTP {}（Release 可能不存在或无权访问）",
+            resp.status().as_u16()
+        ));
+    }
+
+    // 流式下载 + SHA256 累积
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("创建文件失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取下载流失败：{e}"))?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入文件失败：{e}"))?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("刷盘失败：{e}"))?;
+    drop(file);
+
+    // 校验文件大小
+    if expected_size > 0 && written != expected_size {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!(
+            "文件大小不匹配：预期 {} 字节，实际下载 {} 字节",
+            expected_size, written
+        ));
+    }
+
+    // 校验 SHA256
+    let got = hex_encode(&hasher.finalize());
+    if !got.eq_ignore_ascii_case(expected_sha256) {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!(
+            "SHA256 校验失败：\n  预期: {}\n  实际: {}",
+            expected_sha256, got
+        ));
+    }
+
+    Ok(())
+}
+
+fn execute_slash_command_impl(
     cmd: &str,
     arg: &str,
     state: &mut UiState,
@@ -865,47 +1371,17 @@ pub(super) fn execute_slash_command(
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
         }
         "status" => {
-            let mut txt = t(Msg::StatusBody {
-                model: &ctx.model_name,
-                dir: &ctx.working_dir.display().to_string(),
-                config: &Config::default_path().display().to_string(),
-                tokens: state.total_tokens,
-            })
-            .into_owned();
-            txt.push_str(&format!(
-                "  Proxy:  {}\n",
-                ctx.config.network.proxy.summary()
-            ));
-            txt.push_str(&render_codingplan_status_for_status_cmd());
-
-            txt.push('\n');
-            txt.push_str(&render_instruction_status_block(&ctx.working_dir));
-
+            // Interactive `/status` shows the Proxy line (after CodingPlan); the
+            // remote/phone view omits it. Order is owned by `assemble_status`.
+            let proxy = format!("  Proxy:  {}\n", ctx.config.network.proxy.summary());
+            let txt = build_status_text(ctx, Some(&proxy));
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
         "diff" => {
-            let out = std::process::Command::new("git")
-                .args(["diff", "--stat"])
-                .current_dir(&ctx.working_dir)
-                .output();
-            match out {
-                Ok(o) => {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    renderer.render(UiLine::CommandOutput(if s.is_empty() {
-                        t(Msg::CmdNoChanges).into_owned()
-                    } else {
-                        s
-                    }));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::DiffFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
+            match build_diff_text(ctx) {
+                Ok(s) => renderer.render(UiLine::CommandOutput(s)),
+                Err(e) => renderer.render(UiLine::Error(e)),
             }
             renderer.flush();
         }
@@ -913,30 +1389,7 @@ pub(super) fn execute_slash_command(
             dispatch_undo(arg, state, ctx, renderer);
         }
         "cost" => {
-            let total = state.prompt_tokens + state.completion_tokens;
-            let cache_rate = if state.prompt_tokens > 0 {
-                ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
-            } else {
-                0
-            };
-            let cost = crate::pricing::calculate_cost(
-                &ctx.model_name,
-                state.prompt_tokens,
-                state.completion_tokens,
-                state.cached_tokens,
-            );
-            let cost_str = crate::pricing::format_cost(cost);
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CostReport {
-                    prompt: state.prompt_tokens,
-                    completion: state.completion_tokens,
-                    cached: state.cached_tokens,
-                    cache_rate,
-                    total,
-                    cost: &cost_str,
-                })
-                .into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
             renderer.flush();
         }
         "context" => {
@@ -1088,6 +1541,224 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "app" => {
+            // HIDDEN until the mobile app launches: behave exactly like an unknown
+            // command so the unreleased feature isn't discoverable. The full
+            // implementation below is intentionally preserved — re-enable via
+            // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
+            // in BUILTIN_COMMANDS).
+            if !crate::commands::app_remote_enabled() {
+                renderer.render(UiLine::Error(
+                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
+            // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
+            // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
+            // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
+            //
+            // 中继地址 → (ws 拨号 URL, App 用的 https 根)。
+            fn derive_relay_urls(base: &str) -> (String, String) {
+                let trimmed = base.trim().trim_end_matches('/');
+                // 用户可能直接给 wss://.../ws/daemon：剥掉路径还原成根。
+                let https_base = if let Some(rest) = trimmed.strip_prefix("wss://") {
+                    format!("https://{}", rest.trim_end_matches("/ws/daemon"))
+                } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+                    format!("http://{}", rest.trim_end_matches("/ws/daemon"))
+                } else {
+                    trimmed.to_string()
+                };
+                let ws_url = if let Some(rest) = https_base.strip_prefix("https://") {
+                    format!("wss://{rest}/ws/daemon")
+                } else if let Some(rest) = https_base.strip_prefix("http://") {
+                    format!("ws://{rest}/ws/daemon")
+                } else {
+                    // 没写 scheme：默认按 TLS 处理。
+                    format!("wss://{https_base}/ws/daemon")
+                };
+                (ws_url, https_base)
+            }
+            // 最小百分号编码：query value 里除 unreserved 外全部转义，
+            // App 端 Uri.queryParameters 会自动解码还原。
+            fn pct(s: &str) -> String {
+                let mut out = String::with_capacity(s.len() * 3);
+                for b in s.bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+                        | b'~' => out.push(b as char),
+                        _ => out.push_str(&format!("%{b:02X}")),
+                    }
+                }
+                out
+            }
+
+            let a = arg.trim();
+            let msg = if a == "stop" {
+                let killed = ctx
+                    .app_relay_child
+                    .take()
+                    .map(|mut c| {
+                        let _ = c.start_kill();
+                    })
+                    .is_some();
+                if let Some(h) = ctx.sync_forwarder.take() {
+                    h.abort();
+                }
+                ctx.sync_session = None;
+                let server_stopped = atomcode_daemon::stop_app_server();
+                if killed || server_stopped {
+                    "已停止 App 远程访问".to_string()
+                } else {
+                    "App 远程访问未在运行".to_string()
+                }
+            } else {
+                // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
+                // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
+                const APP_DEFAULT_RELAY: &str = "https://relay-atomcode.atomgit.com";
+                // 中继地址：命令参数 > ATOMCODE_APP_RELAY 环境变量 > 生产默认。
+                let relay_base = if a.is_empty() {
+                    std::env::var("ATOMCODE_APP_RELAY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| Some(APP_DEFAULT_RELAY.to_string()))
+                } else {
+                    Some(a.trim_start_matches("--relay").trim().to_string())
+                };
+                match relay_base.filter(|s| !s.is_empty()) {
+                    // 仅在显式给了空参数（如 `/app --relay`）时可达。
+                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖"
+                        .to_string(),
+                    Some(relay) => {
+                        // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
+                        let (initial, sid) = if ctx.current_session.messages.is_empty() {
+                            (Vec::new(), None)
+                        } else {
+                            (
+                                ctx.current_session.messages.clone(),
+                                Some(ctx.current_session.id.clone()),
+                            )
+                        };
+                        // 合并 main 后函数更名为 ensure_live_session,且 session_id
+                        // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
+                        let session = atomcode_daemon::ensure_live_session(
+                            ctx.working_dir.clone(),
+                            ctx.telemetry.clone(),
+                            sid,
+                            initial,
+                        );
+                        // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        let started = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                atomcode_daemon::ensure_app_server(
+                                    "127.0.0.1",
+                                    atomcode_daemon::APP_DEFAULT_PORT,
+                                ),
+                            )
+                        });
+                        match started {
+                            Err(e) => format!("App server 启动失败：{e}"),
+                            Ok((_h, port)) => {
+                                // 3) route token（中继路由 key + 凭证）+ 中继 URL。
+                                // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
+                                let token = match atomcode_core::auth::oauth::get_stored_auth() {
+                                    Some(auth) => format!(
+                                        "{}.{}",
+                                        auth.user.id,
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                    None => format!(
+                                        "{}{}",
+                                        uuid::Uuid::new_v4().simple(),
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                };
+                                let (ws_url, https_base) = derive_relay_urls(&relay);
+                                let machine = std::env::var("HOSTNAME")
+                                    .ok()
+                                    .or_else(|| std::env::var("COMPUTERNAME").ok());
+                                // 4) 确保 relay-client 二进制可用（查找本地或自动下载），
+                                //    然后拉起子进程。自身即 daemon，故
+                                //    --no-supervise-daemon。kill_on_drop：TUI 退出随之清理。
+                                let daemon_url = format!("http://127.0.0.1:{port}");
+                                let spawn_result = match ensure_relay_client_bin() {
+                                    Err(e) => format!("启动 relay-client 失败：{e}"),
+                                    Ok(bin) => {
+                                        let mut cmd = tokio::process::Command::new(&bin);
+                                        cmd.arg("run")
+                                            .arg("--relay")
+                                            .arg(&ws_url)
+                                            .arg("--token")
+                                            .arg(&token)
+                                            .arg("--daemon")
+                                            .arg(&daemon_url)
+                                            .arg("--supervise-daemon")
+                                            .arg("false")
+                                            .kill_on_drop(true)
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null());
+                                        if let Some(m) = &machine {
+                                            cmd.arg("--machine-name").arg(m);
+                                        }
+                                        if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
+                                            .ok()
+                                            .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            cmd.arg("--register-secret").arg(secret);
+                                        }
+                                        match cmd.spawn() {
+                                            Err(e) => format!(
+                                                "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
+                                                 relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
+                                                 请确认它在 PATH 中或与 atomcode 同目录，\
+                                                 也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
+                                            ),
+                                            Ok(child) => {
+                                                if let Some(mut old) = ctx.app_relay_child.take() {
+                                                    let _ = old.start_kill();
+                                                }
+                                                ctx.app_relay_child = Some(child);
+                                                // 5) 配对 URI（App 扫码解析 r= / t= / m=）。
+                                                let m_param = machine
+                                                    .as_deref()
+                                                    .map(|m| format!("&m={}", pct(m)))
+                                                    .unwrap_or_default();
+                                                let pair_uri = format!(
+                                                    "atomcode-link://pair?r={}&t={}{}",
+                                                    pct(&https_base),
+                                                    token,
+                                                    m_param
+                                                );
+                                                // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
+                                                attach_live_session(ctx, renderer, session, false);
+                                                match crate::render::qr::render_login_qr(
+                                                    &pair_uri,
+                                                    crate::render::qr::QrStyle::Dense1x2,
+                                                ) {
+                                                    Some(q) => format!(
+                                                        "用 AtomCode App 扫码连接
+                                                        \n{q}\n\
+                                                         （/app stop 断开）"
+                                                    ),
+                                                    None => format!(
+                                                        "配对链接（二维码生成失败，手动填）：{pair_uri}"
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+                                spawn_result
+                            }
+                        }
+                    }
+                }
+            };
+            renderer.render(UiLine::CommandOutput(msg));
+            renderer.flush();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }
@@ -1117,20 +1788,7 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "whoami" => {
-            let txt = if let Some(auth) = atomcode_core::auth::get_stored_auth() {
-                let email = auth.user.email.as_deref().unwrap_or("—");
-                let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
-                format!(
-                    "  {} ({})\n  {}\n  auth: {}\n",
-                    name,
-                    auth.user.username,
-                    email,
-                    atomcode_core::auth::auth_file_path().display(),
-                )
-            } else {
-                t(Msg::CmdWhoamiNotSignedIn).into_owned()
-            };
-            renderer.render(UiLine::CommandOutput(txt));
+            renderer.render(UiLine::CommandOutput(build_whoami_text()));
             renderer.flush();
         }
         "upgrade" => {
@@ -2901,6 +3559,53 @@ pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt:
     format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
 }
 
+/// `/status` login line: the signed-in identity (already formatted, e.g.
+/// `昵称(用户名)`), or a not-signed-in prompt. Pure over the resolved string.
+fn render_login_line(user: Option<&str>) -> String {
+    match user {
+        Some(u) => t(Msg::StatusLoginLoggedIn { user: u }).into_owned(),
+        None => t(Msg::StatusLoginNotSignedIn).into_owned(),
+    }
+}
+
+/// Format the signed-in identity as `display_name(username)` — the agreed
+/// `昵称(用户名)` form. Falls back to just `username` when there is no distinct
+/// display name: name absent, empty/whitespace, or identical to the username
+/// (so we never render `Saulcy(Saulcy)`).
+fn format_login_identity(name: Option<&str>, username: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty() && *n != username) {
+        Some(n) => format!("{n}({username})"),
+        None => username.to_string(),
+    }
+}
+
+/// The `/status` login line sourced from stored auth: `昵称(用户名)` (display
+/// name + username), or just the username when there is no distinct display
+/// name. Shared by both `/status` renderers so the interactive and remote
+/// outputs can't drift.
+fn render_login_line_from_stored_auth() -> String {
+    match atomcode_core::auth::get_stored_auth() {
+        Some(a) => {
+            let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
+            render_login_line(Some(&identity))
+        }
+        None => render_login_line(None),
+    }
+}
+
+/// Render a CodingPlan auth failure. An EXPIRED login (`is_auth_expired` on the error
+/// chain — dead local token, or a 401 from the server) → a clear localized "run
+/// /login" prompt; otherwise `fallback()` (a genuine not-signed-in hint, or the raw
+/// fetch-failure line). `from_stored_auth` returns `AuthExpired` for a dead token but a
+/// PLAIN error when never logged in, so the two stay distinguishable.
+fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
+    if atomcode_core::coding_plan::is_auth_expired(e) {
+        t(Msg::StatusCpAuthExpired).into_owned()
+    } else {
+        fallback()
+    }
+}
+
 /// Fetch + format the CodingPlan section appended to `/status`. Runs a
 /// blocking HTTP call (~100–500ms) against `/coding-plan/status` — same
 /// endpoint as the `/codingplan` flow's step 4. Falls back to a one-line
@@ -2913,17 +3618,20 @@ fn render_codingplan_status_for_status_cmd() -> String {
 
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
-        Err(_) => {
-            return t(Msg::StatusCpNotSignedIn).into_owned();
-        }
+        // Expired login → clear re-login prompt; genuinely not signed in → the
+        // not-signed-in hint. Without this split a dead token showed "not signed in"
+        // while the Login line above said "signed in as X" — contradictory.
+        Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
     };
     let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
-            return t(Msg::StatusCpFetchFailed {
-                error: &format!("{:#}", e),
+            return render_cp_auth_error(&e, || {
+                t(Msg::StatusCpFetchFailed {
+                    error: &format!("{:#}", e),
+                })
+                .into_owned()
             })
-            .into_owned();
         }
     };
     let plan = match &status.codingplan_free {
@@ -3209,10 +3917,128 @@ pub(crate) fn launch_fixissue(
     }
 }
 
-/// Commit a new working-directory choice: notify the agent, update cwd +
-/// previous_dir on the shared context, push the new entry into the
-/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
-/// DirPicker modal's Enter handler so both paths keep state coherent.
+/// Assemble the `/status` body in canonical display order: the login line FIRST
+/// (so you see who you're signed in as at a glance), then the model/dir/config
+/// block, the CodingPlan section, an optional Proxy line (interactive `/status`
+/// only — the remote/phone view omits it), a blank separator, then the
+/// instruction-files block. Pure over its already-rendered pieces so the order is
+/// unit-testable and the interactive + remote renderers can't drift apart.
+fn assemble_status(
+    login: &str,
+    body: &str,
+    codingplan: &str,
+    proxy: Option<&str>,
+    instructions: &str,
+) -> String {
+    let mut txt = String::with_capacity(
+        login.len() + body.len() + codingplan.len() + instructions.len() + 16,
+    );
+    txt.push_str(login);
+    txt.push_str(body);
+    txt.push_str(codingplan);
+    if let Some(p) = proxy {
+        txt.push_str(p);
+    }
+    txt.push('\n');
+    txt.push_str(instructions);
+    txt
+}
+
+/// `/status` 的报告文本。TUI arm 与手机远程执行（run_remote_command）共用。
+/// `proxy` = 交互式 `/status` 传入的 Proxy 行；远程视图传 `None` 省略。
+pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
+    let body = t(Msg::StatusBody {
+        model: &ctx.model_name,
+        dir: &ctx.working_dir.display().to_string(),
+        config: &Config::default_path().display().to_string(),
+    })
+    .into_owned();
+    assemble_status(
+        &render_login_line_from_stored_auth(),
+        &body,
+        &render_codingplan_status_for_status_cmd(),
+        proxy,
+        &render_instruction_status_block(&ctx.working_dir),
+    )
+}
+
+/// `/cost` 的用量报告文本。TUI arm 与手机远程执行共用。
+pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    let total = state.prompt_tokens + state.completion_tokens;
+    let cache_rate = if state.prompt_tokens > 0 {
+        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+    } else {
+        0
+    };
+    let cost = crate::pricing::calculate_cost(
+        &ctx.model_name,
+        state.prompt_tokens,
+        state.completion_tokens,
+        state.cached_tokens,
+    );
+    let cost_str = crate::pricing::format_cost(cost);
+    t(Msg::CostReport {
+        prompt: state.prompt_tokens,
+        completion: state.completion_tokens,
+        cached: state.cached_tokens,
+        cache_rate,
+        total,
+        cost: &cost_str,
+    })
+    .into_owned()
+}
+
+/// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
+pub(super) fn build_whoami_text() -> String {
+    if let Some(auth) = atomcode_core::auth::get_stored_auth() {
+        let email = auth.user.email.as_deref().unwrap_or("—");
+        let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
+        format!(
+            "  {} ({})\n  {}\n  auth: {}\n",
+            name,
+            auth.user.username,
+            email,
+            atomcode_core::auth::auth_file_path().display(),
+        )
+    } else {
+        t(Msg::CmdWhoamiNotSignedIn).into_owned()
+    }
+}
+
+/// `/diff` 的改动概要文本（Err = 渲染为错误行的文案）。TUI arm 与手机远程执行共用。
+pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
+    match std::process::Command::new("git")
+        .args(["diff", "--stat"])
+        .current_dir(&ctx.working_dir)
+        .output()
+    {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            Ok(if s.is_empty() {
+                t(Msg::CmdNoChanges).into_owned()
+            } else {
+                s
+            })
+        }
+        Err(e) => Err(t(Msg::DiffFailed {
+            error: &format!("{}", e),
+        })
+        .into_owned()),
+    }
+}
+
+/// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
+/// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
+pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
+    match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
+        "status" => Some(build_status_text(ctx, None)),
+        "cost" => Some(build_cost_text(ctx, state)),
+        "whoami" => Some(build_whoami_text()),
+        "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
+        _ => None,
+    }
+}
+
 /// Drop the current conversation and start a brand-new session in the current
 /// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
 /// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
@@ -3259,12 +4085,16 @@ pub(crate) fn reset_to_new_session(
         working_dir: dir_display,
     });
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
-    renderer.flush();
     renderer.end_sync();
     // 同步模式：把这次「本地新建会话」双向同步到 webui，并把共享 LiveSession 重绑到新会话。
     sync_local_session_switch(ctx, renderer);
+
 }
 
+/// Commit a new working-directory choice: notify the agent, update cwd +
+/// previous_dir on the shared context, push the new entry into the
+/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
+/// DirPicker modal's Enter handler so both paths keep state coherent.
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     ctx.agent
         .cmd_tx
@@ -3691,6 +4521,108 @@ fn fmt_dur(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod status_login_tests {
+    use super::*;
+
+    #[test]
+    fn login_line_shows_username_when_signed_in() {
+        let line = render_login_line(Some("张三"));
+        assert!(line.contains("张三"), "signed-in line must show the username: {line:?}");
+    }
+
+    #[test]
+    fn login_line_prompts_login_when_not_signed_in() {
+        let line = render_login_line(None);
+        assert!(line.contains("/login"), "not-signed-in line must point to /login: {line:?}");
+        assert!(!line.contains("张三"));
+    }
+
+    #[test]
+    fn login_identity_is_name_paren_username() {
+        // The agreed 昵称(用户名) form: display name with the username in parens.
+        assert_eq!(format_login_identity(Some("TheoCui"), "Saulcy"), "TheoCui(Saulcy)");
+        assert_eq!(format_login_identity(Some("  Theo  "), "Saulcy"), "Theo(Saulcy)");
+    }
+
+    #[test]
+    fn login_identity_falls_back_to_bare_username() {
+        // No distinct display name → just the username (never `Saulcy(Saulcy)`).
+        assert_eq!(format_login_identity(None, "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some(""), "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some("   "), "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some("Saulcy"), "Saulcy"), "Saulcy");
+    }
+
+    #[test]
+    fn status_order_is_login_first_then_body_codingplan_proxy() {
+        // Reorder spec: login line at the very top; Proxy AFTER CodingPlan.
+        let s = assemble_status(
+            "LOGIN\n",
+            "BODY\n",
+            "CODINGPLAN\n",
+            Some("PROXY\n"),
+            "INSTRUCTIONS",
+        );
+        assert!(s.starts_with("LOGIN\n"), "login must be first: {s:?}");
+        let (login, body, cp, proxy, instr) = (
+            s.find("LOGIN").unwrap(),
+            s.find("BODY").unwrap(),
+            s.find("CODINGPLAN").unwrap(),
+            s.find("PROXY").unwrap(),
+            s.find("INSTRUCTIONS").unwrap(),
+        );
+        // login < body < codingplan < proxy < instructions
+        assert!(login < body && body < cp, "body sits between login and codingplan: {s:?}");
+        assert!(cp < proxy, "Proxy must come AFTER CodingPlan: {s:?}");
+        assert!(proxy < instr, "instructions come last: {s:?}");
+    }
+
+    #[test]
+    fn status_omits_proxy_line_when_none() {
+        // The remote/phone view passes None → no Proxy line at all.
+        let s = assemble_status("LOGIN\n", "BODY\n", "CODINGPLAN\n", None, "INSTRUCTIONS");
+        assert!(!s.contains("PROXY"), "proxy must be absent when None: {s:?}");
+        assert!(s.starts_with("LOGIN\n"), "login still first: {s:?}");
+    }
+
+    #[test]
+    fn status_body_no_longer_shows_a_token_line() {
+        // /status is a quick-glance state view; per-session token count is /cost's job.
+        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
+            model: "m", dir: "/d", config: "/c",
+        });
+        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
+            model: "m", dir: "/d", config: "/c",
+        });
+        assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
+        assert!(!zh.contains("Token"), "zh StatusBody must not carry a Token line: {zh}");
+    }
+
+    #[test]
+    fn cp_auth_error_expired_ignores_fallback_and_prompts_relogin() {
+        use atomcode_core::coding_plan::AuthExpired;
+        let err = anyhow::Error::new(AuthExpired { status: 401 });
+        let line = render_cp_auth_error(&err, || "FALLBACK".to_string());
+        assert!(line.contains("/login"), "auth-expired must prompt /login: {line:?}");
+        assert!(!line.contains("FALLBACK"), "expired must not use the fallback: {line:?}");
+        // Must NOT bury it as the raw error text.
+        assert!(
+            !line.contains("authentication failed (401)"),
+            "auth-expired should be a clean localized message, not the raw error: {line:?}"
+        );
+    }
+
+    #[test]
+    fn cp_auth_error_non_auth_uses_fallback() {
+        // A genuine not-signed-in / network error falls through to the caller's
+        // fallback (not-signed-in hint, or the raw fetch-failure line).
+        let err = anyhow::anyhow!("network boom");
+        let line = render_cp_auth_error(&err, || format!("fetch failed — {err:#}"));
+        assert!(line.contains("network boom"), "non-auth errors fall through to the fallback: {line:?}");
     }
 }
 

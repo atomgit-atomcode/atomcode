@@ -35,7 +35,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        shell_tool_description(cfg!(target_os = "windows"))
+        shell_tool_description(cfg!(target_os = "windows"), windows_bash_active())
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -166,6 +166,35 @@ impl Tool for BashTool {
     }
 }
 
+/// Whether the `bash` tool will actually route through a POSIX bash (Git Bash / MSYS2)
+/// on THIS machine. The single source of truth for both the tool description AND the
+/// system-prompt `Shell:` line, so the model is told the shell IT ACTUALLY GETS instead
+/// of a hard-coded lie. `#[cfg(windows)]` consults the cached `detect_windows_bash()` —
+/// its FIRST call runs up to a few synchronous, console-suppressed probes (`where bash`,
+/// `where git`, then `reg query`), then memoizes; every later call (and `build_command`)
+/// reuses the cache. Elsewhere the tool always uses a real `bash`, so the Windows
+/// cmd-vs-bash fork does not apply and this is `false`.
+pub(crate) fn windows_bash_active() -> bool {
+    #[cfg(windows)]
+    {
+        detect_windows_bash().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Short label for the system-prompt `Shell:` line on Windows: the POSIX bash when one
+/// is active, else cmd.exe. Pure (takes the flag) so it is unit-testable off Windows.
+pub(crate) fn windows_shell_label(bash_present: bool) -> &'static str {
+    if bash_present {
+        "bash"
+    } else {
+        "cmd.exe"
+    }
+}
+
 /// The `bash` tool description for the current platform.
 ///
 /// The tool keeps the name `bash` (every provider's model is trained to reach
@@ -175,7 +204,7 @@ impl Tool for BashTool {
 /// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
 /// Naming the real shell here removes the contradiction. Pure (takes a bool) so
 /// the Windows wording is unit-testable off Windows.
-fn shell_tool_description(is_windows: bool) -> &'static str {
+fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str {
     // Single-source the base paragraph so a Windows/Unix edit can't drift. A
     // macro (not a `const`) because `concat!` only splices literals.
     macro_rules! base {
@@ -183,12 +212,18 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
             "Run a shell command in the working directory and return its combined \
              stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
              commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
-             risky and may require approval."
+             risky and may require approval.\n\
+             Prefer the dedicated tools over bash for file operations — they are \
+             gitignore-aware, cross-platform, and cheaper: read_file to read a file (NOT \
+             cat/head/tail), grep to search file contents (NOT grep/rg), glob to find \
+             files by name (NOT find/fd), list_directory for a directory tree (NOT ls). \
+             Reserve bash for real shell work — git, builds, package managers, running \
+             commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
+             the dedicated tools can't do."
         };
     }
-    if is_windows {
-        concat!(
-            base!(),
+    macro_rules! cmd_suffix {
+        () => {
             "\n\
              Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
              bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
@@ -200,11 +235,30 @@ fn shell_tool_description(is_windows: bool) -> &'static str {
              cmd.exe builtin. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
-             Prefer the dedicated tools over shell file operations: read_file to read a file, \
-             grep to search file contents, glob to list or find files by pattern — instead of \
-             cmd's type/find/dir. They are cross-platform and avoid all the cmd.exe quoting \
-             pitfalls above."
-        )
+             The dedicated file tools above (read_file / grep / glob / list_directory) also \
+             sidestep cmd's type/find/dir and all the quoting pitfalls here."
+        };
+    }
+    macro_rules! bash_suffix {
+        () => {
+            "\n\
+             Windows: a POSIX bash (Git Bash / MSYS2) is installed and this tool runs \
+             commands via `bash -c` — use bash syntax, NOT cmd.exe. `$(...)`, `&&`, `|`, \
+             quoting, heredocs and `printf` all work as on Linux.\n\
+             PATHS: bash treats `\\` as an escape, so a Windows path like `C:\\Windows` is \
+             mangled — use forward slashes (`C:/Windows`) or POSIX form (`/c/Windows`). \
+             Relative paths work (the working directory is already set).\n\
+             Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
+             NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
+             equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above."
+        };
+    }
+    if is_windows {
+        if bash_present {
+            concat!(base!(), bash_suffix!())
+        } else {
+            concat!(base!(), cmd_suffix!())
+        }
     } else {
         base!()
     }
@@ -360,12 +414,43 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
 /// filesystem (`/mnt/c` vs `C:\`), Linux `python`/`node` (not the user's Windows ones),
 /// and a Windows `working_dir` it cannot `cd` into. Excluded from bash detection. Pure
 /// path check so it is unit-testable off Windows.
+///
+/// ALSO excludes the App-Execution-Alias form: Win10/11 exposes WSL's `bash` as a 0-byte
+/// reparse stub under `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`. `where bash` often
+/// returns THAT first (WindowsApps sits on the user PATH ahead of System32) and it
+/// `is_file()`, so without this it would be picked and launch WSL. Installing Docker
+/// Desktop (WSL2 backend) enables the alias; a machine with no working distro then fails
+/// every `bash -c`. A genuine Git Bash / MSYS2 is never under WindowsApps, so this is safe.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_wsl_launcher(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy().to_ascii_lowercase();
     s.contains(r"\windows\system32\")
         || s.contains(r"\windows\syswow64\")
         || s.contains(r"\windows\sysnative\")
+        || s.contains(r"\windowsapps\")
+}
+
+/// Derive a Git for Windows `bash.exe` from a `git.exe` path. Git ships `git.exe` in
+/// `<root>\cmd\` (and `<root>\bin\`) and `bash.exe` in `<root>\bin\`, so bash is the
+/// grandparent of `git.exe` joined with `bin\bash.exe` (works for both layouts since `cmd`
+/// and `bin` are siblings under the install root). This is how a Git install on a non-`C:`
+/// drive is found when only `git` (not `bash`) is on PATH. Pure path arithmetic (no fs) so
+/// it is unit-testable off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bash_beside_git(git_exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = git_exe.parent()?.parent()?;
+    Some(root.join("bin").join("bash.exe"))
+}
+
+/// Parse the install root out of `reg query HKLM\SOFTWARE\GitForWindows /v InstallPath`
+/// output. The value line is `    InstallPath    REG_SZ    <path>`; everything after the
+/// `REG_SZ` type token is the path (so paths containing spaces survive). Pure — testable
+/// off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reg_install_path(reg_stdout: &str) -> Option<&str> {
+    reg_stdout
+        .lines()
+        .find_map(|l| l.split("REG_SZ").nth(1).map(str::trim).filter(|s| !s.is_empty()))
 }
 
 /// Detect a Git Bash / MSYS2 bash on Windows. Checks PATH (`where bash`) then common
@@ -382,7 +467,13 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
     CACHED.get_or_init(|| {
         // 1. PATH lookup via `where bash` (cmd.exe builtin, always available). SKIP the
         // WSL launcher — it is usually first on PATH but runs in the Linux distro.
-        let where_out = std::process::Command::new("where").arg("bash").output();
+        // CREATE_NO_WINDOW: this now runs at prompt-build time (to label the shell), so a
+        // bare spawn would flash a console window on every launch (the daemon/headless
+        // flicker class). Suppress it — one probe per process, cached below.
+        let mut where_bash = std::process::Command::new("where");
+        where_bash.arg("bash");
+        crate::process_utils::suppress_console_window_sync(&mut where_bash);
+        let where_out = where_bash.output();
         if let Ok(o) = where_out {
             if o.status.success() {
                 let txt = String::from_utf8_lossy(&o.stdout);
@@ -394,7 +485,53 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
                 }
             }
         }
-        // 2. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
+        // 2. Derive from `git.exe` on PATH. Git for Windows installed ANYWHERE (incl. a
+        // non-`C:` drive like `D:\program\git`) is found here even when its `bin\bash.exe`
+        // is not on PATH — as long as `git` is (the common case). `bash.exe` lives beside
+        // git under `<root>\bin`.
+        let mut where_git = std::process::Command::new("where");
+        where_git.arg("git");
+        crate::process_utils::suppress_console_window_sync(&mut where_git);
+        if let Ok(o) = where_git.output() {
+            if o.status.success() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for line in txt.lines() {
+                    if let Some(b) = bash_beside_git(&std::path::PathBuf::from(line.trim())) {
+                        if b.is_file() && !is_wsl_launcher(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        // 3. `GIT_INSTALL_ROOT` env var (some setups export it) → `<root>\bin\bash.exe`.
+        if let Ok(root) = std::env::var("GIT_INSTALL_ROOT") {
+            let b = std::path::Path::new(&root).join("bin").join("bash.exe");
+            if b.is_file() && !is_wsl_launcher(&b) {
+                return Some(b);
+            }
+        }
+        // 4. Git for Windows registry `InstallPath` (a registered install on any drive).
+        for key in [r"HKLM\SOFTWARE\GitForWindows", r"HKLM\SOFTWARE\WOW6432Node\GitForWindows"] {
+            // Suppress the console window like the `where` probes above — this path is
+            // reached on eager (prompt-build) detection when NO bash/git is on PATH, i.e.
+            // exactly the cmd.exe users, who would otherwise see a `reg` window flash.
+            let mut reg = std::process::Command::new("reg");
+            reg.args(["query", key, "/v", "InstallPath"]);
+            crate::process_utils::suppress_console_window_sync(&mut reg);
+            if let Ok(o) = reg.output() {
+                if o.status.success() {
+                    let txt = String::from_utf8_lossy(&o.stdout);
+                    if let Some(root) = parse_reg_install_path(&txt) {
+                        let b = std::path::Path::new(root).join("bin").join("bash.exe");
+                        if b.is_file() && !is_wsl_launcher(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        // 5. Common install locations — Git for Windows / MSYS2 ONLY. Deliberately NOT
         // `System32\bash.exe` (WSL): see `is_wsl_launcher`.
         let candidates = [
             r"C:\Program Files\Git\bin\bash.exe",
@@ -953,9 +1090,47 @@ mod tests {
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\SysWOW64\bash.exe")));
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\Sysnative\bash.exe")));
+        // App-execution-alias: Win10/11 exposes WSL's `bash` as a 0-byte reparse stub
+        // under `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`. `where bash` often returns
+        // THIS first (WindowsApps is on the user PATH ahead of System32), it `is_file()`,
+        // and it launches WSL — so it MUST be rejected too. Installing Docker Desktop
+        // (WSL2 backend) enables the alias; if WSL has no working distro, `bash -c` fails.
+        assert!(is_wsl_launcher(Path::new(
+            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        )));
         // Git Bash / MSYS2 are real shells we CAN use — must NOT be rejected.
         assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
         assert!(!is_wsl_launcher(Path::new(r"C:\msys64\usr\bin\bash.exe")));
+    }
+
+    #[test]
+    fn bash_derived_from_git_exe_on_any_drive() {
+        use std::path::{Path, PathBuf};
+        // Forward slashes so `Path` treats them as separators on the (non-Windows) test host;
+        // on real Windows the `where git` input uses backslashes, handled natively.
+        // git.exe in `<root>/cmd` (Git for Windows default layout).
+        assert_eq!(
+            bash_beside_git(Path::new("D:/program/git/cmd/git.exe")),
+            Some(PathBuf::from("D:/program/git/bin/bash.exe")),
+        );
+        // git.exe in `<root>/bin` (alternate layout) → same `bin/bash.exe`.
+        assert_eq!(
+            bash_beside_git(Path::new("D:/program/git/bin/git.exe")),
+            Some(PathBuf::from("D:/program/git/bin/bash.exe")),
+        );
+        // Too shallow (no grandparent) → None, not a panic.
+        assert_eq!(bash_beside_git(Path::new("git.exe")), None);
+    }
+
+    #[test]
+    fn parse_reg_install_path_extracts_path_with_spaces() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows\r\n    InstallPath    REG_SZ    D:\\program\\git\r\n";
+        assert_eq!(parse_reg_install_path(out), Some(r"D:\program\git"));
+        // Path containing a space survives (everything after REG_SZ is taken).
+        let spaced = "    InstallPath    REG_SZ    D:\\my apps\\Git\r\n";
+        assert_eq!(parse_reg_install_path(spaced), Some(r"D:\my apps\Git"));
+        // No value line → None.
+        assert_eq!(parse_reg_install_path("ERROR: key not found\r\n"), None);
     }
 
     #[test]
@@ -1023,14 +1198,14 @@ mod tests {
     // quoting that cmd.exe can't parse, then thrashes into temp-file workarounds.
     #[test]
     fn windows_description_steers_to_cmd_not_bash() {
-        let win = shell_tool_description(true);
+        let win = shell_tool_description(true, false);
         assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
         let lc = win.to_lowercase();
         assert!(lc.contains("not bash"), "windows desc must say it is not bash");
         assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
         assert!(win.contains("$("), "windows desc must warn off command substitution");
 
-        let unix = shell_tool_description(false);
+        let unix = shell_tool_description(false, false);
         assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
     }
 
@@ -1041,7 +1216,7 @@ mod tests {
     // and (c) steer file ops to the native read_file/grep/glob tools.
     #[test]
     fn windows_description_discourages_shell_mixing_and_steers_to_native_tools() {
-        let win = shell_tool_description(true);
+        let win = shell_tool_description(true, false);
         let lc = win.to_lowercase();
         // Don't switch shells: cmd.exe only, no PowerShell, no git-bash `cmd //c`.
         assert!(lc.contains("powershell") || lc.contains("pwsh"), "must warn off PowerShell: {win}");
@@ -1053,8 +1228,70 @@ mod tests {
         assert!(win.contains("grep"), "must steer to grep: {win}");
         assert!(win.contains("read_file"), "must steer to read_file: {win}");
         // The unix description stays lean (no Windows shell noise).
-        let unix = shell_tool_description(false);
+        let unix = shell_tool_description(false, false);
         assert!(!unix.contains("PowerShell") && !unix.contains("//c"), "unix desc unchanged: {unix}");
+    }
+
+    // THE FIX: when a POSIX bash (Git Bash / MSYS2) is actually present, `build_command`
+    // routes the command through `bash -c` — so the description must tell the model the
+    // TRUTH (it's bash), not the old hard-coded "cmd.exe" lie. Otherwise the model, told
+    // cmd.exe, emits `dir C:\Windows` / `%VAR%` / `type` which then run in bash and break.
+    #[test]
+    fn windows_with_bash_present_tells_model_bash_not_cmd() {
+        let d = shell_tool_description(true, true);
+        let lc = d.to_lowercase();
+        // Must NOT claim cmd.exe / demand cmd-only syntax when bash is what runs.
+        assert!(
+            !lc.contains("run via cmd.exe") && !lc.contains("use cmd.exe syntax"),
+            "must not tell the model cmd.exe when a POSIX bash actually runs: {d}"
+        );
+        // Must name the real shell and permit bash syntax.
+        assert!(lc.contains("git bash") || lc.contains("posix bash"),
+            "must name the real shell (Git Bash / POSIX bash): {d}");
+        assert!(lc.contains("bash syntax") || lc.contains("bash-c") || lc.contains("bash -c"),
+            "must tell the model bash syntax is fine: {d}");
+        // Must warn about Windows path backslashes (bash treats `\\` as escape) and steer
+        // to forward-slash / POSIX form — the concrete thing that breaks `dir C:\\Windows`.
+        assert!(lc.contains("forward slash") || lc.contains("/c/") || lc.contains("c:/"),
+            "must steer to forward-slash / POSIX paths: {d}");
+        // Base steering (native file tools) still present.
+        assert!(d.contains("read_file") && d.contains("glob"), "base steering retained: {d}");
+    }
+
+    // With NO bash present, cmd.exe IS what runs — the description must keep the cmd.exe
+    // guidance (unchanged from before the fix).
+    #[test]
+    fn windows_without_bash_keeps_cmd_guidance() {
+        let d = shell_tool_description(true, false);
+        assert!(d.contains("cmd.exe"), "no bash → cmd.exe guidance: {d}");
+        assert!(d.contains("$("), "cmd guidance warns off command substitution: {d}");
+    }
+
+    // The system-prompt `Shell:` line must report the same shell the tool uses.
+    #[test]
+    fn windows_shell_label_matches_actual_shell() {
+        assert_eq!(windows_shell_label(true), "bash", "bash present → report bash");
+        assert_eq!(windows_shell_label(false), "cmd.exe", "no bash → report cmd.exe");
+    }
+
+    // Previously the unix description said NOTHING about preferring the dedicated file
+    // tools, so on macOS/Linux the only steering lived in the persona — far from the
+    // model's tool-choice decision point. Weak models (GLM-5.2) shell out `ls`/`grep`
+    // anyway. Mirror opencode: put the "don't shell out for file ops" guidance in the
+    // bash tool's OWN description, on EVERY platform — and keep an explicit carve-out so
+    // audit-style pipelines (wc/sort/uniq/git log) still legitimately use bash.
+    #[test]
+    fn unix_description_steers_file_ops_to_native_tools() {
+        let unix = shell_tool_description(false, false);
+        for tool in ["read_file", "grep", "glob", "list_directory"] {
+            assert!(unix.contains(tool), "unix desc must steer to {tool}: {unix}");
+        }
+        let lc = unix.to_lowercase();
+        assert!(
+            lc.contains("aggregation") || lc.contains("pipeline"),
+            "must carve out shell pipelines/aggregation for bash: {unix}"
+        );
+        assert!(!unix.contains("cmd.exe"), "unix desc must not mention cmd.exe");
     }
 
     #[test]

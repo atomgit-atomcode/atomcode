@@ -11,6 +11,12 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
+import {
+  applyAtMentionSelection,
+  detectAtMentionRange,
+  ensureActiveDescendantVisible,
+  splitAtToken,
+} from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 
 interface Message {
@@ -22,6 +28,30 @@ interface Message {
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
 function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** Format all parts of a message as readable text (including tool calls and their
+ *  output), matching what is displayed on the page. Used by the copy button to
+ *  copy the full visible content of an assistant turn. */
+function messageFullText(m: Message): string {
+  const lines: string[] = [];
+  for (const p of m.parts) {
+    if (p.kind === 'text') {
+      lines.push(p.text);
+    } else if (p.kind === 'tool') {
+      const tool = p.tool;
+      lines.push(`🔧 ${displayToolName(tool.name)}`);
+      const detail = formatToolDetail(tool.name, tool.args);
+      if (detail) lines.push(`   ${detail}`);
+      if (tool.args) lines.push(`   参数: ${tool.args}`);
+      if (tool.output) lines.push(`   输出: ${tool.output}`);
+    } else if (p.kind === 'notice') {
+      lines.push(p.text);
+    } else if (p.kind === 'rate_limited') {
+      lines.push(p.text);
+    }
+  }
+  return lines.join('\n');
 }
 
 /** Whether a message contains any tool segments. */
@@ -445,9 +475,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // @ 文件菜单：把 @ 后文本拆成「目录段 + 过滤词」，以支持进入子目录 / 返回上级。
   // 例如 "examples/fo" → 列 cwd/examples 的内容，并按前缀 "fo" 过滤。
-  const atSlash = atQuery.lastIndexOf('/');
-  const atDirPart = atSlash >= 0 ? atQuery.slice(0, atSlash + 1) : '';
-  const atFilter = atSlash >= 0 ? atQuery.slice(atSlash + 1) : atQuery;
+  const { scopeDir: atDirPart, filter: atFilter } = splitAtToken(atQuery);
   const atTargetDir =
     atDirPart === ''
       ? cwd
@@ -480,6 +508,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   for (const it of atItems) {
     if (it.name.toLowerCase().startsWith(atFilter.toLowerCase())) atRows.push(it);
   }
+
+  useEffect(() => {
+    if (!atOpen) return;
+    requestAnimationFrame(() => {
+      const container = atRef.current;
+      const active = container?.querySelector<HTMLButtonElement>('.at-row.active');
+      if (container && active) ensureActiveDescendantVisible(container, active);
+    });
+  }, [atIndex, atOpen, atRows.length]);
 
   // ── 共享的实时流启/停逻辑 ──
   function startLiveStream() {
@@ -1122,44 +1159,48 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
-  // 把光标前的 @ 段替换为相对路径 rel。keepOpen=true 用于进入目录（保留菜单、继续浏览），
-  // false 用于最终选定文件（补空格、关闭菜单）。
-  function setAtMention(rel: string, keepOpen: boolean) {
+  // 把当前 @ 段替换为相对路径 rel，不自动追加空格，目录可继续下钻补全。
+  function setAtMention(rel: string, isDir: boolean) {
     const ta = textareaRef.current;
     if (!ta) return;
     const pos = ta.selectionStart ?? ta.value.length;
-    const before = ta.value.slice(0, pos);
-    const after = ta.value.slice(pos);
-    const atIdx = before.lastIndexOf('@');
-    if (atIdx < 0) return;
-    const suffix = keepOpen ? '' : ' ';
-    const next = before.slice(0, atIdx) + `@${rel}${suffix}` + after;
-    setInput(next);
-    if (keepOpen) {
-      setAtQuery(rel);
-      setAtIndex(0);
-    } else {
-      setAtOpen(false);
-    }
+    const range = detectAtMentionRange(ta.value, pos);
+    if (!range) return;
+    const next = applyAtMentionSelection(ta.value, range, rel, isDir);
+    setInput(next.text);
+    setAtOpen(next.keepOpen);
+    setAtQuery(next.query);
+    if (next.keepOpen) setAtItems([]);
+    setAtIndex(0);
     requestAnimationFrame(() => {
       ta.focus();
-      const newPos = atIdx + 1 + rel.length + suffix.length;
-      ta.setSelectionRange(newPos, newPos);
+      ta.setSelectionRange(next.cursor, next.cursor);
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
     });
   }
 
-  // 选择 @ 菜单某一行：「..」→返回上级；目录→进入；文件→插入完整相对路径并关闭。
+  // 选择 @ 菜单某一行：「..」仍用于返回上级；目录/文件都插入完整相对路径。
   function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean }) {
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
       const idx = trimmed.lastIndexOf('/');
-      setAtMention(idx >= 0 ? trimmed.slice(0, idx + 1) : '', true);
-    } else if (row.is_dir) {
-      setAtMention(atDirPart + row.name + '/', true);
+      const parent = idx >= 0 ? trimmed.slice(0, idx + 1) : '';
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const range = detectAtMentionRange(ta.value, ta.selectionStart ?? ta.value.length);
+      if (!range) return;
+      const nextText = ta.value.slice(0, range.start) + `@${parent}` + ta.value.slice(range.end);
+      setInput(nextText);
+      setAtQuery(parent);
+      setAtIndex(0);
+      requestAnimationFrame(() => {
+        ta.focus();
+        const cursor = range.start + 1 + parent.length;
+        ta.setSelectionRange(cursor, cursor);
+      });
     } else {
-      setAtMention(atDirPart + row.name, false);
+      setAtMention(atDirPart + row.name + (row.is_dir ? '/' : ''), row.is_dir);
     }
   }
 
@@ -1196,10 +1237,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 检测光标前是否有 @（行首 或 空格后）。@ 后文本可含 "/" 以进入子目录；
     // 实际列目录/过滤由派生的 atTargetDir + useEffect 处理（见上）。
-    const atIdx = before.lastIndexOf('@');
-    if (atIdx >= 0 && (atIdx === 0 || before[atIdx - 1] === ' ')) {
-      const query = before.slice(atIdx + 1);
-      if (!query.includes(' ') && query.length <= 120) {
+    const atRange = detectAtMentionRange(val, pos);
+    if (atRange) {
+      const query = atRange.token;
+      if (query.length <= 120) {
         setSlashOpen(false);
         setAtQuery(query);
         setAtIndex(0);
@@ -1362,10 +1403,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               onMouseDown={(e) => { e.preventDefault(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.up ? '..' : atDirPart + item.name}
+              title={item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}
             >
               <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.up ? '..' : item.name}</span>
+              <span class="at-name">{item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}</span>
             </button>
           ))}
           {!atLoading && atRows.length === 0 && (
@@ -1594,49 +1635,64 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           </div>
         )}
 
-        {messages.map((msg, idx) => {
-          const isLast = idx === lastIdx;
-          if (msg.role === 'user') {
-            return <UserMessageView key={idx} msg={msg} />;
+        {(() => {
+          // Pre-compute per-turn text for assistant messages: collect all text
+          // from consecutive assistant messages between two user messages, so
+          // the copy button can copy the entire LLM turn (not just one chunk).
+          const turnTexts = new Map<number, string>();
+          {
+            let start = -1;
+            let parts: string[] = [];
+            for (let i = 0; i < messages.length; i++) {
+              if (messages[i].role === 'assistant') {
+                if (start < 0) start = i;
+                const t = messageFullText(messages[i]);
+                if (t) parts.push(t);
+              } else {
+                if (start >= 0) {
+                  for (let j = start; j < i; j++) {
+                    turnTexts.set(j, parts.join('\n\n'));
+                  }
+                  start = -1;
+                  parts = [];
+                }
+              }
+            }
+            // Flush the last turn
+            if (start >= 0) {
+              for (let j = start; j < messages.length; j++) {
+                turnTexts.set(j, parts.join('\n\n'));
+              }
+            }
           }
 
-          const text = messageText(msg);
-          const isError =
-            text.includes('[错误:') ||
-            text.includes('[连接错误:') ||
-            text.includes('[Error:') ||
-            text.includes('[Connection error:');
-          const streaming = isLast && busy;
-          // 终条且简短（无工具、单行）时，去掉多余的“时间线末端”橙点，只留一个起始点。
-          const terse =
-            isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
-          const dotClass = isError ? 'dot-error' : 'dot-brand';
-          const cls =
-            'timeline-message ' +
-            dotClass +
-            (streaming ? ' dot-blink' : '') +
-            (isLast ? ' is-last' : '') +
-            (terse ? ' is-terse' : '');
+          return messages.map((msg, idx) => {
+            const isLast = idx === lastIdx;
+            if (msg.role === 'user') {
+              return <UserMessageView key={idx} msg={msg} />;
+            }
 
-          return (
-            <div key={idx} class={cls}>
-              {/* Error turns are pure injected text — render flat. */}
-              {isError ? (
-                <div class="error-message-content">
-                  {text}
-                  {streaming && <span class="streaming-cursor" />}
-                </div>
-              ) : (
-                <>
-                  {/* Segments in chronological order: text→tool→text→tool,
-                      matching the TUI. Consecutive tools share one tool-list. */}
-                  {renderAssistantParts(msg.parts)}
-                  {streaming && <span class="streaming-cursor" />}
-                </>
-              )}
-            </div>
-          );
-        })}
+            // Determine if this assistant message is the last one in the current
+            // turn (i.e. the next message is a user message, or this is the very
+            // last message in the list). Only the last assistant message in a turn
+            // gets the copy button, so one user turn → one copy button.
+            const isLastInTurn =
+              idx === lastIdx ||
+              messages[idx + 1]?.role === 'user';
+
+            return (
+              <AssistantMessageView
+                key={idx}
+                msg={msg}
+                isLast={isLast}
+                busy={busy}
+                lastIdx={lastIdx}
+                isLastInTurn={isLastInTurn}
+                turnText={turnTexts.get(idx) ?? ''}
+              />
+            );
+          });
+        })()}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {queued.map((q) => (
@@ -1686,6 +1742,80 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
+  const t = useT();
+  const text = messageText(msg);
+  const isError =
+    text.includes('[错误:') ||
+    text.includes('[连接错误:') ||
+    text.includes('[Error:') ||
+    text.includes('[Connection error:');
+  const streaming = isLast && busy;
+  // 终条且简短（无工具、单行）时，去掉多余的"时间线末端"橙点，只留一个起始点。
+  const terse =
+    isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
+  const dotClass = isError ? 'dot-error' : 'dot-brand';
+  const cls =
+    'timeline-message ' +
+    dotClass +
+    (streaming ? ' dot-blink' : '') +
+    (isLast ? ' is-last' : '') +
+    (terse ? ' is-terse' : '');
+
+  // Copy button: only shown on the last assistant message in a turn.
+  // Copies the entire turn's text (all assistant messages in this turn joined).
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(turnText).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }
+
+  const copyBtn = isLastInTurn && !isError && !streaming && turnText ? (
+    <div class="msg-actions msg-actions-left">
+      <button
+        class={'msg-copy-btn' + (copied ? ' copied' : '')}
+        onClick={handleCopy}
+        title={copied ? t('copy.copied') : t('copy.copy')}
+        aria-label={copied ? t('copy.copied') : t('copy.copy')}
+      >
+        {copied ? (
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+            <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+          </svg>
+        )}
+      </button>
+    </div>
+  ) : null;
+
+  return (
+    <div class={cls}>
+      {/* Error turns are pure injected text — render flat. */}
+      {isError ? (
+        <div class="error-message-content">
+          {text}
+          {streaming && <span class="streaming-cursor" />}
+        </div>
+      ) : (
+        <>
+          {/* Segments in chronological order: text→tool→text→tool,
+              matching the TUI. Consecutive tools share one tool-list. */}
+          {renderAssistantParts(msg.parts)}
+          {streaming && <span class="streaming-cursor" />}
+        </>
+      )}
+      {copyBtn}
+    </div>
+  );
+}
+
 function renderAssistantParts(parts: MsgPart[]): VNode[] {
   const out: VNode[] = [];
   let i = 0;
@@ -1735,6 +1865,14 @@ function UserMessageView({ msg }: { msg: Message }) {
   const text = messageText(msg);
   const skillTitle = detectSkillContent(text);
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }
 
   const images = msg.images && msg.images.length > 0 && (
     <div class="msg-images">
@@ -1742,6 +1880,26 @@ function UserMessageView({ msg }: { msg: Message }) {
         <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
       ))}
     </div>
+  );
+
+  const copyBtn = (
+    <button
+      class={'msg-copy-btn' + (copied ? ' copied' : '')}
+      onClick={handleCopy}
+      title={copied ? t('copy.copied') : t('copy.copy')}
+      aria-label={copied ? t('copy.copied') : t('copy.copy')}
+    >
+      {copied ? (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+        </svg>
+      )}
+    </button>
   );
 
   if (skillTitle && !expanded) {
@@ -1773,6 +1931,9 @@ function UserMessageView({ msg }: { msg: Message }) {
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
         {skillTitle ? <Markdown content={text} /> : text}
+      </div>
+      <div class="msg-actions">
+        {copyBtn}
       </div>
     </div>
   );

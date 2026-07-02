@@ -55,7 +55,7 @@ pub struct TurnRunner {
     /// Propagated to ToolCallStartContext so built-in hooks (e.g.
     /// ToolAuditLogHook) see the correct turn index.
     pub current_turn_number: u32,
- }
+}
 
 impl TurnRunner {
     /// Execute one LLM turn: stream response, execute any tool calls, return result.
@@ -96,10 +96,7 @@ impl TurnRunner {
         //                   default-host table lives next to the schema.
         //   model         = LlmProvider::model_name() — the wire-level model
         //                   string sent to the API.
-        let pcfg = self
-            .config
-            .providers
-            .get(&self.config.default_provider);
+        let pcfg = self.config.providers.get(&self.config.default_provider);
         let vendor = pcfg.map(|p| p.provider_type.clone());
         let host = pcfg.and_then(|p| {
             atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
@@ -286,8 +283,7 @@ impl TurnRunner {
         // `finalize_stream_with_tool_calls_and_thinking` so the next
         // request can echo them back — Anthropic 400s otherwise (`The
         // content[].thinking in the thinking mode must be passed back`).
-        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> =
-            Vec::new();
+        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> = Vec::new();
         let mut total_tokens: usize = 0;
         // Telemetry: per-turn token counters populated from StreamEvent::Usage.
         let mut tel_input_tokens: u32 = 0;
@@ -303,11 +299,11 @@ impl TurnRunner {
                 let result = $result;
                 let messages_count = $conv.messages.len() as u32;
                 // system_tokens: estimate from the system prompt string
-                let system_tokens: u32 =
-                    crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        system_prompt,
-                    ).estimate_tokens() as u32;
+                let system_tokens: u32 = crate::conversation::message::Message::new(
+                    crate::conversation::message::Role::System,
+                    system_prompt,
+                )
+                .estimate_tokens() as u32;
                 // tool_def_tokens: direct measurement from tool definitions sent to the LLM.
                 // Each ToolDef contributes name + description + JSON-serialized parameters.
                 let tool_def_tokens: u32 = tool_defs
@@ -329,11 +325,13 @@ impl TurnRunner {
                 let message_tokens: u32 = $conv
                     .messages
                     .iter()
-                    .filter(|m| matches!(
-                        m.role,
-                        crate::conversation::message::Role::User
-                            | crate::conversation::message::Role::Assistant
-                    ))
+                    .filter(|m| {
+                        matches!(
+                            m.role,
+                            crate::conversation::message::Role::User
+                                | crate::conversation::message::Role::Assistant
+                        )
+                    })
                     .map(|m| m.estimate_tokens() as u32)
                     .sum();
                 let (error_kind, error_data) = if result.is_failed() {
@@ -426,16 +424,18 @@ impl TurnRunner {
                             biased;
 
             _ = cancel.cancelled() => {
+                                let reasoning = reasoning_opt(&reasoning_buf);
                                 conversation.finalize_stream_with_reasoning(
-                                    reasoning_opt(&reasoning_buf),
+                                    reasoning.as_deref(),
                                     std::mem::take(&mut thinking_blocks),
                                 );
                                 tel_return!(TurnResult::Cancelled, 0u32);
                             }
 
                             _ = tokio::time::sleep(timeout) => {
+                                let reasoning = reasoning_opt(&reasoning_buf);
                                 conversation.finalize_stream_with_reasoning(
-                                    reasoning_opt(&reasoning_buf),
+                                    reasoning.as_deref(),
                                     std::mem::take(&mut thinking_blocks),
                                 );
                                 tel_return!(TurnResult::Failed(format!(
@@ -469,8 +469,9 @@ impl TurnRunner {
                                                     visible_text_buf.push_str(&visible);
                                                     let _ = event_tx
                                                         .send(TurnEvent::TextDelta(visible));
+                                                    let reasoning = reasoning_opt(&reasoning_buf);
                                                     conversation.finalize_stream_with_reasoning(
-                                                        reasoning_opt(&reasoning_buf),
+                                                        reasoning.as_deref(),
                                                         std::mem::take(&mut thinking_blocks),
                                                     );
                                                     tel_return!(
@@ -486,11 +487,14 @@ impl TurnRunner {
                                     }
                                     Some(Ok(StreamEvent::Reasoning(text))) => {
                                         got_any_event = true;
-                                        // Emit to UI for verbose mode (Ctrl+O) display.
-                                        // Still accumulate for the fallback case where
-                                        // content ends up empty.
-                                        let _ = event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
-                                        reasoning_buf.push_str(&text);
+                                        // Emit to UI for verbose mode (Ctrl+O) display,
+                                        // but do not surface known provider filler.
+                                        let text = strip_reasoning_filler(&text);
+                                        if !text.is_empty() {
+                                            let _ =
+                                                event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
+                                            reasoning_buf.push_str(&text);
+                                        }
                                     }
                                     Some(Ok(StreamEvent::ThinkingBlock { text, signature })) => {
                                         got_any_event = true;
@@ -685,8 +689,9 @@ impl TurnRunner {
                                             // splice placeholder copies INTO that content
                                             // (mixed case). Strip them so the sentinel never
                                             // surfaces in the user-visible answer.
-                                            let promoted = std::mem::take(&mut reasoning_buf)
-                                                .replace(crate::provider::REASONING_PLACEHOLDER, "");
+                                            let promoted = strip_reasoning_filler(&std::mem::take(
+                                                &mut reasoning_buf,
+                                            ));
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
                                             // Reasoning channel doesn't carry tool_call XML
@@ -733,16 +738,12 @@ impl TurnRunner {
                                         // tool call message". The send-side ReasoningPolicy
                                         // (per-provider) decides whether the field actually
                                         // reaches the wire.
-                                        let reasoning = if reasoning_buf.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(reasoning_buf.as_str())
-                                        };
+                                        let reasoning = reasoning_opt(&reasoning_buf);
                                         if !tool_calls_buf.is_empty() {
                                             conversation
                                                 .finalize_stream_with_tool_calls_and_thinking(
                                                     &tool_calls_buf,
-                                                    reasoning,
+                                                    reasoning.as_deref(),
                                                     std::mem::take(&mut thinking_blocks),
                                                 );
                                         } else {
@@ -754,7 +755,7 @@ impl TurnRunner {
                                             // thinking models mimic back. See
                                             // `finalize_stream_with_reasoning`.
                                             conversation.finalize_stream_with_reasoning(
-                                                reasoning,
+                                                reasoning.as_deref(),
                                                 std::mem::take(&mut thinking_blocks),
                                             );
                                         }
@@ -763,8 +764,9 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Error(e))) => {
+                                        let reasoning = reasoning_opt(&reasoning_buf);
                                         conversation.finalize_stream_with_reasoning(
-                                            reasoning_opt(&reasoning_buf),
+                                            reasoning.as_deref(),
                                             std::mem::take(&mut thinking_blocks),
                                         );
                                         tel_return!(TurnResult::Failed(e), 0u32);
@@ -780,8 +782,9 @@ impl TurnRunner {
                                     }
 
                                     Some(Err(e)) => {
+                                        let reasoning = reasoning_opt(&reasoning_buf);
                                         conversation.finalize_stream_with_reasoning(
-                                            reasoning_opt(&reasoning_buf),
+                                            reasoning.as_deref(),
                                             std::mem::take(&mut thinking_blocks),
                                         );
                                         tel_return!(TurnResult::Failed(e.to_string()), 0u32);
@@ -790,8 +793,9 @@ impl TurnRunner {
                                     None => {
                                         // Stream ended without Done event — preserve any
                                         // captured reasoning, mirroring the Done branch.
+                                        let reasoning = reasoning_opt(&reasoning_buf);
                                         conversation.finalize_stream_with_reasoning(
-                                            reasoning_opt(&reasoning_buf),
+                                            reasoning.as_deref(),
                                             std::mem::take(&mut thinking_blocks),
                                         );
                                         break;
@@ -815,12 +819,13 @@ impl TurnRunner {
             &wd,
             self.config.datalog.dir.as_deref(),
         );
+        let logged_reasoning = strip_reasoning_filler(&reasoning_buf);
         super::log::log_llm_response(
             &datalog_dir,
             pending_request_log,
             &text_buf,
             &tool_calls_buf,
-            &reasoning_buf,
+            &logged_reasoning,
             self.provider.model_name(),
             0, // step is set by caller
             response_duration,
@@ -1119,7 +1124,9 @@ impl TurnRunner {
         )
         .with_session(self.provider.session_id())
         .with_turn(self.current_turn_number);
-        self.hook_engine.trigger_post_turn(&hook_ctx, turn_result).await;
+        self.hook_engine
+            .trigger_post_turn(&hook_ctx, turn_result)
+            .await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -1203,7 +1210,10 @@ impl TurnRunner {
             // No alias match — try case-insensitive lookup in registry
             if self.tools.get(&call.name).await.is_some() {
                 call.name.clone()
-            } else if let Some(name) = self.tools.iter().await
+            } else if let Some(name) = self
+                .tools
+                .iter()
+                .await
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
                 .map(|(k, _)| k)
             {
@@ -1219,7 +1229,10 @@ impl TurnRunner {
         let tool = match self.tools.get(&corrected_name).await {
             Some(t) => t,
             None => {
-                let available: String = self.tools.iter().await
+                let available: String = self
+                    .tools
+                    .iter()
+                    .await
                     .map(|(name, _)| name)
                     .collect::<Vec<String>>()
                     .join(", ");
@@ -1308,11 +1321,14 @@ impl TurnRunner {
                 success: false,
                 duration_ms: 0,
                 error_kind: Some(ToolErrorKind::InvalidArgs),
-                error_data: Some(serde_json::json!({
-                    "tool_name": corrected_name,
-                    "reason": reason,
-                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                }).to_string()),
+                error_data: Some(
+                    serde_json::json!({
+                        "tool_name": corrected_name,
+                        "reason": reason,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                    })
+                    .to_string(),
+                ),
             });
             return ToolResult {
                 call_id: call.id.clone(),
@@ -1343,7 +1359,9 @@ impl TurnRunner {
             call_id: call.id.clone(),
             turn_number: self.current_turn_number,
         };
-        self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
+        self.hook_engine
+            .trigger_on_tool_call_start(&tc_start_ctx)
+            .await;
 
         let mut final_args = call.arguments.clone();
         // Deferred init: every non-diverging match arm below assigns this (the
@@ -1371,13 +1389,16 @@ impl TurnRunner {
                     success: false,
                     duration_ms: 0,
                     error_kind: Some(ToolErrorKind::BlockedByHook),
-                    error_data: Some(serde_json::json!({
-                        "tool_name": corrected_name,
-                        "duration_ms": 0,
-                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                        "hook_reason": reason,
-                        "reason": "Tool call blocked by PreToolUse hook",
-                    }).to_string()),
+                    error_data: Some(
+                        serde_json::json!({
+                            "tool_name": corrected_name,
+                            "duration_ms": 0,
+                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                            "hook_reason": reason,
+                            "reason": "Tool call blocked by PreToolUse hook",
+                        })
+                        .to_string(),
+                    ),
                 });
                 return ToolResult {
                     call_id: call.id.clone(),
@@ -1396,7 +1417,8 @@ impl TurnRunner {
             let approval = tool.approval_with_context(&final_args, &self.context);
             if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
             | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason)
-            | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } = approval
+            | crate::tool::ApprovalRequirement::RequireApprovalScoped { ref reason, .. } =
+                approval
             {
                 // Only emit the ApprovalRequested event (which triggers the
                 // TUI approval prompt) when the decider actually needs user
@@ -1433,7 +1455,7 @@ impl TurnRunner {
                         success: false,
                         duration: std::time::Duration::ZERO,
                     });
-                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    self.context.telemetry.track(TelemetryEvent::ToolCall {
                     name: corrected_name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -1473,7 +1495,12 @@ impl TurnRunner {
         // bash) finish fast enough that interrupting them mid-execution
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
-        crate::ctrace!("RNR", "execute_single_tool start name={} cancel_already={}", call.name, cancel.is_cancelled());
+        crate::ctrace!(
+            "RNR",
+            "execute_single_tool start name={} cancel_already={}",
+            call.name,
+            cancel.is_cancelled()
+        );
         let result = tokio::select! {
             r = tool.execute(&call.arguments, &self.context) => {
                 crate::ctrace!("RNR", "execute_single_tool tool returned name={} elapsed_ms={} cancel_now={}", call.name, start.elapsed().as_millis(), cancel.is_cancelled());
@@ -1550,7 +1577,9 @@ impl TurnRunner {
             success: tool_result.success,
             duration_ms: duration.as_millis() as u64,
         };
-        self.hook_engine.trigger_post_tool_use(&pr_hook_ctx, &result_ctx).await;
+        self.hook_engine
+            .trigger_post_tool_use(&pr_hook_ctx, &result_ctx)
+            .await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
@@ -1571,16 +1600,22 @@ impl TurnRunner {
             200,
         );
         // Detect warning: exit 0 (success) but stderr present.
-        let has_stderr = tool_result.output.contains("STDERR:")
-            || tool_result.output.contains("[stderr]");
+        let has_stderr =
+            tool_result.output.contains("STDERR:") || tool_result.output.contains("[stderr]");
         let (error_kind, error_data) = if !tool_result.success {
-            (Some(ToolErrorKind::ExecutionFailed), Some(serde_json::json!({
-                "tool_name": corrected_name,
-                "duration_ms": duration.as_millis() as u32,
-                "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                "output_tail": output_tail,
-                "reason": "Tool execution returned an error",
-            }).to_string()))
+            (
+                Some(ToolErrorKind::ExecutionFailed),
+                Some(
+                    serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": duration.as_millis() as u32,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "output_tail": output_tail,
+                        "reason": "Tool execution returned an error",
+                    })
+                    .to_string(),
+                ),
+            )
         } else if has_stderr {
             (Some(ToolErrorKind::Warning), Some(serde_json::json!({
                 "tool_name": corrected_name,
@@ -1603,7 +1638,6 @@ impl TurnRunner {
 
         tool_result
     }
-
 }
 
 /// Canonicalise a tool-call `arguments` string for in-batch dedup keying.
@@ -1622,24 +1656,105 @@ impl TurnRunner {
 /// (free-form text, garbage from broken streams) round-trip through the
 /// fallback unchanged so we don't regress free-form tools or accidentally
 /// merge two genuinely different malformed payloads.
-/// True iff `reasoning` contains nothing besides one or more copies
-/// of the outbound placeholder (`REASONING_PLACEHOLDER`) interleaved
-/// with whitespace — including the all-empty / all-whitespace case.
+/// True iff `reasoning` contains nothing besides known bogus reasoning fillers
+/// interleaved with whitespace — including the all-empty / all-whitespace case.
 ///
 /// The Done-event skip-promotion guard uses this to detect not just
 /// the trivial single-copy echo but also the multi-copy mimicry seen
 /// on DeepSeek V4 thinking-mode (a long session has many historical
 /// copies of the placeholder in context, and the model regenerates the
 /// pattern in its own response — observed 3+ copies concatenated in a
-/// single reasoning_content stream).
+/// single reasoning_content stream). It also covers legacy/upstream protocol
+/// residue such as `(no reasoning detected)</｜｜DSML｜｜parameter>`.
 fn is_only_placeholder_filler(reasoning: &str) -> bool {
-    reasoning
-        .replace(crate::provider::REASONING_PLACEHOLDER, "")
-        .trim()
-        .is_empty()
+    strip_reasoning_filler(reasoning).trim().is_empty()
 }
 
-/// `None` for an empty/whitespace reasoning buffer, else `Some(buf)`.
+// KEEP IN SYNC WITH crates/atomcode-kernel/src/agent.rs `strip_reasoning_filler`
+// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
+// These are intentionally duplicated because kernel takes no dependency on core;
+// any bugfix here must be applied to the kernel copy as well.
+fn strip_reasoning_filler(reasoning: &str) -> String {
+    const LEGACY_REASONING_FILLERS: &[&str] = &[
+        crate::provider::REASONING_PLACEHOLDER,
+        "(no reasoning detected)",
+        "(no reasoning recorded)",
+        "no reasoning detected",
+        "no reasoning recorded",
+    ];
+
+    let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
+    for marker in LEGACY_REASONING_FILLERS {
+        if cleaned.contains(marker) {
+            cleaned = cleaned.replace(marker, "");
+            changed = true;
+        }
+    }
+
+    if changed {
+        let (tail_cleaned, tail_changed) = strip_leading_parameter_tail(&cleaned);
+        if tail_changed {
+            cleaned = tail_cleaned;
+        }
+    }
+
+    if changed {
+        cleaned.trim().to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_dsml_parameter_fragments(input: &str) -> (String, bool) {
+    let mut rest = input;
+    let mut out = String::new();
+    let mut changed = false;
+
+    while let Some(dsml_idx) = rest.find("DSML") {
+        let before_dsml = &rest[..dsml_idx];
+        let after_dsml = &rest[dsml_idx..];
+        let start = before_dsml.rfind('<');
+        let end = after_dsml.find('>');
+
+        if let (Some(start), Some(end)) = (start, end) {
+            let end = dsml_idx + end + 1;
+            let fragment = &rest[start..end];
+            if fragment.to_ascii_lowercase().contains("parameter") {
+                out.push_str(&rest[..start]);
+                rest = &rest[end..];
+                changed = true;
+                continue;
+            }
+        }
+
+        let split = dsml_idx + "DSML".len();
+        out.push_str(&rest[..split]);
+        rest = &rest[split..];
+    }
+
+    out.push_str(rest);
+    (out, changed)
+}
+
+/// Strip a legacy tail left behind after removing `(no reasoning detected)`.
+/// Keep this deliberately narrow so real XML/code examples using
+/// `<parameter ...>` survive unchanged.
+fn strip_leading_parameter_tail(input: &str) -> (String, bool) {
+    let trimmed = input.trim_start();
+    if !trimmed
+        .get(.."</parameter>".len())
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("</parameter>"))
+    {
+        return (input.to_string(), false);
+    }
+
+    let skipped_ws = input.len() - trimmed.len();
+    let tail_start = skipped_ws + "</parameter>".len();
+    (input[tail_start..].to_string(), true)
+}
+
+/// `None` for an empty/whitespace/filler-only reasoning buffer, else the
+/// reasoning with known bogus fillers removed.
 ///
 /// Used at every stream-termination site (Done, error, abort, stream-end) so
 /// any captured thinking-model reasoning is preserved into history rather than
@@ -1647,11 +1762,12 @@ fn is_only_placeholder_filler(reasoning: &str) -> bool {
 /// `finalize_stream()`, so non-thinking models are unaffected. Preserving real
 /// reasoning means the next request echoes it instead of falling back to the
 /// `REASONING_PLACEHOLDER` filler.
-fn reasoning_opt(buf: &str) -> Option<&str> {
-    if buf.trim().is_empty() {
+fn reasoning_opt(buf: &str) -> Option<String> {
+    let cleaned = strip_reasoning_filler(buf);
+    if cleaned.trim().is_empty() {
         None
     } else {
-        Some(buf)
+        Some(cleaned)
     }
 }
 
@@ -1700,7 +1816,8 @@ fn name_looks_corrupt(name: &str) -> bool {
     if name.len() > 96 {
         return true;
     }
-    name.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '<' | '>'))
+    name.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '<' | '>'))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1758,8 +1875,8 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
         };
         let body = body.trim();
 
-        if let Some((name, args_json)) = parse_xml_tool_call(body)
-            .or_else(|| parse_xml_attr_style_tool_call(body))
+        if let Some((name, args_json)) =
+            parse_xml_tool_call(body).or_else(|| parse_xml_attr_style_tool_call(body))
         {
             let call_id = format!("rescued_{}", calls.len());
             calls.push(ToolCall {
@@ -2166,10 +2283,9 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     removed_ids
 }
 
-
 #[cfg(test)]
 mod is_only_placeholder_filler_tests {
-    use super::is_only_placeholder_filler;
+    use super::{is_only_placeholder_filler, strip_reasoning_filler};
     use crate::provider::REASONING_PLACEHOLDER;
 
     #[test]
@@ -2203,8 +2319,23 @@ mod is_only_placeholder_filler_tests {
     fn placeholders_with_whitespace_are_filler() {
         // Some gateways insert chunk delimiters (newlines, spaces)
         // between repeated placeholder echoes. Filler regardless.
-        let mixed = format!("{}\n{}  {}", REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER);
+        let mixed = format!(
+            "{}\n{}  {}",
+            REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER
+        );
         assert!(is_only_placeholder_filler(&mixed));
+    }
+
+    #[test]
+    fn legacy_no_reasoning_detected_with_dsml_tail_is_filler() {
+        let legacy = "(no reasoning detected)</｜｜DSML｜｜parameter>";
+        assert!(is_only_placeholder_filler(legacy));
+    }
+
+    #[test]
+    fn legacy_no_reasoning_recorded_with_ascii_dsml_tail_is_filler() {
+        let legacy = "(no reasoning recorded)</|||DSML|||parameter>";
+        assert!(is_only_placeholder_filler(legacy));
     }
 
     #[test]
@@ -2224,14 +2355,29 @@ mod is_only_placeholder_filler_tests {
     }
 
     #[test]
+    fn strip_reasoning_filler_removes_legacy_markers_but_keeps_real_content() {
+        let mixed = "(no reasoning detected)</｜｜DSML｜｜parameter> actual answer";
+        assert_eq!(strip_reasoning_filler(mixed), "actual answer");
+    }
+
+    #[test]
+    fn strip_reasoning_filler_preserves_real_parameter_xml_without_legacy_marker() {
+        let real = r#"Use <parameter name="path">src/main.rs</parameter> in the request."#;
+        assert_eq!(strip_reasoning_filler(real), real);
+    }
+
+    #[test]
     fn reasoning_opt_maps_empty_to_none_and_content_to_some_verbatim() {
         use super::reasoning_opt;
         assert_eq!(reasoning_opt(""), None);
         assert_eq!(reasoning_opt("   \n\t "), None);
-        assert_eq!(reasoning_opt("real thinking"), Some("real thinking"));
+        assert_eq!(
+            reasoning_opt("real thinking").as_deref(),
+            Some("real thinking")
+        );
         // Emptiness is judged after trim, but the value is returned verbatim
         // (never trimmed) so we never mutate captured reasoning.
-        assert_eq!(reasoning_opt("  pad  "), Some("  pad  "));
+        assert_eq!(reasoning_opt("  pad  ").as_deref(), Some("  pad  "));
     }
 }
 
@@ -2288,7 +2434,10 @@ mod normalize_tool_args_tests {
         // we don't accidentally dedup unrelated calls.)
         let raw = "not even json {{{";
         assert_eq!(normalize_tool_args(raw), raw);
-        assert_ne!(normalize_tool_args("garbage A"), normalize_tool_args("garbage B"));
+        assert_ne!(
+            normalize_tool_args("garbage A"),
+            normalize_tool_args("garbage B")
+        );
     }
 }
 
@@ -2413,7 +2562,11 @@ mod tool_call_text_rescue_tests {
 </function>
 </tool_call>"#;
         let calls = rescue_text_tool_calls(text);
-        assert_eq!(calls.len(), 2, "two sequential blocks must rescue two calls");
+        assert_eq!(
+            calls.len(),
+            2,
+            "two sequential blocks must rescue two calls"
+        );
 
         let v0: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(calls[0].name, "read_file");
@@ -2484,7 +2637,10 @@ src/main.rs
 <parameter=file_path>x.rs</parameter>
 </tool_call>"#;
         let calls = rescue_text_tool_calls(text);
-        assert!(calls.is_empty(), "missing </function> must yield zero calls");
+        assert!(
+            calls.is_empty(),
+            "missing </function> must yield zero calls"
+        );
     }
 
     #[test]
@@ -2723,8 +2879,16 @@ src/main.rs
         // order so the second JSON call gets the second XML's args, not the
         // first one's reused.
         let mut calls = vec![
-            tc("c1", "edit_file", r#"{"file_path":"a.rs","new_string":"a_new"}"#),
-            tc("c2", "edit_file", r#"{"file_path":"b.rs","new_string":"b_new"}"#),
+            tc(
+                "c1",
+                "edit_file",
+                r#"{"file_path":"a.rs","new_string":"a_new"}"#,
+            ),
+            tc(
+                "c2",
+                "edit_file",
+                r#"{"file_path":"b.rs","new_string":"b_new"}"#,
+            ),
         ];
         let xml_pool = vec![
             tc(
@@ -2820,11 +2984,7 @@ pub(crate) fn build_llm_error_data(
     // Strip the raw JSON body that some providers append after a colon.
     let home = crate::tool::real_home_dir();
     let cwd = std::env::current_dir().ok();
-    let message_raw = scrub::scrub_path(
-        reason,
-        home.as_deref(),
-        cwd.as_deref(),
-    );
+    let message_raw = scrub::scrub_path(reason, home.as_deref(), cwd.as_deref());
     let message = scrub::truncate_head(&message_raw, 200);
 
     let base = || -> serde_json::Value {
@@ -2912,7 +3072,10 @@ pub(crate) fn build_llm_error_data(
             obj.insert("sent_tokens".into(), serde_json::json!(sent_tokens));
             obj.insert("system_tokens".into(), serde_json::json!(system_tokens));
             obj.insert("tool_def_tokens".into(), serde_json::json!(tool_def_tokens));
-            obj.insert("tool_result_tokens".into(), serde_json::json!(tool_result_tokens));
+            obj.insert(
+                "tool_result_tokens".into(),
+                serde_json::json!(tool_result_tokens),
+            );
             obj.insert("message_tokens".into(), serde_json::json!(message_tokens));
             obj.insert("messages_count".into(), serde_json::json!(messages_count));
             m
@@ -2961,7 +3124,11 @@ pub(crate) fn classify_llm_error(reason: &str) -> LlmErrorKind {
         LlmErrorKind::StreamInterrupted
     } else if r.contains("context") || r.contains("max_tokens") || r.contains("token limit") {
         LlmErrorKind::ContextOverflow
-    } else if r.contains("connect") || r.contains("dns") || r.contains("network") || r.contains("timeout") {
+    } else if r.contains("connect")
+        || r.contains("dns")
+        || r.contains("network")
+        || r.contains("timeout")
+    {
         LlmErrorKind::NetworkError
     } else {
         LlmErrorKind::Other
@@ -2983,11 +3150,14 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
                         serde_json::Value::Null => "null".to_string(),
-                        _ => format!("<{}>", match v {
-                            serde_json::Value::Array(_) => "array",
-                            serde_json::Value::Object(_) => "object",
-                            _ => "value",
-                        }),
+                        _ => format!(
+                            "<{}>",
+                            match v {
+                                serde_json::Value::Array(_) => "array",
+                                serde_json::Value::Object(_) => "object",
+                                _ => "value",
+                            }
+                        ),
                     };
                     format!("{}={}", k, val_str)
                 })
@@ -2996,5 +3166,9 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
         }
     }
     // Fallback: truncate raw args
-    format!("{}({})", tool_name, atomcode_telemetry::scrub::truncate_head(args, 100))
+    format!(
+        "{}({})",
+        tool_name,
+        atomcode_telemetry::scrub::truncate_head(args, 100)
+    )
 }

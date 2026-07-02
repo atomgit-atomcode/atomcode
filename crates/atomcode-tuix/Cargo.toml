@@ -16,7 +16,7 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Async HTTPS client for the passive version_check latest.json fetch
@@ -33,6 +33,8 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 urlencoding = "2"
+futures = "0.3"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's

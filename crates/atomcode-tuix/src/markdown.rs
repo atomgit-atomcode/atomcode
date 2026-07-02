@@ -43,6 +43,14 @@ pub struct MdState {
     /// large single-block replies the peak memory is `O(source size)`
     /// which matches the existing `code_buf` behaviour.
     pub last_code_block_source: Option<String>,
+    /// How many properly-CLOSED fenced code blocks have been seen since the
+    /// last [`reset`](Self::reset) (i.e. in the current assistant message).
+    /// Auto-copy fires ONLY when a whole reply is essentially a SINGLE code
+    /// block (`== 1`): a long answer that merely contains several illustrative
+    /// blocks must not clobber the clipboard per-block nor spam a "copied" hint.
+    /// An UNCLOSED / prematurely-finalized block does NOT increment this — only
+    /// a real close fence does — so an incomplete block is never auto-copied.
+    pub code_block_count: usize,
 }
 
 /// Manual impl so `fence_char` / `fence_len` start at realistic sentinel
@@ -59,6 +67,7 @@ impl Default for MdState {
             table_buf: Vec::new(),
             code_buf: Vec::new(),
             last_code_block_source: None,
+            code_block_count: 0,
         }
     }
 }
@@ -77,6 +86,7 @@ impl MdState {
         self.table_buf.clear();
         self.code_buf.clear();
         self.last_code_block_source = None;
+        self.code_block_count = 0;
     }
 }
 
@@ -151,6 +161,8 @@ pub fn render_line_with_width(
         let source = state.code_buf.join("\n");
         let highlighted = crate::highlight::highlight_block(&source);
         state.last_code_block_source = Some(source);
+        // A PROPERLY-CLOSED block — the only kind eligible for auto-copy.
+        state.code_block_count += 1;
         state.in_code_block = false;
         state.code_buf.clear();
         return Some(prepend(highlighted));
@@ -250,9 +262,15 @@ pub fn finalize_with_width(
     };
 
     let code_part = if state.in_code_block && !state.code_buf.is_empty() {
+        // An UNCLOSED block reaching finalize — either the model never wrote the
+        // closing ```, or a mid-stream flush (e.g. a tool call interleaving the
+        // reply) forced an early finalize. Render it so no content is lost, but
+        // do NOT feed auto-copy: an incomplete block must never be copied, and a
+        // premature mid-stream finalize must not fire a spurious "copied" hint.
+        // (Only the real close-fence path sets `last_code_block_source` / bumps
+        // `code_block_count`.)
         let source = state.code_buf.join("\n");
         let highlighted = crate::highlight::highlight_block(&source);
-        state.last_code_block_source = Some(source);
         state.in_code_block = false;
         state.code_buf.clear();
         Some(highlighted)
@@ -1318,6 +1336,50 @@ mod tests {
         );
         assert!(!st.in_code_block);
         assert!(st.code_buf.is_empty());
+    }
+
+    #[test]
+    fn plain_markdown_never_sets_code_block_source_or_count() {
+        // Invariant behind auto-copy: ordinary prose — numbered bold headers +
+        // indented list items with INLINE `code` — must never set
+        // `last_code_block_source` nor bump `code_block_count`. Only a real ```
+        // fence can. So a "代码块已复制" hint can NEVER attach to non-fenced
+        // content (rules out the "auto-copy fired on plain prose" reading).
+        let md = "\
+✅ **要写的内容**
+
+1. **技术栈（一句话）**
+   这是一个 Vue 3 + TypeScript 项目，使用 `Pinia` 做状态管理、`Tailwind` 做样式、`Vitest` 做单元测试。
+
+2. **项目特有的约定（命令式，清晰直接）**
+   - 组件一律使用 `<script setup lang=\"ts\">` Composition API
+   - 样式只写 `Tailwind`，不写内联 style 和单独的 .css 文件
+   - 所有 API 调用走 `src/services/*`，不在组件里直接 fetch
+
+3. **常用命令（让 AI 知道怎么跑测试/构建）**
+   - 启动开发：`pnpm dev`
+   - 类型检查：`pnpm typecheck`
+   - 测试：`pnpm test`
+
+4. **禁区（哪些文件不能动）**
+   - 不要修改 `src/generated/*`，那是从 OpenAPI 自动生成的
+
+× **不要写的内容**";
+        let mut st = MdState::new();
+        let mut sets: Vec<String> = Vec::new();
+        for line in md.split('\n') {
+            let _ = render_line(line, &mut st, caps());
+            if let Some(s) = &st.last_code_block_source {
+                sets.push(format!("after {:?} → source={:?}", line, s));
+            }
+        }
+        assert!(
+            sets.is_empty(),
+            "plain markdown set last_code_block_source (should be impossible without a ``` fence): {:#?}",
+            sets
+        );
+        assert_eq!(st.code_block_count, 0, "no fenced block ⇒ count stays 0");
+        assert!(!st.in_code_block, "no fence opened ⇒ never in a code block");
     }
 
     #[test]

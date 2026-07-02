@@ -10,6 +10,7 @@ export interface ChatRequest {
 export interface ImageInput {
   media_type: string;
   data: string;
+  missing?: boolean;
 }
 
 export interface SkillInfo {

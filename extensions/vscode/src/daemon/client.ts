@@ -27,6 +27,39 @@ import {
 
 const REST_TIMEOUT = 30000;
 
+const REQUEST_BODY_TOO_LARGE_MESSAGE =
+  '消息内容过大，发送失败。请压缩图片、减少附件数量，或缩短消息后重试。';
+
+export function formatDaemonHttpError(statusCode: number | undefined, raw: string): string {
+  let message = raw;
+  try {
+    const parsed = JSON.parse(raw) as { error?: string; message?: string };
+    message = parsed.error || parsed.message || raw;
+  } catch {
+    // Keep the daemon's plain-text response.
+  }
+
+  if (
+    statusCode === 413
+    || message.includes('Failed to buffer the request body')
+    || message.includes('length limit exceeded')
+  ) {
+    return REQUEST_BODY_TOO_LARGE_MESSAGE;
+  }
+
+  return message;
+}
+
+export function classifyDaemonStreamError(
+  message: string,
+  requestAborted: boolean,
+): { type: 'stopped' } | { type: 'error'; message: string } {
+  if (requestAborted || message === 'aborted') {
+    return { type: 'stopped' };
+  }
+  return { type: 'error', message: `Stream error: ${message}` };
+}
+
 export class DaemonClient {
   private baseUrl: string;
   private host: string;
@@ -80,7 +113,7 @@ export class DaemonClient {
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
           if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${this.errorMessage(raw)}`));
+            reject(new Error(`HTTP ${res.statusCode}: ${this.errorMessage(res.statusCode, raw)}`));
             return;
           }
           try {
@@ -127,13 +160,8 @@ export class DaemonClient {
     return this.request<T>('DELETE', path);
   }
 
-  private errorMessage(raw: string): string {
-    try {
-      const parsed = JSON.parse(raw) as { error?: string; message?: string };
-      return parsed.error || parsed.message || raw;
-    } catch {
-      return raw;
-    }
+  private errorMessage(statusCode: number | undefined, raw: string): string {
+    return formatDaemonHttpError(statusCode, raw);
   }
 
   // ── Health ────────────────────────────────────────────────────
@@ -315,7 +343,7 @@ export class DaemonClient {
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
-          callbacks.onError(`HTTP ${res.statusCode}: ${this.errorMessage(raw)}`);
+          callbacks.onError(`HTTP ${res.statusCode}: ${this.errorMessage(res.statusCode, raw)}`);
         });
         return;
       }
@@ -354,7 +382,12 @@ export class DaemonClient {
       });
 
       res.on('error', (err) => {
-        callbacks.onError(`Stream error: ${err.message}`);
+        const classified = classifyDaemonStreamError(err.message, controller.signal.aborted);
+        if (classified.type === 'stopped') {
+          callbacks.onStopped();
+        } else {
+          callbacks.onError(classified.message);
+        }
       });
     });
 

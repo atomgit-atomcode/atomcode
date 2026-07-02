@@ -127,15 +127,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
 
         // ── /status 命令主体 ──
-        Msg::StatusBody { model, dir, config, tokens } =>
+        Msg::StatusBody { model, dir, config } =>
             format!(
-                "  模型：    {}\n  目录：    {}\n  配置文件：{}\n  Token：   {}\n",
-                model, dir, config, tokens,
+                "  模型：    {}\n  目录：    {}\n  配置文件：{}\n",
+                model, dir, config,
             ).into(),
+        Msg::StatusLoginLoggedIn { user } =>
+            format!("  登录：  {}\n", user).into(),
+        Msg::StatusLoginNotSignedIn =>
+            "  登录：  未登录（运行 /login）\n".into(),
         Msg::StatusCpNotSignedIn =>
             "  CodingPlan：（未登录 — 运行 /login 进行配置）\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan：（状态获取失败 — {}）\n", error).into(),
+        Msg::StatusCpAuthExpired =>
+            "  CodingPlan：（登录已过期 — 运行 /login 重新登录）\n".into(),
         Msg::StatusCpNoActive =>
             "  CodingPlan：（无激活套餐 — 运行 /login）\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
@@ -742,8 +748,11 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
         Msg::PluginGitNotFound =>
             "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
-        Msg::PluginMarketplaceAdded { name, commit, count } =>
-            format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
+            format!(
+                "✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）\n  \
+                 插件：{plugins} —— 运行 /plugin install <插件名>@{name} 安装后才能使用其命令"
+            ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
@@ -804,6 +813,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CodeBlockCopied => "📋 代码块已复制到剪贴板".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
+        Msg::CmdDescApp => "通过中继将当前会话暴露给手机 App（扫码配对；/app stop 断开）".into(),
+        Msg::CmdDescSync => "接入实时 webui 会话（/sync off 断开）".into(),
+        Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
+        Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
+        Msg::CmdDescProxy => "切换出站代理模式".into(),
         Msg::ViewUsage => "用法：/view <文件路径>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
@@ -1073,6 +1087,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
+        Msg::ProviderInitNeedsLogin =>
+            "尚未登录，模型暂不可用；运行 /login 后可继续对话。".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\

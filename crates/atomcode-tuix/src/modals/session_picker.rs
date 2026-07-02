@@ -514,7 +514,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
                 }
                 for tc in tool_calls {
                     renderer.render(UiLine::ToolCall {
-                        name: tc.name.clone(),
+                        name: crate::event_loop::display_tool_name(&tc.name),
                         detail: format_tool_detail(&tc.name, &tc.arguments),
                     });
                 }

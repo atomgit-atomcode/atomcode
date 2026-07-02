@@ -33,6 +33,13 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // Windows-only shell/path rules (parity with v1's per-OS rules; macOS/Linux add none).
     #[cfg(windows)]
     p.push_str(WINDOWS_PLATFORM);
+    // Models with weaker soft-instruction adherence (observed: GLM, DeepSeek shell out
+    // `ls`/`grep` despite the persona preference) get an extra, blunt restatement of the
+    // tool-preference rules. Keyed only on the model name (frozen per session), so it is
+    // prompt-cache-stable; frontier models that already comply skip the extra tokens.
+    if model_needs_firm_tool_steering(model) {
+        p.push_str(FIRM_TOOL_DISCIPLINE);
+    }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
     // cache-stable AND present on EVERY round, including a turn's first round which the
@@ -47,6 +54,29 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     p
 }
 
+/// Whether `model` belongs to a family with weaker soft-instruction adherence (GLM,
+/// DeepSeek) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`] restatement. Substring
+/// match on the lower-cased name so version suffixes (`glm-5.2`, `deepseek-v4-flash`) all
+/// hit. Frontier models (Claude, GPT) follow the soft `## TOOLS:` preferences and are
+/// excluded to keep their prompt lean and cache-stable.
+fn model_needs_firm_tool_steering(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("glm") || m.contains("deepseek")
+}
+
+/// Blunt, point-of-decision restatement of the file-tool preference, appended only for
+/// models flagged by [`model_needs_firm_tool_steering`]. The soft `## TOOLS:` guidance
+/// already says this once; weak models need it stated as a hard rule. The aggregation
+/// carve-out keeps audit-style shell pipelines legitimate.
+const FIRM_TOOL_DISCIPLINE: &str = "\n\n## TOOL DISCIPLINE (MANDATORY):\n\
+Do NOT shell out for file work:\n\
+- List a directory → list_directory (NOT `bash ls`).\n\
+- Find files by name → glob (NOT `bash find`).\n\
+- Search file contents → grep (NOT `bash grep` / `rg`).\n\
+- Read a file → read_file (NOT `bash cat`).\n\
+Use bash ONLY for git, builds, package managers, running commands, and pipelines / \
+aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
+
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
 /// clock once per session.
@@ -55,14 +85,20 @@ fn date_anchor_line(today: &str) -> String {
 }
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
+///
+/// Deliberately SHELL-NEUTRAL: the actual shell (Git Bash when installed, else cmd.exe)
+/// varies per machine, so the `bash` tool's OWN description states which shell it uses and
+/// the syntax to write. Claiming a shell here would re-introduce the "told cmd, ran bash"
+/// contradiction. This keeps only Windows-general advice that holds under either shell.
 #[cfg(windows)]
 const WINDOWS_PLATFORM: &str = "\n\n## PLATFORM (Windows):\n\
-`bash` runs via cmd.exe — prefer Windows-native commands and quote forward-slash paths (or \
-use backslashes). Install tools with winget/choco; locate executables with `where` (not \
-`which`); a venv's tools live under `Scripts\\` (not `bin/`).";
+The `bash` tool's own description states which shell actually runs (Git Bash if installed, \
+else cmd.exe) and which syntax to use — follow it, and don't assume cmd.exe. \
+Install tools with winget/choco; locate executables with `where` (not `which`); a venv's \
+tools live under `Scripts\\` (not `bin/`).";
 
 const RULES: &str = "\
-Solve tasks efficiently with minimal tool calls. Act decisively — go straight to tool calls or answers.
+Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
 ## SYSTEM REMINDERS:
 Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
@@ -70,12 +106,13 @@ Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYST
 ## WORKFLOW:
 For simple changes (rename, one-line fix, config tweak): just do it — search, edit, verify, done.
 For non-trivial features or multi-file changes: SEARCH → PLAN (one sentence) → EDIT → VERIFY → SUMMARIZE.
-For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command first) → DIAGNOSE → FIX → VERIFY.
+For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command if one exists) → DIAGNOSE → FIX → VERIFY.
 
 Guidelines:
-- REPRODUCE: run the failing command with bash BEFORE reading code. See the real error first.
+- REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
+- CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps. Do NOT keep searching for something that may not be in the code.
 
 ## TOOLS:
@@ -89,10 +126,10 @@ MANDATORY parallel scenarios (must be ONE turn):
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
-To list directories, use `list_directory` instead of `bash ls` / `find` when a tree view is enough; it is gitignore-aware and skips build/cache directories.
+To list directories, default to `list_directory` instead of `bash ls` / `find` — it is gitignore-aware and skips build/cache directories. Fall back to `bash ls -la` ONLY when you specifically need file sizes, permissions, or timestamps, which `list_directory` omits.
 To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
-To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites.
+To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo.
 The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
 To open or preview a local file or directory in the GUI, use `open_file` — not `bash open`, not `bash xdg-open`, not `bash start`, and not `bash wslview`.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
@@ -103,10 +140,12 @@ Use the code-intelligence tools (list_symbols / read_symbol / find_references / 
 - Prefer editing existing files over creating new ones.
 - If an approach fails, diagnose WHY before switching tactics. Read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.
 - Don't add features, refactor code, or make improvements beyond what was asked. A bug fix doesn't need surrounding code cleaned up.
+- Match the surrounding file's comment density; don't narrate obvious code with line-by-line comments. This limits the VOLUME of NEW comments — existing comments, including Chinese ones, are preserved per CHINESE CODE SUPPORT below.
 - Don't add error handling or validation for scenarios that can't happen. Only validate at system boundaries.
 - Be careful not to introduce security vulnerabilities (command injection, XSS, SQL injection).
 - Don't guess library APIs. Read the source or documentation first.
 - Report outcomes faithfully. If tests fail, say so. If you didn't verify, say so. Never claim success without evidence.
+- Prioritize technical correctness over agreeing with the user. If their assumption, diagnosis, or proposed fix is wrong, say so plainly and explain why — don't validate it just to be agreeable. Pursue the real cause; never confirm a belief you haven't verified.
 
 ## WHEN COMMANDS FAIL:
 Read the error output carefully. Identify the root cause. Fix it.
@@ -203,6 +242,74 @@ mod tests {
                 "persona must advertise the mounted tool `{tool}`"
             );
         }
+    }
+
+    #[test]
+    fn persona_carries_behavioral_guardrails() {
+        // Three v1 guardrails the initial v2 port dropped, restored for parity with the
+        // legacy engine (peer agents like opencode keep them too).
+        let p = coding_persona("m");
+        assert!(
+            p.contains("Prioritize technical correctness over agreeing with the user"),
+            "anti-sycophancy guardrail (DOING TASKS)"
+        );
+        assert!(
+            p.contains("Never mutate a file with"),
+            "no-bash-file-mutation guardrail (TOOLS)"
+        );
+        assert!(
+            p.contains("CARRY IT THROUGH"),
+            "carry-to-completion guardrail (WORKFLOW)"
+        );
+    }
+
+    #[test]
+    fn persona_keeps_the_soft_comment_density_rule() {
+        // v1 `prompt_sections.rs` carries a comment-density rule (weak / Chinese-RLHF
+        // models like GLM over-comment with line-by-line narration); the initial v2 port
+        // dropped it. Restore parity and cross-ref CHINESE CODE SUPPORT so the volume
+        // limit applies to NEW comments only, never to existing (incl. Chinese) ones.
+        let p = coding_persona("glm-5.2");
+        assert!(
+            p.contains("comment density"),
+            "must keep the soft comment-density rule: {p}"
+        );
+        assert!(
+            p.contains("VOLUME of NEW comments"),
+            "the rule must scope to NEW comments, not existing ones"
+        );
+    }
+
+    #[test]
+    fn persona_frames_efficiency_as_round_trips_not_fewer_tool_calls() {
+        // "minimal tool calls" contradicts the `## TOOLS:` section (which urges maximal
+        // parallel calls) and can push weak models to under-read / guess. The real cost is
+        // round-trip latency, so the opening line must target round-trips, not tool count.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("minimizing round-trips"),
+            "opening line must frame efficiency as round-trips: {p}"
+        );
+        assert!(
+            !p.contains("minimal tool calls"),
+            "must not tell the model to minimize tool calls (contradicts ## TOOLS:)"
+        );
+    }
+
+    #[test]
+    fn reproduce_step_is_conditional_on_a_runnable_repro() {
+        // Many bugs (UI/rendering, intermittent, state-dependent) have no single runnable
+        // command; the old absolute "run the failing command BEFORE reading code" made weak
+        // models burn a round or fabricate a repro. The step must be conditional.
+        let p = coding_persona("m");
+        assert!(
+            p.contains("when a runnable reproduction exists"),
+            "REPRODUCE must be conditional on a runnable repro: {p}"
+        );
+        assert!(
+            p.contains("skip straight to DIAGNOSE"),
+            "must give an explicit out when there is no runnable command"
+        );
     }
 
     #[test]
@@ -322,5 +429,57 @@ mod tests {
                 "persona must preserve tool preference: {phrase}"
             );
         }
+    }
+
+    #[test]
+    fn list_directory_guidance_drops_the_vague_escape_hatch() {
+        // The old wording ("when a tree view is enough") let weak models justify
+        // `bash ls -la` for almost anything. Replace the vague condition with one
+        // concrete exception (sizes/permissions/timestamps) so the default is
+        // unambiguous, while still preferring list_directory over `bash ls`.
+        let p = coding_persona("m");
+        assert!(
+            !p.contains("when a tree view is enough"),
+            "the vague escape hatch must be gone: {p}"
+        );
+        assert!(
+            p.contains("instead of `bash ls`"),
+            "must still prefer list_directory over `bash ls`"
+        );
+        assert!(
+            p.contains("file sizes, permissions, or timestamps"),
+            "must name the single concrete fallback case: {p}"
+        );
+    }
+
+    #[test]
+    fn weak_instruction_models_get_a_firm_tool_discipline_block() {
+        // GLM / DeepSeek follow soft prompt preferences less reliably than frontier
+        // models (observed: GLM-5.2 shells out `ls -la` despite the persona preference).
+        // Give them an extra, blunt restatement at the model's decision point. Models
+        // that already comply don't need the extra tokens.
+        for weak in ["glm-5.2", "GLM-4.6", "deepseek-v4-flash"] {
+            let p = coding_persona(weak);
+            assert!(
+                p.contains("## TOOL DISCIPLINE"),
+                "{weak} must get the firm tool-discipline block: {p}"
+            );
+        }
+        for strong in ["claude-opus-4-8", "gpt-5", "m"] {
+            let p = coding_persona(strong);
+            assert!(
+                !p.contains("## TOOL DISCIPLINE"),
+                "{strong} must not carry the extra firm block"
+            );
+        }
+    }
+
+    #[test]
+    fn model_needs_firm_tool_steering_matches_weak_families() {
+        assert!(model_needs_firm_tool_steering("glm-5.2"));
+        assert!(model_needs_firm_tool_steering("GLM-4.6"));
+        assert!(model_needs_firm_tool_steering("deepseek-chat"));
+        assert!(!model_needs_firm_tool_steering("claude-opus-4-8"));
+        assert!(!model_needs_firm_tool_steering("gpt-5"));
     }
 }

@@ -1,4 +1,14 @@
-import { ChatState, ChatAction, ChatMessage, ToolCallData, ContextFile } from './types';
+import {
+  ChatState,
+  ChatAction,
+  ChatMessage,
+  ToolCallData,
+  ContextFile,
+  ArtifactData,
+  MessageBlock,
+  PermissionRequestData,
+} from './types';
+import { blocksFromLegacyMessage } from './blocks';
 
 let _msgCounter = 0;
 function nextId(): string {
@@ -10,6 +20,44 @@ function lastAssistantIndex(messages: ChatMessage[]): number {
     if (messages[i].role === 'assistant') return i;
   }
   return -1;
+}
+
+function artifactLanguage(artifactType: string, language?: string, title?: string): string {
+  const titleExt = title?.trim().match(/\.([a-z0-9]+)$/i)?.[1];
+  const candidates = [language, artifactType, titleExt];
+  for (const candidate of candidates) {
+    const normalized = (candidate ?? '').trim().toLowerCase();
+    if (!normalized) continue;
+    if (normalized === 'diff' || normalized === 'patch') return 'diff';
+    if (normalized === 'typescript') return 'ts';
+    if (normalized === 'javascript') return 'js';
+    if (normalized === 'markdown') return 'md';
+    if (normalized === 'html' || normalized === 'htm') return 'html';
+    if (normalized === 'svg') return 'svg';
+    if (normalized === 'mermaid') return 'mermaid';
+    if (normalized === 'code') continue;
+    return normalized.replace(/^\./, '');
+  }
+  return 'text';
+}
+
+function mapHistoryArtifact(artifact: {
+  id: string;
+  artifact_type?: string;
+  artifactType?: string;
+  title?: string;
+  language?: string;
+  content: string;
+}): ArtifactData {
+  const artifactType = artifact.artifactType ?? artifact.artifact_type ?? 'code';
+  return {
+    id: artifact.id,
+    artifactType,
+    title: artifact.title,
+    language: artifactLanguage(artifactType, artifact.language, artifact.title),
+    content: artifact.content,
+    status: 'complete',
+  };
 }
 
 function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' | 'unknown' {
@@ -45,11 +93,121 @@ function textFromContent(content: unknown): string {
   return '';
 }
 
+function currentBlocks(message: ChatMessage): MessageBlock[] {
+  return message.blocks ? [...message.blocks] : blocksFromLegacyMessage(message);
+}
+
+function appendTextBlock(message: ChatMessage, content: string): ChatMessage {
+  if (!content) return message;
+  const blocks = currentBlocks(message);
+  const last = blocks[blocks.length - 1];
+  const nextBlocks = last?.type === 'text'
+    ? [
+        ...blocks.slice(0, -1),
+        { ...last, content: last.content + content },
+      ]
+    : [
+        ...blocks,
+        { id: `${message.id}-text-${blocks.length}`, type: 'text' as const, content },
+      ];
+  return { ...message, text: message.text + content, blocks: nextBlocks };
+}
+
+function upsertToolBlock(message: ChatMessage, tool: ToolCallData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'tool' && block.tool.id === tool.id);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) => index === existing && block.type === 'tool' ? { ...block, tool } : block)
+    : [...blocks, { id: `${message.id}-tool-${tool.id}`, type: 'tool' as const, tool }];
+  return { ...message, blocks: nextBlocks };
+}
+
+function upsertArtifactMetadataBlock(message: ChatMessage, artifact: ArtifactData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'artifact' && block.artifact.id === artifact.id);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) =>
+        index === existing && block.type === 'artifact'
+          ? {
+              ...block,
+              artifact: {
+                ...block.artifact,
+                artifactType: artifact.artifactType,
+                title: artifact.title ?? block.artifact.title,
+                language: artifact.language,
+                content: block.artifact.content || artifact.content,
+                status: artifact.status,
+              },
+            }
+          : block,
+      )
+    : [...blocks, { id: `${message.id}-artifact-${artifact.id}`, type: 'artifact' as const, artifact }];
+  return { ...message, blocks: nextBlocks };
+}
+
+function mergeArtifactContent(existing: string, incoming: string): string {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  return existing + incoming;
+}
+
+function appendArtifactContentBlock(message: ChatMessage, id: string, content: string): ChatMessage {
+  if (!content) return message;
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'artifact' && block.artifact.id === id);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) =>
+        index === existing && block.type === 'artifact'
+          ? {
+              ...block,
+              artifact: {
+                ...block.artifact,
+                content: mergeArtifactContent(block.artifact.content, content),
+                status: 'streaming' as const,
+              },
+            }
+          : block,
+      )
+    : [
+        ...blocks,
+        {
+          id: `${message.id}-artifact-${id}`,
+          type: 'artifact' as const,
+          artifact: {
+            id,
+            artifactType: 'code',
+            language: 'text',
+            content,
+            status: 'streaming' as const,
+          },
+        },
+      ];
+  return { ...message, blocks: nextBlocks };
+}
+
+function completeArtifactBlock(message: ChatMessage, id: string): ChatMessage {
+  const blocks = currentBlocks(message).map((block) =>
+    block.type === 'artifact' && block.artifact.id === id
+      ? { ...block, artifact: { ...block.artifact, status: 'complete' as const } }
+      : block,
+  );
+  return { ...message, blocks };
+}
+
+function upsertPermissionBlock(message: ChatMessage, request: PermissionRequestData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'permission' && block.request.id === request.id);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) => index === existing && block.type === 'permission' ? { ...block, request } : block)
+    : [...blocks, { id: `${message.id}-permission-${request.id}`, type: 'permission' as const, request }];
+  return { ...message, blocks: nextBlocks };
+}
+
 // Matches the prefix emitted in provider.ts _handleSend when context files are attached.
-const ATTACHED_FILES_PREFIX = 'The user has attached the following file(s) for context.';
+const ATTACHED_FILES_PREFIX = /^The user has attached the following file\(s\)(?:\/selection\(s\))? for context\./;
 
 function parseAttachedMessage(rawText: string): { displayText: string; contextFiles: ContextFile[] } {
-  if (!rawText.startsWith(ATTACHED_FILES_PREFIX)) {
+  if (!ATTACHED_FILES_PREFIX.test(rawText)) {
     return { displayText: rawText, contextFiles: [] };
   }
 
@@ -59,20 +217,38 @@ function parseAttachedMessage(rawText: string): { displayText: string; contextFi
 
   // Extract file names from ```<ext> fenced blocks.
   const contextFiles: ContextFile[] = [];
-  const filePattern = /^File: (\S+)$/gm;
+  const filePattern = /^File: (.+?)(?: \(lines (\d+)-(\d+)\))?$/gm;
   let match: RegExpExecArray | null;
   while ((match = filePattern.exec(rawText)) !== null) {
     const fileName = match[1];
+    const startLine = match[2] ? Number(match[2]) : undefined;
+    const endLine = match[3] ? Number(match[3]) : undefined;
     if (!contextFiles.some((f) => f.fileName === fileName)) {
       contextFiles.push({
         path: fileName,
         fileName,
-        type: 'file',
+        type: startLine && endLine ? 'selection' : 'file',
+        startLine,
+        endLine,
       });
     }
   }
 
   return { displayText: userQuestion, contextFiles };
+}
+
+function stripVisionPreprocessText(rawText: string): { displayText: string; hadVisionMarker: boolean } {
+  const markerIndex = rawText.indexOf('[图片内容（由');
+  const failureIndex = rawText.indexOf('[图片识别失败]');
+  const indexes = [markerIndex, failureIndex].filter((index) => index >= 0);
+  if (indexes.length === 0) {
+    return { displayText: rawText, hadVisionMarker: false };
+  }
+
+  return {
+    displayText: rawText.slice(0, Math.min(...indexes)).trimEnd(),
+    hadVisionMarker: true,
+  };
 }
 
 export const initialState: ChatState = {
@@ -99,6 +275,7 @@ export const initialState: ChatState = {
   settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
+  locale: document.body.dataset.locale,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -146,10 +323,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
 
     case 'ADD_ASSISTANT_MESSAGE': {
+      const id = nextId();
       const msg: ChatMessage = {
-        id: nextId(),
+        id,
         role: 'assistant',
         text: action.text,
+        blocks: action.text ? [{ id: `${id}-text-0`, type: 'text', content: action.text }] : [],
         toolCalls: [],
         streaming: false,
         timestamp: Date.now(),
@@ -163,6 +342,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         id: nextId(),
         role: 'assistant',
         text: '',
+        blocks: [],
         toolCalls: [],
         streaming: true,
         timestamp: Date.now(),
@@ -182,6 +362,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         id: nextId(),
         role: 'assistant',
         text: '',
+        blocks: [],
         toolCalls: [],
         streaming: true,
         timestamp: Date.now(),
@@ -198,7 +379,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, text: assistant.text + action.content };
+        msgs[assistantIndex] = appendTextBlock(assistant, action.content);
       }
       return { ...state, messages: msgs };
     }
@@ -218,6 +399,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ...assistant,
           toolCalls: [...(assistant.toolCalls ?? []), ...tools],
         };
+        msgs[assistantIndex] = tools.reduce((message, tool) => upsertToolBlock(message, tool), msgs[assistantIndex]);
       }
       return { ...state, messages: msgs };
     }
@@ -233,7 +415,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           const updated = assistant.toolCalls!.map((t, i) =>
             i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
           );
-          msgs[assistantIndex] = { ...assistant, toolCalls: updated };
+          const updatedTool = updated[existingIndex];
+          msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
         } else {
           // Legacy path: tool wasn't in a batch, add it directly as running
           const tool: ToolCallData = {
@@ -246,6 +429,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             ...assistant,
             toolCalls: [...(assistant.toolCalls ?? []), tool],
           };
+          msgs[assistantIndex] = upsertToolBlock(msgs[assistantIndex], tool);
         }
       }
       return { ...state, messages: msgs };
@@ -261,7 +445,81 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, status: 'done' as const }
             : t,
         );
-        msgs[assistantIndex] = { ...assistant, toolCalls: tools };
+        const updatedTool = tools.find((tool) => tool.id === action.id);
+        msgs[assistantIndex] = updatedTool
+          ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
+          : { ...assistant, toolCalls: tools };
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'ARTIFACT_START': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        const artifact: ArtifactData = {
+          id: action.id,
+          artifactType: action.artifactType,
+          title: action.title,
+          language: artifactLanguage(action.artifactType, action.language, action.title),
+          content: '',
+          status: 'streaming',
+        };
+        const existing = assistant.artifacts ?? [];
+        const nextArtifacts = existing.some((a) => a.id === action.id)
+          ? existing.map((a) =>
+              a.id === action.id
+                ? {
+                    ...a,
+                    artifactType: action.artifactType,
+                    title: action.title ?? a.title,
+                    language: artifact.language,
+                    status: 'streaming' as const,
+                  }
+                : a,
+            )
+          : [...existing, artifact];
+        msgs[assistantIndex] = upsertArtifactMetadataBlock({ ...assistant, artifacts: nextArtifacts }, artifact);
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'ARTIFACT_CONTENT': {
+      if (!action.content) return state;
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        const artifacts = assistant.artifacts ?? [];
+        const nextArtifacts = artifacts.some((a) => a.id === action.id)
+          ? artifacts.map((a) =>
+              a.id === action.id ? { ...a, content: mergeArtifactContent(a.content, action.content), status: 'streaming' as const } : a,
+            )
+          : [{
+              id: action.id,
+              artifactType: 'code',
+              language: 'text',
+              content: action.content,
+              status: 'streaming' as const,
+            }];
+        msgs[assistantIndex] = appendArtifactContentBlock({ ...assistant, artifacts: nextArtifacts }, action.id, action.content);
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'ARTIFACT_END': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant?.artifacts) {
+        msgs[assistantIndex] = {
+          ...assistant,
+          artifacts: assistant.artifacts.map((artifact) =>
+            artifact.id === action.id ? { ...artifact, status: 'complete' as const } : artifact,
+          ),
+        };
+        msgs[assistantIndex] = completeArtifactBlock(msgs[assistantIndex], action.id);
       }
       return { ...state, messages: msgs };
     }
@@ -471,7 +729,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
                     }
                   : tool,
               );
-              messages[lastAssistantIdx] = { ...lastAssistant, toolCalls: newToolCalls };
+              const updatedTool = newToolCalls[targetIndex];
+              messages[lastAssistantIdx] = upsertToolBlock({ ...lastAssistant, toolCalls: newToolCalls }, updatedTool);
             }
           }
           continue;
@@ -490,24 +749,36 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
 
         const rawText = textFromContent(m.content);
+        const { displayText: userVisibleText, hadVisionMarker } = role === 'user'
+          ? stripVisionPreprocessText(rawText)
+          : { displayText: rawText, hadVisionMarker: false };
 
         // User messages may contain inline file content from the send path.
         // Parse it out into contextFiles so the UI shows attachment pills
         // instead of dumping the file body into the message bubble.
         const { displayText, contextFiles } = role === 'user'
-          ? parseAttachedMessage(rawText)
-          : { displayText: rawText, contextFiles: [] as ContextFile[] };
+          ? parseAttachedMessage(userVisibleText)
+          : { displayText: userVisibleText, contextFiles: [] as ContextFile[] };
+        const images = role === 'user' && m.images && m.images.length > 0
+          ? m.images
+          : role === 'user' && hadVisionMarker
+            ? [{ media_type: 'image/png', data: '', missing: true }]
+            : undefined;
 
-        messages.push({
+        const message: ChatMessage = {
           id: nextId(),
           role,
           text: displayText,
           toolCalls,
+          artifacts: role === 'assistant' && m.artifacts && m.artifacts.length > 0
+            ? m.artifacts.map(mapHistoryArtifact)
+            : undefined,
           contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
-          images: role === 'user' && m.images && m.images.length > 0 ? m.images : undefined,
+          images,
           streaming: false,
           timestamp: Date.now(),
-        });
+        };
+        messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
       return { ...state, messages, isGenerating: false };
     }
@@ -522,16 +793,17 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = {
-          ...last,
-          permissionRequest: {
-            id: action.id,
-            toolName: action.toolName,
-            args: action.args,
-            isDestructive: action.isDestructive,
-            status: 'pending',
-          },
+        const request: PermissionRequestData = {
+          id: action.id,
+          toolName: action.toolName,
+          args: action.args,
+          isDestructive: action.isDestructive,
+          status: 'pending',
         };
+        msgs[msgs.length - 1] = upsertPermissionBlock({
+          ...last,
+          permissionRequest: request,
+        }, request);
       }
       return { ...state, messages: msgs };
     }
@@ -540,13 +812,14 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant' && last.permissionRequest?.id === action.id) {
-        msgs[msgs.length - 1] = {
-          ...last,
-          permissionRequest: {
-            ...last.permissionRequest,
-            status: action.allowed ? 'allowed' : 'denied',
-          },
+        const request: PermissionRequestData = {
+          ...last.permissionRequest,
+          status: action.allowed ? 'allowed' : 'denied',
         };
+        msgs[msgs.length - 1] = upsertPermissionBlock({
+          ...last,
+          permissionRequest: request,
+        }, request);
       }
       return { ...state, messages: msgs };
     }
@@ -561,6 +834,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         activeSessionId: action.activeSessionId ?? state.activeSessionId,
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
+        locale: action.locale ?? state.locale,
       };
 
     default:

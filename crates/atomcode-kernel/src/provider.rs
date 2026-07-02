@@ -94,6 +94,19 @@ pub trait LlmProvider: Send + Sync {
     fn context_window(&self) -> u32 {
         0
     }
+    /// Bind this provider to its owning Agent's session id, ONCE. The kernel calls
+    /// this at spawn — the single point where the session id (allocated by the coding
+    /// layer's `prepare`, threaded in via `AgentBuilder::session_id`) meets the
+    /// provider — so no driver re-threads it. An adapter forwards it as the
+    /// `x-atomcode-session-id` header, letting a forwarding gateway (LiteLLM) pin the
+    /// whole conversation to one upstream for prefix-cache affinity.
+    ///
+    /// This is a one-shot binding, NOT a mutable setter: the session id is constant
+    /// for an Agent's life (a `/session` switch rebuilds the Agent + provider, not the
+    /// id in place), so adapters back it with a `OnceLock`. Default no-op: adapters
+    /// that don't forward an affinity id, and test doubles, ignore it. Never called ⇒
+    /// no affinity (header omitted) — the neutral default for session-less sub-agents.
+    fn bind_session_id(&self, _session_id: &str) {}
     /// Open the stream for one turn. `Err` = a failed OPEN (auth/connect/etc.);
     /// the stream itself may then still fail mid-flight via `StreamEvent::Error`.
     ///

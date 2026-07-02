@@ -142,9 +142,16 @@ pub enum Msg<'a> {
     StatusWebuiHint,
 
     // ── /status command body ──
-    StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
+    StatusBody { model: &'a str, dir: &'a str, config: &'a str },
+    /// `/status` login line — signed in, showing the account display name/username.
+    StatusLoginLoggedIn { user: &'a str },
+    /// `/status` login line — not signed in.
+    StatusLoginNotSignedIn,
     StatusCpNotSignedIn,
     StatusCpFetchFailed { error: &'a str },
+    /// `/status` CodingPlan line when the fetch failed specifically because auth
+    /// expired (`is_auth_expired`) — a clear re-login prompt instead of the raw error.
+    StatusCpAuthExpired,
     StatusCpNoActive,
     StatusCpLine {
         plan: &'a str,
@@ -535,7 +542,7 @@ pub enum Msg<'a> {
     /// for both manual `/plugin marketplace add` and the detached
     /// startup-bootstrap auto-install. `count` is the number of plugins the
     /// marketplace exposes after cloning.
-    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize },
+    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize, plugins: &'a str },
     /// Marketplace `update` completion toast — HEAD actually moved. No-op
     /// pulls (HEAD unchanged) emit no toast at all so a quiet `git pull`
     /// doesn't spam the body region.
@@ -616,6 +623,16 @@ pub enum Msg<'a> {
     CmdDescGuide,
     /// Description for the `/view` slash command — opens an overlay modal showing file content.
     CmdDescView,
+    /// Description for the `/app` slash command — expose the session to the mobile App via relay.
+    CmdDescApp,
+    /// Description for the `/sync` slash command — attach to a live webui session.
+    CmdDescSync,
+    /// Description for the `/review` slash command — code review the current changes.
+    CmdDescReview,
+    /// Description for the `/goal` slash command — set an autonomous completion goal.
+    CmdDescGoal,
+    /// Description for the `/proxy` slash command — switch the outbound proxy mode.
+    CmdDescProxy,
     /// Error shown when `/view` is used without a filepath argument.
     ViewUsage,
     /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
@@ -974,6 +991,10 @@ pub enum Msg<'a> {
     /// Frame for a provider/engine init failure surfaced to the driver.
     /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
     ProviderInitFailed { detail: &'a str },
+    /// Calm advisory (yellow) when a provider build fails purely because the
+    /// user isn't logged in — the expected state right after `/logout` or on a
+    /// fresh launch before `/login`. Replaces the alarming red init-failure line.
+    ProviderInitNeedsLogin,
     /// The configured `base_url` is an AtomGit gateway that this (open-source)
     /// build can't sign requests for. Points the user at the official binary
     /// or a plain OpenAI-compatible endpoint.

@@ -7,6 +7,7 @@ import { AtomCodeActionProvider } from './editor/actions';
 import { DiffContentProvider } from './editor/diff';
 import { getEditorContext, buildContextualPrompt } from './editor/context';
 import { getConfig, DEFAULT_PORT } from './config';
+import { getQuickActionPrompt } from './chat/quickActions';
 
 class ExtensionState {
   client!: DaemonClient;
@@ -69,7 +70,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // 6. Register commands before daemon startup. Command handlers surface daemon errors in the chat UI.
   const cmds = [
     vscode.commands.registerCommand('atomcode.openSidebar', async () => {
-      await runCommand('open AtomCode sidebar', () => extensionState.chatProvider.openInSidebar());
+      await runCommand(vscode.l10n.t('open AtomCode sidebar'), () => extensionState.chatProvider.openInSidebar());
     }),
 
     vscode.commands.registerCommand('atomcode.openTab', () => {
@@ -77,15 +78,15 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('atomcode.openPreferredLocation', async () => {
-      await runCommand('open AtomCode', () => extensionState.chatProvider.openPreferredLocation());
+      await runCommand(vscode.l10n.t('open AtomCode'), () => extensionState.chatProvider.openPreferredLocation());
     }),
 
     vscode.commands.registerCommand('atomcode.focusInput', async () => {
-      await runCommand('focus AtomCode input', () => extensionState.chatProvider.focusInput());
+      await runCommand(vscode.l10n.t('focus AtomCode input'), () => extensionState.chatProvider.focusInput());
     }),
 
     vscode.commands.registerCommand('atomcode.newConversation', async () => {
-      await runCommand('start a new AtomCode conversation', () => extensionState.chatProvider.newConversation());
+      await runCommand(vscode.l10n.t('start a new AtomCode conversation'), () => extensionState.chatProvider.newConversation());
     }),
 
     vscode.commands.registerCommand('atomcode.stop', () => {
@@ -94,26 +95,26 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('atomcode.explain', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please explain this code. What does it do, and why?', ctx);
-      await runCommand('explain the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
+      const prompt = buildContextualPrompt(getQuickActionPrompt('explain', vscode.env.language), ctx, vscode.env.language);
+      await runCommand(vscode.l10n.t('explain the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.fix', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please fix any bugs or issues in this code.', ctx);
-      await runCommand('fix the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
+      const prompt = buildContextualPrompt(getQuickActionPrompt('fix', vscode.env.language), ctx, vscode.env.language);
+      await runCommand(vscode.l10n.t('fix the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.optimize', async () => {
       const ctx = getEditorContext();
-      const prompt = buildContextualPrompt('Please optimize this code for better performance and readability.', ctx);
-      await runCommand('optimize the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
+      const prompt = buildContextualPrompt(getQuickActionPrompt('optimize', vscode.env.language), ctx, vscode.env.language);
+      await runCommand(vscode.l10n.t('optimize the selected code'), () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
     vscode.commands.registerCommand('atomcode.addToChat', async () => {
       const ctx = getEditorContext();
       if (!ctx.selection || !ctx.filePath) return;
-      await runCommand('add selection to chat', () => extensionState.chatProvider.addToChat({
+      await runCommand(vscode.l10n.t('add selection to chat'), () => extensionState.chatProvider.addToChat({
         path: ctx.filePath!,
         fileName: ctx.fileName!,
         language: ctx.language,
@@ -171,7 +172,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const newConfig = vscode.workspace.getConfiguration('atomcode');
         const newPort = newConfig.get<number>('daemon.port', 13456);
         if (newPort !== config.daemonPort) {
-          vscode.window.showInformationMessage('AtomCode: Restart VS Code to apply port change.');
+          vscode.window.showInformationMessage(vscode.l10n.t('AtomCode: Restart VS Code to apply port change.'));
         }
       }
     })
@@ -183,7 +184,7 @@ async function runCommand(label: string, command: () => Thenable<unknown> | Prom
     await command();
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    vscode.window.showErrorMessage(`AtomCode failed to ${label}: ${message}`);
+    vscode.window.showErrorMessage(vscode.l10n.t('AtomCode failed to {label}: {message}', { label, message }));
   }
 }
 
@@ -204,7 +205,7 @@ async function initializeDaemon() {
   } catch (e) {
     extensionState.statusBar.update(false);
     const message = e instanceof Error ? e.message : String(e);
-    vscode.window.showWarningMessage(`AtomCode daemon startup failed: ${message}`);
+    vscode.window.showWarningMessage(vscode.l10n.t('AtomCode daemon startup failed: {message}', { message }));
   }
 }
 

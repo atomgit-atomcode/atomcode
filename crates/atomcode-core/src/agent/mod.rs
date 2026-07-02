@@ -436,6 +436,11 @@ pub enum AgentEvent {
     /// webui directory switch. Kept distinct from `WorkingDirChanged` precisely
     /// so an agent-driven `cd` mid-task never wipes the conversation.
     ProjectSwitched(PathBuf),
+    /// The mobile app asked the desktop TUI to run a slash command (e.g.
+    /// `/status`). Whitelist-checked on the TUI side; the textual output is
+    /// broadcast back via `LiveEvent::CommandOutput`. Delivered over the
+    /// live-sync channel (`LiveEvent::RemoteCommand` → here).
+    RemoteSlashCommand(String),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
@@ -473,6 +478,8 @@ pub enum AgentEvent {
     ProviderChanged(String),
     /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
     SessionSwitched(String),
+    /// daemon 给当前活动会话改名。TUI 据此更新会话选择器与头部显示。
+    SessionRenamed { name: String },
 }
 
 /// The current phase of the agent (for UI display).
@@ -3195,7 +3202,9 @@ impl AgentLoop {
                                 "\n[模型返回空响应，重试中({}/{})...]\n",
                                 self.empty_response_retries, EMPTY_RESPONSE_MAX_RETRIES
                             )));
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            if backoff_or_cancelled(wait, &self.cancel_token).await {
+                                return self.finalize_cancelled();
+                            }
                             continue;
                         } else {
                             // Exhausted: surface a clear, non-alarming reason
@@ -3287,7 +3296,9 @@ impl AgentLoop {
                             "\n[Rate limited — retrying in {}s...]\n",
                             wait
                         )));
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        if backoff_or_cancelled(wait, &self.cancel_token).await {
+                            return self.finalize_cancelled();
+                        }
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
@@ -3306,7 +3317,9 @@ impl AgentLoop {
                             "\n[API error {}，{} 秒后重试({}/3)...]\n",
                             reason, wait, self.retry_count
                         )));
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        if backoff_or_cancelled(wait, &self.cancel_token).await {
+                            return self.finalize_cancelled();
+                        }
                         continue;
                     } else {
                         self.datalog.log_error(&e);
@@ -4146,6 +4159,21 @@ fn parse_retry_after_hint(e: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+/// Back off for `secs`, but wake the instant the user cancels. Returns `true` if
+/// a cancellation landed during the wait (the caller must stop and finalize),
+/// `false` if the full backoff elapsed. Every retry backoff in `run_turn_loop`
+/// routes through this instead of a bare `sleep().await`: otherwise a cancel
+/// pressed during a backoff (up to 30s for the rate-limit path) isn't observed
+/// until the sleep finishes, which the user perceives as "cancel not working"
+/// even though the loop-top guard would eventually catch it. Mirrors the
+/// cancel-cooperative wait used by the /goal evaluator backoff.
+async fn backoff_or_cancelled(secs: u64, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(secs)) => false,
+        _ = cancel.cancelled() => true,
+    }
+}
+
 fn is_auth_error(e: &str) -> bool {
     e.contains("401 ")
         || e.contains("403 ")
@@ -4352,6 +4380,49 @@ fn fmt_k_tokens(t: usize) -> String {
         format!("{:.1}K", t as f64 / 1000.0)
     } else {
         format!("{}", t)
+    }
+}
+
+#[cfg(test)]
+mod backoff_cancel_tests {
+    use super::backoff_or_cancelled;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn already_cancelled_short_circuits_the_backoff() {
+        let token = CancellationToken::new();
+        token.cancel();
+        // A 30s backoff must NOT be waited out when cancel is already set.
+        assert!(
+            backoff_or_cancelled(30, &token).await,
+            "pre-cancelled token must return true immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_backoff_returns_false_when_not_cancelled() {
+        let token = CancellationToken::new();
+        // 0s sleep elapses at once; token never cancels → caller should retry.
+        assert!(
+            !backoff_or_cancelled(0, &token).await,
+            "a completed backoff must return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_landing_mid_wait_wins_over_the_sleep() {
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+        // 30s sleep must lose to a cancel that lands 20ms in.
+        assert!(
+            backoff_or_cancelled(30, &token).await,
+            "a cancel fired during the wait must win"
+        );
     }
 }
 

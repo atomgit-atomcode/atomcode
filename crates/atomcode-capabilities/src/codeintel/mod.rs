@@ -105,8 +105,13 @@ pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(DiagnosticsTool::new(Arc::new(LspManager::new()))));
 }
 
-// Local path/result helpers (kept independent of the `tools` feature).
+// Local path/result helpers (kept independent of the `tools` feature). Leading-`~`
+// expansion routes through the crate-shared `pathutil` so codeintel tools
+// (`read_symbol`, `blast_radius`, …) resolve `~/x` the SAME as `read_file`/`bash`.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+    if let Some(home) = crate::pathutil::expand_tilde(raw) {
+        return home;
+    }
     let p = Path::new(raw);
     if p.is_absolute() {
         p.to_path_buf()

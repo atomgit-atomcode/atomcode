@@ -42,6 +42,19 @@ pub struct ReviewAgentConfig {
     /// mid-stream (keepalive bytes keep `stream_timeout`'s idle timer reset). Engineering
     /// callers set it (e.g. `--max-duration 900`); a bare CLI run stays unbounded.
     pub max_turn_duration: Option<std::time::Duration>,
+    /// Disable the `web_search` tool for this review. `false` (default) ⇒ web_search is
+    /// mounted as before (behavior unchanged). `true` ⇒ the tool is registered but NOT
+    /// mounted, so the model cannot call it — used by runtimes where web egress is blocked
+    /// or undesirable, so a web_search attempt can't fail and abort the whole review.
+    pub no_web: bool,
+    /// Auto-degrade threshold for the code-graph tools: they are mounted only when the repo
+    /// has AT MOST this many git-tracked indexable source files. Above it, building the
+    /// O(repo) tree-sitter call graph would blow the review's wall-clock budget for no
+    /// measured quality gain, so the graph tools are dropped (grep-only). `usize::MAX`
+    /// (default) ⇒ NO degrade: the graph is always mounted, matching bare-CLI behavior.
+    /// Engineering callers (e.g. the service, which reviews huge repos on NFS) set a bound
+    /// like `8000` so a kernel-scale repo degrades automatically. `0` ⇒ never mount.
+    pub graph_max_indexed_files: usize,
 }
 
 impl ReviewAgentConfig {
@@ -64,6 +77,8 @@ impl ReviewAgentConfig {
             persona_append: None,
             max_rounds: None,
             max_turn_duration: None,
+            no_web: false,
+            graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
         }
     }
 

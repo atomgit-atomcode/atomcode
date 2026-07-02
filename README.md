@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -123,6 +123,17 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser
 - **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
 - **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
+
+### App Remote Access
+
+- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
+- **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
+- **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
+- **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
+- **Remote commands** — the phone can run `/status`, `/cost`, `/diff`, `/whoami` etc., which execute on the desktop and echo results back
+- **Switch projects / sessions** — switch projects or open a history session on the phone, and the desktop follows immediately
+- **Model sync** — switching models on either end keeps the other in sync
+- **`/app stop`** disconnects remote access
 
 ### Safety
 

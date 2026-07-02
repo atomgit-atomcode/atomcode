@@ -51,6 +51,10 @@ pub fn detect_at_mention(buf: &str, cursor: usize) -> Option<String> {
         .map(|(at_pos, end)| buf[at_pos + 1..end].to_string())
 }
 
+pub fn format_at_mention_replacement(selected_path: &str) -> String {
+    format!("@{}", selected_path)
+}
+
 /// Companion to `detect_at_mention`. Returns the byte range
 /// `(at_pos_inclusive, token_end_exclusive)` for buffer-slice operations.
 /// `at_pos` points at the `@` character; `end` is the byte after the last
@@ -554,6 +558,17 @@ mod tests {
         let buf = "summarize @crates/foo";
         let range = detect_at_mention_range(buf, buf.len()).expect("Some");
         assert_eq!(&buf[range.0..range.1], "@crates/foo");
+    }
+
+    #[test]
+    fn at_mention_replacement_keeps_token_active() {
+        let replacement = format_at_mention_replacement("crates/atomcode-bridge/");
+
+        assert_eq!(replacement, "@crates/atomcode-bridge/");
+        assert_eq!(
+            detect_at_mention(&replacement, replacement.len()),
+            Some("crates/atomcode-bridge/".to_string())
+        );
     }
 
     // ---- split_token ----

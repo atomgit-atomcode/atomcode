@@ -913,6 +913,9 @@ pub struct LoopCtx {
     pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
     /// live 转发任务句柄（分离同步时 abort）。
     pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
+    /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
+    pub app_relay_child: Option<tokio::process::Child>,
     /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
     /// / non-TTY). The onboarding wizard checks this — plain mode can't
     /// run interactive multi-step flows, so first-run falls through to
@@ -1994,6 +1997,56 @@ mod menu_tests {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         assert!(build_menu_items("/zzznomatch", 0, &reg, &custom, None, None).is_none());
+    }
+
+    #[test]
+    fn at_directory_completion_can_build_child_menu() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let index = file_index::FileIndex::from_entries(
+            std::path::PathBuf::from("/tmp"),
+            vec![
+                file_index::Entry {
+                    rel_path: "crates/".into(),
+                    is_dir: true,
+                    depth: 1,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/".into(),
+                    is_dir: true,
+                    depth: 2,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/src/".into(),
+                    is_dir: true,
+                    depth: 3,
+                },
+                file_index::Entry {
+                    rel_path: "crates/atomcode-bridge/Cargo.toml".into(),
+                    is_dir: false,
+                    depth: 3,
+                },
+            ],
+        );
+        let replacement = file_index::format_at_mention_replacement("crates/atomcode-bridge/");
+
+        let items = build_menu_items(
+            &replacement,
+            replacement.len(),
+            &reg,
+            &custom,
+            None,
+            Some(&index),
+        )
+        .expect("directory completion should immediately show child entries");
+
+        assert_eq!(
+            items.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
+            vec![
+                "crates/atomcode-bridge/src/",
+                "crates/atomcode-bridge/Cargo.toml",
+            ]
+        );
     }
 
     fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
@@ -5603,23 +5656,34 @@ fn handle_idle_key(
                 // modifier guard; crossterm reports Shift+Tab as
                 // `KeyCode::BackTab` so it doesn't match this arm.
                 //
-                // `@`-mention selection: insert `@<full_path> ` at the
-                // token range, with trailing space as terminator.
-                // Backspace on the trailing space lets the user re-open
-                // the menu for drill-down.
+                // `@`-mention selection: insert `@<full_path>` at the
+                // token range. Directory candidates keep their trailing
+                // slash so the token stays active for drill-down.
                 if !items.is_empty() {
                     if let Some((at_pos, end)) =
                         file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
                     {
                         // `items[selected].0` is the full relative path
-                        // (e.g. `crates/atomcode-cli/`); prepend `@` and a
-                        // trailing space terminator.
+                        // (e.g. `crates/atomcode-cli/`); prepend `@` without
+                        // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
-                        let replacement = format!("@{} ", selected_path);
+                        let replacement =
+                            file_index::format_at_mention_replacement(&selected_path);
                         app.buf.text.replace_range(at_pos..end, &replacement);
                         app.buf.cursor = at_pos + replacement.len();
                         app.menu.selected = 0;
-                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        if let Some(next_items) = build_menu_items(
+                            &app.buf.text,
+                            app.buf.cursor,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
+                        ) {
+                            redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
                         return Ok(());
                     }
                 }
@@ -7151,11 +7215,7 @@ fn cancel_active_turn(ctx: &LoopCtx) -> bool {
 /// as before.
 fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     if ctx.sync_forwarder.is_some() {
-        let decision = match cmd {
-            AgentCommand::ApproveTool => atomcode_core::tool::PermissionDecision::Allow,
-            AgentCommand::ApproveToolAlways => atomcode_core::tool::PermissionDecision::AllowAlways,
-            _ => atomcode_core::tool::PermissionDecision::Deny,
-        };
+        let decision = approval_command_to_decision(&cmd);
         if let Some(session) = atomcode_daemon::current_live_session() {
             let _ = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(session.approve(decision))
@@ -7163,6 +7223,92 @@ fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
         }
     } else {
         ctx.agent.cmd_tx.send(cmd).ok();
+    }
+}
+
+/// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
+/// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
+/// the command↔decision contract (notably that an auto-approve sends `Allow`,
+/// not `Deny`/`Ask`) is unit-testable without building a `LoopCtx`.
+fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::PermissionDecision {
+    use atomcode_core::tool::PermissionDecision;
+    match cmd {
+        AgentCommand::ApproveTool => PermissionDecision::Allow,
+        AgentCommand::ApproveToolAlways => PermissionDecision::AllowAlways,
+        _ => PermissionDecision::Deny,
+    }
+}
+
+/// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
+/// of surfaced as a prompt (false), given the TUI's bypass flag.
+///
+/// In LOCAL mode the core decider short-circuits and never emits the event, so
+/// this only bites in SYNC mode, where the daemon's LiveSession always asks.
+/// Honoring bypass here is what keeps `--dangerously-skip-permissions` working
+/// for daemon-backed turns (e.g. a `/skills` expansion that drives tool calls).
+fn approval_needed_is_auto_bypassed(dangerously_skip_permissions: bool) -> bool {
+    dangerously_skip_permissions
+}
+
+/// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
+/// auto-resolves. A named function so the `handle_agent_event` short-circuit
+/// and its test share one source of truth.
+fn bypass_approval_command() -> AgentCommand {
+    AgentCommand::ApproveTool
+}
+
+#[cfg(test)]
+mod bypass_approval_tests {
+    use super::{
+        approval_command_to_decision, approval_needed_is_auto_bypassed, bypass_approval_command,
+        AgentCommand,
+    };
+    use atomcode_core::tool::PermissionDecision;
+
+    // The fix's core invariant: with `--dangerously-skip-permissions` on, an
+    // incoming `ApprovalNeeded` is auto-approved rather than prompted. This is
+    // what was broken in SYNC mode — the daemon always asks, and the TUI used
+    // to show the prompt regardless of bypass (e.g. on `/skills` tool calls).
+    #[test]
+    fn bypass_on_auto_approves() {
+        assert!(approval_needed_is_auto_bypassed(true));
+    }
+
+    // Without bypass, the event must NOT be short-circuited — the normal
+    // prompt path runs. Guards against an accidental inversion of the flag.
+    #[test]
+    fn bypass_off_still_prompts() {
+        assert!(!approval_needed_is_auto_bypassed(false));
+    }
+
+    // End-to-end on the pure seam: the command BYPASS issues must resolve to a
+    // genuine `Allow`. If either the issued command or the mapping drifts so
+    // that bypass yields `Deny`/`Ask`, the tool would stall/deny instead of
+    // sailing through — exactly the regression this test pins.
+    #[test]
+    fn bypass_command_resolves_to_allow() {
+        let decision = approval_command_to_decision(&bypass_approval_command());
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "BYPASS must auto-approve with Allow, got {decision:?}"
+        );
+    }
+
+    // The full command↔decision contract used by sync-mode `deliver_approval`.
+    #[test]
+    fn approval_command_decision_mapping() {
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::ApproveTool),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::ApproveToolAlways),
+            PermissionDecision::AllowAlways
+        ));
+        assert!(matches!(
+            approval_command_to_decision(&AgentCommand::DenyTool),
+            PermissionDecision::Deny
+        ));
     }
 }
 
@@ -7246,11 +7392,16 @@ pub(super) fn handle_plugin_job_event(
             // left edge regardless of which subsystem owns it.
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
+            // Adding a marketplace does NOT install its plugins — list them + the install
+            // command so the user isn't left thinking a plugin command (e.g. /wechat) is
+            // already usable (a common confusion: `marketplace add` ≠ install).
+            let plugin_list = info.plugins.join(", ");
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
                     name: &info.name,
                     commit: short_commit,
                     count: info.plugins.len(),
+                    plugins: &plugin_list,
                 })
                 .into_owned(),
             ));
@@ -8117,6 +8268,22 @@ fn handle_agent_event(
         AgentEvent::ApprovalNeeded {
             tool_name, call, snapshot, ..
         } => {
+            // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
+            // skip the prompt entirely. In LOCAL mode the core decider already
+            // short-circuits, so this event never fires there. But in SYNC mode
+            // the daemon's LiveSession runs an InteractivePermissionDecider
+            // (auto_approve=false, see live_api.rs) that ALWAYS asks and forwards
+            // ApprovalRequested → here (live_sync.rs); the TUI's bypass flag would
+            // otherwise be ignored, surfacing prompts whenever a turn drives tool
+            // calls — e.g. a `/skills` expansion. Honor bypass at the TUI seam
+            // rather than flipping the shared daemon executor (which would leak
+            // bypass to webui peers attached to the same LiveSession).
+            // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
+            // and to the local agent otherwise.
+            if approval_needed_is_auto_bypassed(ctx.dangerously_skip_permissions) {
+                deliver_approval(ctx, bypass_approval_command());
+                return;
+            }
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
             if !snapshot.messages.is_empty() {
@@ -8653,8 +8820,38 @@ fn handle_agent_event(
             // `cd`, conversation preserved). No-op when already there to avoid
             // resetting on a redundant broadcast.
             if ctx.working_dir != new_dir {
-                commands::apply_cd(ctx, new_dir);
+                commands::apply_cd(ctx, new_dir.clone());
+                // 新项目的会话要存进新项目的 hash 目录。session_manager 只在启动
+                // 时按初始目录构建，不重建的话切项目后的新会话会写进旧项目，
+                // /resume 与手机端项目列表都会在错误的项目下看到它。
+                ctx.session_manager = atomcode_core::session::SessionManager::new(&new_dir);
                 commands::reset_to_new_session(ctx, state, renderer);
+            }
+        }
+        AgentEvent::RemoteSlashCommand(line) => {
+            // 手机端发来的斜杠命令：只放行只读信息类白名单（status/cost/whoami/
+            // diff），在桌面同样渲染一份（让桌面用户知道手机做了什么），输出经
+            // CommandOutput 广播回手机。交互式/桌面专属命令礼貌拒绝。
+            let display = format!("/{}", line.trim().trim_start_matches('/'));
+            match commands::run_remote_command(ctx, state, &line) {
+                Some(txt) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "（手机端执行 {display}）"
+                    )));
+                    renderer.render(UiLine::CommandOutput(txt.clone()));
+                    renderer.flush();
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!("{display}\n{txt}"));
+                    }
+                }
+                None => {
+                    if let Some(live) = &ctx.sync_session {
+                        live.notify_command_output(format!(
+                            "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
+                             /status /cost /whoami /diff）"
+                        ));
+                    }
+                }
             }
         }
         AgentEvent::ContextStats {
@@ -9078,16 +9275,10 @@ fn handle_agent_event(
             if running {
                 state.on_submit();
             } else {
-                // Peer's turn finished. In sync mode this is the ONLY
-                // turn-completion signal we get (the forwarder never sends
-                // AgentEvent::TurnComplete), so do the stream finalization
-                // TurnComplete normally performs:
-                //  1. Flush the buffered assistant line. A short reply with no
-                //     trailing newline (e.g. "在的！") otherwise stays parked in
-                //     the renderer's assistant_line_buf and never reaches
-                //     scrollback — the blank-assistant-bubble bug in sync mode.
-                //  2. Reset the <think> stripper between turns so a model that
-                //     left it inside=true can't swallow the next turn's text.
+                // 对端轮次结束:把流式累积的助手行收尾落地(等价本地 TurnComplete
+                // 的第一步 AssistantLineBreak),否则短回复(如"在的!")一直挂在
+                // 流式当前行不提交,要等下一轮才一起刷出 —— sync 模式下的空助手气泡
+                // bug。同时 reset think-stripper,避免上一轮残留吞掉下一轮文本。
                 renderer.render(UiLine::AssistantLineBreak);
                 renderer.flush();
                 think.reset();
@@ -9228,6 +9419,15 @@ fn handle_agent_event(
                 crate::tuix_trace!("TUI", "SessionSwitched: attaching LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
                 attach_live_session(ctx, renderer, session, false);
             }
+        }
+        AgentEvent::SessionRenamed { name } => {
+            // daemon AI 给当前活动会话改了名（via `/rename` or auto-namer）。
+            // 更新会话对象，保存到磁盘，选择器等 UI 看到新名。
+            crate::tuix_trace!("TUI", "SessionRenamed: name={}", name);
+            ctx.current_session.name = name.clone();
+            ctx.current_session.touch();
+            // 同步保存失败无碍（用户只是看不到最新名字直到重启）。
+            let _ = ctx.session_manager.save(&ctx.current_session);
         }
         AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
             // Non-error pause line: dim/plain body row, never red.
@@ -9909,6 +10109,16 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .map(|c| crate::width::truncate_with_ellipsis(&c, 500))
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
+        "code_review" => {
+            let base = get_str("base");
+            let staged = v.get("staged").and_then(|x| x.as_bool()).unwrap_or(false);
+            match (base, staged) {
+                (Some(b), true) => format!("base: \"{}\", staged: true", b),
+                (Some(b), false) => format!("base: \"{}\"", b),
+                (None, true) => "staged: true".to_string(),
+                (None, false) => String::new(),
+            }
+        }
         "web_fetch" => get_str("url")
             .map(|u| crate::width::truncate_with_ellipsis(&u, 150))
             .unwrap_or_default(),
@@ -10039,7 +10249,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 200);
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 450);
                     }
                 }
             }

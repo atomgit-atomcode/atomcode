@@ -25,6 +25,8 @@ atomcode-core = { path = "../atomcode-core" }
 atomcode-askpass = { path = "../atomcode-askpass" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
+# ACP (Agent Client Protocol) stdio server mode.
+atomcode-acp = { path = "../atomcode-acp" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }

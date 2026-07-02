@@ -86,6 +86,14 @@ pub struct CodingAgentConfig {
     /// an interruption marker, forwarded to the kernel `Agent` builder
     /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
+    /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
+    /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
+    /// can attribute/slice traffic by version. Restores parity with v1's
+    /// `build_http_client`, which the v2 adapters had dropped.
+    pub user_agent: Option<String>,
+    /// Disable TLS certificate verification (self-signed / internal gateways).
+    /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
+    pub skip_tls_verify: bool,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -140,6 +148,8 @@ impl CodingAgentConfig {
             compact_threshold: 0.7,
             web_search_provider: None,
             keep_interrupted_context: false,
+            user_agent: None,
+            skip_tls_verify: false,
         }
     }
 }

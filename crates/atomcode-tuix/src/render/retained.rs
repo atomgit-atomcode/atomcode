@@ -34,19 +34,6 @@ use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
 
-/// When `ATOMCODE_AUTO_COPY=0` or `=false`, the renderer skips automatic
-/// clipboard copy after code-block flushes. Default is on (enabled).
-/// Result is cached in a `OnceLock` — environment is read once per process.
-fn auto_copy_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ATOMCODE_AUTO_COPY")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
-
 const PAD_COL: usize = 2;
 
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
@@ -411,6 +398,12 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// and "Copied" hint lines so replay doesn't overwrite the user's
     /// clipboard or inject stale annotations (issue #699).
     suppress_auto_copy: bool,
+    /// Master switch for the code-block auto-copy feature (issue #699).
+    /// Default OFF: auto-copy silently overwrote the user's clipboard on every
+    /// code-block reply, so it is now opt-in via `config.ui.auto_copy_code_blocks`
+    /// (or `ATOMCODE_AUTO_COPY`), plumbed in at startup via `set_auto_copy_enabled`.
+    /// Explicit `/copy` stays available regardless.
+    auto_copy_enabled: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -667,6 +660,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
             suppress_auto_copy: false,
+            auto_copy_enabled: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
@@ -1706,18 +1700,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
-        // Hide the terminal cursor while EITHER a live spinner OR an
-        // inflight-tool row is animating. The inflight branch was added
-        // when `render_inflight_tool` switched to direct cursor-position
-        // writes (to fix the scrollback-leak bug): those writes leave
-        // the real terminal cursor at end-of-row, but `screen` doesn't
-        // know that since it bypasses the cell-diff path. Without
-        // hiding, the user sees a blinking caret floating at the right
-        // edge of the active `▸ Bash(...)` row in addition to the input
-        // box's caret. `inflight_tool.is_none()` flips back as soon as
+        // Hide the terminal cursor ONLY while an inflight-tool row is
+        // animating. `render_inflight_tool`'s in-place path writes raw
+        // cursor-position bytes via `self.out.write_all` to overwrite each
+        // row, leaving the terminal cursor at end-of-row. `paint_footer`
+        // repositions the cell-model cursor to the input box but
+        // `set_cursor_visible(true)` keeps the terminal blinking — so for
+        // every 5ms paint window before the next CUP lands, the user saw
+        // two carets. `inflight_tool.is_none()` flips back as soon as
         // the call commits, so the cursor reappears at the input box on
         // the very next 5ms paint tick.
-        let suppress_cursor = self.live_spinner_active || self.inflight_tool.is_some();
+        //
+        // The live spinner is NOT a reason to hide the input cursor: the
+        // spinner lives in the BODY now (not the footer), and the input
+        // box stays editable during streaming (type-ahead message queue),
+        // so hiding the caret would leave the user typing blind — the
+        // "no cursor while replying" bug.
+        let suppress_cursor = self.inflight_tool.is_some();
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 
@@ -2243,8 +2242,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
-        // The cursor will be re-shown on the next paint_footer (which
-        // sees live_spinner_active=false and calls set_cursor_visible(true)).
+        // (Cursor visibility is no longer coupled to the spinner — the
+        // input box stays editable during streaming, so the caret is
+        // always shown at the input position. See `paint_footer`.)
         // After pop, the spinner row's screen slot is `next_body_emit_row`
         // (1-indexed) — that's where the spinner was and where the next
         // body emit will land. EL it now for immediate visual feedback;
@@ -2396,11 +2396,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.push_body_row(row_cells);
             self.live_spinner_active = true;
         }
-        // Cursor visibility is driven by `paint_footer` reading
-        // `live_spinner_active` — see set_cursor_visible call there.
-        // No direct DECTCEM write here, otherwise the next render_diff
-        // would re-emit \x1b[?25h based on screen.cursor_visible and
-        // visually undo our hide on a 5ms cadence.
+        // (Cursor visibility is driven by `paint_footer` reading
+        // `inflight_tool` only — the spinner no longer hides the input
+        // caret. No direct DECTCEM write here, otherwise the next
+        // render_diff would re-emit \x1b[?25h based on
+        // screen.cursor_visible and visually undo our hide on a 5ms
+        // cadence.)
     }
 
     /// Freeze the current inflight_tool row into the body transcript
@@ -2703,11 +2704,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             ) {
                 completed.push(rendered);
             }
-            // Auto-copy code block to clipboard when the close fence just
-            // flushed (issue #699). Delegates to `maybe_auto_copy_hint`.
-            if let Some(hint) = self.maybe_auto_copy_hint() {
-                completed.push(hint);
-            }
+            // NOTE: auto-copy is DELIBERATELY not done here (per-close-fence).
+            // A reply may contain several ``` blocks; copying each as its fence
+            // flushes would clobber the clipboard (last block wins) and spam a
+            // "copied" hint per block. The decision is deferred to the turn
+            // boundary (`flush_assistant_remainder` → `maybe_auto_copy_hint`),
+            // which copies ONLY when the whole reply held exactly ONE block.
         }
         for rendered in completed {
             self.push_markdown_body(&rendered);
@@ -2747,17 +2749,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// If the markdown parser just finished a code block, copy its raw
     /// source to the system clipboard and return a muted hint line for
     /// display. Returns `None` when no block was finished or auto-copy
-    /// is disabled (see [`auto_copy_enabled`]).
+    /// is disabled (see `auto_copy_enabled` field / `set_auto_copy_enabled`).
     fn maybe_auto_copy_hint(&mut self) -> Option<String> {
-        // Never auto-copy during history replay (/resume, /undo, atomcode -c).
-        // The markdown events are identical to live streaming, but we
-        // must not overwrite the user's clipboard or inject stale
-        // "Copied" hints into replayed output (issue #699 P1).
-        if self.suppress_auto_copy {
+        // Gate BEFORE consuming the source, so a disabled renderer never
+        // touches the clipboard. Two reasons to bail:
+        //   - auto-copy is off (the default now — opt-in via
+        //     `config.ui.auto_copy_code_blocks` / `ATOMCODE_AUTO_COPY`; it used to
+        //     silently clobber the user's clipboard on every code-block reply);
+        //   - history replay (/resume, /undo, atomcode -c): the markdown events are
+        //     identical to live streaming, but replay must not overwrite the
+        //     clipboard or inject stale "Copied" hints (issue #699 P1).
+        if !self.auto_copy_enabled || self.suppress_auto_copy {
+            return None;
+        }
+        // SINGLE-BLOCK gate: auto-copy only when the whole reply was essentially
+        // ONE fenced code block. For a multi-block reply (`!= 1`) we neither copy
+        // nor hint — copying each block would clobber the clipboard and the hint
+        // would repeat, the user-reported side-effect. `== 0` (no closed block,
+        // e.g. an unclosed/interrupted fence) also declines. `take()` past the
+        // gate so a declined reply leaves no stale source for a later flush.
+        if self.md_state.code_block_count != 1 {
             return None;
         }
         let source = self.md_state.last_code_block_source.take()?;
-        if !auto_copy_enabled() || source.trim().is_empty() {
+        if source.trim().is_empty() {
             return None;
         }
         // Write through `self.out` so the escape sequence stays ordered
@@ -4415,6 +4430,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
         self.suppress_auto_copy = suppress;
+    }
+
+    fn set_auto_copy_enabled(&mut self, enabled: bool) {
+        self.auto_copy_enabled = enabled;
     }
 
     fn clear_screen(&mut self) {
@@ -6353,10 +6372,11 @@ mod tests {
     /// keeps the terminal blinking — so for every 5ms paint window
     /// before the next CUP lands, the user saw two carets.
     ///
-    /// Fix: hide the cursor whenever an inflight tool is active, in
-    /// addition to the existing live-spinner gate. `inflight_tool.is_none()`
-    /// flips back at commit time, so the cursor reappears at the input
-    /// box on the next paint without a leftover blink.
+    /// Fix: hide the cursor whenever an inflight tool is active.
+    /// `inflight_tool.is_none()` flips back at commit time, so the
+    /// cursor reappears at the input box on the next paint without a
+    /// leftover blink. (The live spinner was removed from this gate —
+    /// see `retained_spinner_keeps_input_cursor_visible`.)
     #[test]
     fn retained_inflight_tool_hides_terminal_cursor() {
         let term_w: u16 = 80;
@@ -6409,6 +6429,51 @@ mod tests {
             vterm.cursor_visible(),
             "terminal cursor must be visible again after the inflight tool \
              commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
+    /// Regression: user reported "no cursor" (没有光标) while typing
+    /// into the input box DURING a reply — the caret disappears as soon
+    /// as the streaming spinner starts animating. Root cause: the live
+    /// spinner used to live in the FOOTER and `paint_footer` hid the
+    /// terminal cursor while `live_spinner_active` was true. But the
+    /// spinner moved to the BODY (see `push_or_update_live_spinner`)
+    /// and the input box stayed editable during streaming (type-ahead
+    /// message queue), so hiding the caret left the user typing blind.
+    ///
+    /// Fix: only `inflight_tool.is_some()` suppresses the cursor now —
+    /// the spinner is in the body and the input caret must stay visible
+    /// so the user sees where they're typing while queuing the next
+    /// message.
+    #[test]
+    fn retained_spinner_keeps_input_cursor_visible() {
+        let term_w: u16 = 80;
+        let (mut r, buf) = new_capturing(term_w, 24);
+
+        // Seed input prompt so the footer has a cursor position.
+        r.render(UiLine::InputPrompt {
+            buf: "meiyouguangbiao".into(),
+            cursor_byte: 16,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        // Spinner ticks (simulating streaming) — the caret must NOT
+        // disappear.
+        for frame in ["⠋", "⠙", "⠹", "⠸"] {
+            r.render(UiLine::Spinner {
+                frame: frame.into(),
+                label: "thinking".into(),
+            });
+        }
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "input cursor must stay visible during spinner activity — \
+             the input box is editable during streaming (type-ahead), \
+             hiding it leaves the user typing blind"
         );
     }
 
@@ -11696,6 +11761,50 @@ mod tests {
         );
     }
 
+    /// Auto-copy is OFF by default: a completed code block must NOT hijack the
+    /// clipboard nor emit the "copied" hint unless the user opted in. The gate
+    /// short-circuits BEFORE consuming the code-block source, so the source is
+    /// left untouched — a deterministic, clipboard-independent proof no copy was
+    /// attempted. Regression guard for the #699 auto-copy that silently clobbered
+    /// the user's clipboard on every code-block reply.
+    #[test]
+    fn auto_copy_off_by_default_makes_no_copy_attempt() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.md_state.last_code_block_source = Some("cargo build --release".into());
+        assert!(
+            r.maybe_auto_copy_hint().is_none(),
+            "auto-copy OFF by default → no hint"
+        );
+        assert!(
+            r.md_state.last_code_block_source.is_some(),
+            "OFF must not even consume the source — no clipboard write attempted"
+        );
+    }
+
+    /// End-to-end companion to `auto_copy_fires_for_single_code_block_reply`:
+    /// the SAME single-block reply that WOULD be copy-eligible must produce NO
+    /// copy when auto-copy is off (the default). This is the exact user-reported
+    /// scenario — a single-block reply silently clobbering the clipboard — now
+    /// suppressed by default.
+    #[test]
+    fn auto_copy_off_by_default_single_block_not_copied() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // No set_auto_copy_enabled → default OFF.
+        let stream = "here is the snippet:\n\
+                      ```\nthe only block\n```\n\
+                      thanks\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "default-OFF must not auto-copy even a single-block reply"
+        );
+    }
+
+    // (The "enabled → single block copies" case is covered end-to-end by
+    // `auto_copy_fires_for_single_code_block_reply` below, which opts in first.)
+
     /// Defense-in-depth: no cell in a Java code block (after the full
     /// `AssistantText` → `flush_assistant_remainder` →
     /// `push_markdown_body` → `parse_markdown_to_cells` pipeline) may
@@ -11714,6 +11823,73 @@ mod tests {
     /// a regression net so any future addition of `\x1b[7m` upstream
     /// of `parse_markdown_to_cells` trips here instead of silently
     /// rendering reverse-video on every code-block cell.
+    // Auto-copy should fire ONLY when the whole reply is essentially a SINGLE
+    // fenced code block. A long answer that happens to contain several
+    // illustrative ``` blocks must NOT auto-copy: each per-block copy clobbers
+    // the system clipboard (last block wins) and spams a "代码块已复制" hint —
+    // the user-reported side-effect. The copy tier tries arboard first (so OSC52
+    // is not always emitted); the locale-independent signal that a copy DID
+    // happen is the "📋" hint row pushed into the body on success (both the zh
+    // and en `CodeBlockCopied` strings start with 📋).
+    fn copy_hint_count(r: &RetainedRenderer<CapturingSink>) -> usize {
+        r.body_lines
+            .iter()
+            .filter(|row| row.iter().any(|c| c.ch == '📋'))
+            .count()
+    }
+
+    #[test]
+    fn auto_copy_skips_multi_code_block_reply() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in, so this tests the block-COUNT gate
+        let stream = "intro\n\
+                      ```\nblock one\n```\n\
+                      middle\n\
+                      ```\nblock two\n```\n\
+                      end\n\
+                      ```\nblock three\n```\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "a reply with 3 fenced code blocks must NOT auto-copy any of them"
+        );
+    }
+
+    #[test]
+    fn auto_copy_fires_for_single_code_block_reply() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in (#699: auto-copy is OFF by default)
+        let stream = "here is the snippet:\n\
+                      ```\nthe only block\n```\n\
+                      thanks\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            1,
+            "a reply with exactly ONE fenced code block must auto-copy it exactly once"
+        );
+    }
+
+    #[test]
+    fn auto_copy_skips_unclosed_code_block() {
+        // Latent bug: an unclosed fence (model never wrote the closing ```), or a
+        // block prematurely finalized mid-stream (tool interleave), must NOT be
+        // auto-copied — it's incomplete. Only a properly-CLOSED fence counts.
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.set_auto_copy_enabled(true); // opt-in, so this tests the CLOSED-fence gate
+        let stream = "text\n```\nunclosed block content\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::TurnComplete);
+        assert_eq!(
+            copy_hint_count(&r),
+            0,
+            "an unclosed (incomplete) code block must NOT auto-copy"
+        );
+    }
+
     #[test]
     fn retained_java_code_block_has_no_reverse_video_cells() {
         let (mut r, _buf) = new_capturing(80, 24);

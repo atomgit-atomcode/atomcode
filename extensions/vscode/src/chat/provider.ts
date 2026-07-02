@@ -14,10 +14,12 @@ import {
   ProvidersResponse,
   ImageInput,
 } from '../daemon/types';
+import { getQuickActionPrompt } from './quickActions';
 
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
 type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
+type WorkspacePathItem = { path: string; fileName: string; relativePath: string; isDir: boolean; depth: number };
 type PanelSessionInfo = {
   sessionId: string;
   projectHash?: string;
@@ -32,7 +34,7 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
     data: any;
   }>;
 }
@@ -50,6 +52,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
+  private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
   public onModelSelected?: (model: string) => void;
 
   constructor(
@@ -404,7 +407,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             canSelectFiles: true,
             canSelectFolders: true,
             canSelectMany: false,
-            openLabel: 'Insert Path',
+            openLabel: vscode.l10n.t('Insert Path'),
           });
           const picked = uris?.[0]?.fsPath;
           if (picked) {
@@ -417,7 +420,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             canSelectFiles: true,
             canSelectFolders: false,
             canSelectMany: true,
-            openLabel: 'Attach File',
+            openLabel: vscode.l10n.t('Attach File'),
           });
           for (const uri of uris ?? []) {
             this._postMessage({
@@ -452,8 +455,102 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this._postMessage({ type: 'workspaceFiles', files, query });
           break;
         }
+        case 'searchWorkspacePaths': {
+          const query = String(msg.query || '');
+          const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+          if (!workspaceFolder) {
+            this._postMessage({ type: 'workspacePaths', paths: [], query });
+            break;
+          }
+          try {
+            const paths = await this._searchWorkspacePaths(workspaceFolder, query);
+            this._postMessage({ type: 'workspacePaths', paths, query });
+          } catch {
+            this._postMessage({ type: 'workspacePaths', paths: [], query });
+          }
+          break;
+        }
       }
     });
+  }
+
+  private async _workspacePathItems(workspaceFolder: vscode.WorkspaceFolder): Promise<WorkspacePathItem[]> {
+    const root = workspaceFolder.uri.fsPath;
+    const now = Date.now();
+    if (this._workspacePathCache
+      && this._workspacePathCache.root === root
+      && now - this._workspacePathCache.builtAt < 3000) {
+      return this._workspacePathCache.items;
+    }
+
+    const excludePattern = '{**/node_modules/**,**/.git/**,**/target/**,**/dist/**,**/build/**,**/__pycache__/**,**/*.d.ts,**/*.map}';
+    const uris = await vscode.workspace.findFiles('**/*', excludePattern, 50000);
+    const byRelativePath = new Map<string, WorkspacePathItem>();
+    const toRelative = (fsPath: string) => path.relative(root, fsPath).split(path.sep).join('/');
+    const addDir = (relativeDir: string) => {
+      const clean = relativeDir.replace(/\/+$/, '');
+      if (!clean || clean.includes(' ') || clean === '.git' || clean.startsWith('.git/')) return;
+      const relativePath = `${clean}/`;
+      if (byRelativePath.has(relativePath)) return;
+      byRelativePath.set(relativePath, {
+        path: path.join(root, clean),
+        fileName: path.basename(clean),
+        relativePath,
+        isDir: true,
+        depth: clean.split('/').filter(Boolean).length,
+      });
+    };
+
+    for (const uri of uris) {
+      const relative = toRelative(uri.fsPath);
+      if (!relative || relative.includes(' ') || relative === '.git' || relative.startsWith('.git/')) {
+        continue;
+      }
+      const parts = relative.split('/');
+      for (let i = 1; i < parts.length; i += 1) {
+        addDir(parts.slice(0, i).join('/'));
+      }
+      byRelativePath.set(relative, {
+        path: uri.fsPath,
+        fileName: path.basename(uri.fsPath),
+        relativePath: relative,
+        isDir: false,
+        depth: parts.length,
+      });
+    }
+
+    const items = Array.from(byRelativePath.values());
+    this._workspacePathCache = { root, builtAt: now, items };
+    return items;
+  }
+
+  private async _searchWorkspacePaths(
+    workspaceFolder: vscode.WorkspaceFolder,
+    token: string,
+  ): Promise<Array<Omit<WorkspacePathItem, 'depth'>>> {
+    const slash = token.lastIndexOf('/');
+    const scopeDir = slash >= 0 ? token.slice(0, slash + 1) : '';
+    const filter = slash >= 0 ? token.slice(slash + 1) : token;
+    const filterLower = filter.toLowerCase();
+    const scopeDepth = scopeDir ? scopeDir.split('/').filter(Boolean).length : 0;
+    const items = await this._workspacePathItems(workspaceFolder);
+
+    return items
+      .filter((item) => item.relativePath.startsWith(scopeDir))
+      .filter((item) => item.relativePath !== scopeDir)
+      .filter((item) => {
+        if (!filterLower) return item.depth === scopeDepth + 1;
+        return item.relativePath.slice(scopeDir.length).toLowerCase().includes(filterLower);
+      })
+      .sort((a, b) => {
+        const aDirect = a.depth === scopeDepth + 1;
+        const bDirect = b.depth === scopeDepth + 1;
+        if (aDirect !== bDirect) return aDirect ? -1 : 1;
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.relativePath.localeCompare(b.relativePath);
+      })
+      .slice(0, 30)
+      .map(({ depth, ...item }) => item);
   }
 
   // Public API for commands
@@ -704,12 +801,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'tokens', data: { prompt, completion, total } });
         this._postMessageToPanel(streamSessionId, { type: 'tokens', prompt, completion, total });
       },
-      onArtifactStart: (id, artifactType, language, title) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title }),
-      onArtifactContent: (id, content) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content }),
-      onArtifactEnd: (id) =>
-        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id }),
+      onArtifactStart: (id, artifactType, language, title) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactStart', data: { id, artifactType, language, title } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactStart', id, artifactType, language, title });
+      },
+      onArtifactContent: (id, content) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactContent', data: { id, content } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactContent', id, content });
+      },
+      onArtifactEnd: (id) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'artifactEnd', data: { id } });
+        this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id });
+      },
       onDone: (tokens, toolCalls, sessionId) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -736,8 +845,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         this._postMessageToPanel(sessionId || streamSessionId, { type: 'done', tokens, toolCalls, sessionId });
-        void this._refreshSessions();
-        setTimeout(() => void this._sendNextQueuedMessage(), 75);
+        void this._reloadFinishedSessionHistory(sessionId || streamSessionId)
+          .finally(() => {
+            void this._refreshSessions();
+            setTimeout(() => void this._sendNextQueuedMessage(), 75);
+          });
       },
       onStopped: () => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -770,6 +882,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt2 = this._sessionRuntimes.get(sid);
     if (rt2 && !rt2.isGenerating) {
       void this._sendNextQueuedMessage();
+    }
+  }
+
+  private async _reloadFinishedSessionHistory(sessionId: string) {
+    const info = this._panelSessions.get(sessionId);
+    const projectHash = info?.projectHash ?? this._sessionRuntimes.get(sessionId)?.projectHash;
+    if (!projectHash) return;
+
+    try {
+      const detail = await this._client.getSession(projectHash, sessionId);
+      const messages = detail?.messages;
+      if (!messages) return;
+
+      this._panelSessions.set(sessionId, {
+        ...(info ?? { sessionId }),
+        sessionId,
+        projectHash,
+        messages,
+        messagesPromise: undefined,
+      });
+      this._postOrQueueToPanel(sessionId, { type: 'sessionMessages', messages });
+    } catch {
+      // The already-delivered stream remains visible if history refresh fails.
     }
   }
 
@@ -862,6 +997,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       activeSessionId: sid,
       projectHash,
       isSessionList: mode === 'sidebar',
+      locale: vscode.env.language,
     }, webview);
   }
 
@@ -941,7 +1077,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this._loginStartedFromCommand) {
         this._postMessage({
           type: 'assistantMessage',
-          text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+          text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
         });
         this._loginStartedFromCommand = false;
       }
@@ -982,10 +1118,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (announceInChat) {
         this._postMessage({
           type: 'assistantMessage',
-          text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
+          text: vscode.l10n.t('Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.'),
         });
       }
-      this._broadcastMessage({ type: 'setupWorking', message: 'Waiting for AtomGit sign-in...' });
+      this._broadcastMessage({ type: 'setupWorking', message: vscode.l10n.t('Waiting for AtomGit sign-in...') });
 
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
@@ -1005,7 +1141,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (announceInChat) {
           this._postMessage({
             type: 'assistantMessage',
-            text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+            text: vscode.l10n.t('Signed in as {name}.', { name: result.user?.name || result.user?.username || vscode.l10n.t('AtomGit user') }),
           });
         }
         await this._sendSetupState();
@@ -1039,10 +1175,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (options.announceInChat) {
         this._postMessage({
           type: 'assistantMessage',
-          text: 'Syncing CodingPlan models...',
+          text: vscode.l10n.t('Syncing CodingPlan models...'),
         });
       }
-      this._broadcastMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
+      this._broadcastMessage({ type: 'setupWorking', message: vscode.l10n.t('Syncing CodingPlan models...') });
       const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
       this._broadcastMessage({ type: 'codingPlanResult', result });
       await this._sendSetupState();
@@ -1150,7 +1286,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (!hash) {
-      vscode.window.showErrorMessage('Unable to open session: missing project hash.');
+      vscode.window.showErrorMessage(vscode.l10n.t('Unable to open session: missing project hash.'));
       return;
     }
 
@@ -1205,6 +1341,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
           break;
+        case 'artifactStart':
+          post({ type: 'artifactStart', id: evt.data.id, artifactType: evt.data.artifactType, language: evt.data.language, title: evt.data.title });
+          break;
+        case 'artifactContent':
+          post({ type: 'artifactContent', id: evt.data.id, content: evt.data.content });
+          break;
+        case 'artifactEnd':
+          post({ type: 'artifactEnd', id: evt.data.id });
+          break;
         case 'tokens':
           post({ type: 'tokens', prompt: evt.data.prompt, completion: evt.data.completion, total: evt.data.total });
           break;
@@ -1215,16 +1360,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _renameSession(sessionId: string, projectHash?: string, currentName?: string) {
     const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
     if (!hash) {
-      this._postMessage({ type: 'error', message: 'Unable to rename session: missing project hash.' });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to rename session: missing project hash.') });
       return;
     }
 
     const nextName = await vscode.window.showInputBox({
-      title: 'Rename AtomCode session',
-      prompt: 'Enter a new session name',
+      title: vscode.l10n.t('Rename AtomCode session'),
+      prompt: vscode.l10n.t('Enter a new session name'),
       value: currentName || '',
       ignoreFocusOut: true,
-      validateInput: (value) => value.trim() ? undefined : 'Session name cannot be empty',
+      validateInput: (value) => value.trim() ? undefined : vscode.l10n.t('Session name cannot be empty'),
     });
     if (nextName === undefined) return;
 
@@ -1232,29 +1377,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._client.renameSession(hash, sessionId, nextName.trim());
       await this._refreshSessions();
     } catch (e) {
-      this._postMessage({ type: 'error', message: `Unable to rename session: ${this._messageFromError(e)}` });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to rename session: {message}', { message: this._messageFromError(e) }) });
     }
   }
 
   private async _deleteSession(sessionId: string, projectHash?: string, currentName?: string) {
     const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
     if (!hash) {
-      this._postMessage({ type: 'error', message: 'Unable to delete session: missing project hash.' });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to delete session: missing project hash.') });
       return;
     }
 
     const label = currentName || sessionId;
+    const deleteLabel = vscode.l10n.t('Delete');
     const choice = await vscode.window.showWarningMessage(
-      `Delete AtomCode session "${label}"?`,
-      { modal: true, detail: 'This removes the session from local history.' },
-      'Delete',
+      vscode.l10n.t('Delete AtomCode session "{label}"?', { label }),
+      { modal: true, detail: vscode.l10n.t('This removes the session from local history.') },
+      deleteLabel,
     );
-    if (choice !== 'Delete') return;
+    if (choice !== deleteLabel) return;
 
     try {
       await this._deleteSessionInternal(sessionId, hash);
     } catch (e) {
-      this._postMessage({ type: 'error', message: `Unable to delete session: ${this._messageFromError(e)}` });
+      this._postMessage({ type: 'error', message: vscode.l10n.t('Unable to delete session: {message}', { message: this._messageFromError(e) }) });
     }
   }
 
@@ -1309,15 +1455,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const count = sessions.length;
     const label = count === 1
-      ? `Delete AtomCode session "${sessions[0].name || sessions[0].sessionId}"?`
-      : `确定删除 ${count} 个会话？`;
+      ? vscode.l10n.t('Delete AtomCode session "{label}"?', { label: sessions[0].name || sessions[0].sessionId })
+      : vscode.l10n.t('Delete {count} sessions?', { count });
+    const deleteLabel = vscode.l10n.t('Delete');
 
     const choice = await vscode.window.showWarningMessage(
       label,
-      { modal: true, detail: '此操作不可撤销，会话将从本地历史中移除。' },
-      'Delete',
+      { modal: true, detail: vscode.l10n.t('This cannot be undone. Sessions will be removed from local history.') },
+      deleteLabel,
     );
-    if (choice !== 'Delete') return;
+    if (choice !== deleteLabel) return;
 
     let succeeded = 0;
     let failed = 0;
@@ -1361,7 +1508,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (failed > 0) {
-      const errMsg = { type: 'error', message: `已删除 ${succeeded}/${count} 个会话，${failed} 个失败` };
+      const errMsg = { type: 'error', message: vscode.l10n.t('Deleted {succeeded}/{count} sessions, {failed} failed', { succeeded, count, failed }) };
       if (sourceWebview) {
         this._postMessage(errMsg, sourceWebview);
       } else {
@@ -1387,7 +1534,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _applyCode(code: string, _language: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
-      vscode.window.showInformationMessage('No active editor to apply code to');
+      vscode.window.showInformationMessage(vscode.l10n.t('No active editor to apply code to'));
       return;
     }
     const selection = editor.selection;
@@ -1401,23 +1548,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleQuickAction(action: string) {
-    const ctx = this._getEditorContext();
-    const prompts: Record<string, string> = {
-      explain: 'Please explain this code. What does it do and why?',
-      fix: 'Please fix any bugs or issues in this code.',
-      test: 'Please generate unit tests for this code.',
-      refactor: 'Please refactor this code for better readability and maintainability.',
-      docs: 'Please add documentation comments to this code.',
-      review: 'Please review this code for issues, improvements, and best practices.',
-      optimize: 'Please optimize this code for performance while preserving behavior.',
-    };
-    const prompt = prompts[action] || action;
-    const text = ctx.selection
-      ? `File: ${ctx.fileName} (${ctx.language})\nSelected code:\n\`\`\`${ctx.language}\n${ctx.selection}\n\`\`\`\n\n${prompt}`
-      : prompt;
+    const prompt = getQuickActionPrompt(action, vscode.env.language);
 
     this._postMessage({ type: 'userMessage', text: prompt });
-    await this._handleSend(text);
+    await this._handleSend(prompt);
   }
 
   private async _handleSlashCommand(command: string) {
@@ -1441,9 +1575,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
           const auth = await this._client.logout();
           this._broadcastMessage({ type: 'authStatus', auth });
-          this._postSlashInfo('Signed out of AtomGit.', sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Signed out of AtomGit.'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to sign out: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to sign out: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/whoami':
@@ -1453,7 +1587,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const name = auth.user.name || auth.user.username || auth.user.email || auth.user.id;
             const lines = [
               `${name} (${auth.user.username || auth.user.id})`,
-              auth.user.email || 'Email: not provided',
+              auth.user.email || vscode.l10n.t('Email: not provided'),
               `User ID: ${auth.user.id}`,
               `Auth: ${auth.auth_path}`,
             ];
@@ -1463,14 +1597,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               if (auth.token.expires_in !== undefined) {
                 lines.push(`Expires in: ${auth.token.expires_in}s`);
               }
-              lines.push(`Refresh token: ${auth.token.has_refresh_token ? 'yes' : 'no'}`);
+              lines.push(`Refresh token: ${auth.token.has_refresh_token ? vscode.l10n.t('yes') : vscode.l10n.t('no')}`);
             }
             this._postSlashInfo(lines.join('\n'), sessionId, text);
           } else {
-            this._postSlashInfo('Not signed in.', sessionId, text);
+            this._postSlashInfo(vscode.l10n.t('Not signed in.'), sessionId, text);
           }
         } catch (e) {
-          this._postSlashInfo(`Unable to read auth status: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read auth status: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/status':
@@ -1483,11 +1617,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const provider = providers?.providers.find((p) => p.name === providers.default_provider || p.is_default);
           this._postSlashInfo([
             `Daemon: ${health.service} ${health.version}`,
-            `Auth: ${auth?.logged_in ? 'signed in' : 'not signed in'}`,
-            `Provider: ${provider ? `${provider.name} (${provider.model})` : 'not configured'}`,
+            `Auth: ${auth?.logged_in ? vscode.l10n.t('signed in') : vscode.l10n.t('not signed in')}`,
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : vscode.l10n.t('not configured')}`,
           ].join('\n'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to read status: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read status: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/config':
@@ -1495,10 +1629,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const config = await this._client.getConfig();
           const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
           this._postSlashInfo([
-            `Provider: ${provider ? `${provider.name} (${provider.model})` : config.default_provider || 'not configured'}`,
+            `Provider: ${provider ? `${provider.name} (${provider.model})` : config.default_provider || vscode.l10n.t('not configured')}`,
             `Config: ${config.path}`,
             '',
-            'Example:',
+            vscode.l10n.t('Example:'),
             '',
             '```toml',
             'default_provider = "deepseek"',
@@ -1511,11 +1645,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             'context_window = 64000',
             '```',
             '',
-            'Full reference: docs/config.example.toml',
-            'Edit the file, then run /reload. No restart needed.',
+            vscode.l10n.t('Full reference: docs/config.example.toml'),
+            vscode.l10n.t('Edit the file, then run /reload. No restart needed.'),
           ].join('\n'), sessionId, text);
         } catch (e) {
-          this._postSlashInfo(`Unable to read config: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to read config: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       case '/reload':
@@ -1524,12 +1658,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const provider = config.providers.find((p) => p.name === config.default_provider || p.is_default);
           await this._sendSetupState();
           this._postSlashInfo(
-            `Reloaded config. Default provider: ${provider?.name || config.default_provider || 'none'}.`,
+            vscode.l10n.t('Reloaded config. Default provider: {provider}.', { provider: provider?.name || config.default_provider || 'none' }),
             sessionId,
             text,
           );
         } catch (e) {
-          this._postSlashInfo(`Unable to reload config: ${this._messageFromError(e)}`, sessionId, text);
+          this._postSlashInfo(vscode.l10n.t('Unable to reload config: {message}', { message: this._messageFromError(e) }), sessionId, text);
         }
         return true;
       default:
@@ -1614,7 +1748,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!existingIds.has(info.sessionId)) {
           sessions.unshift({
             id: info.sessionId,
-            name: 'New session',
+            name: vscode.l10n.t('New session'),
             created_at: Date.now(),
             updated_at: Date.now(),
             isGenerating: this._sessionRuntimes.get(info.sessionId)?.isGenerating ?? false,
@@ -1738,6 +1872,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\{\{nonce\}\}/g, nonce);
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
     html = html.replace(/\{\{viewMode\}\}/g, mode);
+    html = html.replace(/\{\{locale\}\}/g, vscode.env.language || 'en');
 
     return html;
   }

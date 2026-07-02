@@ -333,22 +333,14 @@ pub async fn prepare_with_plugin_hooks(
             Some(cc)
         }
     };
-    // 6. TelemetryHook — observation-only (on_request + on_model_response): emits
-    //    LlmChat per round. Last in the chain; it mutates nothing, so order is moot.
-    //    Only when the driver supplied a telemetry sink (kernel stays zero-telemetry
-    //    otherwise). Vendor = the configured `provider_type` (`openai`/`claude`/`ollama`,
-    //    the exact vocabulary telemetry's `resolve_provider_host` keys on) — NOT a fixed
-    //    "openai": since the provider_type dispatch landed, claude/ollama no longer speak
-    //    OpenAI-compat, so a hardcoded vendor would misattribute their telemetry.
-    if let Some(tel) = &cfg.telemetry {
-        hooks.push(Arc::new(crate::telemetry::TelemetryHook::new(
-            tel.clone(),
-            cfg.provider_type.as_str(),
-            &cfg.base_url,
-            &cfg.model,
-            session.as_ref().map(|b| b.id.as_str()),
-        )));
-    }
+    // NOTE: the turn-level `TelemetryHook` is NOT built here. Its envelope fixes the
+    // model + provider_host at construction, and a `/login` or `/model` swap re-runs
+    // `assemble` ONLY (never `prepare`) — so building it here froze the prepare-time
+    // values (most visibly model="" + the openai host default `api.openai.com` for a
+    // session launched before a provider was resolvable). It is built in `assemble`
+    // instead, alongside `ToolTelemetryMiddleware`, so every reload re-attributes to
+    // the currently active model. (v1 sourced the model live from the running provider;
+    // this is the v2 equivalent.)
 
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
@@ -483,6 +475,19 @@ pub fn assemble(
     // approval then DENIES is still recorded (the after-chain runs for every middleware).
     if let Some(tel) = &cfg.telemetry {
         builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
+            tel.clone(),
+            cfg.provider_type.as_str(),
+            &cfg.base_url,
+            &cfg.model,
+            parts.session.as_ref().map(|b| b.id.as_str()),
+        )));
+        // Turn-level TelemetryHook (observation-only: on_request + on_model_response →
+        // one LlmChat per round). Built HERE, not in `prepare`, so a /login or /model
+        // swap (which re-runs assemble only) re-attributes every subsequent round to the
+        // CURRENT model + provider_host instead of the value frozen at prepare. Vendor =
+        // the configured `provider_type` (the exact vocabulary telemetry's
+        // `resolve_provider_host` keys on). It mutates nothing, so chain order is moot.
+        builder = builder.hook(Arc::new(crate::telemetry::TelemetryHook::new(
             tel.clone(),
             cfg.provider_type.as_str(),
             &cfg.base_url,
@@ -784,6 +789,49 @@ mod tests {
         assert_eq!(
             llm_chats, 1,
             "review sub-agent LLM round must emit one LlmChat token event"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
+    /// (never `prepare`). The primary turn-level `TelemetryHook` must therefore be
+    /// (re)built at `assemble` so its `LlmChat` envelope reports the CURRENTLY active
+    /// model — not the value frozen at `prepare`. Regression guard for the v2 bug where
+    /// a session that launched with no resolvable provider (model="" + the openai host
+    /// default `api.openai.com`) kept mis-attributing every real post-login round.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn primary_telemetry_hook_tracks_model_swapped_at_assemble() {
+        use atomcode_kernel::agent::AutoRespond;
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+
+        let (tel, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+        let proj = tempfile::tempdir().unwrap();
+        // Launched in onboarding mode: no resolvable provider ⇒ empty model at prepare.
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "", proj.path());
+        cfg.telemetry = Some(tel);
+
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+
+        // /login resolves the real provider: cfg picks up the model, assemble re-runs.
+        cfg.model = "swapped-model".to_string();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+
+        let _ = agent.run_to_completion("hi", AutoRespond::AllowAll).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        let chat = records
+            .iter()
+            .find(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
+            .expect("the primary turn must emit one LlmChat");
+        assert_eq!(
+            chat.envelope.model.as_deref(),
+            Some("swapped-model"),
+            "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
 
         std::env::remove_var("ATOMCODE_HOME");

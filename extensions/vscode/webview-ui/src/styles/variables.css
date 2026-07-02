@@ -39,6 +39,10 @@ html {
   --app-menu-border: var(--vscode-menu-border, var(--vscode-dropdown-border));
   --app-menu-foreground: var(--vscode-menu-foreground, var(--vscode-dropdown-foreground));
   --app-menu-selection-background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+  --app-command-menu-hover-background: color-mix(in srgb, var(--app-brand) 10%, var(--app-menu-background));
+  --app-command-menu-active-background: color-mix(in srgb, var(--app-brand) 22%, var(--app-menu-background));
+  --app-command-menu-active-foreground: var(--app-menu-foreground);
+  --app-command-menu-active-accent: var(--app-brand);
 
   /* Status */
   --app-success-foreground: var(--vscode-gitDecoration-addedResourceForeground, #74c991);

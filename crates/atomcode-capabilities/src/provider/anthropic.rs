@@ -68,6 +68,13 @@ pub struct AnthropicConfig {
     pub connect_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
+    /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
+    /// driver injects `atomcode/<version>` for gateway attribution. See the
+    /// `OpenAiCompatConfig::user_agent` doc for why a local const won't do.
+    pub user_agent: Option<String>,
+    /// Disable TLS certificate verification (self-signed / internal gateways).
+    /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
+    pub skip_tls_verify: bool,
 }
 
 impl AnthropicConfig {
@@ -88,6 +95,8 @@ impl AnthropicConfig {
             idle_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
+            user_agent: None,
+            skip_tls_verify: false,
         }
     }
 }
@@ -96,14 +105,24 @@ pub struct AnthropicProvider {
     cfg: AnthropicConfig,
     client: reqwest::Client,
     url: String,
+    /// Stable per-conversation id bound ONCE by the kernel; see the field on
+    /// `OpenAiCompatProvider`. `OnceLock` — constant for the provider's life.
+    /// Forwarded as `x-atomcode-session-id`. Unset ⇒ omitted.
+    session_id: std::sync::OnceLock<String>,
 }
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
-        let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .connect_timeout(cfg.connect_timeout)
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+            // Product UA for gateway attribution (parity with core's build_http_client).
+            .user_agent(cfg.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+        if cfg.skip_tls_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder
             .build()
             .map_err(|e| ProviderError {
                 retryable: false,
@@ -111,7 +130,12 @@ impl AnthropicProvider {
                 ..Default::default()
             })?;
         let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-        Ok(Self { cfg, client, url })
+        Ok(Self {
+            cfg,
+            client,
+            url,
+            session_id: std::sync::OnceLock::new(),
+        })
     }
 }
 
@@ -123,6 +147,10 @@ impl LlmProvider for AnthropicProvider {
 
     fn context_window(&self) -> u32 {
         self.cfg.context_window
+    }
+
+    fn bind_session_id(&self, session_id: &str) {
+        let _ = self.session_id.set(session_id.to_string());
     }
 
     async fn chat_stream(
@@ -141,8 +169,11 @@ impl LlmProvider for AnthropicProvider {
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
         let anthropic_version = self.cfg.anthropic_version.clone();
+        // Snapshot the session id once; reused across the open and any mid-stream reopen.
+        let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp = open_stream(&client, &url, &body, &api_key, &anthropic_version, &policy).await?;
+        let resp =
+            open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy).await?;
 
         let s = async_stream::stream! {
             // v1 parity: a body that dies BEFORE any event reaches the consumer is
@@ -179,7 +210,7 @@ impl LlmProvider for AnthropicProvider {
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &policy).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -222,17 +253,21 @@ async fn open_stream(
     body: &Value,
     api_key: &str,
     anthropic_version: &str,
+    session_id: &str,
     policy: &RetryPolicy,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
-        let send = client
+        let mut req = client
             .post(url)
             .header("x-api-key", api_key)
             .header("anthropic-version", anthropic_version)
-            .json(body)
-            .send()
-            .await;
+            .json(body);
+        // Stable session id → gateway prefix-cache affinity. Empty ⇒ omitted.
+        if !session_id.is_empty() {
+            req = req.header("x-atomcode-session-id", session_id);
+        }
+        let send = req.send().await;
         match send {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -1391,5 +1426,55 @@ mod tests {
         assert_eq!(text, "ok", "should deliver the third (successful) response: {events:?}");
 
         let _ = handle.join();
+    }
+
+    /// Capture the first request's head, drain its body, then answer 200 + close so
+    /// `chat_stream` resolves and the stream ends on EOF (provider-agnostic).
+    fn capture_then_ok(port_back: std::sync::mpsc::Sender<u16>) -> (std::sync::Arc<std::sync::Mutex<String>>, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        port_back.send(listener.local_addr().unwrap().port()).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = match s.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => n };
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            }
+            *cap.lock().unwrap() =
+                String::from_utf8_lossy(&buf).split("\r\n\r\n").next().unwrap_or("").to_string();
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let _ = s.flush();
+            drop(s);
+        });
+        (captured, handle)
+    }
+
+    #[tokio::test]
+    async fn forwards_session_id_and_product_ua_alongside_anthropic_auth() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (captured, handle) = capture_then_ok(tx);
+        let port = rx.recv().unwrap();
+
+        let mut cfg = AnthropicConfig::new("ak", format!("http://127.0.0.1:{port}"), "claude-test");
+        cfg.user_agent = Some("atomcode/9.9.9".to_string());
+        let provider = AnthropicProvider::new(cfg).unwrap();
+        provider.bind_session_id("sess-anthropic");
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let _: Vec<StreamEvent> = stream.collect().await;
+        let _ = handle.join();
+
+        let head = captured.lock().unwrap().to_lowercase();
+        assert!(head.contains("x-api-key: ak"), "anthropic auth must remain: {head}");
+        assert!(head.contains("x-atomcode-session-id: sess-anthropic"), "session header must be forwarded: {head}");
+        assert!(head.contains("user-agent: atomcode/9.9.9"), "product UA must be sent: {head}");
     }
 }

@@ -74,6 +74,11 @@ pub struct CodeGraph {
     pub edges_in: HashMap<SymbolId, Vec<Edge>>,
     pub file_symbols: HashMap<PathBuf, Vec<SymbolId>>,
     pub file_mtimes: HashMap<PathBuf, u64>,
+    /// name → symbol ids. Derivable from `nodes`; `#[serde(skip)]` keeps it out of any
+    /// serialized form, so `rebuild_name_index` must be called after a deserialize.
+    /// Lets `find_by_name` be O(candidates) instead of an O(nodes) scan.
+    #[serde(skip)]
+    pub by_name: HashMap<String, Vec<SymbolId>>,
 }
 
 impl CodeGraph {
@@ -93,6 +98,7 @@ impl CodeGraph {
     pub fn add_symbol(&mut self, node: SymbolNode) {
         let id = node.id;
         let file = node.file.clone();
+        self.by_name.entry(node.name.clone()).or_default().push(id);
         self.nodes.insert(id, node);
         self.file_symbols.entry(file).or_default().push(id);
     }
@@ -119,8 +125,21 @@ impl CodeGraph {
         self.edges_in.get(&id)
     }
     pub fn find_by_name(&self, name: &str) -> Vec<&SymbolNode> {
-        self.nodes.values().filter(|n| n.name == name).collect()
+        match self.by_name.get(name) {
+            Some(ids) => ids.iter().filter_map(|id| self.nodes.get(id)).collect(),
+            None => Vec::new(),
+        }
     }
+
+    /// Rebuild `by_name` from `nodes`. Call after constructing a graph by any path that
+    /// bypasses `add_symbol` (e.g. a serde deserialize, which skips `by_name`).
+    pub fn rebuild_name_index(&mut self) {
+        self.by_name.clear();
+        for (id, node) in &self.nodes {
+            self.by_name.entry(node.name.clone()).or_default().push(*id);
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -285,5 +304,28 @@ mod tests {
         assert!(deps.contains(&PathBuf::from("a.rs")));
         assert!(deps.contains(&PathBuf::from("b.rs")));
         assert!(!deps.contains(&PathBuf::from("c.rs")));
+    }
+
+    #[test]
+    fn name_index_finds_all_same_named() {
+        let mut g = CodeGraph::new();
+        g.add_symbol(node(1, "dup", "a.rs"));
+        g.add_symbol(node(2, "dup", "b.rs"));
+        g.add_symbol(node(3, "other", "c.rs"));
+        assert_eq!(g.find_by_name("dup").len(), 2, "both dup symbols found");
+        assert_eq!(g.find_by_name("other").len(), 1);
+        assert!(g.find_by_name("missing").is_empty());
+    }
+
+    #[test]
+    fn rebuild_name_index_restores_lookup() {
+        let mut g = CodeGraph::new();
+        g.add_symbol(node(1, "dup", "a.rs"));
+        g.add_symbol(node(2, "dup", "b.rs"));
+        // Simulate a graph produced by a path that bypasses add_symbol (serde skips by_name).
+        g.by_name.clear();
+        assert!(g.find_by_name("dup").is_empty(), "empty index → lookup misses");
+        g.rebuild_name_index();
+        assert_eq!(g.find_by_name("dup").len(), 2, "rebuild restores the index");
     }
 }
