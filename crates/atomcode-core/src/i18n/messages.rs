@@ -771,6 +771,10 @@ pub enum Msg<'a> {
     CompactStarting,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
+    /// Footer spinner liveness segment during the HIDDEN reasoning phase — a live
+    /// count of streamed reasoning chars (`count` is a pre-formatted compact number,
+    /// e.g. "8.20K" from `fmt_tokens`) so a long think doesn't read as a hang.
+    SpinnerThinking { count: &'a str },
     /// Footer spinner label while a compaction's LLM summary runs (slow tier).
     Compacting,
     /// Spinner label variant when the compaction summary has stalled (>20s).
