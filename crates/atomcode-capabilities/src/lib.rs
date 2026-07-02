@@ -59,6 +59,11 @@ pub(crate) mod process_utils;
 #[cfg(any(feature = "provider", feature = "web", feature = "atomgit", feature = "mcp"))]
 pub(crate) mod proxy;
 
+/// Ungated path helpers (leading-`~` expansion, home dir) shared by the `tools` and
+/// `codeintel` families so model-supplied paths resolve identically across both — see
+/// [`pathutil`]. Free of any feature `cfg` because `codeintel` is independent of `tools`.
+pub(crate) mod pathutil;
+
 #[cfg(feature = "provider")]
 pub mod provider;
 
