@@ -1731,8 +1731,8 @@ fn execute_slash_command_impl(
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 AtomCode App 扫码连接（手机需能访问中继 \
-                                                         {https_base}）：\n\n{q}\n配对链接：{pair_uri}\n\
+                                                        "用 AtomCode App 扫码连接
+                                                        \n{q}\n\
                                                          （/app stop 断开）"
                                                     ),
                                                     None => format!(
