@@ -3539,28 +3539,38 @@ pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt:
     format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
 }
 
-/// `/status` login line: the signed-in account's display name (falling back to the
-/// username), or a not-signed-in prompt. Pure over the resolved name for testability.
-fn render_login_line(username: Option<&str>) -> String {
-    match username {
+/// `/status` login line: the signed-in identity (already formatted, e.g.
+/// `昵称(用户名)`), or a not-signed-in prompt. Pure over the resolved string.
+fn render_login_line(user: Option<&str>) -> String {
+    match user {
         Some(u) => t(Msg::StatusLoginLoggedIn { user: u }).into_owned(),
         None => t(Msg::StatusLoginNotSignedIn).into_owned(),
     }
 }
 
-/// The `/status` login line sourced from stored auth: display name → username, with an
-/// empty name treated as absent. Shared by both `/status` renderers so the interactive
-/// and remote outputs can't drift.
+/// Format the signed-in identity as `display_name(username)` — the agreed
+/// `昵称(用户名)` form. Falls back to just `username` when there is no distinct
+/// display name: name absent, empty/whitespace, or identical to the username
+/// (so we never render `Saulcy(Saulcy)`).
+fn format_login_identity(name: Option<&str>, username: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty() && *n != username) {
+        Some(n) => format!("{n}({username})"),
+        None => username.to_string(),
+    }
+}
+
+/// The `/status` login line sourced from stored auth: `昵称(用户名)` (display
+/// name + username), or just the username when there is no distinct display
+/// name. Shared by both `/status` renderers so the interactive and remote
+/// outputs can't drift.
 fn render_login_line_from_stored_auth() -> String {
-    let stored = atomcode_core::auth::get_stored_auth();
-    let username = stored.as_ref().map(|a| {
-        a.user
-            .name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(a.user.username.as_str())
-    });
-    render_login_line(username)
+    match atomcode_core::auth::get_stored_auth() {
+        Some(a) => {
+            let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
+            render_login_line(Some(&identity))
+        }
+        None => render_login_line(None),
+    }
 }
 
 /// Render a CodingPlan auth failure. An EXPIRED login (`is_auth_expired` on the error
@@ -4509,6 +4519,22 @@ mod status_login_tests {
         let line = render_login_line(None);
         assert!(line.contains("/login"), "not-signed-in line must point to /login: {line:?}");
         assert!(!line.contains("张三"));
+    }
+
+    #[test]
+    fn login_identity_is_name_paren_username() {
+        // The agreed 昵称(用户名) form: display name with the username in parens.
+        assert_eq!(format_login_identity(Some("TheoCui"), "Saulcy"), "TheoCui(Saulcy)");
+        assert_eq!(format_login_identity(Some("  Theo  "), "Saulcy"), "Theo(Saulcy)");
+    }
+
+    #[test]
+    fn login_identity_falls_back_to_bare_username() {
+        // No distinct display name → just the username (never `Saulcy(Saulcy)`).
+        assert_eq!(format_login_identity(None, "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some(""), "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some("   "), "Saulcy"), "Saulcy");
+        assert_eq!(format_login_identity(Some("Saulcy"), "Saulcy"), "Saulcy");
     }
 
     #[test]
