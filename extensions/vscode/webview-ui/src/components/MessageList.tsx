@@ -3,9 +3,11 @@ import { useChatContext } from '../state/ChatProvider';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { SearchBar } from './SearchBar';
+import { useT } from '../i18n';
 
 export function MessageList() {
   const { state } = useChatContext();
+  const t = useT();
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
@@ -70,8 +72,8 @@ export function MessageList() {
           <button
             className="scroll-to-bottom-btn"
             onClick={scrollToBottom}
-            aria-label="Scroll to latest"
-            title="Scroll to latest"
+            aria-label={t('search.scrollLatest')}
+            title={t('search.scrollLatest')}
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M4 6L8 10L12 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />

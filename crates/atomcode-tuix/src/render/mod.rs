@@ -278,6 +278,11 @@ pub trait Renderer: Send {
     /// this.
     fn set_suppress_auto_copy(&mut self, _suppress: bool) {}
 
+    /// Enable/disable the code-block auto-copy feature (issue #699). Default
+    /// OFF (opt-in via `config.ui.auto_copy_code_blocks` / `ATOMCODE_AUTO_COPY`),
+    /// set once at startup. Default no-op — only the retained renderer implements it.
+    fn set_auto_copy_enabled(&mut self, _enabled: bool) {}
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use

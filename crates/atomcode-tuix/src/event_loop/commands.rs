@@ -313,7 +313,7 @@ pub(crate) fn attach_live_session(
                     }
                     for tc in tool_calls {
                         renderer.render(UiLine::ToolCall {
-                            name: tc.name.clone(),
+                            name: super::display_tool_name(&tc.name),
                             detail: super::format_tool_detail(&tc.name, &tc.arguments),
                         });
                     }

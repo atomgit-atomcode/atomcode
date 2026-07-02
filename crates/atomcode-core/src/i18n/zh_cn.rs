@@ -742,8 +742,11 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
         Msg::PluginGitNotFound =>
             "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
-        Msg::PluginMarketplaceAdded { name, commit, count } =>
-            format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
+            format!(
+                "✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）\n  \
+                 插件：{plugins} —— 运行 /plugin install <插件名>@{name} 安装后才能使用其命令"
+            ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {

@@ -2,8 +2,15 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { groupSessionsByDate, formatTimeAgo } from '../utils/format';
 import type { SessionMeta } from '../state/types';
+import { MsgKey, useT } from '../i18n';
 
 const DATE_ORDER = ['Today', 'Yesterday', 'This Week', 'Older'];
+const DATE_LABEL_KEYS: Record<string, MsgKey> = {
+  Today: 'session.today',
+  Yesterday: 'session.yesterday',
+  'This Week': 'session.thisWeek',
+  Older: 'session.older',
+};
 
 interface SessionListProps {
   variant?: 'overlay' | 'sidebar';
@@ -11,6 +18,7 @@ interface SessionListProps {
 
 export function SessionList({ variant = 'overlay' }: SessionListProps) {
   const { state, dispatch, openSessionInTab, renameSession, deleteSession, deleteSessions } = useChatContext();
+  const t = useT();
   const [search, setSearch] = useState('');
   const [menu, setMenu] = useState<{ session: SessionMeta; x: number; y: number } | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -156,10 +164,10 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
               className="select-mode-toggle"
               onClick={selectMode ? exitSelectMode : enterSelectMode}
             >
-              {selectMode ? '完成' : '选择'}
+              {selectMode ? t('session.done') : t('session.select')}
             </button>
             {isOverlay && (
-              <button className="ghost-btn" onClick={() => dispatch({ type: 'TOGGLE_HISTORY' })} title="Close">
+              <button className="ghost-btn" onClick={() => dispatch({ type: 'TOGGLE_HISTORY' })} title={t('session.close')}>
                 &times;
               </button>
             )}
@@ -167,12 +175,12 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
         </div>
         <button className="session-new-btn" onClick={handleNewSession}>
           <span className="session-new-icon">+</span>
-          <span>New session</span>
+          <span>{t('session.new')}</span>
         </button>
         <input
           className="session-search"
           type="text"
-          placeholder="Search sessions..."
+          placeholder={t('session.searchPlaceholder')}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           autoFocus={isOverlay}
@@ -180,25 +188,25 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
       </div>
       {hasSelection && (
         <div className="session-list-selection-bar">
-          <span className="selection-count">已选 {selectedCount} 项</span>
+          <span className="selection-count">{t('session.selectedCount', { count: selectedCount })}</span>
           <button className="selection-bar-btn danger" onClick={handleDeleteSelected}>
-            删除所选
+            {t('session.deleteSelected')}
           </button>
           <button className="selection-bar-btn" onClick={exitSelectMode}>
-            取消选择
+            {t('session.cancelSelection')}
           </button>
         </div>
       )}
       <div className="session-list-body">
         {filteredSessions.length === 0 ? (
-          <div className="session-empty">No sessions yet</div>
+          <div className="session-empty">{t('session.empty')}</div>
         ) : (
           DATE_ORDER.map((label) => {
             const items = groups[label];
             if (!items || items.length === 0) return null;
             return (
               <div key={label}>
-                <div className="session-group-label">{label}</div>
+                <div className="session-group-label">{t(DATE_LABEL_KEYS[label])}</div>
                 {items.map((s) => {
                   const isActive = s.id === state.activeSessionId;
                   const isChecked = selectedIds.has(s.id);
@@ -216,7 +224,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                       className={`session-item${isActive ? ' active' : ''}${selectMode && isChecked ? ' selected' : ''}`}
                       onClick={() => handleSelect(s)}
                       onContextMenu={(e) => handleContextMenu(e, s)}
-                      title={selectMode ? undefined : (s.name || s.title || 'Untitled')}
+                      title={selectMode ? undefined : (s.name || s.title || t('session.untitled'))}
                     >
                       <span
                         className={`session-item-checkbox${isChecked ? ' checked' : ''}`}
@@ -228,10 +236,10 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                       />
                       {dotClass && <span className={dotClass} />}
                       <span className="session-item-name">
-                        {s.name || s.title || 'Untitled'}
+                        {s.name || s.title || t('session.untitled')}
                       </span>
                       <span className="session-item-time">
-                        {formatTimeAgo(s.updated_at ?? s.created_at)}
+                        {formatTimeAgo(s.updated_at ?? s.created_at, t)}
                       </span>
                     </button>
                   );
@@ -256,7 +264,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
               setMenu(null);
             }}
           >
-            修改名称
+            {t('session.rename')}
           </button>
           <button
             type="button"
@@ -266,7 +274,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
               setMenu(null);
             }}
           >
-            删除会话
+            {t('session.delete')}
           </button>
         </div>
       )}

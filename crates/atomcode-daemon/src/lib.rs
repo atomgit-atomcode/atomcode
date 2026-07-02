@@ -429,6 +429,53 @@ pub struct MessageInfo {
 pub struct ImageData {
     pub media_type: String,
     pub data: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+}
+
+impl ImageData {
+    fn missing_placeholder() -> Self {
+        Self {
+            media_type: "image/png".to_string(),
+            data: String::new(),
+            missing: true,
+        }
+    }
+}
+
+fn strip_vision_marker(raw: &str) -> (String, bool) {
+    match raw
+        .find("[图片内容（由")
+        .or_else(|| raw.find("[图片识别失败]"))
+    {
+        Some(i) => (raw[..i].trim_end().to_string(), true),
+        None => (raw.to_string(), false),
+    }
+}
+
+fn restore_submitted_user_images_before_save(
+    messages: &mut [atomcode_core::conversation::message::Message],
+    submitted_text: &str,
+    submitted_images: &[atomcode_core::conversation::message::ImagePart],
+) {
+    if submitted_images.is_empty() {
+        return;
+    }
+
+    let Some(idx) = messages.iter().rposition(|msg| {
+        matches!(msg.role, atomcode_core::conversation::message::Role::User) && !msg.synthetic
+    }) else {
+        return;
+    };
+
+    messages[idx].content = atomcode_core::conversation::message::MessageContent::MultiPart {
+        text: if submitted_text.is_empty() {
+            None
+        } else {
+            Some(submitted_text.to_string())
+        },
+        images: submitted_images.to_vec(),
+    };
 }
 
 impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
@@ -492,28 +539,19 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::MultiPart { text, images } => {
+            atomcode_core::conversation::message::MessageContent::MultiPart { text, .. } => {
                 // 图片走下面的 images 字段渲染缩略图；文本里若拼接了 VL 识别结果
                 // （[图片内容（由 … 识别）] / [图片识别失败]，仅用于喂给非视觉模型），
                 // 展示时剥离，只保留用户原始输入，避免历史里出现一大段识别文字。
                 let raw = text.clone().unwrap_or_default();
-                let display = if images.is_empty() {
-                    raw
-                } else {
-                    match raw
-                        .find("[图片内容（由")
-                        .or_else(|| raw.find("[图片识别失败]"))
-                    {
-                        Some(i) => raw[..i].trim_end().to_string(),
-                        None => raw,
-                    }
-                };
+                let (display, _) = strip_vision_marker(&raw);
                 (display, None, None, None)
             }
         };
+        let mut content = content;
 
         // 提取 MultiPart 的图片，供 webui 历史渲染缩略图。
-        let images =
+        let mut images =
             match &msg.content {
                 atomcode_core::conversation::message::MessageContent::MultiPart {
                     images, ..
@@ -523,11 +561,21 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                         .map(|i| ImageData {
                             media_type: i.media_type.clone(),
                             data: i.data.clone(),
+                            missing: false,
                         })
                         .collect(),
                 ),
                 _ => None,
             };
+        if matches!(msg.role, atomcode_core::conversation::message::Role::User) {
+            let (display, had_vision_marker) = strip_vision_marker(&content);
+            if had_vision_marker {
+                content = display;
+                if images.is_none() {
+                    images = Some(vec![ImageData::missing_placeholder()]);
+                }
+            }
+        }
 
         Self {
             role: role.to_string(),
@@ -916,7 +964,8 @@ fn channel_interactive_permission(
     enforce_token: bool,
     bind_host: &str,
 ) -> bool {
-    enforce_token || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
+    enforce_token
+        || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
 }
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -926,7 +975,8 @@ pub(crate) fn hash_path(path: &std::path::Path) -> String {
     // - Different path separators (Windows: `\` vs `/`)
     // - Case sensitivity (Windows paths are case-insensitive)
     // - Trailing slashes
-    let normalized = atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
+    let normalized =
+        atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
     // Remove trailing slash (but keep root "/" or "C:/")
@@ -1181,8 +1231,7 @@ async fn serve_webui_index(
                     };
                     let cookie = format!(
                         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        state.webui_cookie_name,
-                        token
+                        state.webui_cookie_name, token
                     );
                     return axum::response::Response::builder()
                         .status(StatusCode::FOUND)
@@ -1418,10 +1467,16 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
-fn merge_session_messages_for_display(session: &atomcode_core::session::Session) -> Vec<MessageInfo> {
+fn merge_session_messages_for_display(
+    session: &atomcode_core::session::Session,
+) -> Vec<MessageInfo> {
     let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
 
-    for display in session.display_messages.iter().filter(|d| d.after_message == 0) {
+    for display in session
+        .display_messages
+        .iter()
+        .filter(|d| d.after_message == 0)
+    {
         messages.push(MessageInfo::from(&display.message));
     }
 
@@ -1563,10 +1618,12 @@ async fn append_session_messages(
                 return (StatusCode::BAD_REQUEST, Json(err)).into_response();
             }
         };
-        session.display_messages.push(atomcode_core::session::DisplayMessage {
-            after_message,
-            message: atomcode_core::conversation::message::Message::new(role, msg.content),
-        });
+        session
+            .display_messages
+            .push(atomcode_core::session::DisplayMessage {
+                after_message,
+                message: atomcode_core::conversation::message::Message::new(role, msg.content),
+            });
     }
 
     session.touch();
@@ -1966,8 +2023,8 @@ struct ArtifactDetector {
 enum ArtifactDetectorState {
     /// Normal text output
     Normal,
-    /// Inside a code block, collecting content
-    InCodeBlock { id: String, content: String },
+    /// Inside a code block
+    InCodeBlock { id: String },
     /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
     InHtml { id: String, content: String },
     /// Inside SVG block (detected by <svg> tag)
@@ -2013,139 +2070,211 @@ impl ArtifactDetector {
     /// Process incoming text delta and return events to emit
     fn process(&mut self, text: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
+        let mut remaining = text;
 
-        match &mut self.state {
-            ArtifactDetectorState::Normal => {
-                // Check for code block start
-                if text.starts_with("```") {
-                    let rest = &text[3..];
-                    let end_of_line = rest.find('\n').unwrap_or(rest.len());
-                    let language = rest[..end_of_line].trim().to_string();
+        while !remaining.is_empty() {
+            match self.state.clone() {
+                ArtifactDetectorState::Normal => {
+                    // Check for code block start
+                    if let Some((fence_start, content_start, language)) =
+                        Self::find_code_fence_start(remaining)
+                    {
+                        if fence_start > 0 {
+                            events.push(ChatEvent::TextDelta {
+                                content: remaining[..fence_start].to_string(),
+                            });
+                        }
 
-                    let (artifact_type, title) = Self::artifact_type_for_language(&language);
-                    let id = self.next_id();
-                    events.push(ChatEvent::ArtifactStart {
-                        id: id.clone(),
-                        artifact_type,
-                        language: Some(language.clone()),
-                        title,
-                    });
+                        let (artifact_type, title) = Self::artifact_type_for_language(&language);
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type,
+                            language: Some(language),
+                            title,
+                        });
 
-                    self.state = ArtifactDetectorState::InCodeBlock {
-                        id,
-                        content: String::new(),
-                    };
-                }
-                // Check for SVG block start (standalone <svg> tag)
-                else if self.is_svg_start(text) {
-                    let id = self.next_id();
-                    events.push(ChatEvent::ArtifactStart {
-                        id: id.clone(),
-                        artifact_type: "svg".to_string(),
-                        language: None,
-                        title: None,
-                    });
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
-
-                    self.state = ArtifactDetectorState::InSvg {
-                        id,
-                        content: text.to_string(),
-                    };
-                }
-                // Check for HTML block start
-                else if self.is_html_start(text) {
-                    let id = self.next_id();
-                    events.push(ChatEvent::ArtifactStart {
-                        id: id.clone(),
-                        artifact_type: "html".to_string(),
-                        language: None,
-                        title: None,
-                    });
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
-
-                    self.state = ArtifactDetectorState::InHtml {
-                        id,
-                        content: text.to_string(),
-                    };
-                } else {
-                    // Normal text
-                    events.push(ChatEvent::TextDelta {
-                        content: text.to_string(),
-                    });
-                }
-            }
-            ArtifactDetectorState::InCodeBlock { id, content } => {
-                // Check for code block end
-                if text.trim() == "```" {
-                    // Emit the accumulated content
-                    if !content.is_empty() {
+                        self.state = ArtifactDetectorState::InCodeBlock { id };
+                        remaining = &remaining[content_start..];
+                    }
+                    // Check for SVG block start (standalone <svg> tag)
+                    else if self.is_svg_start(remaining) {
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type: "svg".to_string(),
+                            language: None,
+                            title: None,
+                        });
                         events.push(ChatEvent::ArtifactContent {
                             id: id.clone(),
-                            content: content.clone(),
+                            content: remaining.to_string(),
                         });
+
+                        self.state = ArtifactDetectorState::InSvg {
+                            id,
+                            content: remaining.to_string(),
+                        };
+                        remaining = "";
                     }
-                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
-                    self.state = ArtifactDetectorState::Normal;
-                } else {
-                    // Accumulate content
-                    content.push_str(text);
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
+                    // Check for HTML block start
+                    else if self.is_html_start(remaining) {
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type: "html".to_string(),
+                            language: None,
+                            title: None,
+                        });
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+
+                        self.state = ArtifactDetectorState::InHtml {
+                            id,
+                            content: remaining.to_string(),
+                        };
+                        remaining = "";
+                    } else {
+                        // Normal text
+                        events.push(ChatEvent::TextDelta {
+                            content: remaining.to_string(),
+                        });
+                        remaining = "";
+                    }
                 }
-            }
-            ArtifactDetectorState::InHtml { id, content } => {
-                // Check for HTML end (simple heuristic: </html> or </body>)
-                let trimmed = text.trim();
-                if trimmed.ends_with("</html>")
-                    || trimmed.ends_with("</HTML>")
-                    || trimmed.ends_with("</body>")
-                    || trimmed.ends_with("</BODY>")
-                {
-                    content.push_str(text);
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
-                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
-                    self.state = ArtifactDetectorState::Normal;
-                } else {
-                    content.push_str(text);
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
+                ArtifactDetectorState::InCodeBlock { id } => {
+                    // Check for code block end
+                    if let Some((fence_start, after_fence_line)) =
+                        Self::find_code_fence_end(remaining)
+                    {
+                        if fence_start > 0 {
+                            events.push(ChatEvent::ArtifactContent {
+                                id: id.clone(),
+                                content: remaining[..fence_start].to_string(),
+                            });
+                        }
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                        remaining = &remaining[after_fence_line..];
+                    } else {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        remaining = "";
+                    }
                 }
-            }
-            ArtifactDetectorState::InSvg { id, content } => {
-                // Check for SVG end (</svg> tag)
-                let trimmed = text.trim();
-                if trimmed.ends_with("</svg>") || trimmed.ends_with("</SVG>") {
-                    content.push_str(text);
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
-                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
-                    self.state = ArtifactDetectorState::Normal;
-                } else {
-                    content.push_str(text);
-                    events.push(ChatEvent::ArtifactContent {
-                        id: id.clone(),
-                        content: text.to_string(),
-                    });
+                ArtifactDetectorState::InHtml { id, mut content } => {
+                    // Check for HTML end (simple heuristic: </html> or </body>)
+                    let trimmed = remaining.trim();
+                    if trimmed.ends_with("</html>")
+                        || trimmed.ends_with("</HTML>")
+                        || trimmed.ends_with("</body>")
+                        || trimmed.ends_with("</BODY>")
+                    {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                    } else {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        self.state = ArtifactDetectorState::InHtml { id, content };
+                    }
+                    remaining = "";
+                }
+                ArtifactDetectorState::InSvg { id, mut content } => {
+                    // Check for SVG end (</svg> tag)
+                    let trimmed = remaining.trim();
+                    if trimmed.ends_with("</svg>") || trimmed.ends_with("</SVG>") {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                    } else {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        self.state = ArtifactDetectorState::InSvg { id, content };
+                    }
+                    remaining = "";
                 }
             }
         }
 
         events
+    }
+
+    fn find_code_fence_start(text: &str) -> Option<(usize, usize, String)> {
+        let mut search_start = 0;
+        while let Some(relative_marker_start) = text[search_start..].find("```") {
+            let marker_start = search_start + relative_marker_start;
+            let line_start = text[..marker_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let indentation = &text[line_start..marker_start];
+
+            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
+                let language_start = marker_start + 3;
+                let line_end = text[language_start..]
+                    .find('\n')
+                    .map(|index| language_start + index);
+                let language = match line_end {
+                    Some(end) => text[language_start..end].trim().to_string(),
+                    None => text[language_start..].trim().to_string(),
+                };
+                let content_start = line_end.map_or(text.len(), |index| index + 1);
+                return Some((line_start, content_start, language));
+            }
+
+            search_start = marker_start + 3;
+        }
+
+        None
+    }
+
+    fn find_code_fence_end(text: &str) -> Option<(usize, usize)> {
+        let mut search_start = 0;
+        while let Some(relative_marker_start) = text[search_start..].find("```") {
+            let marker_start = search_start + relative_marker_start;
+            let line_start = text[..marker_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let indentation = &text[line_start..marker_start];
+
+            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
+                let after_marker = marker_start + 3;
+                let line_end = text[after_marker..]
+                    .find('\n')
+                    .map(|index| after_marker + index);
+                let trailing = match line_end {
+                    Some(end) => &text[after_marker..end],
+                    None => &text[after_marker..],
+                };
+
+                if trailing.trim().is_empty() {
+                    let after_fence_line = line_end.map_or(text.len(), |index| index + 1);
+                    return Some((line_start, after_fence_line));
+                }
+            }
+
+            search_start = marker_start + 3;
+        }
+
+        None
     }
 
     fn is_html_start(&self, text: &str) -> bool {
@@ -2164,7 +2293,7 @@ impl ArtifactDetector {
     /// Finalize any pending artifact
     fn finish(&mut self) -> Option<ChatEvent> {
         match &self.state {
-            ArtifactDetectorState::InCodeBlock { id, .. } => {
+            ArtifactDetectorState::InCodeBlock { id } => {
                 let id = id.clone();
                 self.state = ArtifactDetectorState::Normal;
                 Some(ChatEvent::ArtifactEnd { id })
@@ -2399,7 +2528,11 @@ async fn process_chat_request(
             conv.messages.push(Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if req.message.is_empty() { None } else { Some(req.message.clone()) },
+                    text: if req.message.is_empty() {
+                        None
+                    } else {
+                        Some(req.message.clone())
+                    },
                     images,
                 },
                 synthetic: false,
@@ -2574,28 +2707,30 @@ async fn process_chat_request(
     // plumbing. The standalone daemon (VSCode extension, no browser) has no
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if interactive_permission {
-        let (perm_req_tx, perm_req_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-        let (perm_resp_tx, perm_resp_rx) =
-            tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-        let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-            atomcode_core::tool::PermissionStore::new(),
-        ));
-        pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-        (
-            Box::new(InteractivePermissionDecider::new(
-                perm_req_tx,
-                perm_resp_rx,
-                perm_store,
-            )),
-            Some(perm_req_rx),
-        )
-    } else {
-        (
-            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-            None,
-        )
-    };
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) =
+        if interactive_permission {
+            let (perm_req_tx, perm_req_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+            let (perm_resp_tx, perm_resp_rx) =
+                tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                atomcode_core::tool::PermissionStore::new(),
+            ));
+            pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+            (
+                Box::new(InteractivePermissionDecider::new(
+                    perm_req_tx,
+                    perm_resp_rx,
+                    perm_store,
+                )),
+                Some(perm_req_rx),
+            )
+        } else {
+            (
+                Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+                None,
+            )
+        };
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider (the one actually selected for this turn,
     // not config.default_provider), fallback to synthetic 128K config if absent.
@@ -2735,10 +2870,8 @@ async fn process_chat_request(
                             .iter()
                             .rev()
                             .find(|m| {
-                                matches!(
-                                    m.role,
-                                    atomcode_core::conversation::message::Role::User
-                                ) && !m.synthetic
+                                matches!(m.role, atomcode_core::conversation::message::Role::User)
+                                    && !m.synthetic
                             })
                             .and_then(|m| m.text())
                             .map(|text| {
@@ -2971,6 +3104,19 @@ async fn process_chat_request(
         if was_stopped {
             conv.cancel_current_turn();
         }
+        let submitted_images: Vec<atomcode_core::conversation::message::ImagePart> = req
+            .images
+            .iter()
+            .map(|i| atomcode_core::conversation::message::ImagePart {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+            })
+            .collect();
+        restore_submitted_user_images_before_save(
+            &mut conv.messages,
+            &req.message,
+            &submitted_images,
+        );
         session.update_from_conversation(&conv);
     }
     session.auto_name_from_messages();
@@ -4252,7 +4398,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/cancel", post(live_api::live_cancel))
         .route("/live/command", post(live_api::live_command))
-        .route("/live/switch_session", post(live_api::live_switch_session_endpoint))
+        .route(
+            "/live/switch_session",
+            post(live_api::live_switch_session_endpoint),
+        )
         .route(
             "/live/reasoning_effort",
             post(live_api::live_reasoning_effort),
@@ -4509,11 +4658,110 @@ mod tests {
         })
         .unwrap();
         // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
-        assert!(json.contains(r#""type":"rate_limited""#), "wrong type: {json}");
+        assert!(
+            json.contains(r#""type":"rate_limited""#),
+            "wrong type: {json}"
+        );
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
         assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
         assert!(json.contains(r#""auto_resuming":false"#), "{json}");
+    }
+
+    #[test]
+    fn message_info_user_text_with_vl_marker_renders_missing_image_placeholder() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        let msg = Message::new(
+            Role::User,
+            "识别图片内容\n\n[图片内容（由 AtomGit-Qwen-Qwen3-VL-8B-Instruct 识别）]\n这是一张图片",
+        );
+
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.content, "识别图片内容");
+        assert!(matches!(
+            info.images.as_deref(),
+            Some([ImageData { missing: true, .. }])
+        ));
+    }
+
+    #[test]
+    fn restore_submitted_user_images_before_save_repairs_text_only_v2_snapshot() {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+
+        let mut messages = vec![
+            Message::new(Role::System, "session context"),
+            Message::new(
+                Role::User,
+                "分析图片内容\n\n[图片内容（由 vl-provider 识别）]\n图片描述",
+            ),
+            Message::new(Role::Assistant, "done"),
+        ];
+        let images = vec![ImagePart {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }];
+
+        restore_submitted_user_images_before_save(&mut messages, "分析图片内容", &images);
+
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::MultiPart { text, images }
+                if text.as_deref() == Some("分析图片内容")
+                    && images.len() == 1
+                    && images[0].data == "aW1hZ2U="
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_does_not_repeat_full_code_block_content_on_close() {
+        let mut detector = ArtifactDetector::new();
+        assert!(matches!(
+            detector.process("```typescript\n").as_slice(),
+            [ChatEvent::ArtifactStart { .. }]
+        ));
+
+        let first_delta = detector.process("export const value = 1;\n");
+        assert!(matches!(
+            first_delta.as_slice(),
+            [ChatEvent::ArtifactContent { content, .. }] if content == "export const value = 1;\n"
+        ));
+
+        let close_events = detector.process("```");
+        assert!(matches!(
+            close_events.as_slice(),
+            [ChatEvent::ArtifactEnd { .. }]
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_splits_fenced_code_when_delta_contains_surrounding_text() {
+        let mut detector = ArtifactDetector::new();
+        let events = detector.process("验证：\n```rust\n#[test]\nfn renders_code() {}\n```\n完成");
+
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            ChatEvent::TextDelta { content } if content == "验证：\n"
+        ));
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ArtifactStart { artifact_type, language, title, .. }
+                if artifact_type == "code"
+                    && language.as_deref() == Some("rust")
+                    && title.as_deref() == Some("rust")
+        ));
+        assert!(matches!(
+            &events[2],
+            ChatEvent::ArtifactContent { content, .. }
+                if content == "#[test]\nfn renders_code() {}\n"
+        ));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(matches!(
+            &events[4],
+            ChatEvent::TextDelta { content } if content == "完成"
+        ));
     }
 
     #[test]
@@ -4740,9 +4988,25 @@ mod channel_mode_tests {
 
     #[test]
     fn channel_interactive_only_on_loopback() {
-        assert!(channel_interactive_permission(SessionMode::Ide, true, "0.0.0.0"));
-        assert!(channel_interactive_permission(SessionMode::Channel, false, "127.0.0.1"));
-        assert!(!channel_interactive_permission(SessionMode::Channel, false, "0.0.0.0"));
-        assert!(!channel_interactive_permission(SessionMode::Ide, false, "127.0.0.1"));
+        assert!(channel_interactive_permission(
+            SessionMode::Ide,
+            true,
+            "0.0.0.0"
+        ));
+        assert!(channel_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(!channel_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!channel_interactive_permission(
+            SessionMode::Ide,
+            false,
+            "127.0.0.1"
+        ));
     }
 }

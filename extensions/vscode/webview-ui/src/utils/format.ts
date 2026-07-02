@@ -1,6 +1,11 @@
-export function formatTokenCount(total: number): string {
-  if (total < 1000) return `${total} tokens`;
-  return `${(total / 1000).toFixed(1)}k tokens`;
+import type { MsgKey } from '../i18n';
+
+type Translator = (key: MsgKey, params?: Record<string, string | number | boolean>) => string;
+
+export function formatTokenCount(total: number, t?: Translator): string {
+  if (total < 1000) return t ? t('token.count', { count: total }) : `${total} tokens`;
+  const count = (total / 1000).toFixed(1);
+  return t ? t('token.countK', { count }) : `${count}k tokens`;
 }
 
 function toTimestamp(value?: string | number): number | undefined {
@@ -12,18 +17,18 @@ function toTimestamp(value?: string | number): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-export function formatTimeAgo(dateStr?: string | number): string {
+export function formatTimeAgo(dateStr?: string | number, t?: Translator): string {
   const ts = toTimestamp(dateStr);
   if (!ts) return '';
   const diff = Date.now() - ts;
   const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return t ? t('time.justNow') : 'just now';
+  if (mins < 60) return t ? t('time.minutesAgo', { count: mins }) : `${mins}m ago`;
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 24) return t ? t('time.hoursAgo', { count: hours }) : `${hours}h ago`;
   const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return 'older';
+  if (days < 7) return t ? t('time.daysAgo', { count: days }) : `${days}d ago`;
+  return t ? t('time.older') : 'older';
 }
 
 export function escapeHtml(text: string): string {

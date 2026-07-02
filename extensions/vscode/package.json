@@ -1,8 +1,8 @@
 {
   "name": "atomcode-tools",
-  "displayName": "AtomCode for VS Code",
-  "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
-  "version": "0.0.9",
+  "displayName": "%atomcode.displayName%",
+  "description": "%atomcode.description%",
+  "version": "0.1.0",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
@@ -26,6 +26,7 @@
   ],
   "icon": "resources/icon.png",
   "main": "./out/extension.js",
+  "l10n": "./l10n",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -33,52 +34,56 @@
     "commands": [
       {
         "command": "atomcode.openSidebar",
-        "title": "AtomCode: Open in Side Bar",
+        "title": "%atomcode.commands.openSidebar.title%",
         "icon": "$(hubot)"
       },
       {
         "command": "atomcode.openTab",
-        "title": "AtomCode: Open in New Tab",
+        "title": "%atomcode.commands.openTab.title%",
         "icon": "$(hubot)"
       },
       {
         "command": "atomcode.openPreferredLocation",
-        "title": "AtomCode: Open Preferred Location",
+        "title": "%atomcode.commands.openPreferredLocation.title%",
         "icon": "$(hubot)"
       },
       {
         "command": "atomcode.focusInput",
-        "title": "AtomCode: Focus Input",
+        "title": "%atomcode.commands.focusInput.title%",
         "icon": "$(edit)"
       },
       {
         "command": "atomcode.newConversation",
-        "title": "AtomCode: New Conversation",
+        "title": "%atomcode.commands.newConversation.title%",
         "icon": "$(add)"
       },
       {
         "command": "atomcode.explain",
-        "title": "AtomCode: Explain Selection",
+        "title": "%atomcode.commands.explain.title%",
+        "shortTitle": "%atomcode.commands.explain.shortTitle%",
         "icon": "$(question)"
       },
       {
         "command": "atomcode.fix",
-        "title": "AtomCode: Fix Selection",
+        "title": "%atomcode.commands.fix.title%",
+        "shortTitle": "%atomcode.commands.fix.shortTitle%",
         "icon": "$(wrench)"
       },
       {
         "command": "atomcode.optimize",
-        "title": "AtomCode: Optimize Selection",
+        "title": "%atomcode.commands.optimize.title%",
+        "shortTitle": "%atomcode.commands.optimize.shortTitle%",
         "icon": "$(rocket)"
       },
       {
         "command": "atomcode.addToChat",
-        "title": "AtomCode: Add to Chat",
+        "title": "%atomcode.commands.addToChat.title%",
+        "shortTitle": "%atomcode.commands.addToChat.shortTitle%",
         "icon": "$(comment-add)"
       },
       {
         "command": "atomcode.stop",
-        "title": "AtomCode: Stop Generation",
+        "title": "%atomcode.commands.stop.title%",
         "icon": "$(stop-circle)"
       }
     ],
@@ -96,7 +101,7 @@
         {
           "type": "webview",
           "id": "atomcode.chatView",
-          "name": "Sessions",
+          "name": "%atomcode.views.chat.name%",
           "icon": "resources/icon.svg"
         }
       ]
@@ -131,17 +136,17 @@
         "atomcode.daemon.port": {
           "type": "number",
           "default": 13456,
-          "description": "AtomCode daemon HTTP port"
+          "description": "%atomcode.configuration.daemon.port.description%"
         },
         "atomcode.daemon.autoStart": {
           "type": "boolean",
           "default": true,
-          "description": "Auto-start daemon if not running"
+          "description": "%atomcode.configuration.daemon.autoStart.description%"
         },
         "atomcode.daemon.binaryPath": {
           "type": "string",
           "default": "",
-          "description": "Path to atomcode binary (auto-detected if empty)"
+          "description": "%atomcode.configuration.daemon.binaryPath.description%"
         },
         "atomcode.preferredLocation": {
           "type": "string",
@@ -150,27 +155,27 @@
             "panel"
           ],
           "default": "sidebar",
-          "description": "Where to open the chat panel"
+          "description": "%atomcode.configuration.preferredLocation.description%"
         },
         "atomcode.autoSave": {
           "type": "boolean",
           "default": true,
-          "description": "Auto-save files before AI reads them"
+          "description": "%atomcode.configuration.autoSave.description%"
         },
         "atomcode.sendWithCtrlEnter": {
           "type": "boolean",
           "default": false,
-          "description": "Use Ctrl+Enter instead of Enter to send messages"
+          "description": "%atomcode.configuration.sendWithCtrlEnter.description%"
         },
         "atomcode.fontSize": {
           "type": "number",
           "default": 13,
-          "description": "Font size in chat panel"
+          "description": "%atomcode.configuration.fontSize.description%"
         },
         "atomcode.showInlineHints": {
           "type": "boolean",
           "default": true,
-          "description": "Show inline diff hints when AI edits files"
+          "description": "%atomcode.configuration.showInlineHints.description%"
         }
       }
     },
@@ -205,6 +210,7 @@
     "bundle:daemon": "node scripts/bundle-daemon.js",
     "bundle:daemon:required": "node scripts/bundle-daemon.js --require",
     "compile": "tsc -p ./ && npm run build:webview",
+    "test:webview": "node webview-ui/test/run-tests.js",
     "vscode:prepublish": "npm run compile && npm run bundle:daemon",
     "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
     "lint": "eslint src --ext ts",

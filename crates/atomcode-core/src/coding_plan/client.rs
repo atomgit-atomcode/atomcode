@@ -143,14 +143,17 @@ impl Client {
     pub fn claim_v2(&self, plan_type: PlanType) -> Result<ClaimResponse> {
         let url = format!("{}/coding-plan/claim-v2", api_base_url());
         let body_str = format!(r#"{{"plan_type":"{}"}}"#, plan_type.as_str());
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .with_context(|| format!("POST {} failed", url))?;
+        // Retry transient transport failures ("error sending request"): the POST never
+        // reached the server on a send error, so re-sending cannot double-claim.
+        let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .header("Content-Type", "application/json")
+                .body(body_str.clone())
+                .send()
+        })
+        .with_context(|| format!("POST {} failed", url))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -182,12 +185,10 @@ impl Client {
             api_base_url(),
             plan_type.as_str()
         );
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .with_context(|| format!("GET {} failed", url))?;
+        let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
+            self.http.get(&url).bearer_auth(&self.token).send()
+        })
+        .with_context(|| format!("GET {} failed", url))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -212,12 +213,10 @@ impl Client {
     /// rollout, so the parser type stays put.
     pub fn status_v2(&self) -> Result<StatusResponse> {
         let url = format!("{}/coding-plan/status-v2", api_base_url());
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .with_context(|| format!("GET {} failed", url))?;
+        let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
+            self.http.get(&url).bearer_auth(&self.token).send()
+        })
+        .with_context(|| format!("GET {} failed", url))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -282,9 +281,102 @@ fn format_api_error(descriptor: &str, status: reqwest::StatusCode, body: &str) -
     )
 }
 
+/// Backoff between retry attempts for the CodingPlan HTTP requests. Length = number of
+/// RETRIES (2 ⇒ up to 3 total attempts).
+const CODING_PLAN_RETRY_BACKOFFS: [std::time::Duration; 2] =
+    [std::time::Duration::from_millis(400), std::time::Duration::from_millis(1200)];
+
+/// A reqwest error worth retrying: a TRANSPORT-layer failure where the request did not reach
+/// the server (connect / timeout / send), so re-sending is safe even for a POST — the server
+/// never processed the first attempt (an HTTP error STATUS would come back as `Ok(resp)`, not
+/// a send `Err`). Also walks the source chain for a transient transport `io::Error` (a stale
+/// keep-alive reset, etc. — the "error sending request" class).
+fn is_transient_send_error(e: &reqwest::Error) -> bool {
+    use std::error::Error;
+    if e.is_timeout() || e.is_connect() || e.is_request() {
+        return true;
+    }
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            if matches!(
+                io.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | TimedOut | NotConnected
+            ) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+    false
+}
+
+/// Call `f`, retrying on transient errors with `backoffs` sleeps between attempts. Returns the
+/// first `Ok`, or the last `Err` once a non-transient error occurs or the backoffs run out.
+/// Generic (no reqwest types) so the retry/stop logic is unit-testable in isolation.
+fn with_retries<T, E, F>(
+    backoffs: &[std::time::Duration],
+    is_transient: impl Fn(&E) -> bool,
+    mut f: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> std::result::Result<T, E>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match f() {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                if attempt < backoffs.len() && is_transient(&e) {
+                    std::thread::sleep(backoffs[attempt]);
+                    attempt += 1;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn with_retries_retries_transient_then_succeeds() {
+        let calls = Cell::new(0);
+        let r: Result<i32, &str> = with_retries(&[Duration::ZERO, Duration::ZERO], |_| true, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 { Err("transient") } else { Ok(42) }
+        });
+        assert_eq!(r, Ok(42));
+        assert_eq!(calls.get(), 3, "two retries then success");
+    }
+
+    #[test]
+    fn with_retries_does_not_retry_non_transient() {
+        let calls = Cell::new(0);
+        let r: Result<i32, &str> = with_retries(&[Duration::ZERO, Duration::ZERO], |_| false, || {
+            calls.set(calls.get() + 1);
+            Err("permanent")
+        });
+        assert_eq!(r, Err("permanent"));
+        assert_eq!(calls.get(), 1, "non-transient ⇒ no retry");
+    }
+
+    #[test]
+    fn with_retries_exhausts_backoffs_then_returns_last_err() {
+        let calls = Cell::new(0);
+        let r: Result<i32, &str> = with_retries(&[Duration::ZERO], |_| true, || {
+            calls.set(calls.get() + 1);
+            Err("always")
+        });
+        assert_eq!(r, Err("always"));
+        assert_eq!(calls.get(), 2, "1 backoff ⇒ 1 retry ⇒ 2 attempts total");
+    }
 
     /// `AuthExpired` must Display identically to the legacy
     /// `anyhow!("authentication failed (NNN) — run `atomcode login` again")`

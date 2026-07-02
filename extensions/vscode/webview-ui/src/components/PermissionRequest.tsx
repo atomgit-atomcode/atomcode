@@ -3,6 +3,7 @@ import { PermissionRequestData } from '../state/types';
 import { useChatContext } from '../state/ChatProvider';
 import { postMessage } from '../vscode';
 import { formatToolArgs } from '../utils/format';
+import { useT } from '../i18n';
 
 interface PermissionRequestProps {
   request: PermissionRequestData;
@@ -10,6 +11,7 @@ interface PermissionRequestProps {
 
 export function PermissionRequest({ request }: PermissionRequestProps) {
   const { dispatch } = useChatContext();
+  const t = useT();
 
   const handleRespond = useCallback((allowed: boolean) => {
     dispatch({ type: 'PERMISSION_RESPOND', id: request.id, allowed });
@@ -47,7 +49,7 @@ export function PermissionRequest({ request }: PermissionRequestProps) {
         )}
         {request.isDestructive && (
           <div style={{ marginBottom: 12 }}>
-            <span className="tool-annotation destructive">destructive</span>
+            <span className="tool-annotation destructive">{t('tool.destructive')}</span>
           </div>
         )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -60,7 +62,7 @@ export function PermissionRequest({ request }: PermissionRequestProps) {
               borderRadius: 5, padding: '4px 14px', fontSize: 12, cursor: 'pointer',
             }}
           >
-            Deny
+            {t('permission.deny')}
           </button>
           <button
             onClick={() => handleRespond(true)}
@@ -71,7 +73,7 @@ export function PermissionRequest({ request }: PermissionRequestProps) {
               borderRadius: 5, padding: '4px 14px', fontSize: 12, cursor: 'pointer',
             }}
           >
-            Allow
+            {t('permission.allow')}
           </button>
         </div>
       </div>

@@ -54,8 +54,17 @@ impl SessionContextHook {
     }
 
     fn env_block(&self) -> String {
-        let shell = std::env::var("SHELL")
-            .unwrap_or_else(|_| if cfg!(windows) { "cmd.exe".into() } else { "sh".into() });
+        // Report the shell the `bash` tool ACTUALLY uses, so the model's env line agrees
+        // with the tool description. On Windows that is Git Bash when present, else
+        // cmd.exe (NOT `$SHELL`, which the tool ignores) — the old hard-coded "cmd.exe"
+        // lied whenever Git Bash was installed, so the model emitted cmd syntax that then
+        // ran in bash and broke. See `crate::tools::bash::windows_bash_active`.
+        let shell = if cfg!(windows) {
+            crate::tools::bash::windows_shell_label(crate::tools::bash::windows_bash_active())
+                .to_string()
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
+        };
         format!(
             "Working directory: {}\nPlatform: {}\nShell: {}",
             self.working_dir.display(),

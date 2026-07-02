@@ -181,7 +181,10 @@ mod tests {
         );
         // Among other cookies, any order.
         assert_eq!(
-            token_from_cookie(Some("foo=1; atomcode_webui=abc123; bar=2"), "atomcode_webui"),
+            token_from_cookie(
+                Some("foo=1; atomcode_webui=abc123; bar=2"),
+                "atomcode_webui"
+            ),
             Some("abc123".to_string())
         );
         assert_eq!(
@@ -194,11 +197,23 @@ mod tests {
     fn cookie_without_token_is_none() {
         assert_eq!(token_from_cookie(None, "atomcode_webui"), None);
         assert_eq!(token_from_cookie(Some(""), "atomcode_webui"), None);
-        assert_eq!(token_from_cookie(Some("foo=1; bar=2"), "atomcode_webui"), None);
-        assert_eq!(token_from_cookie(Some("atomcode_webui="), "atomcode_webui"), None);
-        assert_eq!(token_from_cookie(Some("atomcode_webui= "), "atomcode_webui"), None);
+        assert_eq!(
+            token_from_cookie(Some("foo=1; bar=2"), "atomcode_webui"),
+            None
+        );
+        assert_eq!(
+            token_from_cookie(Some("atomcode_webui="), "atomcode_webui"),
+            None
+        );
+        assert_eq!(
+            token_from_cookie(Some("atomcode_webui= "), "atomcode_webui"),
+            None
+        );
         // Must not match a different cookie that merely ends with the name.
-        assert_eq!(token_from_cookie(Some("x_atomcode_webui=nope"), "atomcode_webui"), None);
+        assert_eq!(
+            token_from_cookie(Some("x_atomcode_webui=nope"), "atomcode_webui"),
+            None
+        );
     }
 
     #[test]

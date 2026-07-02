@@ -132,6 +132,11 @@ struct ReviewArgs {
     /// Emit findings as JSON instead of a human-readable report.
     #[arg(long)]
     json: bool,
+    /// Disable the `web_search` tool for this review. Use when the runtime has no/blocked web
+    /// egress, so a web_search attempt can't fail and abort the whole review. Other read-only
+    /// tools are unaffected. Default: web_search stays available.
+    #[arg(long)]
+    no_web: bool,
 }
 
 #[tokio::main]
@@ -275,6 +280,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
     cfg.max_rounds = args.max_rounds;
     cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
+    cfg.no_web = args.no_web;
     // Full system-prompt override (flag text > file/stdin). None ⇒ built-in reviewer persona.
     cfg.persona = resolve_system_prompt(args.system_prompt.clone(), args.system_prompt_file.clone())?;
     // Appended sections compose after the persona: engine-injected language rules first,

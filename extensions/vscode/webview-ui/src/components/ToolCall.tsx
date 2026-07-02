@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react';
 import { ToolCallData } from '../state/types';
 import { formatToolArgs } from '../utils/format';
 import { DiffView } from './DiffView';
+import { useT } from '../i18n';
 
 interface ToolCallProps {
   tool: ToolCallData;
@@ -13,6 +14,7 @@ function isDiffContent(output: string): boolean {
 
 function CopyButton({ text, label }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const t = useT();
 
   const handleCopy = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
@@ -23,7 +25,7 @@ function CopyButton({ text, label }: { text: string; label?: string }) {
   }, [text]);
 
   return (
-    <button className="tool-body-row-copy" onClick={handleCopy} title={copied ? 'Copied!' : `Copy ${label || ''}`}>
+    <button className="tool-body-row-copy" onClick={handleCopy} title={copied ? t('tool.copied') : t('tool.copy', { label: label || '' })}>
       {copied ? '✓' : '📋'}
     </button>
   );
@@ -31,6 +33,7 @@ function CopyButton({ text, label }: { text: string; label?: string }) {
 
 export function ToolCall({ tool }: ToolCallProps) {
   const [expanded, setExpanded] = useState(false);
+  const t = useT();
   const secondary = formatToolArgs(tool.name, tool.args);
 
   const isEditTool = /edit|write/i.test(tool.name);
@@ -42,11 +45,11 @@ export function ToolCall({ tool }: ToolCallProps) {
     tool.status === 'queued' ? 'queued' : '';
 
   const annotationText =
-    tool.status === 'queued' ? 'waiting' :
+    tool.status === 'queued' ? t('tool.waiting') :
     tool.status === 'running' ? undefined :
-    tool.status === 'error' ? 'error' :
-    isEditTool && tool.status === 'done' ? 'applied' :
-    tool.durationMs !== undefined ? `${(tool.durationMs / 1000).toFixed(1)}s` : 'done';
+    tool.status === 'error' ? t('tool.error') :
+    isEditTool && tool.status === 'done' ? t('tool.applied') :
+    tool.durationMs !== undefined ? `${(tool.durationMs / 1000).toFixed(1)}s` : t('tool.done');
 
   return (
     <div className="tool-body">
@@ -68,7 +71,7 @@ export function ToolCall({ tool }: ToolCallProps) {
           <div className="tool-body-row">
             <div className="tool-body-row-label-row">
               <span className="tool-body-row-label">IN</span>
-              <CopyButton text={tool.args} label="input" />
+              <CopyButton text={tool.args} label={t('tool.input')} />
             </div>
             <div className="tool-body-row-content clipped">{tool.args}</div>
           </div>
@@ -76,7 +79,7 @@ export function ToolCall({ tool }: ToolCallProps) {
             <div className="tool-body-row">
               <div className="tool-body-row-label-row">
                 <span className="tool-body-row-label">OUT</span>
-                <CopyButton text={tool.output} label="output" />
+                <CopyButton text={tool.output} label={t('tool.output')} />
               </div>
               <div className="tool-body-row-content" style={showDiff ? { maxHeight: 'none' } : undefined}>
                 {showDiff ? <DiffView content={tool.output} /> : tool.output}

@@ -755,8 +755,11 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
         Msg::PluginGitNotFound =>
             "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart AtomCode.".into(),
-        Msg::PluginMarketplaceAdded { name, commit, count } =>
-            format!("✓ marketplace `{name}` added at {commit} ({count} plugins)").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
+            format!(
+                "✓ marketplace `{name}` added at {commit} ({count} plugins)\n  \
+                 Plugins: {plugins} — run /plugin install <plugin>@{name} to install before using its commands"
+            ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {

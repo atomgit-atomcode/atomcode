@@ -7,7 +7,7 @@ export class StatusBarManager {
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.item.command = 'atomcode.openPreferredLocation';
-    this.item.tooltip = 'AtomCode: Click to open chat';
+    this.item.tooltip = vscode.l10n.t('AtomCode: Click to open chat');
     this.update(false);
     this.item.show();
   }
@@ -19,11 +19,11 @@ export class StatusBarManager {
     if (connected) {
       this.item.text = '$(hubot) AtomCode';
       this.item.tooltip = this._model
-        ? `AtomCode: Connected (${this._model})`
-        : 'AtomCode: Connected';
+        ? vscode.l10n.t('AtomCode: Connected ({model})', { model: this._model })
+        : vscode.l10n.t('AtomCode: Connected');
     } else {
       this.item.text = '$(hubot) AtomCode ○';
-      this.item.tooltip = 'AtomCode: Not connected — click to retry';
+      this.item.tooltip = vscode.l10n.t('AtomCode: Not connected — click to retry');
     }
   }
 

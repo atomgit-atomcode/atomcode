@@ -535,7 +535,7 @@ pub enum Msg<'a> {
     /// for both manual `/plugin marketplace add` and the detached
     /// startup-bootstrap auto-install. `count` is the number of plugins the
     /// marketplace exposes after cloning.
-    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize },
+    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize, plugins: &'a str },
     /// Marketplace `update` completion toast — HEAD actually moved. No-op
     /// pulls (HEAD unchanged) emit no toast at all so a quiet `git pull`
     /// doesn't spam the body region.

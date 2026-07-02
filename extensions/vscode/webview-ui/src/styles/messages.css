@@ -126,7 +126,7 @@
 .user-message-bubble {
   display: block;
   position: relative;
-  white-space: pre-wrap;
+  white-space: normal;
   word-break: break-word;
   border: 1px solid var(--vscode-chat-requestBorder, var(--app-input-border));
   border-radius: var(--corner-radius-small);
@@ -154,7 +154,7 @@
 }
 
 .user-message-text {
-  white-space: pre-wrap;
+  white-space: normal;
 }
 
 .user-message-text.is-collapsed {
@@ -242,11 +242,41 @@
   background: var(--app-primary-background);
 }
 
+.user-message-image-placeholder {
+  width: min(180px, 100%);
+  height: 120px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px dashed var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 35%);
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+}
+
+.user-message-image-placeholder-icon {
+  font-size: 28px;
+  line-height: 1;
+  color: var(--app-secondary-foreground);
+}
+
 /* === Assistant Message === */
 .assistant-message-content {
   font-size: 13px;
   line-height: 1.6;
   width: 100%;
+  min-width: 0;
+}
+
+.assistant-block-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
 }
 
@@ -332,7 +362,14 @@
   color: var(--app-primary-foreground);
 }
 
-.markdown-root pre code { padding: 0; }
+.markdown-root pre code {
+  display: block;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: inherit;
+  word-break: normal;
+}
 
 .markdown-root .ansi-fg-black { color: var(--vscode-terminal-ansiBlack, #000000); }
 .markdown-root .ansi-fg-red { color: var(--vscode-terminal-ansiRed, #cd3131); }
@@ -382,20 +419,123 @@
 }
 
 /* === Code Block === */
-.code-block-wrapper { position: relative; margin: 10px 0; }
+.code-block-wrapper {
+  position: relative;
+  margin: 8px 0;
+  max-width: 100%;
+  min-width: 0;
+}
 
 .code-block-wrapper pre {
   overflow-x: auto;
   white-space: pre;
   border-radius: 6px;
-  padding: 14px 16px;
+  padding: 10px 12px;
+  padding-right: 38px;
   max-width: 100%;
   margin: 0;
   font-family: var(--app-monospace-font-family);
   font-size: var(--app-monospace-font-size);
-  line-height: 1.65;
+  line-height: 1.5;
   background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
   border: 1px solid var(--app-input-border);
+}
+
+.code-block-wrapper.is-single-line {
+  margin: 6px 0;
+}
+
+.code-block-wrapper.is-single-line pre {
+  min-height: 34px;
+  padding: 7px 36px 7px 12px;
+  line-height: 1.45;
+  display: flex;
+  align-items: center;
+}
+
+.code-block-wrapper.is-short-block pre {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  line-height: 1.5;
+}
+
+.code-block-wrapper.no-language code {
+  color: var(--app-primary-foreground);
+}
+
+.code-block-wrapper.is-diff-like code {
+  color: var(--app-primary-foreground);
+}
+
+.code-block-wrapper.is-diff-like pre {
+  padding: 0;
+  display: block;
+  line-height: 1.45;
+}
+
+.code-block-wrapper.is-diff-like.is-single-line pre {
+  min-height: 0;
+}
+
+.code-block-wrapper.is-diff-like .hljs {
+  display: block;
+}
+
+.diff-code-line {
+  display: grid;
+  grid-template-columns: 22px minmax(max-content, 1fr);
+  min-width: max-content;
+  padding: 3px 36px 3px 0;
+}
+
+.diff-code-empty {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.diff-code-gutter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  text-align: center;
+  color: var(--vscode-editorLineNumber-foreground, var(--app-secondary-foreground));
+}
+
+.diff-code-content {
+  display: block;
+  white-space: pre;
+}
+
+.diff-code-add {
+  background: var(--vscode-diffEditor-insertedLineBackground, rgba(35, 134, 54, 0.16));
+}
+
+.diff-code-add .diff-code-gutter {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #2da44e);
+}
+
+.diff-code-del {
+  background: var(--vscode-diffEditor-removedLineBackground, rgba(248, 81, 73, 0.16));
+}
+
+.diff-code-del .diff-code-gutter {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #cf222e);
+}
+
+.diff-code-ctx {
+  background: transparent;
+}
+
+.diff-code-hunk,
+.diff-code-meta {
+  color: var(--app-secondary-foreground);
+  background: var(--vscode-diffEditor-diagonalFill, color-mix(in srgb, var(--app-secondary-background), transparent 45%));
+}
+
+.diff-code-hunk .diff-code-gutter,
+.diff-code-meta .diff-code-gutter {
+  color: transparent;
 }
 
 /* Subtle selection highlight in code blocks — avoids jarring browser default blue */
@@ -412,7 +552,7 @@
   position: absolute;
   top: 6px;
   right: 6px;
-  opacity: 0.55;
+  opacity: 0.34;
   transition: opacity 0.15s, background 0.15s;
   background: var(--app-secondary-background);
   border: 1px solid var(--app-input-border);
@@ -427,7 +567,152 @@
   font-size: 11px;
 }
 
+.code-block-wrapper.is-single-line .copy-button {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.code-block-wrapper:hover .copy-button {
+  opacity: 0.65;
+}
+
 .copy-button:hover { opacity: 1; background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
+
+/* === Artifact Block === */
+.artifact-block {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-medium);
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+}
+
+.artifact-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--app-input-border);
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 45%);
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
+
+.artifact-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--app-primary-foreground);
+  font-weight: 600;
+}
+
+.artifact-meta,
+.artifact-status {
+  flex-shrink: 0;
+  color: var(--app-secondary-foreground);
+}
+
+.artifact-status {
+  margin-left: auto;
+}
+
+.artifact-block .artifact-code-render .code-block-wrapper {
+  margin: 0;
+}
+
+.artifact-block .artifact-code-render .code-block-wrapper pre {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+.artifact-diff {
+  overflow-x: auto;
+}
+
+.artifact-block.is-streaming .artifact-status {
+  color: var(--app-link-color);
+}
+
+/* === Diff View === */
+.diff-view {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  font-family: var(--app-monospace-font-family);
+  font-size: var(--app-monospace-font-size-small);
+  line-height: 1.45;
+  background: var(--app-tool-background);
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: 38px 38px 22px minmax(max-content, 1fr);
+  min-width: max-content;
+}
+
+.diff-line-number,
+.diff-marker {
+  user-select: none;
+  text-align: right;
+  color: var(--vscode-editorLineNumber-foreground, var(--app-secondary-foreground));
+}
+
+.diff-line-number {
+  padding: 1px 6px 1px 4px;
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 22%);
+}
+
+.diff-marker {
+  padding: 1px 6px;
+  text-align: center;
+}
+
+.diff-line-content {
+  padding: 1px 12px 1px 2px;
+  white-space: pre;
+}
+
+.diff-row-add {
+  background: var(--vscode-diffEditor-insertedLineBackground, rgba(35, 134, 54, 0.16));
+}
+
+.diff-row-add .diff-marker,
+.diff-row-add .new {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #2da44e);
+}
+
+.diff-row-del {
+  background: var(--vscode-diffEditor-removedLineBackground, rgba(248, 81, 73, 0.16));
+}
+
+.diff-row-del .diff-marker,
+.diff-row-del .old {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #cf222e);
+}
+
+.diff-row-hunk,
+.diff-row-meta {
+  color: var(--app-secondary-foreground);
+  background: var(--vscode-diffEditor-diagonalFill, color-mix(in srgb, var(--app-secondary-background), transparent 45%));
+}
+
+.diff-row-hunk .diff-line-content,
+.diff-row-meta .diff-line-content {
+  grid-column: 1 / -1;
+  padding-left: 10px;
+}
+
+.diff-row-hunk .diff-line-number,
+.diff-row-hunk .diff-marker,
+.diff-row-meta .diff-line-number,
+.diff-row-meta .diff-marker {
+  display: none;
+}
 
 /* === Tool Call === */
 .tool-list {

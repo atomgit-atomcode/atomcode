@@ -380,7 +380,7 @@ pub async fn run(
         atomcode_core::config::UiTheme::Light => true,
         atomcode_core::config::UiTheme::Dark => false,
         atomcode_core::config::UiTheme::Auto => {
-            if caps.colors {
+            if caps.colors && !force_plain {
                 crate::terminal_bg::detect_light(
                     std::time::Duration::from_millis(60),
                 )
@@ -420,7 +420,7 @@ pub async fn run(
     // auto-trigger; the modal would otherwise try to draw a
     // Cyan-bordered box into a stdout that no human is watching.
     let is_plain_renderer = !caps.tty;
-    let inner: Box<dyn Renderer> = if caps.tty {
+    let mut inner: Box<dyn Renderer> = if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
         // Pass caps + the ORIGINAL tty value so PlainRenderer can:
@@ -437,6 +437,16 @@ pub async fn run(
             was_real_tty,
         ))
     };
+    // Code-block auto-copy (issue #699): OFF by default (it silently overwrote the
+    // user's clipboard on every reply). Opt-in via `config.ui.auto_copy_code_blocks`;
+    // `ATOMCODE_AUTO_COPY` overrides the config when set (back-compat with the old env
+    // knob). Set on the concrete renderer BEFORE it's moved onto the worker thread, so
+    // no per-command plumbing is needed. `/copy` stays available regardless.
+    let auto_copy = match std::env::var("ATOMCODE_AUTO_COPY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => config.ui.auto_copy_code_blocks,
+    };
+    inner.set_auto_copy_enabled(auto_copy);
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode

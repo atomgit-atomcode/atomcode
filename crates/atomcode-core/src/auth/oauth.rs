@@ -581,6 +581,14 @@ pub fn open_browser(url: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub fn open_browser(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
+    // `explorer.exe <url>` hands the URL to the shell's default-protocol handler as ONE
+    // argument, so a URL with `&` (our webui URL is `…/?token=…&sync=1`) opens intact — the
+    // `&` is data, not a shell operator. `cmd /C start "" "<url&x>"` mishandles the `&` and
+    // often fails to open the browser (esp. cold-launch). explorer also avoids the cmd
+    // console flash. Keep the legacy `cmd start` only as a fallback if explorer can't spawn.
+    if std::process::Command::new("explorer").arg(url).spawn().is_ok() {
+        return Ok(());
+    }
     std::process::Command::new("cmd")
         .raw_arg(format!("/C start \"\" \"{}\"", url))
         .spawn()

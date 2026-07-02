@@ -1,9 +1,11 @@
 import React, { useRef, useEffect } from 'react';
 import { useChatContext } from '../state/ChatProvider';
+import { useT } from '../i18n';
 
 export function SearchBar() {
   const { state, dispatch } = useChatContext();
   const inputRef = useRef<HTMLInputElement>(null);
+  const t = useT();
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -31,14 +33,14 @@ export function SearchBar() {
         value={state.searchQuery}
         onChange={(e) => dispatch({ type: 'SET_SEARCH_QUERY', query: e.target.value })}
         onKeyDown={(e) => { if (e.key === 'Escape') dispatch({ type: 'TOGGLE_SEARCH' }); }}
-        placeholder="Search messages..."
+        placeholder={t('search.placeholder')}
         style={{
           flex: 1, background: 'transparent', border: 'none', outline: 'none',
           color: 'var(--app-primary-foreground)', fontSize: 12, fontFamily: 'inherit',
         }}
       />
       {state.searchQuery && (
-        <span style={{ fontSize: 11, color: 'var(--app-secondary-foreground)' }}>{matchCount} found</span>
+        <span style={{ fontSize: 11, color: 'var(--app-secondary-foreground)' }}>{t('search.found', { count: matchCount })}</span>
       )}
       <button
         onClick={() => dispatch({ type: 'TOGGLE_SEARCH' })}

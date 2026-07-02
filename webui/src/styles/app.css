@@ -320,6 +320,47 @@ body {
 .user-message-bubble.is-markdown > :first-child { margin-top: 0; }
 .user-message-bubble.is-markdown > :last-child { margin-bottom: 0; }
 
+/* Copy button row below user message bubble: hidden by default, shown on hover. */
+.msg-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  height: 24px;
+}
+.msg-actions-left {
+  justify-content: flex-start;
+}
+.user-message-wrapper:hover .msg-actions {
+  opacity: 1;
+}
+.timeline-message:hover .msg-actions {
+  opacity: 1;
+}
+.msg-copy-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  transition: color 0.15s, background 0.15s;
+}
+.msg-copy-btn:hover {
+  background: var(--app-hover-background);
+  color: var(--app-primary-foreground);
+}
+.msg-copy-btn.copied {
+  color: var(--app-brand);
+}
+
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */
 .user-message-wrapper.queued .user-message-bubble {
   opacity: 0.7;
@@ -640,7 +681,7 @@ body {
 /* === Markdown Root === */
 .markdown-root {
   text-wrap: auto;
-  overflow-x: hidden;
+  overflow-x: clip;
   width: 100%;
   /* Container must NOT be pre-wrap (the .assistant-message-content class on the
      wrapper sets pre-wrap, which would render inter-block newlines as gaps). */

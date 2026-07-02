@@ -220,7 +220,7 @@ async fn auto_compaction_escalates_to_summary_at_high_utilization() {
     let calls = calls.lock().unwrap();
     let t3_req = &calls[4].0; // [0,1]=t1, [2,3]=t2, [4,5]=t3
     assert!(
-        t3_req.iter().any(|m| m.text == "SUMMARY"),
+        t3_req.iter().any(|m| m.text.contains("SUMMARY")),
         "t3 request must carry the drained-history summary; got: {:?}",
         t3_req
             .iter()

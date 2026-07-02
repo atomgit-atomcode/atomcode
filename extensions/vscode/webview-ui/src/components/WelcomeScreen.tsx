@@ -1,24 +1,26 @@
 import React, { useState } from 'react';
 import { postMessage } from '../vscode';
 import { useChatContext } from '../state/ChatProvider';
+import { MsgKey, useT } from '../i18n';
 
 interface QuickAction {
   id: string;
-  label: string;
+  labelKey: MsgKey;
   icon: string;
 }
 
 const quickActions: QuickAction[] = [
-  { id: 'explain', label: 'Explain Code', icon: '💡' },
-  { id: 'fix', label: 'Fix Issues', icon: '🔧' },
-  { id: 'test', label: 'Write Tests', icon: '🧪' },
-  { id: 'refactor', label: 'Refactor', icon: '♻️' },
-  { id: 'docs', label: 'Add Docs', icon: '📝' },
-  { id: 'review', label: 'Code Review', icon: '🔍' },
+  { id: 'intro', labelKey: 'welcome.quick.intro', icon: '💡' },
+  { id: 'projectOverview', labelKey: 'welcome.quick.projectOverview', icon: '🗂️' },
+  { id: 'improvements', labelKey: 'welcome.quick.improvements', icon: '🔎' },
+  { id: 'devPlan', labelKey: 'welcome.quick.devPlan', icon: '🧭' },
+  { id: 'configuration', labelKey: 'welcome.quick.configuration', icon: '⚙️' },
+  { id: 'tips', labelKey: 'welcome.quick.tips', icon: '✨' },
 ];
 
 export function WelcomeScreen() {
   const { state } = useChatContext();
+  const t = useT();
   const [manualOpen, setManualOpen] = useState(false);
   const [providerName, setProviderName] = useState('openai');
   const [providerType, setProviderType] = useState('openai');
@@ -69,31 +71,32 @@ export function WelcomeScreen() {
   }
 
   const needsSetup = state.setupRequired || state.providers.length === 0;
+  const signedInName = state.auth?.user?.name || state.auth?.user?.username || t('setup.atomgitUser');
 
   return (
     <div className="welcome-screen">
       <div className="welcome-content">
         <h1 className="welcome-title">AtomCode</h1>
         <p className="welcome-subtitle">
-          {needsSetup ? 'Set up AtomCode to start chatting in VS Code' : 'AI-powered coding assistant'}
+          {needsSetup ? t('welcome.subtitle.setup') : t('welcome.subtitle.ready')}
         </p>
 
         {needsSetup && (
           <section className="setup-card">
             <div className="setup-step">
               <div className="setup-copy">
-                <div className="setup-title">Account</div>
+                <div className="setup-title">{t('setup.account')}</div>
                 <div className="setup-subtitle">
                   {state.auth?.logged_in
-                    ? `Signed in as ${state.auth.user?.name || state.auth.user?.username || 'AtomGit user'}`
-                    : 'Sign in to use AtomGit CodingPlan models.'}
+                    ? t('setup.signedInAs', { name: signedInName })
+                    : t('setup.signInHint')}
                 </div>
               </div>
               <div className="setup-actions">
                 {state.auth?.logged_in ? (
-                  <button type="button" className="setup-secondary" onClick={refreshSetupState}>Refresh account</button>
+                  <button type="button" className="setup-secondary" onClick={refreshSetupState}>{t('setup.refreshAccount')}</button>
                 ) : (
-                  <button type="button" className="setup-primary" onClick={startLogin}>Sign in with AtomGit</button>
+                  <button type="button" className="setup-primary" onClick={startLogin}>{t('setup.signInWithAtomGit')}</button>
                 )}
               </div>
             </div>
@@ -101,39 +104,39 @@ export function WelcomeScreen() {
             {state.loginUrl && (
               <div className="setup-url">
                 <span>{state.loginUrl}</span>
-                <button type="button" onClick={() => navigator.clipboard.writeText(state.loginUrl || '')}>Copy</button>
-                <button type="button" onClick={cancelLogin}>Cancel</button>
+                <button type="button" onClick={() => navigator.clipboard.writeText(state.loginUrl || '')}>{t('setup.copy')}</button>
+                <button type="button" onClick={cancelLogin}>{t('setup.cancel')}</button>
               </div>
             )}
 
             <div className="setup-step">
               <div className="setup-copy">
-                <div className="setup-title">Models</div>
+                <div className="setup-title">{t('setup.models')}</div>
                 <div className="setup-subtitle">
                   {state.providers.length > 0
-                    ? `${state.providers.length} provider${state.providers.length === 1 ? '' : 's'} configured`
-                    : 'Sync CodingPlan models or add a provider manually.'}
+                    ? t('setup.providersConfigured', { count: state.providers.length })
+                    : t('setup.syncOrAddProvider')}
                 </div>
               </div>
               <div className="setup-actions">
                 {state.auth?.logged_in && (
-                  <button type="button" className="setup-primary" onClick={setupCodingPlan}>Sync CodingPlan models</button>
+                  <button type="button" className="setup-primary" onClick={setupCodingPlan}>{t('setup.syncCodingPlanModels')}</button>
                 )}
               </div>
             </div>
 
             <button type="button" className="setup-secondary setup-wide" onClick={() => setManualOpen(!manualOpen)}>
-              Add provider manually
+              {t('setup.addProviderManually')}
             </button>
 
             {manualOpen && (
               <form className="provider-form" onSubmit={submitProvider}>
-                <input value={providerName} onChange={(e) => setProviderName(e.target.value)} placeholder="Provider name" />
-                <input value={providerType} onChange={(e) => setProviderType(e.target.value)} placeholder="Type, e.g. openai" />
-                <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="Model" />
-                <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="Base URL" />
-                <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="API key" type="password" />
-                <button className="setup-primary setup-wide" type="submit">Save provider</button>
+                <input value={providerName} onChange={(e) => setProviderName(e.target.value)} placeholder={t('setup.providerName')} />
+                <input value={providerType} onChange={(e) => setProviderType(e.target.value)} placeholder={t('setup.providerType')} />
+                <input value={model} onChange={(e) => setModel(e.target.value)} placeholder={t('setup.model')} />
+                <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={t('setup.baseUrl')} />
+                <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={t('setup.apiKey')} type="password" />
+                <button className="setup-primary setup-wide" type="submit">{t('setup.saveProvider')}</button>
               </form>
             )}
 
@@ -150,7 +153,7 @@ export function WelcomeScreen() {
               onClick={() => handleAction(a.id)}
             >
               <span className="quick-action-icon">{a.icon}</span>
-              <span className="quick-action-label">{a.label}</span>
+              <span className="quick-action-label">{t(a.labelKey)}</span>
             </button>
           ))}
         </div>

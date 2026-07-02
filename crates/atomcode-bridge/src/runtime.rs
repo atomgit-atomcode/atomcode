@@ -79,6 +79,15 @@ pub struct BridgeConfig {
     /// Preserve a cancelled turn's partial work in history (default false). Mapped
     /// from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
+    /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒ the
+    /// engine sends the product `atomcode/<version>`. Threaded so the v2 adapters
+    /// send the same UA the legacy engine did (previously dropped → requests went out
+    /// with the bare `reqwest/x.y.z` UA, breaking gateway per-version attribution).
+    pub user_agent: Option<String>,
+    /// Disable TLS certificate verification (`ProviderConfig::skip_tls_verify`).
+    /// Threaded so self-signed / internal gateways work under v2 (the legacy engine
+    /// honored it via `build_http_client`; v2 had no path for it). Default false.
+    pub skip_tls_verify: bool,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -251,6 +260,11 @@ impl Bridge {
         coding_cfg.thinking_enabled = cfg.thinking_enabled;
         coding_cfg.thinking_type = cfg.thinking_type.clone();
         coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+        // Gateway identity: product UA + TLS-verify toggle. Parity with v1's
+        // `build_http_client`; the v2 adapters dropped both, so requests went out with
+        // the bare `reqwest` UA and ignored `skip_tls_verify`.
+        coding_cfg.user_agent = cfg.user_agent.clone();
+        coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
         // Interactive drivers PARK approvals (a present human must not be auto-denied for
         // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
         // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
@@ -1935,6 +1949,9 @@ fn apply_reload_provider(
     cfg.thinking_enabled = provider.thinking_enabled;
     cfg.thinking_type = provider.thinking_type.clone();
     cfg.thinking_keep = provider.thinking_keep.clone();
+    // A /model swap can point at a provider with different UA / TLS settings.
+    cfg.user_agent = provider.user_agent.clone();
+    cfg.skip_tls_verify = provider.skip_tls_verify;
 }
 
 /// Provider-config fallback output cap when neither the per-call `ChatOptions` nor an explicit
@@ -1955,6 +1972,14 @@ fn build_provider(
     };
     use atomcode_core::coding_plan::crypto;
 
+    // Resolve the User-Agent ONCE: a per-provider override wins, else the product
+    // `atomcode/<version>` (core owns the canonical constant; this crate's own version
+    // is independent, so it can't synthesize it). Restores v1 `build_http_client` parity.
+    let ua = cfg
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| atomcode_core::ATOMCODE_USER_AGENT.to_string());
+
     // Dispatch by provider_type — the v2 engine has native adapters for each, and using the
     // wrong one (e.g. OpenAI-format to the Anthropic API) fails. Mirrors v1 `create_provider`.
     match cfg.provider_type.as_str() {
@@ -1967,6 +1992,8 @@ fn build_provider(
             // `/think on` → adaptive extended thinking. (v2 uses adaptive, so v1's
             // thinking_budget has no direct mapping — intentionally dropped.)
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
+            ac.user_agent = Some(ua.clone());
+            ac.skip_tls_verify = cfg.skip_tls_verify;
             Ok(Arc::new(
                 AnthropicProvider::new(ac).map_err(|e| anyhow::anyhow!(e.message))?,
             ))
@@ -1978,6 +2005,8 @@ fn build_provider(
             // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
             oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
+            oc.user_agent = Some(ua.clone());
+            oc.skip_tls_verify = cfg.skip_tls_verify;
             Ok(Arc::new(
                 OllamaProvider::new(oc).map_err(|e| anyhow::anyhow!(e.message))?,
             ))
@@ -1996,6 +2025,8 @@ fn build_provider(
             // Kimi-family thinking (`thinking.{type,keep}`); omitted unless configured.
             pc.thinking_type = cfg.thinking_type.clone();
             pc.thinking_keep = cfg.thinking_keep.clone();
+            pc.user_agent = Some(ua.clone());
+            pc.skip_tls_verify = cfg.skip_tls_verify;
 
             // AtomGit gateways need per-request auth instead of a static api_key, handled by
             // the closed `atomcode-codingplan-crypto` (gated by core's `codingplan-crypto`
@@ -2017,6 +2048,36 @@ fn build_provider(
             ))
         }
     }
+}
+
+/// Build an authenticated [`LlmProvider`] directly from a [`BridgeConfig`].
+///
+/// Thin public entry point for the `atomcode acp` CLI subcommand: the CLI needs
+/// a gateway-signed provider (with the AtomGit HMAC signer when the endpoint is
+/// the AtomGit gateway) but cannot reach the private [`build_provider`] directly
+/// and does not depend on `atomcode-coding`'s `CodingAgentConfig`.
+///
+/// The `working_dir` field of the interim `CodingAgentConfig` is unused by the
+/// provider builder; the process working directory is used as a placeholder.
+pub fn build_provider_for_acp(
+    cfg: &BridgeConfig,
+) -> anyhow::Result<std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider>> {
+    let mut coding_cfg = CodingAgentConfig::new(
+        &cfg.api_key,
+        &cfg.base_url,
+        &cfg.model,
+        // working_dir is not used by build_provider; placeholder is fine.
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    coding_cfg.context_window = cfg.context_window;
+    coding_cfg.provider_type = cfg.provider_type.clone();
+    coding_cfg.reasoning_history = cfg.reasoning_history.clone();
+    coding_cfg.thinking_enabled = cfg.thinking_enabled;
+    coding_cfg.thinking_type = cfg.thinking_type.clone();
+    coding_cfg.thinking_keep = cfg.thinking_keep.clone();
+    coding_cfg.user_agent = cfg.user_agent.clone();
+    coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
+    build_provider(&coding_cfg)
 }
 
 /// Map a raw provider error to a user-actionable one before it reaches the UI.

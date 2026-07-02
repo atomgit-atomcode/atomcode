@@ -50,3 +50,32 @@ mode = "no_proxy"
 # https = "http://127.0.0.1:7890"
 # all = "socks5://127.0.0.1:7890"
 # no_proxy = "localhost,127.0.0.1"
+
+# Lifecycle hooks — run custom scripts on key events.
+# Hooks are NOT configured in this file. Use separate config files instead:
+#   TOML: ~/.atomcode/hooks/hooks.toml (recommended, supports ScriptHook + Webhook)
+#   JSON: ~/.atomcode/hooks.json (CC-compatible, lightweight)
+# See docs/hooks.md for full reference.
+#
+# Available events (JSON CC format; TOML ScriptHook uses different trigger names — see docs/hooks.md):
+#   pre_tool_use    — before each tool call (can block via stdout {"action":"block","reason":"..."})
+#   post_tool_use   — after each tool call
+#   user_prompt_submit — when the user submits a prompt (can block via stdout {"decision":"block","reason":"..."} or inject context via {"hookSpecificOutput":{"additionalContext":"..."}})
+#   session_start   — when a new session begins
+#   session_end     — when a session ends
+#
+# JSON CC scripts receive context via env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME,
+# ATOMCODE_HOOK_CONTEXT (JSON string). TOML ScriptHook uses stdin instead — see docs/hooks.md.
+# JSON CC PreToolUse stdout supports (TOML ScriptHook uses text protocol ok/deny:/modify: — see docs/hooks.md):
+#   {"action":"allow"} or {"action":"block","reason":"..."} or {"action":"modify","args":{...}}
+#
+# Example ~/.atomcode/hooks.json (JSON CC format; TOML uses [[hooks]] with trigger/script/timeout_secs — see docs/hooks.md):
+# {
+#   "hooks": {
+#     "verify-gate": {
+#       "event": "post_tool_use",
+#       "command": "python ~/.atomcode/scripts/verify-gate.py",  # ~ 不会自动展开，需用绝对路径（如 C:\Users\you\.atomcode\scripts\verify-gate.py 或 /home/you/.atomcode/scripts/verify-gate.py）
+#       "timeout_ms": 30000  # default is 10000 (10s); set 30s here because verify may be slow
+#     }
+#   }
+# }
