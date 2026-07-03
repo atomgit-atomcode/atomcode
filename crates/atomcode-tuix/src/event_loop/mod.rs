@@ -3807,7 +3807,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
     sync_reasoning_effort_from_provider(&mut ctx);
 
+    // Terminal tab/window title mirrors the current session name. Tracked
+    // here so we only emit an OSC title write when it actually changes
+    // (startup, first-message auto-name, `/rename`, `/resume`, `/new`) rather
+    // than every loop iteration. `None` forces the first pass to emit.
+    let mut last_terminal_title: Option<String> = None;
+
     loop {
+        sync_terminal_title(&ctx, renderer, &mut last_terminal_title);
+
         #[cfg(unix)]
         tokio::select! {
             // Biased ordering: spinner first so whenever a tick is
@@ -6526,6 +6534,24 @@ pub(crate) fn sync_recalled_attachments(
     }
 }
 
+/// Emit the terminal tab/window title for the current session, but only when
+/// it differs from what was last emitted (`last`). Called at the top of every
+/// event-loop iteration; `last` starts as `None` so the first pass always
+/// emits (startup fallback), and each session-name change (auto-name, `/rename`,
+/// `/resume`, `/new`) is picked up on the next iteration.
+///
+/// Fallback for un-named / brand-new sessions is `atomcode v<version>`, so a
+/// fresh tab shows the running version instead of whatever stale string the
+/// launcher/shortcut left behind (the original `atomcode-v4.25.6`-lingering bug).
+fn sync_terminal_title(ctx: &LoopCtx, renderer: &mut dyn Renderer, last: &mut Option<String>) {
+    const VERSION_FALLBACK: &str = concat!("atomcode v", env!("CARGO_PKG_VERSION"));
+    let title = crate::title::session_terminal_title(&ctx.current_session.name, VERSION_FALLBACK);
+    if last.as_deref() != Some(title.as_str()) {
+        renderer.set_title(title.clone());
+        *last = Some(title);
+    }
+}
+
 /// Idle prompt without any menu/picker — used by the common
 /// "Redraw" path and the post-event-loop fallback after an agent
 /// event returns the UI to Idle.
@@ -7890,6 +7916,54 @@ mod tool_output_stream_gate_tests {
     }
 }
 
+/// Determine whether the Ctrl+O hint should be shown for a tool call.
+///
+/// The hint appears only for bash commands when real-time output is
+/// disabled and the call is not a local-shell (-prefixed) invocation.
+/// Extracted as a pure function so the gating logic can be unit-tested
+/// independently of 's rendering infrastructure.
+fn should_show_ctrl_o_hint(tool_name: &str, verbose: bool, call_id: &str) -> bool {
+    tool_name == "bash" && !verbose && !call_id.starts_with("local-shell-")
+}
+
+#[cfg(test)]
+mod ctrl_o_hint_gating_tests {
+    use super::should_show_ctrl_o_hint;
+
+    #[test]
+    fn shown_for_bash_without_verbose() {
+        // Normal case: bash command, verbose off → show hint
+        assert!(should_show_ctrl_o_hint("bash", false, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_when_verbose_on() {
+        // Verbose already on → hint not needed
+        assert!(!should_show_ctrl_o_hint("bash", true, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_for_non_bash_tools() {
+        // Non-bash tools don't stream output
+        assert!(!should_show_ctrl_o_hint("read_file", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("edit_file", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("grep", false, "call-1"));
+        assert!(!should_show_ctrl_o_hint("glob", false, "call-1"));
+    }
+
+    #[test]
+    fn suppressed_for_local_shell() {
+        // Local shell () always streams — no hint needed
+        assert!(!should_show_ctrl_o_hint("bash", false, "local-shell-7"));
+    }
+
+    #[test]
+    fn suppressed_when_verbose_and_local_shell() {
+        // Both conditions simultaneously
+        assert!(!should_show_ctrl_o_hint("bash", true, "local-shell-3"));
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -8028,6 +8102,25 @@ fn handle_agent_event(
                 name: display.clone(),
                 detail: detail.clone(),
             });
+            // Show hint for bash commands if real-time output is disabled.
+            // Placed HERE (at ToolCallStarted) rather than at ToolCallResult
+            // (where it was before), so users see it WHILE the command is
+            // running — pressing Ctrl+O actually streams live chunks.
+            // The old placement after ToolCallResult meant the command had
+            // already finished and no more ToolOutputChunk events were coming,
+            // so pressing Ctrl+O showed the "enabled" banner but no output.
+            if should_show_ctrl_o_hint(&name, state.show_tool_output, &id) {
+                let reset = "[0m";
+                let mute = if crate::highlight::theme::is_light_for_render() {
+                    "[90m"
+                } else {
+                    "[2m"
+                };
+                renderer.render(UiLine::CommandOutput(format!(
+                    "{mute}  ○ Press Ctrl+o to show real-time output while running{reset}
+",
+                )));
+            }
             renderer.flush();
 
             // Mark as rendered so ToolCallResult doesn't emit it again.
@@ -8238,30 +8331,7 @@ fn handle_agent_event(
                     renderer.render(UiLine::DiffBlock(diff_entries));
                 }
             }
-            // Show hint for bash commands if real-time output is disabled.
-            // Display AFTER the result so user sees the command first.
-            // Trailing `\n` is intentional: `push_body_text` splits on
-            // `\n` and the empty chunk after the `\n` pushes ONE blank
-            // row, which becomes the breathing-room separator between
-            // consecutive bash blocks. Without it adjacent bash results
-            // visually run together (screenshot 47.png) and the eye
-            // can't tell where one block ends and the next begins.
-            // The previous over-correction (screenshot 44 → 47) showed
-            // that "looks like 2 blank lines" is just font line-height
-            // padding — the actual row count is 1, which is correct.
-            if name == "bash" && !state.show_tool_output && !call_id.starts_with("local-shell-") {
-                // Use muted style matching ToolResult's summary_style:
-                // light theme → SGR 90 (DarkGrey), dark theme → SGR 2 (faint)
-                let reset = "\x1b[0m";
-                let mute = if crate::highlight::theme::is_light_for_render() {
-                    "\x1b[90m"
-                } else {
-                    "\x1b[2m"
-                };
-                renderer.render(UiLine::CommandOutput(format!(
-                    "{mute}  ○ Press Ctrl+o to show real-time output{reset}\n",
-                )));
-            }
+            // Flush any pending diff renders before the next event.
             renderer.flush();
             let _ = name;
         }
@@ -9421,13 +9491,13 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SessionRenamed { name } => {
-            // daemon AI 给当前活动会话改了名（via `/rename` or auto-namer）。
-            // 更新会话对象，保存到磁盘，选择器等 UI 看到新名。
+            // AI session-namer renamed the active session (fire-and-forget after
+            // the first turn, or mirrored from a daemon session). Apply only if
+            // the session is still auto-named and the user hasn't renamed it —
+            // never clobber an explicit `/rename`. The next loop iteration's
+            // `sync_terminal_title` picks up the new name for the tab title.
             crate::tuix_trace!("TUI", "SessionRenamed: name={}", name);
-            ctx.current_session.name = name.clone();
-            ctx.current_session.touch();
-            // 同步保存失败无碍（用户只是看不到最新名字直到重启）。
-            let _ = ctx.session_manager.save(&ctx.current_session);
+            apply_ai_session_name(ctx, name, renderer);
         }
         AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
             // Non-error pause line: dim/plain body row, never red.
@@ -9441,6 +9511,28 @@ fn handle_agent_event(
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
+    }
+}
+
+/// Apply an AI-generated session name if the session is still auto-named and
+/// not user-renamed. Saves directly (NOT via `apply_session_snapshot`, which
+/// would re-truncate the name). Auto-name semantics: does NOT set
+/// `user_renamed`, so a later explicit `/rename` still wins.
+fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Renderer) {
+    if !atomcode_core::agent::session_title::should_accept_ai_name(
+        ctx.current_session.user_renamed,
+        ctx.current_session.ai_named,
+    ) {
+        return;
+    }
+    ctx.current_session.name = name;
+    ctx.current_session.ai_named = true;
+    ctx.current_session.touch();
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+        renderer.render(UiLine::Error(format!("session save failed: {e}")));
+        renderer.flush();
     }
 }
 
@@ -9623,6 +9715,18 @@ mod session_naming_tests {
         assert!(!is_synthetic_user_text("Fix the auth bug in login.rs"));
         assert!(!is_synthetic_user_text("Continue."));
         assert!(!is_synthetic_user_text("(why does this break?)"));
+    }
+
+    #[test]
+    fn ai_rename_applies_unless_user_renamed_or_already_ai_named() {
+        use atomcode_core::agent::session_title::should_accept_ai_name;
+        // Not user-renamed and not yet AI-named → accept (the AI title wins
+        // over the first-turn truncation the auto-namer set).
+        assert!(should_accept_ai_name(false, false));
+        // A deliberate /rename is never overwritten.
+        assert!(!should_accept_ai_name(true, false));
+        // Already AI-named → don't re-name on reconnect/resume.
+        assert!(!should_accept_ai_name(false, true));
     }
 }
 

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.9-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -621,8 +621,9 @@ Scan the QR code below with WeChat to join the AtomCode community group — shar
 ☕ AtomCode is free, and the Coding Plan is free too. If it's saved you a bit of time, consider buying the author a coffee — it keeps us motivated to keep making it better.
 
 <p align="center">
-  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
-  <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode Alipay donate QR code" width="220">
+  <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode WeChat Pay donate QR code" width="240">
+>>>>>>> main
 </p>
 
 ## License

@@ -219,6 +219,10 @@ struct Bridge {
     /// on SetGoal from `evaluator_provider`/default provider. Cloned into each
     /// spawned eval task.
     goal_provider: Option<Arc<dyn atomcode_core::provider::LlmProvider>>,
+    /// `true` once the AI session-namer has been spawned for this session. Ensures
+    /// the naming task fires at most once (after the first completed turn) and is
+    /// reset to `false` on session respawn.
+    ai_name_attempted: bool,
     /// Cancels an in-flight goal evaluation (fresh per goal). Triggered by
     /// Cancel/ClearGoal/Shutdown so Esc interrupts the evaluator immediately
     /// instead of waiting out its 30s/event timeout.
@@ -356,6 +360,7 @@ impl Bridge {
             degraded,
             goal: None,
             goal_provider: None,
+            ai_name_attempted: false,
             goal_cancel: CancellationToken::new(),
             pending_goal: None,
             goal_eval_tx,
@@ -1056,6 +1061,12 @@ impl Bridge {
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
         await_kernel_or_abort(&mut task, Duration::from_secs(5)).await;
         let mut opts = self.opts_template.clone();
+        // Whether this respawn starts a genuinely NEW conversation. `Fresh` =
+        // /clear or /cd-into-new-project → a new session that should get an AI
+        // name. `Resume` = snapshot restore / ReloadHooks (/plugin, /mcp
+        // reload) / model swap → the SAME conversation continues; re-running the
+        // namer would just burn an LLM call whose result the host guard discards.
+        let want_fresh = matches!(session, SessionMode::Fresh);
         opts.session = session;
 
         // Try the requested session mode first; if that fails (e.g. Resume could
@@ -1124,6 +1135,13 @@ impl Bridge {
                 self.turn_running = false;
                 self.pending_approval = None;
                 self.degraded = false;
+                // Only re-arm the AI namer for a genuinely fresh conversation.
+                // On Resume the conversation (and any existing name) carries
+                // over, so leave `ai_name_attempted` latched to avoid a wasted
+                // naming round-trip on every /resume, model swap, or hook reload.
+                if want_fresh {
+                    self.ai_name_attempted = false;
+                }
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -1238,6 +1256,11 @@ impl Bridge {
                 // "turn ended: …" error here — that double-reported the failure and
                 // dropped the structured code. `stop_reason` on TurnComplete carries
                 // the terminal classification.
+                //
+                // Capture first-exchange text before `messages` is moved into the
+                // snapshot (used for AI session naming below).
+                let ai_convo_text =
+                    atomcode_core::agent::session_title::first_exchange_text(&messages);
                 self.emit(CoreEv::TurnComplete {
                     duration,
                     total_tokens: self.stats.total_tokens,
@@ -1246,6 +1269,52 @@ impl Bridge {
                     snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
                     stop_reason,
                 });
+                // Fire-and-forget AI session naming, once per session, after the first
+                // completed turn. The host re-checks the authoritative guard before
+                // applying, so here we only gate on feature + not-yet-attempted + a
+                // real first exchange existing.
+                //
+                // Cheap gates FIRST — a real first exchange must exist and we must not
+                // have attempted yet — so the synchronous `Config::load` (disk read +
+                // TOML parse) does NOT run on every later TurnComplete, and never on the
+                // async loop's hot path once naming is done for this session.
+                if let Some(convo) = ai_convo_text {
+                    if !self.ai_name_attempted {
+                        let feature_on = atomcode_core::config::Config::load(
+                            &atomcode_core::config::Config::default_path(),
+                        )
+                        .map(|c| atomcode_core::config::ai_session_naming_enabled(&c))
+                        .unwrap_or(false);
+                        if should_attempt(feature_on, self.ai_name_attempted, true) {
+                            self.ai_name_attempted = true;
+                        let ev_tx = self.ev_tx.clone();
+                        tokio::spawn(async move {
+                            let Some(provider) = build_naming_provider() else {
+                                return;
+                            };
+                            let prompt = atomcode_core::agent::session_title::session_title_prompt(
+                                &convo,
+                            );
+                            let (raw, _, _, _, had_error) =
+                                atomcode_core::agent::compression::run_llm_summary(
+                                    provider.as_ref(),
+                                    &prompt,
+                                )
+                                .await;
+                            if had_error {
+                                return;
+                            }
+                            if let Some(name) =
+                                atomcode_core::agent::session_title::sanitize_generated_title(&raw)
+                            {
+                                let _ = ev_tx.send(
+                                    atomcode_core::agent::AgentEvent::SessionRenamed { name },
+                                );
+                            }
+                        });
+                        }
+                    }
+                }
             }
         }
         self.emit(CoreEv::PhaseChange(AgentPhase::Idle));
@@ -1678,6 +1747,24 @@ fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>
         }
     }
     try_key(&config.default_provider)
+}
+
+/// Build a core provider for the one-off session-title call. Mirrors
+/// `build_goal_provider`: loads config, uses the default provider. Returns
+/// `None` (⇒ naming skipped) if config/provider is unavailable.
+fn build_naming_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+    let config =
+        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
+    let pcfg = config.providers.get(&config.default_provider)?;
+    let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+    Some(Arc::from(provider))
+}
+
+/// Pure guard: returns `true` only when all conditions for attempting AI session naming
+/// are met — feature is enabled, not yet attempted this session, and a user message
+/// is present for the first exchange.
+fn should_attempt(feature_enabled: bool, already_attempted: bool, has_user_msg: bool) -> bool {
+    feature_enabled && !already_attempted && has_user_msg
 }
 
 /// Escape `<`/`>`/`&` so command output can't forge the `<bash-*>` tags the model
@@ -2678,5 +2765,18 @@ mod ratelimited_mapping_tests {
             secs_until_reset: Some(7200),
             auto_resuming: false,
         };
+    }
+}
+
+#[cfg(test)]
+mod ai_name_tests {
+    use super::should_attempt;
+
+    #[test]
+    fn attempts_once_when_enabled_with_user_msg() {
+        assert!(should_attempt(true, false, true));
+        assert!(!should_attempt(true, true, true)); // already attempted
+        assert!(!should_attempt(false, false, true)); // disabled
+        assert!(!should_attempt(true, false, false)); // no user msg yet
     }
 }

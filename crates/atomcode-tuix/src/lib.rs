@@ -23,6 +23,7 @@ pub mod terminal_bg;
 #[cfg(test)]
 pub mod test_term;
 pub mod think;
+pub mod title;
 pub mod trace;
 pub mod width;
 

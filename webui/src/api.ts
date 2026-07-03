@@ -520,6 +520,7 @@ export type LiveWireEvent =
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'session_switched'; session_id: string }
+  | { type: 'session_renamed'; session_id: string; name: string }
   | { type: 'working_dir'; working_dir: string };
 
 export async function streamLive(

@@ -823,6 +823,40 @@ impl KernelTurnExecutor {
     }
 }
 
+/// Persist an AI-generated session rename without setting `user_renamed`.
+/// Guards with `should_accept_ai_name` — silently no-ops if the session has
+/// already been user-renamed or has a non-default AI name.
+/// Returns `Ok(true)` when the AI name was actually applied+persisted, `Ok(false)`
+/// when the guard rejected it (already user-renamed / already AI-named) so the
+/// caller can skip the broadcast — otherwise browser tabs would flip to a name
+/// that was never persisted (and could contradict an explicit `/rename`).
+fn ai_rename_session_file(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    new_name: &str,
+) -> std::io::Result<bool> {
+    use atomcode_core::session::SessionManager;
+    let mut session = SessionManager::load_any(session_id)?;
+    if !atomcode_core::agent::session_title::should_accept_ai_name(
+        session.user_renamed,
+        session.ai_named,
+    ) {
+        return Ok(false);
+    }
+    session.name = new_name.to_string();
+    session.ai_named = true;
+    session.touch();
+    // Save via the session's own working_dir (most accurate); fall back to the
+    // executor working_dir only if the session's stored path is missing/wrong.
+    let save_dir = if session.working_dir.as_os_str().is_empty() {
+        working_dir.to_path_buf()
+    } else {
+        session.working_dir.clone()
+    };
+    SessionManager::new(&save_dir).save(&session)?;
+    Ok(true)
+}
+
 /// Pull the text + images out of the just-appended user message.
 fn extract_user_input(
     m: &atomcode_core::conversation::message::Message,
@@ -1183,6 +1217,25 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
                 AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+                AgentEvent::SessionRenamed { name } => {
+                    // Persist on the daemon side (AI rename: sets name + ai_named,
+                    // never user_renamed). Broadcast to browser tabs ONLY when the
+                    // rename was actually applied — a guard-rejected name (already
+                    // user-renamed / AI-named) must not flip every tab's title to a
+                    // value that was never persisted.
+                    match ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
+                        Ok(true) => {
+                            let _ = events.send(LiveEvent::SessionRenamed {
+                                session_id: self.session_id.to_string(),
+                                name,
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            emit(TurnEvent::Warning(format!("session rename persist failed: {e}")));
+                        }
+                    }
+                }
                 _ => {}
             }
         };
@@ -1620,10 +1673,12 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
-    /// Session was renamed (via daemon AI namer). All webui tabs update their
-    /// session display to reflect the new name.
+    /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
+    /// tab only updates its title when IT is viewing that session — the live
+    /// broadcast reaches every subscribed tab, so an unscoped update would flip
+    /// the title of tabs viewing other sessions.
     #[serde(rename = "session_renamed")]
-    SessionRenamed { name: String },
+    SessionRenamed { session_id: String, name: String },
     /// Working directory switched (any view's `/cd`). Every webui tab updates its
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
@@ -1669,8 +1724,10 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
         },
         // 会话切换：通知所有 webui tab 跟随切换到新会话。
         LiveEvent::SessionSwitched(session_id) => LiveWireEvent::SessionSwitched { session_id },
-        // daemon AI 改了会话名：通知所有 webui tab 更新会话显示。
-        LiveEvent::SessionRenamed(name) => LiveWireEvent::SessionRenamed { name },
+        // AI 自动命名：通知所有 webui tab 更新标签/标题。
+        LiveEvent::SessionRenamed { session_id, name } => {
+            LiveWireEvent::SessionRenamed { session_id, name }
+        }
         // 仅进程内：由 TUI 执行，结果走 CommandOutput 回来。
         LiveEvent::RemoteCommand(_) => return None,
         LiveEvent::CommandOutput(text) => LiveWireEvent::CommandOutput { text },

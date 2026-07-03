@@ -447,6 +447,7 @@ export function App() {
             onCwdChanged={setCwd}
             onLanding={setIsLanding}
             skillInsert={skillInsert}
+            onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
         </div>
       </div>

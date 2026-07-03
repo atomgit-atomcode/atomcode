@@ -110,6 +110,16 @@ pub struct Session {
     /// load as `false` (i.e., behave like auto-named).
     #[serde(default)]
     pub user_renamed: bool,
+    /// True once the AI session-namer has set this session's name (see
+    /// `agent::session_title`). Persisted so the one-shot naming survives
+    /// reconnects/restarts: a fresh bridge instance re-arms its in-memory
+    /// `ai_name_attempted` flag, so without this durable marker every
+    /// `/resume`-then-message would re-run the namer and overwrite a perfectly
+    /// good AI name. Gates `should_accept_ai_name`. A deliberate `/rename`
+    /// (`user_renamed`) still wins over an AI name regardless of this flag.
+    /// `#[serde(default)]` → sessions saved before this field load as `false`.
+    #[serde(default)]
+    pub ai_named: bool,
     /// Per-turn summary stats (one per completed turn), so `/resume` can
     /// re-render the `✓ … 工具 · tokens` divider between turns. `#[serde(default)]`
     /// keeps sessions saved before this field loading — they replay with plain
@@ -132,6 +142,7 @@ impl Session {
             display_messages: Vec::new(),
             cold_summaries: Vec::new(),
             user_renamed: false,
+            ai_named: false,
             turn_stats: Vec::new(),
         }
     }
@@ -148,6 +159,7 @@ impl Session {
             display_messages: Vec::new(),
             cold_summaries: Vec::new(),
             user_renamed: false,
+            ai_named: false,
             turn_stats: Vec::new(),
         }
     }
@@ -227,7 +239,7 @@ impl Session {
     }
 }
 
-fn should_auto_name_session(name: &str) -> bool {
+pub(crate) fn should_auto_name_session(name: &str) -> bool {
     // Names starting with `[` are legacy auto-names derived from a
     // synthetic user message (pre-`Message.synthetic`-field heuristic).
     // Treat them like default / session-<ts>: candidates for re-naming
@@ -891,7 +903,9 @@ mod tests {
 
         // Simulate rapid successive saves (as if multiple turns completed quickly)
         for i in 0..20 {
-            session.messages.push(Message::new(Role::User, &format!("msg {}", i)));
+            session
+                .messages
+                .push(Message::new(Role::User, &format!("msg {}", i)));
             session.touch();
             manager.save(&session).unwrap();
         }
@@ -933,7 +947,9 @@ mod tests {
         // Save a valid session
         let mut session = Session::new(wd.clone());
         session.id = SessionId::from_string("partial-write-test".to_string());
-        session.messages.push(Message::new(Role::User, "original content"));
+        session
+            .messages
+            .push(Message::new(Role::User, "original content"));
         manager.save(&session).unwrap();
 
         // Simulate a failed write by corrupting the file manually
@@ -1068,14 +1084,19 @@ mod tests {
         let mut session = Session::new(wd.clone());
         session.id = SessionId::from_string("no-trailing-test".to_string());
         for i in 0..20 {
-            session
-                .messages
-                .push(Message::new(Role::User, &format!("msg {}: {}", i, "x".repeat(200))));
+            session.messages.push(Message::new(
+                Role::User,
+                &format!("msg {}: {}", i, "x".repeat(200)),
+            ));
         }
         manager.save(&session).unwrap();
         let path = manager.project_dir().join(format!("{}.json", session.id));
         let size_big = std::fs::metadata(&path).unwrap().len();
-        assert!(size_big > 2000, "big session should be >2KB, got {}", size_big);
+        assert!(
+            size_big > 2000,
+            "big session should be >2KB, got {}",
+            size_big
+        );
 
         // 2. Clear all messages → small JSON
         session.messages.clear();
@@ -1094,9 +1115,13 @@ mod tests {
         // 4. Raw bytes must be valid JSON with no trailing content
         let raw = std::fs::read(&path).unwrap();
         // Last meaningful byte must be '}' or whitespace before it
-        let trimmed_end = raw.iter().rposition(|&b| b != b'\n' && b != b' ').unwrap_or(0);
+        let trimmed_end = raw
+            .iter()
+            .rposition(|&b| b != b'\n' && b != b' ')
+            .unwrap_or(0);
         assert_eq!(
-            raw[trimmed_end], b'}',
+            raw[trimmed_end],
+            b'}',
             "file must end with closing brace, got {:?}",
             &raw[trimmed_end.saturating_sub(5)..]
         );

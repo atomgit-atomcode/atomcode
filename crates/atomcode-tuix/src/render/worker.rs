@@ -78,6 +78,11 @@ enum RenderCmd {
     /// Suppress / restore automatic clipboard copy during history replay
     /// (issue #699 P1-1). Fire-and-forget.
     SetSuppressAutoCopy(bool),
+    /// Set the terminal window/tab title. Fire-and-forget — routed through
+    /// the worker so the OSC bytes serialize with every other stdout write
+    /// (the worker owns stdout; writing from the event-loop thread would
+    /// risk interleaving mid-escape-sequence).
+    SetTitle(String),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -179,6 +184,10 @@ impl Renderer for TaskRenderer {
 
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
         let _ = self.cmd_tx.send(RenderCmd::SetSuppressAutoCopy(suppress));
+    }
+
+    fn set_title(&mut self, title: String) {
+        let _ = self.cmd_tx.send(RenderCmd::SetTitle(title));
     }
 
     fn suspend_for_external(&mut self) {
@@ -316,6 +325,9 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::SetSuppressAutoCopy(suppress) => {
                 inner.set_suppress_auto_copy(suppress);
+            }
+            RenderCmd::SetTitle(title) => {
+                inner.set_title(title);
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

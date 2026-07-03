@@ -283,6 +283,12 @@ pub trait Renderer: Send {
     /// set once at startup. Default no-op — only the retained renderer implements it.
     fn set_auto_copy_enabled(&mut self, _enabled: bool) {}
 
+    /// Set the terminal window/tab title. Default no-op — only the
+    /// interactive retained renderer implements this, so title bytes never
+    /// leak into piped/plain (non-TTY) output. `title` is already sanitised
+    /// (see `crate::title::session_terminal_title`).
+    fn set_title(&mut self, _title: String) {}
+
     /// Hand the terminal off to a non-TUI child process (blocking OAuth
     /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
     /// any pending writes. After this returns, the child is free to use

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.9-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -618,8 +618,13 @@ cargo install --path crates/atomcode-cli
 ☕ AtomCode 免费用，Coding Plan 也不收费。如果它帮你省下了一点时间，欢迎请作者喝杯咖啡，让我们更有动力把它做下去。
 
 <p align="center">
+<<<<<<< HEAD
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 支付宝赞赏码" width="220">
+  <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信赞赏码" width="240">
+=======
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
   <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
+>>>>>>> main
 </p>
 
 

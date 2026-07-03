@@ -9,6 +9,7 @@ pub mod compression;
 pub mod goal;
 pub mod goal_evaluator;
 pub mod parallel_edit;
+pub mod session_title;
 pub mod subtask_driver;
 
 mod diagnose;
