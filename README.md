@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -126,7 +126,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 ### App Remote Access
 
-- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the AtomCode mobile app from any network to connect to your current session
+- **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
 - **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
 - **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
 - **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
@@ -623,6 +623,7 @@ Scan the QR code below with WeChat to join the AtomCode community group — shar
 <p align="center">
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode Alipay donate QR code" width="220">
   <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode WeChat Pay donate QR code" width="240">
+>>>>>>> main
 </p>
 
 ## License

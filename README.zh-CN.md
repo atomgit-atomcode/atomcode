@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.25.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -126,7 +126,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 ### App 远程访问
 
-- **`/app`**（TUI 内）开启移动端远程访问，终端打印二维码，用手机 AtomCode App 扫码即可在任意网络下连入当前对话
+- **`/app`**（TUI 内）开启移动端远程访问，终端打印二维码，用手机 GitCode App 扫码即可在任意网络下连入当前对话
 - **任意网络可达** —— 电脑通过反向 WSS 隧道连接到公网中继，手机经中继访问电脑，不需要公网 IP、DDNS 或路由器端口映射
 - **双向实时同步** —— 任一端发消息，另一端实时显示（AI 流式回复、工具调用卡片、token 用量）
 - **工具审批** —— 电脑执行到需要授权的工具时，手机弹出审批卡片，可直接点允许/拒绝
@@ -618,8 +618,13 @@ cargo install --path crates/atomcode-cli
 ☕ AtomCode 免费用，Coding Plan 也不收费。如果它帮你省下了一点时间，欢迎请作者喝杯咖啡，让我们更有动力把它做下去。
 
 <p align="center">
+<<<<<<< HEAD
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 支付宝赞赏码" width="220">
   <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信赞赏码" width="240">
+=======
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
+  <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
+>>>>>>> main
 </p>
 
 

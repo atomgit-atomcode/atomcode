@@ -1542,6 +1542,18 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "app" => {
+            // HIDDEN until the mobile app launches: behave exactly like an unknown
+            // command so the unreleased feature isn't discoverable. The full
+            // implementation below is intentionally preserved — re-enable via
+            // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
+            // in BUILTIN_COMMANDS).
+            if !crate::commands::app_remote_enabled() {
+                renderer.render(UiLine::Error(
+                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
             // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
@@ -1649,11 +1661,19 @@ fn execute_slash_command_impl(
                             Err(e) => format!("App server 启动失败：{e}"),
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
-                                let token = format!(
-                                    "{}{}",
-                                    uuid::Uuid::new_v4().simple(),
-                                    uuid::Uuid::new_v4().simple()
-                                );
+                                // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
+                                let token = match atomcode_core::auth::oauth::get_stored_auth() {
+                                    Some(auth) => format!(
+                                        "{}.{}",
+                                        auth.user.id,
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                    None => format!(
+                                        "{}{}",
+                                        uuid::Uuid::new_v4().simple(),
+                                        uuid::Uuid::new_v4().simple()
+                                    ),
+                                };
                                 let (ws_url, https_base) = derive_relay_urls(&relay);
                                 let machine = std::env::var("HOSTNAME")
                                     .ok()
