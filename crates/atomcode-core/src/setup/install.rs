@@ -7,8 +7,6 @@ use crate::setup::fs_atomic::atomic_write;
 use crate::setup::types::*;
 use std::path::PathBuf;
 
-#[allow(dead_code)] // TODO: T20 uses this for explicit gitignore-marker presence checks.
-const GITIGNORE_MARKER: &str = ".atomcode/local/";
 const GITIGNORE_BLOCK: &str = "\n# AtomCode local-scope configs (machine-specific)\n.atomcode/local/\n";
 
 #[derive(Debug)]
