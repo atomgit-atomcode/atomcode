@@ -85,7 +85,7 @@ pub(crate) fn session_terminal_title_with_status(name: &str, fallback: &str, gly
 /// phase, where the terminal is handed to an external child). When
 /// `glyph_enabled` is false, no dot is added — behaviour identical to before
 /// this feature.
-pub fn status_title(name: &str, fallback: &str, phase: UiPhase, glyph_enabled: bool) -> Option<String> {
+pub(crate) fn status_title(name: &str, fallback: &str, phase: UiPhase, glyph_enabled: bool) -> Option<String> {
     if phase == UiPhase::Suspended {
         return None;
     }

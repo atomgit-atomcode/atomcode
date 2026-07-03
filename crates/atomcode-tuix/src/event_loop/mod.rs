@@ -6556,11 +6556,18 @@ fn sync_terminal_title(
     const VERSION_FALLBACK: &str = concat!("atomcode v", env!("CARGO_PKG_VERSION"));
     // `None` = leave the title untouched (Suspended: an external child owns
     // the terminal during /shell, OAuth, etc.).
+    // Gate the glyph on the terminal's auto-detected unicode capability too,
+    // not just the config toggle: `TERM=dumb` / `LANG=C` / `ATOMCODE_ASCII` /
+    // legacy conhost report `unicode_symbols == false`, where the emoji dot
+    // would render as a tofu box. This mirrors every other symbol site
+    // (chevron, goal marker, dir-picker) so ASCII terminals fall back without
+    // the user having to disable `terminal_status_glyph` by hand.
+    let glyph_enabled = ctx.caps.unicode_symbols && ctx.config.ui.terminal_status_glyph;
     let Some(title) = crate::title::status_title(
         &ctx.current_session.name,
         VERSION_FALLBACK,
         phase,
-        ctx.config.ui.terminal_status_glyph,
+        glyph_enabled,
     ) else {
         return;
     };
