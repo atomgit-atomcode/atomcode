@@ -72,7 +72,7 @@ fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
 /// portion reuses [`session_terminal_title`] unchanged (so its truncation /
 /// scrubbing budget is untouched); the glyph is an extra 1-scalar + space
 /// prefix, so a status title is at most 2 chars longer than the plain one.
-pub fn session_terminal_title_with_status(name: &str, fallback: &str, glyph: Option<&str>) -> String {
+pub(crate) fn session_terminal_title_with_status(name: &str, fallback: &str, glyph: Option<&str>) -> String {
     let title = session_terminal_title(name, fallback);
     match glyph {
         Some(g) => format!("{g} {title}"),
@@ -86,11 +86,10 @@ pub fn session_terminal_title_with_status(name: &str, fallback: &str, glyph: Opt
 /// `glyph_enabled` is false, no dot is added — behaviour identical to before
 /// this feature.
 pub fn status_title(name: &str, fallback: &str, phase: UiPhase, glyph_enabled: bool) -> Option<String> {
-    let glyph = phase_status_glyph(phase);
     if phase == UiPhase::Suspended {
         return None;
     }
-    let glyph = if glyph_enabled { glyph } else { None };
+    let glyph = if glyph_enabled { phase_status_glyph(phase) } else { None };
     Some(session_terminal_title_with_status(name, fallback, glyph))
 }
 
