@@ -1,5 +1,24 @@
 default_provider = "deepseek"
- 
+
+# ─── Example: AtomGit CodingPlan (recommended) ───
+# Run `atomcode login` to auto-configure via OAuth, which writes
+# providers like the one below. Manual setup is for reference only.
+#
+# [providers.AtomGit-deepseek-v4-flash]
+# type = "openai"
+# api_key = "<your-codingplan-api-key>"
+# model = "deepseek-v4-flash"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 1000000
+#
+# [providers.AtomGit-Qwen-Qwen3-VL-8B-Instruct]
+# type = "openai"
+# api_key = "<your-codingplan-api-key>"
+# model = "Qwen/Qwen3-VL-8B-Instruct"
+# base_url = "https://llm-api.atomgit.com/v1"
+# context_window = 64000
+# ─────────────────────────────────────────────────
+
 [providers.deepseek]
 type = "openai"
 api_key = "sk-..."
