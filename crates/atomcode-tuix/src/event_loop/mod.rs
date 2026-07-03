@@ -1221,12 +1221,16 @@ impl Buffer {
                     return BufferResult::Redraw;
                 }
                 let mut line = self.text.trim();
-                // Strip leading shell prompt characters (❯, $, >, #, %, λ)
-                // that users accidentally paste from terminal output.
-                while let Some(rest) =
-                    line.strip_prefix(|c: char| matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ'))
-                {
-                    line = rest.trim_start();
+                // Strip leading shell-prompt chars (❯ $ > # % λ) that users
+                // accidentally paste from terminal output — but only when the
+                // char is followed by whitespace, the shape a pasted prompt
+                // actually has (`$ ls`, `❯ git status`). A prompt char glued to
+                // the next token (`$brainstorming`) is intentional `$skill` /
+                // command syntax and must survive: otherwise a `$skill` recalled
+                // from history (which bypasses the `$` menu) loses its `$` and
+                // commits as plain text.
+                while let Some(rest) = strip_pasted_prompt_prefix(line) {
+                    line = rest;
                 }
                 let line = line.to_string();
                 if line.is_empty() {
@@ -1938,6 +1942,72 @@ mod buffer_tests {
             BufferResult::Commit(s) => assert_eq!(s, "abc\\def"),
             _ => panic!("expected Commit"),
         }
+    }
+
+    /// Regression: a `$skill` recalled from history bypasses the `$` menu
+    /// (recall parks the cursor at 0 to suppress it), so Enter goes through the
+    /// raw submit path. The shell-prompt cleanup below must NOT eat the leading
+    /// `$` of an intentional `$name` invocation — otherwise it commits as plain
+    /// text and the skill never runs.
+    fn commit_of(text: &str) -> BufferResult {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = text.to_string();
+        b.cursor = b.text.len();
+        b.apply(Action::Submit, &history, &reg)
+    }
+
+    #[test]
+    fn submit_preserves_dollar_skill_prefix() {
+        match commit_of("$brainstorming") {
+            BufferResult::Commit(s) => assert_eq!(s, "$brainstorming"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_preserves_dollar_skill_with_args() {
+        match commit_of("$brainstorming why is X slow") {
+            BufferResult::Commit(s) => assert_eq!(s, "$brainstorming why is X slow"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_still_strips_pasted_dollar_shell_prompt() {
+        // `$ ` (dollar + space) is the shape of an accidentally pasted prompt —
+        // still cleaned.
+        match commit_of("$ ls -la") {
+            BufferResult::Commit(s) => assert_eq!(s, "ls -la"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_still_strips_powerline_prompt() {
+        match commit_of("❯ git status") {
+            BufferResult::Commit(s) => assert_eq!(s, "git status"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_strips_compact_prompt_char_without_space() {
+        // Prompt chars other than `$` have no competing syntax, so a compact
+        // PS1 with no trailing space (`❯git`) is still cleaned — unlike `$`,
+        // which is only stripped before a space so `$skill` survives.
+        match commit_of("❯git status") {
+            BufferResult::Commit(s) => assert_eq!(s, "git status"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_bare_dollar_is_empty() {
+        // `$` alone is not a skill invocation; it collapses to an empty line
+        // (Redraw), same as before this fix.
+        assert!(matches!(commit_of("$"), BufferResult::Redraw));
     }
 }
 
@@ -5383,6 +5453,32 @@ fn parse_dollar_line(line: &str) -> Option<(String, String)> {
     }
     let args = parts.next().unwrap_or("").trim();
     Some((name.to_string(), args.to_string()))
+}
+
+/// Strip ONE leading shell-prompt char from `line` — the accidental-paste
+/// cleanup for the submit path (users copy `$ ls` / `❯ git status` from a
+/// terminal). Returns the `trim_start`ed remainder if a char was stripped,
+/// else `None`.
+///
+/// The five unambiguous prompt chars (`❯ > # % λ`) are stripped whenever they
+/// lead, matching the long-standing cleanup. `$` is special: it is ALSO the
+/// `$skill` invocation prefix, so it is only treated as a pasted prompt when
+/// followed by a space (`$ ls`). A glued `$brainstorming` is intentional syntax
+/// and is kept verbatim — otherwise a `$skill` recalled from history (which
+/// bypasses the `$` menu) would lose its `$` and commit as plain text.
+fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str();
+    match first {
+        '$' => match rest.strip_prefix(' ') {
+            Some(after) => Some(after.trim_start()), // `$ ls` → pasted prompt
+            None if rest.is_empty() => Some(rest),   // bare `$` → collapses to empty
+            None => None,                            // `$brainstorming` → keep verbatim
+        },
+        '❯' | '>' | '#' | '%' | 'λ' => Some(rest.trim_start()),
+        _ => None,
+    }
 }
 
 /// Build the second-level skills palette: user-invocable skills whose bare
