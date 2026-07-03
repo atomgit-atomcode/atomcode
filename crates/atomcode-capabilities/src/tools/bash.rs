@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
+use std::borrow::Cow;
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -250,7 +251,10 @@ fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str 
              Relative paths work (the working directory is already set).\n\
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
-             equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above."
+             equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
+             OUTPUT: discard a stream with `>/dev/null` (or `2>/dev/null`), NEVER `nul` — \
+             here `> nul` does not mean the null device; it creates a stray, undeletable \
+             `nul` file in the working directory."
         };
     }
     if is_windows {
@@ -581,6 +585,138 @@ fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
     None
 }
 
+/// Rewrite a bash redirect whose target is the bare Windows device name `nul`
+/// (case-insensitive) to `/dev/null`.
+///
+/// On Windows the `bash` tool routes through Git Bash / MSYS2 (see `build_command`), where
+/// `nul` is NOT the null device — only `/dev/null` is. So the cmd.exe idiom `command > nul`
+/// (which models reflexively emit to discard output) treats `nul` as a plain relative
+/// filename and bash CREATES A REAL FILE named `nul` in the working directory. Worse, MSYS2
+/// opens files via NT-native paths (`\??\…`), bypassing Win32's reserved-name guard, so the
+/// file genuinely exists yet cannot be removed via Explorer or `del nul` (both re-apply the
+/// Win32 guard and address the device) — it needs `del \\.\nul`. Users hit stray, undeletable
+/// `nul` files. Rewriting the redirect target to `/dev/null` preserves the model's intent
+/// (discard the stream) and never touches disk.
+///
+/// ONLY a `nul` that appears as a REDIRECT TARGET is rewritten. `echo nul`, `cat nul.txt`,
+/// `grep nul file`, and any `nul` inside quotes are left untouched. Quote/escape state is
+/// tracked so a `> nul` inside a string literal is preserved. Pure / platform-independent
+/// (scans bytes; ASCII operators never collide with UTF-8 continuation bytes) so it is
+/// unit-testable off Windows.
+///
+/// KNOWN LIMITATIONS (all deliberately accepted — the bash_suffix description warning is the
+/// primary, robust mitigation; this rewrite is a best-effort safety net for the reflex idiom):
+///   * Heredocs: a command containing `<<` is left ENTIRELY untouched, because a `> nul` in a
+///     heredoc/here-string BODY may be literal content the model is writing verbatim (e.g. a
+///     `.bat` where `nul` really IS the cmd.exe device). Skipping avoids silently corrupting
+///     that content; the cost is that a genuine top-level `> nul` in the same command is not
+///     rewritten (pre-fix stray-file behavior persists — a miss, never a new corruption).
+///   * Not covered (rare, non-cmd idioms → at worst a stray file, same as before): the csh-style
+///     `>& nul` dup form, `> nul` nested inside `"$(…)"`, the colon-device spelling `> nul:`,
+///     and `< nul` input redirects. `[[ … > nul ]]` / `# comment > nul` are not distinguished
+///     from redirects but are negligible in practice.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rewrite_nul_redirect(command: &str) -> Cow<'_, str> {
+    let bytes = command.as_bytes();
+    if !bytes.contains(&b'>') {
+        return Cow::Borrowed(command); // no redirect operator ⇒ nothing to rewrite
+    }
+    // Heredoc / here-string present: `> nul` may live in a verbatim body (a `.bat` the model
+    // is writing, where `nul` is the real cmd.exe device). Rewriting it would silently corrupt
+    // that content, so bail entirely — a possible stray file is strictly better than mutating
+    // data the user asked to write verbatim.
+    if command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+    // A `nul` redirect target ends at one of these (or end-of-string). A following `.`,
+    // alnum, `_`, `/` etc. means it is `nul.txt` / `nully` / a path — NOT the bare device.
+    fn is_boundary(next: Option<u8>) -> bool {
+        match next {
+            None => true,
+            Some(b) => matches!(
+                b,
+                b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'<' | b'>' | b')' | b'`'
+            ),
+        }
+    }
+    let n = bytes.len();
+    let mut result = String::new();
+    let mut last_copied = 0usize; // command[..last_copied] has been flushed into `result`
+    let mut changed = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            // Inside double quotes a backslash may escape the next byte (`\"`, `\\`).
+            if c == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'\\' if i + 1 < n => i += 2, // escaped char outside quotes — skip both
+            b'>' => {
+                // Consume the redirect operator: this `>` plus any immediately-following
+                // `>` (append) / `|` (noclobber override). A leading fd (`2`, `&`) was
+                // already emitted as an ordinary char before this `>`.
+                let mut op_end = i + 1;
+                while op_end < n && (bytes[op_end] == b'>' || bytes[op_end] == b'|') {
+                    op_end += 1;
+                }
+                // Skip blanks between the operator and the target.
+                let mut t = op_end;
+                while t < n && (bytes[t] == b' ' || bytes[t] == b'\t') {
+                    t += 1;
+                }
+                let is_nul = t + 3 <= n
+                    && bytes[t].eq_ignore_ascii_case(&b'n')
+                    && bytes[t + 1].eq_ignore_ascii_case(&b'u')
+                    && bytes[t + 2].eq_ignore_ascii_case(&b'l')
+                    && is_boundary(bytes.get(t + 3).copied());
+                if is_nul {
+                    // Flush everything up to (and including) the operator + blanks verbatim,
+                    // then substitute the target.
+                    result.push_str(&command[last_copied..t]);
+                    result.push_str("/dev/null");
+                    last_copied = t + 3;
+                    changed = true;
+                    i = t + 3;
+                } else {
+                    i = op_end; // not a nul target — resume scanning past the operator
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(command);
+    }
+    result.push_str(&command[last_copied..]);
+    Cow::Owned(result)
+}
+
 /// Windows shell selection. Returns `Ok(Command)` ready to spawn, or `Err(reason)` when
 /// the command contains bash constructs that neither bash (absent) nor cmd.exe can handle
 /// safely — the caller surfaces that as a clear tool error so the model can rewrite.
@@ -590,8 +726,12 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
         // Bash available (Git Bash / WSL / MSYS2) — route through it, unifying with
         // the Unix path. `bash -c "<script>"` honors bash quoting exactly as the model
         // expects; no silent corruption of `$()`, inline Python, or multi-line strings.
+        // Rewrite the cmd.exe idiom `> nul` → `> /dev/null` first: under Git Bash `nul`
+        // is a plain filename, so `> nul` would create a stray, undeletable `nul` file in
+        // the cwd (see `rewrite_nul_redirect`).
+        let command = rewrite_nul_redirect(command);
         let mut cmd = tokio::process::Command::new(bash);
-        cmd.arg("-c").arg(command);
+        cmd.arg("-c").arg(command.as_ref());
         return Ok(cmd);
     }
     // No bash — cmd.exe fallback. Guard against constructs cmd.exe will silently corrupt
@@ -1192,6 +1332,53 @@ mod tests {
         assert_eq!(rewrite_sudo_for_askpass("find / -name x"), "find / -name x");
     }
 
+    // On Windows the `bash` tool routes through Git Bash / MSYS2, where the cmd.exe
+    // idiom `> nul` (a reflex models emit to discard output) does NOT hit the null
+    // device — `nul` is a plain relative filename, so bash creates a REAL file named
+    // `nul` in the cwd. MSYS2 opens via NT-native paths, bypassing Win32's reserved-name
+    // guard, so the file is real and undeletable via Explorer / `del nul`. We rewrite the
+    // redirect target to `/dev/null` (the model's actual intent) so nothing hits disk.
+    #[test]
+    fn rewrite_nul_redirect_targets_only() {
+        // Bare `> nul` (with and without space) → /dev/null.
+        assert_eq!(rewrite_nul_redirect("echo hi > nul"), "echo hi > /dev/null");
+        assert_eq!(rewrite_nul_redirect("echo hi >nul"), "echo hi >/dev/null");
+        // fd-prefixed and combined forms.
+        assert_eq!(rewrite_nul_redirect("foo 2> nul"), "foo 2> /dev/null");
+        assert_eq!(rewrite_nul_redirect("foo 2>nul"), "foo 2>/dev/null");
+        assert_eq!(rewrite_nul_redirect("foo &> nul"), "foo &> /dev/null");
+        assert_eq!(rewrite_nul_redirect("foo >> nul"), "foo >> /dev/null");
+        assert_eq!(rewrite_nul_redirect("foo 2>>nul"), "foo 2>>/dev/null");
+        // Case-insensitive (NUL / Nul).
+        assert_eq!(rewrite_nul_redirect("foo > NUL"), "foo > /dev/null");
+        assert_eq!(rewrite_nul_redirect("foo >Nul"), "foo >/dev/null");
+        // The common `cmd > nul 2>&1` — only the nul target is touched; `2>&1` intact.
+        assert_eq!(rewrite_nul_redirect("cmd > nul 2>&1"), "cmd > /dev/null 2>&1");
+        // Trailing separators are boundaries.
+        assert_eq!(rewrite_nul_redirect("a > nul; b"), "a > /dev/null; b");
+        assert_eq!(rewrite_nul_redirect("a > nul|b"), "a > /dev/null|b");
+        // `nul` as an argument, not a redirect target → UNTOUCHED.
+        assert_eq!(rewrite_nul_redirect("echo nul"), "echo nul");
+        assert_eq!(rewrite_nul_redirect("grep nul file"), "grep nul file");
+        // `nul` with a suffix is a different file → not a bare device name → untouched.
+        assert_eq!(rewrite_nul_redirect("cat > nul.txt"), "cat > nul.txt");
+        assert_eq!(rewrite_nul_redirect("cat > nully"), "cat > nully");
+        // Inside quotes the target is literal / user-intended → untouched.
+        assert_eq!(rewrite_nul_redirect("echo 'a > nul'"), "echo 'a > nul'");
+        assert_eq!(rewrite_nul_redirect(r#"echo "a > nul""#), r#"echo "a > nul""#);
+        // A real target that merely follows a redirect is untouched (not nul).
+        assert_eq!(rewrite_nul_redirect("foo > out.log"), "foo > out.log");
+        // No redirect at all → borrowed, no allocation.
+        assert!(matches!(rewrite_nul_redirect("ls -la"), std::borrow::Cow::Borrowed(_)));
+        // Multibyte content survives the byte-level scan.
+        assert_eq!(rewrite_nul_redirect("echo 你好 > nul"), "echo 你好 > /dev/null");
+        // Heredoc present → bail entirely: a `> nul` in the body may be verbatim content the
+        // model is writing (e.g. a .bat where `nul` is the real cmd.exe device). Must NOT be
+        // mutated — a possible stray file beats silently corrupting written content.
+        let heredoc = "cat > build.bat <<'EOF'\ncl a.c > nul\nEOF";
+        assert_eq!(rewrite_nul_redirect(heredoc), heredoc);
+    }
+
     // On Windows the description must explicitly tell the model it runs via
     // cmd.exe (not bash) and steer it away from bash-only syntax — otherwise the
     // model follows the `bash` tool name and emits heredocs / $(...) / single-quote
@@ -1256,6 +1443,10 @@ mod tests {
             "must steer to forward-slash / POSIX paths: {d}");
         // Base steering (native file tools) still present.
         assert!(d.contains("read_file") && d.contains("glob"), "base steering retained: {d}");
+        // Must steer output-discard to /dev/null, NOT `nul`: under Git Bash `> nul`
+        // creates a stray, undeletable file (we also rewrite it defensively).
+        assert!(lc.contains("/dev/null"), "must tell the model to discard via /dev/null: {d}");
+        assert!(lc.contains("nul"), "must warn against the `nul` redirect target: {d}");
     }
 
     // With NO bash present, cmd.exe IS what runs — the description must keep the cmd.exe
