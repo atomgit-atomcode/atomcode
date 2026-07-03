@@ -703,6 +703,13 @@ impl Bridge {
                 };
                 match target.canonicalize() {
                     Ok(d) if d.is_dir() => {
+                        // On Windows `canonicalize` re-adds the `\\?\` verbatim prefix even
+                        // when the incoming `dir` was already plain — strip it before it
+                        // reaches the engine's `working_dir` OR the `WorkingDirChanged` event
+                        // the TUI stores into `ctx.working_dir` (otherwise it re-verbatims the
+                        // value the TUI's own `/cd` just stripped, and the status row / any
+                        // cwd display leaks `\\?\C:\…`). Mirrors the daemon's `change_dir`.
+                        let d = atomcode_core::tool::strip_verbatim_prefix_path(&d);
                         // `/cd` = a NEW SESSION in the new project: re-prepare the engine
                         // rooted at the new dir so persona/context/instructions/MCP/skills
                         // all rebind. An in-place `shared_cwd` write would only move the

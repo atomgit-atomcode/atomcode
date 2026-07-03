@@ -8875,6 +8875,13 @@ fn handle_agent_event(
             // streaming, idle redraw after turn complete). Without this the
             // footer is stuck on the old path until the user types `/cd` or
             // restarts the session.
+            //
+            // Strip the Windows `\\?\` verbatim prefix: the emitter (bridge / core
+            // turn runner) canonicalizes the target, so `new_dir` can arrive as
+            // `\\?\C:\…` and would otherwise re-verbatim `ctx.working_dir` (and
+            // recent_dirs) after `apply_cd` just stripped it. This is the one
+            // `working_dir` writer that does not funnel through `apply_cd`.
+            let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
                 ctx.runtime_factory.set_working_dir(new_dir.clone());

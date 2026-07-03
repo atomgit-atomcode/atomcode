@@ -181,7 +181,10 @@ impl Modal for DirPicker {
                     return Ok(ModalAction::Close);
                 }
                 apply_cd(ctx, path.clone());
-                let p = path.display().to_string();
+                // Render from the normalized `working_dir` (apply_cd strips the Windows
+                // `\\?\` verbatim prefix) rather than the raw recent-dirs entry, which may
+                // be a persisted `\\?\C:\…` from before the fix.
+                let p = ctx.working_dir.display().to_string();
                 renderer.render(UiLine::CommandOutput(
                     crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p }).into_owned(),
                 ));

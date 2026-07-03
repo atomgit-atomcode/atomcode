@@ -4096,6 +4096,13 @@ pub(crate) fn reset_to_new_session(
 /// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
 /// DirPicker modal's Enter handler so both paths keep state coherent.
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
+    // Normalize the funnel: `resolve_cd` strips the Windows `\\?\` verbatim prefix,
+    // but the dir-picker's recent-list branch and the webui `ProjectSwitched` event
+    // reach here WITHOUT going through it, carrying a canonicalized `\\?\C:\…` path
+    // (persisted recent_dirs.txt entries from before the fix, or a re-canonicalized
+    // bridge value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDir`
+    // command, and the webui sync all store the plain form regardless of caller.
+    let path = atomcode_core::tool::strip_verbatim_prefix_path(&path);
     ctx.agent
         .cmd_tx
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
@@ -4145,6 +4152,9 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
             s.lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(PathBuf::from)
+                // Strip the `\\?\` verbatim prefix off entries persisted before the
+                // fix, so the picker list never shows the raw `\\?\C:\…` form.
+                .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
                 .filter(|p| p.is_dir())
                 .take(MAX_RECENT_DIRS)
                 .collect()
