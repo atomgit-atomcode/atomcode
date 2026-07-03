@@ -4175,6 +4175,17 @@ pub(crate) fn resolve_cd(
     let canon = target
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
+    // On Windows `canonicalize` returns a `\\?\` verbatim / extended-length path.
+    // Strip it here at the SOURCE so every downstream sink carries the plain
+    // `C:\…` form: the "已切换到 …" confirmation (uses this value directly), the
+    // stored `working_dir`, the `AgentCommand::ChangeDir` sent to the runtime, the
+    // webui footer sync (`live_set_working_dir`), and `recent_dirs.txt`. Only the
+    // status-row `collapse_home` stripped before, so those other sites leaked the
+    // raw `\\?\C:\Users\hao\atomcode`. Mirrors the daemon's `change_dir`, which
+    // already strips before setting its working dir. No-op off Windows / on
+    // non-verbatim paths; `hash_path` strips internally so the session bucket is
+    // unchanged.
+    let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
     if !canon.is_dir() {
         return Err(t(Msg::DirNotADirectory {
             path: &canon.display().to_string(),
@@ -5249,13 +5260,34 @@ mod tests {
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and
     /// on macOS `/var/folders/...` → `/private/var/folders/...`.
+    ///
+    /// The verbatim prefix is stripped to match `resolve_cd`'s new contract:
+    /// on Windows `canonicalize` yields `\\?\C:\…`, but `resolve_cd` strips that
+    /// at the source, so the expected values here must strip too or every
+    /// comparison below would fail on Windows. No-op off Windows.
     fn make_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = tmp.path().canonicalize().expect("canon cwd");
+        let strip = atomcode_core::tool::strip_verbatim_prefix_path;
+        let cwd = strip(&tmp.path().canonicalize().expect("canon cwd"));
         let sub = cwd.join("sub");
         std::fs::create_dir(&sub).expect("mkdir sub");
-        let sub = sub.canonicalize().expect("canon sub");
+        let sub = strip(&sub.canonicalize().expect("canon sub"));
         (tmp, cwd, sub)
+    }
+
+    /// `resolve_cd` must never return a Windows `\\?\` verbatim / extended-length
+    /// path — that raw form leaked into the `/cd` confirmation message and the
+    /// webui footer chip (`\\?\C:\Users\hao\atomcode`). Trivially true off
+    /// Windows; the real guard is on Windows, where `canonicalize` adds the prefix.
+    #[test]
+    fn resolve_cd_strips_verbatim_prefix() {
+        let (_tmp, cwd, _sub) = make_dirs();
+        let got = resolve_cd(".", &cwd, None).expect("cwd resolves");
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "resolve_cd leaked a verbatim prefix: {}",
+            got.display()
+        );
     }
 
     #[test]
@@ -5313,6 +5345,9 @@ mod tests {
         let Ok(canon_home) = home.canonicalize() else {
             return;
         };
+        // `resolve_cd` strips the Windows `\\?\` verbatim prefix, so strip the
+        // expected value to match (no-op off Windows).
+        let canon_home = atomcode_core::tool::strip_verbatim_prefix_path(&canon_home);
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);
