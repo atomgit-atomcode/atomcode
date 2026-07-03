@@ -137,11 +137,15 @@ pub fn prompt_text(req: &PromptRequest) -> (String, Vec<ImageContent>) {
 /// permission responses can still be processed by the loop. This function owns
 /// the deferred [`Responder`] and answers it exactly once on every exit path.
 ///
-/// Turn-level failures (a kernel `Error` event, or an abnormal stop reason)
-/// respond to the prompt with a JSON-RPC error but return `Ok(())` — returning
-/// `Err` from a spawned task tears the whole connection down, which we must
-/// reserve for genuine transport failures (`?` on `send_notification` /
-/// `handle_approval`, where the connection is already broken).
+/// Turn-level failures (a kernel `Error` event, an abnormal stop reason, or an
+/// approval round-trip failure) respond to the prompt with a JSON-RPC error (or
+/// fail the one tool call closed) but return `Ok(())` — returning `Err` from a
+/// spawned task tears the whole connection down, wiping the client's thread.
+/// That is reserved for genuine transport death (`?` on `send_notification`,
+/// where the wire is already broken). An approval hiccup — the client cancelled
+/// the prompt, ESC'd, or sent an unexpected message — is NOT transport death:
+/// `handle_approval` fails closed internally and the call site here also guards,
+/// so a denied permission never crashes the session.
 pub async fn run_prompt_turn(
     cx: ConnectionTo<Client>,
     sessions: Sessions,
@@ -199,8 +203,18 @@ pub async fn run_prompt_turn(
                         id,
                         value: serde_json::json!({"decision": "allow"}),
                     });
-                } else {
-                    crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await?;
+                } else if let Err(e) =
+                    crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await
+                {
+                    // Defense-in-depth: `handle_approval` already fails closed internally
+                    // and returns `Ok`, but a `?` here would tear the WHOLE connection down
+                    // (see this function's doc) — reserved for genuine transport death, NOT
+                    // an approval hiccup. Deny this call so the kernel unparks, keep the turn.
+                    eprintln!("acp: approval handling errored ({e}); denying this call, turn continues");
+                    let _ = cmd_tx.send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({"decision": "deny"}),
+                    });
                 }
             }
             Some(AgentEvent::Request { id, .. }) => {
