@@ -623,7 +623,6 @@ Scan the QR code below with WeChat to join the AtomCode community group — shar
 <p align="center">
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode Alipay donate QR code" width="220">
   <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode WeChat Pay donate QR code" width="240">
->>>>>>> main
 </p>
 
 ## License
