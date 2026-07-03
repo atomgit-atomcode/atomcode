@@ -12,13 +12,14 @@ echo "# AtomCode Test Report" > $REPORT
 echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')" >> $REPORT
 echo "**Build:** $(git rev-parse --short HEAD)" >> $REPORT
 echo "**Branch:** $(git branch --show-current)" >> $REPORT
+echo "**Scope:** All workspace crates (cargo test --workspace)" >> $REPORT
 echo "" >> $REPORT
 
 # Run all tests in one cargo invocation (compile + run)
 echo "=== AtomCode Full Test Suite ==="
 echo ""
 echo -n "Compiling & running all tests... "
-output=$(cargo test -p atomcode-core 2>&1) || true
+output=$(cargo test --workspace 2>&1) || true
 
 # Extract compile warnings from the combined output. Rustc diagnostics usually
 # start with `warning:`; some tools emit `warning[lint_name]:`.

@@ -3814,7 +3814,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     let mut last_terminal_title: Option<String> = None;
 
     loop {
-        sync_terminal_title(&ctx, renderer, &mut last_terminal_title);
+        sync_terminal_title(&ctx, renderer, &mut last_terminal_title, app.state.phase);
 
         #[cfg(unix)]
         tokio::select! {
@@ -6540,12 +6540,37 @@ pub(crate) fn sync_recalled_attachments(
 /// emits (startup fallback), and each session-name change (auto-name, `/rename`,
 /// `/resume`, `/new`) is picked up on the next iteration.
 ///
+/// The title is prefixed with a status dot derived from `phase`
+/// (🟢 idle / 🟡 busy / 🔴 approval) when `ctx.config.ui.terminal_status_glyph`
+/// is on; a phase change re-emits on the next loop iteration.
+///
 /// Fallback for un-named / brand-new sessions is `atomcode v<version>`, so a
 /// fresh tab shows the running version instead of whatever stale string the
 /// launcher/shortcut left behind (the original `atomcode-v4.25.6`-lingering bug).
-fn sync_terminal_title(ctx: &LoopCtx, renderer: &mut dyn Renderer, last: &mut Option<String>) {
+fn sync_terminal_title(
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+    last: &mut Option<String>,
+    phase: UiPhase,
+) {
     const VERSION_FALLBACK: &str = concat!("atomcode v", env!("CARGO_PKG_VERSION"));
-    let title = crate::title::session_terminal_title(&ctx.current_session.name, VERSION_FALLBACK);
+    // `None` = leave the title untouched (Suspended: an external child owns
+    // the terminal during /shell, OAuth, etc.).
+    // Gate the glyph on the terminal's auto-detected unicode capability too,
+    // not just the config toggle: `TERM=dumb` / `LANG=C` / `ATOMCODE_ASCII` /
+    // legacy conhost report `unicode_symbols == false`, where the emoji dot
+    // would render as a tofu box. This mirrors every other symbol site
+    // (chevron, goal marker, dir-picker) so ASCII terminals fall back without
+    // the user having to disable `terminal_status_glyph` by hand.
+    let glyph_enabled = ctx.caps.unicode_symbols && ctx.config.ui.terminal_status_glyph;
+    let Some(title) = crate::title::status_title(
+        &ctx.current_session.name,
+        VERSION_FALLBACK,
+        phase,
+        glyph_enabled,
+    ) else {
+        return;
+    };
     if last.as_deref() != Some(title.as_str()) {
         renderer.set_title(title.clone());
         *last = Some(title);
@@ -8875,6 +8900,13 @@ fn handle_agent_event(
             // streaming, idle redraw after turn complete). Without this the
             // footer is stuck on the old path until the user types `/cd` or
             // restarts the session.
+            //
+            // Strip the Windows `\\?\` verbatim prefix: the emitter (bridge / core
+            // turn runner) canonicalizes the target, so `new_dir` can arrive as
+            // `\\?\C:\…` and would otherwise re-verbatim `ctx.working_dir` (and
+            // recent_dirs) after `apply_cd` just stripped it. This is the one
+            // `working_dir` writer that does not funnel through `apply_cd`.
+            let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
                 ctx.runtime_factory.set_working_dir(new_dir.clone());

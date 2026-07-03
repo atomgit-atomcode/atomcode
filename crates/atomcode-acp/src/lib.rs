@@ -41,7 +41,7 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
     NewSessionRequest, PromptCapabilities, PromptRequest,
 };
-use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Dispatch, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Dispatch, Handled, Stdio};
 use atomcode_kernel::provider::LlmProvider;
 
 use crate::dispatch::{handle_cancel, handle_new_session, Sessions};
@@ -185,10 +185,29 @@ where
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
-                message.respond_with_error(
-                    agent_client_protocol::util::internal_error("unhandled message"),
-                    cx,
-                )
+                // Catch-all for messages no typed handler above claimed. CRITICAL: only
+                // claim unknown client→agent REQUESTS (reply with an error so the client
+                // gets a clean failure, not a hang). RESPONSES and NOTIFICATIONS MUST pass
+                // through (`Handled::No`) to the crate's built-in router.
+                //
+                // Why this matters: this handler receives `Dispatch<UntypedMessage>`, whose
+                // `matches_method()` is ALWAYS true, so it sees every message — including the
+                // `Dispatch::Response` carrying the client's reply to our outgoing
+                // `session/request_permission`. The old code called `respond_with_error` on
+                // it, which for a Response forwards the error to the task awaiting it — so
+                // `handle_approval`'s `block_task().await` got `Err("unhandled message")` for
+                // EVERY approval (even "Allow"), which (before the resilience fix) tore the
+                // whole ACP connection down and wiped the client's thread. Passing responses
+                // through lets the built-in forwarder deliver them to their awaiter.
+                if matches!(message, Dispatch::Request(..)) {
+                    message.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                        cx,
+                    )?;
+                    Ok(Handled::Yes)
+                } else {
+                    Ok(Handled::No { message, retry: false })
+                }
             },
             agent_client_protocol::on_receive_dispatch!(),
         )

@@ -4096,6 +4096,13 @@ pub(crate) fn reset_to_new_session(
 /// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
 /// DirPicker modal's Enter handler so both paths keep state coherent.
 pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
+    // Normalize the funnel: `resolve_cd` strips the Windows `\\?\` verbatim prefix,
+    // but the dir-picker's recent-list branch and the webui `ProjectSwitched` event
+    // reach here WITHOUT going through it, carrying a canonicalized `\\?\C:\…` path
+    // (persisted recent_dirs.txt entries from before the fix, or a re-canonicalized
+    // bridge value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDir`
+    // command, and the webui sync all store the plain form regardless of caller.
+    let path = atomcode_core::tool::strip_verbatim_prefix_path(&path);
     ctx.agent
         .cmd_tx
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
@@ -4135,6 +4142,27 @@ pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
     dirs.truncate(MAX_RECENT_DIRS);
 }
 
+/// Parse `recent_dirs.txt` contents into a `\\?\`-stripped, de-duplicated path
+/// list, preserving first-occurrence order. Pure (no filesystem) so it is
+/// unit-testable; the `is_dir` liveness filter + `MAX_RECENT_DIRS` cap stay in
+/// `load_recent_dirs` because they touch the FS.
+///
+/// De-dup matters because a legacy file can hold BOTH the `\\?\C:\…` verbatim
+/// form and the plain `C:\…` form of the same dir (cd'd on an old vs a fixed
+/// binary). Stripping collapses them to one path, but `push_recent_dir` only
+/// de-dups on WRITE — without de-duping on read the picker showed the same dir
+/// as two identical `~/atomcode` rows.
+fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(PathBuf::from)
+        .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
 /// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
 /// so stale entries from a deleted project don't linger in the picker.
 pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
@@ -4142,9 +4170,8 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| {
-            s.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(PathBuf::from)
+            parse_recent_dirs(&s)
+                .into_iter()
                 .filter(|p| p.is_dir())
                 .take(MAX_RECENT_DIRS)
                 .collect()
@@ -5279,6 +5306,33 @@ mod tests {
     /// path — that raw form leaked into the `/cd` confirmation message and the
     /// webui footer chip (`\\?\C:\Users\hao\atomcode`). Trivially true off
     /// Windows; the real guard is on Windows, where `canonicalize` adds the prefix.
+    // The picker showed the same dir twice (`~/atomcode` ×2) because
+    // recent_dirs.txt accumulated BOTH the `\\?\C:\…` verbatim form and the plain
+    // `C:\…` form of one dir. Stripping collapses them; parse must then de-dup so
+    // the picker shows each dir once.
+    #[test]
+    fn parse_recent_dirs_strips_verbatim_and_dedups() {
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            r"\\?\C:\Users\hao\atomcode", // legacy verbatim form
+            r"C:\Users\hao\atomcode",     // plain form of the SAME dir
+            r"C:\Users\hao\temp0620",
+        );
+        assert_eq!(
+            parse_recent_dirs(&contents),
+            vec![
+                PathBuf::from(r"C:\Users\hao\atomcode"),
+                PathBuf::from(r"C:\Users\hao\temp0620"),
+            ],
+            "verbatim + plain forms of one dir must collapse to a single entry"
+        );
+        // Blank lines skipped; exact dupes collapsed; first-occurrence order kept.
+        assert_eq!(
+            parse_recent_dirs("/a\n\n/b\n/a\n"),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+    }
+
     #[test]
     fn resolve_cd_strips_verbatim_prefix() {
         let (_tmp, cwd, _sub) = make_dirs();

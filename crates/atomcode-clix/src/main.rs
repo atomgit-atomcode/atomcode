@@ -1317,11 +1317,26 @@ base_url = "https://openrouter.ai/api/v1"
         if !git(&["init", "-q"]).status.success() {
             return; // git unavailable in this environment → skip
         }
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
+        let assert_git = |args: &[&str]| {
+            let out = git(args);
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        };
+        assert_git(&["config", "user.email", "t@t"]);
+        assert_git(&["config", "user.name", "t"]);
         std::fs::write(repo.join("f.txt"), "one\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "init"]);
+        assert_git(&["add", "."]);
+        assert_git(&[
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--no-verify",
+            "-qm",
+            "chore: initialize test repo",
+        ]);
         std::fs::write(repo.join("f.txt"), "two\n").unwrap();
 
         let diff = git_diff(repo, None, false).unwrap();

@@ -81,21 +81,32 @@ pub async fn handle_approval(
         ToolCallUpdateFields::new().title(tool),
     );
 
-    let resp = cx
+    // The `session/request_permission` round-trip must NEVER propagate its error:
+    // this runs inside the spawned prompt turn, and returning `Err` there tears the
+    // WHOLE ACP connection down (server exits, the Zed thread is wiped). A round-trip
+    // failure — the client cancelled/ESC'd the prompt, sent an unexpected message, or
+    // hit a transient error — is a single-call event, not a reason to kill the session.
+    // On ANY failure, fail closed (deny) so the kernel still gets a decision and unparks
+    // (otherwise it reports "no decision received … internal channel failure"), and the
+    // turn continues. eprintln goes to stderr (the ACP log channel; stdout is JSON-RPC).
+    let decision = match cx
         .send_request(RequestPermissionRequest::new(
             session_id.clone(),
             tc,
             permission_options(),
         ))
         .block_task()
-        .await?;
-
-    let decision = match resp.outcome {
-        RequestPermissionOutcome::Selected(sel) => {
-            outcome_to_decision(sel.option_id.0.as_ref())
+        .await
+    {
+        Ok(resp) => match resp.outcome {
+            RequestPermissionOutcome::Selected(sel) => outcome_to_decision(sel.option_id.0.as_ref()),
+            // Cancelled or any future non-exhaustive variant → fail closed.
+            _ => serde_json::json!({"decision": "deny"}),
+        },
+        Err(e) => {
+            eprintln!("acp: request_permission round-trip failed ({e}); denying this call");
+            serde_json::json!({"decision": "deny"})
         }
-        // Cancelled or any future non-exhaustive variant → fail closed.
-        _ => serde_json::json!({"decision": "deny"}),
     };
 
     cmd_tx.send(AgentCommand::Respond { id: req_id, value: decision }).ok();

@@ -247,6 +247,15 @@ fn default_ai_session_naming() -> bool {
     true
 }
 
+fn default_terminal_status_glyph() -> bool {
+    // ON by default: a colored status dot (🟢 idle / 🟡 busy / 🔴 approval)
+    // prefixed to the terminal tab title so the user can tell state without
+    // switching windows. Off for terminals that render emoji as tofu boxes
+    // (tmux, plain VT, some embedded IDE terminals). Read from ctx.config, so
+    // /reload picks up a change.
+    true
+}
+
 /// UI section of the config — currently just the theme switch driving
 /// the TUIX colour palette. Persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +284,11 @@ pub struct UiConfig {
     /// off, the session keeps the truncation name.
     #[serde(default = "default_ai_session_naming")]
     pub ai_session_naming: bool,
+    /// Prefix a colored status dot (🟢 idle / 🟡 busy / 🔴 needs-approval) to
+    /// the terminal tab/window title. Default on; turn off if your terminal
+    /// shows emoji as monochrome tofu boxes.
+    #[serde(default = "default_terminal_status_glyph")]
+    pub terminal_status_glyph: bool,
 }
 
 impl Default for UiConfig {
@@ -284,6 +298,7 @@ impl Default for UiConfig {
             auto_copy_on_select: default_auto_copy_on_select(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
+            terminal_status_glyph: default_terminal_status_glyph(),
         }
     }
 }
@@ -840,6 +855,14 @@ mod tests {
         // A config that omits the key (older configs) also lands OFF.
         let ui: UiConfig = toml::from_str("theme = \"dark\"").unwrap();
         assert!(!ui.auto_copy_code_blocks, "missing key → default off");
+    }
+
+    #[test]
+    fn terminal_status_glyph_defaults_on() {
+        // Default-on: fresh config and a config missing the key both enable it.
+        assert!(UiConfig::default().terminal_status_glyph);
+        let ui: UiConfig = toml::from_str("").unwrap();
+        assert!(ui.terminal_status_glyph, "missing key → default on");
     }
 
     #[test]

@@ -1,6 +1,13 @@
 //! LiveSession 的 daemon 侧：独立 turn 构造 + 真实 TurnExecutor + /live 端点。
 //! 不依赖也不修改 process_chat_request / `/chat`（以少量重复换 /chat 零回归）。
 
+// This module runs IN the TUI process under `/webui`, so any write to the real
+// stdout/stderr corrupts the terminal — diagnostics MUST use the file-sink
+// `ctrace!`. These denies catch the common console-print forms when clippy runs;
+// the `no_console_prints_in_live_path` test is the always-on backstop (clippy is
+// not currently wired into CI). Inert (not an error) under a plain `cargo build`.
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -255,7 +262,7 @@ pub(crate) fn ensure_live_session_global(
     // 复用既有会话的分支已在上方提前 return，不会走到这里。
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
     let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
-        eprintln!("[engine v2] daemon live turns on the new stack");
+        atomcode_core::ctrace!("LIVE", "engine v2: daemon live turns on the new stack");
         Arc::new(KernelTurnExecutor::new(
             working_dir,
             None,
@@ -694,7 +701,7 @@ impl TurnExecutor for DaemonTurnExecutor {
             session.auto_name_from_messages();
             session.touch();
             if let Err(e) = manager.save(&session) {
-                eprintln!("Warning: failed to save live session: {e}");
+                atomcode_core::ctrace!("LIVE", "failed to save live session: {e}");
             }
         }
     }
@@ -1263,7 +1270,7 @@ impl TurnExecutor for KernelTurnExecutor {
                 c.messages.clone()
             };
             if let Err(e) = save_live_session_json(&self.working_dir, &self.session_id, messages) {
-                eprintln!("Warning: failed to save live session (v2): {e}");
+                atomcode_core::ctrace!("LIVE", "failed to save live session (v2): {e}");
             }
         }
 
@@ -1898,7 +1905,7 @@ pub(crate) async fn live_stream(
         let json = match serde_json::to_string(&w) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("live_stream: serde_json serialization failed: {e}");
+                atomcode_core::ctrace!("LIVE", "live_stream: serde_json serialization failed: {e}");
                 return Ok::<_, std::convert::Infallible>(Event::default().data(""));
             }
         };
@@ -2231,6 +2238,46 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard (2nd occurrence — see the `never eprintln` note near the
+    /// top of this file). Under `/webui` the LiveSession path runs IN the TUI
+    /// process, so a console print writes straight to the shared terminal and
+    /// corrupts the TUI — a stray "[engine v2] daemon live turns on the new stack"
+    /// landed on the input line when a dir switch during sync spun up the live
+    /// stack. Every diagnostic in this file must use the file-sink `ctrace!`.
+    ///
+    /// This scans our own source for the print-macro family (`print!` / `println!`
+    /// / `eprint!` / `eprintln!`) plus `dbg!`, which cover the realistic
+    /// regressions. It does NOT catch raw handle writes (`write!(io::stdout(), …)`)
+    /// — those are left to the module-level `#![deny(clippy::print_stdout, …)]`
+    /// and review, since a `stdout(`/`stderr(` substring scan false-positives on
+    /// `Command::stdout(Stdio::…)` and friends. Backstop, not a proof.
+    #[test]
+    fn no_console_prints_in_live_path() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/live_api.rs"))
+            .expect("read live_api.rs source");
+        // Needles built at runtime so this test body doesn't match itself. The
+        // "println" needle also catches the eprintln variant (it ends the same
+        // way); the "print" needle catches the eprint variant; "dbg" catches the
+        // one-keystroke debug print that writes to stderr.
+        let needles = [
+            format!("{}{}", "println", "!("),
+            format!("{}{}", "print", "!("),
+            format!("{}{}", "dbg", "!("),
+        ];
+        for (i, line) in src.lines().enumerate() {
+            if let Some(hit) = needles.iter().find(|n| line.contains(n.as_str())) {
+                panic!(
+                    "console print (`{}`) at live_api.rs:{} — use ctrace! (file sink), \
+                     never a console print: the /webui live path runs in the TUI process \
+                     and any stdout/stderr write here corrupts the terminal. Line: {}",
+                    hit,
+                    i + 1,
+                    line.trim(),
+                );
+            }
+        }
+    }
 
     // 回归：webui sync/live 模式切换模型——/live/message 必须解析 provider 字段，
     // 且 set_live_provider 把选择写入 LIVE_PROVIDER（None 不覆盖既有选择）。
