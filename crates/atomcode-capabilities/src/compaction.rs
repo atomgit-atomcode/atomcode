@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::{
@@ -124,6 +125,16 @@ const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
 const MAX_SUMMARY_TOKENS: u32 = 16_000;
+/// Wall-clock ceiling on the one-shot `/compact` summary LLM call. The provider's stream
+/// timeout is BYTE-IDLE only (300s of silence): a thinking model (e.g. GLM-5.2) on a ~200K
+/// prompt trickles hidden-reasoning bytes for many minutes, so the idle timer never fires and
+/// `/compact` can hang 20+ min. This hard cap bounds it — on expiry we fall back to the gentle
+/// in-place stub policy (keeps every message, folds bloated tool results) instead of hanging.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
+/// fall back to stub compaction, so the user understands why they got a lighter compaction.
+const SUMMARY_TIMEOUT_NOTE: &str =
+    "[系统] 本次 /compact 的 AI 摘要超时（>120s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
 
 /// System prompt for the anchored compaction summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
@@ -226,7 +237,15 @@ impl OverflowCompaction {
                     }
                     return CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None };
                 }
-                let summary = self.summarize(&msgs[floor..drain_to], None).await;
+                // Same wall-clock cap as `/compact` (a thinking model can hang the summary
+                // for many minutes). On timeout, degrade to plain drain (summary=None) — which
+                // this tier already handles — rather than freezing emergency overflow recovery.
+                let summary = tokio::time::timeout(
+                    SUMMARY_TIMEOUT,
+                    self.summarize(&msgs[floor..drain_to], None),
+                )
+                .await
+                .unwrap_or(None);
                 CompactionPlan { drain_from: floor, drain_to, summary, rewrites, resume_note: None }
             }
         }
@@ -251,7 +270,30 @@ impl OverflowCompaction {
             // to the gentle stub policy.
             return self.inner.plan(view).await;
         }
-        let summary = self.summarize(&msgs[floor..drain_to], focus).await;
+        // Wall-clock cap on the summary LLM call (see `SUMMARY_TIMEOUT`). On timeout, fall
+        // back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
+        // when there's nothing drainable — so a hung thinking model degrades `/compact` to a
+        // lighter compaction instead of freezing it. A note tells the user what happened.
+        let summary = match tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            self.summarize(&msgs[floor..drain_to], focus),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                let mut plan = self.inner.plan(view).await;
+                // Only annotate a plan that actually shrinks; adding a note to a noop plan
+                // would grow it and get (correctly) refused by the net-loss guard for nothing.
+                if !plan.rewrites.is_empty() {
+                    plan.resume_note = Some(match plan.resume_note.take() {
+                        Some(n) => format!("{n}\n{SUMMARY_TIMEOUT_NOTE}"),
+                        None => SUMMARY_TIMEOUT_NOTE.to_string(),
+                    });
+                }
+                return plan;
+            }
+        };
         CompactionPlan { drain_from: floor, drain_to, summary, rewrites: Vec::new(), resume_note: None }
     }
 
@@ -815,6 +857,58 @@ mod tests {
         }
     }
 
+    /// Opens the stream fine, then never yields a byte — models a thinking model (e.g.
+    /// GLM-5.2) stuck in hidden reasoning on a huge prompt, where the provider's byte-idle
+    /// stream timeout never fires. The manual `/compact` wall-clock cap must fire instead.
+    struct HangingSummaryProvider;
+    #[async_trait]
+    impl LlmProvider for HangingSummaryProvider {
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, atomcode_kernel::stream::ProviderError>
+        {
+            Ok(Box::pin(futures::stream::pending::<StreamEvent>()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_compact_summary_timeout_falls_back_to_stub() {
+        // sys, user1, asst(bash), tool(bash big), user2, asst(grep), tool(grep big), user3-active
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("first"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("bash out"), false),
+            Message::user("second"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", &big("grep out"), false),
+            Message::user("third-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(HangingSummaryProvider)),
+        );
+        // start_paused auto-advances virtual time to the 120s cap while the provider hangs.
+        let plan = strat.plan(&manual_view(&conv.messages, floor, None)).await;
+        // Timeout → C fallback: the gentle in-place stub policy (no drain, no LLM summary),
+        // so every message survives and old tool results are folded to reclaim tokens.
+        assert_eq!(plan.drain_from, 0, "timeout must NOT drain-and-summarize");
+        assert_eq!(plan.drain_to, 0, "timeout must NOT drain-and-summarize");
+        assert!(plan.summary.is_none(), "no LLM summary on timeout");
+        assert!(!plan.rewrites.is_empty(), "stub fallback must fold old tool results");
+        let note = plan.resume_note.expect("timeout must surface a user-facing notice");
+        assert!(note.contains("超时"), "notice should explain the timeout: {note:?}");
+    }
+
     #[tokio::test]
     async fn summary_is_capped_at_max_bytes() {
         let msgs = vec![
@@ -1068,6 +1162,30 @@ mod tests {
             .await;
         assert!(plan.summary.is_none(), "no provider → plain drain");
         assert!(plan.drain_to > floor);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overflow_tier2_summary_timeout_plain_drains() {
+        // A hanging (thinking) provider must NOT freeze emergency overflow recovery: the
+        // wall-clock cap fires (virtual time under start_paused) → plain drain, same as no
+        // provider. Proves the tier-2 summarize call is bounded, not just `/compact`.
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            Message::assistant("a1", vec![]),
+            Message::user("u2-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let plan = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(HangingSummaryProvider)),
+        )
+        .plan(&overflow_view(&conv.messages, floor, 2, 8000))
+        .await;
+        assert!(plan.summary.is_none(), "summary timeout → plain drain");
+        assert!(plan.drain_to > floor, "still drains old turns");
     }
 
     #[test]
