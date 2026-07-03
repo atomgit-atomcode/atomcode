@@ -8,6 +8,7 @@
 // title fixes that and lets each tab show which session it is.
 
 use crate::sanitize::scrub_controls;
+use crate::state::UiPhase;
 
 /// Max characters kept in the title before truncation. Tab strips are
 /// narrow, so keep this modest; the ellipsis counts toward the budget.
@@ -53,6 +54,44 @@ pub fn session_terminal_title(name: &str, fallback: &str) -> String {
     }
 
     cleaned
+}
+
+/// Colored status dot for the terminal-title prefix, keyed off the current
+/// UI phase. `None` means "no dot" — used for `Suspended` (external handoff:
+/// `/shell`, OAuth) where we leave whatever title was last shown.
+fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
+    match phase {
+        UiPhase::Idle => Some("🟢"),
+        UiPhase::Streaming => Some("🟡"),
+        UiPhase::Approval => Some("🔴"),
+        UiPhase::Suspended => None,
+    }
+}
+
+/// Build the title, optionally prefixed with a status `glyph`. The name
+/// portion reuses [`session_terminal_title`] unchanged (so its truncation /
+/// scrubbing budget is untouched); the glyph is an extra 1-scalar + space
+/// prefix, so a status title is at most 2 chars longer than the plain one.
+pub fn session_terminal_title_with_status(name: &str, fallback: &str, glyph: Option<&str>) -> String {
+    let title = session_terminal_title(name, fallback);
+    match glyph {
+        Some(g) => format!("{g} {title}"),
+        None => title,
+    }
+}
+
+/// Decide the full terminal title to emit for `(name, phase, glyph_enabled)`.
+/// Returns `None` when the title should be left untouched (the `Suspended`
+/// phase, where the terminal is handed to an external child). When
+/// `glyph_enabled` is false, no dot is added — behaviour identical to before
+/// this feature.
+pub fn status_title(name: &str, fallback: &str, phase: UiPhase, glyph_enabled: bool) -> Option<String> {
+    let glyph = phase_status_glyph(phase);
+    if phase == UiPhase::Suspended {
+        return None;
+    }
+    let glyph = if glyph_enabled { glyph } else { None };
+    Some(session_terminal_title_with_status(name, fallback, glyph))
 }
 
 #[cfg(test)]
@@ -111,5 +150,73 @@ mod tests {
         let title = session_terminal_title(&name, FB);
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn glyph_maps_each_phase() {
+        assert_eq!(phase_status_glyph(UiPhase::Idle), Some("🟢"));
+        assert_eq!(phase_status_glyph(UiPhase::Streaming), Some("🟡"));
+        assert_eq!(phase_status_glyph(UiPhase::Approval), Some("🔴"));
+        assert_eq!(phase_status_glyph(UiPhase::Suspended), None);
+    }
+
+    #[test]
+    fn with_status_prefixes_glyph_and_space() {
+        let t = session_terminal_title_with_status("fix login bug", FB, Some("🟡"));
+        assert_eq!(t, "🟡 fix login bug");
+    }
+
+    #[test]
+    fn with_status_none_is_identical_to_plain_title() {
+        // Toggle-off / no-glyph path must equal today's behaviour exactly.
+        assert_eq!(
+            session_terminal_title_with_status("fix login bug", FB, None),
+            session_terminal_title("fix login bug", FB),
+        );
+        assert_eq!(
+            session_terminal_title_with_status("default", FB, None),
+            FB,
+        );
+    }
+
+    #[test]
+    fn placeholder_name_still_gets_glyph() {
+        // A brand-new idle window shows 🟢 atomcode v9.9.9 (alive + idle).
+        assert_eq!(
+            session_terminal_title_with_status("default", FB, Some("🟢")),
+            format!("🟢 {FB}"),
+        );
+    }
+
+    #[test]
+    fn long_name_budget_survives_glyph_prefix() {
+        // The name portion is still truncated to MAX_TITLE_CHARS; the glyph
+        // is extra, so total is MAX + "🟢 " (2 chars) and the name part is intact.
+        let name = "a".repeat(50);
+        let plain = session_terminal_title(&name, FB); // MAX_TITLE_CHARS chars, ends with …
+        let with = session_terminal_title_with_status(&name, FB, Some("🟢"));
+        assert_eq!(with, format!("🟢 {plain}"));
+        assert!(plain.chars().count() == MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn status_title_suspended_returns_none() {
+        assert_eq!(status_title("fix login bug", FB, UiPhase::Suspended, true), None);
+    }
+
+    #[test]
+    fn status_title_disabled_drops_glyph() {
+        assert_eq!(
+            status_title("fix login bug", FB, UiPhase::Streaming, false),
+            Some("fix login bug".to_string()),
+        );
+    }
+
+    #[test]
+    fn status_title_enabled_prefixes_phase_glyph() {
+        assert_eq!(
+            status_title("fix login bug", FB, UiPhase::Approval, true),
+            Some("🔴 fix login bug".to_string()),
+        );
     }
 }
