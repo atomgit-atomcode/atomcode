@@ -65,6 +65,12 @@ pub enum UiLine {
         id: String,
         name: String,
         detail: String,
+        /// Optional ephemeral hint rendered as part of the inflight strip
+        /// (e.g. the bash "Press Ctrl+o …" line). Kept INSIDE the strip so
+        /// the spinner tick / commit erase cover it atomically — emitting it
+        /// as a separate body row breaks the "inflight strip = body tail"
+        /// invariant and orphans the spinner glyph on commit.
+        hint: Option<String>,
     },
     /// Freeze the most recent `ToolCallInFlight` row to its final
     /// static `▸` icon. Emitted right before `ToolResult` so the

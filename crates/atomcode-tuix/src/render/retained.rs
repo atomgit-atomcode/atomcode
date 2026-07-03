@@ -507,6 +507,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
+    /// Optional ephemeral hint (e.g. the bash "Press Ctrl+o …" line) rendered
+    /// as the LAST row(s) of the inflight strip by `render_inflight_tool`, so
+    /// it's counted in `inflight_tool_rows` and cleared atomically with the
+    /// spinner on commit. Must NOT be pushed as a standalone body row — that
+    /// breaks the "inflight strip = body tail" invariant and orphans the
+    /// spinner glyph next to the committed `●` (bash-only, since the hint is).
+    inflight_hint: Option<String>,
 
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -674,6 +681,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             in_sync_batch: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
+            inflight_hint: None,
             live_group: None,
             modal_overlay: None,
             body_log: Vec::new(),
@@ -785,7 +793,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let detail_style = self.style_for(Role::Secondary);
         let meta_style = self.style_bold(Role::ToolName);
 
-        let new_rows = if safe_detail.is_empty() {
+        let mut new_rows = if safe_detail.is_empty() {
             // No detail: simple path — name + meta, all bold
             self.build_mixed_style_rows(
                 &prefix, &prefix_style,
@@ -811,6 +819,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &full_body,
             )
         };
+
+        // Append the ephemeral hint (bash "Press Ctrl+o …") as the LAST row of
+        // the strip. Kept INSIDE `new_rows` — hence counted in `inflight_tool_rows`
+        // — so the in-place spinner rewrite and `commit_inflight_tool`'s erase
+        // cover it atomically. Rendering it as a standalone body row instead
+        // orphaned the spinner glyph on commit (the reported bug).
+        if let Some(hint) = self.inflight_hint.clone() {
+            let muted = if crate::highlight::theme::is_light_for_render() {
+                self.style_for(Role::Muted)
+            } else {
+                self.style_faint(Role::Muted)
+            };
+            let marker = if self.caps.unicode_symbols { "\u{25cb}" } else { "o" };
+            let hint_text = format!("  {marker} {hint}");
+            let screen_w = self.screen.width();
+            new_rows.push(build_one_row(&hint_text, &muted, screen_w));
+        }
 
         let prev_rows = self.inflight_tool_rows;
         let n = new_rows.len();
@@ -2418,6 +2443,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // Clear any previously rendered inflight tool rows so
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
+            // The hint rode inside the strip (counted in inflight_tool_rows),
+            // so the erase below covers it; just drop the state so it can't
+            // leak onto the next tool's spinner.
+            self.inflight_hint = None;
             let remove = self.inflight_tool_rows.min(self.body_lines.len());
             // CRITICAL: capture the bottom row BEFORE truncating. With
             // the top-anchored body model, `body_bottom_row()` returns
@@ -3208,6 +3237,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_group = None;
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
+        self.inflight_hint = None;
         self.live_spinner_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
@@ -3461,7 +3491,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
 
             // ── body: tools & diffs ──
-            UiLine::ToolCallInFlight { id, name, detail } => {
+            UiLine::ToolCallInFlight { id, name, detail, hint } => {
                 self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
@@ -3475,6 +3505,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // the body transcript) before starting a new one.
                     self.commit_inflight_tool();
                 }
+                // The hint (e.g. bash "Press Ctrl+o …") rides INSIDE the
+                // inflight strip so the spinner tick / commit erase cover it
+                // atomically. Set AFTER the preempt-commit above (which clears
+                // `inflight_hint`) so a tool that preempts a still-running one
+                // keeps ITS OWN hint, and BEFORE render_inflight_tool so the
+                // first paint already includes it.
+                self.inflight_hint = hint;
                 // Use a plausible "still" frame for the initial paint;
                 // the next Spinner / StreamingBox tick (within ~80ms)
                 // overwrites with the real frame, picking up the
@@ -6218,6 +6255,7 @@ mod tests {
             id: "call-leak".into(),
             name: "Bash".into(),
             detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
+            hint: None,
         });
         // Drive an in-place tick so the icon updates via the in-place
         // path (prev_rows>0). This is what the user's session looks
@@ -6326,6 +6364,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "cargo install cargo-udeps --locked".into(),
+            hint: None,
         });
         r.render(UiLine::Spinner {
             frame: "⠋".into(),
@@ -6407,6 +6446,7 @@ mod tests {
             id: "call_1".into(),
             name: "Bash".into(),
             detail: detail.into(),
+            hint: None,
         });
         // A spinner tick to exercise the in-place branch.
         r.render(UiLine::Spinner {
@@ -7305,6 +7345,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "test.txt ← \"10\"".into(),
+            hint: None,
         });
         inflight_r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
@@ -8306,6 +8347,7 @@ mod tests {
             id: "call-write-1".into(),
             name: "WriteFile".into(),
             detail: "test.txt".into(),
+            hint: None,
         });
 
         let row_texts: Vec<String> = r
@@ -9941,6 +9983,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "rm -f /tmp/test.txt".into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -10074,6 +10117,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: long_detail.into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -10966,6 +11010,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "ls -la /tmp".into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -11000,6 +11045,117 @@ mod tests {
     /// regress this path. With the over-erase removed (or the math
     /// corrected) the test passes for the right reason instead of
     /// being saved by the invalidation hammer.
+    /// Regression: the bash "Press Ctrl+o …" hint must ride INSIDE the
+    /// inflight strip so the commit erase covers it. Previously the hint was a
+    /// separate body row pushed AFTER the strip, breaking the "strip = body
+    /// tail" invariant; on commit the spinner glyph orphaned and lingered next
+    /// to the committed `●` (bash-only, since only bash gets the hint).
+    #[test]
+    fn retained_bash_inflight_hint_is_part_of_strip_and_cleared_on_commit() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Bash inflight WITH the Ctrl+o hint (the bash-only case that regressed).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "grep -n pattern file".into(),
+            hint: Some("Press Ctrl+o to show real-time output while running".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // During flight the hint is visible AND part of the strip (so
+        // inflight_tool_rows counts it — header + hint ≥ 2).
+        assert!(
+            vterm.any_row(|row| row.contains("Press Ctrl+o")),
+            "hint must show during flight:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            r.inflight_tool_rows >= 2,
+            "hint must be part of the inflight strip (rows>=2), got {}",
+            r.inflight_tool_rows
+        );
+
+        // Commit the tool (ToolCallResult → ToolCallCommit).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The committed tool row remains, but the hint is GONE — not orphaned
+        // above the committed `●`.
+        assert!(
+            vterm.any_row(|row| row.contains("Bash")),
+            "committed tool row must remain:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.any_row(|row| row.contains("Press Ctrl+o")),
+            "hint must be cleared on commit, not left orphaned:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// A second inflight tool that PREEMPTS a still-running one (the rare
+    /// parallel-call path) must keep ITS OWN hint. Regression guard: the hint
+    /// must be set AFTER the preempt-commit (which clears `inflight_hint`),
+    /// not before, or the new tool renders without its hint.
+    #[test]
+    fn retained_preempting_inflight_keeps_its_own_hint() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Tool A starts (still inflight — no commit).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-a".into(),
+            name: "Bash".into(),
+            detail: "first cmd".into(),
+            hint: Some("HINT_FOR_A".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Tool B preempts A (arrives before A commits) with ITS OWN hint.
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-b".into(),
+            name: "Bash".into(),
+            detail: "second cmd".into(),
+            hint: Some("HINT_FOR_B".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // B's hint must be visible — not wiped by A's preempt-commit.
+        assert!(
+            vterm.any_row(|row| row.contains("HINT_FOR_B")),
+            "preempting tool must keep its own hint:\n{}",
+            vterm.dump()
+        );
+    }
+
     #[test]
     fn retained_approval_pop_preserves_prior_body() {
         let w: u16 = 80;
@@ -11106,6 +11262,7 @@ mod tests {
             id: "call-7".into(),
             name: "WriteFile".into(),
             detail: "atomcode_smoke_replace.txt".into(),
+            hint: None,
         });
         // Spinner ticks for the inflight tool.
         for frame in ["⠋", "⠙", "⠹"] {
@@ -11182,6 +11339,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "numbers.txt ← \"5\"".into(),
+            hint: None,
         });
         r.flush_deferred();
 
@@ -11262,6 +11420,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "numbers.txt ← \"5\"".into(),
+            hint: None,
         });
         r.flush_deferred();
 

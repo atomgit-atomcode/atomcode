@@ -189,7 +189,8 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
+            UiLine::ToolCall { name, detail }
+            | UiLine::ToolCallInFlight { id: _, name, detail, hint: _ } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees

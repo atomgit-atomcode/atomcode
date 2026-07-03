@@ -8122,30 +8122,24 @@ fn handle_agent_event(
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
+            // Show hint for bash commands if real-time output is disabled, so
+            // users see it WHILE the command runs (pressing Ctrl+O streams live
+            // chunks). It rides INSIDE the ToolCallInFlight strip (renderer adds
+            // the "○ " marker + muted style) — NOT as a standalone body row: a
+            // separate row after the strip breaks the "strip = body tail"
+            // invariant, so on commit the spinner glyph orphaned and lingered
+            // next to the committed `●` (bash-only, since the hint is).
+            let ctrl_o_hint = if should_show_ctrl_o_hint(&name, state.show_tool_output, &id) {
+                Some("Press Ctrl+o to show real-time output while running".to_string())
+            } else {
+                None
+            };
             renderer.render(UiLine::ToolCallInFlight {
                 id: id.clone(),
                 name: display.clone(),
                 detail: detail.clone(),
+                hint: ctrl_o_hint,
             });
-            // Show hint for bash commands if real-time output is disabled.
-            // Placed HERE (at ToolCallStarted) rather than at ToolCallResult
-            // (where it was before), so users see it WHILE the command is
-            // running — pressing Ctrl+O actually streams live chunks.
-            // The old placement after ToolCallResult meant the command had
-            // already finished and no more ToolOutputChunk events were coming,
-            // so pressing Ctrl+O showed the "enabled" banner but no output.
-            if should_show_ctrl_o_hint(&name, state.show_tool_output, &id) {
-                let reset = "[0m";
-                let mute = if crate::highlight::theme::is_light_for_render() {
-                    "[90m"
-                } else {
-                    "[2m"
-                };
-                renderer.render(UiLine::CommandOutput(format!(
-                    "{mute}  ○ Press Ctrl+o to show real-time output while running{reset}
-",
-                )));
-            }
             renderer.flush();
 
             // Mark as rendered so ToolCallResult doesn't emit it again.
