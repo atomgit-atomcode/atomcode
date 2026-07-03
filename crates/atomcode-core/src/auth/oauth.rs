@@ -580,12 +580,47 @@ pub fn open_browser(url: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn open_browser(url: &str) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::process::CommandExt;
-    // `explorer.exe <url>` hands the URL to the shell's default-protocol handler as ONE
-    // argument, so a URL with `&` (our webui URL is `…/?token=…&sync=1`) opens intact — the
-    // `&` is data, not a shell operator. `cmd /C start "" "<url&x>"` mishandles the `&` and
-    // often fails to open the browser (esp. cold-launch). explorer also avoids the cmd
-    // console flash. Keep the legacy `cmd start` only as a fallback if explorer can't spawn.
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // NUL-terminated UTF-16 for the Win32 `W` API.
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // `ShellExecuteW(NULL, "open", url, …)` is exactly what clicking a hyperlink does:
+    // the URL is a single opaque argument (no shell / command-line parsing at all), so
+    // `?` and `&` in our `…/?token=…&sync=1` URL are pure data, and it reliably routes to
+    // the default browser whether or not one is already running. The prior `explorer.exe
+    // <url>` was unreliable — when it couldn't resolve the arg as a URL (notably on a cold
+    // browser launch) it opened a File Explorer *folder* window (Documents / This PC)
+    // instead, and `.spawn()` still reported success so the `cmd start` fallback never
+    // fired. `cmd /C start "" "<url>"` in turn mishandles `&`. ShellExecuteW sidesteps all
+    // three problems and avoids the cmd console flash.
+    let verb = wide("open");
+    let file = wide(url);
+    // Docs: ShellExecuteW returns a value > 32 on success (it's an HINSTANCE-typed status).
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if rc as isize > 32 {
+        return Ok(());
+    }
+
+    // ShellExecute failed (rare). Fall back to the legacy launchers.
     if std::process::Command::new("explorer").arg(url).spawn().is_ok() {
         return Ok(());
     }
