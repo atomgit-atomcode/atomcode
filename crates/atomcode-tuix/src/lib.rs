@@ -4,6 +4,7 @@ pub mod commands;
 pub mod custom_commands;
 pub mod event_loop;
 pub mod git;
+pub mod glyph;
 pub mod highlight;
 pub mod i18n;
 pub mod init;

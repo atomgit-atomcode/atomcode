@@ -834,7 +834,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let marker = if self.caps.unicode_symbols { "\u{25cb}" } else { "o" };
             let hint_text = format!("  {marker} {hint}");
             let screen_w = self.screen.width();
-            new_rows.push(build_one_row(&hint_text, &muted, screen_w));
+            new_rows.push(build_one_row(&hint_text, &muted, screen_w, self.caps.unicode_symbols));
         }
 
         let prev_rows = self.inflight_tool_rows;
@@ -2571,6 +2571,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// its own body row with a PAD_COL prefix. Used by variants
     /// whose content is plain (assistant text, command output).
     fn push_body_text(&mut self, text: &str, style: &CellStyle) {
+        // ASCII-downgrade decorative glyphs (`✓`/`✗`/`→`/box-drawing …) on non-unicode
+        // terminals so hardcoded-in-i18n marks don't render as `□` tofu (see `glyph`).
+        let text = crate::glyph::downgrade_glyphs(text, self.caps.unicode_symbols);
+        let text = text.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if w == 0 {
             return;
@@ -2606,6 +2610,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// caller has plain text and stays on the simpler
     /// `push_body_text`.
     fn push_body_text_sgr(&mut self, text: &str) {
+        // Downgrade decorative glyphs on non-unicode terminals (see `glyph`). The inline
+        // SGR escapes are ASCII and pass through untouched.
+        let text = crate::glyph::downgrade_glyphs(text, self.caps.unicode_symbols);
+        let text = text.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if w == 0 {
             return;
@@ -2681,6 +2689,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body_style: &CellStyle,
         cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
+        // Downgrade decorative glyphs (the `●`/`▸` prefixes AND any glyphs in the body)
+        // on non-unicode terminals — 1-col ASCII stand-ins keep prefix_w alignment.
+        let u = self.caps.unicode_symbols;
+        let prefix_cow = crate::glyph::downgrade_glyphs(prefix, u);
+        let body_cow = crate::glyph::downgrade_glyphs(body, u);
+        let prefix = prefix_cow.as_ref();
+        let body = body_cow.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
             return Vec::new();
@@ -3312,10 +3327,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 status,
                 attachments,
             } => {
-                // Returning to idle input: the spinner row served its
-                // purpose — clear it from both body history and the
-                // terminal so the user sees a clean input prompt, not
-                // a stale `⠋ Pondering…` row above the input box.
+                // Universal safety net for the hidden-caret bug: reaching the
+                // idle input prompt means the turn is over, so no tool can still
+                // be in flight. Any termination path that failed to commit it
+                // (silent non-Stopped stops, goal timeouts, protocol gaps) would
+                // otherwise leave `inflight_tool` Some and `paint_footer`'s
+                // `suppress_cursor` keep the caret hidden. No-op when already
+                // committed; `InputPrompt` is idle-only (streaming type-ahead
+                // renders via `StreamingBox`), so this can never freeze a
+                // genuinely-running tool early.
+                //
+                // Ordered before `clear_live_spinner` defensively: today the two
+                // are mutually exclusive (an inflight tool's spinner ticks route
+                // through `render_inflight_tool`, which never sets
+                // `live_spinner_active`; `ToolCallInFlight` also clears any live
+                // spinner first), so `clear_live_spinner` is a no-op while a tool
+                // is in flight. Committing first keeps that safe even if a future
+                // change lets both be active at once (`clear_live_spinner` pops a
+                // single row; a stale strip would then mis-truncate).
+                self.commit_inflight_tool();
+                // Returning to idle input: any remaining (non-tool) spinner row
+                // served its purpose — clear it so the user sees a clean input
+                // prompt, not a stale `⠋ Pondering…` row above the input box.
                 self.clear_live_spinner();
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
@@ -3387,6 +3420,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::TurnSeparator { label } => {
                 self.last_mark_was_assistant = false;
                 let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                // The summary label bakes `✓`/`✗`/`↻` from i18n — downgrade on non-unicode
+                // terminals (the reported `✗ Stopped` → `□` tofu).
+                let label = crate::glyph::downgrade_glyphs(&label, self.caps.unicode_symbols);
                 let safe = scrub_controls(&label);
                 let lw = crate::width::display_width(&safe);
                 let padded = 1 + lw + 1;
@@ -3589,14 +3625,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.style_faint(Role::Muted)
                 };
                 let screen_w = self.screen.width();
-                let header_row = build_one_row(&header, &header_style, screen_w);
+                let header_row = build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
                 self.push_body_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
-                    let row = build_one_row(&c.text, &muted, screen_w);
+                    let row = build_one_row(&c.text, &muted, screen_w, self.caps.unicode_symbols);
                     self.push_body_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
@@ -3652,7 +3688,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     self.style_faint(Role::Muted)
                 };
-                let new_row = build_one_row(&new_text, &muted, self.screen.width());
+                let new_row = build_one_row(&new_text, &muted, self.screen.width(), self.caps.unicode_symbols);
 
                 // Update in-memory.
                 if let Some(slot) = self.body_lines.get_mut(row_idx) {
@@ -3696,7 +3732,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // bug as the header (see header_style comment above for
                 // the full rationale and screenshot).
                 let style = self.style_for(Role::Secondary);
-                let row = build_one_row(&text, &style, self.screen.width());
+                let row = build_one_row(&text, &style, self.screen.width(), self.caps.unicode_symbols);
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
@@ -4012,6 +4048,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::Error(msg) => {
+                // Defense in depth (mirror TurnComplete / TurnCancelled): a turn
+                // that errors while a tool is still in flight — gateway 5xx,
+                // timeout, rate-limit, empty-response error, a failure mid-tool —
+                // must commit it. Otherwise `inflight_tool` stays `Some` and
+                // `paint_footer`'s `suppress_cursor` keeps the input caret hidden
+                // on EVERY repaint (including while the user types), until `/clear`
+                // resets it — the reported "cursor disappears after a while" bug.
+                // Commit BEFORE the error line so the frozen `▸` tool row lands
+                // above it, matching the transcript order of a normal commit.
+                self.flush_assistant_remainder();
+                self.commit_inflight_tool();
                 let err_style = self.style_for(Role::Error);
                 let safe = scrub_controls(&msg);
                 let body = t(Msg::ErrorPrefix { msg: &safe });
@@ -4972,9 +5019,11 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
 /// and the children to col 4, breaking visual alignment with the
 /// rest of the body which lives at col 0 (user messages, single
 /// tool calls).
-fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
+fn build_one_row(text: &str, style: &CellStyle, screen_w: u16, unicode: bool) -> Vec<Cell> {
     let avail = (screen_w as usize).saturating_sub(PAD_COL);
-    let safe = scrub_controls(text);
+    // Downgrade decorative glyphs (`●` header, `└` child branches) on non-unicode terminals.
+    let text = crate::glyph::downgrade_glyphs(text, unicode);
+    let safe = scrub_controls(&text);
     // Width-aware truncation: CJK glyphs occupy 2 cols each, so a row of
     // 30 汉字 (60 cols) on a 40-col screen must trip truncate and append `…`,
     // not slip past the chars().count() check and leak past the screen edge.
@@ -6482,6 +6531,95 @@ mod tests {
             vterm.cursor_visible(),
             "terminal cursor must be visible again after the inflight tool \
              commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
+    /// Regression: user reported the input caret vanishing "after running
+    /// a while" (can still type; `/clear` fixes it). Root cause: a turn that
+    /// ERRORS while a tool is in flight never committed `inflight_tool`
+    /// (`UiLine::Error` didn't, unlike TurnComplete/TurnCancelled), so
+    /// `paint_footer`'s `suppress_cursor` kept the caret hidden on every
+    /// repaint. Fix: the Error arm now commits the inflight tool.
+    #[test]
+    fn retained_error_after_inflight_tool_restores_cursor() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!vterm.cursor_visible(), "hidden while tool in flight");
+
+        // Turn errors mid-tool (no ToolCallCommit / TurnComplete arrives).
+        r.render(UiLine::Error("gateway 5xx".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "caret must return after an error commits the orphaned inflight tool"
+        );
+    }
+
+    /// Safety net: any termination path that returns to the idle input prompt
+    /// without committing the inflight tool (silent non-Stopped stops, goal
+    /// timeouts) must not leave the caret suppressed — the idle `InputPrompt`
+    /// redraw commits any orphan.
+    #[test]
+    fn retained_idle_redraw_commits_orphan_inflight_tool() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // A committed body line ABOVE the inflight strip — the orphan commit
+        // must remove only the strip rows, never the real body above them.
+        r.render(UiLine::AssistantText("SENTINEL_KEEP_ME".into()));
+        r.render(UiLine::AssistantLineBreak);
+        // Long detail so the inflight strip wraps to >1 row.
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cd /Users/theo/Documents/workspace/atomcode && cargo test -p atomcode-tuix --lib -- --nocapture 2>&1 | tail -200".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!vterm.cursor_visible(), "hidden while tool in flight");
+
+        // Return to idle WITHOUT a commit/complete/error (silent stop).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "idle redraw must commit the orphan inflight tool and restore the caret"
+        );
+        // Assert on the body MODEL (not scrollback — the sentinel was already
+        // emitted there on first render, so it survives there even when the
+        // model is corrupted). The double-remove truncates the sentinel out of
+        // `body_lines`; a correct commit removes only the strip rows.
+        let body_has_sentinel = r.body_lines.iter().any(|row| {
+            row.iter().map(|c| c.ch).collect::<String>().contains("SENTINEL_KEEP_ME")
+        });
+        assert!(
+            body_has_sentinel,
+            "committing the orphan strip must not eat the real body row above it"
         );
     }
 
@@ -10228,7 +10366,7 @@ mod tests {
         // 30 汉字 = 60 display cols. Screen 40 → avail = 40 - PAD_COL = 38.
         // Row's summed cell widths must fit within avail.
         let text = "你".repeat(30);
-        let row = build_one_row(&text, &CellStyle::default(), 40);
+        let row = build_one_row(&text, &CellStyle::default(), 40, true);
         let total_cols: usize = row.iter().map(|c| c.width as usize).sum();
         assert!(
             total_cols <= 38,
