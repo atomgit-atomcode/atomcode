@@ -37,11 +37,13 @@ pub mod telemetry;
 
 mod assemble;
 mod rate_limit;
+mod todo;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::CodingAgentConfig;
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
+pub use todo::TodoHook;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hooks, CodingParts, PrepareOptions, SessionBinding,
