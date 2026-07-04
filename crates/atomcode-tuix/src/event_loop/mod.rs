@@ -8215,6 +8215,37 @@ fn handle_agent_event(
                 return;
             }
 
+            // todowrite: render a compact glyph list block instead of the animated
+            // ToolCallInFlight spinner row. Each item line is styled by status:
+            // completed → Muted (dim), in_progress → Warning (yellow), pending → Muted.
+            // Falls through to the normal ToolCallInFlight path when parse fails.
+            if name == "todowrite" {
+                let block = todo_block_lines(&arguments, ctx.caps.unicode_symbols);
+                if !block.is_empty() {
+                    renderer.render(UiLine::AssistantLineBreak);
+                    for line in &block {
+                        let ui_line =
+                            if line.starts_with("[x]") || line.starts_with("[\u{2713}]") {
+                                // completed → dim/muted
+                                UiLine::Muted(format!("  {line}"))
+                            } else if line.starts_with("[~]") || line.starts_with("[\u{2022}]") {
+                                // in_progress → warning-colored
+                                UiLine::Warning(format!("  {line}"))
+                            } else {
+                                // pending → muted
+                                UiLine::Muted(format!("  {line}"))
+                            };
+                        renderer.render(ui_line);
+                    }
+                    renderer.flush();
+                    // Mark as rendered (call_rendered=true) so ToolCallResult
+                    // suppresses the normal ToolCall + ToolResult lines.
+                    pending_tools.insert(id, (display.clone(), detail, true));
+                    state.on_tool_call_started(&display);
+                    return;
+                }
+            }
+
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
@@ -8372,7 +8403,11 @@ fn handle_agent_event(
             // the ▸ tool-call line and the ⎿ result line; the model
             // still receives full output via the ToolResult message
             // in the conversation.
-            let suppress_body_echo = name == "parallel_edit_files";
+            // todowrite: the glyph list block was already rendered at ToolCallStarted
+            // (call_rendered=true); suppress both ToolCall + ToolResult lines to avoid
+            // printing the raw JSON echo a second time.
+            let suppress_body_echo = name == "parallel_edit_files"
+                || (name == "todowrite" && call_rendered);
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
@@ -10816,6 +10851,42 @@ pub(crate) fn install_password_modal(
     app.active_modal = Some(Box::new(
         crate::modals::password::PasswordModal::new(prompt, reply),
     ));
+}
+
+/// Split a todowrite call's args into per-item display lines (`<glyph> <content>`).
+/// Returns an empty Vec on parse failure — the caller then falls back to the normal
+/// tool row. Each returned string is already fully formatted: `<glyph> <content>`.
+pub(crate) fn todo_block_lines(args: &str, unicode: bool) -> Vec<String> {
+    match atomcode_capabilities::tools::todo::parse_todos(args) {
+        Ok(todos) if !todos.is_empty() => {
+            atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod todo_block_tests {
+    use super::*;
+
+    #[test]
+    fn todo_block_renders_glyph_lines() {
+        let lines = todo_block_lines(
+            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]}"#,
+            false,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "[x] a");
+        assert_eq!(lines[1], "[ ] b");
+    }
+
+    #[test]
+    fn todo_block_bad_args_empty() {
+        assert!(todo_block_lines(r#"{"nope":1}"#, false).is_empty());
+    }
 }
 
 #[cfg(test)]

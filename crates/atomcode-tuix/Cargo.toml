@@ -9,6 +9,7 @@ distro-pm = ["atomcode-core/distro-pm"]
 
 [dependencies]
 atomcode-askpass = { path = "../atomcode-askpass" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools"] }
 atomcode-core = { path = "../atomcode-core" }
 zeroize = "1"
 atomcode-daemon = { path = "../atomcode-daemon" }

@@ -619,6 +619,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "atomcode-askpass",
+ "atomcode-capabilities",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
