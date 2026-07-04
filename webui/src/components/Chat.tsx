@@ -1659,11 +1659,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               placeholder={t('chat.searchPlaceholder')}
               onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && searchTrim) {
+                if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
                   e.preventDefault();
-                  if (e.shiftKey) setMatchIdx((i) => (i - 1 + visibleMessages.length) % Math.max(visibleMessages.length, 1));
-                  else setMatchIdx((i) => (i + 1) % Math.max(visibleMessages.length, 1));
-                  const node = matchRefs.current[matchIdx];
+                  // P1 修复: 先算 newIdx 再同时用于 setMatchIdx 和滚动,
+                  // 避免闭包里 matchIdx 是旧值导致"慢一拍"。
+                  const delta = e.shiftKey ? -1 : 1;
+                  const n = visibleMessages.length;
+                  const newIdx = (matchIdx + delta + n) % n;
+                  setMatchIdx(newIdx);
+                  const node = matchRefs.current[newIdx];
                   if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }
               }}
@@ -1674,30 +1678,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
               </span>
             )}
-            {searchTrim && (
+            {/* 零匹配时只显示计数+清除,隐藏无效的 ↑/↓ 导航按钮 (bot review Low) */}
+            {searchTrim && visibleMessages.length > 0 && (
               <>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { setMatchIdx((i) => (i - 1 + visibleMessages.length) % Math.max(visibleMessages.length, 1)); const node = matchRefs.current[matchIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdx - 1 + n) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
                   title={t('chat.searchPrev')}
                   aria-label={t('chat.searchPrev')}
                   type="button"
                 >↑</button>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { setMatchIdx((i) => (i + 1) % Math.max(visibleMessages.length, 1)); const node = matchRefs.current[matchIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdx + 1) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
                   title={t('chat.searchNext')}
                   aria-label={t('chat.searchNext')}
                   type="button"
                 >↓</button>
-                <button
-                  class="msg-search-clear"
-                  onClick={() => { setSearch(''); setMatchIdx(0); }}
-                  title={t('chat.searchClear')}
-                  aria-label={t('chat.searchClear')}
-                  type="button"
-                >×</button>
               </>
+            )}
+            {searchTrim && (
+              <button
+                class="msg-search-clear"
+                onClick={() => { setSearch(''); setMatchIdx(0); }}
+                title={t('chat.searchClear')}
+                aria-label={t('chat.searchClear')}
+                type="button"
+              >×</button>
             )}
           </div>
         )}

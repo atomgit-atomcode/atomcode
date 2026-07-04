@@ -376,6 +376,7 @@ body {
   border: 1px solid var(--app-input-border);
   border-radius: var(--corner-radius-small);
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .msg-search-icon {
   flex: 0 0 auto;
@@ -393,6 +394,13 @@ body {
   outline: none;
 }
 .msg-search-input::-webkit-search-cancel-button { display: none; }
+/* 焦点可见性 (WCAG 2.4.7): outline:none 移除默认环后必须给替代视觉,
+   否则键盘 Tab 进入看不到焦点。用 :focus-visible 避免鼠标点击也触发。 */
+.msg-search-input:focus-visible {
+  outline: 2px solid var(--app-brand);
+  outline-offset: -2px;
+  border-radius: 2px;
+}
 .msg-search-count {
   flex: 0 0 auto;
   font-size: 11px;
