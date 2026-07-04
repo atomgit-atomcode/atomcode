@@ -566,4 +566,29 @@ mod tests {
         assert!(r.is_error, "a short fragment must not fuzzy-match: {}", r.content);
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "\tx\n", "unchanged");
     }
+
+    // Regression: indent arithmetic must count *characters*, not bytes. When the file
+    // is indented with a multi-byte whitespace char (here U+3000 IDEOGRAPHIC SPACE,
+    // 3 bytes / 1 char), the old byte-based `file_indent` fed into `chars().take(n)`
+    // grabbed content chars into the indent prefix, producing corruption like
+    // "\u{3000}x x = 99". The fix (leading_ws_chars) keeps exactly the whitespace.
+    #[tokio::test]
+    async fn fuzzy_preserves_multibyte_whitespace_indentation() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f.py"), "def f():\n\u{3000}x = 1\n\u{3000}y = 2\n").unwrap();
+        // Model reproduced the body with plain-space indentation → exact match fails,
+        // fuzzy path fires.
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"f.py","old_string":"    x = 1\n    y = 2","new_string":"    x = 99\n    y = 2"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "fuzzy match must succeed: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("f.py")).unwrap(),
+            "def f():\n\u{3000}x = 99\n\u{3000}y = 2\n",
+            "the file's multi-byte whitespace indent must be preserved with no content leaking into it"
+        );
+    }
 }
