@@ -5150,26 +5150,27 @@ pub(crate) fn format_todo_command(
     unicode: bool,
 ) -> String {
     use atomcode_core::conversation::message::MessageContent;
-    // Walk backwards to find the last `todowrite` tool-call arguments.
-    let last_args = messages.iter().rev().find_map(|m| {
-        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-            tool_calls
-                .iter()
-                .rev()
-                .find(|c| c.name == "todowrite")
-                .map(|c| c.arguments.clone())
-        } else {
-            None
+    // Walk backwards to find the last VALID `todowrite` tool-call, skipping
+    // calls whose args fail validation so an invalid final call never wipes
+    // an earlier valid list (mirrors derive_current_todos in capabilities).
+    let todos = 'found: {
+        for m in messages.iter().rev() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+                    if let Ok(parsed) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
+                        break 'found parsed;
+                    }
+                }
+            }
         }
-    });
-    let todos = last_args
-        .and_then(|args| atomcode_capabilities::tools::todo::parse_todos(&args).ok())
-        .unwrap_or_default();
+        Vec::new()
+    };
     if todos.is_empty() {
-        return "当前无任务清单（模型尚未创建 todo）。".to_string();
+        return t(Msg::TodoNoList).into_owned();
     }
     format!(
-        "当前任务清单:\n{}",
+        "{}\n{}",
+        t(Msg::TodoListHeader),
         atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
     )
 }
@@ -5671,15 +5672,17 @@ mod tests {
 mod todo_command_tests {
     use super::format_todo_command;
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
 
     #[test]
     fn todo_command_text_with_and_without_list() {
-        // No todowrite calls → "no list" message.
+        // No todowrite calls → "no list" message (i18n'd).
         let empty = vec![Message::new(Role::User, "hi")];
+        let no_list = t(Msg::TodoNoList).into_owned();
         assert!(
-            format_todo_command(&empty, false).contains("当前无任务清单"),
-            "empty messages should contain '当前无任务清单'"
+            format_todo_command(&empty, false).contains(&no_list),
+            "empty messages should contain the i18n no-list message: {no_list:?}"
         );
 
         // A todowrite call with one pending item → list output.

@@ -3045,6 +3045,23 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_todowrite_shows_task_count() {
+        // Multiple tasks → "N tasks"
+        let args = r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#;
+        let out = format_tool_detail("todowrite", args);
+        assert_eq!(out, "2 tasks");
+        // Single task → "1 task" (singular)
+        let one = r#"{"todos":[{"content":"only","status":"pending"}]}"#;
+        assert_eq!(format_tool_detail("todowrite", one), "1 task");
+        // Empty list → "0 tasks"
+        let empty = r#"{"todos":[]}"#;
+        assert_eq!(format_tool_detail("todowrite", empty), "0 tasks");
+        // Missing todos key → empty string
+        let bad = r#"{"other":"field"}"#;
+        assert_eq!(format_tool_detail("todowrite", bad), "");
+    }
+
+    #[test]
     fn format_tool_detail_search_replace_shows_arrow() {
         let args = r#"{"search":"bg-blue-600","replace":"bg-violet-600","glob":"*.vue"}"#;
         let out = format_tool_detail("search_replace", args);
@@ -8406,8 +8423,10 @@ fn handle_agent_event(
             // todowrite: the glyph list block was already rendered at ToolCallStarted
             // (call_rendered=true); suppress both ToolCall + ToolResult lines to avoid
             // printing the raw JSON echo a second time.
+            // Only suppress on SUCCESS — if the tool returned an error (bad args, etc.)
+            // the user must see the error result even though the call was rendered.
             let suppress_body_echo = name == "parallel_edit_files"
-                || (name == "todowrite" && call_rendered);
+                || (name == "todowrite" && call_rendered && success);
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
@@ -10457,6 +10476,17 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 crate::width::truncate_with_ellipsis(&detail, 200)
             } else {
                 String::new()
+            }
+        }
+        "todowrite" => {
+            // Show the number of tasks in the full-replace list so the
+            // in-flight row has useful detail even before the glyph block lands.
+            let n = v.get("todos").and_then(|t| t.as_array()).map(|a| a.len());
+            match n {
+                Some(0) => "0 tasks".to_string(),
+                Some(1) => "1 task".to_string(),
+                Some(n) => format!("{} tasks", n),
+                None => String::new(),
             }
         }
         "todo" => {

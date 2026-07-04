@@ -95,12 +95,16 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     Ok(out)
 }
 
-/// The current list = args of the LAST `todowrite` tool call in history. `vec![]` if
-/// none or the args no longer parse.
+/// The current list = args of the last VALID `todowrite` tool call in history.
+/// Skips calls whose args fail validation (e.g. two in_progress) so an invalid
+/// last call never wipes an earlier valid list. Returns `vec![]` if no valid
+/// call exists.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
     for m in messages.iter().rev() {
-        if let Some(call) = m.tool_calls.iter().rev().find(|c| c.name == "todowrite") {
-            return parse_todos(&call.arguments).unwrap_or_default();
+        for call in m.tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+            if let Ok(todos) = parse_todos(&call.arguments) {
+                return todos;
+            }
         }
     }
     Vec::new()
@@ -253,6 +257,29 @@ mod tests {
     fn derive_none_when_no_todowrite() {
         let msgs = vec![Message::user("hi"), Message::assistant("hello", vec![])];
         assert!(derive_current_todos(&msgs).is_empty());
+    }
+
+    #[test]
+    fn derive_skips_invalid_and_returns_last_valid() {
+        // The LAST todowrite has two in_progress items (invalid); the earlier one
+        // is valid. derive_current_todos must return the earlier valid list, not [].
+        let msgs = vec![
+            Message::assistant("", vec![ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"keep","status":"pending"}]}"#.into(),
+            }]),
+            Message::assistant("", vec![ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                // Invalid: two in_progress items.
+                arguments: r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}"#.into(),
+            }]),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(todos.len(), 1, "should skip invalid call and return last valid list");
+        assert_eq!(todos[0].content, "keep");
+        assert_eq!(todos[0].status, TodoStatus::Pending);
     }
 
     #[tokio::test]
