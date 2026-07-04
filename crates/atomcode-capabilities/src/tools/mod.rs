@@ -112,7 +112,16 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(SearchReplaceTool));
     reg.register(Arc::new(AstGrepTool));
-    reg.register(Arc::new(TodoTool::new()));
+    // Gate on ATOMCODE_TODO env var (0/false/off → skip; anything else or absent → register).
+    // Mirrors atomcode_core::config::todo_enabled_from_env but inlined here because
+    // atomcode-capabilities must NOT depend on atomcode-core (layering constraint).
+    let todo_env_off = std::env::var("ATOMCODE_TODO")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(false);
+    if !todo_env_off {
+        reg.register(Arc::new(TodoTool::new()));
+    }
 }
 
 /// Apply `CREATE_NO_WINDOW` on Windows so a spawned child does not pop a console window;

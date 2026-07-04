@@ -289,10 +289,6 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
-    /// AI-driven todo list (todowrite tool + per-turn injection + render). Default on.
-    /// Env `ATOMCODE_TODO` overrides this when set (`0/false/off` → off, `1/true/on` → on).
-    #[serde(default = "default_true")]
-    pub todo: bool,
 }
 
 impl Default for UiConfig {
@@ -303,7 +299,6 @@ impl Default for UiConfig {
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
-            todo: true,
         }
     }
 }
@@ -917,12 +912,6 @@ mod tests {
     fn ai_naming_falls_through_to_config_when_env_unset() {
         assert!(super::ai_session_naming_from_parts(None, true));
         assert!(!super::ai_session_naming_from_parts(None, false));
-    }
-
-    #[test]
-    fn ui_todo_defaults_on() {
-        let c = Config::default();
-        assert!(c.ui.todo, "todo should default on");
     }
 
     #[test]
