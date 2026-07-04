@@ -315,6 +315,10 @@ export interface ProjectState {
   previous_dir?: string;
   recent_dirs?: string[];
   name?: string;
+  // Physical session-bucket hash for `working_dir`. The sidebar scopes its
+  // list by this (not the mutable `working_dir` string) so sessions whose
+  // stored working_dir was restamped can't leak across projects.
+  project_hash?: string;
 }
 
 export async function getProject(): Promise<ProjectState> {

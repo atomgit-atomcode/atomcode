@@ -967,30 +967,17 @@ fn channel_interactive_permission(
     enforce_token
         || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
 }
+/// Map a working directory to its physical session-bucket name.
+///
+/// MUST match `atomcode_core::session::hash_path` exactly — the core session
+/// store names its `<sessions_root>/<hash>/` directories with that function,
+/// so the daemon has to delegate to it. A previous local copy hashed the
+/// normalized string via `str::hash` instead of `Path::hash`, producing a
+/// DIFFERENT hash for the same path; `/project` then reported a bucket that
+/// did not exist on disk and the webui fell back to matching sessions by the
+/// mutable `working_dir` field, which cross-contaminates projects.
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Normalize the path before hashing to ensure consistent results across:
-    // - Different path separators (Windows: `\` vs `/`)
-    // - Case sensitivity (Windows paths are case-insensitive)
-    // - Trailing slashes
-    let normalized =
-        atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
-    let mut normalized = normalized.replace('\\', "/");
-
-    // Remove trailing slash (but keep root "/" or "C:/")
-    if normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-
-    // On Windows, paths are case-insensitive
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
-
-    let mut hasher = DefaultHasher::new();
-    normalized.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    atomcode_core::session::hash_path(path)
 }
 
 /// List all projects (scans sessions directory)
@@ -1276,14 +1263,29 @@ async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"success": true}))
 }
 
+/// Current project state plus the physical session-bucket hash for the
+/// working directory. The webui uses `project_hash` — NOT the mutable
+/// `working_dir` string — to decide which sessions belong to this project,
+/// so it must be the same hash the session store files them under.
+#[derive(Debug, Serialize)]
+struct ProjectStateResponse {
+    working_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_dir: Option<PathBuf>,
+    recent_dirs: Vec<PathBuf>,
+    name: String,
+    project_hash: String,
+}
+
 /// GET /project - Get current project state
 async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.project.read().await;
-    Json(ProjectState {
+    Json(ProjectStateResponse {
         working_dir: state.working_dir.clone(),
         previous_dir: state.previous_dir.clone(),
         recent_dirs: state.recent_dirs.clone(),
         name: state.name.clone(),
+        project_hash: hash_path(&state.working_dir),
     })
 }
 
@@ -4653,6 +4655,27 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 core 会话存储命名目录
+    // 用的 hash 完全一致。曾经 daemon 自持一份用 `str::hash`（而非 `Path::hash`）的
+    // 拷贝，对同一路径算出不同 hash → `/project` 指向磁盘上不存在的桶 → webui 退化成
+    // 按可变的 `working_dir` 字段匹配会话，导致跨项目串台。
+    #[test]
+    fn daemon_hash_path_matches_core_session_bucket_naming() {
+        for p in [
+            "/Users/theo/Documents/workspace/atomcode",
+            "/Users/theo/Desktop",
+            "/tmp/nested/proj/",
+            "/",
+        ] {
+            let path = std::path::Path::new(p);
+            assert_eq!(
+                hash_path(path),
+                atomcode_core::session::hash_path(path),
+                "daemon hash for {p:?} diverged from core session bucket naming"
+            );
+        }
+    }
 
     // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发，而不是 error。
     // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，

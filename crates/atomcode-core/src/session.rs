@@ -510,13 +510,18 @@ impl SessionManager {
     }
 }
 
-/// Generate a hash for a path (used as directory name).
+/// Generate a hash for a path (used as the on-disk session directory name).
 ///
 /// Normalizes the path before hashing to ensure consistent results across:
 /// - Different path separators (Windows: `\` vs `/`)
 /// - Case sensitivity (Windows paths are case-insensitive)
 /// - Trailing slashes
-fn hash_path(path: &Path) -> String {
+///
+/// Public because the daemon must compute the SAME hash to map a working
+/// directory back to the physical session bucket this module writes. Any
+/// divergence (e.g. hashing the raw `&str` instead of a `Path`) silently
+/// files or looks up sessions under the wrong bucket.
+pub fn hash_path(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

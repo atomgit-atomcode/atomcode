@@ -30,8 +30,12 @@ interface SidebarProps {
   optimisticSession?: SessionMetaWithProject | null;
   /** 列表（重新）加载后回传当前会话的真实元数据，供顶部标题头同步自动命名后的标题。 */
   onActiveSessionMeta?: (session: SessionMetaWithProject) => void;
-  /** Only show sessions whose working_dir matches this path (empty = show all) */
+  /** Current working directory, for display + as the fallback session scope. */
   cwd?: string;
+  /** Physical session-bucket hash of the current project. When set, the list is
+   *  scoped to sessions in THIS bucket (robust against `working_dir` restamping);
+   *  sessions lacking a hash fall back to matching `cwd`. Empty = scope by cwd. */
+  projectHash?: string;
   /** Called after a session is renamed (id + new name). */
   onSessionRenamed?: (id: string, name: string) => void;
   /** Called after a session is deleted. */
@@ -273,6 +277,7 @@ export function Sidebar({
   optimisticSession,
   onActiveSessionMeta,
   cwd,
+  projectHash,
   onSessionRenamed,
   onSessionDeleted,
   onPickSkill,
@@ -795,12 +800,22 @@ export function Sidebar({
   // 避免出现两条相同会话（刷新才消失）。
   const merged = mergeOptimisticSession(optimisticSession ?? null, sessions);
 
-  // 先按当前工作目录收窄，再按搜索词过滤。
+  // 先按当前项目收窄，再按搜索词过滤。优先用物理会话桶 project_hash 收窄（不受
+  // daemon 全局 working_dir 被改写影响，避免跨项目串台）；缺 hash 的条目回退按
+  // working_dir==cwd 匹配；projectHash 为空时整体回退到旧的 cwd 过滤。乐观条目
+  // （刚发送、置顶）永远保留：它必属当前项目，但在 /project 解析出 hash 之前其
+  // working_dir/project_hash 还是空的，不豁免会被 hash 过滤误删。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
-  const inCwd = cwdNorm
-    ? merged.filter((s) => normDir(s.working_dir) === cwdNorm)
-    : merged;
+  const optimisticId = optimisticSession?.id;
+  const inScope = (s: SessionMetaWithProject): boolean => {
+    if (s.id === optimisticId) return true;
+    if (projectHash) {
+      return s.project_hash ? s.project_hash === projectHash : normDir(s.working_dir) === cwdNorm;
+    }
+    return cwdNorm ? normDir(s.working_dir) === cwdNorm : true;
+  };
+  const inCwd = merged.filter(inScope);
 
   const q = query.trim().toLowerCase();
   const filtered = q

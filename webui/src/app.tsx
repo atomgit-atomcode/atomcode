@@ -36,6 +36,11 @@ export function App() {
   // 覆盖它（Sidebar 按 id 去重，真实条目优先），标题随之从「前 10 字」换成自动命名。
   const [optimisticSession, setOptimisticSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
+  // Physical session-bucket hash of the current project. The sidebar scopes its
+  // list by this (see Sidebar `projectHash`), not by the `cwd` string, so a
+  // session whose stored `working_dir` was restamped by the daemon's global
+  // working_dir can't leak into the wrong project. Tracked alongside `cwd`.
+  const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
@@ -100,7 +105,9 @@ export function App() {
       id: activeSession?.id ?? `optimistic-${now}`,
       name: title,
       working_dir: activeSession?.working_dir ?? cwd,
-      project_hash: activeSession?.project_hash ?? '',
+      // Fall back to the current project's hash (not '') so the optimistic row
+      // survives the sidebar's project_hash filter on a landing-page first send.
+      project_hash: activeSession?.project_hash ?? projectHash,
       created_at: activeSession?.created_at ?? now,
       updated_at: now,
       message_count: 1,
@@ -137,7 +144,9 @@ export function App() {
     let cancelled = false;
     getProject()
       .then((p) => {
-        if (!cancelled && p.working_dir) setCwd((c) => c || p.working_dir);
+        if (cancelled) return;
+        if (p.working_dir) setCwd((c) => c || p.working_dir);
+        if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
       })
       .catch(() => {
         // Ignore; cwd stays empty
@@ -178,6 +187,7 @@ export function App() {
           setSessionId(found.id);
           setActiveSession(found);
           if (found.working_dir) setCwd(found.working_dir);
+          if (found.project_hash) setProjectHash(found.project_hash);
         }
       })
       .catch(() => {
@@ -215,6 +225,10 @@ export function App() {
           updated_at: data.created_at,
           message_count: 0,
         });
+        // Adopt the freshly-created session's bucket as the current project so
+        // the sidebar filters to it (handlePickCwd cleared it to fall back to
+        // cwd until this resolves).
+        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionListVersion((v) => v + 1);
       })
       .catch((err) => {
@@ -235,12 +249,18 @@ export function App() {
     if (session.working_dir) {
       setCwd(session.working_dir);
     }
+    // Scope the sidebar to the picked session's physical project bucket.
+    if (session.project_hash) setProjectHash(session.project_hash);
     setSidebarOpen(false);
   }
 
   // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
   function handlePickCwd(path: string) {
     setCwd(path);
+    // We don't know the new dir's bucket hash until the daemon creates a session
+    // there; clear it so the sidebar falls back to filtering by `cwd` in the
+    // meantime, then openNewSession's response re-pins projectHash.
+    setProjectHash('');
     openNewSession(path || undefined);
   }
 
@@ -338,6 +358,7 @@ export function App() {
         optimisticSession={optimisticSession}
         onActiveSessionMeta={handleActiveSessionMeta}
         cwd={cwd}
+        projectHash={projectHash}
         onSessionRenamed={handleSessionRenamed}
         onSessionDeleted={handleSessionDeleted}
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}

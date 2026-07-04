@@ -79,3 +79,28 @@ test('empty optimistic name never matches by prefix (avoids hiding unrelated ses
   const merged = mergeOptimisticSession(optimistic, [persisted]);
   assert.equal(merged.length, 2, 'an empty name must not prefix-match everything');
 });
+
+// Regression: a 2-char name like "你好" is under MIN_PREFIX_MATCH_LEN, so the
+// prefix path never fired and the optimistic (live id) + persisted (core id)
+// rows both showed. An EXACT name match in the same project closes this.
+test('short EXACT name in the same project (by hash) suppresses the duplicate', () => {
+  const optimistic = s({ id: 'opt', name: '你好', working_dir: '/w', project_hash: 'h1' });
+  const persisted = s({ id: 'real', name: '你好', working_dir: '/w', project_hash: 'h1' });
+  const merged = mergeOptimisticSession(optimistic, [persisted]);
+  assert.equal(merged.length, 1, 'exact short name in same project must dedup');
+  assert.equal(merged[0].id, 'real');
+});
+
+test('short EXACT name in a DIFFERENT project (different hash) is NOT merged', () => {
+  const optimistic = s({ id: 'opt', name: '你好', working_dir: '/a', project_hash: 'h1' });
+  const persisted = s({ id: 'real', name: '你好', working_dir: '/b', project_hash: 'h2' });
+  const merged = mergeOptimisticSession(optimistic, [persisted]);
+  assert.equal(merged.length, 2, 'same short name in a different project is a different session');
+});
+
+test('exact-name dedup still works via working_dir when no hash is present', () => {
+  const optimistic = s({ id: 'opt', name: '你好', working_dir: '/w' });
+  const persisted = s({ id: 'real', name: '你好', working_dir: '/w' });
+  const merged = mergeOptimisticSession(optimistic, [persisted]);
+  assert.equal(merged.length, 1, 'landing-page optimistic (no hash) falls back to working_dir');
+});
