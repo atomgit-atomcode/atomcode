@@ -54,7 +54,7 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{
     ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
+    PermissionDecider, PlanPermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
@@ -2707,24 +2707,37 @@ async fn process_chat_request(
     // plumbing. The standalone daemon (VSCode extension, no browser) has no
     // approver, so it must keep the prior BypassAll behaviour — otherwise any
     // tool requiring approval would block the turn forever.
+    // A browser is present (interactive) — honour the webui「模式」pill
+    // (LIVE_APPROVAL_MODE), so Plan/Bypass work in the DEFAULT non-sync path too
+    // (this /chat handler), not only in sync mode. Standalone (no browser) keeps
+    // BypassAll — a tool needing approval would otherwise block forever.
     let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) =
         if interactive_permission {
-            let (perm_req_tx, perm_req_rx) =
-                tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-            let (perm_resp_tx, perm_resp_rx) =
-                tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-            let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                atomcode_core::tool::PermissionStore::new(),
-            ));
-            pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-            (
-                Box::new(InteractivePermissionDecider::new(
-                    perm_req_tx,
-                    perm_resp_rx,
-                    perm_store,
-                )),
-                Some(perm_req_rx),
-            )
+            match live_api::live_current_approval_mode() {
+                live_api::ApprovalMode::Bypass => (
+                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+                    None,
+                ),
+                live_api::ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
+                live_api::ApprovalMode::Build => {
+                    let (perm_req_tx, perm_req_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+                    let (perm_resp_tx, perm_resp_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                        atomcode_core::tool::PermissionStore::new(),
+                    ));
+                    pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+                    (
+                        Box::new(InteractivePermissionDecider::new(
+                            perm_req_tx,
+                            perm_resp_rx,
+                            perm_store,
+                        )),
+                        Some(perm_req_rx),
+                    )
+                }
+            }
         } else {
             (
                 Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
@@ -2775,8 +2788,17 @@ async fn process_chat_request(
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt =
+    let mut system_prompt =
         build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    // Plan mode (browser present): append the read-only plan instruction so the
+    // model explores + plans instead of firing edits the PlanPermissionDecider
+    // will deny. Mirrors the live path; gated on `interactive_permission` so the
+    // standalone BypassAll path is untouched.
+    if interactive_permission
+        && live_api::live_current_approval_mode() == live_api::ApprovalMode::Plan
+    {
+        system_prompt.push_str(live_api::PLAN_MODE_SYSTEM_SUFFIX);
+    }
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 

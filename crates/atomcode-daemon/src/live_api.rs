@@ -28,7 +28,7 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{
     ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
+    PermissionDecider, PlanPermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
@@ -69,8 +69,9 @@ pub enum ApprovalMode {
     Bypass,
 }
 
-/// 读取当前生效的审批模式。
-fn live_current_approval_mode() -> ApprovalMode {
+/// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
+/// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
+pub(crate) fn live_current_approval_mode() -> ApprovalMode {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -84,7 +85,7 @@ fn live_current_mode_wire() -> String {
 
 /// Plan 模式追加到 system prompt 的约束（每轮重建，不持久）。中英双语，短且强，
 /// 让弱模型也能遵从：只读探索 + 出方案，不要动文件/不要跑改动类命令。
-const PLAN_MODE_SYSTEM_SUFFIX: &str = "\n\n# Plan mode (read-only)\n\
+pub(crate) const PLAN_MODE_SYSTEM_SUFFIX: &str = "\n\n# Plan mode (read-only)\n\
 You are in PLAN MODE. Explore the codebase read-only and PRESENT A PLAN for the \
 user to approve. Do NOT edit files, do NOT run mutating shell commands — any such \
 tool call will be denied. Use read/search tools freely, then summarize the concrete \
@@ -648,12 +649,11 @@ impl TurnExecutor for DaemonTurnExecutor {
                     Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
                     None,
                 ),
-                // Plan：拒改动类工具（DenyAll 拒所有需审批的工具 = 放行只读、拒写/改/bash），
-                // 配合下方注入的 plan 指令让模型只探索+出方案。无交互提示。
-                ApprovalMode::Plan => (
-                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::DenyAll)),
-                    None,
-                ),
+                // Plan：拒改动类工具（放行只读、拒写/改/bash），配合下方注入的 plan 指令
+                // 让模型只探索+出方案。用 PlanPermissionDecider（而非 DenyAll）——其
+                // will_auto_approve=true 抑制了「等待审批」卡片的闪现（DenyAll 会为每个被
+                // 拒的工具先弹一张随即作废的审批卡）。无交互提示、不注册 approver。
+                ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
                 // Build：交互审批（现状，走 webui PermissionCard）。
                 ApprovalMode::Build => {
                     let (perm_req_tx, perm_req_rx) =
