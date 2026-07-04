@@ -289,6 +289,10 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
+    /// AI-driven todo list (todowrite tool + per-turn injection + render). Default on.
+    /// Env `ATOMCODE_TODO` overrides this when set (`0/false/off` → off, `1/true/on` → on).
+    #[serde(default = "default_true")]
+    pub todo: bool,
 }
 
 impl Default for UiConfig {
@@ -299,6 +303,7 @@ impl Default for UiConfig {
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
+            todo: true,
         }
     }
 }
@@ -528,6 +533,16 @@ pub fn ai_session_naming_enabled(cfg: &Config) -> bool {
         std::env::var("ATOMCODE_AI_SESSION_NAMING").ok().as_deref(),
         cfg.ui.ai_session_naming,
     )
+}
+
+/// Resolve the effective todo switch: env `ATOMCODE_TODO` (0/false/off vs 1/true/on)
+/// overrides the config value; absent/empty env → config value.
+pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
+    match env.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if v == "0" || v == "false" || v == "off" => false,
+        Some(v) if v == "1" || v == "true" || v == "on" => true,
+        _ => cfg_value,
+    }
 }
 
 impl Default for DatalogConfig {
@@ -902,6 +917,19 @@ mod tests {
     fn ai_naming_falls_through_to_config_when_env_unset() {
         assert!(super::ai_session_naming_from_parts(None, true));
         assert!(!super::ai_session_naming_from_parts(None, false));
+    }
+
+    #[test]
+    fn ui_todo_defaults_on() {
+        let c = Config::default();
+        assert!(c.ui.todo, "todo should default on");
+    }
+
+    #[test]
+    fn ui_todo_env_off_overrides() {
+        assert!(!super::todo_enabled_from_env(Some("0"), true));
+        assert!(super::todo_enabled_from_env(Some("1"), false));
+        assert!(super::todo_enabled_from_env(None, true));  // 无 env → 用 config 值
     }
 
     /// Migration: on-disk config that looks like it was auto-written by
