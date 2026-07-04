@@ -8661,6 +8661,15 @@ fn handle_agent_event(
             // can re-render the same `✓ … 工具 · tokens` divider between turns —
             // sessions persist only `messages`, so without this the per-turn
             // token/duration numbers are lost on reload and turns butt together.
+            // Snapshot the context gauge (prompt occupancy + window) so `/resume`
+            // can rehydrate the footer + `/context` without waiting for a new
+            // live turn — see `UiState::restore_context`. Reads the same
+            // `last_context.sent_tokens` the live gauge shows, for exact symmetry.
+            let (last_used, last_window) = state
+                .last_context
+                .as_ref()
+                .map(|c| (c.sent_tokens, c.ctx_window))
+                .unwrap_or((0, 0));
             ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
                 after_message: snapshot.messages.len(),
                 turn_count,
@@ -8668,6 +8677,8 @@ fn handle_agent_event(
                 duration_ms: duration.as_millis() as u64,
                 total_tokens,
                 errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
+                used_tokens: last_used,
+                ctx_window: last_window,
             });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.

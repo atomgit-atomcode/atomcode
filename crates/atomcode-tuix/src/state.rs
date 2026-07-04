@@ -490,7 +490,15 @@ impl UiState {
             .get_or_insert_with(ContextSnapshot::default);
         if is_rich {
             snap.system_tokens = system_tokens;
-            snap.sent_tokens = sent_tokens;
+            // A rich emission with `sent_tokens == 0` means "no completed turn yet
+            // this engine session" (the v2 bridge's `last_usage` is None), NOT a
+            // genuine zero occupancy — `emit_context_stats` never reports a real 0.
+            // Preserve a value restored from the persisted session on resume so
+            // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
+            // the moment the user runs it. A real turn always sends `sent > 0`.
+            if sent_tokens > 0 {
+                snap.sent_tokens = sent_tokens;
+            }
             snap.tool_defs_tokens = tool_defs_tokens;
             snap.cold_zone_tokens = cold_zone_tokens;
             snap.total_messages = total_messages;
@@ -523,6 +531,36 @@ impl UiState {
         // narrow path passes "" and we keep whatever was cached last.
         if !system_prompt.is_empty() {
             snap.system_prompt = system_prompt.to_string();
+        }
+    }
+
+    /// Rehydrate the context gauge for the session being replayed, from its
+    /// persisted last-turn usage (`TurnStat.used_tokens` / `ctx_window`).
+    /// `replay_session` re-renders the transcript but never sees live
+    /// `ContextStats` events, so without this the footer + `/context` read
+    /// `0/100%` after `atomcode -c`, `/resume`, the session picker, or `/bg`
+    /// until the next live turn lands.
+    ///
+    /// `sent_tokens` is set unconditionally (even to `0`): a session switch must
+    /// show THIS session's occupancy, never the previous one's — passing `0` for
+    /// a session with no completed turns correctly clears a stale gauge. The
+    /// window is only filled when none is cached yet: a startup / model-switch
+    /// seed reflects the CURRENT model and is a better denominator than a window
+    /// persisted under a possibly-different model last session.
+    ///
+    /// No-ops only when there is nothing to show AND nothing to clear (`0/0`
+    /// with no cached snapshot) so a fresh session still reads "no turns yet"
+    /// rather than a fabricated `0/0` "waiting for window" state.
+    pub fn restore_context(&mut self, used_tokens: usize, ctx_window: usize) {
+        if used_tokens == 0 && ctx_window == 0 && self.last_context.is_none() {
+            return;
+        }
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        snap.sent_tokens = used_tokens;
+        if ctx_window > 0 && snap.ctx_window == 0 {
+            snap.ctx_window = ctx_window;
         }
     }
 
@@ -940,6 +978,75 @@ mod tests {
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.ctx_window, 128_000, "window must follow the new model");
         assert_eq!(snap.sent_tokens, 10_100, "used count must be preserved");
+    }
+
+    #[test]
+    fn restore_context_rehydrates_gauge_after_resume() {
+        // After `/resume`, replay never sees live ContextStats — restore_context
+        // seeds the gauge from the persisted last-turn usage so the footer +
+        // `/context` show the real occupancy immediately.
+        let mut s = UiState::new();
+        assert!(s.last_context.is_none());
+        s.restore_context(42_000, 200_000);
+        let snap = s.last_context.as_ref().expect("gauge rehydrated");
+        assert_eq!(snap.sent_tokens, 42_000);
+        assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn restore_context_noop_for_old_session_without_persisted_usage() {
+        // Sessions saved before the persisted usage fields load as 0/0 — restore
+        // must not fabricate a snapshot (gauge stays empty until the next turn).
+        let mut s = UiState::new();
+        s.restore_context(0, 0);
+        assert!(s.last_context.is_none(), "must not seed a snapshot from 0/0");
+    }
+
+    #[test]
+    fn refresh_with_zero_sent_does_not_clobber_restored_gauge() {
+        // `/context` after resume dispatches RefreshContextStats; the v2 bridge
+        // replies with sent_tokens=0 (last_usage None) but a real window. That
+        // "unknown" 0 must not wipe the value restored from the persisted session.
+        let mut s = UiState::new();
+        s.restore_context(42_000, 200_000);
+        // Simulate the RefreshContextStats reply (rich: window > 0, sent = 0).
+        s.on_context_stats(0, 0, 0, 0, 0, 200_000, "engine-v2", "");
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
+        assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn restore_context_keeps_seeded_window_when_none_persisted() {
+        // If startup already seeded the current model's window, a persisted
+        // used-only restore must fill the used count without zeroing the window.
+        let mut s = UiState::new();
+        s.on_model_window_changed(128_000);
+        s.restore_context(9_000, 0);
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 9_000);
+        assert_eq!(snap.ctx_window, 128_000, "seeded window preserved");
+    }
+
+    #[test]
+    fn restore_context_prefers_seeded_window_over_stale_persisted() {
+        // Current model's window (seeded at startup) beats a window persisted
+        // under a possibly-different model last session.
+        let mut s = UiState::new();
+        s.on_model_window_changed(128_000);
+        s.restore_context(9_000, 1_000_000);
+        assert_eq!(s.last_context.as_ref().unwrap().ctx_window, 128_000);
+    }
+
+    #[test]
+    fn restore_context_clears_previous_session_gauge_on_switch() {
+        // Switching from a big session (A) to one with no completed turns (B)
+        // must reset the gauge to 0, not leave A's occupancy on screen.
+        let mut s = UiState::new();
+        s.on_context_stats(0, 500_000, 0, 0, 0, 1_000_000, "engine-v2", ""); // session A
+        s.restore_context(0, 0); // replay of empty session B
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 0, "A's occupancy must be cleared");
     }
 
     #[test]

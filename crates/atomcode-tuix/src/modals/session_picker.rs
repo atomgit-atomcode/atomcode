@@ -611,6 +611,20 @@ pub(crate) fn replay_session(
     // so the next live turn's first delta clears it instead of appending.
     state.last_assistant_response = last_assistant_reply_markdown(&session.messages);
     state.response_finalized = true;
+
+    // Rehydrate the context gauge (footer token line + `/context`) from the last
+    // completed turn's persisted usage. Replay never sees live `ContextStats`
+    // events, so without this the gauge reads `0/100%` after resume even for a
+    // huge conversation, until the next live turn. Called unconditionally (with
+    // `0/0` when the target has no completed turns) so a session SWITCH resets
+    // the gauge to THIS session and never leaves the previous session's count on
+    // screen; `restore_context` no-ops only when there's nothing to show or clear.
+    let (used, window) = session
+        .turn_stats
+        .last()
+        .map(|s| (s.used_tokens, s.ctx_window))
+        .unwrap_or((0, 0));
+    state.restore_context(used, window);
 }
 
 #[cfg(test)]
@@ -641,6 +655,8 @@ mod tests {
             duration_ms: 6800,
             total_tokens: 1651,
             errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
         };
         // Persisted stat → the same `✓ … 工具 · tokens` line the live turn showed
         // (locale-independent: digits + glyph appear in both en/zh templates). Token

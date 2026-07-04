@@ -69,6 +69,18 @@ pub struct TurnStat {
     /// The turn ended in an error (render the ✗ "stopped" variant).
     #[serde(default)]
     pub errored: bool,
+    /// Context occupancy as of this turn: the prompt tokens the last request
+    /// actually used (what the footer / `/context` gauge shows). Persisted so
+    /// `/resume` can rehydrate the gauge from the final turn instead of showing
+    /// 0/100% until a new live turn fires. `#[serde(default)]` → sessions saved
+    /// before this field load as `0` (gauge stays empty until the next turn, as
+    /// before).
+    #[serde(default)]
+    pub used_tokens: usize,
+    /// The model's context window at this turn. Paired with `used_tokens` for
+    /// the resume rehydration above. `#[serde(default)]` → old sessions load `0`.
+    #[serde(default)]
+    pub ctx_window: usize,
 }
 
 /// A UI-only message that should be replayed in session history but must not
@@ -577,12 +589,16 @@ mod tests {
             duration_ms: 6800,
             total_tokens: 1651,
             errored: false,
+            used_tokens: 42_000,
+            ctx_window: 200_000,
         });
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.turn_stats.len(), 1);
         assert_eq!(back.turn_stats[0].after_message, 4);
         assert_eq!(back.turn_stats[0].total_tokens, 1651);
+        assert_eq!(back.turn_stats[0].used_tokens, 42_000);
+        assert_eq!(back.turn_stats[0].ctx_window, 200_000);
 
         // A session saved before this field existed (no `turn_stats` key) must
         // still load — `#[serde(default)]` → empty vec, replay falls back to
@@ -648,6 +664,8 @@ mod tests {
             tool_call_count: 0,
             turn_count: 1,
             errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
         });
         s.touch();
         manager.save(&s).unwrap();
@@ -669,6 +687,8 @@ mod tests {
             tool_call_count: 1,
             turn_count: 2,
             errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
         });
         loaded.touch();
         manager.save(&loaded).unwrap();
