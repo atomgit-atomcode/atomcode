@@ -1341,6 +1341,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
+  // 会话内搜索反查定位:输入关键词过滤时间线到包含该词的消息;↑/↓/Enter 在
+  // 匹配间跳转并滚动到视口中央;清除恢复完整视图。仅前端,不动后端。
+  // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
+  // turnTexts / isLastInTurn(这两个是按原索引算的)。
+  const [search, setSearch] = useState('');
+  const searchTrim = search.trim().toLowerCase();
+  const visibleMessages = searchTrim
+    ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
+    : messages.map((m, origIdx) => ({ msg: m, origIdx }));
+  const lastVisibleIdx = visibleMessages.length - 1;
+  // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
+  const matchRefs = useRef<Record<number, HTMLElement | null>>({});
+  const [matchIdx, setMatchIdx] = useState(0);
+
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
@@ -1630,6 +1644,64 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {/* Message timeline */}
       <div class="messages-container">
         <div class="timeline-inner">
+        {/* 会话内搜索栏:仅在有历史时显示。sticky 在滚动区顶部,Enter/↑/↓
+            在匹配间跳转并滚动定位(反查定位),清除恢复完整时间线。 */}
+        {messages.length > 0 && (
+          <div class="msg-search-bar">
+            <svg class="msg-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m21 21-4.3-4.3" />
+            </svg>
+            <input
+              class="msg-search-input"
+              type="search"
+              value={search}
+              placeholder={t('chat.searchPlaceholder')}
+              onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && searchTrim) {
+                  e.preventDefault();
+                  if (e.shiftKey) setMatchIdx((i) => (i - 1 + visibleMessages.length) % Math.max(visibleMessages.length, 1));
+                  else setMatchIdx((i) => (i + 1) % Math.max(visibleMessages.length, 1));
+                  const node = matchRefs.current[matchIdx];
+                  if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+              }}
+              aria-label={t('chat.searchPlaceholder')}
+            />
+            {searchTrim && (
+              <span class="msg-search-count">
+                {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
+              </span>
+            )}
+            {searchTrim && (
+              <>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => { setMatchIdx((i) => (i - 1 + visibleMessages.length) % Math.max(visibleMessages.length, 1)); const node = matchRefs.current[matchIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  title={t('chat.searchPrev')}
+                  aria-label={t('chat.searchPrev')}
+                  type="button"
+                >↑</button>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => { setMatchIdx((i) => (i + 1) % Math.max(visibleMessages.length, 1)); const node = matchRefs.current[matchIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  title={t('chat.searchNext')}
+                  aria-label={t('chat.searchNext')}
+                  type="button"
+                >↓</button>
+                <button
+                  class="msg-search-clear"
+                  onClick={() => { setSearch(''); setMatchIdx(0); }}
+                  title={t('chat.searchClear')}
+                  aria-label={t('chat.searchClear')}
+                  type="button"
+                >×</button>
+              </>
+            )}
+          </div>
+        )}
+
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -1644,6 +1716,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               {historyHint}
               <div class="sub">{t('chat.continueHint')}</div>
             </div>
+          </div>
+        )}
+
+        {searchTrim && visibleMessages.length === 0 && (
+          <div class="messages-empty">
+            <div>{t('chat.searchNoMatch')}</div>
           </div>
         )}
 
@@ -1678,19 +1756,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             }
           }
 
-          return messages.map((msg, idx) => {
-            const isLast = idx === lastIdx;
+          return visibleMessages.map(({ msg, origIdx }, idx) => {
+            const isLast = idx === lastVisibleIdx;
+            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
             if (msg.role === 'user') {
-              return <UserMessageView key={idx} msg={msg} />;
+              return <UserMessageView key={idx} msg={msg} searchRef={setMatchRef} />;
             }
 
             // Determine if this assistant message is the last one in the current
             // turn (i.e. the next message is a user message, or this is the very
             // last message in the list). Only the last assistant message in a turn
             // gets the copy button, so one user turn → one copy button.
+            // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
+            // 因为这两者是基于完整 messages 序列算的。
             const isLastInTurn =
-              idx === lastIdx ||
-              messages[idx + 1]?.role === 'user';
+              origIdx === lastIdx ||
+              messages[origIdx + 1]?.role === 'user';
 
             return (
               <AssistantMessageView
@@ -1700,7 +1781,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 busy={busy}
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
-                turnText={turnTexts.get(idx) ?? ''}
+                turnText={turnTexts.get(origIdx) ?? ''}
+                searchRef={setMatchRef}
               />
             );
           });
@@ -1754,7 +1836,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -1808,7 +1890,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { m
   ) : null;
 
   return (
-    <div class={cls}>
+    <div class={cls} ref={searchRef}>
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
@@ -1871,7 +1953,7 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
   return out;
 }
 
-function UserMessageView({ msg }: { msg: Message }) {
+function UserMessageView({ msg, searchRef }: { msg: Message; searchRef?: (el: HTMLElement | null) => void }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -1916,7 +1998,7 @@ function UserMessageView({ msg }: { msg: Message }) {
 
   if (skillTitle && !expanded) {
     return (
-      <div class="user-message-wrapper">
+      <div class="user-message-wrapper" ref={searchRef}>
         {images}
         <button
           class="skill-badge"
@@ -1932,7 +2014,7 @@ function UserMessageView({ msg }: { msg: Message }) {
   }
 
   return (
-    <div class="user-message-wrapper">
+    <div class="user-message-wrapper" ref={searchRef}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (

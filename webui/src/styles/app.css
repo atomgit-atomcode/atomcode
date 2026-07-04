@@ -361,6 +361,71 @@ body {
   color: var(--app-brand);
 }
 
+/* === 会话内搜索栏 (反查定位) === */
+/* sticky 在滚动区顶部,仅在有历史时显示。低对比,不与时间线争抢注意力。 */
+.msg-search-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: var(--app-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  backdrop-filter: blur(4px);
+}
+.msg-search-icon {
+  flex: 0 0 auto;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+}
+.msg-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--app-primary-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
+}
+.msg-search-input::-webkit-search-cancel-button { display: none; }
+.msg-search-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+.msg-search-nav,
+.msg-search-clear {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-secondary-background);
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  opacity: 0.7;
+}
+.msg-search-nav:hover,
+.msg-search-clear:hover {
+  opacity: 1;
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */
 .user-message-wrapper.queued .user-message-bubble {
   opacity: 0.7;
