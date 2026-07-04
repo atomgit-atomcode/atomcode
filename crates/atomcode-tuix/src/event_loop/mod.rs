@@ -4898,6 +4898,31 @@ fn attach_typed_image_paths(
 }
 
 /// `/paste` slash-command handler. Exists for Windows users whose
+/// On HarmonyOS the system clipboard is unreadable (arboard has no ohos backend;
+/// the `ohos-pasteboard` CLI ships only in unreleased 7.0), so Ctrl+V can never
+/// paste. Show the file-path workaround hint ONCE per process — it's a one-time
+/// education, not per-keystroke noise (the clipboard is always empty, so every
+/// Ctrl+V would otherwise stack a red line). Rendered as a scrollback error line,
+/// same place as the `/paste` hint. Compiled to a no-op on every other platform.
+#[cfg(target_env = "ohos")]
+fn show_ohos_paste_hint_once(app: &App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if SHOWN.swap(true, Ordering::Relaxed) {
+        return; // already shown once this run
+    }
+    renderer.render(UiLine::Error(
+        crate::i18n::t(crate::i18n::Msg::CmdPasteNoImageOhos).into_owned(),
+    ));
+    renderer.flush();
+    if matches!(app.state.phase, UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
+}
+
+#[cfg(not(target_env = "ohos"))]
+fn show_ohos_paste_hint_once(_app: &App, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {}
+
 /// Ctrl+V is intercepted by Windows Terminal / conhost before the
 /// keystroke reaches atomcode — the terminal-layer `paste` action
 /// only forwards `CF_UNICODETEXT`, so an image-only clipboard never
@@ -4916,9 +4941,16 @@ fn handle_paste_command(
 ) -> Result<()> {
     let img_hash = try_paste_clipboard_image();
     if img_hash.is_none() {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
-        ));
+        // On HarmonyOS the system clipboard is unreadable (arboard has no ohos
+        // backend; the `ohos-pasteboard` CLI ships only in unreleased 7.0), so the
+        // generic "no image in clipboard" reads like a false negative. Point the
+        // user at the file-path workaround instead. Every other platform keeps the
+        // original message unchanged.
+        #[cfg(target_env = "ohos")]
+        let msg = crate::i18n::Msg::CmdPasteNoImageOhos;
+        #[cfg(not(target_env = "ohos"))]
+        let msg = crate::i18n::Msg::CmdPasteNoImage;
+        renderer.render(UiLine::Error(crate::i18n::t(msg).into_owned()));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -5314,7 +5346,10 @@ fn handle_input(
                 }
                 // Empty clipboard — Ctrl+V has no other binding
                 // (key_action::classify maps it to NoOp), so swallow
-                // silently rather than insert a literal `v`.
+                // silently rather than insert a literal `v`. On HarmonyOS the
+                // clipboard is fundamentally unreadable, so surface the file-path
+                // hint once instead of a silent no-op (no-op on other platforms).
+                show_ohos_paste_hint_once(app, ctx, renderer);
                 return Ok(());
             }
 
@@ -6143,8 +6178,16 @@ fn handle_idle_key(
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
-        // No image in clipboard — fall through to normal key handling
-        // (the `v` char will be inserted as a regular character via classify).
+        // No image in clipboard. On HarmonyOS the clipboard is unreadable and
+        // falling through would insert a literal `v` — show the file-path hint
+        // once and swallow the key instead.
+        #[cfg(target_env = "ohos")]
+        {
+            show_ohos_paste_hint_once(app, ctx, renderer);
+            return Ok(());
+        }
+        // Elsewhere: fall through to normal key handling (the `v` char will be
+        // inserted as a regular character via classify).
     }
 
     // Ctrl+T cycles reasoning_effort

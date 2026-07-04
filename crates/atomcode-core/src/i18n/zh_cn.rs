@@ -846,6 +846,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdGuideInstallFailed { error } =>
             format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+        Msg::CmdPasteNoImageOhos => {
+            "鸿蒙暂不支持读取系统剪贴板图片。请把图片存成文件，然后粘贴/输入它的绝对路径（如 /storage/.../pic.png）来添加图片。".into()
+        }
 
         // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),

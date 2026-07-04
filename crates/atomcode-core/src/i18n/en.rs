@@ -859,6 +859,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdGuideInstallFailed { error } =>
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+        Msg::CmdPasteNoImageOhos => {
+            "HarmonyOS can't read images from the system clipboard yet. Save the image to a file, then paste/type its absolute path (e.g. /storage/.../pic.png) to attach it.".into()
+        }
 
         // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),

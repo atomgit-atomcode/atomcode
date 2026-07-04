@@ -683,6 +683,11 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+    /// `/paste` on HarmonyOS (ohos): the system clipboard is not
+    /// readable at all (arboard has no ohos backend, and the
+    /// `ohos-pasteboard` CLI ships only in unreleased 7.0), so "no
+    /// image" is misleading — point the user at the file-path workaround.
+    CmdPasteNoImageOhos,
 
     // ── reasoning effort ──
     /// Rendered when the user tries to set reasoning_effort on a
