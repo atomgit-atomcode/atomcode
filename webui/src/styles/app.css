@@ -2301,6 +2301,32 @@ body {
 
 .model-item:hover { background: var(--app-list-hover-background); }
 
+/* ── Approval mode selector (Build / Plan / Bypass) ──────────────────────
+   Reuses .model-selector / .model-dropdown / .model-item chrome. Each option
+   stacks a bold label over a muted one-line description. Bypass (免审批) is a
+   safety-consequential toggle → warning accent on both the option and, while
+   active, the trigger pill (mirrors the TUI red BYPASS badge). */
+.mode-item {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.mode-item-desc {
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  white-space: normal;
+  line-height: 1.3;
+}
+/* Warning accent (amber) — readable on both light and dark app themes. */
+.mode-item-bypass .model-item-model { color: #c2410c; }
+.mode-item-bypass .mode-item-desc { color: #c2410c; opacity: 0.85; }
+.mode-selector-trigger.mode-bypass {
+  color: #c2410c;
+  border-color: #c2410c;
+  background: color-mix(in srgb, #c2410c 8%, transparent);
+}
+.mode-selector-trigger.mode-bypass .effort-prefix { color: inherit; }
+
 .model-item.active {
   background: var(--app-list-active-background);
   color: var(--app-primary-foreground);

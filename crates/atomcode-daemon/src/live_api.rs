@@ -52,6 +52,45 @@ static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的审批模式（webui 底栏「模式」pill 切换，默认 Build）。
+/// `/live/mode` 端点写入；DaemonTurnExecutor::run_turn 每轮读取以选择 PermissionDecider，
+/// 因此在 sync/live 模式下切换模式对下一轮生效（执行器 Arc<dyn> 不可变，沿用 LIVE_PROVIDER
+/// 的进程级覆盖范式）。跨 tab / TUI 通过 LiveEvent::ModeChanged 广播同步。
+static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
+
+/// webui 三档审批模式。`Build` = 交互审批（现状，走 PermissionCard）；`Bypass` = 免审批
+/// （BypassAll，全放行）；`Plan` = 只读探索（拒改动类工具、放行只读，并注入 plan 指令）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    #[default]
+    Build,
+    Plan,
+    Bypass,
+}
+
+/// 读取当前生效的审批模式。
+fn live_current_approval_mode() -> ApprovalMode {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
+fn live_current_mode_wire() -> String {
+    serde_json::to_value(live_current_approval_mode())
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "build".to_string())
+}
+
+/// Plan 模式追加到 system prompt 的约束（每轮重建，不持久）。中英双语，短且强，
+/// 让弱模型也能遵从：只读探索 + 出方案，不要动文件/不要跑改动类命令。
+const PLAN_MODE_SYSTEM_SUFFIX: &str = "\n\n# Plan mode (read-only)\n\
+You are in PLAN MODE. Explore the codebase read-only and PRESENT A PLAN for the \
+user to approve. Do NOT edit files, do NOT run mutating shell commands — any such \
+tool call will be denied. Use read/search tools freely, then summarize the concrete \
+steps you would take. 你正处于「Plan 只读模式」：只读探索并给出方案，不要改文件、不要跑\
+改动类命令（会被拒绝），最后给出你打算执行的具体步骤。";
+
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
 /// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
 /// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
@@ -101,6 +140,20 @@ pub fn live_set_provider(provider: String) {
     *LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider.clone());
     if let Some(s) = current_live_session() {
         s.notify_provider_changed(provider);
+    }
+}
+
+/// 设置进程级审批模式并广播给所有视图（webui 底栏 pill / 其他 tab）。下一轮
+/// `run_turn` 读 `LIVE_APPROVAL_MODE` 选 decider。无活动 LiveSession 时仍更新
+/// 状态（下次 ensure 出会话即生效），只是没有订阅者收到广播（无妨）。
+pub fn live_set_mode(mode: ApprovalMode) {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    if let Some(s) = current_live_session() {
+        let wire = serde_json::to_value(mode)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "build".to_string());
+        s.notify_mode_changed(wire);
     }
 }
 
@@ -549,7 +602,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         // 模式下 /cd 切目录对下一轮的 system prompt / 工具 cwd / 会话落盘全部生效
         // （issue #755）。v1 每轮重建 parts，故读到新目录即重建出新的 system prompt。
         let working_dir = live_current_working_dir(&self.working_dir);
-        let parts = match build_turn_parts(
+        let mut parts = match build_turn_parts(
             &working_dir,
             provider_name,
             &self.mcp_cache,
@@ -565,37 +618,63 @@ impl TurnExecutor for DaemonTurnExecutor {
                 return;
             }
         };
+        // Plan mode: tell the model up-front it's read-only so it explores and
+        // presents a plan instead of firing edits that the DenyAll decider will
+        // reject. `parts.system_prompt` is per-turn (rebuilt every turn from the
+        // current working dir), so appending here never persists into the next
+        // non-plan turn. Mirrors the TUI PlanModeGate's intent for the v1 path.
+        if live_current_approval_mode() == ApprovalMode::Plan && !self.auto_approve {
+            parts.system_prompt.push_str(PLAN_MODE_SYSTEM_SUFFIX);
+        }
         // Build the permission decider. When interactive, mirror process_chat_request:
         // create two channels, register the response sender into the LiveSession approver
         // slot (so any view calling LiveSession.approve() delivers the decision here),
         // and keep the request receiver alive for the duration of the turn (the channel
         // must stay open so InteractivePermissionDecider::decide() can send on it without
         // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
+        // Effective mode: an executor forced to auto-approve (standalone / multi-tab
+        // BypassAll) always bypasses; otherwise honour the webui runtime pill
+        // (`LIVE_APPROVAL_MODE`, default Build). Read per-turn so a mid-session switch
+        // takes effect next turn — same rationale as LIVE_PROVIDER.
+        let effective_mode = if self.auto_approve {
+            ApprovalMode::Bypass
+        } else {
+            live_current_approval_mode()
+        };
         let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
-            if self.auto_approve {
-                (
+            match effective_mode {
+                // 免审批：全放行。
+                ApprovalMode::Bypass => (
                     Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
                     None,
-                )
-            } else {
-                let (perm_req_tx, perm_req_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                let (perm_resp_tx, perm_resp_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
-                // Register the response sender into the LiveSession approver slot.
-                // LiveSession.approve(decision) will take this sender and deliver the decision.
-                *approver.lock().await = Some(perm_resp_tx);
-                let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                    atomcode_core::tool::PermissionStore::new(),
-                ));
-                (
-                    Box::new(InteractivePermissionDecider::new(
-                        perm_req_tx,
-                        perm_resp_rx,
-                        perm_store,
-                    )),
-                    Some(perm_req_rx),
-                )
+                ),
+                // Plan：拒改动类工具（DenyAll 拒所有需审批的工具 = 放行只读、拒写/改/bash），
+                // 配合下方注入的 plan 指令让模型只探索+出方案。无交互提示。
+                ApprovalMode::Plan => (
+                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::DenyAll)),
+                    None,
+                ),
+                // Build：交互审批（现状，走 webui PermissionCard）。
+                ApprovalMode::Build => {
+                    let (perm_req_tx, perm_req_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+                    let (perm_resp_tx, perm_resp_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
+                    // Register the response sender into the LiveSession approver slot.
+                    // LiveSession.approve(decision) will take this sender and deliver the decision.
+                    *approver.lock().await = Some(perm_resp_tx);
+                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                        atomcode_core::tool::PermissionStore::new(),
+                    ));
+                    (
+                        Box::new(InteractivePermissionDecider::new(
+                            perm_req_tx,
+                            perm_resp_rx,
+                            perm_store,
+                        )),
+                        Some(perm_req_rx),
+                    )
+                }
             };
 
         // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
@@ -1625,9 +1704,14 @@ pub(crate) enum LiveWireEvent {
         session_id: String,
         project_hash: String,
         provider: String,
+        /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
+        mode: String,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
+    /// 审批模式切换（build / plan / bypass）——webui 各 tab 的「模式」pill 据此同步。
+    #[serde(rename = "mode")]
+    Mode { mode: String },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
     #[serde(rename = "command_output")]
@@ -1723,6 +1807,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             running: matches!(s, TurnState::Running),
         },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
+        // 审批模式切换：让所有 webui tab 的「模式」pill 跟随。
+        LiveEvent::ModeChanged(mode) => LiveWireEvent::Mode { mode },
         // Carry a cwd switch (TUI `/cd`, webui `/cd`, worktree command) to every
         // webui tab so its path display + session-list filter follow. The
         // sync-mode TUI follows the same LiveEvent in-process via live_sync.
@@ -1876,6 +1962,7 @@ pub(crate) async fn live_stream(
         session_id: live_session_id_or_unknown(),
         project_hash,
         provider: live_current_provider(),
+        mode: live_current_mode_wire(),
     });
     // 进行中回合的事件回放（StateChanged(Running) + 本回合 Turn 事件）：snapshot
     // 只到上一个 turn 边界，这段补上当前回合已发生的执行过程（工具卡片、流式
@@ -2100,6 +2187,28 @@ pub(crate) async fn live_provider(
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct LiveModeReq {
+    /// "build" | "plan" | "bypass"
+    pub mode: ApprovalMode,
+}
+
+/// POST /live/mode — webui 底栏「模式」pill 切换审批模式（build / plan / bypass）。
+///
+/// 与 /live/provider 同源：确保有 live 会话，更新进程级 LIVE_APPROVAL_MODE 并在 live
+/// 总线广播 ModeChanged，使其他 webui tab（未来还有 TUI footer）实时跟随。下一轮实际
+/// 用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。模式是运行时会话状态，
+/// 不写入 config（与 provider 持久化为默认不同）——避免「免审批」这种危险态被静默持久化。
+pub(crate) async fn live_mode(
+    State(state): State<AppState>,
+    Json(req): Json<LiveModeReq>,
+) -> impl IntoResponse {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    live_set_mode(req.mode);
+    Json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveReasoningEffortReq {
     /// 目标 provider；None 时取当前默认 provider。
     #[serde(default)]
@@ -2238,6 +2347,28 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
+    /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
+    /// union depends on these EXACT strings — lock the wire contract.
+    #[test]
+    fn approval_mode_wire_strings_are_lowercase() {
+        let cases = [
+            (ApprovalMode::Build, "build"),
+            (ApprovalMode::Plan, "plan"),
+            (ApprovalMode::Bypass, "bypass"),
+        ];
+        for (mode, wire) in cases {
+            // Serialize (used by Snapshot.mode + ModeChanged broadcast).
+            assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(wire));
+            // Deserialize (the `/live/mode` request body → LiveModeReq.mode).
+            let back: ApprovalMode =
+                serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(back, mode);
+        }
+        // Default is Build (the safe interactive-approval mode).
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Build);
+    }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
     /// top of this file). Under `/webui` the LiveSession path runs IN the TUI

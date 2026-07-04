@@ -3,10 +3,11 @@
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
+import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
@@ -327,6 +328,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
+  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。默认 build。
+  const [mode, setMode] = useState<ApprovalMode>('build');
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -670,6 +674,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) setProvider(e.provider);
+      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
+      if (e.mode) setMode(e.mode);
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
@@ -683,6 +689,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
       setProvider(e.provider);
+      return;
+    }
+    // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
+    if (e.type === 'mode') {
+      setMode(e.mode);
       return;
     }
     // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
@@ -1524,6 +1535,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             {(tokens.total / 1000).toFixed(1)}k tokens
           </span>
         )}
+        <ModeSelector
+          value={mode}
+          onChange={(m) => {
+            setMode(m);
+            // 模式是进程级 runtime 状态：立即通知后端（下一轮生效）并广播给其他 tab。
+            // 与 provider 不同，无 sync 门控——审批策略是会话级全局，始终上报。
+            void postLiveMode(m);
+          }}
+        />
         <ModelSelector
           value={provider}
           onChange={(p) => {

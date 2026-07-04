@@ -70,6 +70,15 @@ const zh = {
   // Model selector
   'model.label': '模型',
 
+  // Approval mode selector (Build / Plan / Bypass)
+  'mode.label': '模式',
+  'mode.build': 'Build',
+  'mode.build.desc': '改动前逐个审批（默认）',
+  'mode.plan': 'Plan',
+  'mode.plan.desc': '只读探索，先出方案',
+  'mode.bypass': '免审批',
+  'mode.bypass.desc': '⚠ 自动批准所有操作，含改文件/跑命令',
+
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': '强度',
   'effort.default': '默认',
@@ -295,6 +304,15 @@ const en: Record<MsgKey, string> = {
   'time.yesterday': 'yesterday',
 
   'model.label': 'Model',
+
+  // Approval mode selector (Build / Plan / Bypass)
+  'mode.label': 'Mode',
+  'mode.build': 'Build',
+  'mode.build.desc': 'Approve each change (default)',
+  'mode.plan': 'Plan',
+  'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.bypass': 'Bypass',
+  'mode.bypass.desc': '⚠ Auto-approve everything, incl. edits/commands',
 
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': 'Effort',

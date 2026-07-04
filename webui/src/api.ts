@@ -504,9 +504,14 @@ export async function getSession(
 
 // --- Live session (multi-tab real-time sync) ---
 
+/** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,
+ *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
+export type ApprovalMode = 'build' | 'plan' | 'bypass';
+
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
+  | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[] }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
@@ -595,6 +600,16 @@ export async function postLiveProvider(provider: string): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider }),
+  });
+}
+
+/** Switch the approval mode (build / plan / bypass). Runtime session state —
+ *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
+export async function postLiveMode(mode: ApprovalMode): Promise<void> {
+  await fetch('/live/mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ mode }),
   });
 }
 

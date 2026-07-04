@@ -154,6 +154,9 @@ pub(crate) fn spawn_live_forwarder(
                 // 命令输出广播：TUI 自己执行命令时已在本地渲染过（或经
                 // RemoteSlashCommand 路径渲染），这里忽略，避免重复刷屏。
                 Ok(LiveEvent::CommandOutput(_)) => continue,
+                // webui 切了审批模式：TUI footer 侧的模式镜像是后续项，暂不处理
+                // （本功能范围是 webui 三档;TUI 已有 Tab 切 Build/Plan 的本地状态）。
+                Ok(LiveEvent::ModeChanged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     crate::tuix_trace!("FWD", "Lagged: {} events lost", n);
                     continue;
