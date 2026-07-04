@@ -350,6 +350,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
+  // ONLY while the user is at the bottom; scrolling up releases the follow so history
+  // stays put. A ref (not state) avoids re-rendering on every scroll event.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const slashRef = useRef<HTMLDivElement>(null);
   const atRef = useRef<HTMLDivElement>(null);
@@ -444,9 +450,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }).catch(() => {});
   }, []);
 
-  // Auto-scroll to bottom when messages change
+  // How close to the bottom (px) still counts as "at the bottom" — a small slack so
+  // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
+  const BOTTOM_SLACK = 80;
+  const recomputeAtBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+    atBottomRef.current = atBottom;
+    setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
+  };
+  const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+    atBottomRef.current = true;
+    setShowJumpBtn(false);
+    bottomRef.current?.scrollIntoView({ behavior });
+  };
+
+  // Follow streaming output ONLY while the user is at the bottom. Scrolling up
+  // releases the follow (recomputeAtBottom on the container's scroll event sets
+  // atBottomRef=false), so history stays put mid-stream. Instant behavior so the
+  // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages, tokens]);
 
   // Abort the live (/live) stream if the component unmounts while sync is on.
@@ -1048,6 +1073,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const images = pendingImages;
     if (!text && images.length === 0) return;
 
+    // Sending re-engages auto-follow: the user wants to see their message + the reply.
+    // The messages-change effect below does the actual scroll (atBottom is now true).
+    atBottomRef.current = true;
+    setShowJumpBtn(false);
+
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
     setPendingImages([]);
@@ -1628,7 +1658,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   return (
     <>
       {/* Message timeline */}
-      <div class="messages-container">
+      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
@@ -1736,6 +1766,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         <div ref={bottomRef} />
         </div>
       </div>
+
+      {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
+      {showJumpBtn && (
+        <button
+          class="jump-to-bottom"
+          onClick={() => scrollToBottom('smooth')}
+          title={t('chat.jumpToBottom')}
+          aria-label={t('chat.jumpToBottom')}
+        >
+          ↓
+        </button>
+      )}
 
       {/* Floating input */}
       <div class="input-container">

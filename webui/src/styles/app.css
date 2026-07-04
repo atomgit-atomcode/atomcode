@@ -2798,3 +2798,28 @@ body {
   object-fit: contain;
   display: block;
 }
+
+/* Jump-to-bottom pill: shown when the user scrolls up during streaming (auto-follow
+   released). Fixed above the input bar; theme-safe via var fallbacks. */
+.jump-to-bottom {
+  position: fixed;
+  right: 28px;
+  bottom: 96px;
+  z-index: 20;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.35));
+  background: var(--app-primary-background, #1e1e1e);
+  color: var(--app-primary-text, inherit);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.92;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.jump-to-bottom:hover { opacity: 1; transform: translateY(-1px); }
