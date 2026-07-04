@@ -86,7 +86,7 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todo"]
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -311,7 +311,7 @@ mod tests {
         "glob",
         "search_replace",
         "ast_grep",
-        "todo",
+        "todowrite",
     ];
 
     #[test]
@@ -414,5 +414,14 @@ mod tests {
         let r = reg.mount(&["read_file"]).get("read_file").unwrap()
             .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
         assert_eq!(r.images.len(), 1, "after re-register with vision, image must be attached: {}", r.content);
+    }
+
+    #[test]
+    fn todowrite_registered_under_new_name() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
+        assert!(names.iter().any(|n| n == "todowrite"), "todowrite must be registered: {names:?}");
     }
 }
