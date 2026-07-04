@@ -268,7 +268,6 @@ where
                 return Err(e);
             }
         };
-        // TODO: trace marker when atomcode-core gets a trace macro
         match client.execute(req).await {
             Ok(resp) => {
                 let status = resp.status();
