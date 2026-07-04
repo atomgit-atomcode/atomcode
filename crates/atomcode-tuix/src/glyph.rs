@@ -45,7 +45,8 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         '\u{23F3}' | '\u{231B}' => "~", // ⏳ ⌛
         // ── box drawing (rules, trees, tables) → classic ASCII box ──
         '\u{2500}' | '\u{2550}' | '\u{2501}' => "-", // ─ ═ ━
-        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' | '\u{23BD}' => "|", // │ ║ ┃ ▎ ⎽-ish
+        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' => "|", // │ ║ ┃ ▎
+        '\u{23BD}' | '\u{23BC}' => "_", // ⎽ ⎼ horizontal scan lines
         '\u{23BF}' | '\u{2514}' | '\u{2570}' => "`", // ⎿ └ ╰
         '\u{250C}' | '\u{2510}' | '\u{2518}' | '\u{251C}' | '\u{2524}' | '\u{252C}'
         | '\u{2534}' | '\u{253C}' | '\u{256D}' | '\u{256E}' | '\u{256F}' | '\u{2554}'
@@ -58,6 +59,17 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         '\u{1F7E2}' | '\u{1F7E1}' | '\u{1F534}' | '\u{1F535}' | '\u{1F7E0}' => "*", // 🟢🟡🔴🔵🟠
         _ => return None,
     })
+}
+
+/// Cell-level variant: the ASCII stand-in as a single `char`, for downgrading a
+/// rendered cell in place. All map entries are one ASCII column, so this always
+/// succeeds where [`ascii_for`] does — the `Option` is defensive against a future
+/// multi-char entry (which would not fit one cell and is skipped).
+pub fn single_char_ascii(ch: char) -> Option<char> {
+    let s = ascii_for(ch)?;
+    let mut it = s.chars();
+    let c = it.next()?;
+    it.next().is_none().then_some(c)
 }
 
 /// Replace decorative glyphs with ASCII when the terminal lacks unicode support.
@@ -116,5 +128,16 @@ mod tests {
     #[test]
     fn cjk_and_ascii_preserved_around_glyphs() {
         assert_eq!(downgrade_glyphs("✓ 写网页 done", false), "v 写网页 done");
+    }
+
+    #[test]
+    fn single_char_ascii_maps_1col_glyphs() {
+        assert_eq!(single_char_ascii('\u{2717}'), Some('x')); // ✗
+        assert_eq!(single_char_ascii('\u{2713}'), Some('v')); // ✓
+        assert_eq!(single_char_ascii('\u{25CF}'), Some('*')); // ●
+        assert_eq!(single_char_ascii('\u{2500}'), Some('-')); // ─
+        assert_eq!(single_char_ascii('\u{2514}'), Some('`')); // └
+        assert_eq!(single_char_ascii('A'), None); // ASCII passes through
+        assert_eq!(single_char_ascii('写'), None); // CJK untouched
     }
 }

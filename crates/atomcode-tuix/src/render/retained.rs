@@ -948,6 +948,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         meta_style: &CellStyle,
         full_body: &str,
     ) -> Vec<Vec<Cell>> {
+        // Downgrade decorative glyphs (the `●`/`▸` prefix + any in name/detail) on
+        // non-unicode terminals — 1-col ASCII stand-ins preserve prefix_w alignment.
+        let u = self.caps.unicode_symbols;
+        let prefix_cow = crate::glyph::downgrade_glyphs(prefix, u);
+        let name_cow = crate::glyph::downgrade_glyphs(name, u);
+        let detail_cow = crate::glyph::downgrade_glyphs(detail, u);
+        let meta_cow = crate::glyph::downgrade_glyphs(meta, u);
+        let full_body_cow = crate::glyph::downgrade_glyphs(full_body, u);
+        let (prefix, name, detail, meta, full_body) = (
+            prefix_cow.as_ref(),
+            name_cow.as_ref(),
+            detail_cow.as_ref(),
+            meta_cow.as_ref(),
+            full_body_cow.as_ref(),
+        );
         if detail.is_empty() {
             // No detail: append meta (if any) to name, all in name_style.
             let body = if meta.is_empty() {
@@ -2299,7 +2314,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// erase it first and overwrite in-place: the spinner is
     /// transient, the new row takes its slot without scrolling other
     /// history up by one.
-    fn push_body_row(&mut self, row: Vec<Cell>) {
+    fn push_body_row(&mut self, mut row: Vec<Cell>) {
+        // Cell-level ASCII fallback backstop: every body row funnels through here, so a
+        // single pass catches decorative glyphs built as cells DIRECTLY (rule `─`, tool
+        // `●`/`└`, i18n `✓`/`✗`) that the string-level chokepoints miss. No-op on unicode
+        // terminals. Also fixes width for a downgraded 2-col glyph (emoji → 1-col ASCII).
+        if !self.caps.unicode_symbols {
+            for cell in row.iter_mut() {
+                if let Some(a) = crate::glyph::single_char_ascii(cell.ch) {
+                    cell.ch = a;
+                    cell.width = 1;
+                }
+            }
+        }
         // Diagnostic trace for the user-reported "duplicate rows in
         // scrollback" bug — every push goes through here, so a single
         // log point captures the full sequence. Enable via
@@ -3855,6 +3882,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("✗ {}", safe)
                 };
+                // This handler builds cells directly (bypassing push_body_text), so
+                // downgrade the `✗` prefix + any glyphs in the summary here.
+                let body_str =
+                    crate::glyph::downgrade_glyphs(&body_str, self.caps.unicode_symbols).into_owned();
                 // Align the `└` glyph with the `B` of the `Bash` (or
                 // any tool name) in the row above: the tool-call row is
                 // `● Bash(...)` with `●` at col 0 and the tool name at
@@ -3880,6 +3911,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // use 4 spaces, same column width as `"  └ "`, so the
                 // text stays aligned under the head text.
                 let mut first_visual = true;
+                // `└` leaf marker, gated for non-unicode terminals (→ ASCII backtick).
+                let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same
@@ -3901,7 +3934,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        let prefix = if first_visual { "  └ " } else { "    " };
+                        let prefix = if first_visual { leaf } else { "    " };
                         push_str_cells(&mut row, prefix, &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
