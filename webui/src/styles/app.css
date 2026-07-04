@@ -361,6 +361,24 @@ body {
   color: var(--app-brand);
 }
 
+/* === PR #562: send-time label under each message === */
+/* Dimmed, small, non-interactive. Assistant turns: left-aligned under the
+   reply (matches .timeline-message's flex-start). User turns: right-aligned
+   to sit under the bubble (.msg-time-user). Full timestamp via title tooltip. */
+.msg-time {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+  user-select: none;
+  pointer-events: none;
+}
+.msg-time-user {
+  align-self: flex-end;
+  margin-right: 2px;
+}
+
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */
 .user-message-wrapper.queued .user-message-bubble {
   opacity: 0.7;

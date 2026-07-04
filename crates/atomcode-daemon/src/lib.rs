@@ -422,6 +422,14 @@ pub struct MessageInfo {
     /// re-render thumbnails when loading history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+    /// Epoch MILLISECONDS this message was authored/received. lets the webui
+    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
+    /// has no per-message clock, so for replayed history we approximate with
+    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
+    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
+    /// keeps old daemons/clients interoperating when the field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 /// Serializable image payload returned in session history.
@@ -584,6 +592,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             tool_result,
             artifacts,
             images,
+            created_at: None,
         }
     }
 }
@@ -1472,23 +1481,36 @@ fn merge_session_messages_for_display(
 ) -> Vec<MessageInfo> {
     let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
 
+    // PR #562: stamp every replayed message with the session's last-update time so
+    // the webui can show a send-time label even for history the kernel stored without
+    // a per-message clock. Kernel stores `updated_at` in epoch SECONDS; the webui
+    // works in ms, so multiply here once. Live/snapshot turns inject `Date.now()`
+    // client-side and never read this field.
+    let session_ts_ms = session.updated_at.checked_mul(1000);
+
     for display in session
         .display_messages
         .iter()
         .filter(|d| d.after_message == 0)
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     for (idx, msg) in session.messages.iter().enumerate() {
         let after_message = idx + 1;
-        messages.push(MessageInfo::from(msg));
+        let mut info = MessageInfo::from(msg);
+        info.created_at = session_ts_ms;
+        messages.push(info);
         for display in session
             .display_messages
             .iter()
             .filter(|d| d.after_message == after_message)
         {
-            messages.push(MessageInfo::from(&display.message));
+            let mut info = MessageInfo::from(&display.message);
+            info.created_at = session_ts_ms;
+            messages.push(info);
         }
     }
 
@@ -1497,7 +1519,9 @@ fn merge_session_messages_for_display(
         .iter()
         .filter(|d| d.after_message > session.messages.len())
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     messages

@@ -23,11 +23,50 @@ interface Message {
   role: 'user' | 'assistant';
   parts: MsgPart[];
   images?: ImageData[];
+  /** Epoch ms this message was sent/received (PR #562 send-time labels).
+   *  Live + freshly-typed turns stamp `Date.now()`; history loaded from the
+   *  daemon carries the session's `updated_at` (also ms). Optional so the
+   *  type stays backward-compatible with the few code paths that build a
+   *  Message literal without a clock (e.g. the queued-placeholder). */
+  ts?: number;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
 function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** PR #562: format a send-time label for a message bubble.
+ *  - Today → "HH:MM" (compact, the common case)
+ *  - Yesterday → "昨天 HH:MM"
+ *  - Same year → "M月D日 HH:MM"
+ *  - Older / other year → "YYYY/M/D HH:MM"
+ *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
+ *  Local time, because a chat send time is a wall-clock fact the user reads
+ *  the same way they read a timestamp in any messaging app. */
+function formatMsgTime(ts?: number): string {
+  if (!ts || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const pad = (n: number) => (n < 10 ? '0' + n : '' + n);
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  if (sameDay(d, now)) return hm;
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameDay(d, yest)) return `昨天 ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/** Full local timestamp for the hover tooltip (seconds + full date). */
+function formatMsgTimeFull(ts?: number): string {
+  if (!ts || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => (n < 10 ? '0' + n : '' + n);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 /** Format all parts of a message as readable text (including tool calls and their
@@ -578,6 +617,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
+          ts: msg.created_at,
         });
       } else if (msg.role === 'assistant') {
         // Text comes first (the LLM speaks, then calls tools), so the part
@@ -595,7 +635,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             },
           });
         }
-        loaded.push({ role: 'assistant', parts });
+        loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
         const result = msg.tool_result;
         outer: for (let i = loaded.length - 1; i >= 0; i--) {
@@ -712,10 +752,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     switch (e.type) {
       case 'user': {
         // Append the peer's user message + empty assistant placeholder
+        const now = Date.now();
         setMessages((prev) => [
           ...prev,
-          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined },
-          { role: 'assistant', parts: [] },
+          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined, ts: now },
+          { role: 'assistant', parts: [], ts: now },
         ]);
         break;
       }
@@ -1003,10 +1044,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
+    const now = Date.now();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined },
-      { role: 'assistant', parts: [] },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+      { role: 'assistant', parts: [], ts: now },
     ]);
 
     const controller = new AbortController();
@@ -1680,8 +1722,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
           return messages.map((msg, idx) => {
             const isLast = idx === lastIdx;
+            const timeLabel = formatMsgTime(msg.ts);
+            const timeFull = formatMsgTimeFull(msg.ts);
             if (msg.role === 'user') {
-              return <UserMessageView key={idx} msg={msg} />;
+              return <UserMessageView key={idx} msg={msg} timeLabel={timeLabel} timeFull={timeFull} />;
             }
 
             // Determine if this assistant message is the last one in the current
@@ -1701,6 +1745,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
                 turnText={turnTexts.get(idx) ?? ''}
+                timeLabel={timeLabel}
+                timeFull={timeFull}
               />
             );
           });
@@ -1754,7 +1800,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, timeLabel, timeFull }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -1824,6 +1870,12 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { m
         </>
       )}
       {copyBtn}
+      {/* PR #562 send-time label — under the reply, dimmed; full timestamp in
+          the tooltip. Suppressed while streaming (turn isn't done yet), on
+          error turns, and on tool-only turns with no text. */}
+      {timeLabel && !streaming && text && !isError && (
+        <div class="msg-time" title={timeFull}>{timeLabel}</div>
+      )}
     </div>
   );
 }
@@ -1871,7 +1923,7 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
   return out;
 }
 
-function UserMessageView({ msg }: { msg: Message }) {
+function UserMessageView({ msg, timeLabel, timeFull }: { msg: Message; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -1927,6 +1979,7 @@ function UserMessageView({ msg }: { msg: Message }) {
           <span class="skill-badge-label">{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
+        {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
       </div>
     );
   }
@@ -1947,6 +2000,9 @@ function UserMessageView({ msg }: { msg: Message }) {
       <div class="msg-actions">
         {copyBtn}
       </div>
+      {/* PR #562 send-time label — below the bubble, right-aligned to match
+          the user side; full timestamp on hover. */}
+      {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
     </div>
   );
 }
