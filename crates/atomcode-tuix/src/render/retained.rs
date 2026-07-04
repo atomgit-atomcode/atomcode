@@ -4023,9 +4023,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // with a `!` glyph + bold yellow body. Always-visible:
                 // we deliberately don't dim it because the whole point
                 // is to put a truncating-proxy or similar provider
-                // pathology in front of the user immediately.
+                // pathology in front of the user immediately. Colour is
+                // theme-aware (bright yellow is near-invisible on light
+                // backgrounds — see `warning_for_current_theme`).
                 let warn_style = CellStyle {
-                    fg: Some(crossterm::style::Color::Yellow),
+                    fg: Some(crate::render::theme::warning_for_current_theme()),
                     bold: true,
                     ..CellStyle::default()
                 };

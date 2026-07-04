@@ -8282,20 +8282,23 @@ fn handle_agent_event(
             if name == "todowrite" {
                 let block = todo_block_lines(&arguments, ctx.caps.unicode_symbols);
                 if !block.is_empty() {
+                    use atomcode_capabilities::tools::todo::TodoStatus;
                     renderer.render(UiLine::AssistantLineBreak);
-                    for line in &block {
-                        let ui_line =
-                            if line.starts_with("[x]") || line.starts_with("[\u{2713}]") {
-                                // completed → dim/muted
-                                UiLine::Muted(format!("  {line}"))
-                            } else if line.starts_with("[~]") || line.starts_with("[\u{2022}]") {
-                                // in_progress → warning-colored
-                                UiLine::Warning(format!("  {line}"))
-                            } else {
-                                // pending → muted
-                                UiLine::Muted(format!("  {line}"))
-                            };
-                        renderer.render(ui_line);
+                    // Style by TYPED status via CommandOutput's SGR support. Emphasis is
+                    // weight-based (bold / faint) — theme-safe on both light & dark, and
+                    // relative to the terminal's default fg. Deliberately NOT UiLine::Warning:
+                    // it prefixes a `!` (an in-progress task is not a warning) and uses an
+                    // un-theme-aware bright yellow that's near-invisible on light backgrounds.
+                    for (status, line) in &block {
+                        let styled = match status {
+                            // active task stands out
+                            TodoStatus::InProgress => format!("\x1b[1m  {line}\x1b[0m"),
+                            // done recedes
+                            TodoStatus::Completed => format!("\x1b[2m  {line}\x1b[0m"),
+                            // not started — plain, readable
+                            TodoStatus::Pending => format!("  {line}"),
+                        };
+                        renderer.render(UiLine::CommandOutput(styled));
                     }
                     renderer.flush();
                     // Mark as rendered (call_rendered=true) so ToolCallResult
@@ -10941,14 +10944,20 @@ pub(crate) fn install_password_modal(
 /// Split a todowrite call's args into per-item display lines (`<glyph> <content>`).
 /// Returns an empty Vec on parse failure — the caller then falls back to the normal
 /// tool row. Each returned string is already fully formatted: `<glyph> <content>`.
-pub(crate) fn todo_block_lines(args: &str, unicode: bool) -> Vec<String> {
-    match atomcode_capabilities::tools::todo::parse_todos(args) {
-        Ok(todos) if !todos.is_empty() => {
-            atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        }
+/// Parse a todowrite call's args into `(status, "<glyph> <content>")` pairs. Empty
+/// on parse failure / empty list (caller falls back to the normal tool row). Returns
+/// the TYPED status so the renderer styles by status instead of re-sniffing glyph
+/// prefixes (which would silently misclassify a future new status/glyph).
+pub(crate) fn todo_block_lines(
+    args: &str,
+    unicode: bool,
+) -> Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)> {
+    use atomcode_capabilities::tools::todo::{parse_todos, todo_glyph};
+    match parse_todos(args) {
+        Ok(todos) if !todos.is_empty() => todos
+            .into_iter()
+            .map(|t| (t.status, format!("{} {}", todo_glyph(t.status, unicode), t.content)))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -10959,13 +10968,16 @@ mod todo_block_tests {
 
     #[test]
     fn todo_block_renders_glyph_lines() {
+        use atomcode_capabilities::tools::todo::TodoStatus;
         let lines = todo_block_lines(
-            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]}"#,
+            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
             false,
         );
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "[x] a");
-        assert_eq!(lines[1], "[ ] b");
+        assert_eq!(lines[0].0, TodoStatus::Completed);
+        assert_eq!(lines[0].1, "[x] a");
+        assert_eq!(lines[1].0, TodoStatus::InProgress);
+        assert_eq!(lines[1].1, "[~] b");
     }
 
     #[test]

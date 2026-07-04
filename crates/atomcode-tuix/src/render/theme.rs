@@ -59,7 +59,15 @@ impl Palette {
 
     pub const ACCENT: Color = Color::Cyan; // bright cyan (96)
     pub const BORDER: Color = Color::Cyan; // bright cyan (96) — 蓝绿色边框，和 Accent/prompt glyph 视觉呼应，对比度高于 DarkGrey 不易被背景吞掉
-    pub const WARNING: Color = Color::Yellow; // bright yellow (93)
+    /// Warning on **light** backgrounds. Bright yellow (SGR 93 / `Color::Yellow`)
+    /// washes out to near-invisible on white; `DarkYellow` (SGR 33, an olive/gold)
+    /// keeps ~AA contrast. Mirrors the MUTED light/dark split.
+    pub const WARNING_LIGHT: Color = Color::DarkYellow; // SGR 33
+    /// Warning on **dark** backgrounds — bright yellow pops.
+    pub const WARNING_DARK: Color = Color::Yellow; // SGR 93
+    /// Back-compat alias (same as the old unconditional value). New code should
+    /// call [`warning_for_current_theme`] so the shade tracks the active palette.
+    pub const WARNING: Color = Self::WARNING_DARK;
     pub const ERROR: Color = Color::Red; // bright red (91)
     pub const DIFF_ADD: Color = Color::Green; // bright green (92)
     pub const DIFF_REMOVE: Color = Color::Red; // bright red (91) — paired with Error
@@ -82,6 +90,21 @@ pub fn muted_for_current_theme() -> Color {
     }
 }
 
+/// Resolve the warning shade for the active palette — the `!` advisory line.
+///
+/// Light theme → `WARNING_LIGHT` (SGR 33 dark yellow, readable on white).
+/// Dark theme  → `WARNING_DARK`  (SGR 93 bright yellow, pops on dark).
+///
+/// Bright yellow (the old unconditional value) is near-invisible on light
+/// backgrounds; this split restores contrast, matching `muted_for_current_theme`.
+pub fn warning_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::WARNING_LIGHT
+    } else {
+        Palette::WARNING_DARK
+    }
+}
+
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
 /// Returns None when colours are disabled OR when the role intentionally
 /// uses the terminal's default foreground (so strong/tool-name text just
@@ -100,7 +123,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         // terminal's theme chose for regular output.
         Role::Secondary => None,
         Role::Border => Some(Palette::BORDER),
-        Role::Warning => Some(Palette::WARNING),
+        Role::Warning => Some(warning_for_current_theme()),
         Role::Error => Some(Palette::ERROR),
         Role::Success => Some(Palette::DIFF_ADD),
         Role::DiffAdd => Some(Palette::DIFF_ADD),
@@ -195,6 +218,24 @@ mod tests {
         // continues to mean the light-mode shade so any caller that
         // still references the bare constant doesn't silently break.
         assert_eq!(Palette::MUTED, Palette::MUTED_LIGHT);
+    }
+
+    #[test]
+    fn warning_switches_with_theme() {
+        // The `!` advisory colour must track the palette: bright yellow (SGR 93)
+        // is near-invisible on white, so light theme uses dark yellow (SGR 33).
+        use crate::highlight::theme as md_theme;
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(role(caps(true), Role::Warning), Some(Palette::WARNING_DARK));
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(
+            role(caps(true), Role::Warning),
+            Some(Palette::WARNING_LIGHT),
+            "light theme must use SGR 33 (dark yellow) — bright yellow reads invisible on white"
+        );
+        // Distinct shades, else the split is pointless.
+        assert_ne!(Palette::WARNING_LIGHT, Palette::WARNING_DARK);
+        md_theme::set_theme_mode(false); // restore default
     }
 
     #[test]
