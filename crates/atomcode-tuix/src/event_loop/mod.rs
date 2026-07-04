@@ -3669,7 +3669,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // slash command's behaviour: visual replay + AgentCommand::SetConversation.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
-            crate::modals::session_picker::replay_session(renderer, &session, false);
+            crate::modals::session_picker::replay_session(renderer, &mut app.state, &session, false);
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
@@ -8813,7 +8813,7 @@ fn handle_agent_event(
             }
             // Redraw scrollback from the truncated history — reuses the
             // /resume replay path (clears screen, re-renders turn dividers).
-            crate::modals::session_picker::replay_session(renderer, &ctx.current_session, true);
+            crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
             // Put the rolled-back prompt back in the input box for editing.
             buf.set_restored_text(restored_prompt);
             // Confirmation + disk-divergence warning.
@@ -9591,6 +9591,7 @@ fn handle_agent_event(
             } else {
                 crate::modals::session_picker::replay_session(
                     renderer,
+                    state,
                     &ctx.current_session,
                     true,
                 );

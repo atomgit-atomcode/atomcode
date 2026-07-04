@@ -286,7 +286,7 @@ impl Modal for SessionPicker {
                 match ctx.session_manager.load(&id) {
                     Ok(session) => {
                         ctx.current_session_id = Some(id);
-                        replay_session(renderer, &session, true);
+                        replay_session(renderer, state, &session, true);
                         ctx.agent
                             .cmd_tx
                             .send(AgentCommand::SetConversation(
@@ -452,7 +452,57 @@ fn turn_divider_label(stat: Option<&atomcode_core::session::TurnStat>) -> String
     }
 }
 
-pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
+/// The raw markdown of the most recent assistant reply in `messages` — what
+/// `/copy` / `/copy msg` must target after a `/resume` (or `atomcode -c`,
+/// `/undo`, `/bg` resume) repaints the transcript but never streamed the reply
+/// live. Mirrors the live [`UiState::last_assistant_response`]: the accumulated
+/// assistant text of the newest turn that produced any (a `User` message is a
+/// turn boundary). Returns `""` when the session has no assistant text.
+fn last_assistant_reply_markdown(messages: &[atomcode_core::conversation::message::Message]) -> String {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    // Append `text` to the in-progress turn's reply, paragraph-separated so a
+    // turn that emitted prose, then a tool call, then more prose reads cleanly.
+    fn push_reply(acc: &mut String, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !acc.is_empty() {
+            acc.push_str("\n\n");
+        }
+        acc.push_str(text);
+    }
+
+    let mut acc = String::new(); // assistant text of the in-progress turn
+    let mut last = String::new(); // newest turn that produced assistant text
+    for m in messages {
+        match (&m.role, &m.content) {
+            // Turn boundary: seal the turn that just ended (keep the previous
+            // `last` if this turn produced no assistant text — a trailing bare
+            // user message must not blank out the reply above it).
+            (Role::User, _) => {
+                if !acc.is_empty() {
+                    last = std::mem::take(&mut acc);
+                }
+            }
+            (Role::Assistant, MessageContent::Text(s)) => push_reply(&mut acc, s),
+            (Role::Assistant, MessageContent::AssistantWithToolCalls { text: Some(t), .. }) => {
+                push_reply(&mut acc, t)
+            }
+            _ => {}
+        }
+    }
+    if !acc.is_empty() {
+        last = acc;
+    }
+    last
+}
+
+pub(crate) fn replay_session(
+    renderer: &mut dyn Renderer,
+    state: &mut UiState,
+    session: &Session,
+    reset: bool,
+) {
     use atomcode_core::conversation::message::{MessageContent, Role};
     // Bracket the whole replay — the `reset()` screen wipe plus the
     // line-by-line re-emit of the entire transcript — in ONE DECSET 2026
@@ -552,6 +602,15 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     renderer.flush();
     renderer.set_suppress_auto_copy(false);
     renderer.end_sync();
+
+    // The transcript is now on screen but was never streamed live, so
+    // `last_assistant_response` (which only the live TextDelta path fills)
+    // is empty or — worse, after switching sessions — still holds the PREVIOUS
+    // session's reply. Restore it from the replayed messages so `/copy` and
+    // `/copy msg` copy THIS session's last reply. `response_finalized = true`
+    // so the next live turn's first delta clears it instead of appending.
+    state.last_assistant_response = last_assistant_reply_markdown(&session.messages);
+    state.response_finalized = true;
 }
 
 #[cfg(test)]
@@ -599,6 +658,71 @@ mod tests {
         assert!(super::turn_divider_label(Some(&err)).contains('✗'));
         // No stat (old session / cancelled turn) → empty label → plain rule.
         assert_eq!(super::turn_divider_label(None), "");
+    }
+
+    // ── /copy after /resume: last_assistant_reply_markdown ───────────────
+    // `replay_session` restores `last_assistant_response` from these so `/copy`
+    // / `/copy msg` target the resumed session's last reply (previously empty
+    // after resume → "/copy msg" said "reply is empty" / copied the wrong
+    // session's reply).
+
+    #[test]
+    fn last_reply_picks_newest_assistant_turn() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let msgs = vec![
+            Message::new(Role::User, "q1"),
+            Message::new(Role::Assistant, "A1"),
+            Message::new(Role::User, "q2"),
+            Message::new(Role::Assistant, "A2"),
+        ];
+        assert_eq!(last_assistant_reply_markdown(&msgs), "A2");
+    }
+
+    #[test]
+    fn last_reply_accumulates_text_across_a_tool_call_turn() {
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        // One turn: prose → tool call (with text) → prose. Live accumulates all
+        // visible text of the turn, so replay must too.
+        let msgs = vec![
+            Message::new(Role::User, "q"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: Some("Let me check.".into()),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
+                },
+                synthetic: false,
+            },
+            Message::new(Role::Assistant, "The answer is X."),
+        ];
+        assert_eq!(
+            last_assistant_reply_markdown(&msgs),
+            "Let me check.\n\nThe answer is X."
+        );
+    }
+
+    #[test]
+    fn last_reply_keeps_prior_reply_when_session_ends_on_bare_user() {
+        use atomcode_core::conversation::message::{Message, Role};
+        // Session ends on a user message the assistant hasn't answered yet —
+        // the reply still on screen is the prior one, so keep it (mirrors live,
+        // where the buffer isn't cleared until the next turn's first delta).
+        let msgs = vec![
+            Message::new(Role::User, "q1"),
+            Message::new(Role::Assistant, "A1"),
+            Message::new(Role::User, "q2 pending"),
+        ];
+        assert_eq!(last_assistant_reply_markdown(&msgs), "A1");
+    }
+
+    #[test]
+    fn last_reply_empty_when_no_assistant_text() {
+        use atomcode_core::conversation::message::{Message, Role};
+        assert_eq!(last_assistant_reply_markdown(&[]), "");
+        let only_user = vec![Message::new(Role::User, "hi")];
+        assert_eq!(last_assistant_reply_markdown(&only_user), "");
     }
 
     #[test]

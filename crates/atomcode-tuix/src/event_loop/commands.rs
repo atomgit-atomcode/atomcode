@@ -2020,6 +2020,7 @@ fn execute_slash_command_impl(
                     state.on_turn_complete();
                     crate::modals::session_picker::replay_session(
                         renderer,
+                        state,
                         &ctx.current_session,
                         true,
                     );
