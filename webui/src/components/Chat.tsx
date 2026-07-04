@@ -423,6 +423,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
         const loaded = sessionMessagesToDisplay(detail.messages);
         if (loaded.length > 0) {
+          // A newly loaded session starts at the bottom regardless of prior scroll state.
+          atBottomRef.current = true;
           setMessages(loaded);
           setHistoryHint(null);
         } else {
@@ -662,6 +664,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
       const loaded = sessionMessagesToDisplay(e.messages);
+      // Live snapshot (session switch / reconnect) → start at the bottom.
+      atBottomRef.current = true;
       setMessages(loaded.length > 0 ? loaded : []);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
@@ -1002,6 +1006,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
   async function deliver(text: string, images: ImageData[]) {
+    // Actually sending a message (immediate OR drained from the queue) re-engages
+    // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
+    // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
+    atBottomRef.current = true;
+    setShowJumpBtn(false);
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
     if (!optimisticFiredRef.current && messages.length === 0) {
@@ -1072,11 +1081,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const text = input.trim();
     const images = pendingImages;
     if (!text && images.length === 0) return;
-
-    // Sending re-engages auto-follow: the user wants to see their message + the reply.
-    // The messages-change effect below does the actual scroll (atBottom is now true).
-    atBottomRef.current = true;
-    setShowJumpBtn(false);
 
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
