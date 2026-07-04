@@ -11,6 +11,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
+import type { MsgKey } from '../i18n';
 import {
   applyAtMentionSelection,
   detectAtMentionRange,
@@ -38,13 +39,15 @@ function messageText(m: Message): string {
 
 /** PR #562: format a send-time label for a message bubble.
  *  - Today → "HH:MM" (compact, the common case)
- *  - Yesterday → "昨天 HH:MM"
- *  - Same year → "M月D日 HH:MM"
- *  - Older / other year → "YYYY/M/D HH:MM"
+ *  - Yesterday → i18n `time.yesterday` + "HH:MM"
+ *  - Same year → i18n `time.sameYear` ({m}月{d}日 {hm} / {m}/{d} {hm})
+ *  - Older / other year → i18n `time.otherYear` ({y}/{m}/{d} {hm})
  *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
- *  Local time, because a chat send time is a wall-clock fact the user reads
- *  the same way they read a timestamp in any messaging app. */
-function formatMsgTime(ts?: number): string {
+ *  `t` is the i18n resolver (passed in from the component so this stays a
+ *  pure top-level helper). Local time, because a chat send time is a
+ *  wall-clock fact the user reads the same way they read a timestamp in
+ *  any messaging app. */
+function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
   if (!ts || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
@@ -55,9 +58,9 @@ function formatMsgTime(ts?: number): string {
     a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
   if (sameDay(d, now)) return hm;
   const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  if (sameDay(d, yest)) return `昨天 ${hm}`;
-  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
-  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) return t('time.sameYear', { m: d.getMonth() + 1, d: d.getDate(), hm });
+  return t('time.otherYear', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate(), hm });
 }
 
 /** Full local timestamp for the hover tooltip (seconds + full date). */
@@ -1722,7 +1725,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
           return messages.map((msg, idx) => {
             const isLast = idx === lastIdx;
-            const timeLabel = formatMsgTime(msg.ts);
+            const timeLabel = formatMsgTime(msg.ts, t);
             const timeFull = formatMsgTimeFull(msg.ts);
             if (msg.role === 'user') {
               return <UserMessageView key={idx} msg={msg} timeLabel={timeLabel} timeFull={timeFull} />;

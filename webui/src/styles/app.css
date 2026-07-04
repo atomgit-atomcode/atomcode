@@ -364,7 +364,9 @@ body {
 /* === PR #562: send-time label under each message === */
 /* Dimmed, small, non-interactive. Assistant turns: left-aligned under the
    reply (matches .timeline-message's flex-start). User turns: right-aligned
-   to sit under the bubble (.msg-time-user). Full timestamp via title tooltip. */
+   to sit under the bubble (.msg-time-user). Full timestamp via title tooltip.
+   Note: 不设 pointer-events:none —— 那会阻断原生 title tooltip 触发
+   (bot review P2)。user-select:none 仍保留以防止误选时间文字。 */
 .msg-time {
   margin-top: 4px;
   font-size: 11px;
@@ -372,7 +374,6 @@ body {
   color: var(--app-secondary-foreground);
   opacity: 0.7;
   user-select: none;
-  pointer-events: none;
 }
 .msg-time-user {
   align-self: flex-end;

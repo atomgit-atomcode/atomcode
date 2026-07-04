@@ -66,6 +66,9 @@ const zh = {
   'time.minutesAgo': '{n}分钟前',
   'time.hoursAgo': '{n}小时前',
   'time.yesterday': '昨天',
+  // PR #601 消息时间标签 — formatMsgTime 用 {y}/{m}/{d}/{hm} 插值
+  'time.sameYear': '{m}月{d}日 {hm}',
+  'time.otherYear': '{y}/{m}/{d} {hm}',
 
   // Model selector
   'model.label': '模型',
@@ -292,6 +295,8 @@ const en: Record<MsgKey, string> = {
   'time.minutesAgo': '{n} min ago',
   'time.hoursAgo': '{n} hr ago',
   'time.yesterday': 'yesterday',
+  'time.sameYear': '{m}/{d} {hm}',
+  'time.otherYear': '{y}/{m}/{d} {hm}',
 
   'model.label': 'Model',
 
