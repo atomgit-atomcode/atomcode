@@ -40,6 +40,12 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if model_needs_firm_tool_steering(model) {
         p.push_str(FIRM_TOOL_DISCIPLINE);
     }
+    // The behavior block is scoped NARROWER than the tool block: only the model whose
+    // execution behavior was actually reported to slip (DeepSeek) — GLM is more capable
+    // and stays lean here even though it gets the tool block. Separate predicate on purpose.
+    if model_needs_firm_execution(model) {
+        p.push_str(FIRM_EXECUTION_DISCIPLINE);
+    }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
     // cache-stable AND present on EVERY round, including a turn's first round which the
@@ -55,13 +61,24 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
 }
 
 /// Whether `model` belongs to a family with weaker soft-instruction adherence (GLM,
-/// DeepSeek) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`] restatement. Substring
-/// match on the lower-cased name so version suffixes (`glm-5.2`, `deepseek-v4-flash`) all
-/// hit. Frontier models (Claude, GPT) follow the soft `## TOOLS:` preferences and are
-/// excluded to keep their prompt lean and cache-stable.
+/// DeepSeek) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`] restatement (observed:
+/// both shell out `ls`/`grep` despite the persona preference). Substring match on the
+/// lower-cased name so version suffixes (`glm-5.2`, `deepseek-v4-flash`) all hit. Frontier
+/// models (Claude, GPT) follow the soft `## TOOLS:` preferences and are excluded to keep
+/// their prompt lean and cache-stable.
 fn model_needs_firm_tool_steering(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.contains("glm") || m.contains("deepseek")
+}
+
+/// Whether `model` needs the blunt [`FIRM_EXECUTION_DISCIPLINE`] behavior restatement.
+/// NARROWER than [`model_needs_firm_tool_steering`]: only DeepSeek, whose execution behavior
+/// (silently deleting code to clear errors, shipping unverified edits, offloading, quitting
+/// early) was actually reported to slip. GLM is more capable and is deliberately EXCLUDED —
+/// it still gets the tool block but not this one. Add another substring here (by evidence)
+/// if a further model is observed to need it.
+fn model_needs_firm_execution(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
 }
 
 /// Blunt, point-of-decision restatement of the file-tool preference, appended only for
@@ -76,6 +93,40 @@ Do NOT shell out for file work:\n\
 - Read a file → read_file (NOT `bash cat`).\n\
 Use bash ONLY for git, builds, package managers, running commands, and pipelines / \
 aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
+
+/// Blunt, point-of-decision restatement of the EXECUTION guardrails, appended only for the
+/// model flagged by [`model_needs_firm_execution`] (DeepSeek only — GLM excluded). The soft rules in
+/// `## DOING TASKS` / `## WORKFLOW` / `## WHEN COMMANDS FAIL` already say most of this once;
+/// weak models (GLM / DeepSeek) follow soft guidance unreliably, so we restate the four
+/// behaviors that fail most in practice (silently deleting code/tests to clear an error,
+/// shipping unverified edits, offloading a doable task, giving up after one failure, and
+/// treating stale memory as current truth) as HARD rules. Deliberately NOT a "never stop /
+/// keep going forever" block — that trades these failures for runaway loops and over-eager
+/// out-of-scope changes; the legitimate stop conditions (risky action / ambiguity / genuinely
+/// stuck) are kept explicit. `## SCOPE`-discipline is unchanged (already firm in `RULES`).
+/// Frozen per session → prompt-cache-stable.
+const FIRM_EXECUTION_DISCIPLINE: &str = "\n\n## EXECUTION DISCIPLINE (MANDATORY):\n\
+- FIX, DON'T HIDE: when a build, type-check, or test fails, find and fix the ROOT CAUSE. \
+NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
+path, or feature just to make the error or a red test disappear — that hides the bug, it \
+does not fix it.\n\
+- VERIFY BEFORE FINISHING: after editing code, actually run the project's check (`cargo \
+check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
+PASSES before handing back. If it does not compile, the task is NOT done. If you did not \
+run it, say so — never claim it works without running it.\n\
+- FINISH THE JOB: when the task is clear and within reach, complete it end-to-end yourself \
+rather than handing a half-done change back with \"you can take it from here\". The only \
+reasons to pause are unchanged from the rules above: a risky action needing approval, \
+genuine ambiguity in what was asked, or the WORKFLOW 3-round search cap when the cause may \
+not be in the code — and then say exactly what you tried.\n\
+- DON'T QUIT EARLY: a first failure is information, not a dead end — read the error, form a \
+new hypothesis, and try a different angle WITHIN the scope of what was asked (a different \
+fix, not a bigger rewrite or extra features). Don't repeat the identical failed action, and \
+don't abandon a workable approach after one miss.\n\
+- A PAST FAILURE ISN'T A VERDICT: \"this failed before\" describes a past attempt, not \
+today's code — a prior failure does NOT mean it fails now, so re-check against the current \
+code before concluding something can't work. (This is about past ATTEMPTS only; your \
+standing project instructions still apply — follow them.)";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -472,6 +523,87 @@ mod tests {
                 "{strong} must not carry the extra firm block"
             );
         }
+    }
+
+    #[test]
+    fn only_deepseek_gets_the_firm_execution_discipline_block() {
+        // The behavior block is DeepSeek-only (its execution behavior was the one reported to
+        // slip): silently deleting code/tests to clear errors, shipping unverified edits,
+        // offloading doable work, quitting after one failure, treating stale memory as truth.
+        let p = coding_persona("deepseek-v4-flash");
+        assert!(p.contains("## EXECUTION DISCIPLINE"), "deepseek must get the block: {p}");
+        // The five behaviors it must cover.
+        assert!(p.contains("FIX, DON'T HIDE"), "must forbid deleting code to clear errors");
+        assert!(p.contains("VERIFY BEFORE FINISHING"), "must require a passing check");
+        assert!(p.contains("FINISH THE JOB"), "must forbid offloading a doable task");
+        assert!(p.contains("DON'T QUIT EARLY"), "must forbid giving up after one failure");
+        assert!(p.contains("A PAST FAILURE ISN'T A VERDICT"), "must add past-failure skepticism");
+        // The rescope must protect standing project instructions from being discounted.
+        assert!(
+            p.contains("standing project instructions still apply"),
+            "must not sweep AGENTS.md rules into 'stale memory'"
+        );
+        // GLM is deliberately EXCLUDED from the behavior block (option A) — but STILL gets
+        // the tool block. Frontier models get neither.
+        for glm in ["glm-5.2", "GLM-4.6"] {
+            let p = coding_persona(glm);
+            assert!(
+                !p.contains("## EXECUTION DISCIPLINE"),
+                "{glm} must NOT get the execution block (it is more capable): {p}"
+            );
+            assert!(
+                p.contains("## TOOL DISCIPLINE"),
+                "{glm} must still get the tool block"
+            );
+        }
+        for strong in ["claude-opus-4-8", "gpt-5", "m"] {
+            let p = coding_persona(strong);
+            assert!(!p.contains("## EXECUTION DISCIPLINE"), "{strong}: no execution block");
+            assert!(!p.contains("## TOOL DISCIPLINE"), "{strong}: no tool block");
+        }
+    }
+
+    #[test]
+    fn model_needs_firm_execution_is_deepseek_only() {
+        assert!(model_needs_firm_execution("deepseek-v4-flash"));
+        assert!(model_needs_firm_execution("deepseek-chat"));
+        assert!(!model_needs_firm_execution("glm-5.2"), "GLM excluded from execution block");
+        assert!(!model_needs_firm_execution("GLM-4.6"));
+        assert!(!model_needs_firm_execution("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn firm_execution_block_is_not_a_never_stop_beast_prompt() {
+        // Deliberately NOT opencode's "beast mode": a "keep going forever / never end your
+        // turn" framing trades the offload failure for runaway loops + out-of-scope changes.
+        // The legitimate stop conditions must remain explicit, and SCOPE discipline unchanged.
+        let p = coding_persona("deepseek-v4-flash");
+        assert!(
+            !p.to_lowercase().contains("never end your turn")
+                && !p.to_lowercase().contains("keep going until"),
+            "must not adopt beast-mode never-stop framing: {p}"
+        );
+        assert!(
+            p.contains("genuine ambiguity"),
+            "must keep legitimate stop conditions explicit"
+        );
+        // Must PRESERVE the base WORKFLOW 3-round diagnostic cap, not replace it with an
+        // open-ended stop-list (else a weak model loops past it until the fuse).
+        assert!(
+            p.contains("3-round"),
+            "FINISH THE JOB must point back at the 3-round cap, not supersede it: {p}"
+        );
+        // Must carry an in-block scope tether so hard 'finish/don't-quit' doesn't push the
+        // weak model into out-of-scope rewrites (the #1 over-engineering complaint).
+        assert!(
+            p.contains("not a bigger rewrite or extra features"),
+            "DON'T QUIT EARLY must tether to scope"
+        );
+        // The existing base scope guardrail (don't over-change) is untouched.
+        assert!(
+            p.contains("beyond what was asked"),
+            "must keep the existing scope-discipline rule"
+        );
     }
 
     #[test]
