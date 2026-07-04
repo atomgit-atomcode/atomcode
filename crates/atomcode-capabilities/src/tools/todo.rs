@@ -1,154 +1,172 @@
-//! `todo` — a session task list the agent manages to track multi-step work. Stateful:
-//! the list lives in the tool instance (interior-mutable `Arc<Mutex<…>>`), so a SINGLE
-//! registered `TodoTool` accumulates items across calls within a session. Non-destructive
-//! to the filesystem ⇒ always `Safe`. Neutral port of the production `todo` tool.
+//! `todowrite` — an AI-driven, full-list-replace task list for the current coding
+//! session. STATELESS: the model sends the entire updated list every call; the tool
+//! validates + echoes it. Current state is DERIVED from the transcript (last todowrite
+//! call), so it persists with the session and survives /resume with zero extra storage.
+//! Non-destructive ⇒ always `Safe`.
 
 use super::{err, ok};
 use async_trait::async_trait;
+use atomcode_kernel::message::Message;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
-struct TodoItem {
-    id: usize,
-    content: String,
-    status: Status,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Status {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
 }
 
-impl Status {
-    fn parse(s: &str) -> Option<Status> {
+impl TodoStatus {
+    fn parse(s: &str) -> Option<TodoStatus> {
         match s {
-            "pending" => Some(Status::Pending),
-            "in_progress" => Some(Status::InProgress),
-            "completed" => Some(Status::Completed),
+            "pending" => Some(TodoStatus::Pending),
+            "in_progress" => Some(TodoStatus::InProgress),
+            "completed" => Some(TodoStatus::Completed),
             _ => None,
         }
     }
-    fn icon(self) -> &'static str {
-        match self {
-            Status::Pending => "[ ]",
-            Status::InProgress => "[>]",
-            Status::Completed => "[x]",
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Status::Pending => "pending",
-            Status::InProgress => "in_progress",
-            Status::Completed => "completed",
-        }
+}
+
+#[derive(Clone, Debug)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// Terminal-safe status glyph. Unicode `[•]`/`[✓]` gated behind `unicode`; ASCII
+/// `[~]`/`[x]` fallback (mirrors the spinner / hint-marker unicode gating).
+pub fn todo_glyph(status: TodoStatus, unicode: bool) -> &'static str {
+    match (status, unicode) {
+        (TodoStatus::Pending, _) => "[ ]",
+        (TodoStatus::InProgress, true) => "[\u{2022}]",
+        (TodoStatus::InProgress, false) => "[~]",
+        (TodoStatus::Completed, true) => "[\u{2713}]",
+        (TodoStatus::Completed, false) => "[x]",
     }
 }
 
-/// Session task list. State is shared across `execute` calls because the tool is
-/// registered ONCE as a single `Arc<dyn Tool>` instance; all calls hit the same inner
-/// `Mutex`. Clone is cheap (shares the inner `Arc`).
-#[derive(Clone, Default)]
-pub struct TodoTool {
-    items: Arc<Mutex<Vec<TodoItem>>>,
-    next_id: Arc<Mutex<usize>>,
+/// One line per item: `<glyph> <content>`. Empty list → "(no tasks)".
+pub fn render_todos_text(todos: &[TodoItem], unicode: bool) -> String {
+    if todos.is_empty() {
+        return "(no tasks)".to_string();
+    }
+    todos
+        .iter()
+        .map(|t| format!("{} {}", todo_glyph(t.status, unicode), t.content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-impl TodoTool {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn render(items: &[TodoItem]) -> String {
-        if items.is_empty() {
-            return "No tasks.".to_string();
-        }
-        let mut out = String::new();
-        for it in items {
-            out.push_str(&format!("{} {}. {}\n", it.status.icon(), it.id, it.content));
-        }
-        out.truncate(out.trim_end().len());
-        out
-    }
+#[derive(Deserialize)]
+struct RawItem {
+    content: String,
+    status: String,
 }
 
 #[derive(Deserialize)]
 struct Args {
-    action: String,
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    id: Option<usize>,
-    #[serde(default)]
-    status: Option<String>,
+    todos: Vec<RawItem>,
 }
+
+/// Parse + validate the full-list args. Enforces: valid status enum, non-empty
+/// content, at most one `in_progress`. Returns a human-readable reason on failure
+/// (fed back to the model so it can correct and resend).
+pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
+    let a: Args = serde_json::from_str(args)
+        .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
+    let mut out = Vec::with_capacity(a.todos.len());
+    let mut in_progress = 0usize;
+    for item in a.todos {
+        if item.content.trim().is_empty() {
+            return Err("todowrite: every task needs non-empty `content`.".to_string());
+        }
+        let status = TodoStatus::parse(&item.status)
+            .ok_or_else(|| format!("todowrite: `status` must be one of pending|in_progress|completed (got `{}`).", item.status))?;
+        if status == TodoStatus::InProgress {
+            in_progress += 1;
+        }
+        out.push(TodoItem { content: item.content, status });
+    }
+    if in_progress > 1 {
+        return Err("todowrite: keep exactly ONE task `in_progress` at a time.".to_string());
+    }
+    Ok(out)
+}
+
+/// The current list = args of the last VALID `todowrite` tool call in history.
+/// Skips calls whose args fail validation (e.g. two in_progress) so an invalid
+/// last call never wipes an earlier valid list. Returns `vec![]` if no valid
+/// call exists.
+pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
+    for m in messages.iter().rev() {
+        for call in m.tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+            if let Ok(todos) = parse_todos(&call.arguments) {
+                return todos;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Stateless full-list-replace todo tool. No interior state — current list is derived
+/// from the transcript (see `derive_current_todos`).
+#[derive(Clone, Default)]
+pub struct TodoTool;
+
+impl TodoTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+const TODOWRITE_DESCRIPTION: &str = "Create and maintain a structured task list for the current coding session. \
+Send the ENTIRE updated list every call (full replace). Use it proactively for multi-step work (3+ distinct steps), \
+when the user gives multiple tasks, or to plan a non-trivial refactor. Do NOT use it for a single trivial edit or a \
+purely informational/conversational reply. Rules: update statuses in real time; keep EXACTLY ONE task in_progress at \
+a time; mark a task completed ONLY after the work is actually done (including any required verification), never on \
+intent; keep tasks specific and actionable.";
 
 #[async_trait]
 impl Tool for TodoTool {
     fn name(&self) -> &str {
-        "todo"
+        "todowrite"
     }
     fn description(&self) -> &str {
-        "Manage a task list to track progress on multi-step work. `action:\"add\"` \
-         creates a task (needs `content`), `action:\"update\"` changes a task's status \
-         (needs `id` and `status`), `action:\"list\"` shows all tasks. Every action \
-         returns the full current list."
+        TODOWRITE_DESCRIPTION
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["add", "update", "list"], "description": "add a task, update a task's status, or list all tasks" },
-                "content": { "type": "string", "description": "Task description (required for add)" },
-                "id": { "type": "integer", "description": "Task id (required for update)" },
-                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "New status (required for update)" }
+                "todos": {
+                    "type": "array",
+                    "description": "The full, updated task list (replaces the previous list).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "Brief, actionable task description." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Task status." }
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
             },
-            "required": ["action"]
+            "required": ["todos"]
         })
     }
-    // todo never touches the filesystem → risk() defaults to Safe.
+    // Never touches the filesystem → risk() defaults to Safe.
+    fn always_grant_scope(&self, _args: &str) -> String {
+        // Tool-wide: planning is harmless; one grant covers all calls this session.
+        String::new()
+    }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: Args = match serde_json::from_str(args) {
-            Ok(a) => a,
-            Err(e) => return err(format!("todo: invalid arguments: {e}. Expected {{\"action\":\"add|update|list\"}}.")),
-        };
-        let mut items = self.items.lock().unwrap();
-        match a.action.as_str() {
-            "add" => {
-                let content = match a.content {
-                    Some(c) if !c.trim().is_empty() => c,
-                    _ => return err("todo add: `content` is required and must be non-empty."),
-                };
-                let mut next = self.next_id.lock().unwrap();
-                *next += 1;
-                let id = *next;
-                items.push(TodoItem { id, content: content.clone(), status: Status::Pending });
-                ok(format!("Added task #{}: {}\n{}", id, content, Self::render(&items)))
-            }
-            "update" => {
-                let Some(id) = a.id else {
-                    return err("todo update: `id` is required.");
-                };
-                let status = match a.status.as_deref().map(Status::parse) {
-                    Some(Some(s)) => s,
-                    Some(None) => return err("todo update: `status` must be one of pending|in_progress|completed."),
-                    None => return err("todo update: `status` is required."),
-                };
-                match items.iter_mut().find(|i| i.id == id) {
-                    Some(it) => {
-                        let content = it.content.clone();
-                        it.status = status;
-                        ok(format!("Task #{} '{}' updated to '{}'\n{}", id, content, status.as_str(), Self::render(&items)))
-                    }
-                    None => err(format!("todo update: no task with id {id}.")),
-                }
-            }
-            "list" => ok(Self::render(&items)),
-            other => err(format!("todo: unknown action `{other}` (expected add|update|list).")),
+        match parse_todos(args) {
+            // Echo an ASCII-safe normalized list as the tool result (goes into the
+            // transcript; the renderer draws the pretty version separately).
+            Ok(todos) => ok(render_todos_text(&todos, false)),
+            Err(e) => err(e),
         }
     }
 }
@@ -156,6 +174,8 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
@@ -166,69 +186,120 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn add_then_list_accumulates_across_calls() {
-        let t = TodoTool::new();
-        let r1 = t.execute(r#"{"action":"add","content":"first"}"#, &ctx()).await;
-        assert!(!r1.is_error, "{}", r1.content);
-        assert!(r1.content.contains("Added task #1"), "{}", r1.content);
-        let r2 = t.execute(r#"{"action":"add","content":"second"}"#, &ctx()).await;
-        assert!(r2.content.contains("#2"), "{}", r2.content);
-        // STATE persists across calls on the same instance.
-        let list = t.execute(r#"{"action":"list"}"#, &ctx()).await;
-        assert!(list.content.contains("[ ] 1. first"), "{}", list.content);
-        assert!(list.content.contains("[ ] 2. second"), "{}", list.content);
+    #[test]
+    fn parse_valid_full_list() {
+        let todos = parse_todos(r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#).unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].content, "a");
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn parse_rejects_bad_status() {
+        let e = parse_todos(r#"{"todos":[{"content":"a","status":"done"}]}"#).unwrap_err();
+        assert!(e.contains("pending"), "{e}");
+    }
+
+    #[test]
+    fn parse_rejects_two_in_progress() {
+        let e = parse_todos(r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}"#).unwrap_err();
+        assert!(e.to_ascii_lowercase().contains("in_progress"), "{e}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_content() {
+        let e = parse_todos(r#"{"todos":[{"content":"  ","status":"pending"}]}"#).unwrap_err();
+        assert!(e.contains("content"), "{e}");
+    }
+
+    #[test]
+    fn parse_empty_list_ok() {
+        assert_eq!(parse_todos(r#"{"todos":[]}"#).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn glyph_unicode_vs_ascii() {
+        assert_eq!(todo_glyph(TodoStatus::Pending, true), "[ ]");
+        assert_eq!(todo_glyph(TodoStatus::InProgress, true), "[\u{2022}]"); // [•]
+        assert_eq!(todo_glyph(TodoStatus::Completed, true), "[\u{2713}]");  // [✓]
+        assert_eq!(todo_glyph(TodoStatus::Pending, false), "[ ]");
+        assert_eq!(todo_glyph(TodoStatus::InProgress, false), "[~]");
+        assert_eq!(todo_glyph(TodoStatus::Completed, false), "[x]");
+    }
+
+    #[test]
+    fn render_text_ascii() {
+        let todos = vec![
+            TodoItem { content: "first".into(), status: TodoStatus::Completed },
+            TodoItem { content: "second".into(), status: TodoStatus::InProgress },
+        ];
+        let s = render_todos_text(&todos, false);
+        assert!(s.contains("[x] first"), "{s}");
+        assert!(s.contains("[~] second"), "{s}");
+    }
+
+    #[test]
+    fn derive_finds_last_todowrite() {
+        let msgs = vec![
+            Message::user("hi"),
+            Message::assistant("", vec![ToolCall { id: "1".into(), name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"old","status":"pending"}]}"#.into() }]),
+            Message::assistant("", vec![ToolCall { id: "2".into(), name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"new","status":"in_progress"}]}"#.into() }]),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "new"); // LAST wins
+        assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn derive_none_when_no_todowrite() {
+        let msgs = vec![Message::user("hi"), Message::assistant("hello", vec![])];
+        assert!(derive_current_todos(&msgs).is_empty());
+    }
+
+    #[test]
+    fn derive_skips_invalid_and_returns_last_valid() {
+        // The LAST todowrite has two in_progress items (invalid); the earlier one
+        // is valid. derive_current_todos must return the earlier valid list, not [].
+        let msgs = vec![
+            Message::assistant("", vec![ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"keep","status":"pending"}]}"#.into(),
+            }]),
+            Message::assistant("", vec![ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                // Invalid: two in_progress items.
+                arguments: r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}"#.into(),
+            }]),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(todos.len(), 1, "should skip invalid call and return last valid list");
+        assert_eq!(todos[0].content, "keep");
+        assert_eq!(todos[0].status, TodoStatus::Pending);
     }
 
     #[tokio::test]
-    async fn update_changes_status_icon() {
+    async fn execute_echoes_normalized_list() {
         let t = TodoTool::new();
-        t.execute(r#"{"action":"add","content":"task"}"#, &ctx()).await;
-        let r = t.execute(r#"{"action":"update","id":1,"status":"in_progress"}"#, &ctx()).await;
+        let r = t.execute(r#"{"todos":[{"content":"task","status":"pending"}]}"#, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("[>] 1. task"), "{}", r.content);
-        let r2 = t.execute(r#"{"action":"update","id":1,"status":"completed"}"#, &ctx()).await;
-        assert!(r2.content.contains("[x] 1. task"), "{}", r2.content);
+        assert!(r.content.contains("task"), "{}", r.content);
     }
 
     #[tokio::test]
-    async fn empty_list_reports_no_tasks() {
+    async fn execute_rejects_invalid() {
         let t = TodoTool::new();
-        let r = t.execute(r#"{"action":"list"}"#, &ctx()).await;
-        assert_eq!(r.content, "No tasks.");
-    }
-
-    #[tokio::test]
-    async fn add_without_content_errors() {
-        let t = TodoTool::new();
-        let r = t.execute(r#"{"action":"add"}"#, &ctx()).await;
+        let r = t.execute(r#"{"todos":[{"content":"a","status":"nope"}]}"#, &ctx()).await;
         assert!(r.is_error);
-        assert!(r.content.contains("content"), "{}", r.content);
+        assert!(r.content.contains("pending"), "{}", r.content);
     }
 
-    #[tokio::test]
-    async fn update_missing_id_and_bad_status_error() {
-        let t = TodoTool::new();
-        t.execute(r#"{"action":"add","content":"x"}"#, &ctx()).await;
-        let no_id = t.execute(r#"{"action":"update","status":"completed"}"#, &ctx()).await;
-        assert!(no_id.is_error && no_id.content.contains("id"), "{}", no_id.content);
-        let bad = t.execute(r#"{"action":"update","id":1,"status":"done"}"#, &ctx()).await;
-        assert!(bad.is_error && bad.content.contains("pending|in_progress|completed"), "{}", bad.content);
-    }
-
-    #[tokio::test]
-    async fn update_unknown_id_errors() {
-        let t = TodoTool::new();
-        let r = t.execute(r#"{"action":"update","id":99,"status":"completed"}"#, &ctx()).await;
-        assert!(r.is_error);
-        assert!(r.content.contains("no task with id 99"), "{}", r.content);
-    }
-
-    #[tokio::test]
-    async fn unknown_action_errors() {
-        let t = TodoTool::new();
-        let r = t.execute(r#"{"action":"delete","id":1}"#, &ctx()).await;
-        assert!(r.is_error);
-        assert!(r.content.contains("unknown action"), "{}", r.content);
+    #[test]
+    fn tool_name_is_todowrite() {
+        assert_eq!(TodoTool::new().name(), "todowrite");
     }
 }

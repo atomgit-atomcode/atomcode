@@ -78,6 +78,17 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
     }
+    // Todo-list hook: injects the current todo list as a per-turn <system-reminder> so
+    // the model always sees progress even after compaction. Gated on ATOMCODE_TODO env
+    // (overrides config); cfg_value=true reflects the default-on config.ui.todo default.
+    // CodingAgentConfig doesn't carry ui.todo, so we use the config default (true) here;
+    // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
+    {
+        let env = std::env::var("ATOMCODE_TODO").ok();
+        if atomcode_core::config::todo_enabled_from_env(env.as_deref(), true) {
+            builder = builder.hook(Arc::new(crate::todo::TodoHook));
+        }
+    }
     builder.build()
 }
 

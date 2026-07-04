@@ -86,7 +86,7 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todo"]
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -112,7 +112,16 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(SearchReplaceTool));
     reg.register(Arc::new(AstGrepTool));
-    reg.register(Arc::new(TodoTool::new()));
+    // Gate on ATOMCODE_TODO env var (0/false/off → skip; anything else or absent → register).
+    // Mirrors atomcode_core::config::todo_enabled_from_env but inlined here because
+    // atomcode-capabilities must NOT depend on atomcode-core (layering constraint).
+    let todo_env_off = std::env::var("ATOMCODE_TODO")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(false);
+    if !todo_env_off {
+        reg.register(Arc::new(TodoTool::new()));
+    }
 }
 
 /// Apply `CREATE_NO_WINDOW` on Windows so a spawned child does not pop a console window;
@@ -311,7 +320,7 @@ mod tests {
         "glob",
         "search_replace",
         "ast_grep",
-        "todo",
+        "todowrite",
     ];
 
     #[test]
@@ -414,5 +423,14 @@ mod tests {
         let r = reg.mount(&["read_file"]).get("read_file").unwrap()
             .execute(r#"{"file_path":"c.jpg"}"#, &ctx).await;
         assert_eq!(r.images.len(), 1, "after re-register with vision, image must be attached: {}", r.content);
+    }
+
+    #[test]
+    fn todowrite_registered_under_new_name() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
+        assert!(names.iter().any(|n| n == "todowrite"), "todowrite must be registered: {names:?}");
     }
 }

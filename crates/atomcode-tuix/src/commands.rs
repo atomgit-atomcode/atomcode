@@ -174,6 +174,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
     Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
+    Command { name: "todo",    desc: "Reprint the current todo list derived from the session transcript", needs_args: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -233,6 +234,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "review" => Msg::CmdDescReview,
         "goal" => Msg::CmdDescGoal,
         "proxy" => Msg::CmdDescProxy,
+        "todo" => Msg::CmdDescTodo,
         _ => return None,
     };
     Some(t(msg))
