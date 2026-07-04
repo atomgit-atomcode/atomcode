@@ -2834,6 +2834,18 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "todo" => {
+            // Derive the current todo list from the session transcript and
+            // print it.  Stateless: finds the last `todowrite` tool call in
+            // `ctx.current_session.messages` and re-renders its payload.
+            // No args used; any extra text is silently ignored.
+            let out = format_todo_command(
+                &ctx.current_session.messages,
+                ctx.caps.unicode_symbols,
+            );
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
@@ -5126,6 +5138,42 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     Ok(())
 }
 
+/// Build the `/todo` output from the session message history.
+///
+/// Scans the transcript backwards for the most recent `todowrite` tool call,
+/// parses its `todos` array, and renders one line per task.  Returns a
+/// "no list" message when no such call has been made yet.
+///
+/// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
+pub(crate) fn format_todo_command(
+    messages: &[atomcode_core::conversation::message::Message],
+    unicode: bool,
+) -> String {
+    use atomcode_core::conversation::message::MessageContent;
+    // Walk backwards to find the last `todowrite` tool-call arguments.
+    let last_args = messages.iter().rev().find_map(|m| {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+            tool_calls
+                .iter()
+                .rev()
+                .find(|c| c.name == "todowrite")
+                .map(|c| c.arguments.clone())
+        } else {
+            None
+        }
+    });
+    let todos = last_args
+        .and_then(|args| atomcode_capabilities::tools::todo::parse_todos(&args).ok())
+        .unwrap_or_default();
+    if todos.is_empty() {
+        return "当前无任务清单（模型尚未创建 todo）。".to_string();
+    }
+    format!(
+        "当前任务清单:\n{}",
+        atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
+    )
+}
+
 #[cfg(test)]
 mod copy_tests {
     use super::{extract_code_blocks, resolve_copy, CopyResolve};
@@ -5616,5 +5664,40 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}",
             out
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_command_tests {
+    use super::format_todo_command;
+    use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::tool::ToolCall;
+
+    #[test]
+    fn todo_command_text_with_and_without_list() {
+        // No todowrite calls → "no list" message.
+        let empty = vec![Message::new(Role::User, "hi")];
+        assert!(
+            format_todo_command(&empty, false).contains("当前无任务清单"),
+            "empty messages should contain '当前无任务清单'"
+        );
+
+        // A todowrite call with one pending item → list output.
+        let with = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+        }];
+        let out = format_todo_command(&with, false);
+        assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
     }
 }

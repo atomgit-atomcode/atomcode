@@ -633,6 +633,8 @@ pub enum Msg<'a> {
     CmdDescGoal,
     /// Description for the `/proxy` slash command — switch the outbound proxy mode.
     CmdDescProxy,
+    /// Description for the `/todo` slash command — reprint the current task list.
+    CmdDescTodo,
     /// Error shown when `/view` is used without a filepath argument.
     ViewUsage,
     /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
