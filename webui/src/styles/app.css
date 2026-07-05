@@ -5,6 +5,7 @@
    • Medium .msg-search-bar 缺 -webkit-backdrop-filter → ad2f8da6 已加 (见 .session-header 同写法)
    • Medium .msg-search-input outline:none 缺焦点环    → ad2f8da6 已加 :focus-visible
    • Low .msg-search-bar backdrop-filter 实色背景下死代码 → d4f4d3d4 已删
+   • P3 ::-webkit-search-cancel-button 仅 WebKit 生效,Firefox 重复清除按钮 → 本 commit input 改 type="text" 后删该伪元素规则
    我们愿意根据再审意见继续优化。 */
 
 /* === Base layout === */
@@ -397,7 +398,7 @@ body {
   line-height: 1.5;
   outline: none;
 }
-.msg-search-input::-webkit-search-cancel-button { display: none; }
+/* bot review P3: type="text" 无浏览器默认清除按钮,::-webkit-search-cancel-button 伪元素已无目标,删除。 */
 /* 焦点可见性 (WCAG 2.4.7): outline:none 移除默认环后必须给替代视觉,
    否则键盘 Tab 进入看不到焦点。用 :focus-visible 避免鼠标点击也触发。 */
 .msg-search-input:focus-visible {

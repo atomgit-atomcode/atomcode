@@ -19,6 +19,9 @@
 //   • P2  key={idx} 在搜索过滤后不稳定,expanded/copied 状态丢失 → d4f4d3d4 改为 key={origIdx}
 //   • Low .msg-search-bar backdrop-filter 实色背景下死代码      → d4f4d3d4 移除死代码
 //   • P3 导航滚动逻辑 Enter/↑/↓ 三处重复                        → d4f4d3d4 提取为公共函数 navMatch(delta)
+// ─── bot 07-06 再审反馈响应 ───
+//   • P2  会话切换时 search/matchIdx 未重置,残关键词过滤新会话、matchIdx 超界 → 本 commit 两处 setMessages([]) 后追加 setSearch('') + setMatchIdx(0)
+//   • P3  <input type="search"> Firefox 仍显示默认清除按钮与自定义重复 → 本 commit 改 type="text",删 ::-webkit-search-cancel-button 伪元素
 // 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
@@ -400,6 +403,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       abortRef.current?.abort();
       setBusy(false);
       setMessages([]);
+      // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+      setSearch('');
+      setMatchIdx(0);
       setTokens(null);
       setHistoryHint(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
@@ -709,6 +715,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (!alreadyViewing) {
         onSessionId(e.session_id);
         setMessages([]);
+        // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+        setSearch('');
+        setMatchIdx(0);
         setTokens(null);
         setHistoryHint(null);
       }
@@ -1690,7 +1699,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             </svg>
             <input
               class="msg-search-input"
-              type="search"
+              // bot review P3: type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
+              // 与自定义 .msg-search-clear 重复。type="text" 全浏览器一致,清除按钮仅走自定义路径。
+              type="text"
               value={search}
               placeholder={t('chat.searchPlaceholder')}
               onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
