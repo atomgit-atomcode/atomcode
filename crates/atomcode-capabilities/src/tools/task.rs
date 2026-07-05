@@ -176,39 +176,42 @@ several. Subagents run in parallel and cannot themselves dispatch."
                     .build();
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
-                let outcome = tokio::spawn(async move {
+                //
+                // NOTE: under `panic = "abort"` (workspace default), a child panic aborts
+                // the whole process before the JoinError can surface, so the Err arm below
+                // cannot fire from a panic.  This is defensive parity with parallel_edit.rs:
+                // it removes the silent-success footgun (Outcome::default() == Stopped) and
+                // makes any future non-panic JoinError (e.g. explicit abort()) visible.
+                let outcome = match tokio::spawn(async move {
                     child.run_to_completion(prompt, AutoRespond::AllowAll).await
                 })
                 .await
-                .unwrap_or_default();
+                {
+                    Ok(o) => o,
+                    Err(join_err) => Outcome {
+                        stop: StopReason::ProviderError,
+                        error: Some(format!("subagent task crashed: {join_err}")),
+                        ..Default::default()
+                    },
+                };
                 (label, desc, outcome)
             });
         }
 
         // Collect all child results (order determined by completion, then sorted by label).
-        // Outer JoinErrors (panic/abort of the spawn wrapper) are captured immediately
-        // so they remain visible to the model rather than being silently dropped.
+        // The outer closure always returns Ok(tuple); inner JoinErrors are handled at the
+        // inner spawn site above and mapped to an errored Outcome.
         let mut collected: Vec<(String, String, Outcome)> = Vec::new();
-        let mut crash_blocks: Vec<String> = Vec::new();
         while let Some(res) = set.join_next().await {
-            match res {
-                Ok(tuple) => collected.push(tuple),
-                Err(join_err) => {
-                    crash_blocks.push(render_task_block(
-                        "unknown",
-                        "crashed subtask",
-                        "error",
-                        "task_error",
-                        &format!("subtask panicked or was aborted: {join_err}"),
-                    ));
-                }
+            if let Ok(tuple) = res {
+                collected.push(tuple);
             }
         }
         // Sort by label for deterministic output regardless of scheduling order.
         collected.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut blocks: Vec<String> = Vec::new();
-        let mut any_error = !crash_blocks.is_empty();
+        let mut any_error = false;
         for (label, desc, outcome) in collected {
             let is_err = outcome.stop != StopReason::Stopped;
             any_error |= is_err;
@@ -236,8 +239,6 @@ several. Subagents run in parallel and cannot themselves dispatch."
             };
             blocks.push(render_task_block(&label, &desc, state, tag, &body));
         }
-        // Crash blocks (outer JoinError) appended after sorted normal blocks.
-        blocks.extend(crash_blocks);
 
         ToolResult {
             call_id: String::new(),
