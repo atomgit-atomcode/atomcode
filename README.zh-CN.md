@@ -367,6 +367,7 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/model` | 切换模型 / provider |
 | `/provider` | 管理 provider（添加 / 编辑 / 删除） |
+| `/proxy` | 切换出站代理模式 |
 | `/login` | 通过 AtomGit OAuth 登录 |
 | `/logout` | 退出 AtomGit 登录 |
 | `/whoami` | 查看当前登录用户 |
@@ -380,6 +381,7 @@ atomcode --prompt-file task.md
 | `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
 | `/view <文件路径>` | 在浮层窗口中查看文件内容 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/copy` | 从上一条回复复制代码块（`/copy`、`/copy N`、`/copy all`） |
 | `/cost` | 显示本次会话的 token 消耗 |
 | `/context` | 查看上下文预算占用明细 |
 | `/compact` | 压缩对话历史 |
