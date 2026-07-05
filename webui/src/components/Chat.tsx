@@ -1360,6 +1360,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // + state,事件处理器读 ref,渲染读 state。
   const matchIdxRef = useRef(0);
   const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
+  // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
+  // 三处 (Enter/↑/↓) 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  const navMatch = (delta: number) => {
+    const n = visibleMessages.length;
+    if (n === 0) return;
+    const newIdx = (matchIdxRef.current + delta + n) % n;
+    setMatchIdx(newIdx);
+    const node = matchRefs.current[newIdx];
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
 
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
@@ -1667,15 +1677,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
                   e.preventDefault();
-                  // P1+P3 修复: 先算 newIdx 再同时用于 setMatchIdx 和滚动,
-                  // 且读 matchIdxRef.current (而非闭包 matchIdx) 保证快速
-                  // 连击时也拿到最新值,导航不停滞。
-                  const delta = e.shiftKey ? -1 : 1;
-                  const n = visibleMessages.length;
-                  const newIdx = (matchIdxRef.current + delta + n) % n;
-                  setMatchIdx(newIdx);
-                  const node = matchRefs.current[newIdx];
-                  if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  navMatch(e.shiftKey ? -1 : 1);
                 }
               }}
               aria-label={t('chat.searchPlaceholder')}
@@ -1690,14 +1692,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               <>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdxRef.current - 1 + n) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => navMatch(-1)}
                   title={t('chat.searchPrev')}
                   aria-label={t('chat.searchPrev')}
                   type="button"
                 >↑</button>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdxRef.current + 1) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => navMatch(1)}
                   title={t('chat.searchNext')}
                   aria-label={t('chat.searchNext')}
                   type="button"
@@ -1774,7 +1776,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
             if (msg.role === 'user') {
-              return <UserMessageView key={idx} msg={msg} searchRef={setMatchRef} />;
+              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} />;
             }
 
             // Determine if this assistant message is the last one in the current
@@ -1789,7 +1791,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
             return (
               <AssistantMessageView
-                key={idx}
+                key={origIdx}
                 msg={msg}
                 isLast={isLast}
                 busy={busy}

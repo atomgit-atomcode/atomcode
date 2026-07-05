@@ -375,8 +375,6 @@ body {
   background: var(--app-secondary-background);
   border: 1px solid var(--app-input-border);
   border-radius: var(--corner-radius-small);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
 }
 .msg-search-icon {
   flex: 0 0 auto;
