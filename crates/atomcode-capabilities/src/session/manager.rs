@@ -118,7 +118,12 @@ impl SessionManager {
         if normalized.len() > 1 && normalized.ends_with('/') {
             normalized.pop();
         }
-        #[cfg(windows)]
+        // Fold case on case-insensitive filesystems — MUST match
+        // `atomcode_core::session::hash_path` (which folds on the same platforms),
+        // or this store's `.jsonl/.snapshot/.meta` would bucket differently than
+        // core's `.json` for the same project on macOS. Kept in sync by hand
+        // because this L0 crate cannot depend on atomcode-core.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let normalized = normalized.to_lowercase();
 
         let mut hasher = DefaultHasher::new();
@@ -260,9 +265,15 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        // Case-insensitive filesystems fold case (matching core's hash_path), so
+        // the expected input is lowercased there; case-sensitive Linux hashes the
+        // raw path. Either way it must be the `PathBuf` hash, `{:016x}`.
         let p = Path::new("/Users/theo/Documents/workspace/atomcode");
+        let s = p.to_string_lossy().to_string();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let s = s.to_lowercase();
         let mut expected = DefaultHasher::new();
-        PathBuf::from(p.to_string_lossy().to_string()).hash(&mut expected);
+        PathBuf::from(s).hash(&mut expected);
         assert_eq!(
             SessionManager::project_hash(p),
             format!("{:016x}", expected.finish())

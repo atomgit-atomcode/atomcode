@@ -943,6 +943,11 @@ async fn async_main() {
         std::process::exit(code);
     }
 
+    // One-time on macOS: re-bucket sessions now that hash_path folds path case
+    // there, so /resume history survives a differently-cased working dir. No-op
+    // on Windows/Linux and after the marker is written. Startup-only (moves files).
+    SessionManager::migrate_case_buckets();
+
     // If this invocation is the `.bak` backup binary (left behind by a
     // previous upgrade), skip all upgrade bootstrapping. `apply_pending_upgrade`
     // would rewrite ourselves with the latest version and destroy the

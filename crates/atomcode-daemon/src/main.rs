@@ -150,6 +150,10 @@ async fn main() {
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();
+    // One-time: re-bucket macOS sessions now that hash_path folds path case there
+    // (no-op on Windows/Linux, and after its marker is written). Startup-only so
+    // it moves files exactly once per install, before any handler lists sessions.
+    SessionManager::migrate_case_buckets();
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
 

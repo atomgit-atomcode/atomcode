@@ -393,6 +393,10 @@ impl SessionManager {
     pub fn new(working_dir: &Path) -> Self {
         // Auto-migrate from legacy location on first use
         Self::migrate_from_legacy();
+        // NOTE: `migrate_case_buckets` is deliberately NOT called here — it MOVES
+        // files and is invoked once at binary startup (CLI + daemon main), not on
+        // every manager construction, so the test suite (which builds managers
+        // against the real sessions root) never re-buckets a dev's live data.
 
         let sessions_dir = Self::sessions_root_dir();
         let project_hash = hash_path(working_dir);
@@ -402,6 +406,43 @@ impl SessionManager {
             project_hash,
         }
     }
+
+    /// One-time re-bucketing after `hash_path` began folding case on macOS.
+    ///
+    /// Only macOS transitions (Windows already folded, Linux never), so this is
+    /// a compile-time no-op elsewhere. A marker file makes the common "already
+    /// done" call — every `SessionManager::new` — a single `stat`.
+    ///
+    /// Non-destructive: files are moved (rename, else copy-then-remove) and a
+    /// source is never deleted until its copy exists at the destination; a crash
+    /// mid-run is finished by the next run (idempotent). It moves at the BUCKET
+    /// level (never following a possibly-restamped `working_dir` field into
+    /// another project), keying each bucket off an UNPOLLUTED session whose
+    /// case-sensitive hash matches the bucket name.
+    #[cfg(target_os = "macos")]
+    pub fn migrate_case_buckets() {
+        let root = Self::sessions_root_dir();
+        let marker = root.join(".case_migrated");
+        if marker.exists() {
+            return;
+        }
+        // Write the marker ONLY if the pass fully completed. A partial failure
+        // (permission, disk full, race) would otherwise strand sessions in an
+        // old case-sensitive bucket that the now-folded `hash_path` never looks
+        // in — leaving no marker retries next startup (the pass is idempotent).
+        let complete = if root.exists() {
+            migrate_case_buckets_in_root(&root)
+        } else {
+            true // fresh install: nothing to fold, new sessions write folded
+        };
+        if complete {
+            let _ = std::fs::create_dir_all(&root);
+            let _ = std::fs::write(&marker, b"1");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn migrate_case_buckets() {}
 
     /// Get the directory for this project's sessions.
     fn project_dir(&self) -> PathBuf {
@@ -522,6 +563,19 @@ impl SessionManager {
 /// divergence (e.g. hashing the raw `&str` instead of a `Path`) silently
 /// files or looks up sessions under the wrong bucket.
 pub fn hash_path(path: &Path) -> String {
+    // Fold case on case-insensitive filesystems (Windows, macOS default) so a
+    // directory passed in different cases maps to ONE bucket. `migrate_case_buckets`
+    // re-buckets pre-existing macOS sessions once when this fold was introduced.
+    hash_path_folded(
+        path,
+        cfg!(any(target_os = "windows", target_os = "macos")),
+    )
+}
+
+/// Core of [`hash_path`], parameterized on case-folding so the migration can
+/// compute BOTH the pre-fold (case-sensitive) bucket name — to identify where an
+/// existing bucket came from — and the folded name to move it to.
+fn hash_path_folded(path: &Path, fold_case: bool) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -529,7 +583,7 @@ pub fn hash_path(path: &Path) -> String {
     // 1. Convert to string representation
     // 2. Replace backslashes with forward slashes (Windows)
     // 3. Remove trailing slash (but keep root "/" or "C:/")
-    // 4. Lowercase on Windows (case-insensitive filesystem)
+    // 4. Lowercase on case-insensitive filesystems
     let normalized = crate::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
     let mut normalized = normalized.replace('\\', "/");
 
@@ -537,8 +591,11 @@ pub fn hash_path(path: &Path) -> String {
         normalized.pop();
     }
 
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
+    let normalized = if fold_case {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    };
 
     // IMPORTANT: hash through `Path::hash`, not `str::hash`. `Path`
     // hashes its components with length prefixes, which is NOT the
@@ -553,6 +610,115 @@ pub fn hash_path(path: &Path) -> String {
     let p: PathBuf = PathBuf::from(normalized);
     p.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Read the `working_dir` field from any session file that is a JSON object
+/// (core `.json` or capabilities `.meta`), without depending on either store's
+/// full schema. Returns `None` for line-delimited `.jsonl` / binary `.snapshot`.
+#[cfg(target_os = "macos")]
+fn read_working_dir_field(path: &Path) -> Option<PathBuf> {
+    let json = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v.get("working_dir")?.as_str().map(PathBuf::from)
+}
+
+/// Identify a bucket's true directory: the `working_dir` of some session inside
+/// whose CASE-SENSITIVE hash equals the bucket's name (i.e. an unpolluted
+/// session that was actually filed here). `None` if none matches — then the
+/// bucket is left untouched rather than guessed.
+#[cfg(target_os = "macos")]
+fn bucket_true_path(bucket_dir: &Path, bucket_name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(bucket_dir).ok()?.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if let Some(wd) = read_working_dir_field(&p) {
+            if hash_path_folded(&wd, false) == bucket_name {
+                return Some(wd);
+            }
+        }
+    }
+    None
+}
+
+/// Move every file from `src_dir` into `target_dir` (creating it). Non-destructive:
+/// a source is only removed after its copy exists at the destination. Returns
+/// `true` only if every session file now lives at the destination (so the source
+/// bucket is safe to drop and the migration marker safe to write) — a partial
+/// failure returns `false` so the run is retried instead of marked done.
+#[cfg(target_os = "macos")]
+fn move_bucket_contents(src_dir: &Path, target_dir: &Path) -> bool {
+    if std::fs::create_dir_all(target_dir).is_err() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(src_dir) else {
+        return false;
+    };
+    let mut complete = true;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if !src.is_file() {
+            continue; // stray non-session entry — not our data, don't block the marker
+        }
+        let dst = target_dir.join(entry.file_name());
+        if dst.exists() {
+            // Already at destination (idempotent re-run, or a prior copy that
+            // failed to delete its source). Drop the duplicate source.
+            if std::fs::remove_file(&src).is_err() {
+                complete = false;
+            }
+            continue;
+        }
+        if std::fs::rename(&src, &dst).is_err() {
+            // Cross-device or racing rename → copy then remove, only if copied.
+            if std::fs::copy(&src, &dst).is_ok() {
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        if src.exists() {
+            complete = false; // move did not fully complete for this file
+        }
+    }
+    complete
+}
+
+/// Re-bucket every folder under `root` from its case-sensitive name to the
+/// case-FOLDED name, merging case-variant buckets. Split from
+/// `migrate_case_buckets` so it can be unit-tested against a temp root. Returns
+/// `true` only if every bucket that needed moving was fully moved — intentional
+/// skips (unidentifiable or already-folded buckets) do NOT count as failures.
+#[cfg(target_os = "macos")]
+fn migrate_case_buckets_in_root(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    let mut complete = true;
+    for entry in entries.flatten() {
+        let bucket_dir = entry.path();
+        if !bucket_dir.is_dir() {
+            continue;
+        }
+        let Some(bucket_name) = bucket_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(true_path) = bucket_true_path(&bucket_dir, &bucket_name) else {
+            continue; // can't identify → leave as-is (data stays put, not moved wrong)
+        };
+        let folded = hash_path_folded(&true_path, true);
+        if folded == bucket_name {
+            continue; // already folded-correct (e.g. an all-lowercase path)
+        }
+        if !move_bucket_contents(&bucket_dir, &root.join(&folded)) {
+            complete = false; // a transient move failure → don't let the marker be written
+        }
+        let _ = std::fs::remove_dir(&bucket_dir); // best-effort; only succeeds if now empty
+    }
+    complete
 }
 
 /// Get current timestamp in seconds.
@@ -896,21 +1062,111 @@ mod tests {
 
     #[test]
     fn hash_path_matches_legacy_path_hash_on_unix() {
-        // Regression guard: the pre-normalization implementation just did
-        // `path.hash(&mut hasher)`. Every session saved before the
-        // normalization pass lives in a bucket keyed by that hash. If
-        // `hash_path` stops matching `Path::hash` for a plain-ASCII Unix
-        // path with no trailing slash / backslashes, every legacy
-        // `/resume` session becomes invisible. See the "where did my
-        // /resume history go?" regression.
+        // Regression guard: `hash_path` must hash through `Path::hash` (not
+        // `str::hash`), so a plain path with no trailing slash / backslashes
+        // hashes identically to the pre-normalization implementation. On
+        // case-sensitive Linux the value is UNCHANGED (legacy sessions stay
+        // findable); on case-insensitive Windows/macOS an uppercase path now
+        // FOLDS (that is the whole point — `migrate_case_buckets` re-buckets the
+        // pre-fold macOS sessions), so it equals `Path::hash` of the LOWERCASED
+        // path instead of the raw one.
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let p = Path::new("/Users/theo/Documents/workspace/atomcode");
-        let mut expected = DefaultHasher::new();
-        p.hash(&mut expected);
-        let legacy = format!("{:016x}", expected.finish());
-        assert_eq!(hash_path(p), legacy);
+        let mut raw = DefaultHasher::new();
+        p.hash(&mut raw);
+        let raw = format!("{:016x}", raw.finish());
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(hash_path(p), raw, "case-sensitive FS: unchanged from legacy");
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            assert_ne!(hash_path(p), raw, "case-insensitive FS: uppercase folds");
+            let mut folded = DefaultHasher::new();
+            PathBuf::from(p.to_string_lossy().to_lowercase()).hash(&mut folded);
+            assert_eq!(hash_path(p), format!("{:016x}", folded.finish()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn migrate_case_buckets_merges_case_variants_and_is_idempotent() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        // Write a session under its CASE-SENSITIVE bucket (the pre-fold layout).
+        let mk = |wd: &str| -> SessionId {
+            let bucket = hash_path_folded(Path::new(wd), false);
+            std::fs::create_dir_all(root.join(&bucket)).unwrap();
+            let s = Session::new(PathBuf::from(wd));
+            std::fs::write(
+                root.join(&bucket).join(format!("{}.json", s.id.as_str())),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+            // A sibling file for the same session must move together.
+            std::fs::write(
+                root.join(&bucket).join(format!("{}.meta", s.id.as_str())),
+                format!("{{\"working_dir\":\"{wd}\"}}"),
+            )
+            .unwrap();
+            s.id.clone()
+        };
+        let id_upper = mk("/Users/danan/proj");
+        let id_lower = mk("/users/danan/proj");
+
+        let folded = hash_path_folded(Path::new("/Users/danan/proj"), true);
+        let sensitive_upper = hash_path_folded(Path::new("/Users/danan/proj"), false);
+        assert_ne!(sensitive_upper, folded, "pre-fold buckets differ from folded");
+
+        assert!(migrate_case_buckets_in_root(root), "clean pass reports complete");
+
+        // Both sessions (4 files) now live in the single folded bucket.
+        let files: Vec<_> = std::fs::read_dir(root.join(&folded))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 4, "both sessions + their .meta merged: {files:?}");
+        for id in [&id_upper, &id_lower] {
+            assert!(files.contains(&format!("{}.json", id.as_str())));
+            assert!(files.contains(&format!("{}.meta", id.as_str())));
+        }
+        // The pre-fold uppercase bucket is emptied + removed.
+        assert!(!root.join(&sensitive_upper).exists());
+
+        // Idempotent: a second pass neither loses nor duplicates files.
+        migrate_case_buckets_in_root(root);
+        let count = std::fs::read_dir(root.join(&folded)).unwrap().flatten().count();
+        assert_eq!(count, 4, "second pass is a no-op");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn migrate_case_buckets_leaves_unidentifiable_bucket_untouched() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // A bucket whose name matches NO contained session's case-sensitive hash
+        // (e.g. fully field-restamped) must be left exactly as-is, not guessed.
+        let bogus = "deadbeefdeadbeef";
+        std::fs::create_dir_all(root.join(bogus)).unwrap();
+        let s = Session::new(PathBuf::from("/Users/x/unrelated"));
+        std::fs::write(
+            root.join(bogus).join(format!("{}.json", s.id.as_str())),
+            serde_json::to_string(&s).unwrap(),
+        )
+        .unwrap();
+
+        migrate_case_buckets_in_root(root);
+
+        assert!(
+            root.join(bogus).join(format!("{}.json", s.id.as_str())).exists(),
+            "unidentifiable bucket must be left in place"
+        );
     }
 
     // --- P0-4: Session persistence fault-tolerance tests ---
