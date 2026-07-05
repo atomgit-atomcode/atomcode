@@ -3,7 +3,7 @@
 //! 选子工具集。子 agent 跑在独立内核会话里,结果用 <task_result> 包回。
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond};
+use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, RiskLevel, Tool, ToolContext, ToolResult};
@@ -28,7 +28,6 @@ fn default_subagent_type() -> String {
 
 #[derive(Deserialize)]
 struct SubTask {
-    #[allow(dead_code)]
     description: String,
     prompt: String,
     #[serde(default = "default_subagent_type")]
@@ -116,16 +115,187 @@ several. Subagents run in parallel and cannot themselves dispatch."
         }
     }
 
-    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        // 见 Task 4。
-        ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        let parsed: Args = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolResult {
+                    call_id: String::new(),
+                    content: format!("invalid task args: {e}"),
+                    is_error: true,
+                    images: vec![],
+                }
+            }
+        };
+        if parsed.tasks.is_empty() {
+            return ToolResult {
+                call_id: String::new(),
+                content: "no tasks provided".into(),
+                is_error: true,
+                images: vec![],
+            };
+        }
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        let mut set = tokio::task::JoinSet::new();
+
+        for (idx, t) in parsed.tasks.into_iter().enumerate() {
+            let is_worker = t.subagent_type == "worker";
+            let is_hard = t.difficulty == "hard";
+            // Fresh provider + fresh tools per child (a session consumes its provider).
+            let provider = if is_hard {
+                (self.make_capable_provider)()
+            } else {
+                (self.make_fast_provider)()
+            };
+            let tools = if is_worker {
+                (self.make_worker_tools)()
+            } else {
+                (self.make_explore_tools)()
+            };
+            let persona = if is_worker { WORKER_PERSONA } else { EXPLORE_PERSONA }.to_string();
+            let child_cancel = ctx.cancel.child_token();
+            let wd = ctx.working_dir.clone();
+            let label = format!(
+                "{}#{}",
+                if is_worker { "worker" } else { "explore" },
+                idx + 1
+            );
+            let prompt = t.prompt;
+            let desc = t.description;
+            let sem = sem.clone();
+
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                let child = Agent::builder()
+                    .provider(provider)
+                    .tools(tools)
+                    .persona(persona)
+                    .working_dir(wd)
+                    .cancel_token(child_cancel)
+                    .build();
+                // DETACH: inner spawn lets the child run independent of this future;
+                // cancel propagates only via the child_token.
+                let outcome = tokio::spawn(async move {
+                    child.run_to_completion(prompt, AutoRespond::AllowAll).await
+                })
+                .await
+                .unwrap_or_default();
+                (label, desc, outcome)
+            });
+        }
+
+        // Collect all child results (order determined by completion, then sorted by label).
+        let mut collected: Vec<(String, String, Outcome)> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(tuple) = res {
+                collected.push(tuple);
+            }
+        }
+        // Sort by label for deterministic output regardless of scheduling order.
+        collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut blocks: Vec<String> = Vec::new();
+        let mut any_error = false;
+        for (label, desc, outcome) in collected {
+            let is_err = outcome.stop != StopReason::Stopped;
+            any_error |= is_err;
+            let (state, tag, body) = if is_err {
+                (
+                    "error",
+                    "task_error",
+                    format!(
+                        "subagent failed ({:?}): {}",
+                        outcome.stop,
+                        outcome.error.unwrap_or_else(|| "<no error message>".into())
+                    ),
+                )
+            } else if !outcome.text.is_empty() {
+                ("completed", "task_result", outcome.text)
+            } else {
+                // Pure-tool child (no assistant text): fall back to tool_results.
+                let joined = outcome
+                    .tool_results
+                    .iter()
+                    .map(|r| r.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ("completed", "task_result", joined)
+            };
+            blocks.push(render_task_block(&label, &desc, state, tag, &body));
+        }
+
+        ToolResult {
+            call_id: String::new(),
+            content: blocks.join("\n"),
+            is_error: any_error,
+            images: vec![],
+        }
     }
+}
+
+/// Wrap a child-agent result in an opencode-style `<task>` block.
+fn render_task_block(id: &str, summary: &str, state: &str, tag: &str, body: &str) -> String {
+    format!(
+        "<task id=\"{id}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_kernel::tool::ToolRegistry;
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::provider::ChatOptions;
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    use atomcode_kernel::tool::{ProgressSink, ToolDef, ToolRegistry};
+    use futures::stream::{self, BoxStream};
+    use futures::StreamExt;
+    use tokio_util::sync::CancellationToken;
+
+    /// Scripted provider: `Some(reply)` → one text turn then clean stop;
+    /// `None` → a terminal open error (simulates a failed child).
+    struct MockProvider {
+        reply: Option<String>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _t: &[ToolDef],
+            _o: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            match &self.reply {
+                Some(text) => {
+                    let evs = vec![
+                        StreamEvent::TextDelta(text.clone()),
+                        StreamEvent::Done { truncated: false },
+                    ];
+                    Ok(stream::iter(evs).boxed())
+                }
+                None => Err(ProviderError {
+                    retryable: false,
+                    message: "mock open failure".into(),
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        // Dedicated EMPTY tempdir — shared std::env::temp_dir() can contain stray
+        // build markers that confuse any build-detection logic in child agents.
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        ToolContext {
+            working_dir: dir,
+            cancel: CancellationToken::new(),
+            progress: ProgressSink::noop(),
+        }
+    }
 
     fn dummy() -> TaskTool {
         let reg = Arc::new(ToolRegistry::new());
@@ -151,5 +321,41 @@ mod tests {
         let explore = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
         assert!(matches!(t.risk(worker), RiskLevel::Risky));
         assert!(matches!(t.risk(explore), RiskLevel::Safe));
+    }
+
+    #[tokio::test]
+    async fn explore_task_returns_task_result() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("FOUND: the answer is 42".into()) }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        );
+        let args = r#"{"tasks":[{"description":"find","prompt":"where is X","subagent_type":"explore","difficulty":"simple"}]}"#;
+        let out = tool.execute(args, &ctx()).await;
+        assert!(!out.is_error, "unexpected error: {}", out.content);
+        assert!(out.content.contains("<task_result>"), "missing tag: {}", out.content);
+        assert!(out.content.contains("FOUND: the answer is 42"), "missing reply: {}", out.content);
+        assert!(out.content.contains("state=\"completed\""), "missing state: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn failed_child_returns_task_error() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: None }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: None }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        );
+        let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
+        let out = tool.execute(args, &ctx()).await;
+        assert!(out.is_error, "expected error result, got: {}", out.content);
+        assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
     }
 }
