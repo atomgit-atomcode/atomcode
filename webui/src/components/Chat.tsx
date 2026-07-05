@@ -56,7 +56,9 @@ function sameDay(a: Date, b: Date): boolean {
  *  wall-clock fact the user reads the same way they read a timestamp in
  *  any messaging app. */
 function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
-  if (!ts || !Number.isFinite(ts)) return '';
+  // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
+  // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
+  if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
   const now = new Date();
@@ -70,7 +72,7 @@ function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<
 
 /** Full local timestamp for the hover tooltip (seconds + full date). */
 function formatMsgTimeFull(ts?: number): string {
-  if (!ts || !Number.isFinite(ts)) return '';
+  if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;

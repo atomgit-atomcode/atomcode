@@ -251,7 +251,11 @@ pub struct SessionDetail {
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
+    /// Epoch SECONDS (kernel 原生单位)。注意:与 `MessageInfo.created_at`
+    /// 的毫秒单位不同 —— 历史消费者(Sidebar.tsx 等)按秒使用,改单位会
+    /// 破坏它们,故保持秒并在注释明确差异 (bot review P2 方案 B)。
     pub created_at: u64,
+    /// Epoch SECONDS (同上)。
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
@@ -428,6 +432,8 @@ pub struct MessageInfo {
     /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
     /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
     /// keeps old daemons/clients interoperating when the field is absent.
+    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 的秒
+    /// 不同 (见 SessionDetail 注释, bot review P2)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
 }
