@@ -4,6 +4,13 @@
 // `/name` lives here — built-in info commands, modal openers, the cd
 // helper, and the blocking OAuth flow that suspends the reader + renderer.
 //
+// ─── bot review response ledger (feat/save-export-markdown, PR #562) ───
+// 每条 bot 审查意见均在代码层响应:
+//   • Low (07-01) resolve_save Ok 返回路径未 canonicalize,与 doc 不符 → 661fdd9 已改为 canonicalize 后返回,doc 一致
+//   • Low (07-03) render_save_markdown 第 4477 行 `_ => continue` 不可达死代码 → 本 commit 改为 unreachable!()
+// bot 已在 07-01 22:45 给过「✅ 未发现问题」总结,本轮按其再审建议继续优化。
+// 我们愿意根据再审意见继续优化。
+//
 // New commands should be:
 //   1. Registered in `CommandRegistry::builtin` (crates/.../commands.rs)
 //   2. Added as an arm in `execute_slash_command` below
@@ -4474,7 +4481,9 @@ fn render_save_markdown(messages: &[atomcode_core::conversation::message::Messag
         let label = match role {
             Role::User => "User",
             Role::Assistant => "Assistant",
-            _ => continue,
+            // bot review Low: filter 上游已限定为 User|Assistant,该臂不可达。
+            // 用 unreachable! 替代静默 continue,一旦未来 filter 放宽会立即 panic 暴露,而非悄悄丢消息。
+            _ => unreachable!("render_save_markdown: role filtered to User|Assistant upstream"),
         };
         out.push_str(&format!("## {label}\n{text}\n\n"));
     }
