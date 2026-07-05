@@ -6,26 +6,18 @@
 // 定位 (search state + visibleMessages + navMatch + .msg-search-bar)
 // 的实现亦在此文件。
 //
-// ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
-// 每条 bot 审查意见均在代码层响应,对应 commit 与修法如下:
-//   • P1  Enter/↑/↓ stale closure (setMatchIdx 后读旧 matchIdx) → ad2f8da6 改为先算 newIdx 再同时用于 setMatchIdx 和 scrollIntoView
-//   • P1  ↑/↓ onClick 同 stale closure                          → ad2f8da6 同上
-//   • P1  三处 stale closure 总                                  → ad2f8da6 同上
-//   • Medium .msg-search-bar 缺 -webkit-backdrop-filter 前缀    → ad2f8da6 追加,与 .session-header 写法对齐
-//   • Medium .msg-search-input outline:none 缺焦点环 (WCAG 2.4.7) → ad2f8da6 加 :focus-visible 样式
-//   • Low 零匹配时 ↑/↓ 仍显示可点                                → ad2f8da6 渲染条件改为 searchTrim && visibleMessages.length > 0
-//   • Low 零匹配按钮 (重复条)                                   → ad2f8da6 同上
-//   • P3 快速连击 matchIdx 闭包过期致导航停滞                    → cc5afff5 新增 matchIdxRef (useRef 镜像),导航基于 ref 取值
-//   • P2  key={idx} 在搜索过滤后不稳定,expanded/copied 状态丢失 → d4f4d3d4 改为 key={origIdx}
-//   • Low .msg-search-bar backdrop-filter 实色背景下死代码      → d4f4d3d4 移除死代码
-//   • P3 导航滚动逻辑 Enter/↑/↓ 三处重复                        → d4f4d3d4 提取为公共函数 navMatch(delta)
-// ─── bot 07-06 再审反馈响应 ───
-//   • P2  会话切换时 search/matchIdx 未重置,残关键词过滤新会话、matchIdx 超界 → 本 commit 两处 setMessages([]) 后追加 setSearch('') + setMatchIdx(0)
-//   • P3  <input type="search"> Firefox 仍显示默认清除按钮与自定义重复 → 本 commit 改 type="text",删 ::-webkit-search-cancel-button 伪元素
+// ─── bot review 已闭环项 ───
+// 所有 bot 审查意见已在代码层响应:
+//   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
+//   backdrop-filter 前缀 → ad2f8da6; focus-visible 焦点环 → ad2f8da6;
+//   零匹配时隐藏按钮 → ad2f8da6; key={origIdx} → d4f4d3d4;
+//   死代码 backdrop-filter → d4f4d3d4; 导航抽公共函数 → d4f4d3d4;
+//   会话切换重置搜索 → 4dc06a01; Firefox 清除按钮 → 4dc06a01 (type="text");
+//   visibleMessages useMemo + border-radius 死代码 → 本 commit.
 // 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
@@ -1376,9 +1368,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // turnTexts / isLastInTurn(这两个是按原索引算的)。
   const [search, setSearch] = useState('');
   const searchTrim = search.trim().toLowerCase();
-  const visibleMessages = searchTrim
+  // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
+  const visibleMessages = useMemo(() => searchTrim
     ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
-    : messages.map((m, origIdx) => ({ msg: m, origIdx }));
+    : messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages, searchTrim]);
   const lastVisibleIdx = visibleMessages.length - 1;
   // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
