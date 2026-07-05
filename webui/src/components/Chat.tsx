@@ -1,5 +1,9 @@
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
+//
+// 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
+// 输入与发送、技能/@提及、同步模式、权限卡等。消息发送时间标记
+// (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
