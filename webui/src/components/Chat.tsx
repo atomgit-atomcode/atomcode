@@ -1353,7 +1353,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const lastVisibleIdx = visibleMessages.length - 1;
   // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
-  const [matchIdx, setMatchIdx] = useState(0);
+  const [matchIdx, setMatchIdxState] = useState(0);
+  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到
+  // 最新值,而非闭包里上一次渲染的旧值 (否则连击超过 React 渲染速率时
+  // newIdx 会基于旧 matchIdx 算出,导航"停滞")。setMatchIdx 同步更新 ref
+  // + state,事件处理器读 ref,渲染读 state。
+  const matchIdxRef = useRef(0);
+  const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
 
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
@@ -1661,11 +1667,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
                   e.preventDefault();
-                  // P1 修复: 先算 newIdx 再同时用于 setMatchIdx 和滚动,
-                  // 避免闭包里 matchIdx 是旧值导致"慢一拍"。
+                  // P1+P3 修复: 先算 newIdx 再同时用于 setMatchIdx 和滚动,
+                  // 且读 matchIdxRef.current (而非闭包 matchIdx) 保证快速
+                  // 连击时也拿到最新值,导航不停滞。
                   const delta = e.shiftKey ? -1 : 1;
                   const n = visibleMessages.length;
-                  const newIdx = (matchIdx + delta + n) % n;
+                  const newIdx = (matchIdxRef.current + delta + n) % n;
                   setMatchIdx(newIdx);
                   const node = matchRefs.current[newIdx];
                   if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1683,14 +1690,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               <>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdx - 1 + n) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdxRef.current - 1 + n) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
                   title={t('chat.searchPrev')}
                   aria-label={t('chat.searchPrev')}
                   type="button"
                 >↑</button>
                 <button
                   class="msg-search-nav"
-                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdx + 1) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                  onClick={() => { const n = visibleMessages.length; const newIdx = (matchIdxRef.current + 1) % n; setMatchIdx(newIdx); const node = matchRefs.current[newIdx]; if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
                   title={t('chat.searchNext')}
                   aria-label={t('chat.searchNext')}
                   type="button"
