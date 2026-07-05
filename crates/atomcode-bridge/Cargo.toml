@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-bridge"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "Engine bridge: presents atomcode-core's driver-facing channel protocol (AgentClient/AgentCommand/AgentEvent) backed by the NEW stack (kernel + capabilities + coding). Lets every existing driver — tuix, atomcode-cli headless, daemon-attached flows — run the new engine UNCHANGED."
 

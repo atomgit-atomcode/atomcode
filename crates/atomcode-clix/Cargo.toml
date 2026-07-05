@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-clix"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "Standalone new-stack CLI (D-layer driver): `code` drives the full coding agent (prepare/assemble), `review` drives the atomcode-review agent over a git diff. Decoupled from atomcode-cli / atomcode-core."
 

@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-coding"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "L2 coding specialization: assembles the neutral kernel + capabilities into a runnable, self-correcting coding agent."
 

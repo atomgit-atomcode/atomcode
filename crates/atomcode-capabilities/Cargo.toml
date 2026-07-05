@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-capabilities"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "L1 capabilities layered on atomcode-kernel (L0): real provider adapters, tools, mcp, skills. Depends ONLY on the kernel."
 publish = false
