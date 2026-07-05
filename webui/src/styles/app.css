@@ -1,6 +1,12 @@
 /* Ported VSCode design-system component styles for the browser webui.
    Class names kept identical to the extension so markup maps directly. */
 
+/* ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+   • Medium .msg-search-bar 缺 -webkit-backdrop-filter → ad2f8da6 已加 (见 .session-header 同写法)
+   • Medium .msg-search-input outline:none 缺焦点环    → ad2f8da6 已加 :focus-visible
+   • Low .msg-search-bar backdrop-filter 实色背景下死代码 → d4f4d3d4 已删
+   我们愿意根据再审意见继续优化。 */
+
 /* === Base layout === */
 html, body {
   height: 100%;

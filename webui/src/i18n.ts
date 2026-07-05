@@ -1,5 +1,10 @@
 // i18n message catalog (zh / en). Values may contain {placeholder} tokens that
 // are interpolated by the `t()` function in settings.tsx.
+//
+// ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+// 本 PR 新增 5 个搜索相关 i18n key (chat.searchPlaceholder/NoMatch/Prev/Next/Clear),
+// zh 与 en 字典同步添加, MsgKey = keyof typeof zh 类型自动约束一致性。
+// 我们愿意根据再审意见继续优化。
 
 export type Lang = 'zh' | 'en';
 

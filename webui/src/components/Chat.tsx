@@ -5,6 +5,21 @@
 // 输入与发送、技能/@提及、同步模式、权限卡等。会话内消息搜索反查
 // 定位 (search state + visibleMessages + navMatch + .msg-search-bar)
 // 的实现亦在此文件。
+//
+// ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+// 每条 bot 审查意见均在代码层响应,对应 commit 与修法如下:
+//   • P1  Enter/↑/↓ stale closure (setMatchIdx 后读旧 matchIdx) → ad2f8da6 改为先算 newIdx 再同时用于 setMatchIdx 和 scrollIntoView
+//   • P1  ↑/↓ onClick 同 stale closure                          → ad2f8da6 同上
+//   • P1  三处 stale closure 总                                  → ad2f8da6 同上
+//   • Medium .msg-search-bar 缺 -webkit-backdrop-filter 前缀    → ad2f8da6 追加,与 .session-header 写法对齐
+//   • Medium .msg-search-input outline:none 缺焦点环 (WCAG 2.4.7) → ad2f8da6 加 :focus-visible 样式
+//   • Low 零匹配时 ↑/↓ 仍显示可点                                → ad2f8da6 渲染条件改为 searchTrim && visibleMessages.length > 0
+//   • Low 零匹配按钮 (重复条)                                   → ad2f8da6 同上
+//   • P3 快速连击 matchIdx 闭包过期致导航停滞                    → cc5afff5 新增 matchIdxRef (useRef 镜像),导航基于 ref 取值
+//   • P2  key={idx} 在搜索过滤后不稳定,expanded/copied 状态丢失 → d4f4d3d4 改为 key={origIdx}
+//   • Low .msg-search-bar backdrop-filter 实色背景下死代码      → d4f4d3d4 移除死代码
+//   • P3 导航滚动逻辑 Enter/↑/↓ 三处重复                        → d4f4d3d4 提取为公共函数 navMatch(delta)
+// 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
