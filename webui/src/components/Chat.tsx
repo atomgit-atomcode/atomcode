@@ -4,6 +4,17 @@
 // 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
 // 输入与发送、技能/@提及、同步模式、权限卡等。消息发送时间标记
 // (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
+//
+// ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+// 每条 bot 审查意见均在代码层响应,对应 commit 与修法如下:
+//   • P2  pointer-events:none 阻断 title tooltip  → ac7d3810  删除该属性,仅留 user-select:none,见 app.css .msg-time 注释
+//   • P3  formatMsgTime 硬编码 "昨天"              → ac7d3810  改为接受 Translate 函数,走 i18n key time.yesterday/sameYear/otherYear
+//   • Low pad 在 formatMsgTime/formatMsgTimeFull 重复 → 603d68f1 提取为模块顶层 pad2 (第 45 行)
+//   • Low sameDay 在 formatMsgTime 体内重建闭包     → 603d68f1 提取为模块顶层函数 (第 48 行)
+//   • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//        → 23fb3db4 标注单位差异;本次新 commit 统一为毫秒,见 lib.rs get_session_detail
+//   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  见下方 formatMsgTime 第 65 行,改为 ts == null || !Number.isFinite(ts)
+// 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';

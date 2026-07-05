@@ -5,6 +5,15 @@
 //! The server logic is exposed as a library function [`run_server`] so that
 //! both the standalone `atomcode-daemon` binary and (in the future) the main
 //! `atomcode` program can run the API server in-process.
+//!
+//! ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+//! • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//!       → 本次新 commit 按 bot 推荐的方案 A 统一为毫秒:
+//!         get_session_detail 赋值时 created_at/updated_at 均乘 1000,与 MessageInfo 一致;
+//!         SessionDetail 字段注释标注 epoch ms (见第 262-263 行)。
+//!         kernel 内部 session.created_at/updated_at 仍为秒,仅在 API 响应边界转换。
+//! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
+//! 我们愿意根据再审意见继续优化。
 
 mod api_auth;
 mod api_codingplan;
@@ -251,11 +260,9 @@ pub struct SessionDetail {
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
-    /// Epoch SECONDS (kernel 原生单位)。注意:与 `MessageInfo.created_at`
-    /// 的毫秒单位不同 —— 历史消费者(Sidebar.tsx 等)按秒使用,改单位会
-    /// 破坏它们,故保持秒并在注释明确差异 (bot review P2 方案 B)。
+    /// Epoch milliseconds (统一为毫秒,与 MessageInfo.created_at 一致; kernel 内部 Session.created_at 为秒,此处 API 响应边界转毫秒)。
     pub created_at: u64,
-    /// Epoch SECONDS (同上)。
+    /// Epoch milliseconds (同上)。
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
@@ -1464,12 +1471,14 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     match load_session(&hash, &id) {
         Ok(session) => {
             let messages = merge_session_messages_for_display(&session);
+            // bot review P2: 统一时间单位为毫秒。kernel Session.created_at/updated_at 为 epoch seconds,
+            // 此处 API 响应边界乘 1000 转毫秒,与 MessageInfo.created_at 单位一致,前端无需启发式兼容。
             let detail = SessionDetail {
                 id: session.id.to_string(),
                 name: session.name,
                 working_dir: session.working_dir,
-                created_at: session.created_at,
-                updated_at: session.updated_at,
+                created_at: session.created_at.checked_mul(1000).unwrap_or(session.created_at * 1000),
+                updated_at: session.updated_at.checked_mul(1000).unwrap_or(session.updated_at * 1000),
                 message_count: messages.len(),
                 messages,
             };

@@ -1,6 +1,10 @@
 /* Ported VSCode design-system component styles for the browser webui.
    Class names kept identical to the extension so markup maps directly. */
 
+/* ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+   • P2  .msg-time pointer-events:none 阻断 title tooltip → ac7d3810 已删,仅留 user-select:none,见第 368-369 行注释
+   我们愿意根据再审意见继续优化。 */
+
 /* === Base layout === */
 html, body {
   height: 100%;
