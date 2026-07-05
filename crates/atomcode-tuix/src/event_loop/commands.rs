@@ -4156,7 +4156,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
 /// Does NOT persist — call `save_recent_dirs` after, or use `apply_cd`
 /// which does both.
 pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
-    dirs.retain(|d| d != &new);
+    // De-dup case-insensitively on case-insensitive filesystems so `C:\Users`
+    // and `C:\users` (same physical dir) don't both linger in the picker.
+    let key = atomcode_core::tool::path_case_key(&new);
+    dirs.retain(|d| atomcode_core::tool::path_case_key(d) != key);
     dirs.insert(0, new);
     dirs.truncate(MAX_RECENT_DIRS);
 }
@@ -4168,9 +4171,10 @@ pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
 ///
 /// De-dup matters because a legacy file can hold BOTH the `\\?\C:\…` verbatim
 /// form and the plain `C:\…` form of the same dir (cd'd on an old vs a fixed
-/// binary). Stripping collapses them to one path, but `push_recent_dir` only
-/// de-dups on WRITE — without de-duping on read the picker showed the same dir
-/// as two identical `~/atomcode` rows.
+/// binary), OR the same dir in two cases (`C:\Users` vs `C:\users`). Stripping
+/// collapses the verbatim form and the case-insensitive key collapses the case
+/// variants, so the picker shows one `~/atomcode` row, not two. `push_recent_dir`
+/// only de-dups on WRITE — this handles the READ side for pre-existing files.
 fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     contents
@@ -4178,7 +4182,7 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
         .filter(|l| !l.trim().is_empty())
         .map(PathBuf::from)
         .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
-        .filter(|p| seen.insert(p.clone()))
+        .filter(|p| seen.insert(atomcode_core::tool::path_case_key(p)))
         .collect()
 }
 
@@ -5402,6 +5406,31 @@ mod tests {
         assert_eq!(
             parse_recent_dirs("/a\n\n/b\n/a\n"),
             vec![PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+    }
+
+    // On case-insensitive filesystems (Windows/macOS) the SAME dir written in two
+    // cases (a launcher passing C:\users vs C:\Users) must collapse to one entry;
+    // first occurrence wins. See the reported bug: recent_dirs.txt held both.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn parse_recent_dirs_collapses_case_variants_on_case_insensitive_fs() {
+        assert_eq!(
+            parse_recent_dirs("/Users/danan\n/users/danan\n"),
+            vec![PathBuf::from("/Users/danan")],
+            "same dir in two cases must collapse, keeping the first"
+        );
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn push_recent_dir_dedups_case_variants_on_case_insensitive_fs() {
+        let mut dirs = vec![PathBuf::from("/Users/danan"), PathBuf::from("/other")];
+        push_recent_dir(&mut dirs, PathBuf::from("/users/danan"));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/users/danan"), PathBuf::from("/other")],
+            "re-pushing the same dir in a different case moves it to front, no dupe"
         );
     }
 

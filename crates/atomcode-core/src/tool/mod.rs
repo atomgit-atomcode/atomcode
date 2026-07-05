@@ -265,6 +265,36 @@ pub fn strip_verbatim_prefix_path(path: &std::path::Path) -> std::path::PathBuf 
     std::path::PathBuf::from(strip_verbatim_prefix(&path.to_string_lossy()).as_ref())
 }
 
+/// A platform-aware key for de-duplicating paths that refer to the same
+/// directory but differ only in case. Case-insensitive filesystems (Windows,
+/// macOS default) fold case; case-sensitive ones (Linux) keep the path verbatim,
+/// so `C:\Users` and `C:\users` collapse to one entry on Windows/macOS but
+/// distinct paths stay distinct on Linux.
+///
+/// This is a COMPARISON key only, never persisted — folding on macOS here does
+/// NOT touch the session-bucket hash (`session::hash_path`, which stays as-is to
+/// avoid orphaning existing sessions).
+///
+/// Mirrors `session::hash_path`'s string normalization (strip `\\?\`, unify
+/// separators, drop a trailing slash) so different spellings of one directory —
+/// `C:\Users`, `C:/Users`, `\\?\C:\Users\` — share a key, then case-folds on
+/// case-insensitive filesystems. `to_lowercase` (not ASCII) matches `hash_path`.
+pub fn path_case_key(path: &std::path::Path) -> String {
+    let s = strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
+    let mut s = s.replace('\\', "/");
+    if s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        s
+    }
+}
+
 fn is_windows_sensitive_path(path: &str) -> bool {
     let normalized = path.replace('/', "\\");
     let normalized = strip_verbatim_prefix(&normalized);
@@ -1441,6 +1471,27 @@ fn try_unwrap_once(value: serde_json::Value, expected: &[String]) -> UnwrapStep 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn path_case_key_folds_on_case_insensitive_fs_only() {
+        use std::path::Path;
+        let upper = path_case_key(Path::new("/Users/danan/Proj"));
+        let lower = path_case_key(Path::new("/users/danan/proj"));
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        assert_eq!(upper, lower, "case-insensitive FS: case variants share a key");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_ne!(upper, lower, "case-sensitive FS: case variants stay distinct");
+    }
+
+    #[test]
+    fn path_case_key_normalizes_separators_verbatim_and_trailing_slash() {
+        use std::path::Path;
+        // Same directory, different spellings → one key on every platform
+        // (separator + verbatim + trailing-slash normalization is not case-folding).
+        let a = path_case_key(Path::new(r"\\?\C:\proj\sub"));
+        let b = path_case_key(Path::new("C:/proj/sub/"));
+        assert_eq!(a, b, "verbatim/separator/trailing-slash spellings share a key");
+    }
 
     struct DummyTool;
 

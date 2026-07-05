@@ -361,11 +361,46 @@ fn resolve_initial_working_dir(
     cwd
 }
 
+/// Fold the working directory to its true on-disk case so the webui footer and
+/// newly-created sessions don't drift (e.g. a launcher passing `C:\users\danan`
+/// for a dir the history recorded as `C:\Users\danan`).
+///
+/// Windows-only, and guarded: it adopts the canonical form ONLY when that form
+/// maps to the SAME session bucket as the input. On Windows `hash_path` already
+/// lowercases, so a pure case-fold never changes the bucket — but a junction /
+/// symlink whose resolution WOULD change the bucket (and thus hide existing
+/// sessions) is left untouched. Other platforms keep the path verbatim to avoid
+/// symlink-resolution surprises and bucket orphaning (`hash_path` does not fold
+/// case off Windows).
+#[cfg(windows)]
+fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&p) {
+        Ok(c) => {
+            let c = atomcode_core::tool::strip_verbatim_prefix_path(&c);
+            if hash_path(&c) == hash_path(&p) {
+                c
+            } else {
+                p
+            }
+        }
+        Err(_) => p,
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    p
+}
+
 fn init_project_state(override_dir: Option<PathBuf>) -> ProjectState {
     let config_default = Config::load(&Config::default_path())
         .ok()
         .and_then(|c| c.default_workdir.map(PathBuf::from));
-    let path = resolve_initial_working_dir(override_dir, config_default, default_working_dir());
+    let path = normalize_working_dir_case(resolve_initial_working_dir(
+        override_dir,
+        config_default,
+        default_working_dir(),
+    ));
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1430,6 +1465,9 @@ async fn change_dir(
         // session cwd / hash, so a path that round-tripped through a
         // `canonicalize()`-based client still groups with the plain TUI form.
         let new_path = atomcode_core::tool::strip_verbatim_prefix_path(&new_path);
+        // Fold case to the on-disk truth (Windows, bucket-safe) so a `/cd` with a
+        // differently-cased path doesn't leave the footer/new sessions drifting.
+        let new_path = normalize_working_dir_case(new_path);
 
         // Update state
         let old_dir = project.working_dir.clone();
@@ -1440,8 +1478,12 @@ async fn change_dir(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "project".to_string());
 
-        // Update recent dirs (max 5, deduplicated)
-        project.recent_dirs.retain(|d| d != &new_path);
+        // Update recent dirs (max 5, deduplicated case-insensitively on
+        // case-insensitive filesystems so two cases of one dir don't both linger).
+        let new_key = atomcode_core::tool::path_case_key(&new_path);
+        project
+            .recent_dirs
+            .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
         project.recent_dirs.insert(0, new_path.clone());
         project.recent_dirs.truncate(5);
 
