@@ -1141,6 +1141,74 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
     Ok(all_sessions)
 }
 
+/// Resolve a (possibly short) session id to its full record by scanning bucket
+/// directory ENTRIES. The filename is `<id>.json`, so we match on the name and
+/// parse only the ONE file that matches — cheap, and UNCAPPED (unlike
+/// `/sessions`, which truncates to 50 across all projects and so can't locate an
+/// older session). Prefers an exact id match; otherwise the most-recent prefix
+/// match. `project_hash` is the physical bucket the file lives in.
+///
+/// Split from `resolve_session_by_id` so the scan can be unit-tested against a
+/// temp root without touching the real sessions directory.
+fn resolve_session_in_root(
+    sessions_root: &std::path::Path,
+    id_prefix: &str,
+) -> std::io::Result<Option<SessionMetaWithProject>> {
+    if id_prefix.is_empty() || !sessions_root.exists() {
+        return Ok(None);
+    }
+
+    let read_meta = |bucket: &str, path: &std::path::Path| -> Option<SessionMetaWithProject> {
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let json = std::fs::read_to_string(path).ok()?;
+        let session = serde_json::from_str::<Session>(&json).ok()?;
+        let mut meta = SessionMeta::from(&session);
+        meta.file_size = file_size;
+        Some(SessionMetaWithProject {
+            project_hash: bucket.to_string(),
+            meta,
+        })
+    };
+
+    let mut best: Option<SessionMetaWithProject> = None;
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let bucket = dir.file_name().unwrap().to_string_lossy().to_string();
+        for f in std::fs::read_dir(&dir)? {
+            let f = f?;
+            let path = f.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if stem == id_prefix {
+                        // Exact id wins immediately.
+                        if let Some(m) = read_meta(&bucket, &path) {
+                            return Ok(Some(m));
+                        }
+                    } else if stem.starts_with(id_prefix) {
+                        if let Some(m) = read_meta(&bucket, &path) {
+                            let newer = best
+                                .as_ref()
+                                .map_or(true, |b| m.meta.updated_at > b.meta.updated_at);
+                            if newer {
+                                best = Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaWithProject>> {
+    resolve_session_in_root(&SessionManager::sessions_root_dir(), id_prefix)
+}
+
 /// Load a specific session
 fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
     let path = SessionManager::sessions_root_dir()
@@ -1446,6 +1514,21 @@ async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// GET /sessions/resolve/:id - Resolve a (short or full) session id to its full
+/// record across all projects. Backs the webui's URL-restore, which carries
+/// only a short id and must find which project bucket owns it without the
+/// 50-session cap of `/sessions`.
+async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
+    match resolve_session_by_id(&id) {
+        Ok(Some(s)) => Json(s).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to resolve session: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match load_session(&hash, &id) {
@@ -1679,8 +1762,18 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
                             if session.messages.is_empty() {
                                 continue;
                             }
-                            // Match keyword in session name (case-insensitive)
-                            if session.name.to_lowercase().contains(&keyword_lower) {
+                            // Match on name / working dir (substring) or id (prefix),
+                            // mirroring the webui's previous client-side filter so
+                            // moving search server-side does not drop the ability to
+                            // find a session by its directory or (short) id.
+                            let matches = session.name.to_lowercase().contains(&keyword_lower)
+                                || session
+                                    .working_dir
+                                    .to_string_lossy()
+                                    .to_lowercase()
+                                    .contains(&keyword_lower)
+                                || session.id.as_str().to_lowercase().starts_with(&keyword_lower);
+                            if matches {
                                 let mut meta = SessionMeta::from(&session);
                                 meta.file_size = file_size;
                                 results.push(SessionMetaWithProject {
@@ -4390,6 +4483,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Session APIs
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/search", get(search_sessions))
+        .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
         .route("/cd", post(change_dir))
@@ -4677,7 +4771,46 @@ mod tests {
         }
     }
 
-    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发，而不是 error。
+    // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions
+    // 的 50 条上限影响)。resolve_session_in_root 按文件名前缀扫桶:短前缀命中、
+    // 完整 id 精确命中、未知 id 返回 None,并回带物理桶作为 project_hash。
+    #[test]
+    fn resolve_session_by_short_and_full_id_across_buckets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |bucket: &str, wd: &str| -> atomcode_core::session::Session {
+            std::fs::create_dir_all(root.join(bucket)).unwrap();
+            let s = atomcode_core::session::Session::new(std::path::PathBuf::from(wd));
+            std::fs::write(
+                root.join(bucket).join(format!("{}.json", s.id.as_str())),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+            s
+        };
+        // A decoy in a different bucket + the real target.
+        let _decoy = mk("bucket_decoy_0000", "/proj/decoy");
+        let target = mk("bucket_target_111", "/proj/target");
+
+        // Short prefix resolves to the target and reports its physical bucket.
+        let short = &target.id.as_str()[..8];
+        let found = resolve_session_in_root(root, short)
+            .unwrap()
+            .expect("short id should resolve");
+        assert_eq!(found.project_hash, "bucket_target_111");
+        assert_eq!(found.meta.id.as_str(), target.id.as_str());
+
+        // Full id resolves exactly.
+        let found_full = resolve_session_in_root(root, target.id.as_str())
+            .unwrap()
+            .expect("full id should resolve");
+        assert_eq!(found_full.meta.id.as_str(), target.id.as_str());
+
+        // Unknown id → None.
+        assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
     // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，
     // 被前端染成红色「[错误: …]」并塞进回复气泡。
     #[test]

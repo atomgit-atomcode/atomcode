@@ -208,8 +208,48 @@ export interface SessionDetail {
   messages: SessionMessage[];
 }
 
+// NOTE: `/sessions` caps at the 50 most-recent sessions ACROSS ALL projects.
+// For a project's full history use listProjectSessions; for finding a session
+// anywhere use searchSessions. This capped list is only for cross-project
+// lookups where 50 is enough (e.g. URL-restore of a recent session).
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await fetch('/sessions', { headers: authHeaders() });
+  return resp.json();
+}
+
+// A single project's sessions, UNCAPPED (reads one bucket directly). This is
+// what the sidebar shows — the global `/sessions` cap would otherwise starve a
+// project of its own history when many other projects have newer sessions.
+// The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
+// stamp it back on for the client's project-scoped dedup/filter.
+export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+  const resp = await fetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`list project sessions failed: ${resp.status}`);
+  const list: SessionMeta[] = await resp.json();
+  return list.map((m) => ({ ...m, project_hash: projectHash }));
+}
+
+// Cross-project session search by name, UNCAPPED. Backs the search modal so it
+// can find a session in ANY project (the sidebar list itself is per-project).
+export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
+  const resp = await fetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`search sessions failed: ${resp.status}`);
+  return resp.json();
+}
+
+// Resolve a (short) session id to its full record across all projects, UNCAPPED.
+// URL-restore only has a short id from the address bar; the capped `/sessions`
+// can't locate an older session. Returns null when nothing matches.
+export async function resolveSession(id: string): Promise<SessionMetaWithProject | null> {
+  const resp = await fetch(`/sessions/resolve/${encodeURIComponent(id)}`, {
+    headers: authHeaders(),
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`resolve session failed: ${resp.status}`);
   return resp.json();
 }
 

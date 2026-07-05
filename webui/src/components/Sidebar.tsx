@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, getSkills, getMcpStatus, getSession, SkillInfo, McpStatusInfo, SessionMetaWithProject } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, getSession, SkillInfo, McpStatusInfo, SessionMetaWithProject } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -315,6 +315,11 @@ export function Sidebar({
   // family as the rename/delete dialogs), closes on backdrop click / Escape.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // Cross-project search results (the sidebar list itself is per-project, so the
+  // search modal hits the dedicated all-projects endpoint instead of filtering
+  // the loaded list — which would only ever see the current project).
+  const [searchResults, setSearchResults] = useState<SessionMetaWithProject[]>([]);
+  const [searchBusy, setSearchBusy] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
@@ -325,10 +330,24 @@ export function Sidebar({
   const itemMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
 
+  // Guards against out-of-order load responses: switching project sets
+  // projectHash '' → bucket, firing two loads (the capped fallback, then the
+  // per-project fetch). The fallback reads every project and is SLOWER, so
+  // without this it can land last and clobber the correct per-project list with
+  // the capped one. Only the newest load's response is applied.
+  const loadEpochRef = useRef(0);
   function loadSessions() {
+    const epoch = ++loadEpochRef.current;
     setLoading(true);
-    listSessions()
+    // The sidebar shows ONE project's full history. Fetch that bucket directly
+    // (uncapped) once we know its hash; `/sessions` caps at 50 across ALL
+    // projects, which starves a busy project of its own older sessions. Before
+    // the hash is known (pre-/project), fall back to the capped cross-project
+    // list so something shows immediately.
+    const load = projectHash ? listProjectSessions(projectHash) : listSessions();
+    load
       .then((list) => {
+        if (epoch !== loadEpochRef.current) return; // superseded by a newer load
         setSessions(list);
         // 回合落盘后这次刷新会带出已自动命名的当前会话 → 回传给 App 更新标题头。
         if (activeSessionId) {
@@ -336,14 +355,18 @@ export function Sidebar({
           if (found) onActiveSessionMeta?.(found);
         }
       })
-      .catch(() => setSessions([]))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (epoch === loadEpochRef.current) setSessions([]);
+      })
+      .finally(() => {
+        if (epoch === loadEpochRef.current) setLoading(false);
+      });
   }
 
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey]);
+  }, [reloadKey, projectHash]);
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -622,10 +645,47 @@ export function Sidebar({
     return () => document.removeEventListener('keydown', onKey);
   }, [searchOpen]);
 
-  // Focus the input each time the dialog opens.
+  // Focus the input on open; reset query/results on close so a reopen starts
+  // fresh instead of flashing the previous search's stale results.
   useEffect(() => {
-    if (searchOpen) searchInputRef.current?.focus();
+    if (searchOpen) {
+      searchInputRef.current?.focus();
+    } else {
+      setSearchQuery('');
+      setSearchResults([]);
+      setSearchBusy(false);
+    }
   }, [searchOpen]);
+
+  // Cross-project search: debounce the query and hit the all-projects endpoint.
+  // Empty query → clear (the modal then shows the current project's list).
+  useEffect(() => {
+    if (!searchOpen) return;
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResults([]);
+      setSearchBusy(false);
+      return;
+    }
+    setSearchBusy(true);
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      searchSessions(q)
+        .then((r) => {
+          if (!cancelled) setSearchResults(r);
+        })
+        .catch(() => {
+          if (!cancelled) setSearchResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setSearchBusy(false);
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [searchQuery, searchOpen]);
 
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
@@ -1093,15 +1153,13 @@ export function Sidebar({
             </div>
             <div class="search-results">
               {(() => {
-                const q = searchQuery.trim().toLowerCase();
-                const results = q
-                  ? sessions.filter(
-                      (s) =>
-                        (s.name || '').toLowerCase().includes(q) ||
-                        s.id.toLowerCase().startsWith(q) ||
-                        (s.working_dir || '').toLowerCase().includes(q),
-                    )
-                  : sessions;
+                const q = searchQuery.trim();
+                // Non-empty query → cross-project results from the endpoint;
+                // empty → the current project's loaded list (recent).
+                const results = q ? searchResults : sessions;
+                if (q && searchBusy && results.length === 0) {
+                  return <div class="search-empty">{t('sidebar.searching')}</div>;
+                }
                 if (results.length === 0) {
                   return <div class="search-empty">{t('sidebar.noMatch')}</div>;
                 }

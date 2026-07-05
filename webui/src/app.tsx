@@ -9,7 +9,7 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, listSessions, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
@@ -170,25 +170,20 @@ export function App() {
     window.history.replaceState(null, '', url.pathname + url.search + url.hash);
   }, [sessionId]);
 
-  // 刷新后用 URL 里的短 id 去会话列表按前缀还原成完整记录（完整 id + project_hash
-  // + working_dir），再交给 Chat 加载历史。仅在挂载时执行一次。
+  // 刷新后用 URL 里的短 id 还原成完整记录（完整 id + project_hash + working_dir），
+  // 再交给 Chat 加载历史。用 resolveSession（跨所有桶按 id 定位，不受 /sessions 的
+  // 50 条上限影响），否则较旧的会话刷新后会找不到、回落到新建页。仅在挂载时执行一次。
   useEffect(() => {
     const urlSid = urlSessionRef.current;
     if (!urlSid) return;
     let cancelled = false;
-    listSessions()
-      .then((list) => {
-        if (cancelled) return;
-        // 兼容历史上写入的完整 id：优先精确匹配，否则按前缀匹配。
-        const found =
-          list.find((s) => s.id === urlSid) ??
-          list.find((s) => s.id.startsWith(urlSid));
-        if (found) {
-          setSessionId(found.id);
-          setActiveSession(found);
-          if (found.working_dir) setCwd(found.working_dir);
-          if (found.project_hash) setProjectHash(found.project_hash);
-        }
+    resolveSession(urlSid)
+      .then((found) => {
+        if (cancelled || !found) return;
+        setSessionId(found.id);
+        setActiveSession(found);
+        if (found.working_dir) setCwd(found.working_dir);
+        if (found.project_hash) setProjectHash(found.project_hash);
       })
       .catch(() => {
         /* 找不到就维持现状（回到新建页） */
