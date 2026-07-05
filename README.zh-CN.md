@@ -190,6 +190,28 @@ brew install --cask atomcode
 - Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
 
+### 权限 —— 不要用 `sudo` 启动
+
+请用**普通用户**运行 AtomCode，切勿 `sudo`。AtomCode 把配置、会话、日志都放在
+`~/.atomcode`；一旦用 root 跑过一次，就会在那里留下 root 属主的文件，之后非 root
+启动会在引擎初始化阶段报错：
+
+```
+engine v2 assemble failed: Permission denied (os error 13)
+```
+
+（提示里可能是 `prepare` 而非 `assemble`——同一个原因。）遇到这种情况，把属主收回
+并停止使用 `sudo`：
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # 不要再加 sudo
+```
+
+在 Linux 客户机上，工作目录若在 VirtualBox 共享文件夹（`/media/sf_*`，属主
+`root:vboxsf`）也会导致权限错误——用 `sudo usermod -aG vboxsf "$USER"` 把自己加进
+该组（重新登录后生效），而不是用 `sudo`。
+
 ### 卸载
 
 移除 AtomCode 及（可选）其数据：

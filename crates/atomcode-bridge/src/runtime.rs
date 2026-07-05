@@ -301,7 +301,7 @@ impl Bridge {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 prepare failed: {e}"),
+                    error: engine_init_error_message("prepare", &e),
                     snapshot: ConversationSnapshot::default(),
                 });
                 // prepare() failed — we can't build a Bridge at all (no parts).
@@ -325,7 +325,7 @@ impl Bridge {
                 Ok(a) => (a.spawn(), false),
                 Err(e) => {
                     let _ = ev_tx.send(CoreEv::Error {
-                        error: format!("engine v2 assemble failed: {e}"),
+                        error: engine_init_error_message("assemble", &e),
                         snapshot: ConversationSnapshot::default(),
                     });
                     (Self::noop_handle(), true)
@@ -2043,6 +2043,32 @@ fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
 }
 
+/// Build the user-facing message for an engine-init (`prepare` / `assemble`)
+/// `io::Error`. A bare `Permission denied (os error 13)` gives the user nothing
+/// to act on; on Unix the near-universal cause is a `~/.atomcode` tree left
+/// root-owned by a prior `sudo atomcode` run — root creates config/session files
+/// the non-root user then can't read, so every later non-sudo start fails at the
+/// first disk touch (the session-snapshot load in `assemble`). Append the fix.
+///
+/// Unix-only: the `sudo`/`chown` remedy is meaningless on Windows (no `sudo`, no
+/// root-ownership trap), so there — and for any non-permission error — the
+/// message passes through unchanged. `\n\n` separators so the hint renders as its
+/// own paragraph both in the TUI and the webui (whose Markdown collapses single
+/// newlines to spaces).
+fn engine_init_error_message(stage: &str, e: &std::io::Error) -> String {
+    let base = format!("engine v2 {stage} failed: {e}");
+    if cfg!(unix) && e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{base}\n\n~/.atomcode is not accessible — this usually means a prior `sudo atomcode` \
+             left it root-owned. Fix: run `sudo chown -R \"$(id -un):$(id -gn)\" ~/.atomcode`, \
+             then start WITHOUT sudo.\n\n（~/.atomcode 无权访问，通常是之前用过 sudo atomcode 导致属主变 \
+             root。修复：sudo chown -R \"$(id -un):$(id -gn)\" ~/.atomcode，然后不要再用 sudo 启动。）"
+        )
+    } else {
+        base
+    }
+}
+
 /// Decide how a `build_provider` failure should surface, given whether the user
 /// is logged in. Pure over `logged_in` so the branch is unit-testable without
 /// touching `auth.toml`; the wrapper [`provider_init_event`] supplies the real
@@ -2489,6 +2515,31 @@ mod undo_tests {
         assert_eq!(default_max_tokens(64_000), 16_000); // in range
         assert_eq!(default_max_tokens(128_000), 16_384); // 32_000 → ceil
         assert_eq!(default_max_tokens(1_000_000), 16_384); // huge window → ceil
+    }
+
+    #[test]
+    #[cfg(unix)] // the sudo/chown hint is Unix-only (gated by `cfg!(unix)`)
+    fn engine_init_message_augments_permission_denied() {
+        // A bare "Permission denied" is unactionable; the near-universal cause is a
+        // root-owned ~/.atomcode from a prior `sudo atomcode`, so surface the chown fix.
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        let msg = super::engine_init_error_message("assemble", &e);
+        assert!(msg.contains("engine v2 assemble failed"), "keeps the base line: {msg}");
+        assert!(msg.contains("~/.atomcode"), "names the offending dir: {msg}");
+        assert!(msg.contains("chown -R"), "includes the actionable fix: {msg}");
+        assert!(msg.contains("sudo"), "names the sudo cause: {msg}");
+    }
+
+    #[test]
+    fn engine_init_message_passthrough_non_permission() {
+        // Non-permission errors must NOT gain the sudo/chown hint.
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let msg = super::engine_init_error_message("prepare", &e);
+        assert_eq!(msg, "engine v2 prepare failed: not found");
+        assert!(!msg.contains("chown"), "no hint for non-permission errors: {msg}");
     }
 
     #[test]

@@ -191,6 +191,29 @@ brew install --cask atomcode
 - Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
 - An API key from any supported provider (or an AtomGit account for `/login`)
 
+### Permissions — don't run with `sudo`
+
+Run AtomCode as your **normal user**, never with `sudo`. AtomCode keeps its
+config, sessions, and logs under `~/.atomcode`; running once as root leaves
+root-owned files there, so every later non-root start fails at engine init with:
+
+```
+engine v2 assemble failed: Permission denied (os error 13)
+```
+
+(the message may say `prepare` instead of `assemble` — same cause.) If you hit
+this, reclaim ownership and stop using `sudo`:
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # start WITHOUT sudo
+```
+
+On a Linux guest, a working directory on a VirtualBox shared folder
+(`/media/sf_*`, owned by `root:vboxsf`) can also trigger permission errors — add
+yourself to the group with `sudo usermod -aG vboxsf "$USER"` and re-login, rather
+than using `sudo`.
+
 ### Uninstall
 
 Remove AtomCode and (optionally) its data:
