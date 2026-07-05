@@ -114,7 +114,12 @@ const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
 /// cache-prefix rewrite) instead of letting context climb until overflow. Auto only
 /// fires at all once `compact_threshold` (default 0.7) is crossed; this is the
 /// SECOND, higher gate that decides stub-vs-summarize.
-const AUTO_DRAIN_UTILIZATION: f32 = 0.85;
+///
+/// Set BELOW 0.80 on purpose: models (esp. GLM/DeepSeek) start telling the user
+/// to "开启新对话 / start a new conversation" once they perceive context as full
+/// (~80%). Draining+summarizing a bit earlier keeps real usage down BEFORE that
+/// nag zone, so the automatic compaction — not the user — manages context.
+const AUTO_DRAIN_UTILIZATION: f32 = 0.78;
 
 /// Hard ceiling on a generated summary. A runaway model could emit an enormous summary that
 /// still passes `apply_plan`'s net-loss guard (it's smaller than the drained span) yet bloats
@@ -600,13 +605,16 @@ mod tests {
         Message::assistant("", vec![ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }])
     }
 
+    // A generic AUTO view on the cheap stub path: utilization sits clearly BELOW
+    // AUTO_DRAIN_UTILIZATION so `plan` stubs (does not drain+summarize). Tests that
+    // want the drain path use `auto_view(_, _, high)` instead.
     fn view<'a>(msgs: &'a [Message], sacred_floor: usize) -> CompactionView<'a> {
         CompactionView {
             messages: msgs,
-            trigger: CompactTrigger::Auto { utilization: 0.8 },
+            trigger: CompactTrigger::Auto { utilization: 0.5 },
             ctx_window: 1000,
-            used_tokens: 800,
-            utilization: 0.8,
+            used_tokens: 500,
+            utilization: 0.5,
             sacred_floor,
         }
     }
@@ -1110,11 +1118,40 @@ mod tests {
         let floor = conv.sacred_floor();
         let strat =
             OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
-        let v = auto_view(&conv.messages, floor, 0.8);
+        // Below AUTO_DRAIN_UTILIZATION (0.78): still the cheap stub.
+        let v = auto_view(&conv.messages, floor, 0.72);
         assert!(!strat.will_summarize(&v), "moderate auto must NOT announce a summarize");
         let plan = strat.plan(&v).await;
         assert!(plan.summary.is_none(), "moderate auto = no LLM summary");
         assert_eq!(plan.drain_to, 0, "moderate auto = no drain (stub only)");
+    }
+
+    /// At ~80% — the zone where models start nagging to "start a new conversation" —
+    /// Auto must ESCALATE to a real drain+summary (AUTO_DRAIN_UTILIZATION < 0.80),
+    /// so context is reduced before the model panics. Regression guard for lowering
+    /// the drain gate below 0.80.
+    #[tokio::test]
+    async fn auto_at_eighty_percent_drains_before_the_nag_zone() {
+        let msgs = vec![
+            Message::system("p"),
+            Message::user("u1"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("bash out"), false),
+            Message::assistant("a1", vec![]),
+            Message::user("u2"),
+            Message::assistant("a2", vec![]),
+            Message::user("u3-active"),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+        let strat =
+            OverflowCompaction::new(StubCompaction::default(), Some(Arc::new(CannedSummaryProvider)));
+        let v = auto_view(&conv.messages, floor, 0.8);
+        assert!(
+            strat.will_summarize(&v),
+            "at ~80% auto must escalate to drain+summary, not just stub"
+        );
     }
 
     /// Anti-thrash: when the bulk is the sacred-floor-protected FIRST user message

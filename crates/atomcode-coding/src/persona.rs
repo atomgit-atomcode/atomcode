@@ -4,12 +4,12 @@
 //! Differences from production (deliberate):
 //! - The model name is a parameter (production injects it separately in `prompt.rs`).
 //! - Production's `## CONTEXT:` section promised "your conversation is not limited by the
-//!   context window" — we still DROP that claim. Compaction HAS landed
-//!   ([`StubCompaction`](atomcode_capabilities::compaction::StubCompaction): old tool
-//!   results are stubbed at the task boundary), but it is stub-only — no summarize /
-//!   emergency tier yet — so the unconditional "unlimited context" promise would still
-//!   overstate it. The model-facing implication is already covered honestly under
-//!   `## TOOLS:` ("Tool results may be truncated or condensed … re-read … for detail").
+//!   context window" — we still DROP that exact (over-stated) claim. Instead
+//!   `## CONTEXT MANAGEMENT:` tells the model, honestly, that context is compacted
+//!   automatically (tool results stubbed, then summarized once utilization is high —
+//!   [`compaction`](atomcode_capabilities::compaction)) and that it must NOT nag the user
+//!   to start a new conversation / clear history. Without this, GLM/DeepSeek proactively
+//!   suggest "开启新对话" around ~80% context, which reads as a product defect.
 
 /// Build the coding system prompt for `model`. The identity line carries the model name
 /// so the agent self-identifies correctly; the rest is the language-agnostic coding
@@ -188,6 +188,9 @@ Solve tasks efficiently, minimizing round-trips. Act decisively — go straight 
 
 ## SYSTEM REMINDERS:
 Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
+
+## CONTEXT MANAGEMENT:
+The context window is managed for you: as it fills, older turns are automatically compacted (tool results are stubbed, then summarized). Do NOT tell the user to start a new conversation, clear the history, or that you are \"running low on context\" in order to manage it — that is handled automatically. Keep working; if some earlier detail was condensed and you need it, re-read the source.
 
 ## WORKFLOW:
 For simple changes (rename, one-line fix, config tweak): just do it — search, edit, verify, done.
@@ -478,7 +481,8 @@ mod tests {
 
     #[test]
     fn persona_drops_compaction_claim() {
-        // MVP has no compaction — must NOT promise unlimited context.
+        // Still must NOT make the over-stated "unlimited context" promise, and must
+        // not reuse production's `## CONTEXT:` header (we use `## CONTEXT MANAGEMENT:`).
         let p = coding_persona("m", true);
         assert!(
             !p.contains("not limited by the context window"),
@@ -486,7 +490,20 @@ mod tests {
         );
         assert!(
             !p.contains("## CONTEXT:"),
-            "CONTEXT section dropped for MVP honesty"
+            "production's over-stated CONTEXT section stays dropped"
+        );
+    }
+
+    #[test]
+    fn persona_tells_model_not_to_nag_about_new_conversation() {
+        // Regression: without this, GLM/DeepSeek suggest "start a new conversation"
+        // around ~80% context. The persona must own context management so the model
+        // doesn't push that onto the user.
+        let p = coding_persona("m", true);
+        assert!(p.contains("## CONTEXT MANAGEMENT:"), "context-management section present");
+        assert!(
+            p.contains("start a new conversation"),
+            "must explicitly tell the model not to suggest a new conversation"
         );
     }
 
