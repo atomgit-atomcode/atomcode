@@ -186,17 +186,29 @@ several. Subagents run in parallel and cannot themselves dispatch."
         }
 
         // Collect all child results (order determined by completion, then sorted by label).
+        // Outer JoinErrors (panic/abort of the spawn wrapper) are captured immediately
+        // so they remain visible to the model rather than being silently dropped.
         let mut collected: Vec<(String, String, Outcome)> = Vec::new();
+        let mut crash_blocks: Vec<String> = Vec::new();
         while let Some(res) = set.join_next().await {
-            if let Ok(tuple) = res {
-                collected.push(tuple);
+            match res {
+                Ok(tuple) => collected.push(tuple),
+                Err(join_err) => {
+                    crash_blocks.push(render_task_block(
+                        "unknown",
+                        "crashed subtask",
+                        "error",
+                        "task_error",
+                        &format!("subtask panicked or was aborted: {join_err}"),
+                    ));
+                }
             }
         }
         // Sort by label for deterministic output regardless of scheduling order.
         collected.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut blocks: Vec<String> = Vec::new();
-        let mut any_error = false;
+        let mut any_error = !crash_blocks.is_empty();
         for (label, desc, outcome) in collected {
             let is_err = outcome.stop != StopReason::Stopped;
             any_error |= is_err;
@@ -224,6 +236,8 @@ several. Subagents run in parallel and cannot themselves dispatch."
             };
             blocks.push(render_task_block(&label, &desc, state, tag, &body));
         }
+        // Crash blocks (outer JoinError) appended after sorted normal blocks.
+        blocks.extend(crash_blocks);
 
         ToolResult {
             call_id: String::new(),
