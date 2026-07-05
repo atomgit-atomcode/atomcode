@@ -7677,7 +7677,22 @@ pub(super) fn handle_plugin_job_event(
                 ));
                 renderer.flush();
             }
-            renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
+            // Startup marketplace auto-update runs in the background and is
+            // NON-FATAL (a failed pull — stale repo, offline, git safe.directory
+            // ownership mismatch — never affects chat). Surface it as a CALM
+            // one-line yellow Warning (first line only, dropping the multi-line
+            // git stderr / "To add an exception…" block) instead of a red
+            // multi-line "错误" dump that reads like a crash. User-initiated plugin
+            // ops keep the red Error so genuine failures stay prominent.
+            if op == "auto-update" {
+                let detail = msg.lines().next().unwrap_or(msg.as_str());
+                renderer.render(UiLine::Warning(
+                    crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })
+                        .into_owned(),
+                ));
+            } else {
+                renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
+            }
         }
         PluginJobEvent::GitNotFound => {
             // Not an error — a friendly hint to guide the user to install git.

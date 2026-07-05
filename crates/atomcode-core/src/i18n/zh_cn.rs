@@ -707,6 +707,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("正在更新 marketplace `{name}`…").into(),
         Msg::PluginMarketplaceListFailed { error } =>
             format!("列出 marketplace 失败：{error}").into(),
+        Msg::PluginAutoUpdateSkipped { detail } =>
+            format!("插件市场自动更新已跳过（不影响对话）：{detail}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -1097,6 +1099,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("模型初始化失败：{detail}").into(),
         Msg::ProviderInitNeedsLogin =>
             "尚未登录，模型暂不可用；运行 /login 后可继续对话。".into(),
+        Msg::ProviderInitSourceBuild =>
+            "当前为源码构建，无法使用 AtomGit 免费网关。请用 /provider 配置一个自带 api_key \
+             的模型（如 DeepSeek 官方 / GLM / OpenAI），或改用官方发布版。".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\

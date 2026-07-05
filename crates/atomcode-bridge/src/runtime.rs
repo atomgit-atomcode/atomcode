@@ -2069,18 +2069,52 @@ fn engine_init_error_message(stage: &str, e: &std::io::Error) -> String {
     }
 }
 
+/// A source (open-source) build cannot authenticate to the AtomGit gateway: the
+/// request-signer crate is a placeholder overlaid only by the official-release
+/// build pipeline. Carried as a typed error so `provider_init_event_for` can
+/// downcast it and surface a calm source-build advisory rather than a red
+/// "模型初始化失败" — no login/config change on THIS build fixes it. Display
+/// keeps the detailed gateway message for any plain error-string consumer.
+#[derive(Debug)]
+struct SourceBuildGatewayUnsupported {
+    base_url: String,
+}
+
+impl std::fmt::Display for SourceBuildGatewayUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+                base_url: &self.base_url,
+            })
+        )
+    }
+}
+
+impl std::error::Error for SourceBuildGatewayUnsupported {}
+
 /// Decide how a `build_provider` failure should surface, given whether the user
 /// is logged in. Pure over `logged_in` so the branch is unit-testable without
 /// touching `auth.toml`; the wrapper [`provider_init_event`] supplies the real
 /// login state.
 ///
-/// Not-logged-in is the EXPECTED state right after `/logout` (and on a fresh
-/// launch before `/login`): the gateway signer simply has no token, so the red
-/// "模型初始化失败 / provider init failed" line is noise that looks like a crash.
-/// Surface a calm, localized "run /login" advisory (yellow `Warning`) instead.
-/// A genuine init failure WHILE logged in stays a red `Error`. Keying on
-/// `is_logged_in()` rather than string-matching the signer error keeps this robust.
+/// Three cases, calmest-first:
+///   * Source build hitting the AtomGit gateway → a build limitation, not a
+///     crash and unfixable by /login. Calm yellow advisory pointing at
+///     `/provider` (own api_key) or the official build.
+///   * Not-logged-in (EXPECTED right after `/logout` / before `/login`): the
+///     signer has no token yet → calm "run /login" advisory. The red
+///     "模型初始化失败" line here is noise that looks like a crash.
+///   * A genuine init failure WHILE logged in → stays a red `Error`.
+/// Keying on a typed error / `is_logged_in()` rather than string-matching keeps
+/// this robust across i18n.
 fn provider_init_event_for(logged_in: bool, e: &anyhow::Error) -> CoreEv {
+    if e.downcast_ref::<SourceBuildGatewayUnsupported>().is_some() {
+        return CoreEv::Warning(
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitSourceBuild).into_owned(),
+        );
+    }
     if logged_in {
         CoreEv::Error {
             error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
@@ -2171,12 +2205,14 @@ fn build_provider(
             // feature). Open-source builds have none → fail fast with an actionable message.
             if crypto::is_atomgit_gateway(&cfg.base_url) {
                 if !crypto::signer_available() {
-                    anyhow::bail!(
-                        "{}",
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
-                            base_url: &cfg.base_url,
-                        })
-                    );
+                    // Typed error (not a bare string) so `provider_init_event_for`
+                    // can downcast and surface a CALM source-build advisory instead
+                    // of a red "模型初始化失败" — no /login can fix a placeholder
+                    // signer, so a crash-looking red line is misleading.
+                    return Err(SourceBuildGatewayUnsupported {
+                        base_url: cfg.base_url.clone(),
+                    }
+                    .into());
                 }
                 pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
             }
@@ -2316,7 +2352,25 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod provider_init_event_tests {
-    use super::{provider_init_event_for, CoreEv};
+    use super::{provider_init_event_for, CoreEv, SourceBuildGatewayUnsupported};
+
+    #[test]
+    fn source_build_gateway_is_calm_warning_even_when_logged_in() {
+        // A source build can never auth to the AtomGit gateway (placeholder
+        // signer) — no /login fixes it. Must be a CALM Warning pointing at
+        // /provider or the official build, NOT the red "模型初始化失败", even
+        // when logged_in (the case the user hit).
+        let e: anyhow::Error = SourceBuildGatewayUnsupported {
+            base_url: "https://llm-api.atomgit.com/v1".into(),
+        }
+        .into();
+        match provider_init_event_for(true, &e) {
+            CoreEv::Warning(msg) => {
+                assert!(msg.contains("/provider"), "must point at /provider: {msg}");
+            }
+            other => panic!("source-build gateway must be a calm Warning, got {other:?}"),
+        }
+    }
 
     #[test]
     fn not_logged_in_yields_calm_login_advisory_not_red_error() {

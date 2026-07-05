@@ -720,6 +720,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("updating marketplace `{name}`…").into(),
         Msg::PluginMarketplaceListFailed { error } =>
             format!("list marketplaces: {error}").into(),
+        Msg::PluginAutoUpdateSkipped { detail } =>
+            format!("Marketplace auto-update skipped (chat unaffected): {detail}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -1116,6 +1118,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("provider init failed: {detail}").into(),
         Msg::ProviderInitNeedsLogin =>
             "Not signed in — model unavailable. Run /login to continue.".into(),
+        Msg::ProviderInitSourceBuild =>
+            "This is a source build — the AtomGit free gateway isn't available. Use /provider to \
+             configure a model with your own api_key (e.g. DeepSeek / GLM / OpenAI), or switch to \
+             an official release build.".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url '{base_url}' is an AtomGit gateway this build can't \

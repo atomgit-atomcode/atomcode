@@ -501,6 +501,10 @@ pub enum Msg<'a> {
     PluginMarketplaceRemoveFailed { error: &'a str },
     PluginMarketplaceUpdating { name: &'a str },
     PluginMarketplaceListFailed { error: &'a str },
+    /// Calm one-line advisory (yellow) for a NON-FATAL startup marketplace
+    /// auto-update failure. `detail` is the first line of the underlying error.
+    /// Replaces the red multi-line git-stderr dump that reads like a crash.
+    PluginAutoUpdateSkipped { detail: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
     PluginInstallingByName { plugin: &'a str },
     PluginAlreadyInstalled { id: &'a str },
@@ -1014,6 +1018,11 @@ pub enum Msg<'a> {
     /// user isn't logged in — the expected state right after `/logout` or on a
     /// fresh launch before `/login`. Replaces the alarming red init-failure line.
     ProviderInitNeedsLogin,
+    /// Calm advisory (yellow) for a SOURCE (open-source) build whose default
+    /// provider is the AtomGit gateway: the request-signer is a placeholder, so
+    /// no /login fixes it. Points at `/provider` (own api_key) or the official
+    /// build. Replaces the red "模型初始化失败" that reads like a crash.
+    ProviderInitSourceBuild,
     /// The configured `base_url` is an AtomGit gateway that this (open-source)
     /// build can't sign requests for. Points the user at the official binary
     /// or a plain OpenAI-compatible endpoint.
