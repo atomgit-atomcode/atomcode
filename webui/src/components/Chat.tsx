@@ -700,7 +700,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
-      const loaded = sessionMessagesToDisplay(e.messages);
+      // bot review P2: live 快照路径后端 MessageInfo.created_at 固为 None
+      // (live_api.rs 的 From impl 未注入),与 /chat 历史加载路径不一致。
+      // 此处在前端注入 Date.now() 作为每条快照消息的 ts,让快照消息也显示时间标签,
+      // 与历史加载路径行为一致 (后者用 session.updated_at * 1000 近似)。
+      const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       setMessages(loaded.length > 0 ? loaded : []);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。

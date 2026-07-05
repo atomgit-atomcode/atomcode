@@ -439,8 +439,8 @@ pub struct MessageInfo {
     /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
     /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
     /// keeps old daemons/clients interoperating when the field is absent.
-    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 的秒
-    /// 不同 (见 SessionDetail 注释, bot review P2)。
+    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
+    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
 }
@@ -1473,6 +1473,9 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
             let messages = merge_session_messages_for_display(&session);
             // bot review P2: 统一时间单位为毫秒。kernel Session.created_at/updated_at 为 epoch seconds,
             // 此处 API 响应边界乘 1000 转毫秒,与 MessageInfo.created_at 单位一致,前端无需启发式兼容。
+            // bot review P3: checked_mul 在 epoch 秒值上永不溢出 (u64 上限约 5.8e8 年),
+            // unwrap_or 的 fallback 与主路径同溢出行为,仅作为防御性兜底保留;真溢出时 fallback 也是错的,
+            // 但该场景物理不可能,故不 panic。
             let detail = SessionDetail {
                 id: session.id.to_string(),
                 name: session.name,
@@ -1501,6 +1504,9 @@ fn merge_session_messages_for_display(
     // a per-message clock. Kernel stores `updated_at` in epoch SECONDS; the webui
     // works in ms, so multiply here once. Live/snapshot turns inject `Date.now()`
     // client-side and never read this field.
+    // bot review P3: session.updated_at 在 kernel 中恒有值 (Session::new 时 Instant::now()),
+    // checked_mul(1000) 在 epoch 秒上永不溢出,故 session_ts_ms 恒为 Some;
+    // 下文 info.created_at = session_ts_ms 对所有历史消息统一赋值,不会静默丢失。
     let session_ts_ms = session.updated_at.checked_mul(1000);
 
     for display in session
