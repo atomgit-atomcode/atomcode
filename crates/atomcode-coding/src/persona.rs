@@ -14,7 +14,19 @@
 /// Build the coding system prompt for `model`. The identity line carries the model name
 /// so the agent self-identifies correctly; the rest is the language-agnostic coding
 /// discipline (workflow / tool-parallelism / doing-tasks / verification / output).
-pub fn coding_persona(model: &str) -> String {
+/// The single source of truth for the todo switch across every production
+/// `coding_persona` call site (assemble, parts, model-swap reconcile) AND the
+/// `todowrite` tool/hook gate: `ATOMCODE_TODO` env (0/false/off) overrides the
+/// default-on config. Keeping ALL call sites on this one helper guarantees the
+/// system-prompt guidance and the mounted tool never disagree.
+pub(crate) fn todo_switch_enabled() -> bool {
+    atomcode_core::config::todo_enabled_from_env(
+        std::env::var("ATOMCODE_TODO").ok().as_deref(),
+        true,
+    )
+}
+
+pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
         "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
@@ -45,6 +57,16 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // and stays lean here even though it gets the tool block. Separate predicate on purpose.
     if model_needs_firm_execution(model) {
         p.push_str(FIRM_EXECUTION_DISCIPLINE);
+    }
+    // Todo-list usage guidance — surfaced in the SYSTEM PROMPT (not just the
+    // todowrite tool description) because some models (observed: GLM) under-weight
+    // tool descriptions and so never open a list. Judgment-framed (not mandatory)
+    // to avoid ceremony on trivial tasks. MUST stay gated on the SAME condition as
+    // the `todowrite` tool registration + `TodoHook` (the `ATOMCODE_TODO` switch):
+    // instructing the model to use a tool that isn't mounted would provoke a
+    // phantom tool call. `todo_enabled` is that switch, resolved by the caller.
+    if todo_enabled {
+        p.push_str(TODO_USAGE);
     }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
@@ -148,6 +170,19 @@ else cmd.exe) and which syntax to use — follow it, and don't assume cmd.exe. \
 Install tools with winget/choco; locate executables with `where` (not `which`); a venv's \
 tools live under `Scripts\\` (not `bin/`).";
 
+/// Todo-list usage guidance for the system prompt. Judgment-framed (a clear
+/// trigger + an explicit skip list) — NOT a blanket "always plan" mandate, so
+/// it lifts consistency on genuinely multi-step work without spamming a checklist
+/// on small edits. Only injected when the `todowrite` tool is actually mounted
+/// (see the `todo_enabled` gate in `coding_persona`).
+const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
+For a task that clearly spans several distinct steps (roughly three or more), touches \
+multiple files, or bundles several user requests, start by calling `todowrite` to lay out \
+the steps, then keep it updated as you work — exactly one item in_progress at a time, and \
+mark an item done only after that step is actually verified (never on intent). It keeps you \
+and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
+quick edit, a one-off command, or a purely informational / conversational reply.";
+
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
@@ -238,16 +273,44 @@ mod tests {
     }
 
     #[test]
+    fn todo_guidance_present_only_when_enabled() {
+        // Gating parity: the system-prompt todo guidance must appear iff the
+        // `todowrite` tool + hook are mounted (same ATOMCODE_TODO switch), else the
+        // model would be told to call a tool that isn't there.
+        let on = coding_persona("glm-5.2", true);
+        assert!(on.contains("## TASK TRACKING"), "enabled → guidance present");
+        assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
+
+        let off = coding_persona("glm-5.2", false);
+        assert!(!off.contains("## TASK TRACKING"), "disabled → no guidance");
+        assert!(
+            !off.contains("todowrite"),
+            "disabled → must NOT mention the unmounted tool: {off}"
+        );
+    }
+
+    #[test]
+    fn todo_guidance_is_judgment_framed_not_mandatory() {
+        // Not a blanket mandate — must carry the explicit skip clause so trivial
+        // tasks don't get a checklist.
+        let p = coding_persona("glm-5.2", true);
+        assert!(
+            p.contains("Do NOT use it for a single quick edit"),
+            "must keep the trivial-task skip clause: {p}"
+        );
+    }
+
+    #[test]
     fn persona_carries_a_current_date_anchor() {
         // Every round needs a date anchor (round 1 is skipped by StatusReminderHook),
         // else web_search defaults to the training year.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(p.contains("Today's date:"), "persona must carry a date anchor: {p}");
     }
 
     #[test]
     fn persona_carries_model_and_anchors() {
-        let p = coding_persona("deepseek-chat");
+        let p = coding_persona("deepseek-chat", true);
         assert!(
             p.contains("running the deepseek-chat model"),
             "identity must carry the model"
@@ -299,7 +362,7 @@ mod tests {
     fn persona_carries_behavioral_guardrails() {
         // Three v1 guardrails the initial v2 port dropped, restored for parity with the
         // legacy engine (peer agents like opencode keep them too).
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             p.contains("Prioritize technical correctness over agreeing with the user"),
             "anti-sycophancy guardrail (DOING TASKS)"
@@ -320,7 +383,7 @@ mod tests {
         // models like GLM over-comment with line-by-line narration); the initial v2 port
         // dropped it. Restore parity and cross-ref CHINESE CODE SUPPORT so the volume
         // limit applies to NEW comments only, never to existing (incl. Chinese) ones.
-        let p = coding_persona("glm-5.2");
+        let p = coding_persona("glm-5.2", true);
         assert!(
             p.contains("comment density"),
             "must keep the soft comment-density rule: {p}"
@@ -336,7 +399,7 @@ mod tests {
         // "minimal tool calls" contradicts the `## TOOLS:` section (which urges maximal
         // parallel calls) and can push weak models to under-read / guess. The real cost is
         // round-trip latency, so the opening line must target round-trips, not tool count.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             p.contains("minimizing round-trips"),
             "opening line must frame efficiency as round-trips: {p}"
@@ -352,7 +415,7 @@ mod tests {
         // Many bugs (UI/rendering, intermittent, state-dependent) have no single runnable
         // command; the old absolute "run the failing command BEFORE reading code" made weak
         // models burn a round or fabricate a repro. The step must be conditional.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             p.contains("when a runnable reproduction exists"),
             "REPRODUCE must be conditional on a runnable repro: {p}"
@@ -371,7 +434,7 @@ mod tests {
         // to use it — otherwise the model obeys, calls an unmounted tool, and
         // hits "unknown or unmounted tool: change_dir" (the reported
         // regression), then misleadingly claims `bash cd` switched the dir.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             !p.contains("change_dir"),
             "persona must not advertise the unmounted `change_dir` tool"
@@ -391,7 +454,7 @@ mod tests {
         // (the reported "I'll write it in one go" → finish_reason=length failure).
         // The persona must steer toward INCREMENTAL file writes instead. Guard the
         // exact failure mode so nobody re-introduces the one-shot advice.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             p.contains("## CONTENT-TRANSFORMATION:"),
             "content-transformation section must exist"
@@ -416,7 +479,7 @@ mod tests {
     #[test]
     fn persona_drops_compaction_claim() {
         // MVP has no compaction — must NOT promise unlimited context.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             !p.contains("not limited by the context window"),
             "no false compaction promise"
@@ -429,7 +492,7 @@ mod tests {
 
     #[test]
     fn persona_has_v1_parity_sections() {
-        let p = coding_persona("deepseek-v4-flash");
+        let p = coding_persona("deepseek-v4-flash", true);
         for s in [
             "## GIT COMMITS:",
             "## CONTENT-TRANSFORMATION:",
@@ -464,7 +527,7 @@ mod tests {
 
     #[test]
     fn persona_prefers_builtin_tools_over_shell_equivalents() {
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         for phrase in [
             "not `bash cat`",
             "instead of `bash ls`",
@@ -488,7 +551,7 @@ mod tests {
         // `bash ls -la` for almost anything. Replace the vague condition with one
         // concrete exception (sizes/permissions/timestamps) so the default is
         // unambiguous, while still preferring list_directory over `bash ls`.
-        let p = coding_persona("m");
+        let p = coding_persona("m", true);
         assert!(
             !p.contains("when a tree view is enough"),
             "the vague escape hatch must be gone: {p}"
@@ -510,14 +573,14 @@ mod tests {
         // Give them an extra, blunt restatement at the model's decision point. Models
         // that already comply don't need the extra tokens.
         for weak in ["glm-5.2", "GLM-4.6", "deepseek-v4-flash"] {
-            let p = coding_persona(weak);
+            let p = coding_persona(weak, true);
             assert!(
                 p.contains("## TOOL DISCIPLINE"),
                 "{weak} must get the firm tool-discipline block: {p}"
             );
         }
         for strong in ["claude-opus-4-8", "gpt-5", "m"] {
-            let p = coding_persona(strong);
+            let p = coding_persona(strong, true);
             assert!(
                 !p.contains("## TOOL DISCIPLINE"),
                 "{strong} must not carry the extra firm block"
@@ -530,7 +593,7 @@ mod tests {
         // The behavior block is DeepSeek-only (its execution behavior was the one reported to
         // slip): silently deleting code/tests to clear errors, shipping unverified edits,
         // offloading doable work, quitting after one failure, treating stale memory as truth.
-        let p = coding_persona("deepseek-v4-flash");
+        let p = coding_persona("deepseek-v4-flash", true);
         assert!(p.contains("## EXECUTION DISCIPLINE"), "deepseek must get the block: {p}");
         // The five behaviors it must cover.
         assert!(p.contains("FIX, DON'T HIDE"), "must forbid deleting code to clear errors");
@@ -546,7 +609,7 @@ mod tests {
         // GLM is deliberately EXCLUDED from the behavior block (option A) — but STILL gets
         // the tool block. Frontier models get neither.
         for glm in ["glm-5.2", "GLM-4.6"] {
-            let p = coding_persona(glm);
+            let p = coding_persona(glm, true);
             assert!(
                 !p.contains("## EXECUTION DISCIPLINE"),
                 "{glm} must NOT get the execution block (it is more capable): {p}"
@@ -557,7 +620,7 @@ mod tests {
             );
         }
         for strong in ["claude-opus-4-8", "gpt-5", "m"] {
-            let p = coding_persona(strong);
+            let p = coding_persona(strong, true);
             assert!(!p.contains("## EXECUTION DISCIPLINE"), "{strong}: no execution block");
             assert!(!p.contains("## TOOL DISCIPLINE"), "{strong}: no tool block");
         }
@@ -577,7 +640,7 @@ mod tests {
         // Deliberately NOT opencode's "beast mode": a "keep going forever / never end your
         // turn" framing trades the offload failure for runaway loops + out-of-scope changes.
         // The legitimate stop conditions must remain explicit, and SCOPE discipline unchanged.
-        let p = coding_persona("deepseek-v4-flash");
+        let p = coding_persona("deepseek-v4-flash", true);
         assert!(
             !p.to_lowercase().contains("never end your turn")
                 && !p.to_lowercase().contains("keep going until"),

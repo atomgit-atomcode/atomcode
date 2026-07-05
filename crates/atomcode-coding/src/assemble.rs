@@ -43,10 +43,16 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// provider yourself; otherwise prefer [`build_coding_agent`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
+    // Single source of truth for the todo switch (`ATOMCODE_TODO` env overrides the
+    // default-on config). Used for BOTH the persona usage-guidance section AND the
+    // TodoHook below, so the system prompt never tells the model to use `todowrite`
+    // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
+    // itself is registered on the same env gate in `atomcode-capabilities`.
+    let todo_enabled = crate::persona::todo_switch_enabled();
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools(model_name_suggests_vision(&cfg.model)))
-        .persona(coding_persona(&cfg.model))
+        .persona(coding_persona(&cfg.model, todo_enabled))
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -83,11 +89,8 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     // (overrides config); cfg_value=true reflects the default-on config.ui.todo default.
     // CodingAgentConfig doesn't carry ui.todo, so we use the config default (true) here;
     // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
-    {
-        let env = std::env::var("ATOMCODE_TODO").ok();
-        if atomcode_core::config::todo_enabled_from_env(env.as_deref(), true) {
-            builder = builder.hook(Arc::new(crate::todo::TodoHook));
-        }
+    if todo_enabled {
+        builder = builder.hook(Arc::new(crate::todo::TodoHook));
     }
     builder.build()
 }

@@ -466,7 +466,7 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona(&cfg.model));
+        .persona(coding_persona(&cfg.model, crate::persona::todo_switch_enabled()));
     // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
     // or blocks — so its position does not affect the approve-what-runs contract (an
     // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
@@ -578,7 +578,7 @@ const ATOMCODE_PERSONA_PREFIX: &str =
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
 fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
-    let persona = coding_persona(model);
+    let persona = coding_persona(model, crate::persona::todo_switch_enabled());
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
     };
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn model_switch_replaces_persona_without_duplication() {
         let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(coding_persona("old-model")),
+            Message::system(coding_persona("old-model", crate::persona::todo_switch_enabled())),
             Message::system("SESSION CONTEXT"),
         ]);
 
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn current_persona_keeps_snapshot_byte_stable() {
-        let persona = coding_persona("deepseek-v4-flash");
+        let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),
             Message::system("SESSION CONTEXT"),
