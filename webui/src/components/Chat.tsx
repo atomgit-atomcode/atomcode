@@ -37,6 +37,14 @@ function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
 }
 
+/** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
+const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
+
+/** Whether two dates fall on the same calendar day (Y/M/D all equal). */
+function sameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
 /** PR #562: format a send-time label for a message bubble.
  *  - Today → "HH:MM" (compact, the common case)
  *  - Yesterday → i18n `time.yesterday` + "HH:MM"
@@ -52,10 +60,7 @@ function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
   const now = new Date();
-  const pad = (n: number) => (n < 10 ? '0' + n : '' + n);
-  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  const sameDay = (a: Date, b: Date) =>
-    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   if (sameDay(d, now)) return hm;
   const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
   if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
@@ -68,8 +73,7 @@ function formatMsgTimeFull(ts?: number): string {
   if (!ts || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
-  const pad = (n: number) => (n < 10 ? '0' + n : '' + n);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 /** Format all parts of a message as readable text (including tool calls and their
