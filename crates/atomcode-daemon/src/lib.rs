@@ -365,13 +365,14 @@ fn resolve_initial_working_dir(
 /// newly-created sessions don't drift (e.g. a launcher passing `C:\users\danan`
 /// for a dir the history recorded as `C:\Users\danan`).
 ///
-/// Runs on case-insensitive filesystems (Windows + macOS), and is guarded: it
-/// adopts the canonical form ONLY when that form maps to the SAME session bucket
-/// as the input. `hash_path` folds case on both platforms, so a pure case-fold
-/// never changes the bucket — but a junction / symlink whose resolution WOULD
-/// change the bucket (and thus hide existing sessions) is left untouched. Linux
-/// keeps the path verbatim (case-sensitive FS; nothing to fold).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// Windows-only, and guarded: it adopts the canonical form ONLY when that form
+/// maps to the SAME session bucket as the input. On Windows `hash_path` already
+/// lowercases, so a pure case-fold never changes the bucket — but a junction /
+/// symlink whose resolution WOULD change the bucket (and thus hide existing
+/// sessions) is left untouched. Other platforms keep the path verbatim to avoid
+/// symlink-resolution surprises and bucket orphaning (`hash_path` does not fold
+/// case off Windows).
+#[cfg(windows)]
 fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     match std::fs::canonicalize(&p) {
         Ok(c) => {
@@ -386,7 +387,7 @@ fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(windows))]
 fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     p
 }
