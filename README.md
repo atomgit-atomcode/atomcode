@@ -394,6 +394,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 |---------|--------|
 | `/model` | Switch model / provider |
 | `/provider` | Manage providers (add / edit / delete) |
+| `/proxy` | Switch outbound proxy mode |
 | `/login` | Sign in with AtomGit OAuth |
 | `/logout` | Sign out of AtomGit |
 | `/whoami` | Show the current logged-in user |
@@ -407,6 +408,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/undo` | Undo a turn's file edits (`/undo` or `/undo N`) |
 | `/view <filepath>` | View file content in an overlay modal |
 | `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/copy` | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
 | `/cost` | Show token usage for this session |
 | `/context` | Show the context budget breakdown |
 | `/compact` | Compact conversation history |
@@ -646,7 +648,6 @@ Scan the QR code below with WeChat to join the AtomCode community group — shar
 <p align="center">
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode Alipay donate QR code" width="220">
   <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode WeChat Pay donate QR code" width="240">
->>>>>>> main
 </p>
 
 ## License

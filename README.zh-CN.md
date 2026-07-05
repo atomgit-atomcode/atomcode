@@ -389,6 +389,7 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/model` | 切换模型 / provider |
 | `/provider` | 管理 provider（添加 / 编辑 / 删除） |
+| `/proxy` | 切换出站代理模式 |
 | `/login` | 通过 AtomGit OAuth 登录 |
 | `/logout` | 退出 AtomGit 登录 |
 | `/whoami` | 查看当前登录用户 |
@@ -402,6 +403,7 @@ atomcode --prompt-file task.md
 | `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
 | `/view <文件路径>` | 在浮层窗口中查看文件内容 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/copy` | 从上一条回复复制代码块（`/copy`、`/copy N`、`/copy all`） |
 | `/cost` | 显示本次会话的 token 消耗 |
 | `/context` | 查看上下文预算占用明细 |
 | `/compact` | 压缩对话历史 |
@@ -640,13 +642,8 @@ cargo install --path crates/atomcode-cli
 ☕ AtomCode 免费用，Coding Plan 也不收费。如果它帮你省下了一点时间，欢迎请作者喝杯咖啡，让我们更有动力把它做下去。
 
 <p align="center">
-<<<<<<< HEAD
   <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 支付宝赞赏码" width="220">
   <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信赞赏码" width="240">
-=======
-  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 微信用户群二维码" width="220">
-  <img src=" https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信用户群二维码" width="240">
->>>>>>> main
 </p>
 
 
