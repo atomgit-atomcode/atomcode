@@ -194,6 +194,71 @@ fn format_loop_row(
     format!("{marker}{lbl}{meta}")
 }
 
+/// Todo-row marker: `☑` (Ballot Box With Check, U+2611) when unicode is
+/// available, `+` fallback for legacy terminals. Width-1 + trailing space,
+/// matching the layout contract of `goal_marker`/`loop_marker`. The ASCII
+/// fallback is `+` (not the goal/loop `*`) so a todo row stays distinguishable
+/// from a co-shown goal/loop row on non-unicode terminals.
+fn todo_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "\u{2611} "
+    } else {
+        "+ "
+    }
+}
+
+/// The three display segments of the dedicated footer todo row, width-fitted:
+/// `(marker, current_task, meta)`. Mirrors `goal_row_parts` — marker in Brand,
+/// the running task in normal text, the ` · N/M` count muted. The count is
+/// RESERVED and always survives; the task title fills the rest and is truncated
+/// with `…`. With no task in progress the title is empty and the count renders
+/// bare (no leading separator). CJK/width-safe via `crate::width`.
+fn todo_row_parts(
+    current: Option<&str>,
+    completed: usize,
+    total: usize,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = todo_marker(unicode);
+    let icon_w = crate::width::display_width(marker);
+    let count = format!("{completed}/{total}");
+    match current {
+        Some(task) if !task.is_empty() => {
+            let meta = format!(" · {count}");
+            let title_budget = max_cols
+                .saturating_sub(icon_w)
+                .saturating_sub(crate::width::display_width(&meta));
+            if title_budget == 0 {
+                // Too narrow for the task — keep marker + count only.
+                let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
+                (marker, String::new(), bare)
+            } else {
+                let title = crate::width::truncate_with_ellipsis(task, title_budget);
+                (marker, title, meta)
+            }
+        }
+        // No task in progress → just the bare count (no leading " · ").
+        _ => {
+            let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
+            (marker, String::new(), bare)
+        }
+    }
+}
+
+/// Full todo-row text joined. Thin wrapper over [`todo_row_parts`] for tests.
+#[cfg(test)]
+fn format_todo_row(
+    current: Option<&str>,
+    completed: usize,
+    total: usize,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, title, meta) = todo_row_parts(current, completed, total, max_cols, unicode);
+    format!("{marker}{title}{meta}")
+}
+
 /// Format a token count using k/m units. `round_clean=true` drops the
 /// decimal when the value is an exact multiple of the unit (used for
 /// the model's advertised window — `128_000` → `128k`, `1_000_000` →
@@ -1443,19 +1508,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
-        // Todo progress segment (`[✓] 3/7`) — pre-formatted + glyph-gated in
-        // build_status. Occupies the tail of the left group, after ctx usage.
-        let todo_str = status.todo.clone().unwrap_or_default();
         // Widths of the static " · " separators between visible parts.
         let sep_w = if !model_str.is_empty() { 3 } else { 0 }
             + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
-                3
-            } else {
-                0
-            }
-            + if !todo_str.is_empty()
-                && (!model_str.is_empty() || !status.cwd.is_empty() || !ctx_str.is_empty())
-            {
                 3
             } else {
                 0
@@ -1463,10 +1518,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cwd_budget = left_max
             .saturating_sub(crate::width::display_width(&model_str))
             .saturating_sub(crate::width::display_width(&ctx_str))
-            .saturating_sub(crate::width::display_width(&todo_str))
             .saturating_sub(sep_w);
 
-        let mut parts: Vec<String> = Vec::with_capacity(5);
+        let mut parts: Vec<String> = Vec::with_capacity(4);
         if !model_str.is_empty() {
             parts.push(model_str);
         }
@@ -1483,9 +1537,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
-        }
-        if !todo_str.is_empty() {
-            parts.push(todo_str);
         }
         // NOTE: the goal indicator is NOT appended here any more — it lives on
         // its own dedicated footer row (`build_goal_row`) so it can't be the
@@ -1546,13 +1597,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build the dedicated goal row (one full-width line, shown only while a
-    /// `/goal` loop is active). Sits directly above the status line, with a calm
-    /// hierarchy so it reads as persistent status, not a loud activity line:
-    /// the `◎` marker in `Brand` (a small accent), the condition in normal text,
-    /// and the ` · round N · elapsed` meta in `Muted` gray.
-    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
+    /// Emit one dedicated footer row from its three width-fitted segments,
+    /// with the calm shared hierarchy of the goal/loop/todo rows: `marker` in
+    /// `Brand` (a small accent), `mid` in normal text, `meta` in `Muted` gray.
+    /// Callers produce the tuple via the matching `*_row_parts` fn.
+    fn build_marker_row(&self, marker: &str, mid: &str, meta: &str) -> Vec<Cell> {
         let mut row = Vec::new();
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, mid, &CellStyle::default());
+        push_str_cells(&mut row, meta, &self.style_for(Role::Muted));
+        row
+    }
+
+    /// Build the dedicated goal row (one full-width line, shown only while a
+    /// `/goal` loop is active). Sits directly above the status line: the `◎`
+    /// marker, the condition, and the ` · round N · elapsed` meta.
+    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
         let (marker, condition, meta) = goal_row_parts(
             &scrub_controls(&goal.condition),
             goal.round,
@@ -1560,18 +1620,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rule_width.max(1),
             self.caps.unicode_symbols,
         );
-        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut row, &condition, &CellStyle::default());
-        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
-        row
+        self.build_marker_row(marker, &condition, &meta)
     }
 
     /// Build the dedicated loop row (one full-width line, shown only while a
     /// `/loop` is active). Sits in the same slot as the goal row — goal and loop
-    /// are mutually exclusive in practice. Layout: `⚡` marker in Brand color,
-    /// label in normal text, ` · round N · elapsed` meta in Muted gray.
+    /// are mutually exclusive in practice. `⚡` marker, label, ` · round N · elapsed`.
     fn build_loop_row(&self, ls: &crate::render::LoopStatus, rule_width: usize) -> Vec<Cell> {
-        let mut row = Vec::new();
         let (marker, label, meta) = loop_row_parts(
             &scrub_controls(&ls.label),
             ls.round,
@@ -1579,10 +1634,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rule_width.max(1),
             self.caps.unicode_symbols,
         );
-        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut row, &label, &CellStyle::default());
-        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
-        row
+        self.build_marker_row(marker, &label, &meta)
+    }
+
+    /// Build the dedicated todo row (one full-width line, shown while a todo list
+    /// is active). Sits directly above the status line — and above the goal/loop
+    /// row when one is present. `☑` marker, the running task, ` · N/M` count.
+    fn build_todo_row(&self, todo: &crate::render::TodoProgress, rule_width: usize) -> Vec<Cell> {
+        let current = todo.current.as_deref().map(scrub_controls);
+        let (marker, title, meta) = todo_row_parts(
+            current.as_deref(),
+            todo.completed,
+            todo.total,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        self.build_marker_row(marker, &title, &meta)
     }
 
     /// Paint the full footer into `self.screen`. Layout mirrors
@@ -1680,15 +1747,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
+        // Dedicated todo row: one full-width line above the status row (and above
+        // the goal/loop row when present), shown while a todo list is active.
+        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
         // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
         // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text). The goal/loop row is folded into the
-        // status-rows reservation so the input box height accounts for it too.
+        // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
+        // into the status-rows reservation so the input box height accounts for them.
         let max_input_rows =
-            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows + todo_rows);
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -1699,7 +1769,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         let total_rows =
-            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1741,6 +1811,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
+        let todo_cells: Option<Vec<Cell>> = status_clone
+            .todo
+            .as_ref()
+            .map(|t| self.build_todo_row(t, rule_width));
         let menu_kind = self
             .menu
             .as_ref()
@@ -1816,18 +1890,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
-        // Goal row sits directly above the status line (between the menu and
-        // the status row), so `· menu / goal / status ·`.
+        // Stack above the status line: `· menu / goal|loop / todo / status ·`.
         let goal_top = menu_top + menu_rows;
         if let Some(gr) = goal_cells {
             let mut padded = gr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(goal_top, 0, &padded);
         }
+        let todo_top = goal_top + goal_rows;
+        if let Some(tr) = todo_cells {
+            let mut padded = tr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(todo_top, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
+            self.screen.draw_row(todo_top + todo_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -1888,15 +1967,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
+        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
-        let capped_middle = middle_rows
-            .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + status.
+        let capped_middle = middle_rows.min(Self::max_input_rows(
+            h,
+            attachment_rows,
+            menu_rows,
+            status_rows + goal_rows + todo_rows,
+        ));
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -5567,32 +5651,25 @@ mod tests {
         );
     }
 
-    /// Todo progress segment renders in the left group after the model · cwd
-    /// run. `None` (the common case) leaves the row untouched.
+    /// Dedicated todo row: shows the running task + reserved `N/M` count; the
+    /// count always survives, the title truncates, and with no in-progress task
+    /// the count renders bare (no leading separator).
     #[test]
-    fn build_status_row_renders_todo_progress_segment() {
-        let (mut r, _counter) = new_counting(80, 24);
-        r.caps.colors = true;
-        r.caps.unicode_symbols = true;
-        let status = StatusLine {
-            todo: Some("[\u{2713}] 3/7".into()),
-            ..status_basic()
-        };
-        let row = r.build_status_row(&status, 60);
-        let visible: String = row.iter().map(|c| c.ch).collect();
-        assert!(
-            visible.contains("3/7"),
-            "todo progress segment must appear in the row; got: {:?}",
-            visible
-        );
-        // Absent when None — no noise for todo-less sessions.
-        let plain = r.build_status_row(&status_basic(), 60);
-        let plain_visible: String = plain.iter().map(|c| c.ch).collect();
-        assert!(
-            !plain_visible.contains('/') || !plain_visible.contains("3/7"),
-            "no todo segment when todo is None; got: {:?}",
-            plain_visible
-        );
+    fn todo_row_parts_shows_task_and_reserved_count() {
+        // Running task + count.
+        let s = format_todo_row(Some("write the parser"), 3, 7, 60, true);
+        assert!(s.contains("write the parser"), "task title present; got {s:?}");
+        assert!(s.contains("3/7"), "count present; got {s:?}");
+        assert!(s.contains(" · 3/7"), "count separated from title; got {s:?}");
+        // No in-progress task → bare count, no leading ' · '.
+        let none = format_todo_row(None, 2, 5, 60, true);
+        assert!(none.contains("2/5"), "count present; got {none:?}");
+        assert!(!none.contains(" · "), "no leading separator when no task; got {none:?}");
+        // Narrow terminal → title dropped, count still survives.
+        let narrow = format_todo_row(Some("a very long task description here"), 4, 9, 10, true);
+        assert!(narrow.contains("4/9"), "count survives narrow width; got {narrow:?}");
+        // ASCII marker fallback for legacy terminals — distinct from goal/loop's `*`.
+        assert!(format_todo_row(Some("x"), 1, 2, 60, false).starts_with("+ "));
     }
 
     /// Bypass indicator (--dangerously-skip-permissions) renders on the

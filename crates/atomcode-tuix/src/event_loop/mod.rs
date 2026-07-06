@@ -10544,16 +10544,13 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         round: state.loop_round + 1,
         elapsed_secs: state.loop_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
     });
-    // Todo progress segment (`[✓] 3/7`). Prefer the live in-flight snapshot
-    // (updated by the turn's todowrite calls before they're committed to the
-    // transcript); otherwise derive from the transcript so it's correct at rest,
-    // after `/resume`, and across session switches with no extra bookkeeping.
-    let todo = state
-        .live_turn_todo
-        .or_else(|| todo_progress_from_messages(&ctx.current_session.messages))
-        // `total == 0` ⇒ no list (or a live clear) ⇒ omit the segment entirely.
-        .filter(|&(_, total)| total > 0)
-        .map(|(done, total)| format_todo_footer(done, total, ctx.caps.unicode_symbols));
+    // Todo progress for the dedicated footer todo row. Driven PURELY by the live
+    // in-flight snapshot (set from the turn's todowrite calls, cleared at turn end
+    // in on_turn_complete/cancelled/error) so the row is a live execution
+    // indicator: it appears when the agent starts tracking todos and DISAPPEARS
+    // when the turn finishes — mirroring how the goal/loop row only shows while
+    // active. `total == 0` (a live clear) ⇒ omit the row.
+    let todo = state.live_turn_todo.clone().filter(|p| p.total > 0);
     crate::render::StatusLine {
         model,
         cwd,
@@ -11501,42 +11498,29 @@ pub(crate) fn todo_block_styled_lines(args: &str, unicode: bool) -> Vec<String> 
         .collect()
 }
 
-/// `(completed, total)` for the todo list carried in a single `todowrite` call's
-/// args. `Some((0, 0))` when the call VALIDLY clears the list — distinct from
-/// `None`, which means "unparseable, keep whatever the footer already shows".
-/// This distinction matters mid-turn: a clear must suppress the segment, NOT
-/// fall back to the not-yet-committed transcript (which still holds the old
-/// list). `build_status` treats `total == 0` as "no segment".
-pub(crate) fn todo_progress_from_args(args: &str) -> Option<(usize, usize)> {
-    use atomcode_capabilities::tools::todo::{parse_todos, todo_counts};
-    parse_todos(args).ok().map(|todos| todo_counts(&todos))
+/// Build footer todo progress (current task + completed/total) from a parsed
+/// list. An empty list yields `total == 0`, which `build_status` filters out.
+pub(crate) fn todo_progress_from_items(
+    todos: &[atomcode_capabilities::tools::todo::TodoItem],
+) -> crate::render::TodoProgress {
+    use atomcode_capabilities::tools::todo::{todo_counts, TodoStatus};
+    let (completed, total) = todo_counts(todos);
+    let current = todos
+        .iter()
+        .find(|t| t.status == TodoStatus::InProgress)
+        .map(|t| t.content.clone());
+    crate::render::TodoProgress { current, completed, total }
 }
 
-/// `(completed, total)` for the current todo list derived from the transcript
-/// (last valid `todowrite`), or `None` when there is no list. Used for the
-/// footer progress segment at rest (between turns / after `/resume`). Reuses the
-/// same scan as the `/todo` command so the two never disagree.
-pub(crate) fn todo_progress_from_messages(
-    messages: &[atomcode_core::conversation::message::Message],
-) -> Option<(usize, usize)> {
-    let todos = commands::current_todos_from_transcript(messages);
-    if todos.is_empty() {
-        None
-    } else {
-        Some(atomcode_capabilities::tools::todo::todo_counts(&todos))
-    }
-}
-
-/// Format a `(completed, total)` pair as the footer segment `<glyph> N/M`
-/// (e.g. `[✓] 3/7`). The glyph is unicode-gated so the string is terminal-safe.
-pub(crate) fn format_todo_footer(completed: usize, total: usize, unicode: bool) -> String {
-    use atomcode_capabilities::tools::todo::{todo_glyph, TodoStatus};
-    format!(
-        "{} {}/{}",
-        todo_glyph(TodoStatus::Completed, unicode),
-        completed,
-        total
-    )
+/// Todo progress for the list carried in a single `todowrite` call's args.
+/// `Some(total=0)` when the call VALIDLY clears the list (the footer then hides
+/// the row) — distinct from `None`, which means "unparseable, keep whatever the
+/// footer already shows". The footer todo row is live-only (cleared at turn end),
+/// so this is its sole source.
+pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
+    atomcode_capabilities::tools::todo::parse_todos(args)
+        .ok()
+        .map(|todos| todo_progress_from_items(&todos))
 }
 
 #[cfg(test)]
@@ -11558,24 +11542,24 @@ mod todo_block_tests {
     }
 
     #[test]
-    fn todo_progress_from_args_counts_and_distinguishes_clear_from_unparseable() {
-        assert_eq!(
-            todo_progress_from_args(
-                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]}"#
-            ),
-            Some((1, 2))
-        );
-        // A VALID clear ⇒ Some((0,0)) so the footer suppresses the segment
-        // rather than falling back to the stale (uncommitted) transcript.
-        assert_eq!(todo_progress_from_args(r#"{"todos":[]}"#), Some((0, 0)));
+    fn todo_progress_from_args_carries_current_and_distinguishes_clear() {
+        let p = todo_progress_from_args(
+            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"},{"content":"c","status":"pending"}]}"#,
+        )
+        .expect("valid list");
+        assert_eq!((p.completed, p.total), (1, 3));
+        assert_eq!(p.current.as_deref(), Some("b")); // the in_progress task
+        // No task in progress ⇒ current None, counts still populated.
+        let done = todo_progress_from_args(
+            r#"{"todos":[{"content":"a","status":"completed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!((done.completed, done.total, done.current), (1, 1, None));
+        // A VALID clear ⇒ Some(total=0) so the footer suppresses the row rather
+        // than falling back to the stale (uncommitted) transcript.
+        assert_eq!(todo_progress_from_args(r#"{"todos":[]}"#).map(|p| p.total), Some(0));
         // Unparseable ⇒ None ⇒ keep whatever the footer already shows.
-        assert_eq!(todo_progress_from_args("not json"), None);
-    }
-
-    #[test]
-    fn format_todo_footer_glyph_gated() {
-        assert_eq!(format_todo_footer(3, 7, true), "[\u{2713}] 3/7");
-        assert_eq!(format_todo_footer(3, 7, false), "[x] 3/7");
+        assert!(todo_progress_from_args("not json").is_none());
     }
 
     #[test]

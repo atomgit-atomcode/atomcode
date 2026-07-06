@@ -326,13 +326,13 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
-    /// Live `(completed, total)` todo counts for the footer progress segment,
-    /// captured from the in-flight turn's `todowrite` calls. The footer prefers
-    /// this WHILE a turn runs, because `current_session.messages` only gains the
-    /// turn's todowrite at turn end (persist_current_session). Cleared on
-    /// TurnComplete / TurnCancelled / Error, after which the footer derives from
-    /// the now-updated transcript. `None` ⇒ derive from the transcript.
-    pub live_turn_todo: Option<(usize, usize)>,
+    /// Live todo progress (current task + completed/total) for the footer todo
+    /// row, captured from the in-flight turn's `todowrite` calls. This is the
+    /// row's SOLE source: cleared on TurnComplete / TurnCancelled / Error so the
+    /// row is a live execution indicator that DISAPPEARS when the turn ends
+    /// (mirroring the goal/loop row). `None` ⇒ no row. At-rest progress is seen
+    /// via the `/todo` command or the inline todowrite block, not this row.
+    pub live_turn_todo: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.

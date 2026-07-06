@@ -489,13 +489,13 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
-    /// Pre-formatted todo progress segment (e.g. `[✓] 3/7`), shown in the
-    /// left group of the status row so the user can see multi-step progress
-    /// at a glance without the inline todowrite block (which scrolls away).
-    /// `None` ⇒ no todo list in this session, segment omitted (no noise for
-    /// conversations that never used todowrite). The glyph is unicode-gated
-    /// upstream in `build_status`, so this string is always terminal-safe.
-    pub todo: Option<String>,
+    /// Active todo list progress, rendered on a DEDICATED footer row above the
+    /// status line (like the goal/loop row) so multi-step progress — including
+    /// which task is running — is visible without the inline todowrite block
+    /// (which scrolls away). `None` ⇒ no todo list, row omitted (no noise for
+    /// conversations that never used todowrite). Carries raw fields; the
+    /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
+    pub todo: Option<TodoProgress>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -508,6 +508,20 @@ pub struct StatusLine {
     /// footer loop row (its own full-width line, shown instead of the goal row
     /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
     pub loop_status: Option<LoopStatus>,
+}
+
+/// Progress of the active todo list, rendered on the dedicated footer todo row.
+/// The renderer width-truncates `current` to fit; the `completed`/`total` count
+/// always survives (see `todo_row_parts`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TodoProgress {
+    /// The description of the task currently `in_progress` (todowrite enforces
+    /// at most one). `None` when no task is in progress (all pending / all done).
+    pub current: Option<String>,
+    /// Number of tasks marked `completed`.
+    pub completed: usize,
+    /// Total number of tasks in the list.
+    pub total: usize,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated
