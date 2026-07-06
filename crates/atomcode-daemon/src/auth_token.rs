@@ -154,9 +154,9 @@ pub async fn require_app_user_id(
         return Ok(next.run(req).await);
     }
 
-    // 滑动过期：8 小时无活动则拒，并关闭 App Server 断开隧道。
+    // 滑动过期：24 小时无活动则拒，并关闭 App Server 断开隧道。
     // last_activity 由 activity_tracker_middleware 在每次 API 请求时自动更新。
-    const IDLE_MS: i64 = 8 * 3600 * 1000;
+    const IDLE_MS: i64 = 24 * 3600 * 1000;
     let now = crate::now_unix_ms();
     let last = state.last_activity.load(Ordering::Relaxed);
     if now.saturating_sub(last) > IDLE_MS {
