@@ -1524,24 +1524,11 @@ mod buffer_tests {
     }
 
     #[test]
-    fn cooldown_blocks_second_undo_from_mash() {
-        // 冷却期内,一个本会触发 undo(pending 在窗口内)的第二次 Esc 被压制。
+    fn cooldown_blocks_arming_within_window() {
+        // Reachable state: undo just fired (pending cleared); a follow-up Esc
+        // inside the cooldown neither arms nor triggers.
         let undo_at = std::time::Instant::now();
-        let mashed = undo_at + Duration::from_millis(300); // < 冷却
-        let armed = mashed - Duration::from_millis(50); // 距 mashed 50ms → 在 2s 窗口内
-        let mut pending = Some(armed);
-        assert_eq!(
-            intercept_empty_bare_esc(&mut pending, Some(undo_at), mashed),
-            EmptyEscIntercept::CooldownSilenced
-        );
-        assert_eq!(pending, Some(armed), "冷却压制时不得改动 pending");
-    }
-
-    #[test]
-    fn cooldown_blocks_arming_too() {
-        // 冷却期内,第一次 Esc 连武装都不做。
-        let undo_at = std::time::Instant::now();
-        let during = undo_at + Duration::from_millis(300);
+        let during = undo_at + Duration::from_millis(300); // < cooldown
         let mut pending = None;
         assert_eq!(
             intercept_empty_bare_esc(&mut pending, Some(undo_at), during),
@@ -1551,21 +1538,39 @@ mod buffer_tests {
     }
 
     #[test]
-    fn after_cooldown_double_esc_undoes_again() {
+    fn cooldown_boundary_is_still_silenced() {
+        // Guard is `<=`: exactly at the cooldown edge is still silenced.
         let undo_at = std::time::Instant::now();
-        let later = undo_at + DOUBLE_ESC_UNDO_COOLDOWN + Duration::from_millis(1);
-        let mut pending = Some(later - Duration::from_millis(50)); // 在窗口内
+        let edge = undo_at + DOUBLE_ESC_UNDO_COOLDOWN;
+        let mut pending = None;
         assert_eq!(
-            intercept_empty_bare_esc(&mut pending, Some(undo_at), later),
-            EmptyEscIntercept::TriggerUndo
+            intercept_empty_bare_esc(&mut pending, Some(undo_at), edge),
+            EmptyEscIntercept::CooldownSilenced
         );
     }
 
     #[test]
+    fn deliberate_undo_after_cooldown_pause() {
+        // The real "undo again after a pause" flow: cooldown expired, a fresh
+        // arm, then a 2nd Esc within the arming window → undo + pending clears.
+        let undo_at = std::time::Instant::now();
+        let armed = undo_at + DOUBLE_ESC_UNDO_COOLDOWN + Duration::from_millis(100); // past cooldown
+        let second = armed + Duration::from_millis(50); // within the 2s window
+        let mut pending = Some(armed);
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, Some(undo_at), second),
+            EmptyEscIntercept::TriggerUndo
+        );
+        assert_eq!(pending, None, "触发 undo 后必须清 pending");
+    }
+
+    #[test]
     fn no_prior_undo_keeps_original_behaviour() {
-        // last_undo_at = None → 与改动前完全一致。
-        let now = std::time::Instant::now();
-        let mut pending = Some(now - Duration::from_millis(50));
+        // last_undo_at = None → identical to pre-change behaviour. Forward-only
+        // Instant arithmetic (no `Instant - Duration` underflow).
+        let base = std::time::Instant::now();
+        let now = base + Duration::from_millis(50);
+        let mut pending = Some(base); // armed 50ms ago, within window
         assert_eq!(
             intercept_empty_bare_esc(&mut pending, None, now),
             EmptyEscIntercept::TriggerUndo
