@@ -152,6 +152,12 @@ pub struct ModelEntry {
     /// since switching to it would 403 on every request.
     #[serde(default)]
     pub plan_available: bool,
+    /// Capability rank for the `task` subagent's strong/weak auto-routing (higher = more
+    /// capable). `None` ⇒ this model does not participate. Threaded verbatim into the
+    /// persisted `ProviderConfig::capable_model` at login, so re-ranking or adding gateway
+    /// models is server-driven and needs no client release.
+    #[serde(default)]
+    pub capable_model: Option<i64>,
 }
 
 /// One rate-limit window entry from the new `rate_limit_windows`

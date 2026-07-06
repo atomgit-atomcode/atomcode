@@ -1858,6 +1858,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
 
 };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
@@ -1898,6 +1899,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
 
 };
         let err = match OpenAiProvider::new(&cfg) {
@@ -1946,6 +1948,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         };
         // Bad value rejected at load with a naming error (no silent mid-turn 400).
         let msg = match OpenAiProvider::new(&cfg) {
@@ -2421,6 +2424,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         })
         .expect("provider construction")
     }

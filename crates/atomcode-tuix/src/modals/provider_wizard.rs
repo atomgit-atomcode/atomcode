@@ -125,6 +125,7 @@ impl DraftProvider {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
 
 }
     }

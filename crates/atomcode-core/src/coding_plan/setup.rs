@@ -1114,6 +1114,9 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
+        // Server-driven capability rank for subagent strong/weak routing (None ⇒ not
+        // participating). Threaded verbatim so re-ranking models needs no client release.
+        capable_model: entry.capable_model,
     }
 }
 
@@ -1132,6 +1135,7 @@ mod tests {
         super::super::types::ModelEntry {
             display_model_name: display_model_name.to_string(),
             plan_available: true,
+            capable_model: None,
             ..Default::default()
         }
     }
@@ -1312,6 +1316,7 @@ mod tests {
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
             plan_available: true,
+            capable_model: None,
         };
         let p = build_codingplan_provider(&e);
         assert_eq!(p.model, "GLM-5.1");
@@ -1331,6 +1336,7 @@ mod tests {
             provider_type: Some(String::new()),
             context_window: Some(0),
             plan_available: true,
+            capable_model: None,
             ..Default::default()
         };
         let p = build_codingplan_provider(&e);
@@ -2140,6 +2146,7 @@ mod tests {
             // "available". The split-by-`plan_available` happens
             // upstream in the real `step_models_and_register`.
             plan_available: true,
+            capable_model: None,
             // The new wire-shape optional fields default to None/0 —
             // these tests only care about the model name and the
             // availability flag, so let them fall back to the
@@ -2561,12 +2568,14 @@ mod tests {
             id: 1,
             display_model_name: "lite/foo".into(),
             plan_available: true,
+            capable_model: None,
             ..Default::default()
         };
         let locked = super::super::types::ModelEntry {
             id: 2,
             display_model_name: "max/super-secret".into(),
             plan_available: false,
+            capable_model: None,
             ..Default::default()
         };
         let report = SetupReport {

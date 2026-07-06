@@ -2689,7 +2689,8 @@ fn resolve_tier_thunks(
     host_model: &str,
     full_cfg: &atomcode_core::config::Config,
 ) -> (atomcode_coding::SubagentProvider, atomcode_coding::SubagentProvider) {
-    let (fast_key, cap_key) = atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg);
+    let (fast_key, cap_key) =
+        atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg, host_model);
     let none_thunk = || -> atomcode_coding::SubagentProvider { std::sync::Arc::new(|| None) };
     let thunk_for = |key: &str| -> atomcode_coding::SubagentProvider {
         full_cfg
@@ -3126,6 +3127,7 @@ mod undo_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         };
 
         apply_reload_provider(&mut cfg, &provider);
@@ -3411,6 +3413,7 @@ mod undo_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         }
     }
 

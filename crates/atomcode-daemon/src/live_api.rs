@@ -535,6 +535,7 @@ pub(crate) async fn build_turn_parts(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
+                capable_model: None,
             })
         }
     };

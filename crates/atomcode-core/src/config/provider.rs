@@ -70,6 +70,13 @@ pub struct ProviderConfig {
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]
     pub ephemeral: bool,
+    /// Capability rank for the `task` subagent's strong/weak auto-routing. Higher = more
+    /// capable. A provider WITHOUT this set does NOT participate in tier routing. Populated
+    /// from the AtomGit server's model list at login (or hand-written in config.toml). When
+    /// ≥2 providers carry it, the highest is the `capable` tier and the lowest the `fast`
+    /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capable_model: Option<i64>,
 }
 
 impl ProviderConfig {
@@ -198,6 +205,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -225,6 +233,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
+            capable_model: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
