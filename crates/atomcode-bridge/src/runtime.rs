@@ -323,27 +323,21 @@ impl Bridge {
         // model differs from the host its own SIGNED provider (built here — build_provider
         // + the atomgit signer live in the bridge). A tier equal to the host, or any
         // build failure, leaves the field None ⇒ that tier reuses the host provider slot.
-        // Respawn / ACP assemble sites are intentionally left unset; their tiers collapse
-        // to the host (a `/model` swap at those sites is an explicit override).
+        // Strong/weak routing: create SHARED, swap-aware tier cells. Cheap (config derive
+        // only — the provider builds lazily on first `task` use). Both cells are always
+        // created when the feature is on, so a later `/model` swap can `reset()` them in
+        // place (see `refresh_subagent_tiers`) and routing re-resolves without a respawn.
         if atomcode_coding::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
             if let Ok(full_cfg) =
                 atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
             {
-                let (fast_key, cap_key) =
-                    atomcode_coding::subagent_tiers::resolve_tier_keys(&full_cfg);
                 let host_model = coding_cfg.model.clone();
-                // Prepare LAZY tier builders (cheap: config derive only). The provider is
-                // built on first `task` use, keeping startup off the reqwest-client path.
-                let fast_p = full_cfg
-                    .providers
-                    .get(&fast_key)
-                    .and_then(|pc| tier_builder(&coding_cfg, &host_model, pc));
-                let cap_p = full_cfg
-                    .providers
-                    .get(&cap_key)
-                    .and_then(|pc| tier_builder(&coding_cfg, &host_model, pc));
-                coding_cfg.subagent_fast_provider = fast_p;
-                coding_cfg.subagent_capable_provider = cap_p;
+                let (fast_thunk, cap_thunk) =
+                    resolve_tier_thunks(&coding_cfg, &host_model, &full_cfg);
+                coding_cfg.subagent_fast_provider =
+                    Some(atomcode_coding::TierProvider::new(fast_thunk));
+                coding_cfg.subagent_capable_provider =
+                    Some(atomcode_coding::TierProvider::new(cap_thunk));
             }
         }
 
@@ -1034,6 +1028,10 @@ impl Bridge {
                 }
                 if let Some(p) = config.providers.get(&config.default_provider) {
                     apply_reload_provider(&mut self.coding_cfg, p);
+                    // Re-resolve the subagent tier cells against the NEW host model so
+                    // strong/weak routing follows a `/model` swap (the cells are shared with
+                    // the already-built TaskTool, so no respawn is needed).
+                    refresh_subagent_tiers(&self.coding_cfg);
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             // Assemble BEFORE tearing down the old handle — if
@@ -2680,6 +2678,52 @@ fn tier_builder(
     }
     let tier_cfg = derive_tier_cfg(base, pc);
     Some(std::sync::Arc::new(move || build_provider(&tier_cfg).ok()))
+}
+
+/// Resolve the two `task` tier THUNKS from a loaded config against `host_model`. Each thunk
+/// builds its tier provider lazily on first call; a tier whose model equals the host yields a
+/// thunk that returns `None` (⇒ the TaskTool falls back to the host slot). Always returns a
+/// thunk for BOTH tiers so the cells exist and can be `reset()` on a `/model` swap.
+fn resolve_tier_thunks(
+    base: &CodingAgentConfig,
+    host_model: &str,
+    full_cfg: &atomcode_core::config::Config,
+) -> (atomcode_coding::SubagentProvider, atomcode_coding::SubagentProvider) {
+    let (fast_key, cap_key) = atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg);
+    let none_thunk = || -> atomcode_coding::SubagentProvider { std::sync::Arc::new(|| None) };
+    let thunk_for = |key: &str| -> atomcode_coding::SubagentProvider {
+        full_cfg
+            .providers
+            .get(key)
+            .and_then(|pc| tier_builder(base, host_model, pc))
+            .unwrap_or_else(none_thunk)
+    };
+    (thunk_for(&fast_key), thunk_for(&cap_key))
+}
+
+/// Re-resolve the `task` tier cells against the CURRENT host model and `reset()` them in
+/// place (new thunk + dropped cache), so a mid-session `/model` swap updates strong/weak
+/// routing without re-running `prepare`. No-op when the feature is off (cells are `None`).
+/// The cells are shared `Arc`s, so the already-built TaskTool picks up the change on its
+/// next dispatch.
+fn refresh_subagent_tiers(coding_cfg: &CodingAgentConfig) {
+    if coding_cfg.subagent_fast_provider.is_none() && coding_cfg.subagent_capable_provider.is_none()
+    {
+        return;
+    }
+    let Ok(full_cfg) =
+        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+    else {
+        return; // keep the existing tiers if config can't be read
+    };
+    let host_model = coding_cfg.model.clone();
+    let (fast_thunk, cap_thunk) = resolve_tier_thunks(coding_cfg, &host_model, &full_cfg);
+    if let Some(cell) = &coding_cfg.subagent_fast_provider {
+        cell.reset(fast_thunk);
+    }
+    if let Some(cell) = &coding_cfg.subagent_capable_provider {
+        cell.reset(cap_thunk);
+    }
 }
 
 /// Build an authenticated [`LlmProvider`] directly from a [`BridgeConfig`].

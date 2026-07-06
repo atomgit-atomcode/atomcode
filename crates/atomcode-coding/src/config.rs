@@ -98,24 +98,69 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
-    /// Lazy builder for the `task` tool's FAST tier provider — set by the bridge when the
-    /// fast-tier model differs from the host model. Called ON FIRST `task` use (not at
-    /// startup): building a provider constructs a fresh reqwest client, which loads the OS
-    /// cert store (slow on macOS), so deferring it keeps startup fast — matching how the
-    /// goal/naming/vision providers are built on demand. `None` (outer) ⇒ the fast tier
-    /// reuses the host provider slot; `None` (inner, from the thunk) ⇒ build failed, also
-    /// falls back to host. NOT in the manual `Debug` impl (a thunk isn't `Debug`).
-    pub subagent_fast_provider: Option<SubagentProvider>,
-    /// Lazy builder for the `task` tool's CAPABLE tier provider (same contract as above).
-    pub subagent_capable_provider: Option<SubagentProvider>,
+    /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
+    /// tier reuses the host provider slot. Set by the bridge as a SHARED cell ([`TierProvider`])
+    /// so a mid-session `/model` swap can `reset()` it — re-resolve the tier against the new
+    /// host and drop the cache — and the already-built TaskTool picks up the new routing on its
+    /// next dispatch (no `prepare` rerun). Built ON FIRST use, so startup stays cheap. NOT in
+    /// the manual `Debug` impl.
+    pub subagent_fast_provider: Option<Arc<TierProvider>>,
+    /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
+    pub subagent_capable_provider: Option<Arc<TierProvider>>,
 }
 
-/// A lazily-built subagent tier provider: a thunk the bridge supplies that constructs the
-/// (gateway-signed) provider ON FIRST USE. See the field docs on [`CodingAgentConfig`] for
-/// why the build is deferred. `Some(provider)` on success, `None` if construction failed
-/// (⇒ the tier falls back to the host provider).
+/// A thunk the bridge supplies that constructs a (gateway-signed) tier provider. `Some` on
+/// success, `None` if construction failed (⇒ the tier falls back to the host provider).
 pub type SubagentProvider =
     Arc<dyn Fn() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> + Send + Sync>;
+
+/// A `task`-tier provider cell: lazily built and SWAP-AWARE. Holds a `thunk` (re-resolvable
+/// on a `/model` swap) plus a lazily-populated build `cache`. `get()` builds on first use and
+/// caches (keeps startup cheap — no reqwest client until the first `task`); `reset()` re-points
+/// the thunk and drops the cache. Shared as an `Arc` between [`CodingAgentConfig`] and the
+/// already-built TaskTool, so the bridge can update tier routing on a model swap in place.
+struct TierInner {
+    thunk: SubagentProvider,
+    /// `None` = not built yet; `Some(inner)` = built exactly once (`inner == None` means the
+    /// thunk yielded no provider — host-equal or a failed build — so we do NOT retry the build
+    /// on every dispatch). One `Mutex` over both fields makes `get`/`reset` atomic and prevents
+    /// a concurrent double-build.
+    cache: Option<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>>,
+}
+
+pub struct TierProvider {
+    inner: std::sync::Mutex<TierInner>,
+}
+
+impl TierProvider {
+    pub fn new(thunk: SubagentProvider) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(TierInner { thunk, cache: None }),
+        })
+    }
+
+    /// The built provider (built lazily on first call, then cached — success OR a `None`
+    /// result is remembered, so a failing build isn't re-attempted every dispatch), or `None`
+    /// if the thunk yields none (⇒ the caller falls back to the host slot). Lock poisoning
+    /// cannot occur under the workspace `panic = "abort"` profile, so `unwrap` is unreachable.
+    pub fn get(&self) -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(cached) = &g.cache {
+            return cached.clone();
+        }
+        let built = (g.thunk)();
+        g.cache = Some(built.clone());
+        built
+    }
+
+    /// Re-point at a freshly-resolved thunk and drop the cache — the next `get()` rebuilds.
+    /// Called by the bridge on a `/model` swap so tier routing re-resolves against the new host.
+    pub fn reset(&self, thunk: SubagentProvider) {
+        let mut g = self.inner.lock().unwrap();
+        g.thunk = thunk;
+        g.cache = None;
+    }
+}
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
 /// positive integer, else 300s. Ported from core's env-configurable liveness knob.
@@ -200,6 +245,67 @@ mod tests {
         let c = CodingAgentConfig::new("k", "https://api.example.com/v1", "m", "/tmp");
         assert!(c.subagent_fast_provider.is_none());
         assert!(c.subagent_capable_provider.is_none());
+    }
+
+    #[test]
+    fn tier_provider_builds_once_then_reset_rebuilds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StubP(&'static str);
+        #[async_trait::async_trait]
+        impl atomcode_kernel::provider::LlmProvider for StubP {
+            fn model_name(&self) -> &str {
+                self.0
+            }
+            async fn chat_stream(
+                &self,
+                _m: &[atomcode_kernel::message::Message],
+                _t: &[atomcode_kernel::tool::ToolDef],
+                _o: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                atomcode_kernel::stream::ProviderError,
+            > {
+                unreachable!("not called in this test")
+            }
+        }
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mk = |name: &'static str, builds: Arc<AtomicUsize>| -> SubagentProvider {
+            Arc::new(move || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Some(Arc::new(StubP(name)) as Arc<dyn atomcode_kernel::provider::LlmProvider>)
+            })
+        };
+
+        let cell = TierProvider::new(mk("deepseek", builds.clone()));
+        // Lazy + cached: two gets, one build.
+        assert_eq!(cell.get().unwrap().model_name(), "deepseek");
+        assert_eq!(cell.get().unwrap().model_name(), "deepseek");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "built once, then cached");
+
+        // A /model swap resets the cell: new thunk + dropped cache → next get rebuilds.
+        cell.reset(mk("glm", builds.clone()));
+        assert_eq!(cell.get().unwrap().model_name(), "glm");
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "reset forces a rebuild with the new model");
+    }
+
+    #[test]
+    fn tier_provider_caches_none_result_no_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A thunk that yields no provider (host-equal or a failed build) must be called ONCE,
+        // then its `None` is remembered — not re-attempted (which would re-run build_provider)
+        // every dispatch.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let thunk: SubagentProvider = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let cell = TierProvider::new(thunk);
+        assert!(cell.get().is_none());
+        assert!(cell.get().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "None result must be cached, thunk called once");
     }
 }
 
