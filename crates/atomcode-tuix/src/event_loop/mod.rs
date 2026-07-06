@@ -1504,7 +1504,7 @@ mod buffer_tests {
         let mut pending = None;
 
         assert_eq!(
-            intercept_empty_bare_esc(&mut pending, now),
+            intercept_empty_bare_esc(&mut pending, None, now),
             EmptyEscIntercept::Consumed
         );
         assert_eq!(pending, Some(now));
@@ -1517,10 +1517,65 @@ mod buffer_tests {
         let mut pending = Some(first);
 
         assert_eq!(
-            intercept_empty_bare_esc(&mut pending, second),
+            intercept_empty_bare_esc(&mut pending, None, second),
             EmptyEscIntercept::TriggerUndo
         );
         assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn cooldown_blocks_second_undo_from_mash() {
+        // 冷却期内,一个本会触发 undo(pending 在窗口内)的第二次 Esc 被压制。
+        let undo_at = std::time::Instant::now();
+        let mashed = undo_at + Duration::from_millis(300); // < 冷却
+        let armed = mashed - Duration::from_millis(50); // 距 mashed 50ms → 在 2s 窗口内
+        let mut pending = Some(armed);
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, Some(undo_at), mashed),
+            EmptyEscIntercept::Consumed
+        );
+        assert_eq!(pending, Some(armed), "冷却压制时不得改动 pending");
+    }
+
+    #[test]
+    fn cooldown_blocks_arming_too() {
+        // 冷却期内,第一次 Esc 连武装都不做。
+        let undo_at = std::time::Instant::now();
+        let during = undo_at + Duration::from_millis(300);
+        let mut pending = None;
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, Some(undo_at), during),
+            EmptyEscIntercept::Consumed
+        );
+        assert_eq!(pending, None, "冷却期内不得武装");
+    }
+
+    #[test]
+    fn after_cooldown_double_esc_undoes_again() {
+        let undo_at = std::time::Instant::now();
+        let later = undo_at + DOUBLE_ESC_UNDO_COOLDOWN + Duration::from_millis(1);
+        let mut pending = Some(later - Duration::from_millis(50)); // 在窗口内
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, Some(undo_at), later),
+            EmptyEscIntercept::TriggerUndo
+        );
+    }
+
+    #[test]
+    fn no_prior_undo_keeps_original_behaviour() {
+        // last_undo_at = None → 与改动前完全一致。
+        let now = std::time::Instant::now();
+        let mut pending = Some(now - Duration::from_millis(50));
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending, None, now),
+            EmptyEscIntercept::TriggerUndo
+        );
+        let mut pending2 = None;
+        assert_eq!(
+            intercept_empty_bare_esc(&mut pending2, None, now),
+            EmptyEscIntercept::Consumed
+        );
+        assert_eq!(pending2, Some(now));
     }
 
     #[test]
@@ -3468,6 +3523,10 @@ pub struct App {
     /// Timestamp of the first bare Esc press on an empty idle buffer.
     /// A second Esc within `DOUBLE_ESC_UNDO_WINDOW` triggers `/undo`.
     pub esc_undo_pending: Option<std::time::Instant>,
+    /// When the last double-Esc undo fired. Within `DOUBLE_ESC_UNDO_COOLDOWN`
+    /// of this, a bare Esc neither arms nor triggers undo — so a rapid Esc mash
+    /// undoes at most once per burst.
+    pub esc_undo_last_at: Option<std::time::Instant>,
     /// Set by `/fixissue <url>` while the agent is resolving that issue.
     /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
     /// back as an issue comment + the `fixed` label is applied. Cleared
@@ -3495,6 +3554,10 @@ pub struct App {
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 const DOUBLE_ESC_UNDO_WINDOW: Duration = Duration::from_secs(2);
+/// After a double-Esc undo fires, ignore bare-Esc undo arming for this long so a
+/// rapid Esc mash can't chain multiple undos (the "撤回多轮" complaint). A
+/// deliberate second undo just needs a pause longer than this.
+const DOUBLE_ESC_UNDO_COOLDOWN: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyEscIntercept {
@@ -3508,8 +3571,14 @@ fn second_esc_triggers_undo(pending: Option<std::time::Instant>, now: std::time:
 
 fn intercept_empty_bare_esc(
     pending: &mut Option<std::time::Instant>,
+    last_undo_at: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> EmptyEscIntercept {
+    // Cooldown: within DOUBLE_ESC_UNDO_COOLDOWN of the last undo, a bare Esc
+    // neither arms nor triggers — so a rapid Esc mash undoes at most once.
+    if last_undo_at.is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_UNDO_COOLDOWN) {
+        return EmptyEscIntercept::Consumed;
+    }
     if second_esc_triggers_undo(*pending, now) {
         *pending = None;
         EmptyEscIntercept::TriggerUndo
@@ -3538,6 +3607,7 @@ impl App {
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
             esc_undo_pending: None,
+            esc_undo_last_at: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             setup_pending: false,
@@ -6130,7 +6200,8 @@ fn handle_idle_key(
         && menu_items.is_none()
         && app.buf.text.is_empty()
     {
-        match intercept_empty_bare_esc(&mut app.esc_undo_pending, std::time::Instant::now()) {
+        let now = std::time::Instant::now();
+        match intercept_empty_bare_esc(&mut app.esc_undo_pending, app.esc_undo_last_at, now) {
             EmptyEscIntercept::Consumed => {
                 app.exit_pending = None;
                 // Surface the second-press affordance, mirroring the
@@ -6146,6 +6217,7 @@ fn handle_idle_key(
             }
             EmptyEscIntercept::TriggerUndo => {
                 app.exit_pending = None;
+                app.esc_undo_last_at = Some(now);
                 dispatch_undo("", &app.state, ctx, renderer);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
