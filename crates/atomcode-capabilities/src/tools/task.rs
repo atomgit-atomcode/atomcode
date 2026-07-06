@@ -109,14 +109,17 @@ several. Subagents run in parallel and cannot themselves dispatch."
     }
 
     fn risk(&self, args: &str) -> RiskLevel {
-        match serde_json::from_str::<Args>(args) {
+        // Use the SAME repair-aware parse as `execute` so a `worker` dispatch with
+        // control-char args is still detected as Risky (not silently downgraded to
+        // Safe, which would let a file-editing worker skip the approval gate).
+        match parse_task_args(args) {
             Ok(a) if a.tasks.iter().any(|t| t.subagent_type == "worker") => RiskLevel::Risky,
             _ => RiskLevel::Safe,
         }
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let parsed: Args = match serde_json::from_str(args) {
+        let parsed: Args = match parse_task_args(args) {
             Ok(a) => a,
             Err(e) => {
                 return ToolResult {
@@ -148,6 +151,9 @@ several. Subagents run in parallel and cannot themselves dispatch."
             } else {
                 (self.make_fast_provider)()
             };
+            // Capture the actual model this subtask runs on (for display + routing proof)
+            // BEFORE the provider is moved into the child builder.
+            let model = provider.model_name().to_string();
             let tools = if is_worker {
                 (self.make_worker_tools)()
             } else {
@@ -194,14 +200,14 @@ several. Subagents run in parallel and cannot themselves dispatch."
                         ..Default::default()
                     },
                 };
-                (label, desc, outcome)
+                (label, desc, model, outcome)
             });
         }
 
         // Collect all child results (order determined by completion, then sorted by label).
         // The outer closure always returns Ok(tuple); inner JoinErrors are handled at the
         // inner spawn site above and mapped to an errored Outcome.
-        let mut collected: Vec<(String, String, Outcome)> = Vec::new();
+        let mut collected: Vec<(String, String, String, Outcome)> = Vec::new();
         while let Some(res) = set.join_next().await {
             if let Ok(tuple) = res {
                 collected.push(tuple);
@@ -212,7 +218,7 @@ several. Subagents run in parallel and cannot themselves dispatch."
 
         let mut blocks: Vec<String> = Vec::new();
         let mut any_error = false;
-        for (label, desc, outcome) in collected {
+        for (label, desc, model, outcome) in collected {
             let is_err = outcome.stop != StopReason::Stopped;
             any_error |= is_err;
             let (state, tag, body) = if is_err {
@@ -237,7 +243,7 @@ several. Subagents run in parallel and cannot themselves dispatch."
                     .join("\n");
                 ("completed", "task_result", joined)
             };
-            blocks.push(render_task_block(&label, &desc, state, tag, &body));
+            blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
         }
 
         ToolResult {
@@ -249,10 +255,32 @@ several. Subagents run in parallel and cannot themselves dispatch."
     }
 }
 
-/// Wrap a child-agent result in an opencode-style `<task>` block.
-fn render_task_block(id: &str, summary: &str, state: &str, tag: &str, body: &str) -> String {
+/// Parse the tool args, repairing unescaped control characters on failure (weak
+/// models / gateways sometimes emit a raw newline inside a JSON string value, which
+/// serde rejects). Repairs ONLY on failure, so valid JSON is never altered. Shared by
+/// `risk` and `execute` so both agree on whether a dispatch contains a `worker` — a
+/// mismatch would let a file-editing worker with control-char args skip the approval
+/// gate.
+fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
+    match serde_json::from_str::<Args>(args) {
+        Ok(a) => Ok(a),
+        Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
+    }
+}
+
+/// Wrap a child-agent result in an opencode-style `<task>` block. `model` is the
+/// model the subagent actually ran on (surfaced so the user can see which tier/model
+/// executed — the strong/weak routing proof).
+fn render_task_block(
+    id: &str,
+    summary: &str,
+    model: &str,
+    state: &str,
+    tag: &str,
+    body: &str,
+) -> String {
     format!(
-        "<task id=\"{id}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+        "<task id=\"{id}\" model=\"{model}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
     )
 }
 
@@ -372,5 +400,61 @@ mod tests {
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error, "expected error result, got: {}", out.content);
         assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn task_block_carries_provider_model() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        );
+        let args = r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#;
+        let out = tool.execute(args, &ctx()).await;
+        // The block surfaces the actual model the subagent ran on (MockProvider::model_name).
+        assert!(out.content.contains("model=\"mock\""), "missing model attr: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn control_char_in_args_is_repaired() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        );
+        // A RAW newline (0x0A) inside the `prompt` string value — serde rejects this
+        // outright ("control character found"); the try-then-repair path must recover it.
+        let args = "{\"tasks\":[{\"description\":\"d\",\"prompt\":\"line1\nline2\",\"subagent_type\":\"explore\"}]}";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(args).is_err(),
+            "test premise: raw control char must be invalid JSON"
+        );
+        let out = tool.execute(args, &ctx()).await;
+        assert!(
+            !out.content.contains("invalid task args"),
+            "repair should have recovered the args, got: {}",
+            out.content
+        );
+        assert!(out.content.contains("<task_result>"), "expected a result: {}", out.content);
+    }
+
+    #[test]
+    fn worker_with_control_char_args_still_risky() {
+        // A worker dispatch whose args carry a raw control char must NOT be downgraded
+        // to Safe (which would skip the approval gate while execute() repairs + spawns).
+        let worker = "{\"tasks\":[{\"description\":\"d\",\"prompt\":\"a\nb\",\"subagent_type\":\"worker\"}]}";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(worker).is_err(),
+            "test premise: raw control char must be invalid JSON"
+        );
+        assert!(matches!(dummy().risk(worker), RiskLevel::Risky));
     }
 }
