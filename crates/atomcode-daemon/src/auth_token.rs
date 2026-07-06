@@ -14,6 +14,7 @@ use axum::{
     response::Response,
 };
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -152,6 +153,23 @@ pub async fn require_app_user_id(
         // app_user_id 未设置（非 /app 模式 / 桌面未登录）：不校验，放行。
         return Ok(next.run(req).await);
     }
+
+    // 滑动过期：8 小时无活动则拒，并关闭 App Server 断开隧道。
+    // last_activity 由 activity_tracker_middleware 在每次 API 请求时自动更新。
+    const IDLE_MS: i64 = 8 * 3600 * 1000;
+    let now = crate::now_unix_ms();
+    let last = state.last_activity.load(Ordering::Relaxed);
+    if now.saturating_sub(last) > IDLE_MS {
+        tracing::warn!(
+            "app token expired by inactivity: idle={}ms > {}ms; shutting down app server",
+            now - last,
+            IDLE_MS,
+        );
+        // 关掉 App Server → relay-client 失去目标 → kill_on_drop 清理子进程 → 隧道断开
+        crate::stop_app_server();
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     // 从请求头读取 App 端传来的 user_id
     let actual = req
         .headers()

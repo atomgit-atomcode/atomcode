@@ -1654,6 +1654,14 @@ fn execute_slash_command_impl(
                             sid,
                             initial,
                         );
+                        // 1.5) 检查登录态：未登录不允许开启远程访问。
+                        if atomcode_core::auth::oauth::get_stored_auth().is_none() {
+                            renderer.render(UiLine::CommandOutput(
+                                "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。".to_string(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
