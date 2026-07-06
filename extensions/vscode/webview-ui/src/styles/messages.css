@@ -157,6 +157,12 @@
   white-space: normal;
 }
 
+.user-message-plain-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .user-message-text.is-collapsed {
   max-height: min(260px, 34vh);
   overflow: hidden;

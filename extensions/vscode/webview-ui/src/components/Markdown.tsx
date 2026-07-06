@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useCallback, useMemo } from 'react';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { postMessage } from '../vscode';
-import { renderCodeBlockHtml } from './codeBlockRendering';
+import { escapeHtml, renderCodeBlockHtml } from './codeBlockRendering';
 import { prepareMarkdownForRender } from './streamingMarkdown';
 import { useT } from '../i18n';
 
@@ -14,6 +14,22 @@ marked.setOptions({
 interface MarkdownProps {
   content: string;
   streaming?: boolean;
+}
+
+export function markdownToHtml(
+  content: string,
+  streaming = false,
+  labels: { copy?: string } = {},
+): string {
+  const renderer = new marked.Renderer();
+  renderer.code = function (code: string, infostring?: string) {
+    return renderCodeBlockHtml(code, infostring, labels);
+  };
+  renderer.html = function (html: string) {
+    return escapeHtml(html);
+  };
+  const source = prepareMarkdownForRender(content, streaming);
+  return marked.parse(source, { renderer }) as string;
 }
 
 export function Markdown({ content, streaming = false }: MarkdownProps) {
@@ -51,12 +67,7 @@ export function Markdown({ content, streaming = false }: MarkdownProps) {
   }, [handleActions]);
 
   const html = useMemo(() => {
-    const renderer = new marked.Renderer();
-    renderer.code = function (code: string, infostring?: string) {
-      return renderCodeBlockHtml(code, infostring, { copy: t('assistant.copy') });
-    };
-    const source = prepareMarkdownForRender(content, streaming);
-    const raw = marked.parse(source, { renderer }) as string;
+    const raw = markdownToHtml(content, streaming, { copy: t('assistant.copy') });
     return DOMPurify.sanitize(raw);
   }, [content, streaming, t]);
 

@@ -10,6 +10,7 @@ import {
 } from '../src/components/artifactRendering';
 import { renderCodeBlockHtml } from '../src/components/codeBlockRendering';
 import { parseDiff } from '../src/components/DiffView';
+import { markdownToHtml } from '../src/components/Markdown';
 import { prepareMarkdownForRender, repairStreamingMarkdown } from '../src/components/streamingMarkdown';
 
 declare const require: {
@@ -469,6 +470,22 @@ function testUserMessageContainerDoesNotForceMarkdownPreWrap() {
   assert.match(css, /\.user-message-text\s*\{[^}]*white-space:\s*normal;/s);
 }
 
+function testUserMessageRendersPlainTextInsteadOfMarkdown() {
+  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+
+  assert.doesNotMatch(source, /import\s+\{\s*Markdown\s*\}/);
+  assert.doesNotMatch(source, /<Markdown\s+content=\{message\.text\}/);
+  assert.match(source, /className="user-message-plain-text"/);
+  assert.match(source, /\{message\.text\}/);
+}
+
+function testUserPlainTextCssPreservesLiteralInput() {
+  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+
+  assert.match(css, /\.user-message-plain-text\s*\{[^}]*white-space:\s*pre-wrap;/s);
+  assert.match(css, /\.user-message-plain-text\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
+}
+
 function testInlineArtifactCodeKeepsCodeBlockBorder() {
   const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
 
@@ -535,6 +552,92 @@ function testFinalMarkdownProtectsFenceInsideInlineCodeSpan() {
   assert.match(html, /```/);
 }
 
+function testMarkdownRawHtmlIsEscapedInsteadOfDroppedBySanitizer() {
+  const html = markdownToHtml('请输出一段 </script> 和 <script>alert(1)</script> 文本');
+
+  assert.match(html, /&lt;\/script&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+}
+
+function testMarkdownTableDoesNotSwallowFollowingPlainText() {
+  const markdown = [
+    '| 示例（Pandoc） | 示例（Slidev） |',
+    '|--|--|',
+    '| image | image |',
+    '后续内容',
+  ].join('\n');
+  const html = renderMarkdownForTest(prepareMarkdownForRender(markdown, false));
+
+  assert.match(html, /<\/table>\s*<p>后续内容<\/p>/);
+  assert.doesNotMatch(html, /<td>后续内容<\/td>/);
+}
+
+function testMarkdownTableWithSingleDashDelimiterDoesNotSwallowFollowingPlainText() {
+  const markdown = [
+    '| A | B |',
+    '|-|-|',
+    '| x | y |',
+    '后续内容',
+  ].join('\n');
+  const html = renderMarkdownForTest(prepareMarkdownForRender(markdown, false));
+
+  assert.match(html, /<\/table>\s*<p>后续内容<\/p>/);
+  assert.doesNotMatch(html, /<td>后续内容<\/td>/);
+}
+
+function testMarkdownTableDoesNotSwallowFollowingFencedCode() {
+  const markdown = [
+    '| A | B |',
+    '|--|--|',
+    '| x | y |',
+    '```ts',
+    'const value = 1;',
+    '```',
+  ].join('\n');
+  const html = renderMarkdownForTest(prepareMarkdownForRender(markdown, false));
+
+  assert.match(html, /<\/table>\s*<pre><code class="language-ts">const value = 1;/);
+  assert.doesNotMatch(html, /<td>```ts<\/td>/);
+}
+
+function testMarkdownTableRepairDoesNotChangeFencedCodeSamples() {
+  const markdown = [
+    '```markdown',
+    '| A | B |',
+    '|--|--|',
+    '| x | y |',
+    'plain',
+    '```',
+  ].join('\n');
+
+  assert.equal(prepareMarkdownForRender(markdown, false), markdown);
+}
+
+function testMarkdownTableRepairDoesNotChangeHtmlBlocks() {
+  const markdown = [
+    '<div>',
+    '| A | B |',
+    '|--|--|',
+    'plain',
+    '</div>',
+  ].join('\n');
+
+  assert.equal(prepareMarkdownForRender(markdown, false), markdown);
+}
+
+function testMarkdownTableRepairKeepsMarkedOneColumnRows() {
+  const markdown = [
+    '| A |',
+    '|--|',
+    'plain',
+  ].join('\n');
+  const html = renderMarkdownForTest(prepareMarkdownForRender(markdown, false));
+
+  assert.match(html, /<td>plain<\/td>/);
+  assert.doesNotMatch(html, /<p>plain<\/p>/);
+}
+
 function testGenerationDoneReloadsFinishedSessionHistory() {
   const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
   const onDone = source.match(/onDone:\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n\s*\},\n\s*onStopped:/)?.[0] ?? '';
@@ -568,10 +671,19 @@ testUnifiedDiffMetadataIsNotTreatedAsChangedCode();
 testDiffViewDropsDiffLanguageSentinel();
 testDiffSingleLineCssLetsBackgroundFillTheBlock();
 testUserMessageContainerDoesNotForceMarkdownPreWrap();
+testUserMessageRendersPlainTextInsteadOfMarkdown();
+testUserPlainTextCssPreservesLiteralInput();
 testInlineArtifactCodeKeepsCodeBlockBorder();
 testPreCodeDoesNotUseInlineCodePillStyling();
 testMissingUserImagePlaceholderHasStableThumbnailSizing();
 testStreamingMarkdownRepairsUnclosedCodeFence();
 testStreamingMarkdownLeavesClosedCodeFenceUnchanged();
 testFinalMarkdownProtectsFenceInsideInlineCodeSpan();
+testMarkdownRawHtmlIsEscapedInsteadOfDroppedBySanitizer();
+testMarkdownTableDoesNotSwallowFollowingPlainText();
+testMarkdownTableWithSingleDashDelimiterDoesNotSwallowFollowingPlainText();
+testMarkdownTableDoesNotSwallowFollowingFencedCode();
+testMarkdownTableRepairDoesNotChangeFencedCodeSamples();
+testMarkdownTableRepairDoesNotChangeHtmlBlocks();
+testMarkdownTableRepairKeepsMarkedOneColumnRows();
 testGenerationDoneReloadsFinishedSessionHistory();

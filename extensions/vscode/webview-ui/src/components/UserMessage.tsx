@@ -1,6 +1,5 @@
 import React, { useMemo, useState } from 'react';
 import { ChatMessage } from '../state/types';
-import { Markdown } from './Markdown';
 import { useT } from '../i18n';
 
 interface UserMessageProps {
@@ -56,7 +55,7 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
           </div>
         )}
         <div className={`user-message-text${shouldCollapse && !expanded ? ' is-collapsed' : ''}`}>
-          <Markdown content={message.text} />
+          <div className="user-message-plain-text">{message.text}</div>
         </div>
         {shouldCollapse && (
           <button
