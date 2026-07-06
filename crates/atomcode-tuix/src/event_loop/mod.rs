@@ -11044,8 +11044,9 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         let reason = if ok {
             None
         } else {
-            body.find("subagent failed (").and_then(|i| {
-                let r = &body[i + "subagent failed (".len()..];
+            // Must match TaskTool's error-block emitter (task.rs): "subagent stopped early (Reason): …".
+            body.find("subagent stopped early (").and_then(|i| {
+                let r = &body[i + "subagent stopped early (".len()..];
                 r.find(')').map(|j| r[..j].to_string())
             })
         };
@@ -11237,7 +11238,8 @@ mod task_render_tests {
 
     #[test]
     fn result_failure_shows_reason() {
-        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"error\">\n<summary>d</summary>\n<task_error>\nsubagent failed (Timeout): byte-idle\n</task_error>\n</task>";
+        // Body format must match TaskTool's emitter: "subagent stopped early (Reason): …".
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"error\">\n<summary>d</summary>\n<task_error>\nsubagent stopped early (Timeout): byte-idle\n</task_error>\n</task>";
         let s = summarise_task_result(out);
         assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2717} failed (Timeout)");
     }
