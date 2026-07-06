@@ -82,9 +82,11 @@ impl CommandRegistry {
 /// At launch: delete this gate, uncomment the `/app` entry in `BUILTIN_COMMANDS`,
 /// and remove the guard in the dispatch `"app"` arm. (A `fn`, not a `const`, so
 /// the call site doesn't const-fold into an `unreachable_code` warning.)
-pub(crate) fn app_remote_enabled() -> bool {
-    true
-}
+// pub(crate) fn app_remote_enabled() -> bool {
+//     std::env::var("ATOMCODE_ENABLE_APP")
+//         .map(|v| !v.trim().is_empty())
+//         .unwrap_or(false)
+// }
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },

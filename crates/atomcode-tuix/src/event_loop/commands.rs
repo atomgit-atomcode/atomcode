@@ -1553,13 +1553,13 @@ fn execute_slash_command_impl(
             // implementation below is intentionally preserved — re-enable via
             // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
             // in BUILTIN_COMMANDS).
-            if !crate::commands::app_remote_enabled() {
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
+//             if !crate::commands::app_remote_enabled() {
+//                 renderer.render(UiLine::Error(
+//                     t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
+//                 ));
+//                 renderer.flush();
+//                 return Ok(());
+//             }
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
             // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
