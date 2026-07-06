@@ -3289,6 +3289,10 @@ async fn process_chat_request(
                     auto_resuming,
                 });
             }
+            TurnEvent::WakeupScheduled { .. } => {
+                // Loop wakeup scheduling is a TUI-only concern; the HTTP/daemon
+                // path does not implement timed wakeups yet.
+            }
         }
     }
 

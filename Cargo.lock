@@ -376,12 +376,14 @@ name = "atomcode-bridge"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-core",
  "atomcode-kernel",
  "atomcode-telemetry",
  "getrandom 0.2.17",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

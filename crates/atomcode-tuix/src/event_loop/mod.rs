@@ -17,6 +17,8 @@ pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod live_sync;
+pub(crate) mod loop_ctrl;
+pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
@@ -943,6 +945,9 @@ pub struct LoopCtx {
     /// askpass is not supported on Windows.
     #[cfg(unix)]
     pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>,
+    /// Active fixed-interval loop controller. `None` when no `/loop N …` is
+    /// running. Task 12 wires the timer that flips `due` and fires the payload.
+    pub loop_ctrl: Option<loop_ctrl::LoopController>,
 }
 
 /// A transient hint shown on the status line, with auto-dismiss deadline.
@@ -3641,6 +3646,63 @@ pub enum ExitReason {
     UpgradeRestart { exe: std::path::PathBuf },
 }
 
+/// Drive one decision step of a fixed-interval `/loop`.
+///
+/// Turn-completion driven: this is the *only* place an interval payload
+/// actually fires. The wall-clock deadline arm in `run_loop` merely flips
+/// `due = true` and calls us; we ask the controller's pure `decide(idle)`:
+///
+/// - `Fire`  → idle + due: re-fire the payload (and re-arm the next deadline).
+/// - `Skip`  → either not due yet, or busy (a turn is mid-flight). We do
+///   nothing now; when that turn finishes the TurnComplete path calls us
+///   again and — if still due — fires then. This is what prevents a livelock
+///   when the payload's runtime exceeds the interval: a missed deadline
+///   collapses into a single catch-up fire on the next idle edge, never a
+///   backlog.
+/// - `Stop`  → round/max or 3 consecutive failures: tear the loop down and
+///   surface a notice.
+///
+/// `idle` is derived from `UiPhase::Idle` so "the agent finished its turn"
+/// and "safe to fire" are the same gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_loop_decision(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let idle = matches!(state.phase, UiPhase::Idle);
+    let action = match ctx.loop_ctrl.as_ref() {
+        Some(c) => c.decide(idle),
+        None => return,
+    };
+    match action {
+        crate::event_loop::loop_ctrl::LoopAction::Fire => commands::fire_interval_payload(
+            state,
+            ctx,
+            renderer,
+            active_modal,
+            fixissue_pending,
+            fixissue_buffer,
+            setup_pending,
+        ),
+        crate::event_loop::loop_ctrl::LoopAction::Skip => {}
+        crate::event_loop::loop_ctrl::LoopAction::Stop => {
+            ctx.loop_ctrl = None;
+            state.loop_label = None;
+            state.loop_round = 0;
+            state.loop_started_at = None;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::LoopStopped).into_owned(),
+            ));
+            renderer.flush();
+        }
+    }
+}
+
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
@@ -3979,6 +4041,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     loop {
         sync_terminal_title(&ctx, renderer, &mut last_terminal_title, app.state.phase);
 
+        // ── Fixed-interval /loop deadline ──
+        // Snapshot the next wall-clock fire instant BEFORE select! so the
+        // timer arm's future borrows this local `Instant` rather than `ctx`
+        // (the other arms already hold `&mut ctx.<field>` borrows; a second
+        // `&ctx` inside the macro's future-construction phase would conflict).
+        // Recomputed every loop turn — `fire_interval_payload` re-arms
+        // `next_fire_at`, so the snapshot stays in lock-step with the
+        // controller. `None` when no interval loop is active → the arm's
+        // future parks on `pending()` and its `if` guard keeps it inert.
+        let loop_next_fire: Option<std::time::Instant> =
+            ctx.loop_ctrl.as_ref().and_then(|c| c.next_fire_at);
+
         #[cfg(unix)]
         tokio::select! {
             // Biased ordering: spinner first so whenever a tick is
@@ -4005,6 +4079,31 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming)
                 && app.active_modal.as_ref().map_or(true, |m| !m.captures_all_keys()) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+            }
+
+            // ── Fixed-interval /loop deadline ──
+            // The wall-clock instant when the active interval loop is next
+            // due. Firing is turn-completion driven, so this arm ONLY flips
+            // `due = true`; the actual re-fire happens after the select! in
+            // the shared `handle_loop_decision` call (which checks idleness).
+            // When busy, `decide` returns Skip and `due` stays latched until
+            // the in-flight turn completes — that's what stops a slow payload
+            // (runtime > interval) from livelocking into a backlog.
+            _ = async {
+                match loop_next_fire {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if loop_next_fire.is_some() => {
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.due = true;
+                    // Re-arm next_fire_at: if the payload turn runs longer than
+                    // the interval, leaving next_fire_at in the past makes this
+                    // biased arm perpetually-ready, starving the agent-event arm
+                    // below it (UI freeze + CPU spin). The latched `due` still
+                    // drives the single catch-up fire on the next idle edge.
+                    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+                }
             }
 
             // ── Terminal input ──
@@ -4446,6 +4545,28 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
             }
 
+            // ── Fixed-interval /loop deadline ──
+            // Mirror of the unix arm: flip `due = true` when the wall-clock
+            // deadline passes; the shared post-select! `handle_loop_decision`
+            // does the idle-gated re-fire. See the unix arm for the
+            // anti-livelock rationale.
+            _ = async {
+                match loop_next_fire {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if loop_next_fire.is_some() => {
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.due = true;
+                    // Re-arm next_fire_at: if the payload turn runs longer than
+                    // the interval, leaving next_fire_at in the past makes this
+                    // biased arm perpetually-ready, starving the agent-event arm
+                    // below it (UI freeze + CPU spin). The latched `due` still
+                    // drives the single catch-up fire on the next idle edge.
+                    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+                }
+            }
+
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
@@ -4766,6 +4887,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     );
                 }
             }
+        }
+
+        // ── Fixed-interval /loop decision (turn-completion driven) ──
+        // Runs after EVERY select! wakeup, so it sees both edges that matter:
+        //   • the deadline arm just latched `due = true` → fire now if idle;
+        //   • a TurnComplete just flipped the phase to Idle → fire a `due`
+        //     payload that was deferred while the previous turn was running.
+        // `decide(idle)` collapses both into one gate: Fire only when idle
+        // AND due, Skip otherwise (no livelock), Stop at the round/failure
+        // limit. No-op when no interval loop is active.
+        if ctx.loop_ctrl.is_some() {
+            handle_loop_decision(
+                &mut app.state,
+                &mut ctx,
+                renderer,
+                &mut app.active_modal,
+                &mut app.fixissue_pending,
+                &mut app.fixissue_buffer,
+                &mut app.setup_pending,
+            );
         }
 
         if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
@@ -6929,6 +7070,21 @@ mod streaming_slash_tests {
     }
 
     #[test]
+    fn loop_halt_subcommands_run_mid_stream() {
+        // A running /loop (fixed-interval payload turn OR self-paced continuation)
+        // keeps the TUI in Streaming, where commands are otherwise blocked. So
+        // `/loop stop` (and aliases) MUST be whitelisted or the loop can't be
+        // stopped by command (only Esc), which is the reported bug.
+        for sub in ["stop", "off", "clear", "cancel", "reset", "none"] {
+            let got = exec(&format!("/loop {sub}"));
+            assert_eq!(got, Some(("loop".to_string(), sub.to_string())), "sub={sub}");
+        }
+        // bare /loop (status) and setting a new loop must NOT run mid-stream.
+        assert_eq!(exec("/loop"), None);
+        assert_eq!(exec("/loop 5m /diff"), None);
+    }
+
+    #[test]
     fn bg_no_arg_runs_but_setting_a_goal_does_not() {
         assert_eq!(exec("/bg"), Some(("bg".to_string(), String::new())));
         // Backgrounding a NEW message and SETTING a new goal must NOT run mid-stream.
@@ -7093,6 +7249,19 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
             "clear" | "stop" | "off" | "reset" | "none" | "cancel"
         ) {
             return Some(("goal".to_string(), arg.trim().to_string()));
+        }
+    }
+    // `/loop` halt sub-commands must also run mid-stream: a fixed-interval payload
+    // turn or a self-paced continuation keeps the TUI in Streaming, where commands are
+    // otherwise blocked — so a typed `/loop stop` had no effect (only Esc worked).
+    // A bare `/loop` (status) or `/loop <new spec>` is intentionally NOT whitelisted.
+    if cmd.eq_ignore_ascii_case("loop") {
+        let head = arg.trim().split_whitespace().next().unwrap_or("");
+        if matches!(
+            head.to_ascii_lowercase().as_str(),
+            "stop" | "off" | "clear" | "cancel" | "reset" | "none"
+        ) {
+            return Some(("loop".to_string(), arg.trim().to_string()));
         }
     }
     None
@@ -7992,9 +8161,25 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
             crate::i18n::fmt_tokens(ps.total_tokens),
             cached,
         )
+    } else if ps.was_loop_round {
+        // Mid-loop continuation banner: `⚡ loop round N · stats`.
+        // Uses state.loop_round directly (0-based internally; we show 1-based
+        // by adding 1 and then taking max(1) so round 0 displays as 1).
+        let stats = format!(
+            "{} tools · {} · {} tokens{}",
+            ps.tool_call_count,
+            dur,
+            crate::i18n::fmt_tokens(ps.total_tokens),
+            cached,
+        );
+        crate::i18n::t(crate::i18n::Msg::LoopRound {
+            round: (state.loop_round + 1).max(1) as u32,
+            stats: &stats,
+        })
+        .into_owned()
     } else {
-        // Reached only if a non-goal turn was ever buffered (today they
-        // render immediately). Kept as a correct fallback either way.
+        // Reached only if a non-goal/non-loop turn was ever buffered (today
+        // they render immediately). Kept as a correct fallback either way.
         turn_summary_label(
             state,
             ps.errored,
@@ -8288,6 +8473,9 @@ fn handle_agent_event(
             | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
             | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
             | AgentEvent::GoalUpdate { active: true, .. }
+            // LoopUpdate(active=true) signals a new loop round beginning — flush any
+            // buffered separator as `⚡ loop round N` before the round's first event.
+            | AgentEvent::LoopUpdate { active: true, .. }
             | AgentEvent::TurnCancelled { .. }
             | AgentEvent::Error { .. }
     );
@@ -8811,14 +8999,27 @@ fn handle_agent_event(
                     tool_call_count,
                     total_tokens,
                     was_goal_round: true,
+                    was_loop_round: false,
+                    errored,
+                    cached_pct,
+                });
+            } else if state.loop_label.is_some() {
+                // A /loop is active: DEFER the separator. The next event can be
+                // a new LLM turn start (flushed by should_flush_now as
+                // `⚡ loop round N · stats`) or a LoopUpdate(active=false) that
+                // signals the loop ended (handled by the LoopUpdate branch itself).
+                state.pending_separator = Some(crate::state::PendingSeparator {
+                    duration,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens,
+                    was_goal_round: false,
+                    was_loop_round: true,
                     errored,
                     cached_pct,
                 });
             } else {
-                // No active goal: render the turn summary immediately, exactly
-                // as before the /goal merge — the line lands at the bottom of
-                // the turn that just finished instead of waiting for the next
-                // event. Same i18n + Error-aware label as the deferred path.
+                // No active goal or loop: render the turn summary immediately.
                 let dur = crate::render::fmt_dur(duration);
                 let label = turn_summary_label(
                     state,
@@ -9489,6 +9690,36 @@ fn handle_agent_event(
                 // Now flush the buffered separator as a stats-only line —
                 // the verdict above already conveys what happened, the
                 // separator just visually closes the turn.
+                flush_pending_separator(state, renderer, /* as_goal_end */ true);
+            }
+        }
+        AgentEvent::LoopUpdate { active, round, label, last_reason, .. } => {
+            if active {
+                state.loop_label = Some(label);
+                state.loop_round = round;
+                if state.loop_started_at.is_none() {
+                    state.loop_started_at = Some(std::time::Instant::now());
+                }
+            } else {
+                if state.loop_label.is_some() {
+                    if let Some(reason) = last_reason.as_deref() {
+                        let silent = reason.contains("cancelled")
+                            || reason.contains("cleared by user");
+                        if !silent {
+                            renderer.render(UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::LoopEnded { reason })
+                                    .into_owned(),
+                            ));
+                            renderer.flush();
+                        }
+                    }
+                }
+                state.loop_label = None;
+                state.loop_round = 0;
+                state.loop_started_at = None;
+                // Flush any buffered separator as a bare stats line — the
+                // loop-end banner above already conveyed what happened, the
+                // separator just visually closes the last turn.
                 flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
@@ -10236,6 +10467,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         round: state.goal_round + 1,
         elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
     });
+    // Active /loop → the dedicated footer loop row. Mirrors GoalStatus exactly,
+    // using the loop label as the condition equivalent. Goal takes priority if
+    // somehow both are active simultaneously (they shouldn't be).
+    let loop_status = state.loop_label.as_ref().map(|label| crate::render::LoopStatus {
+        label: label.clone(),
+        // Display 1-based: the engine's round is 0-based internally.
+        round: state.loop_round + 1,
+        elapsed_secs: state.loop_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -10251,6 +10491,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         },
         session_name,
         goal,
+        loop_status,
     }
 }
 

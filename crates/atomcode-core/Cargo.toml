@@ -95,4 +95,9 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_Window
 tempfile = "3"
 wiremock = "0.6"
 serial_test = "3"
+# `test-util` enables tokio's paused-clock test helpers (start_paused /
+# time::pause / advance) used by the self-paced /loop wrapper tests. Dev-only:
+# cargo unions this with the main tokio dependency, so the prod build is
+# unaffected.
+tokio = { version = "1", features = ["test-util"] }
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }

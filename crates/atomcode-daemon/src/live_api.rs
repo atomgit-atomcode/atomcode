@@ -1891,7 +1891,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             | TE::ToolBatchStarted { .. }
             | TE::ToolBatchCompleted { .. }
             | TE::ContextStats { .. }
-            | TE::WorkingDirChanged(_) => return None,
+            | TE::WorkingDirChanged(_)
+            | TE::WakeupScheduled { .. } => return None,
         },
     })
 }

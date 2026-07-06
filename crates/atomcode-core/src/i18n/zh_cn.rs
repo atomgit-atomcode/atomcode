@@ -964,6 +964,20 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GoalNoActive =>
             "  当前没有进行中的目标。\n  用法：/goal <条件>   |   /goal help\n".into(),
         Msg::GoalCleared => "  已清除目标。\n".into(),
+
+        // ── /loop ──
+        Msg::LoopStatus { label, round, mins, secs } =>
+            format!("  ↻ loop：{} · 第 {} 轮 · {}分 {}秒\n", label, round, mins, secs).into(),
+        Msg::LoopNoActive =>
+            "  当前没有进行中的 /loop。\n  用法：/loop <间隔> <命令>  或  /loop <任务>\n".into(),
+        Msg::LoopCleared => "  已停止 /loop。\n".into(),
+        Msg::LoopRound { round, stats } =>
+            format!("⚡ loop 第 {} 轮 · {}", round, stats).into(),
+        Msg::LoopStopped => "⚠ loop 已停止（达到次数上限）\n".into(),
+        Msg::LoopEnded { reason } =>
+            format!("  ↻ Loop 已结束：{reason}\n").into(),
+        Msg::CmdDescLoop =>
+            "按固定间隔重复执行提示/命令，或让模型自主决定节奏".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",

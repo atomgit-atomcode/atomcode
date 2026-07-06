@@ -146,6 +146,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // requires the condition text; `/goal status` / `/goal clear` still work by
     // typing the sub-command + Enter.
     Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true },
+    Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
@@ -237,6 +238,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "goal" => Msg::CmdDescGoal,
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
+        "loop" => Msg::CmdDescLoop,
         _ => return None,
     };
     Some(t(msg))

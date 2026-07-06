@@ -467,6 +467,143 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
+/// Fire one iteration of a fixed-interval `/loop`.
+///
+/// Bumps the round, clears `due`, and re-arms `next_fire_at` (so the next
+/// wall-clock deadline is measured from *this* fire, not from when the
+/// previous payload eventually finished). Then dispatches the payload:
+///
+/// - `Prompt` → enqueue a `SendMessage` to the agent. Prompts can't be
+///   judged success/failure synchronously (the turn runs async), so they
+///   always reset `consecutive_failures` — the round either drives a turn
+///   to completion or the user stops the loop.
+/// - `Slash`  → run `execute_slash_command` inline; its `Result` decides
+///   whether `consecutive_failures` increments (3 in a row → `decide`
+///   returns `Stop`).
+///
+/// Callers must thread `execute_slash_command`'s extra params through so a
+/// slash payload can open modals / drive the fixissue + setup side-channels
+/// exactly as a typed command would.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_interval_payload(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let payload = match ctx.loop_ctrl.as_mut() {
+        Some(c) => {
+            c.round += 1;
+            c.due = false;
+            c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+            state.loop_round = c.round;
+            c.payload.clone()
+        }
+        None => return,
+    };
+    match payload {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage {
+                    text,
+                    images: vec![],
+                    image_markers: vec![],
+                })
+                .ok();
+            state.on_submit();
+            if let Some(c) = ctx.loop_ctrl.as_mut() {
+                c.consecutive_failures = 0;
+            }
+        }
+        crate::event_loop::loop_ctrl::LoopPayload::Slash { cmd, arg } => {
+            let name = cmd.trim_start_matches('/');
+            let res = execute_slash_command(
+                name,
+                &arg,
+                state,
+                ctx,
+                renderer,
+                active_modal,
+                fixissue_pending,
+                fixissue_buffer,
+                setup_pending,
+            );
+            if let Some(c) = ctx.loop_ctrl.as_mut() {
+                if res.is_err() {
+                    c.consecutive_failures += 1;
+                } else {
+                    c.consecutive_failures = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Fully stop any active `/loop`: sends `ClearLoop` to halt the core
+/// self-paced loop engine AND clears the TUI fixed-interval controller plus
+/// all three mirror fields. Idempotent — safe to call when no loop is active.
+pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
+    if ctx.loop_ctrl.is_some() || state.loop_label.is_some() {
+        ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+        ctx.loop_ctrl = None;
+        state.loop_label = None;
+        state.loop_round = 0;
+        state.loop_started_at = None;
+    }
+}
+
+/// Start a fixed-interval `/loop`: parse the raw payload into a
+/// `LoopPayload`, install a fresh `LoopController` on `ctx`, seed the
+/// status-bar label/round/start-clock, and fire the first iteration
+/// immediately (so `/loop 5m /foo` runs `/foo` now, then every 5m).
+///
+/// A payload starting with `/` is a slash command (split into cmd + arg on
+/// the first whitespace); anything else is a free-text prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_interval_loop(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    secs: u64,
+    payload: String,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let p = if payload.starts_with('/') {
+        let (cmd, arg) = payload
+            .split_once(char::is_whitespace)
+            .unwrap_or((payload.as_str(), ""));
+        crate::event_loop::loop_ctrl::LoopPayload::Slash {
+            cmd: cmd.to_string(),
+            arg: arg.trim().to_string(),
+        }
+    } else {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(payload.clone())
+    };
+    let mut c = crate::event_loop::loop_ctrl::LoopController::new_interval(secs, p);
+    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+    // Honor configured max_rounds (parity with self-paced mode).
+    c.max_rounds = ctx.config.loop_config.max_rounds;
+    ctx.loop_ctrl = Some(c);
+    state.loop_label = Some(format!("{secs}s · {payload}"));
+    state.loop_round = 0;
+    state.loop_started_at = Some(std::time::Instant::now());
+    fire_interval_payload(
+        state,
+        ctx,
+        renderer,
+        active_modal,
+        fixissue_pending,
+        fixissue_buffer,
+        setup_pending,
+    );
+}
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -2727,6 +2864,87 @@ fn execute_slash_command_impl(
                 }
             }
         }
+        "loop" => {
+            use crate::event_loop::loop_parse::{parse_loop_arg, LoopArg};
+            match parse_loop_arg(arg) {
+                LoopArg::Status => {
+                    if let Some(ref label) = state.loop_label.clone() {
+                        let secs = state
+                            .loop_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = secs / 60;
+                        let secs_rem = secs % 60;
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopStatus {
+                                label: label.as_str(),
+                                round: (state.loop_round + 1) as u32,
+                                mins,
+                                secs: secs_rem,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopNoActive).into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                LoopArg::Stop => {
+                    stop_active_loop(state, ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopCleared).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::SelfPaced { prompt } => {
+                    // Replace any existing loop (both self-paced core and
+                    // fixed-interval TUI controller) before setting a new one.
+                    stop_active_loop(state, ctx);
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetLoop { prompt: prompt.clone() })
+                        .ok();
+                    state.loop_label = Some(prompt.clone());
+                    state.loop_round = 0;
+                    state.loop_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: prompt,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                }
+                LoopArg::Interval { secs, payload } => {
+                    // Fixed-interval mode: stop any currently running loop
+                    // (self-paced or fixed-interval) first, then install a
+                    // fresh wall-clock LoopController and fire the first
+                    // iteration now. The TUI event loop's deadline arm +
+                    // TurnComplete hook re-fire it on schedule while the agent
+                    // is idle (see run_loop / handle_loop_decision).
+                    stop_active_loop(state, ctx);
+                    start_interval_loop(
+                        state,
+                        ctx,
+                        renderer,
+                        secs,
+                        payload,
+                        active_modal,
+                        fixissue_pending,
+                        fixissue_buffer,
+                        setup_pending,
+                    );
+                }
+                LoopArg::Error(msg) => {
+                    renderer.render(UiLine::Error(msg));
+                    renderer.flush();
+                }
+            }
+        }
         "plugin" => {
             // Bare `/plugin` opens the interactive manager; subcommands
             // (`marketplace …`, `install x@mp`, …) keep their old behavior.
@@ -4110,6 +4328,11 @@ pub(crate) fn reset_to_new_session(
     renderer: &mut dyn Renderer,
 ) {
     ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    // /clear and /session must also halt any active /loop (both self-paced
+    // core and fixed-interval TUI controller).  stop_active_loop sends its
+    // own ClearLoop which is harmless to duplicate — it arrives after
+    // ClearConversation and is idempotent on the core side.
+    stop_active_loop(state, ctx);
     ctx.current_session_id = None;
     state.total_tokens = 0;
     state.prompt_tokens = 0;

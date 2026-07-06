@@ -755,6 +755,7 @@ pub async fn run(
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         #[cfg(unix)]
         askpass_rx,
+        loop_ctrl: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

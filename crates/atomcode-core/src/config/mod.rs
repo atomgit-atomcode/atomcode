@@ -48,6 +48,21 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// /loop command configuration. Persisted as the `[loop_config]` table
+/// (NOT `[loop]` — `loop` is a Rust keyword and is rejected by toml_edit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopConfig {
+    /// Hard cap on /loop iterations (both modes) before auto-stop.
+    pub max_rounds: u32,
+}
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self { max_rounds: 100 }
+    }
+}
+
 /// Sub-agent execution policy (enable + resilience knobs).
 /// Drives `agent::parallel_edit::SubAgentTask::execute` and the
 /// `try_sub_agent_dispatch` config gate.
@@ -130,6 +145,10 @@ pub struct Config {
     /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
     #[serde(default)]
     pub subagent: SubAgentConfig,
+    /// /loop command policy. Missing from older configs → max_rounds=100.
+    /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
+    #[serde(default)]
+    pub loop_config: LoopConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -358,6 +377,7 @@ impl Default for Config {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            loop_config: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
@@ -1168,6 +1188,7 @@ mod tests {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            loop_config: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),

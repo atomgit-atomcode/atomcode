@@ -334,6 +334,12 @@ pub struct UiState {
     pub goal_round: u32,
     /// When the goal was started, for elapsed-time display.
     pub goal_started_at: Option<std::time::Instant>,
+    /// Active loop label (prompt text), if a `/loop` is running.
+    pub loop_label: Option<String>,
+    /// Current round number of the running loop.
+    pub loop_round: u32,
+    /// When the loop was started, for elapsed-time display.
+    pub loop_started_at: Option<std::time::Instant>,
     /// Per-turn stats buffered from the most recent `TurnComplete`. The
     /// separator line is NOT rendered immediately so that — if the next
     /// event happens to be `GoalUpdate(active=false)` (the goal just
@@ -362,6 +368,9 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/goal` (decides `↻` vs `✓`
     /// when flushed without a goal-end event).
     pub was_goal_round: bool,
+    /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
+    /// vs the normal summary when flushed mid-loop).
+    pub was_loop_round: bool,
     /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
     /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
     /// the red Error line (preserves the pre-/goal-merge behaviour).
@@ -453,6 +462,9 @@ impl UiState {
             goal_condition: None,
             goal_round: 0,
             goal_started_at: None,
+            loop_label: None,
+            loop_round: 0,
+            loop_started_at: None,
             pending_separator: None,
         }
     }

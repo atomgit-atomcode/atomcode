@@ -446,6 +446,27 @@ impl CodingParts {
         let names: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
         self.registry.mount(&names)
     }
+
+    /// Register an EXTRA driver-contributed tool into the kernel toolset, so it is
+    /// both resolvable during a turn AND exposed to the model (added to `tool_names`,
+    /// which [`mount`](Self::mount) reads). The `registry` / `tool_names` fields are
+    /// crate-private — this is the supported seam for a driver (the bridge) to inject
+    /// a tool the always-on capability set doesn't include.
+    ///
+    /// Idempotent on name: re-registering the same name (e.g. on a respawn that
+    /// re-injects the bridge's `schedule_wakeup`) replaces the tool in the registry
+    /// and does NOT duplicate the name, keeping the mounted tool list (a cache prefix)
+    /// byte-stable across respawns.
+    ///
+    /// Call BEFORE [`assemble`] (it snapshots the toolset via `mount`). The bridge
+    /// uses this for its kernel-side `schedule_wakeup` (`/loop`).
+    pub fn register_extra_tool(&mut self, tool: Arc<dyn atomcode_kernel::tool::Tool>) {
+        let name = tool.name().to_string();
+        if !self.tool_names.iter().any(|n| n == &name) {
+            self.tool_names.push(name);
+        }
+        self.registry.register(tool);
+    }
 }
 
 /// Phase 2 — composition: parts + provider → a runnable [`Agent`].

@@ -2548,6 +2548,9 @@ async fn run_headless(
                     eprintln!("[compact] {}", label);
                 }
             }
+            AgentEvent::LoopUpdate { .. } => {
+                // Loop progress — headless mode ignores for now.
+            }
         }
     }
 

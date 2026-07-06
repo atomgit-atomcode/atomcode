@@ -138,6 +138,62 @@ fn format_goal_row(
     format!("{marker}{cond}{meta}")
 }
 
+/// Loop marker: `⚡` (Lightning, U+26A1, Miscellaneous Symbols) when unicode is
+/// available, `*` fallback for legacy terminals. Width-1 + trailing space,
+/// matching the layout contract of `goal_marker`.
+fn loop_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "⚡ "
+    } else {
+        "* "
+    }
+}
+
+/// The three display segments of the dedicated footer loop row, width-fitted:
+/// `(marker, label, meta)`. Mirrors `goal_row_parts` exactly — marker in Brand
+/// color, label in normal text, meta (` · round N · elapsed`) muted.
+///
+/// `round` is shown verbatim (callers pass a 1-based value). Elapsed `13s`
+/// under a minute else `2m13s`. The meta is RESERVED; label fills the rest and
+/// is truncated with `…`. CJK/width-safe via `crate::width`.
+fn loop_row_parts(
+    label: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = loop_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let icon_w = crate::width::display_width(marker);
+    let meta = format!(" · round {round} · {elapsed}");
+    let meta_w = crate::width::display_width(&meta);
+    let label_budget = max_cols.saturating_sub(icon_w).saturating_sub(meta_w);
+    if label_budget == 0 {
+        // Too narrow for any label — drop it, keep marker + round/elapsed.
+        let bare = format!("round {round} · {elapsed}");
+        let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
+        return (marker, String::new(), meta_only);
+    }
+    let lbl = crate::width::truncate_with_ellipsis(label, label_budget);
+    (marker, lbl, meta)
+}
+
+/// Full loop-row text joined. Thin wrapper over [`loop_row_parts`] for tests.
+#[cfg(test)]
+fn format_loop_row(
+    label: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, lbl, meta) = loop_row_parts(label, round, elapsed_secs, max_cols, unicode);
+    format!("{marker}{lbl}{meta}")
+}
+
 /// Format a token count using k/m units. `round_clean=true` drops the
 /// decimal when the value is an exact multiple of the unit (used for
 /// the model's advertised window — `128_000` → `128k`, `1_000_000` →
@@ -1496,6 +1552,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    /// Build the dedicated loop row (one full-width line, shown only while a
+    /// `/loop` is active). Sits in the same slot as the goal row — goal and loop
+    /// are mutually exclusive in practice. Layout: `⚡` marker in Brand color,
+    /// label in normal text, ` · round N · elapsed` meta in Muted gray.
+    fn build_loop_row(&self, ls: &crate::render::LoopStatus, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let (marker, label, meta) = loop_row_parts(
+            &scrub_controls(&ls.label),
+            ls.round,
+            ls.elapsed_secs,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, &label, &CellStyle::default());
+        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
+        row
+    }
+
     /// Paint the full footer into `self.screen`. Layout mirrors
     /// `AnsiRenderer::draw_footer_here_with_prev_cursor`:
     ///
@@ -1583,15 +1658,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // Dedicated goal row: one full-width line above the status row, only
-        // while a `/goal` loop is active.
-        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
+        // Dedicated goal/loop row: one full-width line above the status row, shown
+        // while a `/goal` OR `/loop` is active (they are mutually exclusive in
+        // practice, so at most one row is ever reserved here).
+        let goal_rows = if self.status.goal.is_some() || self.status.loop_status.is_some() {
+            1
+        } else {
+            0
+        };
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
         // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
         // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text). The goal row is folded into the
+        // sub-threshold pastes, typed text). The goal/loop row is folded into the
         // status-rows reservation so the input box height accounts for it too.
         let max_input_rows =
             Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
@@ -1638,10 +1718,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let goal_cells = status_clone
-            .goal
-            .as_ref()
-            .map(|g| self.build_goal_row(g, rule_width));
+        // Goal and loop rows occupy the same slot (at most one is shown at a
+        // time).  Goal takes priority if somehow both are set.
+        let goal_cells: Option<Vec<Cell>> = if let Some(g) = status_clone.goal.as_ref() {
+            Some(self.build_goal_row(g, rule_width))
+        } else if let Some(ls) = status_clone.loop_status.as_ref() {
+            Some(self.build_loop_row(ls, rule_width))
+        } else {
+            None
+        };
         let menu_kind = self
             .menu
             .as_ref()
@@ -1784,13 +1869,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
+        let goal_rows = if self.status.goal.is_some() || self.status.loop_status.is_some() {
+            1
+        } else {
+            0
+        };
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
         let capped_middle = middle_rows
             .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
         1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
@@ -5372,6 +5461,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
         }
     }
 
@@ -5397,6 +5487,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -5451,6 +5542,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -5497,6 +5589,7 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
