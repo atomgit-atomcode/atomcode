@@ -70,6 +70,13 @@ pub struct ProviderConfig {
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]
     pub ephemeral: bool,
+    /// Capability rank for the `task` subagent's strong/weak auto-routing. Higher = more
+    /// capable. A provider WITHOUT this set does NOT participate in tier routing. Populated
+    /// from the AtomGit server's model list at login (or hand-written in config.toml). When
+    /// ≥2 providers carry it, the highest is the `capable` tier and the lowest the `fast`
+    /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capable_model: Option<i64>,
 }
 
 impl ProviderConfig {
@@ -198,6 +205,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -225,11 +233,32 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
+            capable_model: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             serialized.contains("skip_tls_verify = true"),
             "skip_tls_verify should be serialized when true"
         );
+    }
+
+    #[test]
+    fn capable_model_round_trips_and_skips_none() {
+        // Hand-written (or server-persisted) rank parses.
+        let toml_str = r#"
+            type = "openai"
+            model = "GLM-5.2"
+            base_url = "https://llm-api.atomgit.com/v1"
+            context_window = 200000
+            capable_model = 1
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.capable_model, Some(1));
+        // Round-trips on save, and `None` is not emitted (existing configs stay clean).
+        let s = toml::to_string(&cfg).expect("serialize");
+        assert!(s.contains("capable_model = 1"), "set rank must serialize");
+        let none_cfg = ProviderConfig { capable_model: None, ..cfg };
+        let s2 = toml::to_string(&none_cfg).expect("serialize");
+        assert!(!s2.contains("capable_model"), "None must not be serialized");
     }
 }

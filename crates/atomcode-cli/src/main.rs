@@ -1463,6 +1463,7 @@ async fn run() -> Result<i32> {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                capable_model: None,
             },
             String::new(),
         )

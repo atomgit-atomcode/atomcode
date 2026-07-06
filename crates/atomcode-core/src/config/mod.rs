@@ -1215,6 +1215,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                capable_model: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -1427,6 +1428,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                capable_model: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -1505,6 +1507,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                capable_model: None,
             },
         );
         Config {
@@ -1566,6 +1569,7 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
+                capable_model: None,
             },
         );
         assert!(cfg.can_handle_attached_images());

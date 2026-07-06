@@ -488,6 +488,7 @@ impl SubAgentTask {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
+                capable_model: None,
 
 }),
         };

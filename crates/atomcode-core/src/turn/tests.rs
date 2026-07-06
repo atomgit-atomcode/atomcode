@@ -287,6 +287,7 @@ fn test_config() -> Config {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
 
 },
     );
@@ -325,6 +326,7 @@ fn make_runner(
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
+        capable_model: None,
 
 };
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
@@ -1478,6 +1480,7 @@ mod telemetry_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: true,
+            capable_model: None,
 
 };
         let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
