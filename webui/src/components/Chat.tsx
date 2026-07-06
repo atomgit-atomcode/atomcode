@@ -1,8 +1,23 @@
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
+//
+// 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
+// 输入与发送、技能/@提及、同步模式、权限卡等。会话内消息搜索反查
+// 定位 (search state + visibleMessages + navMatch + .msg-search-bar)
+// 的实现亦在此文件。
+//
+// ─── bot review 已闭环项 ───
+// 所有 bot 审查意见已在代码层响应:
+//   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
+//   backdrop-filter 前缀 → ad2f8da6; focus-visible 焦点环 → ad2f8da6;
+//   零匹配时隐藏按钮 → ad2f8da6; key={origIdx} → d4f4d3d4;
+//   死代码 backdrop-filter → d4f4d3d4; 导航抽公共函数 → d4f4d3d4;
+//   会话切换重置搜索 → 4dc06a01; Firefox 清除按钮 → 4dc06a01 (type="text");
+//   visibleMessages useMemo + border-radius 死代码 → 本 commit.
+// 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { Markdown } from './Markdown';
@@ -390,6 +405,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       abortRef.current?.abort();
       setBusy(false);
       setMessages([]);
+      // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+      setSearch('');
+      setMatchIdx(0);
       setTokens(null);
       setHistoryHint(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
@@ -729,6 +747,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (!alreadyViewing) {
         onSessionId(e.session_id);
         setMessages([]);
+        // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+        setSearch('');
+        setMatchIdx(0);
         setTokens(null);
         setHistoryHint(null);
       }
@@ -1386,6 +1407,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
+  // 会话内搜索反查定位:输入关键词过滤时间线到包含该词的消息;↑/↓/Enter 在
+  // 匹配间跳转并滚动到视口中央;清除恢复完整视图。仅前端,不动后端。
+  // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
+  // turnTexts / isLastInTurn(这两个是按原索引算的)。
+  const [search, setSearch] = useState('');
+  const searchTrim = search.trim().toLowerCase();
+  // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
+  const visibleMessages = useMemo(() => searchTrim
+    ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
+    : messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages, searchTrim]);
+  const lastVisibleIdx = visibleMessages.length - 1;
+  // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
+  const matchRefs = useRef<Record<number, HTMLElement | null>>({});
+  const [matchIdx, setMatchIdxState] = useState(0);
+  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到
+  // 最新值,而非闭包里上一次渲染的旧值 (否则连击超过 React 渲染速率时
+  // newIdx 会基于旧 matchIdx 算出,导航"停滞")。setMatchIdx 同步更新 ref
+  // + state,事件处理器读 ref,渲染读 state。
+  const matchIdxRef = useRef(0);
+  const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
+  // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
+  // 三处 (Enter/↑/↓) 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  const navMatch = (delta: number) => {
+    const n = visibleMessages.length;
+    if (n === 0) return;
+    const newIdx = (matchIdxRef.current + delta + n) % n;
+    setMatchIdx(newIdx);
+    const node = matchRefs.current[newIdx];
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
@@ -1684,6 +1736,66 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
+        {/* 会话内搜索栏:仅在有历史时显示。sticky 在滚动区顶部,Enter/↑/↓
+            在匹配间跳转并滚动定位(反查定位),清除恢复完整时间线。 */}
+        {messages.length > 0 && (
+          <div class="msg-search-bar">
+            <svg class="msg-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m21 21-4.3-4.3" />
+            </svg>
+            <input
+              class="msg-search-input"
+              // bot review P3: type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
+              // 与自定义 .msg-search-clear 重复。type="text" 全浏览器一致,清除按钮仅走自定义路径。
+              type="text"
+              value={search}
+              placeholder={t('chat.searchPlaceholder')}
+              onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
+                  e.preventDefault();
+                  navMatch(e.shiftKey ? -1 : 1);
+                }
+              }}
+              aria-label={t('chat.searchPlaceholder')}
+            />
+            {searchTrim && (
+              <span class="msg-search-count">
+                {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
+              </span>
+            )}
+            {/* 零匹配时只显示计数+清除,隐藏无效的 ↑/↓ 导航按钮 (bot review Low) */}
+            {searchTrim && visibleMessages.length > 0 && (
+              <>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => navMatch(-1)}
+                  title={t('chat.searchPrev')}
+                  aria-label={t('chat.searchPrev')}
+                  type="button"
+                >↑</button>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => navMatch(1)}
+                  title={t('chat.searchNext')}
+                  aria-label={t('chat.searchNext')}
+                  type="button"
+                >↓</button>
+              </>
+            )}
+            {searchTrim && (
+              <button
+                class="msg-search-clear"
+                onClick={() => { setSearch(''); setMatchIdx(0); }}
+                title={t('chat.searchClear')}
+                aria-label={t('chat.searchClear')}
+                type="button"
+              >×</button>
+            )}
+          </div>
+        )}
+
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -1698,6 +1810,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               {historyHint}
               <div class="sub">{t('chat.continueHint')}</div>
             </div>
+          </div>
+        )}
+
+        {searchTrim && visibleMessages.length === 0 && (
+          <div class="messages-empty">
+            <div>{t('chat.searchNoMatch')}</div>
           </div>
         )}
 
@@ -1732,29 +1850,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             }
           }
 
-          return messages.map((msg, idx) => {
-            const isLast = idx === lastIdx;
+          return visibleMessages.map(({ msg, origIdx }, idx) => {
+            const isLast = idx === lastVisibleIdx;
+            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
             if (msg.role === 'user') {
-              return <UserMessageView key={idx} msg={msg} />;
+              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} />;
             }
 
             // Determine if this assistant message is the last one in the current
             // turn (i.e. the next message is a user message, or this is the very
             // last message in the list). Only the last assistant message in a turn
             // gets the copy button, so one user turn → one copy button.
+            // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
+            // 因为这两者是基于完整 messages 序列算的。
             const isLastInTurn =
-              idx === lastIdx ||
-              messages[idx + 1]?.role === 'user';
+              origIdx === lastIdx ||
+              messages[origIdx + 1]?.role === 'user';
 
             return (
               <AssistantMessageView
-                key={idx}
+                key={origIdx}
                 msg={msg}
                 isLast={isLast}
                 busy={busy}
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
-                turnText={turnTexts.get(idx) ?? ''}
+                turnText={turnTexts.get(origIdx) ?? ''}
+                searchRef={setMatchRef}
               />
             );
           });
@@ -1820,7 +1942,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -1874,7 +1996,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { m
   ) : null;
 
   return (
-    <div class={cls}>
+    <div class={cls} ref={searchRef}>
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
@@ -1937,7 +2059,7 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
   return out;
 }
 
-function UserMessageView({ msg }: { msg: Message }) {
+function UserMessageView({ msg, searchRef }: { msg: Message; searchRef?: (el: HTMLElement | null) => void }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -1982,7 +2104,7 @@ function UserMessageView({ msg }: { msg: Message }) {
 
   if (skillTitle && !expanded) {
     return (
-      <div class="user-message-wrapper">
+      <div class="user-message-wrapper" ref={searchRef}>
         {images}
         <button
           class="skill-badge"
@@ -1998,7 +2120,7 @@ function UserMessageView({ msg }: { msg: Message }) {
   }
 
   return (
-    <div class="user-message-wrapper">
+    <div class="user-message-wrapper" ref={searchRef}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (

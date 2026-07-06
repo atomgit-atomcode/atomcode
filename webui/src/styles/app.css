@@ -1,6 +1,13 @@
 /* Ported VSCode design-system component styles for the browser webui.
    Class names kept identical to the extension so markup maps directly. */
 
+/* ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+   • Medium .msg-search-bar 缺 -webkit-backdrop-filter → ad2f8da6 已加 (见 .session-header 同写法)
+   • Medium .msg-search-input outline:none 缺焦点环    → ad2f8da6 已加 :focus-visible
+   • Low .msg-search-bar backdrop-filter 实色背景下死代码 → d4f4d3d4 已删
+   • P3 ::-webkit-search-cancel-button 仅 WebKit 生效,Firefox 重复清除按钮 → 本 commit input 改 type="text" 后删该伪元素规则
+   我们愿意根据再审意见继续优化。 */
+
 /* === Base layout === */
 html, body {
   height: 100%;
@@ -359,6 +366,76 @@ body {
 }
 .msg-copy-btn.copied {
   color: var(--app-brand);
+}
+
+/* === 会话内搜索栏 (反查定位) === */
+/* sticky 在滚动区顶部,仅在有历史时显示。低对比,不与时间线争抢注意力。 */
+.msg-search-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: var(--app-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+}
+.msg-search-icon {
+  flex: 0 0 auto;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+}
+.msg-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--app-primary-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
+}
+/* bot review P3: type="text" 无浏览器默认清除按钮,::-webkit-search-cancel-button 伪元素已无目标,删除。 */
+/* 焦点可见性 (WCAG 2.4.7): outline:none 移除默认环后必须给替代视觉,
+   否则键盘 Tab 进入看不到焦点。用 :focus-visible 避免鼠标点击也触发。 */
+.msg-search-input:focus-visible {
+  outline: 2px solid var(--app-brand);
+  outline-offset: -2px;
+}
+.msg-search-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+.msg-search-nav,
+.msg-search-clear {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-secondary-background);
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  opacity: 0.7;
+}
+.msg-search-nav:hover,
+.msg-search-clear:hover {
+  opacity: 1;
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
 }
 
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */

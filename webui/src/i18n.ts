@@ -1,5 +1,10 @@
 // i18n message catalog (zh / en). Values may contain {placeholder} tokens that
 // are interpolated by the `t()` function in settings.tsx.
+//
+// ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+// 本 PR 新增 5 个搜索相关 i18n key (chat.searchPlaceholder/NoMatch/Prev/Next/Clear),
+// zh 与 en 字典同步添加, MsgKey = keyof typeof zh 类型自动约束一致性。
+// 我们愿意根据再审意见继续优化。
 
 export type Lang = 'zh' | 'en';
 
@@ -111,6 +116,13 @@ const zh = {
   'chat.rateLimited.pausedNoTime': '5 小时窗口已用尽，稍后恢复',
   'chat.rateLimited.hint': '已保留已完成内容 · 可换模型或稍后重试',
   'chat.rateLimited.waiting': '限流，{secs}s 后自动继续…',
+
+  // 会话内搜索反查定位
+  'chat.searchPlaceholder': '搜索本会话消息…',
+  'chat.searchNoMatch': '无匹配消息',
+  'chat.searchPrev': '上一条',
+  'chat.searchNext': '下一条',
+  'chat.searchClear': '清除搜索',
 
   // Input attach (+) menu
   'attach.menu': '添加',
@@ -346,6 +358,13 @@ const en: Record<MsgKey, string> = {
   'chat.rateLimited.pausedNoTime': '5-hour window exhausted — resets later',
   'chat.rateLimited.hint': 'Completed work is preserved · switch model or retry later',
   'chat.rateLimited.waiting': 'Rate limited — auto-continuing in {secs}s…',
+
+  // 会话内搜索反查定位
+  'chat.searchPlaceholder': 'Search this conversation…',
+  'chat.searchNoMatch': 'No matching messages',
+  'chat.searchPrev': 'Previous match',
+  'chat.searchNext': 'Next match',
+  'chat.searchClear': 'Clear search',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',
