@@ -1165,6 +1165,11 @@ fn execute_slash_command_impl(
                         t(Msg::SaveInvalidPath { path: &p }).into_owned(),
                     ));
                 }
+                SaveOutcome::RefuseOverwrite(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveRefuseOverwrite { path: &p }).into_owned(),
+                    ));
+                }
             }
             renderer.flush();
         }
@@ -4731,6 +4736,39 @@ enum SaveOutcome {
     IoError(String),
     /// The requested path is invalid or its parent directory does not exist.
     InvalidPath(String),
+    /// The target already exists and is NOT a markdown file — refuse to clobber
+    /// it (a `/save mydata.py` typo would otherwise overwrite source/config with
+    /// the transcript). Carries the target path for the message.
+    RefuseOverwrite(String),
+}
+
+/// Expand a leading `~` / `~/` in `arg` to `home`, mirroring shell behaviour so
+/// `/save ~/notes.md` lands in the home dir instead of a literal `./~/` folder
+/// (consistent with read_file / glob, which already expand `~`). Pure over
+/// `home` so it is unit-testable without touching the environment. A bare `~`
+/// → home; `~/x` → home/x; `~user` and everything else pass through unchanged
+/// (we don't resolve other users' homes). No home known → `arg` as-is.
+fn expand_tilde_path(arg: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let Some(home) = home else {
+        return std::path::PathBuf::from(arg);
+    };
+    if arg == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = arg.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(arg)
+}
+
+/// Whether `path`'s extension marks it as a markdown file (case-insensitive
+/// `md` / `markdown`). Used to gate the "refuse to overwrite a non-markdown
+/// file" guard.
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
 }
 
 /// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
@@ -4786,7 +4824,9 @@ fn resolve_save(
     let path = if arg.is_empty() {
         std::path::PathBuf::from(default_save_filename())
     } else {
-        std::path::PathBuf::from(arg)
+        // Expand `~` (sudo-aware home via crate::platform) so `/save ~/x.md`
+        // works like it does in the shell / other file-taking commands.
+        expand_tilde_path(arg, crate::platform::home_dir().as_deref())
     };
 
     // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
@@ -4796,6 +4836,16 @@ fn resolve_save(
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
         }
+    }
+
+    // Refuse to overwrite an existing NON-markdown file: `/save` is a markdown
+    // export, so a target like `config.py` / `.bashrc` / a bare `notes` that
+    // already exists is almost certainly a typo, and clobbering it loses data.
+    // Overwriting an existing `.md` (re-export) is fine; a NEW file of any name
+    // is fine (no clobber). The default filename is always a fresh timestamped
+    // `.md`, so it never trips this.
+    if path.is_file() && !is_markdown_path(&path) {
+        return SaveOutcome::RefuseOverwrite(path.to_string_lossy().into_owned());
     }
 
     match std::fs::write(&path, content) {
@@ -5660,9 +5710,53 @@ mod copy_tests {
 #[cfg(test)]
 mod save_tests {
     use super::{
-        default_save_filename, render_save_markdown, resolve_save, SaveOutcome,
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save, SaveOutcome,
     };
     use atomcode_core::conversation::message::{Message, Role};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn expand_tilde_path_maps_home_prefix() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(expand_tilde_path("~", Some(&home)), home);
+        assert_eq!(expand_tilde_path("~/notes.md", Some(&home)), home.join("notes.md"));
+        // Not a home-relative path → unchanged.
+        assert_eq!(expand_tilde_path("report.md", Some(&home)), PathBuf::from("report.md"));
+        assert_eq!(expand_tilde_path("/abs/x.md", Some(&home)), PathBuf::from("/abs/x.md"));
+        // `~user` is NOT expanded (we don't resolve other users' homes).
+        assert_eq!(expand_tilde_path("~bob/x", Some(&home)), PathBuf::from("~bob/x"));
+        // No home known → passthrough (never fabricate a path).
+        assert_eq!(expand_tilde_path("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_existing_non_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.py");
+        std::fs::write(&target, "SECRET = 1\n").unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        match resolve_save(&msgs, target.to_str().unwrap()) {
+            SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
+            other => panic!("expected RefuseOverwrite, got {other:?}"),
+        }
+        // The existing file must be untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET = 1\n");
+    }
+
+    #[test]
+    fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        // Existing .md → overwrite is fine (re-export).
+        let md = dir.path().join("report.md");
+        std::fs::write(&md, "old").unwrap();
+        assert!(matches!(resolve_save(&msgs, md.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
+        // A NEW non-md file (no clobber) → allowed.
+        let fresh = dir.path().join("notes");
+        assert!(matches!(resolve_save(&msgs, fresh.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(Path::new(&fresh).is_file());
+    }
 
     /// Build a Vec<Message> from (role, text) pairs for test fixtures.
     fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {

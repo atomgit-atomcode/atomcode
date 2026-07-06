@@ -642,6 +642,9 @@ pub enum Msg<'a> {
     SaveIoError { error: &'a str },
     /// `/save`: the requested path's parent directory does not exist.
     SaveInvalidPath { path: &'a str },
+    /// `/save`: the target already exists and is NOT a markdown file — refused
+    /// to overwrite it (likely a typo that would clobber source/config/data).
+    SaveRefuseOverwrite { path: &'a str },
     /// Hint shown after a code block is auto-copied to clipboard (issue #699).
     CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.

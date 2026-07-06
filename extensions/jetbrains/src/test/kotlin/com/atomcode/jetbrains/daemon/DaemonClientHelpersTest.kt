@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.daemon
 
+import com.google.gson.JsonParser
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -31,6 +32,16 @@ class DaemonClientHelpersTest {
     }
 
     @Test
+    fun `jsonQuoted escapes all JSON control characters`() {
+        val input = "tab:\t cr:\r backspace:\b formfeed:\u000C nul:\u0000"
+
+        val quoted = input.jsonQuoted()
+
+        assertEquals("\"tab:\\t cr:\\r backspace:\\b formfeed:\\f nul:\\u0000\"", quoted)
+        assertEquals(input, JsonParser.parseString(quoted).asString)
+    }
+
+    @Test
     fun `jsonQuoted handles mixed special characters`() {
         assertEquals("\"a\\\\b \\\"c\\\"\\nd\"", "a\\b \"c\"\nd".jsonQuoted())
     }
@@ -44,6 +55,38 @@ class DaemonClientHelpersTest {
     @Test
     fun `jsonQuotedOrNull delegates to jsonQuoted for non-null`() {
         assertEquals("\"test\"", "test".jsonQuotedOrNull())
+    }
+
+    @Test
+    fun `formatDaemonHttpError uses json error field`() {
+        val message = formatDaemonHttpError(400, """{"error":"bad request"}""")
+
+        assertEquals("Daemon request failed: HTTP 400: bad request", message)
+    }
+
+    @Test
+    fun `formatDaemonHttpError uses json message field`() {
+        val message = formatDaemonHttpError(413, """{"message":"Failed to buffer the request body"}""")
+
+        assertEquals("Daemon request failed: HTTP 413: Failed to buffer the request body", message)
+    }
+
+    @Test
+    fun `formatDaemonHttpError unwraps json string bodies`() {
+        val message = formatDaemonHttpError(404, """"Session not found"""")
+
+        assertEquals("Daemon request failed: HTTP 404: Session not found", message)
+    }
+
+    @Test
+    fun `formatDaemonHttpError trims raw html bodies`() {
+        val html = "<!DOCTYPE html>" + "x".repeat(600)
+        val prefix = "Daemon request failed: HTTP 404: "
+
+        val message = formatDaemonHttpError(404, html)
+
+        assertEquals(550, message.length)
+        assertEquals(prefix + html.take(550 - prefix.length - 3) + "...", message)
     }
 
     @Test

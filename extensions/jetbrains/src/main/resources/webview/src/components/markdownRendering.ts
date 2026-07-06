@@ -1,9 +1,20 @@
+import { marked } from 'marked';
+
 interface FenceState {
   marker: '`' | '~';
   length: number;
 }
 
 const INLINE_FENCE_PROTECTOR = '\u200b';
+
+export function escapeHtml(source: string): string {
+  return String(source ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function stripLineBreak(line: string): string {
   return line.replace(/[\r\n]+$/, '');
@@ -23,9 +34,7 @@ function fenceOpen(line: string): FenceState | null {
   if (marker !== '`' && marker !== '~') return null;
 
   let markerEnd = index;
-  while (markerEnd < raw.length && raw[markerEnd] === marker) {
-    markerEnd += 1;
-  }
+  while (markerEnd < raw.length && raw[markerEnd] === marker) markerEnd += 1;
   const length = markerEnd - index;
   if (length < 3) return null;
 
@@ -46,9 +55,7 @@ function fenceClose(line: string, state: FenceState): boolean {
   if (indent > 3) return false;
 
   let markerEnd = index;
-  while (markerEnd < raw.length && raw[markerEnd] === state.marker) {
-    markerEnd += 1;
-  }
+  while (markerEnd < raw.length && raw[markerEnd] === state.marker) markerEnd += 1;
 
   return markerEnd - index >= state.length && raw.slice(markerEnd).trim() === '';
 }
@@ -63,15 +70,11 @@ function nextInlineCodeDelimiter(line: string, delimiter: number | null): number
     }
 
     let end = index;
-    while (end < line.length && line[end] === '`') {
-      end += 1;
-    }
+    while (end < line.length && line[end] === '`') end += 1;
 
     const length = end - index;
     if (delimiter === null) {
-      if (length < 3) {
-        delimiter = length;
-      }
+      if (length < 3) delimiter = length;
     } else if (length === delimiter) {
       delimiter = null;
     }
@@ -82,18 +85,15 @@ function nextInlineCodeDelimiter(line: string, delimiter: number | null): number
   return delimiter;
 }
 
-export function protectInlineCodeFenceLines(source: string): string {
-  const text = String(source ?? '');
+function protectInlineCodeFenceLines(source: string): string {
   let openFence: FenceState | null = null;
   let inlineDelimiter: number | null = null;
 
-  return text.split('\n').map((line) => {
+  return String(source ?? '').split('\n').map((line) => {
     let output = line;
 
     if (openFence) {
-      if (fenceClose(line, openFence)) {
-        openFence = null;
-      }
+      if (fenceClose(line, openFence)) openFence = null;
       return output;
     }
 
@@ -125,8 +125,7 @@ export function repairStreamingMarkdown(source: string): string {
   }
 
   if (!open) return text;
-  const fence = open.marker.repeat(open.length);
-  return `${text}${text.endsWith('\n') ? '' : '\n'}${fence}\n`;
+  return `${text}${text.endsWith('\n') ? '' : '\n'}${open.marker.repeat(open.length)}\n`;
 }
 
 function hasUnescapedPipe(line: string): boolean {
@@ -207,17 +206,13 @@ function separateTableFromFollowingParagraph(source: string): string {
 
     if (openHtmlBlock) {
       output.push(line);
-      if (htmlBlockClose(line, openHtmlBlock)) {
-        openHtmlBlock = null;
-      }
+      if (htmlBlockClose(line, openHtmlBlock)) openHtmlBlock = null;
       continue;
     }
 
     if (openFence) {
       output.push(line);
-      if (fenceClose(line, openFence)) {
-        openFence = null;
-      }
+      if (fenceClose(line, openFence)) openFence = null;
       continue;
     }
 
@@ -257,8 +252,22 @@ function separateTableFromFollowingParagraph(source: string): string {
   return output.join('\n');
 }
 
-export function prepareMarkdownForRender(source: string, streaming: boolean): string {
+export function prepareMarkdownForRender(source: string, streaming = false): string {
   const tableSafeSource = separateTableFromFollowingParagraph(source);
   const protectedSource = protectInlineCodeFenceLines(tableSafeSource);
   return streaming ? repairStreamingMarkdown(protectedSource) : protectedSource;
+}
+
+export function markdownToHtml(content: string, streaming = false): string {
+  const renderer = new marked.Renderer();
+  renderer.html = (token) => {
+    if (typeof token === 'string') return escapeHtml(token);
+    const htmlToken = token as { raw?: string; text?: string };
+    return escapeHtml(htmlToken.raw ?? htmlToken.text ?? '');
+  };
+  return marked.parse(prepareMarkdownForRender(content, streaming), {
+    gfm: true,
+    breaks: false,
+    renderer,
+  }) as string;
 }

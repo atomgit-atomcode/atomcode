@@ -819,6 +819,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::SaveEmpty => "当前没有对话内容可导出".into(),
         Msg::SaveIoError { error } => format!("保存对话失败：{error}").into(),
         Msg::SaveInvalidPath { path } => format!("路径无效——目录不存在：{path}").into(),
+        Msg::SaveRefuseOverwrite { path } => format!("目标已存在且非 markdown 文件，已拒绝覆盖（避免误删源码/配置）：{path}。请换个 .md 文件名或新路径。").into(),
         Msg::CodeBlockCopied => "📋 代码块已复制到剪贴板".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),

@@ -5065,6 +5065,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // bug). invalidate() must run AFTER resize so its sentinel rows are
         // sized to the new width.
         self.screen.invalidate();
+        // ── Preserve streaming parser state across the reflow. Issue
+        // #950: resize during a streaming turn must not reset mid-stream
+        // markdown parsing (code blocks lose their fence context). The
+        // partial assistant text is already present in `body_log` because
+        // `render()` logs every AssistantText chunk before buffering it, so
+        // do not append `assistant_line_buf` here.
+
+        // Snapshot markdown parser state. The reflow replays each body_log
+        // entry through render() with a freshly-reset md_state, which may
+        // produce different output (e.g. if a code fence was still open).
+        // Restoring the snapshot after reflow means subsequent AssistantText
+        // chunks continue the parse correctly — the replayed body rows are
+        // for display only.
+        let saved_md_state = self.md_state.clone();
+
+        // live_group child_indices reference body_lines positions that are
+        // invalidated by the reflow. The reflow already clears it; do NOT
+        // restore. The next ToolGroupUpdate event from the agent will rebuild
+        // it at correct positions.
+
         // Reflow the ENTIRE transcript at the new width by replaying the
         // semantic `body_log` through `render()`. The old code only
         // rebuilt the welcome banner and CLIPPED every other row to the
@@ -5077,6 +5097,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
+
+        // ── Restore saved state so subsequent streaming events continue
+        // correctly after the reflow ──
+        self.md_state = saved_md_state;
+        // live_spinner_active is NOT restored: the spinner row position
+        // may have changed (different body row count after width change).
+        // The next spinner tick from the agent naturally places it at the
+        // correct position via `push_or_update_live_spinner`.
         crate::tuix_trace!("RSZ", "body reflowed; paint begin");
         self.paint_frame();
         self.flush_frame();
@@ -12798,6 +12826,26 @@ mod tests {
             out.ends_with("\x1b[?2026l"),
             "resize must close with ESU after the final paint: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn retained_resize_does_not_duplicate_partial_assistant_line() {
+        let (mut r, _buf) = new_capturing(40, 10);
+
+        r.render(UiLine::AssistantText("partial".into()));
+
+        r.on_resize(42, 10);
+        r.on_resize(44, 10);
+
+        assert_eq!(r.body_log.len(), 1, "unexpected body_log: {:?}", r.body_log);
+        let UiLine::AssistantText(text) = &r.body_log[0] else {
+            panic!("expected AssistantText entry, got {:?}", r.body_log);
+        };
+        assert_eq!(
+            text, "partial",
+            "resize must not append assistant_line_buf into body_log again; \
+             AssistantText chunks are already logged before they enter the line buffer"
         );
     }
 
