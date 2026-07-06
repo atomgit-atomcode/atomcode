@@ -33,6 +33,10 @@ use std::sync::Arc;
 pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     let mut provider_cfg = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     provider_cfg.context_window = cfg.context_window;
+    // Text-only models must NOT receive image content — a resumed conversation whose
+    // history contains an image would otherwise 400 every turn. SAME canonical detector
+    // as the tool-mount / read_file vision gate above.
+    provider_cfg.supports_vision = model_name_suggests_vision(&cfg.model);
     let provider =
         OpenAiCompatProvider::new(provider_cfg).map_err(|e| format!("provider init failed: {}", e.message))?;
     Ok(build_coding_agent_with(&cfg, Arc::new(provider)))

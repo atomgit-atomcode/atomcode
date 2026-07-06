@@ -2187,6 +2187,13 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Text-only models must NOT receive image content. The live path VL-preprocesses
+            // a FRESH image into text (see `maybe_preprocess` above), but a RESUMED
+            // conversation's historical image message would still serialize as multimodal and
+            // 400 the whole request every turn (`glm-5.2 is not a multimodal model`). Gate it
+            // with the SAME detector `maybe_preprocess` uses so the two stay consistent.
+            pc.supports_vision =
+                atomcode_core::provider::model_name_suggests_vision(&cfg.model);
             // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
             // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
             pc.max_tokens = Some(default_max_tokens(cfg.context_window));

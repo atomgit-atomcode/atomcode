@@ -68,6 +68,47 @@ pub struct OpenAiCompatConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
+    /// Whether the target model can accept image (`image_url`) content. When
+    /// FALSE, a user message carrying images is DEGRADED to a plain-text string
+    /// (caption kept, image bytes dropped) instead of a multimodal `content`
+    /// array — re-sending a historical image to a text-only model 400s the whole
+    /// request (`glm-5.2 is not a multimodal model`) on every resumed turn.
+    /// `new()` DEFAULTS this from the model name (`model_suggests_vision`), so
+    /// every construction site — including the core-decoupled acp/review/clix
+    /// drivers — is correct without extra wiring; core-aware callers (bridge,
+    /// coding assemble) override it with core's authoritative copy. Mirrors v1
+    /// `supports_vision`.
+    pub supports_vision: bool,
+}
+
+/// Heuristic: does this model name look vision-capable? A VERBATIM copy of
+/// `atomcode_core::provider::model_name_suggests_vision` — this L0 crate cannot
+/// depend on core, so it is duplicated (like `session::hash_path` is in the
+/// daemon). MUST stay in sync: it also gates the live VL-preprocess and the
+/// `read_file` vision path (both via core's copy); a drift silently drops (or
+/// wrongly forwards) images. Used only as the DEFAULT for `supports_vision`;
+/// core-aware callers (bridge / coding assemble) override it with core's copy.
+fn model_suggests_vision(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("vision")
+        || n.contains("-vl")
+        || n.contains("vl-")
+        || n.contains("ocr")
+        || n.contains("-4v")
+        || n.contains("-4.1v")
+        || n.starts_with("gpt-4o")
+        || n.starts_with("claude-3")
+        || n.starts_with("claude-4")
+        || n.starts_with("claude-5")
+        || n.starts_with("claude-6")
+        || n.starts_with("claude-7")
+        || n.starts_with("claude-sonnet")
+        || n.starts_with("claude-opus")
+        || n.starts_with("claude-haiku")
+        || n.starts_with("gemini")
+        || n.starts_with("pixtral")
+        || n.contains("llava")
+        || n.contains("qvq")
 }
 
 impl OpenAiCompatConfig {
@@ -76,10 +117,15 @@ impl OpenAiCompatConfig {
         base_url: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let model = model.into();
+        // Smart default so EVERY construction site (incl. the core-decoupled acp /
+        // review / clix drivers that can't compute it) degrades images for a
+        // text-only model instead of 400ing a resumed conversation.
+        let supports_vision = model_suggests_vision(&model);
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            model,
             context_window: 128_000,
             max_tokens: None,
             reasoning_policy: None,
@@ -91,6 +137,7 @@ impl OpenAiCompatConfig {
             request_signer: None,
             user_agent: None,
             skip_tls_verify: false,
+            supports_vision,
         }
     }
 }
@@ -358,7 +405,13 @@ async fn open_stream(
 // ---------------------------------------------------------------------------
 
 /// Map kernel `Message`s onto OpenAI-compatible wire `messages[]`.
-fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> {
+///
+/// `supports_vision` gates image content: when FALSE, a user message's images are
+/// dropped and only its caption text is sent (as a STRING). This is what keeps a
+/// resumed conversation whose history contains an image from 400ing against a
+/// text-only model (`glm-5.2 is not a multimodal model`) on every turn — v1
+/// `OpenAiProvider::format_messages` had the same degrade; the v2 port lost it.
+fn format_messages(messages: &[Message], policy: ReasoningPolicy, supports_vision: bool) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -366,9 +419,11 @@ fn format_messages(messages: &[Message], policy: ReasoningPolicy) -> Vec<Value> 
             // OpenAI-compatible models accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
-                if m.images.is_empty() {
-                    // Text-only: `content` stays a STRING — byte-identical to the prior
-                    // path, so a no-image conversation's prefix cache is unperturbed.
+                if m.images.is_empty() || !supports_vision {
+                    // Text-only (no images), OR a vision-incapable target: `content`
+                    // stays a STRING. For the vision-incapable case the image bytes are
+                    // dropped and only the caption (with our `[Image #N]` marker) survives
+                    // — a multimodal array here 400s the whole request on a text model.
                     out.push(json!({ "role": "user", "content": m.text }));
                 } else {
                     // Multimodal: `content` becomes an array — text part first (if any),
@@ -487,7 +542,10 @@ fn build_request_body(
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("messages".into(), json!(format_messages(messages, policy)));
+    body.insert(
+        "messages".into(),
+        json!(format_messages(messages, policy, cfg.supports_vision)),
+    );
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
 
@@ -930,7 +988,7 @@ mod tests {
             Message::assistant("ans", vec![]),
             Message::tool_result("call_1", "result text", false),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[2]["role"], "assistant");
@@ -951,7 +1009,7 @@ mod tests {
             Message::system("MEMORY\n- fact"),
             Message::user("hi"),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
         let systems = out.iter().filter(|v| v["role"] == "system").count();
         assert_eq!(systems, 1, "consecutive system messages must coalesce to one: {out:?}");
         assert_eq!(out[0], json!({"role":"system","content":"persona\n\nMEMORY\n- fact"}));
@@ -963,7 +1021,7 @@ mod tests {
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.
-        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude);
+        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude, true);
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
     }
 
@@ -974,12 +1032,42 @@ mod tests {
             "look",
             vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
         assert_eq!(c[1]["type"], "image_url");
         assert_eq!(c[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    /// Ported from v1 `multipart_degrades_to_text_when_target_is_text_only`:
+    /// a resumed conversation whose history carries an image, sent to a TEXT-ONLY
+    /// model (supports_vision=false), must degrade the image message to a plain
+    /// STRING (caption kept, image bytes dropped) — a multimodal `content` array
+    /// 400s the whole request (`glm-5.2 is not a multimodal model`) every turn.
+    #[test]
+    fn user_images_degrade_to_string_when_target_is_text_only() {
+        use atomcode_kernel::message::ImageContent;
+        let m = Message::user_with_images(
+            "[Image #1] 这是什么图啊",
+            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+        );
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, false);
+        let c = &out[0]["content"];
+        assert!(c.is_string(), "text-only target must get a string, got: {c}");
+        let s = c.as_str().unwrap();
+        assert!(s.contains("这是什么图啊"), "caption must survive degradation: {s:?}");
+        assert!(!s.contains("data:image"), "no image_url bytes may leak: {s:?}");
+    }
+
+    #[test]
+    fn new_defaults_supports_vision_from_model_name() {
+        // The smart default keeps core-decoupled callers (acp/review/clix) correct
+        // without wiring: text-only models degrade images, vision models keep them.
+        assert!(!OpenAiCompatConfig::new("k", "u", "glm-5.2").supports_vision);
+        assert!(!OpenAiCompatConfig::new("k", "u", "deepseek-v4-flash").supports_vision);
+        assert!(OpenAiCompatConfig::new("k", "u", "qwen3-vl-plus").supports_vision);
+        assert!(OpenAiCompatConfig::new("k", "u", "gpt-4o-mini").supports_vision);
     }
 
     #[test]
@@ -989,7 +1077,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/jpeg".into(), data: "eHl6".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -1004,7 +1092,7 @@ mod tests {
             "",
             vec![ImageContent { media_type: "image/png".into(), data: "".into() }],
         );
-        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude)[0], json!({"role":"user","content":""}));
+        assert_eq!(format_messages(&[m], ReasoningPolicy::Exclude, true)[0], json!({"role":"user","content":""}));
     }
 
     #[test]
@@ -1014,7 +1102,7 @@ mod tests {
             "x",
             vec![ImageContent { media_type: "".into(), data: "QUJD".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:application/octet-stream;base64,QUJD");
     }
 
@@ -1028,7 +1116,7 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let a = &out[0];
         assert_eq!(a["role"], "assistant");
         assert_eq!(a["content"], ""); // present even when empty
@@ -1054,7 +1142,7 @@ mod tests {
                     .into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(args)
             .unwrap_or_else(|e| panic!("outgoing arguments must be valid JSON ({e}): {args}"));
@@ -1070,7 +1158,7 @@ mod tests {
             "",
             vec![ToolCall { id: "c1".into(), name: "read".into(), arguments: "{\"path\":\"a\"}".into() }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
     }
 
@@ -1086,7 +1174,7 @@ mod tests {
                 arguments: "not json at all <tool_result>".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude);
+        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
         let args = out[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
         assert!(
             serde_json::from_str::<Value>(args).is_ok(),
@@ -1099,7 +1187,7 @@ mod tests {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
         let no = Message::assistant("ans2", vec![]);
-        let out = format_messages(&[with, no], ReasoningPolicy::Include);
+        let out = format_messages(&[with, no], ReasoningPolicy::Include, true);
         assert_eq!(out[0]["reasoning_content"], "because");
         assert_eq!(out[1]["reasoning_content"], REASONING_PLACEHOLDER);
     }
@@ -1108,7 +1196,7 @@ mod tests {
     fn reasoning_exclude_never_echoes() {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
-        let out = format_messages(&[with], ReasoningPolicy::Exclude);
+        let out = format_messages(&[with], ReasoningPolicy::Exclude, true);
         assert!(out[0].get("reasoning_content").is_none());
     }
 
@@ -1203,8 +1291,8 @@ mod tests {
         let h1 = vec![Message::system("s"), Message::user("u1")];
         let mut h2 = h1.clone();
         h2.push(Message::assistant("a1", vec![]));
-        let f1 = format_messages(&h1, ReasoningPolicy::Exclude);
-        let f2 = format_messages(&h2, ReasoningPolicy::Exclude);
+        let f1 = format_messages(&h1, ReasoningPolicy::Exclude, true);
+        let f2 = format_messages(&h2, ReasoningPolicy::Exclude, true);
         for i in 0..f1.len() {
             assert_eq!(
                 serde_json::to_string(&f1[i]).unwrap(),
