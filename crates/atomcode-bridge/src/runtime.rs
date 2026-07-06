@@ -290,14 +290,16 @@ impl Bridge {
                 let (fast_key, cap_key) =
                     atomcode_coding::subagent_tiers::resolve_tier_keys(&full_cfg);
                 let host_model = coding_cfg.model.clone();
+                // Prepare LAZY tier builders (cheap: config derive only). The provider is
+                // built on first `task` use, keeping startup off the reqwest-client path.
                 let fast_p = full_cfg
                     .providers
                     .get(&fast_key)
-                    .and_then(|pc| build_tier_provider(&coding_cfg, &host_model, pc));
+                    .and_then(|pc| tier_builder(&coding_cfg, &host_model, pc));
                 let cap_p = full_cfg
                     .providers
                     .get(&cap_key)
-                    .and_then(|pc| build_tier_provider(&coding_cfg, &host_model, pc));
+                    .and_then(|pc| tier_builder(&coding_cfg, &host_model, pc));
                 coding_cfg.subagent_fast_provider = fast_p;
                 coding_cfg.subagent_capable_provider = cap_p;
             }
@@ -2263,14 +2265,13 @@ fn build_provider(
 /// The derived config clears its own injected-provider fields so a tier agent never
 /// recurses. NOTE: the returned provider is RAW (unmetered) — telemetry attribution
 /// for the non-host tier is a known follow-up polish item.
-fn build_tier_provider(
+/// Derive a `CodingAgentConfig` for a `task` tier from a `ProviderConfig`. CHEAP: clone +
+/// field overrides only — NO provider/client construction. The heavy `build_provider`
+/// (fresh reqwest client, slow OS cert load) happens lazily in [`tier_builder`]'s thunk.
+fn derive_tier_cfg(
     base: &CodingAgentConfig,
-    host_model: &str,
     pc: &atomcode_core::config::provider::ProviderConfig,
-) -> Option<std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider>> {
-    if pc.model == host_model {
-        return None; // tier == host → reuse host slot
-    }
+) -> CodingAgentConfig {
     let mut tier_cfg = base.clone();
     tier_cfg.model = pc.model.clone();
     if let Some(bu) = pc.base_url.clone() {
@@ -2286,10 +2287,28 @@ fn build_tier_provider(
     tier_cfg.reasoning_history = pc.reasoning_history.clone();
     tier_cfg.thinking_enabled = pc.thinking_enabled;
     tier_cfg.skip_tls_verify = pc.skip_tls_verify;
-    // Never let a tier agent carry its own injected providers.
+    // Never let a tier agent carry its own injected providers (no recursion).
     tier_cfg.subagent_fast_provider = None;
     tier_cfg.subagent_capable_provider = None;
-    build_provider(&tier_cfg).ok()
+    tier_cfg
+}
+
+/// Build a LAZY tier-provider thunk for a `task` tier whose model differs from the host.
+/// Returns `None` when the tier's model equals the host (⇒ reuse the host provider slot).
+/// The returned thunk runs `build_provider` ON FIRST `task` USE — deferring the reqwest
+/// client construction (slow OS cert-store load, esp. macOS) off the startup path, matching
+/// how goal/naming/vision providers are built on demand. A build failure inside the thunk
+/// yields `None` ⇒ graceful collapse to the host provider.
+fn tier_builder(
+    base: &CodingAgentConfig,
+    host_model: &str,
+    pc: &atomcode_core::config::provider::ProviderConfig,
+) -> Option<atomcode_coding::SubagentProvider> {
+    if pc.model == host_model {
+        return None; // tier == host → reuse host slot
+    }
+    let tier_cfg = derive_tier_cfg(base, pc);
+    Some(std::sync::Arc::new(move || build_provider(&tier_cfg).ok()))
 }
 
 /// Build an authenticated [`LlmProvider`] directly from a [`BridgeConfig`].
@@ -2899,25 +2918,37 @@ mod undo_tests {
     }
 
     #[test]
-    fn tier_provider_none_when_model_equals_host() {
-        // Short-circuit: tier model == host model ⇒ reuse host slot, return None.
+    fn tier_builder_none_when_model_equals_host() {
+        // Short-circuit: tier model == host model ⇒ reuse host slot, no builder.
         let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
         let pc = tier_pc("glm-5.2", "https://api.example.com/v1");
         assert!(
-            super::build_tier_provider(&base, "glm-5.2", &pc).is_none(),
-            "same model as host must return None (reuse host slot)"
+            super::tier_builder(&base, "glm-5.2", &pc).is_none(),
+            "same model as host must yield no builder (reuse host slot)"
         );
     }
 
     #[test]
-    fn tier_provider_some_when_model_differs() {
-        // Different model + non-gateway base_url ⇒ build succeeds, returns Some.
+    fn tier_builder_some_and_lazy_build_succeeds_when_model_differs() {
+        // Different model + non-gateway base_url ⇒ a builder is returned, and invoking it
+        // (the deferred build) yields a provider. This proves the lazy path constructs.
         let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
         let pc = tier_pc("deepseek-v4-flash", "https://api.example.com/v1");
-        assert!(
-            super::build_tier_provider(&base, "glm-5.2", &pc).is_some(),
-            "distinct model with valid config must return Some"
-        );
+        let builder = super::tier_builder(&base, "glm-5.2", &pc)
+            .expect("distinct model must yield a builder");
+        assert!(builder().is_some(), "lazy build must construct the tier provider");
+    }
+
+    #[test]
+    fn derive_tier_cfg_overrides_model_and_clears_injected() {
+        // The derived config carries the tier's model and no injected providers (no recursion).
+        let base = CodingAgentConfig::new("sk-x", "https://host/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("deepseek-v4-flash", "https://api.example.com/v1");
+        let derived = super::derive_tier_cfg(&base, &pc);
+        assert_eq!(derived.model, "deepseek-v4-flash");
+        assert_eq!(derived.base_url, "https://api.example.com/v1");
+        assert!(derived.subagent_fast_provider.is_none());
+        assert!(derived.subagent_capable_provider.is_none());
     }
 }
 

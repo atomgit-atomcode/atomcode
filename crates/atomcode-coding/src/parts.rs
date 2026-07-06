@@ -259,24 +259,36 @@ pub async fn prepare_with_plugin_hooks(
                 reg_w.mount(&refs)
             };
 
-            // Prefer a bridge-injected tier provider (built when that tier's model differs
-            // from the host model); else fall back to the host-provider slot (filled at
-            // assemble — the single-model / same-as-host collapse path).
-            let inj_fast = cfg.subagent_fast_provider.clone();
-            let inj_cap = cfg.subagent_capable_provider.clone();
+            // Prefer a bridge-injected tier provider, else fall back to the host-provider
+            // slot (filled at assemble — the single-model / same-as-host collapse path).
+            // The injected provider is a LAZY builder: it runs on the FIRST `task` use and
+            // is cached, so startup never pays the reqwest-client cost for a tier a session
+            // may not use. If the build fails (inner None), we also fall back to the host.
+            let fast_builder = cfg.subagent_fast_provider.clone();
+            let cap_builder = cfg.subagent_capable_provider.clone();
+            let fast_cache: Arc<std::sync::OnceLock<Option<Arc<dyn LlmProvider>>>> =
+                Arc::new(std::sync::OnceLock::new());
+            let cap_cache: Arc<std::sync::OnceLock<Option<Arc<dyn LlmProvider>>>> =
+                Arc::new(std::sync::OnceLock::new());
             let slot_fast = slot.clone();
             let slot_cap = slot.clone();
             let make_fast = move || {
-                inj_fast.clone().unwrap_or_else(|| {
-                    slot_fast.read().ok().and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
+                fast_cache
+                    .get_or_init(|| fast_builder.as_ref().and_then(|b| b()))
+                    .clone()
+                    .unwrap_or_else(|| {
+                        slot_fast.read().ok().and_then(|g| g.clone())
+                            .expect("subagent provider slot filled at assemble before any turn")
+                    })
             };
             let make_capable = move || {
-                inj_cap.clone().unwrap_or_else(|| {
-                    slot_cap.read().ok().and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
+                cap_cache
+                    .get_or_init(|| cap_builder.as_ref().and_then(|b| b()))
+                    .clone()
+                    .unwrap_or_else(|| {
+                        slot_cap.read().ok().and_then(|g| g.clone())
+                            .expect("subagent provider slot filled at assemble before any turn")
+                    })
             };
 
             registry.register(Arc::new(TaskTool::new(

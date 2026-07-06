@@ -41,7 +41,7 @@ mod todo;
 pub mod subagent_tiers;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
-pub use config::CodingAgentConfig;
+pub use config::{CodingAgentConfig, SubagentProvider};
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
 pub use todo::TodoHook;
