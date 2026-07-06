@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.client
 
+import com.atomcode.jetbrains.daemon.formatDaemonHttpError
 import com.atomcode.jetbrains.protocol.ChatEvent
 import com.atomcode.jetbrains.protocol.SseParser
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +20,11 @@ class ChatStream(
 ) {
     fun events(): Flow<ChatEvent> = flow {
         val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofLines())
+        if (response.statusCode() >= 400) {
+            emit(ChatEvent.Error(formatDaemonHttpError(response.statusCode(), response.body().toList().joinToString("\n"))))
+            return@flow
+        }
+
         val parser = SseParser()
 
         for (line in response.body()) {
