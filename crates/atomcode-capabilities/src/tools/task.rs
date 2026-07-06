@@ -109,31 +109,24 @@ several. Subagents run in parallel and cannot themselves dispatch."
     }
 
     fn risk(&self, args: &str) -> RiskLevel {
-        match serde_json::from_str::<Args>(args) {
+        // Use the SAME repair-aware parse as `execute` so a `worker` dispatch with
+        // control-char args is still detected as Risky (not silently downgraded to
+        // Safe, which would let a file-editing worker skip the approval gate).
+        match parse_task_args(args) {
             Ok(a) if a.tasks.iter().any(|t| t.subagent_type == "worker") => RiskLevel::Risky,
             _ => RiskLevel::Safe,
         }
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let parsed: Args = match serde_json::from_str(args) {
+        let parsed: Args = match parse_task_args(args) {
             Ok(a) => a,
-            Err(_) => {
-                // Weak models / gateways sometimes emit unescaped control characters
-                // inside JSON string values (e.g. a raw newline in `prompt`), which
-                // serde rejects. Repair (escape control chars in strings) then retry —
-                // ONLY on failure, so valid JSON is never altered. Reuses the shared
-                // tool-arg JSON repairer.
-                match serde_json::from_str(&super::repair::repair_json(args)) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return ToolResult {
-                            call_id: String::new(),
-                            content: format!("invalid task args: {e}"),
-                            is_error: true,
-                            images: vec![],
-                        }
-                    }
+            Err(e) => {
+                return ToolResult {
+                    call_id: String::new(),
+                    content: format!("invalid task args: {e}"),
+                    is_error: true,
+                    images: vec![],
                 }
             }
         };
@@ -259,6 +252,19 @@ several. Subagents run in parallel and cannot themselves dispatch."
             is_error: any_error,
             images: vec![],
         }
+    }
+}
+
+/// Parse the tool args, repairing unescaped control characters on failure (weak
+/// models / gateways sometimes emit a raw newline inside a JSON string value, which
+/// serde rejects). Repairs ONLY on failure, so valid JSON is never altered. Shared by
+/// `risk` and `execute` so both agree on whether a dispatch contains a `worker` — a
+/// mismatch would let a file-editing worker with control-char args skip the approval
+/// gate.
+fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
+    match serde_json::from_str::<Args>(args) {
+        Ok(a) => Ok(a),
+        Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
     }
 }
 
@@ -438,5 +444,17 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("<task_result>"), "expected a result: {}", out.content);
+    }
+
+    #[test]
+    fn worker_with_control_char_args_still_risky() {
+        // A worker dispatch whose args carry a raw control char must NOT be downgraded
+        // to Safe (which would skip the approval gate while execute() repairs + spawns).
+        let worker = "{\"tasks\":[{\"description\":\"d\",\"prompt\":\"a\nb\",\"subagent_type\":\"worker\"}]}";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(worker).is_err(),
+            "test premise: raw control char must be invalid JSON"
+        );
+        assert!(matches!(dummy().risk(worker), RiskLevel::Risky));
     }
 }
