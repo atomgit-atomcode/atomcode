@@ -8598,6 +8598,10 @@ fn handle_agent_event(
                         web_search_result_suffix(&output)
                             .map(|s| format!("sources: {s}"))
                             .unwrap_or_else(|| summarise(&output))
+                    } else if name == "task" {
+                        // Clean per-subtask lines (id · model · status) instead of the
+                        // raw <task ...> block.
+                        summarise_task_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -10671,6 +10675,20 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
+        "task" => {
+            // Header preview: a single subtask shows its description; a batch shows the
+            // count. (Per-subtask model/status is on the RESULT line — see
+            // `summarise_task_result`; the model isn't known until execution.)
+            match v.get("tasks").and_then(|t| t.as_array()) {
+                Some(arr) if arr.len() == 1 => arr[0]
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| crate::width::truncate_with_ellipsis(s, 100))
+                    .unwrap_or_default(),
+                Some(arr) if !arr.is_empty() => format!("{} subtasks", arr.len()),
+                _ => String::new(),
+            }
+        }
         _ => {
             // For MCP tools (name starts with mcp__), render the
             // arguments as key=value pairs so users can see what
@@ -10970,6 +10988,71 @@ pub(crate) fn summarise(output: &str) -> String {
     }
 }
 
+/// Render the `task` tool's `<task ...>` result blocks into clean per-subtask lines:
+/// `id · model · ✓ done` (or `✗ failed (reason)`), one per subtask. A single subtask
+/// drops its `#1` suffix and appends the result's line count. Falls back to the generic
+/// `summarise` if no `<task>` blocks are found (defensive — the format is ours, but a
+/// future change or an early error result shouldn't render blank).
+pub(crate) fn summarise_task_result(output: &str) -> String {
+    // Read a `key="value"` attribute from a `<task ...>` opening tag.
+    fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+        let needle = format!("{key}=\"");
+        let s = tag.find(&needle)? + needle.len();
+        let rest = &tag[s..];
+        rest.find('"').map(|e| &rest[..e])
+    }
+    // Inner text between `<t>` and `</t>` within a block body.
+    fn inner<'a>(body: &'a str, t: &str) -> Option<&'a str> {
+        let open = format!("<{t}>");
+        let close = format!("</{t}>");
+        let s = body.find(&open)? + open.len();
+        let e = body[s..].find(&close)? + s;
+        Some(body[s..e].trim())
+    }
+
+    let segs: Vec<&str> = output.split("<task ").skip(1).collect();
+    if segs.is_empty() {
+        return summarise(output);
+    }
+    let single = segs.len() == 1;
+    let mut lines: Vec<String> = Vec::with_capacity(segs.len());
+    for seg in segs {
+        let Some(tag_end) = seg.find('>') else { continue };
+        let tag = &seg[..tag_end];
+        let body_end = seg.find("</task>").unwrap_or(seg.len());
+        let body = &seg[tag_end + 1..body_end];
+        let mut id = attr(tag, "id").unwrap_or("subtask");
+        if single {
+            // "worker#1" → "worker" when there's only one subtask.
+            id = id.split('#').next().unwrap_or(id);
+        }
+        let model = attr(tag, "model").unwrap_or("?");
+        let ok = attr(tag, "state") == Some("completed");
+        let mark = if ok {
+            "\u{2713} done".to_string()
+        } else {
+            // Pull the StopReason out of "subagent failed (Reason): ..." if present.
+            let reason = body.find("subagent failed (").and_then(|i| {
+                let r = &body[i + "subagent failed (".len()..];
+                r.find(')').map(|j| &r[..j])
+            });
+            match reason {
+                Some(r) => format!("\u{2717} failed ({r})"),
+                None => "\u{2717} failed".to_string(),
+            }
+        };
+        let mut line = format!("{id} \u{b7} {model} \u{b7} {mark}");
+        if single && ok {
+            let n = inner(body, "task_result").map(|s| s.lines().count()).unwrap_or(0);
+            if n > 1 {
+                line.push_str(&format!(" ({n} lines)"));
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 /// A plan-mode interception surfaces as a failed tool result whose body is
 /// `blocked: plan mode …` — the kernel prefixes every middleware block with `blocked: `,
 /// and `PlanModeGate`'s reason starts with `plan mode is active`. Returns the human reason
@@ -11084,6 +11167,55 @@ mod todo_block_tests {
     #[test]
     fn todo_block_bad_args_empty() {
         assert!(todo_block_lines(r#"{"nope":1}"#, false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_render_tests {
+    use super::*;
+
+    #[test]
+    fn header_single_shows_description() {
+        let args = r#"{"tasks":[{"description":"create greet.py","prompt":"p","subagent_type":"worker"}]}"#;
+        assert_eq!(format_tool_detail("task", args), "create greet.py");
+    }
+
+    #[test]
+    fn header_multi_shows_count() {
+        let args = r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"worker"},{"description":"b","prompt":"q","subagent_type":"explore"}]}"#;
+        assert_eq!(format_tool_detail("task", args), "2 subtasks");
+    }
+
+    #[test]
+    fn result_single_clean_line_with_model_and_count() {
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"completed\">\n<summary>d</summary>\n<task_result>\nline1\nline2\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        // single ⇒ "#1" dropped, model shown, line count appended
+        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_multi_one_line_each_keeps_index() {
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"completed\">\n<summary>a</summary>\n<task_result>\nx\n</task_result>\n</task>\n<task id=\"explore#2\" model=\"glm-5.2\" state=\"completed\">\n<summary>b</summary>\n<task_result>\ny\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "worker#1 \u{b7} deepseek-v4-flash \u{b7} \u{2713} done");
+        assert_eq!(lines[1], "explore#2 \u{b7} glm-5.2 \u{b7} \u{2713} done");
+    }
+
+    #[test]
+    fn result_failure_shows_reason() {
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"error\">\n<summary>d</summary>\n<task_error>\nsubagent failed (Timeout): byte-idle\n</task_error>\n</task>";
+        let s = summarise_task_result(out);
+        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2717} failed (Timeout)");
+    }
+
+    #[test]
+    fn result_non_task_output_falls_back() {
+        // Defensive: not a task block ⇒ generic summarise, not blank.
+        let s = summarise_task_result("plain text\nsecond line");
+        assert_eq!(s, "plain text (2 lines)");
     }
 }
 
