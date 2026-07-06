@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.daemon
 
+import com.google.gson.JsonParser
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -28,6 +29,16 @@ class DaemonClientHelpersTest {
     @Test
     fun `jsonQuoted escapes newlines`() {
         assertEquals("\"line1\\nline2\"", "line1\nline2".jsonQuoted())
+    }
+
+    @Test
+    fun `jsonQuoted escapes all JSON control characters`() {
+        val input = "tab:\t cr:\r backspace:\b formfeed:\u000C nul:\u0000"
+
+        val quoted = input.jsonQuoted()
+
+        assertEquals("\"tab:\\t cr:\\r backspace:\\b formfeed:\\f nul:\\u0000\"", quoted)
+        assertEquals(input, JsonParser.parseString(quoted).asString)
     }
 
     @Test

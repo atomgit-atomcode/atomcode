@@ -364,8 +364,29 @@ class AtomCodeDaemonClient(
     }
 }
 
-internal fun String.jsonQuoted(): String =
-    "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+internal fun String.jsonQuoted(): String = buildString(length + 2) {
+    append('"')
+    for (ch in this@jsonQuoted) {
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> {
+                if (ch.code < 0x20) {
+                    append("\\u")
+                    append(ch.code.toString(16).padStart(4, '0'))
+                } else {
+                    append(ch)
+                }
+            }
+        }
+    }
+    append('"')
+}
 
 private fun String.daemonErrorSuffix(): String {
     val message = jsonString("error") ?: jsonString("message") ?: trim()
