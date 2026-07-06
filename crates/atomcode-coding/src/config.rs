@@ -119,36 +119,46 @@ pub type SubagentProvider =
 /// caches (keeps startup cheap — no reqwest client until the first `task`); `reset()` re-points
 /// the thunk and drops the cache. Shared as an `Arc` between [`CodingAgentConfig`] and the
 /// already-built TaskTool, so the bridge can update tier routing on a model swap in place.
+struct TierInner {
+    thunk: SubagentProvider,
+    /// `None` = not built yet; `Some(inner)` = built exactly once (`inner == None` means the
+    /// thunk yielded no provider — host-equal or a failed build — so we do NOT retry the build
+    /// on every dispatch). One `Mutex` over both fields makes `get`/`reset` atomic and prevents
+    /// a concurrent double-build.
+    cache: Option<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>>,
+}
+
 pub struct TierProvider {
-    thunk: std::sync::Mutex<SubagentProvider>,
-    cache: std::sync::Mutex<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>>,
+    inner: std::sync::Mutex<TierInner>,
 }
 
 impl TierProvider {
     pub fn new(thunk: SubagentProvider) -> Arc<Self> {
         Arc::new(Self {
-            thunk: std::sync::Mutex::new(thunk),
-            cache: std::sync::Mutex::new(None),
+            inner: std::sync::Mutex::new(TierInner { thunk, cache: None }),
         })
     }
 
-    /// The built provider (built lazily on first call, then cached), or `None` if the thunk
-    /// yields none (⇒ the caller falls back to the host slot). Lock poisoning cannot occur
-    /// under the workspace `panic = "abort"` profile, so `unwrap` here is unreachable.
+    /// The built provider (built lazily on first call, then cached — success OR a `None`
+    /// result is remembered, so a failing build isn't re-attempted every dispatch), or `None`
+    /// if the thunk yields none (⇒ the caller falls back to the host slot). Lock poisoning
+    /// cannot occur under the workspace `panic = "abort"` profile, so `unwrap` is unreachable.
     pub fn get(&self) -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
-        if let Some(p) = self.cache.lock().unwrap().clone() {
-            return Some(p);
+        let mut g = self.inner.lock().unwrap();
+        if let Some(cached) = &g.cache {
+            return cached.clone();
         }
-        let built = (self.thunk.lock().unwrap())();
-        *self.cache.lock().unwrap() = built.clone();
+        let built = (g.thunk)();
+        g.cache = Some(built.clone());
         built
     }
 
     /// Re-point at a freshly-resolved thunk and drop the cache — the next `get()` rebuilds.
     /// Called by the bridge on a `/model` swap so tier routing re-resolves against the new host.
     pub fn reset(&self, thunk: SubagentProvider) {
-        *self.thunk.lock().unwrap() = thunk;
-        *self.cache.lock().unwrap() = None;
+        let mut g = self.inner.lock().unwrap();
+        g.thunk = thunk;
+        g.cache = None;
     }
 }
 
@@ -278,6 +288,24 @@ mod tests {
         cell.reset(mk("glm", builds.clone()));
         assert_eq!(cell.get().unwrap().model_name(), "glm");
         assert_eq!(builds.load(Ordering::SeqCst), 2, "reset forces a rebuild with the new model");
+    }
+
+    #[test]
+    fn tier_provider_caches_none_result_no_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A thunk that yields no provider (host-equal or a failed build) must be called ONCE,
+        // then its `None` is remembered — not re-attempted (which would re-run build_provider)
+        // every dispatch.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let thunk: SubagentProvider = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let cell = TierProvider::new(thunk);
+        assert!(cell.get().is_none());
+        assert!(cell.get().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "None result must be cached, thunk called once");
     }
 }
 
