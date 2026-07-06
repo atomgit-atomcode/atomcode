@@ -11010,66 +11010,76 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         Some(body[s..e].trim())
     }
 
-    // Split on block boundaries only: a block starts at the very beginning or right after
-    // a newline (render_task_block joins blocks with '\n', and each block's opening tag is
-    // line-leading). Splitting on the bare "<task " would mis-split on a literal "<task "
-    // that appears inline inside a task description (rendered in <summary>).
-    let mut segs: Vec<&str> = Vec::new();
-    for (i, part) in output.split("\n<task ").enumerate() {
-        if i == 0 {
-            // The first part is a block only if the output itself begins with "<task ".
-            if let Some(rest) = part.strip_prefix("<task ") {
-                segs.push(rest);
-            }
-        } else {
-            // Every later part already had its leading "\n<task " consumed by the split.
-            segs.push(part);
-        }
+    // Scan block-by-block. A block starts at a LINE-LEADING "<task " (start of output or
+    // right after '\n' — render_task_block joins blocks with '\n') and ends at the NEXT
+    // "</task>". Crucially we resume the search for the next block AFTER that "</task>",
+    // so a "<task " that appears inside a block BODY (e.g. cat'd XML in a worker's output)
+    // is never mistaken for a boundary (#3). The closing tag is searched AFTER the opening
+    // tag's '>', so a stray '>' in an attribute value can never produce a reverse slice (#6).
+    struct Parsed {
+        id: String,
+        model: String,
+        ok: bool,
+        reason: Option<String>,
+        result_lines: usize,
     }
-    if segs.is_empty() {
+    let mut parsed: Vec<Parsed> = Vec::new();
+    let mut rest = output;
+    loop {
+        let start = if rest.starts_with("<task ") {
+            0
+        } else if let Some(i) = rest.find("\n<task ") {
+            i + 1 // point at '<'
+        } else {
+            break;
+        };
+        let block = &rest[start..]; // begins with "<task "
+        let Some(gt) = block.find('>') else { break }; // end of opening tag
+        // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
+        let Some(close_rel) = block[gt + 1..].find("</task>") else { break };
+        let close = gt + 1 + close_rel;
+        let tag = &block[..gt];
+        let body = &block[gt + 1..close];
+        let ok = attr(tag, "state") == Some("completed");
+        let reason = if ok {
+            None
+        } else {
+            body.find("subagent failed (").and_then(|i| {
+                let r = &body[i + "subagent failed (".len()..];
+                r.find(')').map(|j| r[..j].to_string())
+            })
+        };
+        parsed.push(Parsed {
+            id: attr(tag, "id").unwrap_or("subtask").to_string(),
+            model: attr(tag, "model").unwrap_or("?").to_string(),
+            ok,
+            reason,
+            result_lines: inner(body, "task_result").map(|s| s.lines().count()).unwrap_or(0),
+        });
+        rest = &block[close + "</task>".len()..];
+    }
+    if parsed.is_empty() {
+        // No parseable block (not a task result, or all malformed) → generic summary.
         return summarise(output);
     }
-    let single = segs.len() == 1;
-    let mut lines: Vec<String> = Vec::with_capacity(segs.len());
-    for seg in segs {
-        let Some(tag_end) = seg.find('>') else { continue };
-        let tag = &seg[..tag_end];
-        let body_end = seg.find("</task>").unwrap_or(seg.len());
-        let body = &seg[tag_end + 1..body_end];
-        let mut id = attr(tag, "id").unwrap_or("subtask");
-        if single {
-            // "worker#1" → "worker" when there's only one subtask. `split('#').next()`
-            // always yields the leading segment (or the whole str if no '#').
-            id = id.split('#').next().unwrap_or(id);
-        }
-        let model = attr(tag, "model").unwrap_or("?");
-        let ok = attr(tag, "state") == Some("completed");
-        let mark = if ok {
+    let single = parsed.len() == 1;
+    let mut lines: Vec<String> = Vec::with_capacity(parsed.len());
+    for p in &parsed {
+        // "worker#1" → "worker" when there's only one subtask.
+        let id = if single { p.id.split('#').next().unwrap_or(&p.id) } else { p.id.as_str() };
+        let mark = if p.ok {
             "\u{2713} done".to_string()
         } else {
-            // Pull the StopReason out of "subagent failed (Reason): ..." if present.
-            let reason = body.find("subagent failed (").and_then(|i| {
-                let r = &body[i + "subagent failed (".len()..];
-                r.find(')').map(|j| &r[..j])
-            });
-            match reason {
+            match &p.reason {
                 Some(r) => format!("\u{2717} failed ({r})"),
                 None => "\u{2717} failed".to_string(),
             }
         };
-        let mut line = format!("{id} \u{b7} {model} \u{b7} {mark}");
-        if single && ok {
-            let n = inner(body, "task_result").map(|s| s.lines().count()).unwrap_or(0);
-            if n > 1 {
-                line.push_str(&format!(" ({n} lines)"));
-            }
+        let mut line = format!("{id} \u{b7} {} \u{b7} {mark}", p.model);
+        if single && p.ok && p.result_lines > 1 {
+            line.push_str(&format!(" ({} lines)", p.result_lines));
         }
         lines.push(line);
-    }
-    // Defensive: `<task ` was present but every block was malformed (no `>`), so we
-    // produced nothing — fall back to a generic summary rather than a blank line.
-    if lines.is_empty() {
-        return summarise(output);
     }
     lines.join("\n")
 }
@@ -11246,6 +11256,26 @@ mod task_render_tests {
         let out = "<task id=\"worker#1\" model=\"m\" state=\"completed\">\n<summary>fix <task foo> bug</summary>\n<task_result>\nx\ny\n</task_result>\n</task>";
         let s = summarise_task_result(out);
         assert_eq!(s, "worker \u{b7} m \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_task_literal_in_body_not_missplit() {
+        // A worker's result body containing a LINE-LEADING "<task " must not create a
+        // phantom block (the scanner resumes only after the real "</task>").
+        let out = "<task id=\"worker#1\" model=\"m\" state=\"completed\">\n<summary>d</summary>\n<task_result>\n<task id=\"999\" x=\"y\">\nstuff\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 1, "body <task must not split: {s}");
+        assert_eq!(s, "worker \u{b7} m \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_model_name_with_gt_does_not_panic() {
+        // Absurd model name containing '>' / '</task>' must degrade gracefully, not panic
+        // (workspace is panic=abort, so a reverse slice would kill the process).
+        let out = "<task id=\"worker#1\" model=\"weird</task>x\" state=\"completed\">\n<summary>d</summary>\n<task_result>\nx\n</task_result>\n</task>";
+        let s = summarise_task_result(out); // must not panic
+        assert!(!s.is_empty());
     }
 
     #[test]
