@@ -277,6 +277,32 @@ impl Bridge {
         }
         coding_cfg.keep_interrupted_context = cfg.keep_interrupted_context;
 
+        // Strong/weak routing: when the `task` tool is enabled, give each tier whose
+        // model differs from the host its own SIGNED provider (built here — build_provider
+        // + the atomgit signer live in the bridge). A tier equal to the host, or any
+        // build failure, leaves the field None ⇒ that tier reuses the host provider slot.
+        // Respawn / ACP assemble sites are intentionally left unset; their tiers collapse
+        // to the host (a `/model` swap at those sites is an explicit override).
+        if atomcode_coding::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+            if let Ok(full_cfg) =
+                atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+            {
+                let (fast_key, cap_key) =
+                    atomcode_coding::subagent_tiers::resolve_tier_keys(&full_cfg);
+                let host_model = coding_cfg.model.clone();
+                let fast_p = full_cfg
+                    .providers
+                    .get(&fast_key)
+                    .and_then(|pc| build_tier_provider(&coding_cfg, &host_model, pc));
+                let cap_p = full_cfg
+                    .providers
+                    .get(&cap_key)
+                    .and_then(|pc| build_tier_provider(&coding_cfg, &host_model, pc));
+                coding_cfg.subagent_fast_provider = fast_p;
+                coding_cfg.subagent_capable_provider = cap_p;
+            }
+        }
+
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
             skill_dirs: None,
@@ -2231,6 +2257,41 @@ fn build_provider(
     }
 }
 
+/// Build a distinct signed provider for a `task`-tool tier whose model differs from
+/// the host model. Returns `None` when the tier's model equals the host (⇒ reuse the
+/// host provider slot) or when construction fails (⇒ graceful collapse to host).
+/// The derived config clears its own injected-provider fields so a tier agent never
+/// recurses. NOTE: the returned provider is RAW (unmetered) — telemetry attribution
+/// for the non-host tier is a known follow-up polish item.
+fn build_tier_provider(
+    base: &CodingAgentConfig,
+    host_model: &str,
+    pc: &atomcode_core::config::provider::ProviderConfig,
+) -> Option<std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider>> {
+    if pc.model == host_model {
+        return None; // tier == host → reuse host slot
+    }
+    let mut tier_cfg = base.clone();
+    tier_cfg.model = pc.model.clone();
+    if let Some(bu) = pc.base_url.clone() {
+        tier_cfg.base_url = bu;
+    }
+    if let Some(ak) = pc.api_key.clone() {
+        tier_cfg.api_key = ak;
+    }
+    tier_cfg.provider_type = pc.provider_type.clone();
+    tier_cfg.context_window = pc.context_window as u32;
+    tier_cfg.thinking_type = pc.thinking_type.clone();
+    tier_cfg.thinking_keep = pc.thinking_keep.clone();
+    tier_cfg.reasoning_history = pc.reasoning_history.clone();
+    tier_cfg.thinking_enabled = pc.thinking_enabled;
+    tier_cfg.skip_tls_verify = pc.skip_tls_verify;
+    // Never let a tier agent carry its own injected providers.
+    tier_cfg.subagent_fast_provider = None;
+    tier_cfg.subagent_capable_provider = None;
+    build_provider(&tier_cfg).ok()
+}
+
 /// Build an authenticated [`LlmProvider`] directly from a [`BridgeConfig`].
 ///
 /// Thin public entry point for the `atomcode acp` CLI subcommand: the CLI needs
@@ -2813,6 +2874,50 @@ mod undo_tests {
         let bridge_flag = true; // stands in for BridgeConfig.keep_interrupted_context
         coding.keep_interrupted_context = bridge_flag;
         assert!(coding.keep_interrupted_context, "flag must propagate to CodingAgentConfig");
+    }
+
+    // Helper: build a minimal ProviderConfig for tier-provider tests.
+    fn tier_pc(model: &str, base_url: &str) -> atomcode_core::config::provider::ProviderConfig {
+        atomcode_core::config::provider::ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-x".into()),
+            model: model.into(),
+            base_url: Some(base_url.into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        }
+    }
+
+    #[test]
+    fn tier_provider_none_when_model_equals_host() {
+        // Short-circuit: tier model == host model ⇒ reuse host slot, return None.
+        let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("glm-5.2", "https://api.example.com/v1");
+        assert!(
+            super::build_tier_provider(&base, "glm-5.2", &pc).is_none(),
+            "same model as host must return None (reuse host slot)"
+        );
+    }
+
+    #[test]
+    fn tier_provider_some_when_model_differs() {
+        // Different model + non-gateway base_url ⇒ build succeeds, returns Some.
+        let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("deepseek-v4-flash", "https://api.example.com/v1");
+        assert!(
+            super::build_tier_provider(&base, "glm-5.2", &pc).is_some(),
+            "distinct model with valid config must return Some"
+        );
     }
 }
 

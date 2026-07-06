@@ -1,6 +1,7 @@
 //! Configuration for assembling a coding agent.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
@@ -94,6 +95,13 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
+    /// Pre-built provider for the `task` tool's FAST tier — set by the bridge when the
+    /// fast-tier model differs from the host model (a distinct signed provider). `None`
+    /// ⇒ the fast tier reuses the host provider slot filled at assemble. NOT included in
+    /// the manual `Debug` impl (a `dyn` provider isn't `Debug`).
+    pub subagent_fast_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    /// Pre-built provider for the `task` tool's CAPABLE tier (same contract as above).
+    pub subagent_capable_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
 }
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
@@ -150,6 +158,8 @@ impl CodingAgentConfig {
             keep_interrupted_context: false,
             user_agent: None,
             skip_tls_verify: false,
+            subagent_fast_provider: None,
+            subagent_capable_provider: None,
         }
     }
 }
@@ -163,6 +173,13 @@ mod tests {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
         assert_eq!(c.goal_max_rounds, 200);
         assert_eq!(c.goal_max_duration_secs, 7200);
+    }
+
+    #[test]
+    fn coding_cfg_new_defaults_subagent_providers_none() {
+        let c = CodingAgentConfig::new("k", "https://api.example.com/v1", "m", "/tmp");
+        assert!(c.subagent_fast_provider.is_none());
+        assert!(c.subagent_capable_provider.is_none());
     }
 }
 

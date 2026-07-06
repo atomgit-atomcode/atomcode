@@ -48,7 +48,7 @@ pub use todo::TodoHook;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hooks, CodingParts, PrepareOptions, SessionBinding,
-    SessionMode,
+    SessionMode, subagent_enabled_from_env,
 };
 pub use persona::coding_persona;
 
