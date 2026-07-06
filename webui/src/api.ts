@@ -196,6 +196,10 @@ export interface SessionMessage {
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
+  /** Epoch ms this message was authored (PR #562 send-time labels). Absent
+   *  on older daemons and on live/snapshot turns (the webui injects Date.now()
+   *  there). Optional + `?` so historical payloads without it still parse. */
+  created_at?: number;
 }
 
 export interface SessionDetail {

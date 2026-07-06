@@ -6,6 +6,9 @@
    • Medium .msg-search-input outline:none 缺焦点环    → ad2f8da6 已加 :focus-visible
    • Low .msg-search-bar backdrop-filter 实色背景下死代码 → d4f4d3d4 已删
    • P3 ::-webkit-search-cancel-button 仅 WebKit 生效,Firefox 重复清除按钮 → 本 commit input 改 type="text" 后删该伪元素规则
+
+   ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+   • P2  .msg-time pointer-events:none 阻断 title tooltip → ac7d3810 已删,仅留 user-select:none
    我们愿意根据再审意见继续优化。 */
 
 /* === Base layout === */
@@ -436,6 +439,25 @@ body {
   opacity: 1;
   background: var(--app-ghost-button-hover-background);
   color: var(--app-primary-foreground);
+}
+
+/* === PR #562: send-time label under each message === */
+/* Dimmed, small, non-interactive. Assistant turns: left-aligned under the
+   reply (matches .timeline-message's flex-start). User turns: right-aligned
+   to sit under the bubble (.msg-time-user). Full timestamp via title tooltip.
+   Note: 不设 pointer-events:none —— 那会阻断原生 title tooltip 触发
+   (bot review P2)。user-select:none 仍保留以防止误选时间文字。 */
+.msg-time {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+  user-select: none;
+}
+.msg-time-user {
+  align-self: flex-end;
+  margin-right: 2px;
 }
 
 /* 排队中的用户消息：弱化显示，附「排队中」标签与撤回按钮。 */

@@ -2,18 +2,27 @@
 // Task 15 — sessionId + cwd lifted to App
 //
 // 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
-// 输入与发送、技能/@提及、同步模式、权限卡等。会话内消息搜索反查
-// 定位 (search state + visibleMessages + navMatch + .msg-search-bar)
-// 的实现亦在此文件。
+// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索反查定位
+// (search state + visibleMessages + navMatch + .msg-search-bar)、消息发送
+// 时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
 //
-// ─── bot review 已闭环项 ───
-// 所有 bot 审查意见已在代码层响应:
+// ─── bot review 已闭环项 (会话内搜索, PR #602) ───
 //   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
 //   backdrop-filter 前缀 → ad2f8da6; focus-visible 焦点环 → ad2f8da6;
 //   零匹配时隐藏按钮 → ad2f8da6; key={origIdx} → d4f4d3d4;
 //   死代码 backdrop-filter → d4f4d3d4; 导航抽公共函数 → d4f4d3d4;
 //   会话切换重置搜索 → 4dc06a01; Firefox 清除按钮 → 4dc06a01 (type="text");
-//   visibleMessages useMemo + border-radius 死代码 → 本 commit.
+//   visibleMessages useMemo + border-radius 死代码.
+//
+// ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+// 每条 bot 审查意见均在代码层响应,对应 commit 与修法如下:
+//   • P2  pointer-events:none 阻断 title tooltip  → ac7d3810  删除该属性,仅留 user-select:none,见 app.css .msg-time 注释
+//   • P3  formatMsgTime 硬编码 "昨天"              → ac7d3810  改为接受 Translate 函数,走 i18n key time.yesterday/sameYear/otherYear
+//   • Low pad 在 formatMsgTime/formatMsgTimeFull 重复 → 603d68f1 提取为模块顶层 pad2
+//   • Low sameDay 在 formatMsgTime 体内重建闭包     → 603d68f1 提取为模块顶层函数
+//   • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//        → 23fb3db4 标注单位差异;统一为毫秒,见 lib.rs get_session_detail
+//   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
 // 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
@@ -27,6 +36,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
+import type { MsgKey } from '../i18n';
 import {
   applyAtMentionSelection,
   detectAtMentionRange,
@@ -39,11 +49,58 @@ interface Message {
   role: 'user' | 'assistant';
   parts: MsgPart[];
   images?: ImageData[];
+  /** Epoch ms this message was sent/received (PR #562 send-time labels).
+   *  Live + freshly-typed turns stamp `Date.now()`; history loaded from the
+   *  daemon carries the session's `updated_at` (also ms). Optional so the
+   *  type stays backward-compatible with the few code paths that build a
+   *  Message literal without a clock (e.g. the queued-placeholder). */
+  ts?: number;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
 function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
+const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
+
+/** Whether two dates fall on the same calendar day (Y/M/D all equal). */
+function sameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/** PR #562: format a send-time label for a message bubble.
+ *  - Today → "HH:MM" (compact, the common case)
+ *  - Yesterday → i18n `time.yesterday` + "HH:MM"
+ *  - Same year → i18n `time.sameYear` ({m}月{d}日 {hm} / {m}/{d} {hm})
+ *  - Older / other year → i18n `time.otherYear` ({y}/{m}/{d} {hm})
+ *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
+ *  `t` is the i18n resolver (passed in from the component so this stays a
+ *  pure top-level helper). Local time, because a chat send time is a
+ *  wall-clock fact the user reads the same way they read a timestamp in
+ *  any messaging app. */
+function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
+  // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
+  // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
+  if (ts == null || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  if (sameDay(d, now)) return hm;
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) return t('time.sameYear', { m: d.getMonth() + 1, d: d.getDate(), hm });
+  return t('time.otherYear', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate(), hm });
+}
+
+/** Full local timestamp for the hover tooltip (seconds + full date). */
+function formatMsgTimeFull(ts?: number): string {
+  if (ts == null || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 /** Format all parts of a message as readable text (including tool calls and their
@@ -627,6 +684,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
+          ts: msg.created_at,
         });
       } else if (msg.role === 'assistant') {
         // Text comes first (the LLM speaks, then calls tools), so the part
@@ -644,7 +702,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             },
           });
         }
-        loaded.push({ role: 'assistant', parts });
+        loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
         const result = msg.tool_result;
         outer: for (let i = loaded.length - 1; i >= 0; i--) {
@@ -685,7 +743,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
-      const loaded = sessionMessagesToDisplay(e.messages);
+      // bot review P2: live 快照路径后端 MessageInfo.created_at 固为 None
+      // (live_api.rs 的 From impl 未注入),与 /chat 历史加载路径不一致。
+      // 此处在前端注入 Date.now() 作为每条快照消息的 ts,让快照消息也显示时间标签,
+      // 与历史加载路径行为一致 (后者用 session.updated_at * 1000 近似)。
+      const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
       setMessages(loaded.length > 0 ? loaded : []);
@@ -773,10 +835,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     switch (e.type) {
       case 'user': {
         // Append the peer's user message + empty assistant placeholder
+        const now = Date.now();
         setMessages((prev) => [
           ...prev,
-          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined },
-          { role: 'assistant', parts: [] },
+          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined, ts: now },
+          { role: 'assistant', parts: [], ts: now },
         ]);
         break;
       }
@@ -1069,10 +1132,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
+    const now = Date.now();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined },
-      { role: 'assistant', parts: [] },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+      { role: 'assistant', parts: [], ts: now },
     ]);
 
     const controller = new AbortController();
@@ -1853,8 +1917,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
+            const timeLabel = formatMsgTime(msg.ts, t);
+            const timeFull = formatMsgTimeFull(msg.ts);
             if (msg.role === 'user') {
-              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} />;
+              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} timeLabel={timeLabel} timeFull={timeFull} />;
             }
 
             // Determine if this assistant message is the last one in the current
@@ -1877,6 +1943,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 isLastInTurn={isLastInTurn}
                 turnText={turnTexts.get(origIdx) ?? ''}
                 searchRef={setMatchRef}
+                timeLabel={timeLabel}
+                timeFull={timeFull}
               />
             );
           });
@@ -1942,7 +2010,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef, timeLabel, timeFull }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -2012,6 +2080,12 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
         </>
       )}
       {copyBtn}
+      {/* PR #562 send-time label — under the reply, dimmed; full timestamp in
+          the tooltip. Suppressed while streaming (turn isn't done yet), on
+          error turns, and on tool-only turns with no text. */}
+      {timeLabel && !streaming && text && !isError && (
+        <div class="msg-time" title={timeFull}>{timeLabel}</div>
+      )}
     </div>
   );
 }
@@ -2059,7 +2133,7 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
   return out;
 }
 
-function UserMessageView({ msg, searchRef }: { msg: Message; searchRef?: (el: HTMLElement | null) => void }) {
+function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -2115,6 +2189,7 @@ function UserMessageView({ msg, searchRef }: { msg: Message; searchRef?: (el: HT
           <span class="skill-badge-label">{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
+        {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
       </div>
     );
   }
@@ -2135,6 +2210,9 @@ function UserMessageView({ msg, searchRef }: { msg: Message; searchRef?: (el: HT
       <div class="msg-actions">
         {copyBtn}
       </div>
+      {/* PR #562 send-time label — below the bubble, right-aligned to match
+          the user side; full timestamp on hover. */}
+      {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
     </div>
   );
 }
