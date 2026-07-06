@@ -5,13 +5,41 @@
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
 use atomcode_kernel::event::StopReason;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::provider::LlmProvider;
-use atomcode_kernel::tool::{MountedTools, RiskLevel, Tool, ToolContext, ToolResult};
+use atomcode_kernel::request::RequestCtx;
+use atomcode_kernel::tool::{MountedTools, RiskLevel, Tool, ToolCall, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+
+/// Hard-denies any child tool call that references a sensitive path (credentials, `~/.ssh`,
+/// `.env`, cloud creds). Mounted on every subagent child. Unlike the parent's
+/// `SensitivePathGate` — which PROMPTS — this DENIES outright, because a subagent runs
+/// `AutoRespond::AllowAll`, so a prompt would just auto-approve itself. Only the file tools'
+/// path args are inspected; `bash` retains the user's authority (the worker dispatch itself
+/// is Risky and user-approved — the same trust as approving a bash command in the main loop).
+struct DenySensitivePaths;
+
+#[async_trait]
+impl ToolMiddleware for DenySensitivePaths {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        if crate::tools::references_sensitive_path(&call.arguments) {
+            return BeforeOutcome::deny(format!(
+                "subagent may not touch sensitive paths (credentials / ~/.ssh / .env): {}",
+                call.name
+            ));
+        }
+        BeforeOutcome::Proceed
+    }
+}
 
 const EXPLORE_PERSONA: &str = "You are a READ-ONLY investigation subagent. Use read/search \
 tools to answer the assigned task about the codebase. You CANNOT edit files. When done, \
@@ -179,6 +207,10 @@ several. Subagents run in parallel and cannot themselves dispatch."
                     .persona(persona)
                     .working_dir(wd)
                     .cancel_token(child_cancel)
+                    // The child runs AutoRespond::AllowAll (no human in its loop), so the
+                    // parent's prompting sensitive-path gate wouldn't protect it. Hard-deny
+                    // sensitive-path file ops instead (#1).
+                    .middleware(Arc::new(DenySensitivePaths))
                     .build();
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
@@ -216,32 +248,38 @@ several. Subagents run in parallel and cannot themselves dispatch."
         // Sort by label for deterministic output regardless of scheduling order.
         collected.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let n_total = collected.len();
+        let mut n_error = 0usize;
         let mut blocks: Vec<String> = Vec::new();
-        let mut any_error = false;
         for (label, desc, model, outcome) in collected {
             let is_err = outcome.stop != StopReason::Stopped;
-            any_error |= is_err;
-            let (state, tag, body) = if is_err {
-                (
-                    "error",
-                    "task_error",
-                    format!(
-                        "subagent failed ({:?}): {}",
-                        outcome.stop,
-                        outcome.error.unwrap_or_else(|| "<no error message>".into())
-                    ),
-                )
-            } else if !outcome.text.is_empty() {
-                ("completed", "task_result", outcome.text)
+            if is_err {
+                n_error += 1;
+            }
+            // Collect any output the child produced (assistant text, else tool results).
+            let produced = if !outcome.text.is_empty() {
+                outcome.text
             } else {
-                // Pure-tool child (no assistant text): fall back to tool_results.
-                let joined = outcome
+                outcome
                     .tool_results
                     .iter()
                     .map(|r| r.content.clone())
                     .collect::<Vec<_>>()
-                    .join("\n");
-                ("completed", "task_result", joined)
+                    .join("\n")
+            };
+            let (state, tag, body) = if is_err {
+                // Preserve partial output on a bounded/failed stop (MaxRounds/Timeout/…) —
+                // a worker that did real work before hitting a limit is not a total loss (#2).
+                let mut b = format!("subagent stopped early ({:?})", outcome.stop);
+                if let Some(e) = &outcome.error {
+                    b.push_str(&format!(": {e}"));
+                }
+                if !produced.is_empty() {
+                    b.push_str(&format!("\n--- partial output ---\n{produced}"));
+                }
+                ("error", "task_error", b)
+            } else {
+                ("completed", "task_result", produced)
             };
             blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
         }
@@ -249,7 +287,10 @@ several. Subagents run in parallel and cannot themselves dispatch."
         ToolResult {
             call_id: String::new(),
             content: blocks.join("\n"),
-            is_error: any_error,
+            // Fail the whole tool call only when EVERY subtask failed. A partial failure is
+            // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
+            // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
+            is_error: n_total > 0 && n_error == n_total,
             images: vec![],
         }
     }
@@ -400,6 +441,31 @@ mod tests {
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error, "expected error result, got: {}", out.content);
         assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn partial_batch_failure_is_not_overall_error() {
+        // 2 subtasks, one succeeds + one fails ⇒ overall is_error=false (survivors are
+        // actionable), but both a <task_result> and a <task_error> appear (#5).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mk = {
+            let calls = calls.clone();
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let reply = if n == 0 { Some("did it".to_string()) } else { None };
+                Arc::new(MockProvider { reply }) as Arc<dyn LlmProvider>
+            }
+        };
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(mk.clone(), mk, move || r1.mount(&[]), move || r2.mount(&[]));
+        let args = r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"explore"},{"description":"b","prompt":"q","subagent_type":"explore"}]}"#;
+        let out = tool.execute(args, &ctx()).await;
+        assert!(!out.is_error, "partial failure must not be overall error: {}", out.content);
+        assert!(out.content.contains("<task_result>"), "missing success block: {}", out.content);
+        assert!(out.content.contains("<task_error>"), "missing failure block: {}", out.content);
     }
 
     #[tokio::test]

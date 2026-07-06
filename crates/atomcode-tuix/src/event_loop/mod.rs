@@ -8811,6 +8811,10 @@ fn handle_agent_event(
                         web_search_result_suffix(&output)
                             .map(|s| format!("sources: {s}"))
                             .unwrap_or_else(|| summarise(&output))
+                    } else if name == "task" {
+                        // Clean per-subtask lines (id · model · status) instead of the
+                        // raw <task ...> block.
+                        summarise_task_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -10944,6 +10948,20 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
+        "task" => {
+            // Header preview: a single subtask shows its description; a batch shows the
+            // count. (Per-subtask model/status is on the RESULT line — see
+            // `summarise_task_result`; the model isn't known until execution.)
+            match v.get("tasks").and_then(|t| t.as_array()) {
+                Some(arr) if arr.len() == 1 => arr[0]
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| crate::width::truncate_with_ellipsis(s, 100))
+                    .unwrap_or_default(),
+                Some(arr) if !arr.is_empty() => format!("{} subtasks", arr.len()),
+                _ => String::new(),
+            }
+        }
         _ => {
             // For MCP tools (name starts with mcp__), render the
             // arguments as key=value pairs so users can see what
@@ -11243,6 +11261,103 @@ pub(crate) fn summarise(output: &str) -> String {
     }
 }
 
+/// Render the `task` tool's `<task ...>` result blocks into clean per-subtask lines:
+/// `id · model · ✓ done` (or `✗ failed (reason)`), one per subtask. A single subtask
+/// drops its `#1` suffix and appends the result's line count. Falls back to the generic
+/// `summarise` if no `<task>` blocks are found (defensive — the format is ours, but a
+/// future change or an early error result shouldn't render blank).
+pub(crate) fn summarise_task_result(output: &str) -> String {
+    // Read a `key="value"` attribute from a `<task ...>` opening tag.
+    fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+        let needle = format!("{key}=\"");
+        let s = tag.find(&needle)? + needle.len();
+        let rest = &tag[s..];
+        rest.find('"').map(|e| &rest[..e])
+    }
+    // Inner text between `<t>` and `</t>` within a block body.
+    fn inner<'a>(body: &'a str, t: &str) -> Option<&'a str> {
+        let open = format!("<{t}>");
+        let close = format!("</{t}>");
+        let s = body.find(&open)? + open.len();
+        let e = body[s..].find(&close)? + s;
+        Some(body[s..e].trim())
+    }
+
+    // Scan block-by-block. A block starts at a LINE-LEADING "<task " (start of output or
+    // right after '\n' — render_task_block joins blocks with '\n') and ends at the NEXT
+    // "</task>". Crucially we resume the search for the next block AFTER that "</task>",
+    // so a "<task " that appears inside a block BODY (e.g. cat'd XML in a worker's output)
+    // is never mistaken for a boundary (#3). The closing tag is searched AFTER the opening
+    // tag's '>', so a stray '>' in an attribute value can never produce a reverse slice (#6).
+    struct Parsed {
+        id: String,
+        model: String,
+        ok: bool,
+        reason: Option<String>,
+        result_lines: usize,
+    }
+    let mut parsed: Vec<Parsed> = Vec::new();
+    let mut rest = output;
+    loop {
+        let start = if rest.starts_with("<task ") {
+            0
+        } else if let Some(i) = rest.find("\n<task ") {
+            i + 1 // point at '<'
+        } else {
+            break;
+        };
+        let block = &rest[start..]; // begins with "<task "
+        let Some(gt) = block.find('>') else { break }; // end of opening tag
+        // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
+        let Some(close_rel) = block[gt + 1..].find("</task>") else { break };
+        let close = gt + 1 + close_rel;
+        let tag = &block[..gt];
+        let body = &block[gt + 1..close];
+        let ok = attr(tag, "state") == Some("completed");
+        let reason = if ok {
+            None
+        } else {
+            // Must match TaskTool's error-block emitter (task.rs): "subagent stopped early (Reason): …".
+            body.find("subagent stopped early (").and_then(|i| {
+                let r = &body[i + "subagent stopped early (".len()..];
+                r.find(')').map(|j| r[..j].to_string())
+            })
+        };
+        parsed.push(Parsed {
+            id: attr(tag, "id").unwrap_or("subtask").to_string(),
+            model: attr(tag, "model").unwrap_or("?").to_string(),
+            ok,
+            reason,
+            result_lines: inner(body, "task_result").map(|s| s.lines().count()).unwrap_or(0),
+        });
+        rest = &block[close + "</task>".len()..];
+    }
+    if parsed.is_empty() {
+        // No parseable block (not a task result, or all malformed) → generic summary.
+        return summarise(output);
+    }
+    let single = parsed.len() == 1;
+    let mut lines: Vec<String> = Vec::with_capacity(parsed.len());
+    for p in &parsed {
+        // "worker#1" → "worker" when there's only one subtask.
+        let id = if single { p.id.split('#').next().unwrap_or(&p.id) } else { p.id.as_str() };
+        let mark = if p.ok {
+            "\u{2713} done".to_string()
+        } else {
+            match &p.reason {
+                Some(r) => format!("\u{2717} failed ({r})"),
+                None => "\u{2717} failed".to_string(),
+            }
+        };
+        let mut line = format!("{id} \u{b7} {} \u{b7} {mark}", p.model);
+        if single && p.ok && p.result_lines > 1 {
+            line.push_str(&format!(" ({} lines)", p.result_lines));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 /// A plan-mode interception surfaces as a failed tool result whose body is
 /// `blocked: plan mode …` — the kernel prefixes every middleware block with `blocked: `,
 /// and `PlanModeGate`'s reason starts with `plan mode is active`. Returns the human reason
@@ -11390,6 +11505,94 @@ mod todo_block_tests {
         assert!(!out[2].contains("\x1b[") && out[2].contains('c'), "pending plain: {:?}", out[2]);
         // Empty on parse failure (caller falls back to the normal tool row).
         assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_render_tests {
+    use super::*;
+
+    #[test]
+    fn header_single_shows_description() {
+        let args = r#"{"tasks":[{"description":"create greet.py","prompt":"p","subagent_type":"worker"}]}"#;
+        assert_eq!(format_tool_detail("task", args), "create greet.py");
+    }
+
+    #[test]
+    fn header_multi_shows_count() {
+        let args = r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"worker"},{"description":"b","prompt":"q","subagent_type":"explore"}]}"#;
+        assert_eq!(format_tool_detail("task", args), "2 subtasks");
+    }
+
+    #[test]
+    fn result_single_clean_line_with_model_and_count() {
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"completed\">\n<summary>d</summary>\n<task_result>\nline1\nline2\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        // single ⇒ "#1" dropped, model shown, line count appended
+        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_multi_one_line_each_keeps_index() {
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"completed\">\n<summary>a</summary>\n<task_result>\nx\n</task_result>\n</task>\n<task id=\"explore#2\" model=\"glm-5.2\" state=\"completed\">\n<summary>b</summary>\n<task_result>\ny\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "worker#1 \u{b7} deepseek-v4-flash \u{b7} \u{2713} done");
+        assert_eq!(lines[1], "explore#2 \u{b7} glm-5.2 \u{b7} \u{2713} done");
+    }
+
+    #[test]
+    fn result_failure_shows_reason() {
+        // Body format must match TaskTool's emitter: "subagent stopped early (Reason): …".
+        let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"error\">\n<summary>d</summary>\n<task_error>\nsubagent stopped early (Timeout): byte-idle\n</task_error>\n</task>";
+        let s = summarise_task_result(out);
+        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2717} failed (Timeout)");
+    }
+
+    #[test]
+    fn result_non_task_output_falls_back() {
+        // Defensive: not a task block ⇒ generic summarise, not blank.
+        let s = summarise_task_result("plain text\nsecond line");
+        assert_eq!(s, "plain text (2 lines)");
+    }
+
+    #[test]
+    fn result_description_with_task_literal_not_missplit() {
+        // A description containing an inline "<task " must NOT create a spurious block —
+        // only line-leading "<task " (block boundaries) split.
+        let out = "<task id=\"worker#1\" model=\"m\" state=\"completed\">\n<summary>fix <task foo> bug</summary>\n<task_result>\nx\ny\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        assert_eq!(s, "worker \u{b7} m \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_task_literal_in_body_not_missplit() {
+        // A worker's result body containing a LINE-LEADING "<task " must not create a
+        // phantom block (the scanner resumes only after the real "</task>").
+        let out = "<task id=\"worker#1\" model=\"m\" state=\"completed\">\n<summary>d</summary>\n<task_result>\n<task id=\"999\" x=\"y\">\nstuff\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 1, "body <task must not split: {s}");
+        assert_eq!(s, "worker \u{b7} m \u{b7} \u{2713} done (2 lines)");
+    }
+
+    #[test]
+    fn result_model_name_with_gt_does_not_panic() {
+        // Absurd model name containing '>' / '</task>' must degrade gracefully, not panic
+        // (workspace is panic=abort, so a reverse slice would kill the process).
+        let out = "<task id=\"worker#1\" model=\"weird</task>x\" state=\"completed\">\n<summary>d</summary>\n<task_result>\nx\n</task_result>\n</task>";
+        let s = summarise_task_result(out); // must not panic
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn result_malformed_blocks_fall_back_not_blank() {
+        // `<task ` present but no closing `>` on any block ⇒ generic summarise, not "".
+        let out = "<task id=\"worker#1\" model=\"x\"  (truncated, no gt)";
+        let s = summarise_task_result(out);
+        assert!(!s.is_empty(), "must not be blank");
+        assert!(s.contains("truncated"), "should fall back to raw summary: {s}");
     }
 }
 

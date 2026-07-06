@@ -2650,6 +2650,9 @@ fn derive_tier_cfg(
     }
     tier_cfg.provider_type = pc.provider_type.clone();
     tier_cfg.context_window = pc.context_window as u32;
+    // Use the tier's own per-call output cap, not the host's inherited one (#4). `None`
+    // lets `build_provider` derive a cap from the tier's context_window.
+    tier_cfg.chat_options.max_tokens = pc.max_tokens.map(|n| n as u32);
     tier_cfg.thinking_type = pc.thinking_type.clone();
     tier_cfg.thinking_keep = pc.thinking_keep.clone();
     tier_cfg.reasoning_history = pc.reasoning_history.clone();
