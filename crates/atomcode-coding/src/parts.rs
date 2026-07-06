@@ -259,17 +259,24 @@ pub async fn prepare_with_plugin_hooks(
                 reg_w.mount(&refs)
             };
 
-            // Both tiers read the same host-provider slot (filled at assemble, always before
-            // any turn runs — mirrors how the review tool's slot is guaranteed filled).
+            // Prefer a bridge-injected tier provider (built when that tier's model differs
+            // from the host model); else fall back to the host-provider slot (filled at
+            // assemble — the single-model / same-as-host collapse path).
+            let inj_fast = cfg.subagent_fast_provider.clone();
+            let inj_cap = cfg.subagent_capable_provider.clone();
             let slot_fast = slot.clone();
             let slot_cap = slot.clone();
             let make_fast = move || {
-                slot_fast.read().ok().and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
+                inj_fast.clone().unwrap_or_else(|| {
+                    slot_fast.read().ok().and_then(|g| g.clone())
+                        .expect("subagent provider slot filled at assemble before any turn")
+                })
             };
             let make_capable = move || {
-                slot_cap.read().ok().and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
+                inj_cap.clone().unwrap_or_else(|| {
+                    slot_cap.read().ok().and_then(|g| g.clone())
+                        .expect("subagent provider slot filled at assemble before any turn")
+                })
             };
 
             registry.register(Arc::new(TaskTool::new(
@@ -700,7 +707,7 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
 
 /// env `ATOMCODE_SUBAGENT` gate: default OFF; `0`/`false`/`off`/empty (case-insensitive)
 /// = off, any other non-empty value = on. (Opposite default from `ATOMCODE_TODO`.)
-pub(crate) fn subagent_enabled_from_env(var: Option<&str>) -> bool {
+pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     match var {
         None => false,
         Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off"),

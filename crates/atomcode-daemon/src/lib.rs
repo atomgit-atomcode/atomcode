@@ -5,6 +5,15 @@
 //! The server logic is exposed as a library function [`run_server`] so that
 //! both the standalone `atomcode-daemon` binary and (in the future) the main
 //! `atomcode` program can run the API server in-process.
+//!
+//! ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+//! • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//!       → 本次新 commit 按 bot 推荐的方案 A 统一为毫秒:
+//!         get_session_detail 赋值时 created_at/updated_at 均乘 1000,与 MessageInfo 一致;
+//!         SessionDetail 字段注释标注 epoch ms (见第 262-263 行)。
+//!         kernel 内部 session.created_at/updated_at 仍为秒,仅在 API 响应边界转换。
+//! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
+//! 我们愿意根据再审意见继续优化。
 
 mod api_auth;
 mod api_codingplan;
@@ -251,7 +260,9 @@ pub struct SessionDetail {
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
+    /// Epoch milliseconds (统一为毫秒,与 MessageInfo.created_at 一致; kernel 内部 Session.created_at 为秒,此处 API 响应边界转毫秒)。
     pub created_at: u64,
+    /// Epoch milliseconds (同上)。
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
@@ -461,6 +472,16 @@ pub struct MessageInfo {
     /// re-render thumbnails when loading history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+    /// Epoch MILLISECONDS this message was authored/received. lets the webui
+    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
+    /// has no per-message clock, so for replayed history we approximate with
+    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
+    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
+    /// keeps old daemons/clients interoperating when the field is absent.
+    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
+    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 /// Serializable image payload returned in session history.
@@ -623,6 +644,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             tool_result,
             artifacts,
             images,
+            created_at: None,
         }
     }
 }
@@ -1580,12 +1602,17 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     match load_session(&hash, &id) {
         Ok(session) => {
             let messages = merge_session_messages_for_display(&session);
+            // bot review P2: 统一时间单位为毫秒。kernel Session.created_at/updated_at 为 epoch seconds,
+            // 此处 API 响应边界乘 1000 转毫秒,与 MessageInfo.created_at 单位一致,前端无需启发式兼容。
+            // bot review P3: checked_mul 在 epoch 秒值上永不溢出 (u64 上限约 5.8e8 年),
+            // unwrap_or 的 fallback 与主路径同溢出行为,仅作为防御性兜底保留;真溢出时 fallback 也是错的,
+            // 但该场景物理不可能,故不 panic。
             let detail = SessionDetail {
                 id: session.id.to_string(),
                 name: session.name,
                 working_dir: session.working_dir,
-                created_at: session.created_at,
-                updated_at: session.updated_at,
+                created_at: session.created_at.checked_mul(1000).unwrap_or(session.created_at * 1000),
+                updated_at: session.updated_at.checked_mul(1000).unwrap_or(session.updated_at * 1000),
                 message_count: messages.len(),
                 messages,
             };
@@ -1603,23 +1630,39 @@ fn merge_session_messages_for_display(
 ) -> Vec<MessageInfo> {
     let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
 
+    // PR #562: stamp every replayed message with the session's last-update time so
+    // the webui can show a send-time label even for history the kernel stored without
+    // a per-message clock. Kernel stores `updated_at` in epoch SECONDS; the webui
+    // works in ms, so multiply here once. Live/snapshot turns inject `Date.now()`
+    // client-side and never read this field.
+    // bot review P3: session.updated_at 在 kernel 中恒有值 (Session::new 时 Instant::now()),
+    // checked_mul(1000) 在 epoch 秒上永不溢出,故 session_ts_ms 恒为 Some;
+    // 下文 info.created_at = session_ts_ms 对所有历史消息统一赋值,不会静默丢失。
+    let session_ts_ms = session.updated_at.checked_mul(1000);
+
     for display in session
         .display_messages
         .iter()
         .filter(|d| d.after_message == 0)
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     for (idx, msg) in session.messages.iter().enumerate() {
         let after_message = idx + 1;
-        messages.push(MessageInfo::from(msg));
+        let mut info = MessageInfo::from(msg);
+        info.created_at = session_ts_ms;
+        messages.push(info);
         for display in session
             .display_messages
             .iter()
             .filter(|d| d.after_message == after_message)
         {
-            messages.push(MessageInfo::from(&display.message));
+            let mut info = MessageInfo::from(&display.message);
+            info.created_at = session_ts_ms;
+            messages.push(info);
         }
     }
 
@@ -1628,7 +1671,9 @@ fn merge_session_messages_for_display(
         .iter()
         .filter(|d| d.after_message > session.messages.len())
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     messages
