@@ -13,6 +13,11 @@ packages/npm/*.tgz
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment variables (may contain secrets)
+.env
 
 # Python (dev scripts)
 __pycache__/
