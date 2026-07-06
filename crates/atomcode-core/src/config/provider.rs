@@ -241,4 +241,24 @@ mod tests {
             "skip_tls_verify should be serialized when true"
         );
     }
+
+    #[test]
+    fn capable_model_round_trips_and_skips_none() {
+        // Hand-written (or server-persisted) rank parses.
+        let toml_str = r#"
+            type = "openai"
+            model = "GLM-5.2"
+            base_url = "https://llm-api.atomgit.com/v1"
+            context_window = 200000
+            capable_model = 1
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.capable_model, Some(1));
+        // Round-trips on save, and `None` is not emitted (existing configs stay clean).
+        let s = toml::to_string(&cfg).expect("serialize");
+        assert!(s.contains("capable_model = 1"), "set rank must serialize");
+        let none_cfg = ProviderConfig { capable_model: None, ..cfg };
+        let s2 = toml::to_string(&none_cfg).expect("serialize");
+        assert!(!s2.contains("capable_model"), "None must not be serialized");
+    }
 }

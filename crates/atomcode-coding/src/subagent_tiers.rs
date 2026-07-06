@@ -6,29 +6,26 @@
 
 use atomcode_core::config::Config;
 
-/// Resolve `(fast_key, capable_key)` for the subagent tiers, given the current `host_model`.
+/// Resolve `Some((fast_key, capable_key))` for the subagent tiers, given the current
+/// `host_model`, or `None` when routing should NOT engage (⇒ the subagent uses the current
+/// host provider for both tiers).
 /// - Only providers with `capable_model` set participate; higher rank ⇒ more capable.
 /// - `fast` = the lowest-ranked participant, `capable` = the highest-ranked.
-/// - If the host doesn't participate, or there are fewer than 2 participants, BOTH tiers
-///   collapse to the host provider's own key (⇒ the bridge's `tier_builder` returns `None`
-///   ⇒ the subagent reuses the host provider).
+/// - Returns `None` when the host model doesn't itself participate (a self-configured model),
+///   or when there are fewer than 2 participants. Returning `None` (rather than the host's
+///   key) avoids a subtle bug: if the host model isn't in `providers`, there is no reliable
+///   "host key" to collapse to.
 /// Deterministic: ties in rank are broken by provider key.
-pub fn resolve_tier_keys(config: &Config, host_model: &str) -> (String, String) {
-    // The key of the provider that IS the current host (its model matches `host_model`).
-    // Returning this for both tiers makes `tier_builder` collapse to the host slot.
-    let host_key = config
-        .providers
-        .iter()
-        .find(|(_, pc)| pc.model == host_model)
-        .map(|(k, _)| k.clone())
-        .unwrap_or_else(|| config.default_provider.clone());
-
-    // Does the host model itself opt into auto-routing? (A self-configured host — no
-    // `capable_model` — never routes, even if other providers carry a rank.)
+pub fn resolve_tier_keys(config: &Config, host_model: &str) -> Option<(String, String)> {
+    // A self-configured host (no `capable_model`) never routes, even if other providers
+    // carry a rank.
     let host_participates = config
         .providers
         .values()
         .any(|pc| pc.model == host_model && pc.capable_model.is_some());
+    if !host_participates {
+        return None;
+    }
 
     // Rank the participating providers (ascending capability; ties broken by key).
     let mut ranked: Vec<(&String, i64)> = config
@@ -36,14 +33,11 @@ pub fn resolve_tier_keys(config: &Config, host_model: &str) -> (String, String) 
         .iter()
         .filter_map(|(k, pc)| pc.capable_model.map(|c| (k, c)))
         .collect();
-    ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-
-    if !host_participates || ranked.len() < 2 {
-        return (host_key.clone(), host_key);
+    if ranked.len() < 2 {
+        return None;
     }
-    let fast = ranked.first().unwrap().0.clone();
-    let capable = ranked.last().unwrap().0.clone();
-    (fast, capable)
+    ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+    Some((ranked.first().unwrap().0.clone(), ranked.last().unwrap().0.clone()))
 }
 
 #[cfg(test)]
@@ -81,33 +75,30 @@ mod tests {
         c.providers.insert("p-glm".into(), pc("GLM-5.2", Some(1)));
         c.default_provider = "p-glm".into();
         // host = GLM (participates, highest rank) ⇒ fast = deepseek (min), capable = GLM (max).
-        let (fast, capable) = resolve_tier_keys(&c, "GLM-5.2");
-        assert_eq!(fast, "p-ds");
-        assert_eq!(capable, "p-glm");
+        assert_eq!(
+            resolve_tier_keys(&c, "GLM-5.2"),
+            Some(("p-ds".to_string(), "p-glm".to_string()))
+        );
     }
 
     #[test]
-    fn self_config_host_collapses_to_current_model() {
+    fn self_config_host_does_not_route() {
         // Host is a self-configured model (no capable_model) even though AtomGit models WITH
-        // capable_model are also present ⇒ subagent uses the current model (both tiers = host key).
+        // capable_model are also present ⇒ None (subagent uses the current model).
         let mut c = Config::default();
         c.providers.insert("mine".into(), pc("my-local-model", None));
         c.providers.insert("p-ds".into(), pc("deepseek-v4-flash", Some(0)));
         c.providers.insert("p-glm".into(), pc("GLM-5.2", Some(1)));
         c.default_provider = "mine".into();
-        let (fast, capable) = resolve_tier_keys(&c, "my-local-model");
-        assert_eq!(fast, "mine");
-        assert_eq!(capable, "mine");
+        assert_eq!(resolve_tier_keys(&c, "my-local-model"), None);
     }
 
     #[test]
-    fn single_participant_collapses_to_host() {
+    fn single_participant_does_not_route() {
         let mut c = Config::default();
         c.providers.insert("p-glm".into(), pc("GLM-5.2", Some(1)));
         c.default_provider = "p-glm".into();
-        let (fast, capable) = resolve_tier_keys(&c, "GLM-5.2");
-        assert_eq!(fast, "p-glm");
-        assert_eq!(capable, "p-glm");
+        assert_eq!(resolve_tier_keys(&c, "GLM-5.2"), None);
     }
 
     #[test]
@@ -117,18 +108,18 @@ mod tests {
         c.providers.insert("b".into(), pc("m-b", Some(5)));
         c.providers.insert("c".into(), pc("m-c", Some(2)));
         c.default_provider = "b".into();
-        let (fast, capable) = resolve_tier_keys(&c, "m-b");
-        assert_eq!(fast, "a", "lowest rank is fast");
-        assert_eq!(capable, "b", "highest rank is capable");
+        // lowest rank = fast, highest = capable; middle ignored.
+        assert_eq!(
+            resolve_tier_keys(&c, "m-b"),
+            Some(("a".to_string(), "b".to_string()))
+        );
     }
 
     #[test]
-    fn no_participants_collapses_to_host() {
+    fn no_participants_does_not_route() {
         let mut c = Config::default();
         c.providers.insert("mine".into(), pc("x", None));
         c.default_provider = "mine".into();
-        let (fast, capable) = resolve_tier_keys(&c, "x");
-        assert_eq!(fast, "mine");
-        assert_eq!(capable, "mine");
+        assert_eq!(resolve_tier_keys(&c, "x"), None);
     }
 }

@@ -2689,9 +2689,14 @@ fn resolve_tier_thunks(
     host_model: &str,
     full_cfg: &atomcode_core::config::Config,
 ) -> (atomcode_coding::SubagentProvider, atomcode_coding::SubagentProvider) {
-    let (fast_key, cap_key) =
-        atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg, host_model);
     let none_thunk = || -> atomcode_coding::SubagentProvider { std::sync::Arc::new(|| None) };
+    // `None` ⇒ no routing (self-config host / <2 participants) ⇒ both tiers fall back to the
+    // host provider slot (a null thunk makes the TaskTool factory use the host slot).
+    let Some((fast_key, cap_key)) =
+        atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg, host_model)
+    else {
+        return (none_thunk(), none_thunk());
+    };
     let thunk_for = |key: &str| -> atomcode_coding::SubagentProvider {
         full_cfg
             .providers
