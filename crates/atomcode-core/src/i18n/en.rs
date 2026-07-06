@@ -832,6 +832,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::SaveEmpty => "No conversation to export yet".into(),
         Msg::SaveIoError { error } => format!("Failed to save conversation: {error}").into(),
         Msg::SaveInvalidPath { path } => format!("Invalid path — directory does not exist: {path}").into(),
+        Msg::SaveRefuseOverwrite { path } => format!("Target exists and isn't a markdown file — refused to overwrite it (avoids clobbering source/config): {path}. Use a .md filename or a new path.").into(),
         Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
