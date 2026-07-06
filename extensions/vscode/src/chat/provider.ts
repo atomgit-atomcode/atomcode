@@ -710,7 +710,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (clientMessageId) {
-      this._postMessage({ type: 'queuedMessageSent', id: clientMessageId });
+      this._postMessageForSession(sid, { type: 'queuedMessageSent', id: clientMessageId });
     }
 
     if (!attachedImages && await this._handleLocalCommand(trimmed, sid)) {
@@ -844,11 +844,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        this._postMessageToPanel(sessionId || streamSessionId, { type: 'done', tokens, toolCalls, sessionId });
-        void this._reloadFinishedSessionHistory(sessionId || streamSessionId)
+        const doneSessionId = sessionId || streamSessionId;
+        this._postMessageForSession(doneSessionId, { type: 'done', tokens, toolCalls, sessionId });
+        void this._reloadFinishedSessionHistory(doneSessionId)
           .finally(() => {
             void this._refreshSessions();
-            setTimeout(() => void this._sendNextQueuedMessage(), 75);
+            setTimeout(() => void this._sendNextQueuedMessage(doneSessionId), 75);
           });
       },
       onStopped: () => {
@@ -871,17 +872,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _sendNextQueuedMessage() {
-    const sid = this._focusedPanelId;
+  private async _sendNextQueuedMessage(sessionId?: string) {
+    const sid = sessionId ?? this._focusedPanelId;
     if (!sid) return;
     const rt = this._sessionRuntimes.get(sid);
     if (!rt || rt.isGenerating) return;
     const next = rt.queuedMessages.shift();
     if (!next) return;
-    await this._handleSend(next.text, next.context, next.images, next.clientMessageId);
+    await this._handleSend(next.text, next.context, next.images, next.clientMessageId, sid);
     const rt2 = this._sessionRuntimes.get(sid);
-    if (rt2 && !rt2.isGenerating) {
-      void this._sendNextQueuedMessage();
+    if (rt2 && !rt2.isGenerating && rt2.queuedMessages.length > 0) {
+      void this._sendNextQueuedMessage(sid);
     }
   }
 
@@ -1829,6 +1830,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (panel) {
       panel.webview.postMessage(msg);
     }
+  }
+
+  private _postMessageForSession(sessionId: string, msg: any) {
+    const panel = this._panels.get(sessionId);
+    if (panel) {
+      panel.webview.postMessage(msg);
+      return;
+    }
+    this._postMessage(msg);
   }
 
   private _broadcastToPanels(msg: any) {
