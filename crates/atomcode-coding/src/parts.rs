@@ -134,6 +134,11 @@ pub struct CodingParts {
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
     pub review_provider: Option<SharedReviewProvider>,
+    /// Provider slot for the `task` subagent tool, FILLED by [`assemble`] like
+    /// `review_provider`. Both tiers currently reuse the host provider (strong/weak
+    /// routing is a follow-up that adds a second signed provider in the bridge).
+    /// `None` when the `ATOMCODE_SUBAGENT` env gate is off.
+    pub subagent_provider: Option<SharedReviewProvider>,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -218,6 +223,63 @@ pub async fn prepare_with_plugin_hooks(
     } else {
         None
     };
+
+    // `task` subagent tool (env-gated, default off). Reuses the HOST provider for both
+    // tiers via a slot filled at assemble (mirrors `review_provider`); strong/weak model
+    // routing is a follow-up. Child tools: read-only `explore` vs edit-capable `worker`.
+    let subagent_provider: Option<SharedReviewProvider> =
+        if subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+            use atomcode_capabilities::tools::TaskTool;
+
+            let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
+
+            // Child subagent tool registry (mount a subset per type).
+            let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
+            atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
+            let child_reg = Arc::new(child_reg);
+
+            let explore_names: Vec<String> =
+                ["read_file", "grep", "glob", "list_directory"].iter().map(|s| s.to_string()).collect();
+            let worker_names: Vec<String> = [
+                "read_file", "edit_file", "write_file", "bash", "grep", "glob", "search_replace",
+                "list_directory",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+            let reg_e = child_reg.clone();
+            let reg_w = child_reg.clone();
+            let make_explore_tools = move || {
+                let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
+                reg_e.mount(&refs)
+            };
+            let make_worker_tools = move || {
+                let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
+                reg_w.mount(&refs)
+            };
+
+            // Both tiers read the same host-provider slot (filled at assemble, always before
+            // any turn runs — mirrors how the review tool's slot is guaranteed filled).
+            let slot_fast = slot.clone();
+            let slot_cap = slot.clone();
+            let make_fast = move || {
+                slot_fast.read().ok().and_then(|g| g.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            };
+            let make_capable = move || {
+                slot_cap.read().ok().and_then(|g| g.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            };
+
+            registry.register(Arc::new(TaskTool::new(
+                make_fast, make_capable, make_explore_tools, make_worker_tools,
+            )));
+            names.push("task".to_string());
+            Some(slot)
+        } else {
+            None
+        };
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
@@ -353,6 +415,7 @@ pub async fn prepare_with_plugin_hooks(
         mcp_registry,
         mcp_events,
         review_provider,
+        subagent_provider,
         cc_external_hooks: cc_external,
     })
 }
@@ -457,6 +520,26 @@ pub fn assemble(
         };
         if let Ok(mut g) = slot.write() {
             *g = Some(review_provider);
+        }
+    }
+
+    if let Some(slot) = &parts.subagent_provider {
+        let sub_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+            Some(tel) => Arc::new(
+                crate::telemetry::MeteredProvider::new(
+                    provider.clone(),
+                    tel.clone(),
+                    cfg.provider_type.as_str(),
+                    &cfg.base_url,
+                    &cfg.model,
+                    parts.session.as_ref().map(|b| b.id.as_str()),
+                )
+                .with_surface("subagent"),
+            ),
+            None => provider.clone(),
+        };
+        if let Ok(mut g) = slot.write() {
+            *g = Some(sub_provider);
         }
     }
 
@@ -615,10 +698,32 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
+/// env `ATOMCODE_SUBAGENT` gate: default OFF; `0`/`false`/`off`/empty (case-insensitive)
+/// = off, any other non-empty value = on. (Opposite default from `ATOMCODE_TODO`.)
+pub(crate) fn subagent_enabled_from_env(var: Option<&str>) -> bool {
+    match var {
+        None => false,
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+
+    #[test]
+    fn subagent_env_gate() {
+        use super::subagent_enabled_from_env as g;
+        assert!(!g(None));
+        assert!(!g(Some("0")));
+        assert!(!g(Some("false")));
+        assert!(!g(Some("off")));
+        assert!(!g(Some("")));
+        assert!(g(Some("1")));
+        assert!(g(Some("true")));
+        assert!(g(Some("yes")));
+    }
 
     #[test]
     fn resume_adds_persona_before_legacy_session_context() {

@@ -640,6 +640,28 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     Ok(token.access_token)
 }
 
+/// Speed/capability tier of a model, inferred from its NAME (the server's
+/// `ModelEntry` carries no tier field). Mirrors `model_name_suggests_vision`:
+/// pure, name-based, no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedTier {
+    /// Low-latency workhorse (e.g. `deepseek-v4-flash`).
+    Fast,
+    /// Strong-but-slower (e.g. `GLM-5.2`). Also the conservative default for
+    /// unknown names — never route a hard task to a model we can't confirm is weak.
+    Capable,
+}
+
+/// Classify a model name into a `SpeedTier`. `flash` ⇒ Fast; everything else
+/// (incl. `glm*` and unknown) ⇒ Capable.
+pub fn model_speed_tier(model_name: &str) -> SpeedTier {
+    if model_name.to_ascii_lowercase().contains("flash") {
+        SpeedTier::Fast
+    } else {
+        SpeedTier::Capable
+    }
+}
+
 /// Heuristic: does this model name look like a vision-capable model?
 ///
 /// Used by the TUI's Ctrl+V image-paste handler to refuse attaching an
@@ -887,6 +909,19 @@ mod tests {
         // so this is actually safe. Kept here so the comment lives in
         // a real test and a future false-positive case can be added.
         assert!(!model_name_suggests_vision("focar-text-7b"));
+    }
+
+    // ── model_speed_tier ──────────────────────────────────────────
+
+    #[test]
+    fn speed_tier_classifies_by_name() {
+        use super::{model_speed_tier, SpeedTier};
+        assert_eq!(model_speed_tier("deepseek-v4-flash"), SpeedTier::Fast);
+        assert_eq!(model_speed_tier("openai/deepseek-v4-flash"), SpeedTier::Fast);
+        assert_eq!(model_speed_tier("GLM-5.2"), SpeedTier::Capable);
+        assert_eq!(model_speed_tier("glm-5.2"), SpeedTier::Capable);
+        // 未知模型保守判为 Capable(不把难任务误派给未确认的弱模型)。
+        assert_eq!(model_speed_tier("some-future-model"), SpeedTier::Capable);
     }
 
     // ── Security: OAuth token exfiltration guard ──────────────────

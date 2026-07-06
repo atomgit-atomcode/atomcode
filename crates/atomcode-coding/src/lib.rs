@@ -38,6 +38,7 @@ pub mod telemetry;
 mod assemble;
 mod rate_limit;
 mod todo;
+pub mod subagent_tiers;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::CodingAgentConfig;
