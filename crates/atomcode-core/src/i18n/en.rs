@@ -273,9 +273,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("Model? [{current}] (blank to keep)").into(),
         Msg::ProviderStepContextWindow { default } =>
-            format!("Context window? [{default}] tokens (blank to use default; accepts e.g. 128000 or 128k)").into(),
+            format!("Context window? [{default}] tokens (blank to use default; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
         Msg::ProviderStepContextWindowWithHint { current } =>
-            format!("Context window? [{current}] tokens (blank to keep)").into(),
+            format!("Context window? [{current}] tokens (blank to keep; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
         Msg::ProviderContextWindowInvalid =>
             "Context window must be a positive number of tokens, e.g. 128000 or 128k.".into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
