@@ -1655,11 +1655,15 @@ fn execute_slash_command_impl(
                             initial,
                         );
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        //    传入当前登录 user_id 启用双向校验。
+                        let app_user_id =
+                            atomcode_core::auth::oauth::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
                                     "127.0.0.1",
                                     atomcode_daemon::APP_DEFAULT_PORT,
+                                    app_user_id,
                                 ),
                             )
                         });
