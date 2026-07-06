@@ -173,6 +173,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // terminal-agnostic way to attach an image. Works on every OS.
     Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
     Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false },
+    Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
     Command { name: "todo",    desc: "Reprint the current todo list derived from the session transcript", needs_args: false },
 ];
@@ -228,6 +229,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "plugin" => Msg::CmdDescPlugin,
         "paste" => Msg::CmdDescPaste,
         "copy" => Msg::CmdDescCopy,
+        "save" => Msg::CmdDescSave,
         "view" => Msg::CmdDescView,
         "app" => Msg::CmdDescApp,
         "sync" => Msg::CmdDescSync,

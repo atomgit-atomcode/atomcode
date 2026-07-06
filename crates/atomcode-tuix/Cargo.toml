@@ -17,6 +17,7 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

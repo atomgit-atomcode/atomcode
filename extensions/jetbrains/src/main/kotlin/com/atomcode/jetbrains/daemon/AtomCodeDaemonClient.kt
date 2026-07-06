@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.daemon
 
+import com.google.gson.JsonParser
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -308,7 +309,7 @@ class AtomCodeDaemonClient(
                 try {
                     if (response.statusCode() >= 400) {
                         val error = response.body().bufferedReader().use { it.readText() }
-                        onEvent(ChatEvent.Error("Daemon request failed: HTTP ${response.statusCode()}${error.daemonErrorSuffix()}"))
+                        onEvent(ChatEvent.Error(formatDaemonHttpError(response.statusCode(), error)))
                         future.complete(null)
                         return@thenAcceptAsync
                     }
@@ -345,7 +346,7 @@ class AtomCodeDaemonClient(
 
         return client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             if (response.statusCode() >= 400) {
-                throw IllegalStateException("Daemon request failed: HTTP ${response.statusCode()}")
+                throw IllegalStateException(formatDaemonHttpError(response.statusCode(), response.body()))
             }
             response.body()
         }
@@ -364,13 +365,61 @@ class AtomCodeDaemonClient(
     }
 }
 
-internal fun String.jsonQuoted(): String =
-    "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
-
-private fun String.daemonErrorSuffix(): String {
-    val message = jsonString("error") ?: jsonString("message") ?: trim()
-    return message.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
+internal fun String.jsonQuoted(): String = buildString(length + 2) {
+    append('"')
+    for (ch in this@jsonQuoted) {
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> {
+                if (ch.code < 0x20) {
+                    append("\\u")
+                    append(ch.code.toString(16).padStart(4, '0'))
+                } else {
+                    append(ch)
+                }
+            }
+        }
+    }
+    append('"')
 }
+
+internal fun formatDaemonHttpError(statusCode: Int, body: String): String {
+    val prefix = "Daemon request failed: HTTP $statusCode"
+    val detail = daemonErrorMessage(body).takeIf { it.isNotBlank() } ?: return prefix
+    val message = "$prefix: $detail"
+    return message.takeIf { it.length <= MAX_DAEMON_ERROR_MESSAGE_CHARS }
+        ?: message.take(MAX_DAEMON_ERROR_MESSAGE_CHARS - 3) + "..."
+}
+
+private const val MAX_DAEMON_ERROR_MESSAGE_CHARS = 550
+
+private fun daemonErrorMessage(body: String): String {
+    val trimmed = body.trim()
+    if (trimmed.isBlank()) return ""
+    jsonObjectErrorMessage(trimmed)?.let { return it }
+    jsonStringBody(trimmed)?.let { return it }
+    return trimmed
+}
+
+private fun jsonObjectErrorMessage(body: String): String? =
+    body.jsonString("error") ?: body.jsonString("message")
+
+private fun jsonStringBody(body: String): String? =
+    try {
+        val parsed = JsonParser.parseString(body)
+        parsed.takeIf { it.isJsonPrimitive }
+            ?.asJsonPrimitive
+            ?.takeIf { it.isString }
+            ?.asString
+    } catch (_: Exception) {
+        null
+    }
 
 internal fun String?.jsonQuotedOrNull(): String = this?.jsonQuoted() ?: "null"
 

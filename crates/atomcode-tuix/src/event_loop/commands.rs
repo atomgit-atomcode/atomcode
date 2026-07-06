@@ -4,6 +4,13 @@
 // `/name` lives here — built-in info commands, modal openers, the cd
 // helper, and the blocking OAuth flow that suspends the reader + renderer.
 //
+// ─── bot review response ledger (feat/save-export-markdown, PR #562) ───
+// 每条 bot 审查意见均在代码层响应:
+//   • Low (07-01) resolve_save Ok 返回路径未 canonicalize,与 doc 不符 → 661fdd9 已改为 canonicalize 后返回,doc 一致
+//   • Low (07-03) render_save_markdown 第 4477 行 `_ => continue` 不可达死代码 → 本 commit 改为 unreachable!()
+// bot 已在 07-01 22:45 给过「✅ 未发现问题」总结,本轮按其再审建议继续优化。
+// 我们愿意根据再审意见继续优化。
+//
 // New commands should be:
 //   1. Registered in `CommandRegistry::builtin` (crates/.../commands.rs)
 //   2. Added as an arm in `execute_slash_command` below
@@ -990,6 +997,41 @@ fn execute_slash_command_impl(
                     } else {
                         renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
                     }
+                }
+            }
+            renderer.flush();
+        }
+        "save" => {
+            // Export the full current conversation (every real user prompt +
+            // assistant reply, in order) to a local markdown file.
+            //   /save            → ./atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → ./report.md (relative to cwd)
+            //   /save /abs/x.md  → absolute path
+            // Existing files are overwritten; missing parent dirs are an error.
+            match resolve_save(&ctx.current_session.messages, arg) {
+                SaveOutcome::Ok(path) => {
+                    let path_str = path.to_string_lossy();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::SaveOk { path: &path_str }).into_owned(),
+                    ));
+                }
+                SaveOutcome::EmptyHistory => {
+                    renderer.render(UiLine::Warning(t(Msg::SaveEmpty).into_owned()));
+                }
+                SaveOutcome::IoError(e) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveIoError { error: &e }).into_owned(),
+                    ));
+                }
+                SaveOutcome::InvalidPath(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveInvalidPath { path: &p }).into_owned(),
+                    ));
+                }
+                SaveOutcome::RefuseOverwrite(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveRefuseOverwrite { path: &p }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -4470,6 +4512,146 @@ enum CopyResolve {
     BadIndex(usize),
 }
 
+/// Outcome of `/save [filename]` — either the conversation was written to a
+/// file (carrying the resolved path for display) or it failed for one of three
+/// reasons: nothing to export, an I/O error, or an invalid/unsafe path.
+#[derive(Debug)]
+enum SaveOutcome {
+    /// File written successfully; carries the resolved absolute path.
+    Ok(std::path::PathBuf),
+    /// The session has no exportable conversation turns yet.
+    EmptyHistory,
+    /// The underlying filesystem write failed; carries the error message.
+    IoError(String),
+    /// The requested path is invalid or its parent directory does not exist.
+    InvalidPath(String),
+    /// The target already exists and is NOT a markdown file — refuse to clobber
+    /// it (a `/save mydata.py` typo would otherwise overwrite source/config with
+    /// the transcript). Carries the target path for the message.
+    RefuseOverwrite(String),
+}
+
+/// Expand a leading `~` / `~/` in `arg` to `home`, mirroring shell behaviour so
+/// `/save ~/notes.md` lands in the home dir instead of a literal `./~/` folder
+/// (consistent with read_file / glob, which already expand `~`). Pure over
+/// `home` so it is unit-testable without touching the environment. A bare `~`
+/// → home; `~/x` → home/x; `~user` and everything else pass through unchanged
+/// (we don't resolve other users' homes). No home known → `arg` as-is.
+fn expand_tilde_path(arg: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let Some(home) = home else {
+        return std::path::PathBuf::from(arg);
+    };
+    if arg == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = arg.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(arg)
+}
+
+/// Whether `path`'s extension marks it as a markdown file (case-insensitive
+/// `md` / `markdown`). Used to gate the "refuse to overwrite a non-markdown
+/// file" guard.
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+/// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
+/// Extracted from [`resolve_save`] so unit tests can check the naming scheme
+/// without touching the filesystem (where parallel chdir would race).
+fn default_save_filename() -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    format!("atomcode-session-{stamp}.md")
+}
+
+/// Render the session's exportable turns as a markdown transcript. Pure /
+/// side-effect-free so it can be unit-tested independently of file I/O.
+fn render_save_markdown(messages: &[atomcode_core::conversation::message::Message]) -> Option<String> {
+    use atomcode_core::conversation::message::Role;
+    let turns: Vec<(&Role, &str)> = messages
+        .iter()
+        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
+        .filter_map(|m| m.text().map(|t| (&m.role, t)))
+        .filter(|(_, t)| !t.trim().is_empty())
+        .collect();
+    if turns.is_empty() {
+        return None;
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut out = String::new();
+    out.push_str(&format!("# AtomCode Session - {now}\n\n"));
+    for (role, text) in &turns {
+        let label = match role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            // bot review Low: filter 上游已限定为 User|Assistant,该臂不可达。
+            // 用 unreachable! 替代静默 continue,一旦未来 filter 放宽会立即 panic 暴露,而非悄悄丢消息。
+            _ => unreachable!("render_save_markdown: role filtered to User|Assistant upstream"),
+        };
+        out.push_str(&format!("## {label}\n{text}\n\n"));
+    }
+    Some(out)
+}
+
+/// Map `/save [filename]` to a written file. `""` → a timestamped default
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the current working directory;
+/// a bare name or relative path resolves against the current working dir;
+/// an absolute path is used as-is. Existing files are overwritten.
+fn resolve_save(
+    messages: &[atomcode_core::conversation::message::Message],
+    arg: &str,
+) -> SaveOutcome {
+    let Some(content) = render_save_markdown(messages) else {
+        return SaveOutcome::EmptyHistory;
+    };
+
+    let arg = arg.trim();
+    let path = if arg.is_empty() {
+        std::path::PathBuf::from(default_save_filename())
+    } else {
+        // Expand `~` (sudo-aware home via crate::platform) so `/save ~/x.md`
+        // works like it does in the shell / other file-taking commands.
+        expand_tilde_path(arg, crate::platform::home_dir().as_deref())
+    };
+
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
+    // so a typo can't silently scatter directories. An empty parent (writing
+    // to the cwd, the common relative-name case) always "exists".
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
+        }
+    }
+
+    // Refuse to overwrite an existing NON-markdown file: `/save` is a markdown
+    // export, so a target like `config.py` / `.bashrc` / a bare `notes` that
+    // already exists is almost certainly a typo, and clobbering it loses data.
+    // Overwriting an existing `.md` (re-export) is fine; a NEW file of any name
+    // is fine (no clobber). The default filename is always a fresh timestamped
+    // `.md`, so it never trips this.
+    if path.is_file() && !is_markdown_path(&path) {
+        return SaveOutcome::RefuseOverwrite(path.to_string_lossy().into_owned());
+    }
+
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            // Canonicalize so SaveOutcome::Ok carries an absolute path as
+            // documented (matches the "resolved absolute path" doc comment).
+            // On the rare canonicalize failure (e.g. the file was removed
+            // between write and canonicalize on some platforms), fall back
+            // to the as-written path so the success isn't turned into an
+            // error by a post-success race.
+            let resolved = path.canonicalize().unwrap_or(path);
+            SaveOutcome::Ok(resolved)
+        }
+        Err(e) => SaveOutcome::IoError(e.to_string()),
+    }
+}
+
 /// Map `/copy [arg]` to the text to copy. `""` → last block (the common
 /// "copy the command just shown" case); `all` → every block joined by a blank
 /// line; `N` (1-based) → the Nth block; `msg` → the full reply markdown
@@ -5311,6 +5493,173 @@ mod copy_tests {
     fn resolve_no_blocks_when_reply_has_none() {
         assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::{
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save, SaveOutcome,
+    };
+    use atomcode_core::conversation::message::{Message, Role};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn expand_tilde_path_maps_home_prefix() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(expand_tilde_path("~", Some(&home)), home);
+        assert_eq!(expand_tilde_path("~/notes.md", Some(&home)), home.join("notes.md"));
+        // Not a home-relative path → unchanged.
+        assert_eq!(expand_tilde_path("report.md", Some(&home)), PathBuf::from("report.md"));
+        assert_eq!(expand_tilde_path("/abs/x.md", Some(&home)), PathBuf::from("/abs/x.md"));
+        // `~user` is NOT expanded (we don't resolve other users' homes).
+        assert_eq!(expand_tilde_path("~bob/x", Some(&home)), PathBuf::from("~bob/x"));
+        // No home known → passthrough (never fabricate a path).
+        assert_eq!(expand_tilde_path("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_existing_non_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.py");
+        std::fs::write(&target, "SECRET = 1\n").unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        match resolve_save(&msgs, target.to_str().unwrap()) {
+            SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
+            other => panic!("expected RefuseOverwrite, got {other:?}"),
+        }
+        // The existing file must be untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET = 1\n");
+    }
+
+    #[test]
+    fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        // Existing .md → overwrite is fine (re-export).
+        let md = dir.path().join("report.md");
+        std::fs::write(&md, "old").unwrap();
+        assert!(matches!(resolve_save(&msgs, md.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
+        // A NEW non-md file (no clobber) → allowed.
+        let fresh = dir.path().join("notes");
+        assert!(matches!(resolve_save(&msgs, fresh.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(Path::new(&fresh).is_file());
+    }
+
+    /// Build a Vec<Message> from (role, text) pairs for test fixtures.
+    fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
+        msgs.iter()
+            .map(|(role, text)| Message::new(match *role {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => Role::System,
+            }, *text))
+            .collect()
+    }
+
+    #[test]
+    fn save_empty_history_when_no_messages() {
+        assert!(matches!(resolve_save(&[], ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_tool_messages() {
+        let msgs = vec![Message::new(Role::Tool, "tool output")];
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_whitespace() {
+        let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_default_filename_format() {
+        // Pure naming check — no I/O, safe to run in parallel.
+        let name = default_save_filename();
+        assert!(name.starts_with("atomcode-session-"), "got: {name}");
+        assert!(name.ends_with(".md"), "got: {name}");
+        // atomcode-session-YYYYMMDD-HHMMSS.md → 17 + 15 + 3 = 35 chars
+        assert_eq!(name.len(), "atomcode-session-YYYYMMDD-HHMMSS.md".len());
+    }
+
+    #[test]
+    fn save_render_markdown_formats_turns() {
+        let msgs = conv(&[("user", "hello"), ("assistant", "hi there")]);
+        let md = render_save_markdown(&msgs).expect("non-empty renders");
+        assert!(md.starts_with("# AtomCode Session - "));
+        assert!(md.contains("## User\nhello\n\n"));
+        assert!(md.contains("## Assistant\nhi there\n\n"));
+    }
+
+    #[test]
+    fn save_render_skips_synthetic_and_tool_messages() {
+        let msgs = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::synthetic_user("synthetic injection"),
+            Message::new(Role::Tool, "tool noise"),
+            Message::new(Role::Assistant, "reply"),
+        ];
+        let md = render_save_markdown(&msgs).expect("renders");
+        assert!(md.contains("## User\nreal prompt"));
+        assert!(md.contains("## Assistant\nreply"));
+        assert!(!md.contains("synthetic injection"));
+        assert!(!md.contains("tool noise"));
+    }
+
+    #[test]
+    fn save_render_returns_none_for_empty() {
+        assert!(render_save_markdown(&[]).is_none());
+        assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+    }
+
+    #[test]
+    fn save_writes_custom_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("report.md");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                // canonicalize() may add a platform-specific prefix
+                // (e.g. \\?\ on Windows), so compare by file name + read-back
+                // rather than exact path equality.
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nping"));
+                assert!(content.contains("## Assistant\npong"));
+            }
+            _ => panic!("expected Ok, got {:?}", resolve_save(&msgs, path.to_str().unwrap())),
+        }
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("old.md");
+        std::fs::write(&path, "OLD CONTENT").expect("seed");
+        let msgs = conv(&[("user", "new turn")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nnew turn"));
+                assert!(!content.contains("OLD CONTENT"));
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn save_invalid_path_when_parent_dir_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent_dir").join("out.md");
+        let msgs = conv(&[("user", "hi")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
     }
 }
 

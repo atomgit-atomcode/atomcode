@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs",
+    "test": "npm run build && tsc -p tsconfig.json --module NodeNext --moduleResolution NodeNext --outDir dist && node --test test/*.test.mjs",
     "watch": "node esbuild.config.mjs --watch"
   },
   "dependencies": {

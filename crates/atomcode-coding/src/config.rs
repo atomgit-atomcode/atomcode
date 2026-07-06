@@ -95,14 +95,24 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
-    /// Pre-built provider for the `task` tool's FAST tier — set by the bridge when the
-    /// fast-tier model differs from the host model (a distinct signed provider). `None`
-    /// ⇒ the fast tier reuses the host provider slot filled at assemble. NOT included in
-    /// the manual `Debug` impl (a `dyn` provider isn't `Debug`).
-    pub subagent_fast_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
-    /// Pre-built provider for the `task` tool's CAPABLE tier (same contract as above).
-    pub subagent_capable_provider: Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    /// Lazy builder for the `task` tool's FAST tier provider — set by the bridge when the
+    /// fast-tier model differs from the host model. Called ON FIRST `task` use (not at
+    /// startup): building a provider constructs a fresh reqwest client, which loads the OS
+    /// cert store (slow on macOS), so deferring it keeps startup fast — matching how the
+    /// goal/naming/vision providers are built on demand. `None` (outer) ⇒ the fast tier
+    /// reuses the host provider slot; `None` (inner, from the thunk) ⇒ build failed, also
+    /// falls back to host. NOT in the manual `Debug` impl (a thunk isn't `Debug`).
+    pub subagent_fast_provider: Option<SubagentProvider>,
+    /// Lazy builder for the `task` tool's CAPABLE tier provider (same contract as above).
+    pub subagent_capable_provider: Option<SubagentProvider>,
 }
+
+/// A lazily-built subagent tier provider: a thunk the bridge supplies that constructs the
+/// (gateway-signed) provider ON FIRST USE. See the field docs on [`CodingAgentConfig`] for
+/// why the build is deferred. `Some(provider)` on success, `None` if construction failed
+/// (⇒ the tier falls back to the host provider).
+pub type SubagentProvider =
+    Arc<dyn Fn() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> + Send + Sync>;
 
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
 /// positive integer, else 300s. Ported from core's env-configurable liveness knob.
