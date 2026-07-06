@@ -624,6 +624,7 @@ dependencies = [
  "atomcode-daemon",
  "atomcode-telemetry",
  "base64",
+ "chrono",
  "crossterm",
  "dirs 6.0.0",
  "futures",
