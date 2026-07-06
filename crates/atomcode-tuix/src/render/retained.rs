@@ -1443,9 +1443,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
+        // Todo progress segment (`[✓] 3/7`) — pre-formatted + glyph-gated in
+        // build_status. Occupies the tail of the left group, after ctx usage.
+        let todo_str = status.todo.clone().unwrap_or_default();
         // Widths of the static " · " separators between visible parts.
         let sep_w = if !model_str.is_empty() { 3 } else { 0 }
             + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
+                3
+            } else {
+                0
+            }
+            + if !todo_str.is_empty()
+                && (!model_str.is_empty() || !status.cwd.is_empty() || !ctx_str.is_empty())
+            {
                 3
             } else {
                 0
@@ -1453,9 +1463,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cwd_budget = left_max
             .saturating_sub(crate::width::display_width(&model_str))
             .saturating_sub(crate::width::display_width(&ctx_str))
+            .saturating_sub(crate::width::display_width(&todo_str))
             .saturating_sub(sep_w);
 
-        let mut parts: Vec<String> = Vec::with_capacity(4);
+        let mut parts: Vec<String> = Vec::with_capacity(5);
         if !model_str.is_empty() {
             parts.push(model_str);
         }
@@ -1472,6 +1483,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
+        }
+        if !todo_str.is_empty() {
+            parts.push(todo_str);
         }
         // NOTE: the goal indicator is NOT appended here any more — it lives on
         // its own dedicated footer row (`build_goal_row`) so it can't be the
@@ -5490,6 +5504,7 @@ mod tests {
             reasoning_effort: None,
             goal: None,
             loop_status: None,
+            todo: None,
         }
     }
 
@@ -5516,6 +5531,7 @@ mod tests {
             reasoning_effort: None,
             goal: None,
             loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -5551,6 +5567,34 @@ mod tests {
         );
     }
 
+    /// Todo progress segment renders in the left group after the model · cwd
+    /// run. `None` (the common case) leaves the row untouched.
+    #[test]
+    fn build_status_row_renders_todo_progress_segment() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            todo: Some("[\u{2713}] 3/7".into()),
+            ..status_basic()
+        };
+        let row = r.build_status_row(&status, 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("3/7"),
+            "todo progress segment must appear in the row; got: {:?}",
+            visible
+        );
+        // Absent when None — no noise for todo-less sessions.
+        let plain = r.build_status_row(&status_basic(), 60);
+        let plain_visible: String = plain.iter().map(|c| c.ch).collect();
+        assert!(
+            !plain_visible.contains('/') || !plain_visible.contains("3/7"),
+            "no todo segment when todo is None; got: {:?}",
+            plain_visible
+        );
+    }
+
     /// Bypass indicator (--dangerously-skip-permissions) renders on the
     /// RIGHT side of the status row, after the model · cwd run. It must
     /// NOT displace the left-aligned PLAN mode indicator.
@@ -5571,6 +5615,7 @@ mod tests {
             reasoning_effort: None,
             goal: None,
             loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -5618,6 +5663,7 @@ mod tests {
             reasoning_effort: None,
             goal: None,
             loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();

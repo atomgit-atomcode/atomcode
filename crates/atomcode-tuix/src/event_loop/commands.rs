@@ -5610,26 +5610,35 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// "no list" message when no such call has been made yet.
 ///
 /// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
+/// The current todo list derived from a core-conversation transcript: the last
+/// VALID `todowrite` call's parsed list. Skips calls whose args fail validation
+/// so an invalid final call never wipes an earlier valid list (mirrors
+/// `derive_current_todos` in capabilities, but over the core `Message` type the
+/// TUI session holds rather than the kernel one). Shared by the `/todo` command
+/// and the footer progress segment.
+pub(crate) fn current_todos_from_transcript(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> Vec<atomcode_capabilities::tools::todo::TodoItem> {
+    use atomcode_core::conversation::message::MessageContent;
+    for m in messages.iter().rev() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+            for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+                if let Ok(parsed) =
+                    atomcode_capabilities::tools::todo::parse_todos(&call.arguments)
+                {
+                    return parsed;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 pub(crate) fn format_todo_command(
     messages: &[atomcode_core::conversation::message::Message],
     unicode: bool,
 ) -> String {
-    use atomcode_core::conversation::message::MessageContent;
-    // Walk backwards to find the last VALID `todowrite` tool-call, skipping
-    // calls whose args fail validation so an invalid final call never wipes
-    // an earlier valid list (mirrors derive_current_todos in capabilities).
-    let todos = 'found: {
-        for m in messages.iter().rev() {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
-                    if let Ok(parsed) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
-                        break 'found parsed;
-                    }
-                }
-            }
-        }
-        Vec::new()
-    };
+    let todos = current_todos_from_transcript(messages);
     if todos.is_empty() {
         return t(Msg::TodoNoList).into_owned();
     }

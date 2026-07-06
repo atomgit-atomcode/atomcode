@@ -489,6 +489,13 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
+    /// Pre-formatted todo progress segment (e.g. `[✓] 3/7`), shown in the
+    /// left group of the status row so the user can see multi-step progress
+    /// at a glance without the inline todowrite block (which scrolls away).
+    /// `None` ⇒ no todo list in this session, segment omitted (no noise for
+    /// conversations that never used todowrite). The glyph is unicode-gated
+    /// upstream in `build_status`, so this string is always terminal-safe.
+    pub todo: Option<String>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was

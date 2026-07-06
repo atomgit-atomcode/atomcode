@@ -8622,6 +8622,10 @@ fn handle_agent_event(
             // completed → Muted (dim), in_progress → Warning (yellow), pending → Muted.
             // Falls through to the normal ToolCallInFlight path when parse fails.
             if name == "todowrite" {
+                // Capture live footer progress from this in-flight call — the
+                // transcript won't carry it until turn end (persist_current_session),
+                // so the footer would otherwise not move mid-turn.
+                state.live_turn_todo = todo_progress_from_args(&arguments);
                 // SHARED with the /resume replay (session_picker) via
                 // `todo_block_styled_lines` so live and replay stay identical.
                 let block = todo_block_styled_lines(&arguments, ctx.caps.unicode_symbols);
@@ -10540,6 +10544,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         round: state.loop_round + 1,
         elapsed_secs: state.loop_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
     });
+    // Todo progress segment (`[✓] 3/7`). Prefer the live in-flight snapshot
+    // (updated by the turn's todowrite calls before they're committed to the
+    // transcript); otherwise derive from the transcript so it's correct at rest,
+    // after `/resume`, and across session switches with no extra bookkeeping.
+    let todo = state
+        .live_turn_todo
+        .or_else(|| todo_progress_from_messages(&ctx.current_session.messages))
+        // `total == 0` ⇒ no list (or a live clear) ⇒ omit the segment entirely.
+        .filter(|&(_, total)| total > 0)
+        .map(|(done, total)| format_todo_footer(done, total, ctx.caps.unicode_symbols));
     crate::render::StatusLine {
         model,
         cwd,
@@ -10556,6 +10570,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         session_name,
         goal,
         loop_status,
+        todo,
     }
 }
 
@@ -11486,6 +11501,44 @@ pub(crate) fn todo_block_styled_lines(args: &str, unicode: bool) -> Vec<String> 
         .collect()
 }
 
+/// `(completed, total)` for the todo list carried in a single `todowrite` call's
+/// args. `Some((0, 0))` when the call VALIDLY clears the list — distinct from
+/// `None`, which means "unparseable, keep whatever the footer already shows".
+/// This distinction matters mid-turn: a clear must suppress the segment, NOT
+/// fall back to the not-yet-committed transcript (which still holds the old
+/// list). `build_status` treats `total == 0` as "no segment".
+pub(crate) fn todo_progress_from_args(args: &str) -> Option<(usize, usize)> {
+    use atomcode_capabilities::tools::todo::{parse_todos, todo_counts};
+    parse_todos(args).ok().map(|todos| todo_counts(&todos))
+}
+
+/// `(completed, total)` for the current todo list derived from the transcript
+/// (last valid `todowrite`), or `None` when there is no list. Used for the
+/// footer progress segment at rest (between turns / after `/resume`). Reuses the
+/// same scan as the `/todo` command so the two never disagree.
+pub(crate) fn todo_progress_from_messages(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> Option<(usize, usize)> {
+    let todos = commands::current_todos_from_transcript(messages);
+    if todos.is_empty() {
+        None
+    } else {
+        Some(atomcode_capabilities::tools::todo::todo_counts(&todos))
+    }
+}
+
+/// Format a `(completed, total)` pair as the footer segment `<glyph> N/M`
+/// (e.g. `[✓] 3/7`). The glyph is unicode-gated so the string is terminal-safe.
+pub(crate) fn format_todo_footer(completed: usize, total: usize, unicode: bool) -> String {
+    use atomcode_capabilities::tools::todo::{todo_glyph, TodoStatus};
+    format!(
+        "{} {}/{}",
+        todo_glyph(TodoStatus::Completed, unicode),
+        completed,
+        total
+    )
+}
+
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
@@ -11502,6 +11555,27 @@ mod todo_block_tests {
         assert_eq!(lines[0].1, "[x] a");
         assert_eq!(lines[1].0, TodoStatus::InProgress);
         assert_eq!(lines[1].1, "[~] b");
+    }
+
+    #[test]
+    fn todo_progress_from_args_counts_and_distinguishes_clear_from_unparseable() {
+        assert_eq!(
+            todo_progress_from_args(
+                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]}"#
+            ),
+            Some((1, 2))
+        );
+        // A VALID clear ⇒ Some((0,0)) so the footer suppresses the segment
+        // rather than falling back to the stale (uncommitted) transcript.
+        assert_eq!(todo_progress_from_args(r#"{"todos":[]}"#), Some((0, 0)));
+        // Unparseable ⇒ None ⇒ keep whatever the footer already shows.
+        assert_eq!(todo_progress_from_args("not json"), None);
+    }
+
+    #[test]
+    fn format_todo_footer_glyph_gated() {
+        assert_eq!(format_todo_footer(3, 7, true), "[\u{2713}] 3/7");
+        assert_eq!(format_todo_footer(3, 7, false), "[x] 3/7");
     }
 
     #[test]

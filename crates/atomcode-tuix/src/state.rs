@@ -326,6 +326,13 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
+    /// Live `(completed, total)` todo counts for the footer progress segment,
+    /// captured from the in-flight turn's `todowrite` calls. The footer prefers
+    /// this WHILE a turn runs, because `current_session.messages` only gains the
+    /// turn's todowrite at turn end (persist_current_session). Cleared on
+    /// TurnComplete / TurnCancelled / Error, after which the footer derives from
+    /// the now-updated transcript. `None` ⇒ derive from the transcript.
+    pub live_turn_todo: Option<(usize, usize)>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -458,6 +465,7 @@ impl UiState {
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
+            live_turn_todo: None,
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
@@ -702,6 +710,11 @@ impl UiState {
         // reaches here, so the cancelled path naturally leaves this
         // None too.)
         self.last_submitted_message = None;
+        // The footer's live todo snapshot belongs to the turn that produced it;
+        // hand the segment back to the transcript-derived source now that the
+        // turn (or peer turn / session switch — all funnel through here) is over.
+        // Single source of truth so no turn-end path can pin a stale count.
+        self.live_turn_todo = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -716,6 +729,7 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.live_turn_todo = None;
     }
 
     pub fn on_error(&mut self) {
@@ -725,6 +739,7 @@ impl UiState {
         self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.live_turn_todo = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;

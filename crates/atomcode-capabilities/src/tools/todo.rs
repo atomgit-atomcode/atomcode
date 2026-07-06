@@ -95,6 +95,16 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     Ok(out)
 }
 
+/// `(completed, total)` for a todo list. The footer progress indicator renders
+/// this as `N/M`. `total == 0` ⇒ caller omits the indicator (no todos yet).
+pub fn todo_counts(todos: &[TodoItem]) -> (usize, usize) {
+    let completed = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    (completed, todos.len())
+}
+
 /// The current list = args of the last VALID `todowrite` tool call in history.
 /// Skips calls whose args fail validation (e.g. two in_progress) so an invalid
 /// last call never wipes an earlier valid list. Returns `vec![]` if no valid
@@ -251,6 +261,21 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "new"); // LAST wins
         assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn counts_completed_over_total() {
+        let todos = parse_todos(
+            r#"{"todos":[
+                {"content":"a","status":"completed"},
+                {"content":"b","status":"completed"},
+                {"content":"c","status":"in_progress"},
+                {"content":"d","status":"pending"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(todo_counts(&todos), (2, 4));
+        assert_eq!(todo_counts(&[]), (0, 0));
     }
 
     #[test]
