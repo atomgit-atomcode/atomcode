@@ -1705,6 +1705,13 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
+                        //    清理旧的 sync 状态，避免旧 forwarder task 残留。
+                        if let Some(h) = ctx.sync_forwarder.take() {
+                            h.abort();
+                        }
+                        ctx.sync_session = None;
+                        atomcode_daemon::stop_app_server();
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
                             atomcode_core::auth::oauth::get_stored_auth().map(|a| a.user.id);
@@ -1829,6 +1836,12 @@ fn execute_slash_command_impl(
             // the next LLM request fails with a "re-run /codingplan"
             // hint instead of the TUI crashing on next startup because
             // `default_provider` got cleared.
+            //
+            // 安全：登出时自动关闭 App 远程访问，防止隧道仍在线。
+            if ctx.app_relay_child.take().map_or(false, |mut c| c.start_kill().is_ok()) {
+                let _ = ctx.app_relay_child.take();
+            }
+            atomcode_daemon::stop_app_server();
             match atomcode_core::auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);
