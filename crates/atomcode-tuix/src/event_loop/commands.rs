@@ -2957,6 +2957,11 @@ fn execute_slash_command_impl(
                         })
                         .ok();
                     state.on_submit();
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
                 }
                 LoopArg::Interval { secs, payload } => {
                     // Fixed-interval mode: stop any currently running loop
@@ -2977,6 +2982,12 @@ fn execute_slash_command_impl(
                         fixissue_buffer,
                         setup_pending,
                     );
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
+                    renderer.flush();
                 }
                 LoopArg::Error(msg) => {
                     renderer.render(UiLine::Error(msg));

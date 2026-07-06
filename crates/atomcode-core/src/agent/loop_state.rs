@@ -48,10 +48,6 @@ impl LoopState {
     }
     pub fn clear(&mut self) {
         self.active = false;
-        // Reset the label too: a lingering non-empty label after a loop ends makes
-        // `finalize_loop_cancelled`'s `!active && label.is_empty()` guard mis-fire,
-        // emitting a spurious "loop cancelled" on a later, unrelated cancelled turn.
-        self.label.clear();
     }
     pub fn round_limit_reached(&self) -> bool {
         self.round >= self.max_rounds
@@ -74,13 +70,10 @@ mod tests {
     }
 
     #[test]
-    fn clear_deactivates_and_resets_label() {
+    fn clear_deactivates() {
         let mut s = LoopState::new("watch CI".into());
         s.clear();
         assert!(!s.active);
-        // Label must be reset so `finalize_loop_cancelled`'s `label.is_empty()`
-        // guard doesn't mis-fire a spurious "cancelled" on a later unrelated turn.
-        assert!(s.label.is_empty());
     }
 
     #[test]

@@ -869,9 +869,12 @@ pub enum Msg<'a> {
     LoopStopped,
     /// End-of-loop banner emitted by the `LoopUpdate { active: false }` handler
     /// when the loop ends with a non-cancellation reason.
-    /// `reason` is the internal English identifier from `emit_loop_update`
+    /// `reason` is the internal English identifier from the bridge's loop driver
     /// (e.g. "completed", "round limit (10)") — kept English as-is.
     LoopEnded { reason: &'a str },
+    /// One-line hint shown when a `/loop` is armed: the loop is a live-only
+    /// construct and does NOT survive a restart/resume (persistence deferred).
+    LoopNoPersistHint,
     /// Description for the `/loop` slash command (shown in `/help`).
     CmdDescLoop,
 

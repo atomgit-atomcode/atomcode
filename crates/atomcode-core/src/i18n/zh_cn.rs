@@ -977,6 +977,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::LoopStopped => "⚠ loop 已停止（达到次数上限）\n".into(),
         Msg::LoopEnded { reason } =>
             format!("  ↻ Loop 已结束：{reason}\n").into(),
+        Msg::LoopNoPersistHint =>
+            "  （提示：重启 / 恢复会话后该 loop 不会保留）".into(),
         Msg::CmdDescLoop =>
             "按固定间隔重复执行提示/命令，或让模型自主决定节奏".into(),
         Msg::ModelNoImageSupport { model } => format!(

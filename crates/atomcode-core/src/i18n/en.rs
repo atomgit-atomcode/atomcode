@@ -994,6 +994,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::LoopStopped => "⚠ loop stopped (limit reached)\n".into(),
         Msg::LoopEnded { reason } =>
             format!("  ↻ Loop ended: {reason}\n").into(),
+        Msg::LoopNoPersistHint =>
+            "  (note: the loop won't survive a restart / resume)".into(),
         Msg::CmdDescLoop =>
             "Repeat a prompt/command on an interval, or let the model self-pace".into(),
         Msg::ModelNoImageSupport { model } => format!(
