@@ -11023,7 +11023,8 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         let body = &seg[tag_end + 1..body_end];
         let mut id = attr(tag, "id").unwrap_or("subtask");
         if single {
-            // "worker#1" → "worker" when there's only one subtask.
+            // "worker#1" → "worker" when there's only one subtask. `split('#').next()`
+            // always yields the leading segment (or the whole str if no '#').
             id = id.split('#').next().unwrap_or(id);
         }
         let model = attr(tag, "model").unwrap_or("?");
@@ -11049,6 +11050,11 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
             }
         }
         lines.push(line);
+    }
+    // Defensive: `<task ` was present but every block was malformed (no `>`), so we
+    // produced nothing — fall back to a generic summary rather than a blank line.
+    if lines.is_empty() {
+        return summarise(output);
     }
     lines.join("\n")
 }
@@ -11216,6 +11222,15 @@ mod task_render_tests {
         // Defensive: not a task block ⇒ generic summarise, not blank.
         let s = summarise_task_result("plain text\nsecond line");
         assert_eq!(s, "plain text (2 lines)");
+    }
+
+    #[test]
+    fn result_malformed_blocks_fall_back_not_blank() {
+        // `<task ` present but no closing `>` on any block ⇒ generic summarise, not "".
+        let out = "<task id=\"worker#1\" model=\"x\"  (truncated, no gt)";
+        let s = summarise_task_result(out);
+        assert!(!s.is_empty(), "must not be blank");
+        assert!(s.contains("truncated"), "should fall back to raw summary: {s}");
     }
 }
 
