@@ -724,7 +724,7 @@ async fn bash_execute_background(
 /// Result of running a shell command, decoupled from tool-result framing.
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
 /// (user-invoked `!` mode) both build on this.
-pub(crate) struct ShellOutcome {
+pub struct ShellOutcome {
     pub stdout: String,
     pub stderr: String,
     pub exit: ShellExit,
@@ -733,7 +733,7 @@ pub(crate) struct ShellOutcome {
 
 /// How the child process ended. Mirrors the three branches the old
 /// `bash_execute` match handled: clean exit, idle-kill, hard-timeout-kill.
-pub(crate) enum ShellExit {
+pub enum ShellExit {
     /// Process exited on its own. `success` is `status.success()`,
     /// `code` is the numeric exit code (None = terminated by signal).
     Exited { success: bool, code: Option<i32> },
@@ -747,7 +747,7 @@ pub(crate) enum ShellExit {
 /// No ToolResult framing, no git snapshot, no error-signature tracking —
 /// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
 /// and stderr chunks prefixed with `[stderr] `.
-pub(crate) async fn run_shell(
+pub async fn run_shell(
     command: &str,
     wd: &std::path::Path,
     timeout_secs: u64,

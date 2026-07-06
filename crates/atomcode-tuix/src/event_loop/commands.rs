@@ -499,7 +499,11 @@ pub(crate) fn fire_interval_payload(
             c.round += 1;
             c.due = false;
             c.next_fire_at = Some(std::time::Instant::now() + c.interval);
-            state.loop_round = c.round;
+            // `state.loop_round` is 0-based (self-paced feeds core's 0-based round
+            // here too); every display site adds +1. `c.round` is 1-based after the
+            // bump above, so subtract 1 to keep the interval path from showing one
+            // round too high (first fire = "round 1", not "round 2").
+            state.loop_round = c.round.saturating_sub(1);
             c.payload.clone()
         }
         None => return,
@@ -2217,6 +2221,11 @@ fn execute_slash_command_impl(
                         return Ok(());
                     };
 
+                    // Switching sessions: stop any active /loop so its TUI-side interval
+                    // controller can't keep firing the old payload into the newly-resumed
+                    // session (and clear the stale footer). ClearLoop reaches the outgoing
+                    // agent before the swap below.
+                    stop_active_loop(state, ctx);
                     ctx.agent = client;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;

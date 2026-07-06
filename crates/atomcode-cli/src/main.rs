@@ -2088,6 +2088,7 @@ fn bridge_config_from(
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
+        loop_max_rounds: config.loop_config.max_rounds,
     }
 }
 

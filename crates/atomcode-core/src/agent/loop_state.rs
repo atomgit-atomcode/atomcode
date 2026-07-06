@@ -42,8 +42,16 @@ impl LoopState {
     pub fn new(label: String) -> Self {
         Self { label, active: true, ..Default::default() }
     }
+    /// Like [`new`] but with an explicit round cap (from `[loop_config] max_rounds`).
+    pub fn new_with_limit(label: String, max_rounds: u32) -> Self {
+        Self { label, active: true, max_rounds, ..Default::default() }
+    }
     pub fn clear(&mut self) {
         self.active = false;
+        // Reset the label too: a lingering non-empty label after a loop ends makes
+        // `finalize_loop_cancelled`'s `!active && label.is_empty()` guard mis-fire,
+        // emitting a spurious "loop cancelled" on a later, unrelated cancelled turn.
+        self.label.clear();
     }
     pub fn round_limit_reached(&self) -> bool {
         self.round >= self.max_rounds
@@ -66,10 +74,21 @@ mod tests {
     }
 
     #[test]
-    fn clear_deactivates() {
-        let mut s = LoopState::new("x".into());
+    fn clear_deactivates_and_resets_label() {
+        let mut s = LoopState::new("watch CI".into());
         s.clear();
         assert!(!s.active);
+        // Label must be reset so `finalize_loop_cancelled`'s `label.is_empty()`
+        // guard doesn't mis-fire a spurious "cancelled" on a later unrelated turn.
+        assert!(s.label.is_empty());
+    }
+
+    #[test]
+    fn new_with_limit_sets_cap() {
+        let s = LoopState::new_with_limit("x".into(), 25);
+        assert!(s.active);
+        assert_eq!(s.max_rounds, 25);
+        assert_eq!(s.round, 0);
     }
 
     #[test]

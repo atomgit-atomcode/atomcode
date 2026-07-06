@@ -905,6 +905,7 @@ impl KernelTurnExecutor {
             keep_interrupted_context: config.keep_interrupted_context,
             user_agent: p.user_agent.clone(),
             skip_tls_verify: p.skip_tls_verify,
+            loop_max_rounds: config.loop_config.max_rounds,
         })
     }
 }
@@ -1558,6 +1559,7 @@ pub(crate) fn chat_bridge_config(
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
+        loop_max_rounds: config.loop_config.max_rounds,
     }
 }
 
@@ -1891,8 +1893,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             | TE::ToolBatchStarted { .. }
             | TE::ToolBatchCompleted { .. }
             | TE::ContextStats { .. }
-            | TE::WorkingDirChanged(_)
-            | TE::WakeupScheduled { .. } => return None,
+            | TE::WorkingDirChanged(_) => return None,
         },
     })
 }

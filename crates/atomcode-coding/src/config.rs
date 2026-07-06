@@ -40,6 +40,9 @@ pub struct CodingAgentConfig {
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
     /// `ATOMCODE_GOAL_MAX_DURATION_SECS`.
     pub goal_max_duration_secs: u64,
+    /// Self-paced `/loop` round cap. Default 100; the bridge overrides it from
+    /// `[loop_config] max_rounds`. Env override `ATOMCODE_LOOP_MAX_ROUNDS`.
+    pub loop_max_rounds: u32,
     /// Per-call provider options (reasoning effort / max_tokens / temperature).
     /// Default = no opinion. A respawn (re-`assemble` on the same parts) picks up
     /// changes — how a driver implements `/effort`.
@@ -136,6 +139,12 @@ fn default_goal_max_duration_secs() -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(7200)
 }
+fn default_loop_max_rounds() -> u32 {
+    std::env::var("ATOMCODE_LOOP_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(100)
+}
 
 impl CodingAgentConfig {
     /// Construct with the required fields and sane defaults for the rest.
@@ -156,6 +165,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
+            loop_max_rounds: default_loop_max_rounds(),
             chat_options: Default::default(),
             telemetry: None,
             reasoning_history: None,

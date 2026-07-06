@@ -6963,13 +6963,50 @@ fn sync_terminal_title(
 /// Idle prompt without any menu/picker — used by the common
 /// "Redraw" path and the post-event-loop fallback after an agent
 /// event returns the UI to Idle.
+/// Whether the idle footer should show the `!bash` discoverability hint: the
+/// input (ignoring leading whitespace) is a `!<cmd>` shell command with a
+/// non-empty command — i.e. exactly what `parse_bash_command` would run on
+/// submit (so the hint appears while composing a `!` command, and only then).
+fn bash_input_hint(buf: &str) -> bool {
+    buf.trim_start()
+        .strip_prefix('!')
+        .is_some_and(|rest| !rest.trim().is_empty())
+}
+
+#[cfg(test)]
+mod bash_input_hint_tests {
+    use super::bash_input_hint;
+
+    #[test]
+    fn shows_only_for_a_nonempty_bang_command() {
+        assert!(bash_input_hint("!ls"));
+        assert!(bash_input_hint("! ls"), "space after ! still runs (parse trims)");
+        assert!(bash_input_hint("  !git status"), "leading whitespace ok");
+        assert!(!bash_input_hint("!"), "bare ! won't run → no hint");
+        assert!(!bash_input_hint("!   "), "! + only spaces");
+        assert!(!bash_input_hint(""));
+        assert!(!bash_input_hint("ls"), "not a bang command");
+        assert!(!bash_input_hint("echo !x"), "! not at line start");
+    }
+}
+
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
+    let mut status = build_status(state, ctx);
+    // Discoverability: while composing a `!bash` command, surface a footer hint —
+    // but only in the low-priority Info slot, never over a higher-priority hint
+    // (no-provider / high token usage / upgrade) that `build_status` already set.
+    if status.hint.is_none() && bash_input_hint(&buf.text) {
+        status.hint = Some((
+            crate::i18n::t(crate::i18n::Msg::BashInputHint).into_owned(),
+            crate::render::HintSeverity::Info,
+        ));
+    }
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: None,
-        status: build_status(state, ctx),
+        status,
         attachments,
     });
     // No explicit flush — see `redraw_with_menu` for the rationale
@@ -9197,6 +9234,10 @@ fn handle_agent_event(
             // Persist the truncated conversation: messages + prune stale
             // per-turn dividers (anchored by message-count) so /resume won't
             // replay dividers for removed turns.
+            // /undo rewrites the conversation the loop was driving — stop any active
+            // /loop so its interval controller can't keep firing into the truncated
+            // history (and clear the stale footer).
+            commands::stop_active_loop(state, ctx);
             ctx.current_session.update_from_conversation_snapshot(snapshot);
             ctx.current_session
                 .turn_stats
@@ -9994,6 +10035,9 @@ fn handle_agent_event(
                 }
             };
 
+            // 切换会话：停掉任何进行中的 /loop，避免其 TUI 侧定时器把旧 payload 打进
+            // 新会话（并清掉残留的 footer）。ClearLoop 在下面 SetConversation 之前送达。
+            commands::stop_active_loop(state, ctx);
             // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
             ctx.agent
                 .cmd_tx

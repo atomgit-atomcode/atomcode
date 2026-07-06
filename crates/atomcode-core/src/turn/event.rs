@@ -92,12 +92,6 @@ pub enum TurnEvent {
     /// or a `bash` call starting with `cd`). Lets the TUI footer track
     /// the current cwd without polling the shared `Arc<RwLock<PathBuf>>`.
     WorkingDirChanged(PathBuf),
-    /// Self-paced /loop: model asked to wake up after `delay_seconds`.
-    WakeupScheduled {
-        delay_seconds: u32,
-        prompt: String,
-        reason: String,
-    },
     /// A tool requires user approval. Carries a snapshot of
     /// conversation state so the TUI can persist mid-turn session
     /// state (e.g. for `/bg`). The approval itself is

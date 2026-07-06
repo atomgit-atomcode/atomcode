@@ -89,6 +89,10 @@ pub struct BridgeConfig {
     /// Threaded so self-signed / internal gateways work under v2 (the legacy engine
     /// honored it via `build_http_client`; v2 had no path for it). Default false.
     pub skip_tls_verify: bool,
+    /// Self-paced `/loop` round cap from `[loop_config] max_rounds`. Threaded so the
+    /// v2 self-paced loop honors the same knob the TUI interval mode already reads;
+    /// previously the bridge hardcoded `LoopState`'s default 100 regardless of config.
+    pub loop_max_rounds: u32,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -306,6 +310,7 @@ impl Bridge {
         // the bare `reqwest` UA and ignored `skip_tls_verify`.
         coding_cfg.user_agent = cfg.user_agent.clone();
         coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
+        coding_cfg.loop_max_rounds = cfg.loop_max_rounds;
         // Interactive drivers PARK approvals (a present human must not be auto-denied for
         // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
         // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
@@ -491,6 +496,15 @@ impl Bridge {
                             bridge.finish_turn(reason, Vec::new());
                         } else if bridge.turn_running {
                             bridge.finish_turn(StopReason::Cancelled, Vec::new());
+                        } else if let Some(messages) = bridge.loop_pending_finish.take() {
+                            // A /loop sleeping between rounds holds its turn OPEN
+                            // (pending_finish already consumed, turn_running=false). Without
+                            // this branch the held-open turn never gets a terminal and the
+                            // TUI stays in Streaming forever after the kernel ends.
+                            bridge.finish_turn(StopReason::Cancelled, messages);
+                        } else if let Some((_, messages)) = bridge.pending_goal.take() {
+                            // Same hold-open shape for /goal while the evaluator runs.
+                            bridge.finish_turn(StopReason::Cancelled, messages);
                         }
                         let _ = bridge.ev_tx.send(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
@@ -619,6 +633,45 @@ impl Bridge {
         }
     }
 
+    /// Tear down any active `/loop` because `/goal` is being armed. `/loop` and
+    /// `/goal` are mutually exclusive — the turn-end Snapshot hook drives only one —
+    /// but the command arms never enforced it, so arming a goal over a sleeping loop
+    /// left the loop's cancel-timer alive to fire a stale round after the goal ran.
+    /// Cancels the sleep token, drops loop state + any queued continuation, closes a
+    /// held-open loop turn, and clears the footer. Safe no-op when no loop is active.
+    fn supersede_loop(&mut self, reason: &str) {
+        self.loop_cancel.cancel();
+        self.loop_cancel = CancellationToken::new();
+        while self.loop_fire_rx.try_recv().is_ok() {}
+        while self.wakeup_rx.try_recv().is_ok() {}
+        self.pending_wakeup = None;
+        if let Some(mut l) = self.loop_state.take() {
+            l.clear();
+            l.last_reason = Some(reason.to_string());
+            let ev = loop_update_ev(&l);
+            self.emit(ev);
+        }
+        if let Some(messages) = self.loop_pending_finish.take() {
+            self.finish_turn(StopReason::Cancelled, messages);
+        }
+    }
+
+    /// Symmetric to [`supersede_loop`]: tear down any active `/goal` because `/loop`
+    /// is being armed. Safe no-op when no goal is active.
+    fn supersede_goal(&mut self, reason: &str) {
+        self.goal_cancel.cancel();
+        self.goal_cancel = CancellationToken::new();
+        if let Some(mut g) = self.goal.take() {
+            g.clear();
+            g.last_eval_reason = Some(reason.to_string());
+            let ev = goal_update_ev(&g);
+            self.emit(ev);
+        }
+        if let Some((_, messages)) = self.pending_goal.take() {
+            self.finish_turn(StopReason::Cancelled, messages);
+        }
+    }
+
     /// A /loop delayed continuation reached its fire time. Bump the round, emit a
     /// LoopUpdate, and inject the model's chosen prompt as a fresh turn — the v2
     /// analogue of goal's NotMet continuation, but the model (not an evaluator)
@@ -638,8 +691,9 @@ impl Bridge {
                 l.last_reason = Some(wake.reason);
                 // Round-limit fuse (parity with v1 mod.rs:2345): stop the loop once
                 // `max_rounds` is reached instead of injecting another turn, so a
-                // runaway loop can't burn tokens forever. `max_rounds` defaults to
-                // LoopState's 100 (v2 has no loop config knob to override it).
+                // runaway loop can't burn tokens forever. `max_rounds` comes from
+                // `[loop_config] max_rounds` (threaded via BridgeConfig →
+                // CodingAgentConfig.loop_max_rounds → SetLoop), default 100.
                 if l.round_limit_reached() {
                     l.active = false;
                     l.last_reason = Some(format!("round limit ({})", l.max_rounds));
@@ -1119,7 +1173,21 @@ impl Bridge {
                     arguments: serde_json::json!({ "command": cmd }).to_string(),
                 });
                 let start = Instant::now();
-                let (display, context, success) = run_local_shell(&cmd, &cwd).await;
+                // Stream output LIVE (v1 parity): each chunk → ToolOutputChunk, which
+                // the TUI renders for `local-shell-` ids WITHOUT Ctrl+O verbose (see
+                // `streams_tool_output_by_default`). v2 previously ran buffered
+                // (`Command::output()`) and emitted only the collapsed final result, so
+                // `!ls` showed a single line — this restores v1's full live output.
+                let chunk_tx = self.ev_tx.clone();
+                let chunk_id = call_id.clone();
+                let outcome = atomcode_core::tool::bash::run_shell(&cmd, &cwd, 300, move |chunk| {
+                    let _ = chunk_tx.send(CoreEv::ToolOutputChunk {
+                        call_id: chunk_id.clone(),
+                        chunk: chunk.to_string(),
+                    });
+                })
+                .await;
+                let (display, context, success) = format_local_shell(&cmd, &outcome);
                 self.emit(CoreEv::ToolCallResult {
                     call_id,
                     name: "bash".into(),
@@ -1136,6 +1204,8 @@ impl Bridge {
                 // sends the condition as a normal message, so the FIRST turn starts on
                 // its own; this just arms the loop, which is driven from the turn-end
                 // Snapshot hook (`maybe_continue_goal`).
+                // Goal supersedes any active /loop (mutually exclusive).
+                self.supersede_loop("superseded by /goal");
                 if self.goal_provider.is_none() {
                     self.goal_provider = build_goal_provider();
                 }
@@ -1190,13 +1260,23 @@ impl Bridge {
                 // loop's in-flight sleep is pre-empted (defensive: the TUI sends
                 // ClearLoop first, but don't rely on caller discipline). A stale wakeup
                 // from a previous loop is discarded so it can't be mistaken for THIS one.
+                // Loop supersedes any active /goal (mutually exclusive).
+                self.supersede_goal("superseded by /loop");
                 self.loop_cancel.cancel();
                 self.loop_cancel = CancellationToken::new();
                 self.pending_wakeup = None;
+                // Drain any continuation/wakeup already queued by the PRIOR loop but not yet
+                // processed. `on_loop_fire`'s only staleness guard is `loop_state.active`, and
+                // we're about to install a fresh active loop — without this drain a queued
+                // fire from the old loop would pass the guard and inject the old prompt (and
+                // bump the round) into the new one. Anything queued here necessarily belongs
+                // to the prior loop; the new loop hasn't scheduled anything yet.
+                while self.loop_fire_rx.try_recv().is_ok() {}
+                while self.wakeup_rx.try_recv().is_ok() {}
                 // Drop any hold-open snapshot from a prior loop; the new loop's first turn
                 // (the prompt sent alongside SetLoop) takes over the driver lifecycle.
                 self.loop_pending_finish = None;
-                let state = LoopState::new(prompt);
+                let state = LoopState::new_with_limit(prompt, self.coding_cfg.loop_max_rounds);
                 let ev = loop_update_ev(&state);
                 self.emit(ev);
                 self.loop_state = Some(state);
@@ -2111,60 +2191,40 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Run a `!cmd` local shell in `cwd` (300s cap). Returns
-/// `(display_output, context_block, success)`: the display goes to the driver as the
-/// tool result; the `<bash-*>` context block is injected ahead of the next user
-/// message (clamped so `!cat bigfile` can't blow up the conversation).
-async fn run_local_shell(cmd: &str, cwd: &std::path::Path) -> (String, String, bool) {
-    use tokio::process::Command;
-    let mut c = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
+/// Format a completed `!cmd` [`ShellOutcome`] into `(display, context, success)`:
+/// the display goes to the driver as the tool-result row; the `<bash-*>` context
+/// block is injected ahead of the next user message (clamped so `!cat bigfile`
+/// can't blow up the conversation). PURE — execution + live streaming happen in
+/// the `LocalShell` handler via `atomcode_core::tool::bash::run_shell`.
+fn format_local_shell(
+    cmd: &str,
+    outcome: &atomcode_core::tool::bash::ShellOutcome,
+) -> (String, String, bool) {
+    use atomcode_core::tool::bash::ShellExit;
+    let stdout = outcome.stdout.trim();
+    let stderr = outcome.stderr.trim();
+    let (success, code) = match outcome.exit {
+        ShellExit::Exited { success, code } => (success, code),
+        ShellExit::KilledIdle | ShellExit::KilledTimeout => (false, None),
     };
-    c.current_dir(cwd);
-
-    let out = match tokio::time::timeout(Duration::from_secs(300), c.output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            let m = format!("failed to run: {e}");
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>{}</bash-stderr>",
-                xml_escape(cmd),
-                xml_escape(&m)
-            );
-            return (m, ctx, false);
-        }
-        Err(_) => {
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>command timed out</bash-stderr>",
-                xml_escape(cmd)
-            );
-            return ("command timed out (300s)".into(), ctx, false);
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let code = out.status.code();
-    let success = out.status.success();
 
     // Driver display: full-ish, readable.
     let mut display = String::new();
     if !stdout.is_empty() {
-        display.push_str(&stdout);
+        display.push_str(stdout);
     }
     if !stderr.is_empty() {
         if !display.is_empty() {
             display.push('\n');
         }
-        display.push_str(&stderr);
+        display.push_str(stderr);
     }
-    if !success {
+    if matches!(outcome.exit, ShellExit::KilledTimeout) {
+        if !display.is_empty() {
+            display.push('\n');
+        }
+        display.push_str("[command timed out (300s)]");
+    } else if !success {
         if !display.is_empty() {
             display.push('\n');
         }
@@ -2185,15 +2245,20 @@ async fn run_local_shell(cmd: &str, cwd: &std::path::Path) -> (String, String, b
     };
     let mut ctx = format!("<bash-input>{}</bash-input>", xml_escape(cmd));
     if !stdout.is_empty() {
-        ctx.push_str(&format!("\n<bash-stdout>{}</bash-stdout>", clamp(&stdout)));
+        ctx.push_str(&format!("\n<bash-stdout>{}</bash-stdout>", clamp(stdout)));
     }
     if !stderr.is_empty() {
-        ctx.push_str(&format!("\n<bash-stderr>{}</bash-stderr>", clamp(&stderr)));
+        ctx.push_str(&format!("\n<bash-stderr>{}</bash-stderr>", clamp(stderr)));
     }
-    if let Some(c) = code {
-        if c != 0 {
+    match outcome.exit {
+        ShellExit::Exited { code: Some(c), .. } if c != 0 => {
             ctx.push_str(&format!("\n<bash-exit-code>{c}</bash-exit-code>"));
         }
+        ShellExit::KilledIdle => ctx.push_str("\n<bash-stderr>process killed (stuck)</bash-stderr>"),
+        ShellExit::KilledTimeout => {
+            ctx.push_str("\n<bash-stderr>command timed out (300s)</bash-stderr>")
+        }
+        _ => {}
     }
     (display, ctx, success)
 }
@@ -2641,6 +2706,7 @@ pub fn build_provider_for_acp(
     coding_cfg.thinking_keep = cfg.thinking_keep.clone();
     coding_cfg.user_agent = cfg.user_agent.clone();
     coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
+    coding_cfg.loop_max_rounds = cfg.loop_max_rounds;
     build_provider(&coding_cfg)
 }
 
@@ -3080,19 +3146,38 @@ mod undo_tests {
     }
 
     #[tokio::test]
-    async fn local_shell_runs_and_formats_output() {
-        let (display, ctx, success) =
-            super::run_local_shell("echo hello", std::path::Path::new(".")).await;
+    async fn local_shell_runs_streams_and_formats_output() {
+        // End-to-end: the `!cmd` executor now streams via core `run_shell` (v1 parity)
+        // — the chunk_cb must fire (live output) AND format_local_shell wrap the result.
+        let chunks = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = atomcode_core::tool::bash::run_shell(
+            "echo hello",
+            std::path::Path::new("."),
+            300,
+            |c| chunks.lock().unwrap().push(c.to_string()),
+        )
+        .await;
+        let (display, ctx, success) = super::format_local_shell("echo hello", &outcome);
         assert!(success);
         assert!(display.contains("hello"));
         assert!(ctx.contains("<bash-input>echo hello</bash-input>"));
         assert!(ctx.contains("<bash-stdout>hello</bash-stdout>"));
+        assert!(
+            chunks.lock().unwrap().iter().any(|c| c.contains("hello")),
+            "output must stream via the chunk callback (live display)"
+        );
     }
 
     #[tokio::test]
     async fn local_shell_failure_carries_exit_code() {
-        let (_d, ctx, success) =
-            super::run_local_shell("exit 3", std::path::Path::new(".")).await;
+        let outcome = atomcode_core::tool::bash::run_shell(
+            "exit 3",
+            std::path::Path::new("."),
+            300,
+            |_| {},
+        )
+        .await;
+        let (_d, ctx, success) = super::format_local_shell("exit 3", &outcome);
         assert!(!success);
         assert!(ctx.contains("<bash-exit-code>3</bash-exit-code>"), "ctx={ctx}");
     }
@@ -3127,6 +3212,68 @@ mod undo_tests {
     #[test]
     fn xml_escape_neutralizes_tag_forgery() {
         assert_eq!(super::xml_escape("a</bash-stdout>b"), "a&lt;/bash-stdout&gt;b");
+    }
+
+    #[test]
+    fn format_local_shell_success_shows_stdout_and_wraps_context() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: "file1\nfile2\n".into(),
+            stderr: String::new(),
+            exit: ShellExit::Exited { success: true, code: Some(0) },
+            elapsed_secs: 0.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("ls", &outcome);
+        assert!(success);
+        assert_eq!(display, "file1\nfile2"); // trimmed, full (streaming shows it live)
+        assert!(ctx.contains("<bash-input>ls</bash-input>"));
+        assert!(ctx.contains("<bash-stdout>file1\nfile2</bash-stdout>"));
+        assert!(!ctx.contains("<bash-exit-code>"), "code 0 => no exit-code tag");
+    }
+
+    #[test]
+    fn format_local_shell_failure_shows_exit_code_and_stderr() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: String::new(),
+            stderr: "boom".into(),
+            exit: ShellExit::Exited { success: false, code: Some(2) },
+            elapsed_secs: 0.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("false", &outcome);
+        assert!(!success);
+        assert!(display.contains("boom") && display.contains("[exit 2]"));
+        assert!(ctx.contains("<bash-stderr>boom</bash-stderr>"));
+        assert!(ctx.contains("<bash-exit-code>2</bash-exit-code>"));
+    }
+
+    #[test]
+    fn format_local_shell_empty_output_falls_back() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit: ShellExit::Exited { success: true, code: Some(0) },
+            elapsed_secs: 0.0,
+        };
+        let (display, _ctx, success) = super::format_local_shell("true", &outcome);
+        assert!(success);
+        assert_eq!(display, "(no output)");
+    }
+
+    #[test]
+    fn format_local_shell_timeout_is_marked_failed() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: "partial".into(),
+            stderr: String::new(),
+            exit: ShellExit::KilledTimeout,
+            elapsed_secs: 300.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("sleep 999", &outcome);
+        assert!(!success);
+        assert!(display.contains("[command timed out (300s)]"));
+        assert!(ctx.contains("command timed out (300s)"));
     }
 
     #[test]

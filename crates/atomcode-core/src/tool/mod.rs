@@ -16,7 +16,6 @@ pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
-pub mod schedule_wakeup;
 pub mod search_replace;
 pub mod todo;
 pub mod trace_callees;

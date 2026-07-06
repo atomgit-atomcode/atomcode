@@ -51,8 +51,10 @@ fn parse_interval(tok: &str) -> Option<u64> {
     let n: u64 = num.parse().ok()?;
     match unit {
         "s" => Some(n),
-        "m" => Some(n * 60),
-        "h" => Some(n * 3600),
+        // checked_mul so a pathological token (e.g. `999999999999999999m`) returns
+        // None instead of overflow-panicking in debug / silently wrapping in release.
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
         _ => None,
     }
 }
@@ -112,5 +114,18 @@ mod tests {
     fn empty_is_status() {
         assert_eq!(parse_loop_arg(""), LoopArg::Status);
         assert_eq!(parse_loop_arg("status"), LoopArg::Status);
+    }
+
+    #[test]
+    fn overflowing_interval_does_not_panic() {
+        // `n * 60` / `n * 3600` used to overflow-panic in debug on a pathological
+        // token; checked_mul now makes parse_interval return None, so the token
+        // isn't recognized as an interval and falls through to a bare prompt.
+        assert_eq!(parse_interval("999999999999999999m"), None);
+        assert_eq!(parse_interval("999999999999999999h"), None);
+        assert_eq!(
+            parse_loop_arg("999999999999999999m x"),
+            LoopArg::SelfPaced { prompt: "999999999999999999m x".into() }
+        );
     }
 }

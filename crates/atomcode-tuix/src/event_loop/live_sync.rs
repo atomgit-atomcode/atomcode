@@ -40,8 +40,7 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
         | TurnEvent::ToolBatchStarted { .. }
         | TurnEvent::ToolBatchCompleted { .. }
         | TurnEvent::ContextStats { .. }
-        | TurnEvent::WorkingDirChanged(_)
-        | TurnEvent::WakeupScheduled { .. } => return None,
+        | TurnEvent::WorkingDirChanged(_) => return None,
     })
 }
 
