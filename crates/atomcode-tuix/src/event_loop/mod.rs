@@ -8381,24 +8381,12 @@ fn handle_agent_event(
             // completed → Muted (dim), in_progress → Warning (yellow), pending → Muted.
             // Falls through to the normal ToolCallInFlight path when parse fails.
             if name == "todowrite" {
-                let block = todo_block_lines(&arguments, ctx.caps.unicode_symbols);
+                // SHARED with the /resume replay (session_picker) via
+                // `todo_block_styled_lines` so live and replay stay identical.
+                let block = todo_block_styled_lines(&arguments, ctx.caps.unicode_symbols);
                 if !block.is_empty() {
-                    use atomcode_capabilities::tools::todo::TodoStatus;
                     renderer.render(UiLine::AssistantLineBreak);
-                    // Style by TYPED status via CommandOutput's SGR support. Emphasis is
-                    // weight-based (bold / faint) — theme-safe on both light & dark, and
-                    // relative to the terminal's default fg. Deliberately NOT UiLine::Warning:
-                    // it prefixes a `!` (an in-progress task is not a warning) and uses an
-                    // un-theme-aware bright yellow that's near-invisible on light backgrounds.
-                    for (status, line) in &block {
-                        let styled = match status {
-                            // active task stands out
-                            TodoStatus::InProgress => format!("\x1b[1m  {line}\x1b[0m"),
-                            // done recedes
-                            TodoStatus::Completed => format!("\x1b[2m  {line}\x1b[0m"),
-                            // not started — plain, readable
-                            TodoStatus::Pending => format!("  {line}"),
-                        };
+                    for styled in block {
                         renderer.render(UiLine::CommandOutput(styled));
                     }
                     renderer.flush();
@@ -11063,6 +11051,25 @@ pub(crate) fn todo_block_lines(
     }
 }
 
+/// A todowrite call's args → the compact todo block as ready-to-render body
+/// lines, each SGR-styled by status (in-progress bold, completed faint, pending
+/// plain — weight-based so it's theme-safe). SHARED by the LIVE tool-render path
+/// and the `/resume` replay so the two never drift (each renders these as
+/// `UiLine::CommandOutput`). Empty on parse failure (caller falls back to the
+/// normal tool row). Emphasis is deliberately NOT `UiLine::Warning` (it prefixes
+/// a `!` and uses an un-theme-aware bright yellow).
+pub(crate) fn todo_block_styled_lines(args: &str, unicode: bool) -> Vec<String> {
+    use atomcode_capabilities::tools::todo::TodoStatus;
+    todo_block_lines(args, unicode)
+        .into_iter()
+        .map(|(status, line)| match status {
+            TodoStatus::InProgress => format!("\x1b[1m  {line}\x1b[0m"),
+            TodoStatus::Completed => format!("\x1b[2m  {line}\x1b[0m"),
+            TodoStatus::Pending => format!("  {line}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
@@ -11084,6 +11091,20 @@ mod todo_block_tests {
     #[test]
     fn todo_block_bad_args_empty() {
         assert!(todo_block_lines(r#"{"nope":1}"#, false).is_empty());
+    }
+
+    #[test]
+    fn todo_block_styled_lines_weights_by_status() {
+        let out = todo_block_styled_lines(
+            r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"completed"},{"content":"c","status":"pending"}]}"#,
+            false,
+        );
+        assert_eq!(out.len(), 3);
+        assert!(out[0].starts_with("\x1b[1m") && out[0].contains('a'), "in-progress bold: {:?}", out[0]);
+        assert!(out[1].starts_with("\x1b[2m") && out[1].contains('b'), "completed faint: {:?}", out[1]);
+        assert!(!out[2].contains("\x1b[") && out[2].contains('c'), "pending plain: {:?}", out[2]);
+        // Empty on parse failure (caller falls back to the normal tool row).
+        assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
     }
 }
 

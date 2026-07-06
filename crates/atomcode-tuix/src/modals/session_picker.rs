@@ -530,6 +530,12 @@ pub(crate) fn replay_session(
     // sessions). Without this the previous turn's last output butts straight
     // against the next user input.
     let mut seen_user = false;
+    // Render todowrite calls as the SAME compact status block the live path shows
+    // (not a generic tool row), and suppress their now-redundant tool RESULT. The
+    // unicode flag mirrors the live `ctx.caps.unicode_symbols` — `UiState` froze it
+    // at construction.
+    let unicode = state.unicode_symbols;
+    let mut todowrite_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, m) in session.messages.iter().enumerate() {
         if matches!(m.role, Role::User) {
             if seen_user {
@@ -563,6 +569,23 @@ pub(crate) fn replay_session(
                     }
                 }
                 for tc in tool_calls {
+                    // todowrite → the styled status block (same as live), and remember
+                    // its id so the matching tool RESULT below is suppressed.
+                    if tc.name == "todowrite" {
+                        let block = crate::event_loop::todo_block_styled_lines(&tc.arguments, unicode);
+                        if !block.is_empty() {
+                            renderer.render(UiLine::AssistantLineBreak);
+                            for styled in block {
+                                renderer.render(UiLine::CommandOutput(styled));
+                            }
+                            // Only track a non-empty id: an empty id would suppress the
+                            // FIRST empty-`call_id` result of ANY tool, not this todowrite's.
+                            if !tc.id.is_empty() {
+                                todowrite_call_ids.insert(tc.id.clone());
+                            }
+                            continue;
+                        }
+                    }
                     renderer.render(UiLine::ToolCall {
                         name: crate::event_loop::display_tool_name(&tc.name),
                         detail: format_tool_detail(&tc.name, &tc.arguments),
@@ -570,16 +593,23 @@ pub(crate) fn replay_session(
                 }
             }
             (Role::Tool, MessageContent::ToolResult(r)) => {
-                renderer.render(UiLine::ToolResult {
-                    success: r.success,
-                    summary: summarise(&r.output),
-                });
+                // Suppress ONLY a SUCCESSFUL todowrite result (its block already rendered).
+                // An errored todowrite must still show its error — matches the live path
+                // (`suppress_body_echo = … && success`).
+                if !(r.success && todowrite_call_ids.contains(&r.call_id)) {
+                    renderer.render(UiLine::ToolResult {
+                        success: r.success,
+                        summary: summarise(&r.output),
+                    });
+                }
             }
             (Role::Tool, MessageContent::ToolResultRef(r)) => {
-                renderer.render(UiLine::ToolResult {
-                    success: true,
-                    summary: summarise(&r.summary),
-                });
+                if !(r.success && todowrite_call_ids.contains(&r.call_id)) {
+                    renderer.render(UiLine::ToolResult {
+                        success: true,
+                        summary: summarise(&r.summary),
+                    });
+                }
             }
             _ => {}
         }
@@ -849,5 +879,160 @@ mod tests {
         let p = SessionPicker::open(vec![]);
         let payload = build_menu_payload(&p);
         assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
+    }
+
+    // Parity: on /resume, a todowrite call must render as the SAME styled status
+    // block the live path shows (CommandOutput lines, in-progress bold) — NOT a
+    // generic `● Todowrite` tool row — and its redundant tool RESULT is suppressed.
+    // A normal tool call (read) is unaffected.
+    #[test]
+    fn replay_renders_todowrite_as_styled_block_and_suppresses_its_result() {
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_core::session::Session;
+        use atomcode_core::tool::{ToolCall, ToolResult as MToolResult};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("go".into()),
+                synthetic: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "t1".into(),
+                            name: "todowrite".into(),
+                            arguments: r#"{"todos":[{"content":"task A","status":"in_progress"},{"content":"task B","status":"pending"}]}"#.into(),
+                        },
+                        ToolCall {
+                            id: "r1".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":"x"}"#.into(),
+                        },
+                    ],
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
+                },
+                synthetic: false,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(MToolResult {
+                    call_id: "t1".into(),
+                    output: "[~] task A\n[ ] task B".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(MToolResult {
+                    call_id: "r1".into(),
+                    output: "file contents".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            },
+            // A FAILED todowrite: its block still renders, but its error result must
+            // NOT be suppressed (parity with live's `… && success` suppression).
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "t2".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"todos":[{"content":"task C","status":"pending"}]}"#.into(),
+                    }],
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
+                },
+                synthetic: false,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(MToolResult {
+                    call_id: "t2".into(),
+                    output: "error: bad todo item".into(),
+                    success: false,
+                }),
+                synthetic: false,
+            },
+        ];
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let cmd_out: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                UiLine::CommandOutput(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(cmd_out.iter().any(|s| s.contains("task A")), "block shows task A: {cmd_out:?}");
+        assert!(cmd_out.iter().any(|s| s.contains("task B")), "block shows task B: {cmd_out:?}");
+        assert!(
+            cmd_out.iter().any(|s| s.contains("\x1b[1m") && s.contains("task A")),
+            "in-progress task is bold: {cmd_out:?}"
+        );
+
+        let tool_call_names: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                UiLine::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !tool_call_names.iter().any(|n| n.to_lowercase().contains("todo")),
+            "todowrite must NOT render as a generic tool row: {tool_call_names:?}"
+        );
+        assert_eq!(tool_call_names.len(), 1, "only the non-todowrite call is a tool row: {tool_call_names:?}");
+
+        let results: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                UiLine::ToolResult { summary, .. } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !results.iter().any(|s| s.contains("task A") || s.contains("[~]")),
+            "todowrite result must be suppressed: {results:?}"
+        );
+        assert!(
+            results.iter().any(|s| s.contains("file contents")),
+            "the read tool's result is still shown: {results:?}"
+        );
+        assert!(
+            results.iter().any(|s| s.contains("error: bad todo item")),
+            "a FAILED todowrite's error result must NOT be suppressed: {results:?}"
+        );
     }
 }
