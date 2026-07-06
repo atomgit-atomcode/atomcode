@@ -1732,13 +1732,13 @@ fn execute_slash_command_impl(
             // implementation below is intentionally preserved — re-enable via
             // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
             // in BUILTIN_COMMANDS).
-            if !crate::commands::app_remote_enabled() {
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
+//             if !crate::commands::app_remote_enabled() {
+//                 renderer.render(UiLine::Error(
+//                     t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
+//                 ));
+//                 renderer.flush();
+//                 return Ok(());
+//             }
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
             // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
@@ -1833,12 +1833,31 @@ fn execute_slash_command_impl(
                             sid,
                             initial,
                         );
+                        // 1.5) 检查登录态：未登录不允许开启远程访问。
+                        if atomcode_core::auth::oauth::get_stored_auth().is_none() {
+                            renderer.render(UiLine::CommandOutput(
+                                "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。".to_string(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
+                        //    清理旧的 sync 状态，避免旧 forwarder task 残留。
+                        if let Some(h) = ctx.sync_forwarder.take() {
+                            h.abort();
+                        }
+                        ctx.sync_session = None;
+                        atomcode_daemon::stop_app_server();
+                        //    传入当前登录 user_id 启用双向校验。
+                        let app_user_id =
+                            atomcode_core::auth::oauth::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
                                     "127.0.0.1",
                                     atomcode_daemon::APP_DEFAULT_PORT,
+                                    app_user_id,
                                 ),
                             )
                         });
@@ -1923,7 +1942,7 @@ fn execute_slash_command_impl(
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 AtomCode App 扫码连接
+                                                        "用 GitCode App 扫码连接
                                                         \n{q}\n\
                                                          （/app stop 断开）"
                                                     ),
@@ -1954,6 +1973,12 @@ fn execute_slash_command_impl(
             // the next LLM request fails with a "re-run /codingplan"
             // hint instead of the TUI crashing on next startup because
             // `default_provider` got cleared.
+            //
+            // 安全：登出时自动关闭 App 远程访问，防止隧道仍在线。
+            if ctx.app_relay_child.take().map_or(false, |mut c| c.start_kill().is_ok()) {
+                let _ = ctx.app_relay_child.take();
+            }
+            atomcode_daemon::stop_app_server();
             match atomcode_core::auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);

@@ -318,6 +318,10 @@ pub struct AppState {
     /// 仅 webui 模式（启动时提供了 token store）强制 token 鉴权；
     /// 独立 daemon / VSCode 实例不强制，保持原行为。
     pub enforce_token: bool,
+    /// App 远程访问模式的期望 user_id（来自二维码 token 前缀）。
+    /// 非空时强制校验每条请求的 `X-Atom-User-Id` 头，与桌面端登录账号一致才放行。
+    /// 空串表示不校验（未登录 / 非 app 模式）。
+    pub app_user_id: String,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
@@ -3911,6 +3915,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             working_dir_override: std::env::current_dir().ok(),
             // 预绑定的监听器：run_server 直接复用，跳过内部 bind。
             prebound_listener: Some(listener),
+            // webui 模式不需要 app user_id 校验。
+            app_user_id: None,
         };
         let task = tokio::spawn(async move {
             if let Err(e) = run_server(opts).await {
@@ -4029,9 +4035,16 @@ static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex:
 ///   中继的 route token + 本机回环绑定（server 只听 127.0.0.1，仅本机隧道可达）。
 /// - **不开浏览器**：App 用二维码配对，不需要打开网页。
 ///
+/// `user_id`：可选，桌面端当前登录用户 id。传入后将启用 `X-Atom-User-Id` 请求头校验，
+/// 确保请求来自同一账号的手机 App。
+///
 /// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session]），所以
 /// TUI / 浏览器 / App 看到的是**同一段对话**，双向实时同步。
-pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), String> {
+pub async fn ensure_app_server(
+    host: &str,
+    port: u16,
+    user_id: Option<String>,
+) -> Result<(String, u16), String> {
     // 复用仍在运行的实例（含其绑定地址/端口）。
     let reuse = {
         let guard = APP_SERVER.lock().unwrap();
@@ -4060,6 +4073,7 @@ pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), S
         quiet: true,
         working_dir_override: std::env::current_dir().ok(),
         prebound_listener: Some(listener),
+        app_user_id: user_id,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = run_server(opts).await {
@@ -4441,6 +4455,8 @@ pub struct ServerOpts {
     /// 预绑定的监听器。进程内 webui 启动器先绑定端口（拿到真实端口、支持动态端口）
     /// 再传入，`run_server` 直接复用、跳过内部 bind。独立二进制传 None，照旧自行 bind。
     pub prebound_listener: Option<tokio::net::TcpListener>,
+    /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-Atom-User-Id` 请求头校验。
+    pub app_user_id: Option<String>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -4466,6 +4482,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         quiet,
         working_dir_override,
         prebound_listener,
+        ..
     } = opts;
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
@@ -4545,6 +4562,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         active_connections: active_connections.clone(),
         enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
+        app_user_id: opts.app_user_id.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
@@ -4658,6 +4676,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_token::require_webui_token,
+        ))
+        // App 远程访问 user_id 校验（仅 /app 模式启用）。
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_token::require_app_user_id,
         ));
 
     let app = public

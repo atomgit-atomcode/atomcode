@@ -82,11 +82,11 @@ impl CommandRegistry {
 /// At launch: delete this gate, uncomment the `/app` entry in `BUILTIN_COMMANDS`,
 /// and remove the guard in the dispatch `"app"` arm. (A `fn`, not a `const`, so
 /// the call site doesn't const-fold into an `unreachable_code` warning.)
-pub(crate) fn app_remote_enabled() -> bool {
-    std::env::var("ATOMCODE_ENABLE_APP")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-}
+// pub(crate) fn app_remote_enabled() -> bool {
+//     std::env::var("ATOMCODE_ENABLE_APP")
+//         .map(|v| !v.trim().is_empty())
+//         .unwrap_or(false)
+// }
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
@@ -101,7 +101,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // this entry and remove that gate.
     // needs_args=true：补全只到 `/app `，让用户可追加中继地址或 `stop` 再回车。
     // 裸 `/app ` + 回车则用环境变量 ATOMCODE_APP_RELAY。
-    // Command { name: "app",     desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true },
+    Command { name: "app",     desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },

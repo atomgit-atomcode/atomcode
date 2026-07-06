@@ -129,7 +129,6 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
 - **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
 - **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
-- **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
 - **Remote commands** — the phone can run `/status`, `/cost`, `/diff`, `/whoami` etc., which execute on the desktop and echo results back
 - **Switch projects / sessions** — switch projects or open a history session on the phone, and the desktop follows immediately
 - **Model sync** — switching models on either end keeps the other in sync
