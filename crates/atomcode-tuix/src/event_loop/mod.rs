@@ -11010,7 +11010,22 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         Some(body[s..e].trim())
     }
 
-    let segs: Vec<&str> = output.split("<task ").skip(1).collect();
+    // Split on block boundaries only: a block starts at the very beginning or right after
+    // a newline (render_task_block joins blocks with '\n', and each block's opening tag is
+    // line-leading). Splitting on the bare "<task " would mis-split on a literal "<task "
+    // that appears inline inside a task description (rendered in <summary>).
+    let mut segs: Vec<&str> = Vec::new();
+    for (i, part) in output.split("\n<task ").enumerate() {
+        if i == 0 {
+            // The first part is a block only if the output itself begins with "<task ".
+            if let Some(rest) = part.strip_prefix("<task ") {
+                segs.push(rest);
+            }
+        } else {
+            // Every later part already had its leading "\n<task " consumed by the split.
+            segs.push(part);
+        }
+    }
     if segs.is_empty() {
         return summarise(output);
     }
@@ -11222,6 +11237,15 @@ mod task_render_tests {
         // Defensive: not a task block ⇒ generic summarise, not blank.
         let s = summarise_task_result("plain text\nsecond line");
         assert_eq!(s, "plain text (2 lines)");
+    }
+
+    #[test]
+    fn result_description_with_task_literal_not_missplit() {
+        // A description containing an inline "<task " must NOT create a spurious block —
+        // only line-leading "<task " (block boundaries) split.
+        let out = "<task id=\"worker#1\" model=\"m\" state=\"completed\">\n<summary>fix <task foo> bug</summary>\n<task_result>\nx\ny\n</task_result>\n</task>";
+        let s = summarise_task_result(out);
+        assert_eq!(s, "worker \u{b7} m \u{b7} \u{2713} done (2 lines)");
     }
 
     #[test]
