@@ -1532,7 +1532,7 @@ mod buffer_tests {
         let mut pending = Some(armed);
         assert_eq!(
             intercept_empty_bare_esc(&mut pending, Some(undo_at), mashed),
-            EmptyEscIntercept::Consumed
+            EmptyEscIntercept::CooldownSilenced
         );
         assert_eq!(pending, Some(armed), "冷却压制时不得改动 pending");
     }
@@ -1545,7 +1545,7 @@ mod buffer_tests {
         let mut pending = None;
         assert_eq!(
             intercept_empty_bare_esc(&mut pending, Some(undo_at), during),
-            EmptyEscIntercept::Consumed
+            EmptyEscIntercept::CooldownSilenced
         );
         assert_eq!(pending, None, "冷却期内不得武装");
     }
@@ -3562,6 +3562,7 @@ const DOUBLE_ESC_UNDO_COOLDOWN: Duration = Duration::from_millis(1500);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyEscIntercept {
     Consumed,
+    CooldownSilenced,
     TriggerUndo,
 }
 
@@ -3577,7 +3578,7 @@ fn intercept_empty_bare_esc(
     // Cooldown: within DOUBLE_ESC_UNDO_COOLDOWN of the last undo, a bare Esc
     // neither arms nor triggers — so a rapid Esc mash undoes at most once.
     if last_undo_at.is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_UNDO_COOLDOWN) {
-        return EmptyEscIntercept::Consumed;
+        return EmptyEscIntercept::CooldownSilenced;
     }
     if second_esc_triggers_undo(*pending, now) {
         *pending = None;
@@ -6212,6 +6213,14 @@ fn handle_idle_key(
                     crate::i18n::t(crate::i18n::Msg::EscAgainToUndo).into_owned(),
                 ));
                 renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            EmptyEscIntercept::CooldownSilenced => {
+                // Within the post-undo cooldown: swallow the Esc silently so a
+                // rapid mash neither undoes again nor flashes a misleading
+                // "Esc again to undo" hint that wouldn't fire.
+                app.exit_pending = None;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
