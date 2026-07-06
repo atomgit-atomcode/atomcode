@@ -6610,6 +6610,14 @@ fn handle_idle_key(
                 // `!cmd` — user-invoked bash mode. Echo the line, hand off
                 // to the agent loop (executes + records context, no turn).
                 renderer.render(UiLine::User(line.clone()));
+                // Push the `!cmd` line into the Up-arrow recall buffer so the
+                // just-run command isn't lost — mirrors the `/command` and
+                // regular-message branches. `!` lines carry no pastes/images.
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: line.clone(),
+                    images: Vec::new(),
+                    pastes: Vec::new(),
+                });
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::LocalShell {
@@ -6993,14 +7001,22 @@ mod bash_input_hint_tests {
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_status(state, ctx);
-    // Discoverability: while composing a `!bash` command, surface a footer hint —
-    // but only in the low-priority Info slot, never over a higher-priority hint
-    // (no-provider / high token usage / upgrade) that `build_status` already set.
-    if status.hint.is_none() && bash_input_hint(&buf.text) {
-        status.hint = Some((
-            crate::i18n::t(crate::i18n::Msg::BashInputHint).into_owned(),
-            crate::render::HintSeverity::Info,
-        ));
+    // Discoverability: while composing a `!bash` command, surface a footer hint.
+    // `build_status` always fills the slot with at least the lowest-priority
+    // `/webui` fallback, so gate on "slot is free OR only holds that fallback" —
+    // this shows the bash hint over the webui nudge but still yields to a
+    // higher-priority hint (no-provider / high token usage / upgrade).
+    if bash_input_hint(&buf.text) {
+        let slot_is_free = match &status.hint {
+            None => true,
+            Some((h, _)) => *h == crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
+        };
+        if slot_is_free {
+            status.hint = Some((
+                crate::i18n::t(crate::i18n::Msg::BashInputHint).into_owned(),
+                crate::render::HintSeverity::Info,
+            ));
+        }
     }
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
