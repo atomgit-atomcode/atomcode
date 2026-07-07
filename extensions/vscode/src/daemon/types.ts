@@ -228,6 +228,7 @@ export interface SessionDetail {
 export interface MessageInfo {
   role: string;
   content: string;
+  synthetic?: boolean;
   images?: ImageInput[];
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;

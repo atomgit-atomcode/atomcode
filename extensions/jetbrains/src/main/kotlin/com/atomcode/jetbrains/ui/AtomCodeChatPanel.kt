@@ -889,7 +889,7 @@ class AtomCodeChatPanel(
             val role = message.role.lowercase()
             when (role) {
                 "user" -> {
-                    if (isInternalHistoryUserMessage(message.content)) return@forEach
+                    if (message.synthetic || isInternalHistoryUserMessage(message.content)) return@forEach
                     val restored = decodeHistoryUserMessage(message.content)
                     messageView.addUserMessage(restored.text, restored.contextSummary)
                     assistantGroupOpen = false
@@ -1913,9 +1913,22 @@ internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
 
 internal fun isInternalHistoryUserMessage(content: String): Boolean {
     val trimmed = content.trim()
-    return trimmed.startsWith("<system-reminder>") ||
-        trimmed.startsWith("You made code edits but have not verified them.")
+    return INTERNAL_HISTORY_USER_PREFIXES.any { trimmed.startsWith(it) }
 }
+
+private val INTERNAL_HISTORY_USER_PREFIXES = listOf(
+    "<system-reminder>",
+    "You made code edits but have not verified them.",
+    "Output limit hit — your last response was cut off",
+    "Output limit hit. If the task is already complete",
+    "[PLAN MODE",
+    "[Context was compressed",
+    "[Additional context from user]:",
+    "[SYNTAX CHECK:",
+    "[DEV SERVER ERROR",
+    "[Auto-read from error:",
+    "[Images returned by the tool calls above",
+)
 
 private val HISTORY_CONTEXT_FILE_PATTERN =
     Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")

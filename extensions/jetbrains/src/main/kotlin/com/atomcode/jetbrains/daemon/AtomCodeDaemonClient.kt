@@ -228,6 +228,7 @@ class AtomCodeDaemonClient(
                     MessageInfo(
                         role = it.jsonString("role").orEmpty(),
                         content = it.jsonString("content").orEmpty(),
+                        synthetic = it.jsonBoolean("synthetic") ?: false,
                     )
                 },
             )

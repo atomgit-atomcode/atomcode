@@ -143,7 +143,7 @@ impl AgentLoop {
                 "[SYNTAX CHECK: {}. Fix these before continuing — the file structure may be broken.]",
                 warnings.join("; ")
             );
-            self.conversation.add_user_message(&msg);
+            self.conversation.add_synthetic_user_message(&msg);
         }
     }
 
@@ -244,7 +244,7 @@ impl AgentLoop {
                     "[DEV SERVER ERROR in {}:]\n{}\n\nFix these errors before continuing.",
                     log_name, errors
                 );
-                self.conversation.add_user_message(&msg);
+                self.conversation.add_synthetic_user_message(&msg);
                 break; // One log file's errors is enough
             }
         }

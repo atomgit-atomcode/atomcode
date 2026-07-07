@@ -479,7 +479,7 @@ fn last_assistant_reply_markdown(messages: &[atomcode_core::conversation::messag
             // Turn boundary: seal the turn that just ended (keep the previous
             // `last` if this turn produced no assistant text — a trailing bare
             // user message must not blank out the reply above it).
-            (Role::User, _) => {
+            (Role::User, _) if is_real_user_message(m) => {
                 if !acc.is_empty() {
                     last = std::mem::take(&mut acc);
                 }
@@ -495,6 +495,11 @@ fn last_assistant_reply_markdown(messages: &[atomcode_core::conversation::messag
         last = acc;
     }
     last
+}
+
+fn is_real_user_message(message: &atomcode_core::conversation::message::Message) -> bool {
+    use atomcode_core::conversation::message::Role;
+    matches!(message.role, Role::User) && !message.synthetic
 }
 
 pub(crate) fn replay_session(
@@ -537,7 +542,7 @@ pub(crate) fn replay_session(
     let unicode = state.unicode_symbols;
     let mut todowrite_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, m) in session.messages.iter().enumerate() {
-        if matches!(m.role, Role::User) {
+        if is_real_user_message(m) {
             if seen_user {
                 let stat = session.turn_stats.iter().find(|s| s.after_message == i);
                 renderer.render(UiLine::TurnSeparator {
@@ -547,7 +552,7 @@ pub(crate) fn replay_session(
             seen_user = true;
         }
         match (&m.role, &m.content) {
-            (Role::User, MessageContent::Text(s)) => {
+            (Role::User, MessageContent::Text(s)) if is_real_user_message(m) => {
                 renderer.render(UiLine::User(s.clone()));
             }
             (Role::Assistant, MessageContent::Text(s)) => {
@@ -1034,5 +1039,61 @@ mod tests {
             results.iter().any(|s| s.contains("error: bad todo item")),
             "a FAILED todowrite's error result must NOT be suppressed: {results:?}"
         );
+    }
+
+    #[test]
+    fn replay_skips_synthetic_user_messages() {
+        use atomcode_core::conversation::message::{Message, Role};
+        use atomcode_core::session::Session;
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::new(Role::Assistant, "first reply"),
+            Message::synthetic_user("[SYNTAX CHECK: fix parser before continuing.]"),
+            Message::new(Role::Assistant, "second reply"),
+        ];
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let users: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["real prompt"]);
+
+        let visible_turn_separators = rec
+            .lines
+            .iter()
+            .filter(|line| matches!(line, UiLine::TurnSeparator { .. }))
+            .count();
+        assert_eq!(
+            visible_turn_separators, 2,
+            "resume wrapper separators only; synthetic user must not add a turn divider"
+        );
+        assert_eq!(state.last_assistant_response, "first reply\n\nsecond reply");
     }
 }

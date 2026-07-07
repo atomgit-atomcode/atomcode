@@ -1790,7 +1790,7 @@ impl RunningAgent {
                 // does not pre-empt finishing the truncated content.
                 if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
-                    convo.push(Message::user(TRUNCATION_RESUME_NUDGE.to_string()));
+                    convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
                     continue;
                 }
                 if let Some(reminder) = self.hooks.offer_continuation(convo).await {
@@ -1812,7 +1812,7 @@ impl RunningAgent {
                         }
                     }
                     continuations += 1;
-                    convo.push(Message::user(reminder));
+                    convo.push(Message::synthetic_user(reminder));
                     continue;
                 }
                 // The turn is ENDING. If it ends because the output was truncated and
@@ -2103,7 +2103,7 @@ impl RunningAgent {
                 // CC-bridge producer (M2); no middleware emits `Block` yet, so this is
                 // currently inert.
                 if let Some(reason) = post_block {
-                    convo.push(Message::user(reason));
+                    convo.push(Message::synthetic_user(reason));
                 }
 
                 // (3) Record this id as "resulted" so a later SAME-id call (mode A)

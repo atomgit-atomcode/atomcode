@@ -462,6 +462,11 @@ pub struct ToolResultInfo {
 pub struct MessageInfo {
     pub role: String,
     pub content: String,
+    /// True when a `Role::User` message was injected by the agent/runtime rather
+    /// than authored by the human. UI clients use this to avoid rendering
+    /// internal reminders as user input bubbles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     /// Tool result summary (for tool role messages)
@@ -642,6 +647,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         Self {
             role: role.to_string(),
             content,
+            synthetic: msg.synthetic,
             tool_calls,
             tool_result,
             artifacts,
@@ -5033,6 +5039,17 @@ mod tests {
             info.images.as_deref(),
             Some([ImageData { missing: true, .. }])
         ));
+    }
+
+    #[test]
+    fn message_info_preserves_synthetic_user_flag() {
+        use atomcode_core::conversation::message::Message;
+
+        let msg = Message::synthetic_user("internal reminder");
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.role, "user");
+        assert!(info.synthetic, "daemon API must expose synthetic provenance");
     }
 
     #[test]

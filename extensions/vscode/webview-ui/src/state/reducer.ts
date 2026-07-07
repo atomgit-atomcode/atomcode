@@ -68,6 +68,26 @@ function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' |
   return 'unknown';
 }
 
+const INTERNAL_USER_PREFIXES = [
+  '<system-reminder>',
+  'You made code edits but have not verified them.',
+  'Output limit hit — your last response was cut off',
+  'Output limit hit. If the task is already complete',
+  '[PLAN MODE',
+  '[Context was compressed',
+  '[Additional context from user]:',
+  '[SYNTAX CHECK:',
+  '[DEV SERVER ERROR',
+  '[Auto-read from error:',
+  '[Images returned by the tool calls above',
+];
+
+function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolean {
+  if (synthetic === true) return true;
+  const trimmed = text.trimStart();
+  return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
 function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!content || typeof content !== 'object') return '';
@@ -776,6 +796,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
 
         const rawText = textFromContent(m.content);
+        if (role === 'user' && isInternalHistoryUserMessage(rawText, m.synthetic)) {
+          continue;
+        }
         const { displayText: userVisibleText, hadVisionMarker } = role === 'user'
           ? stripVisionPreprocessText(rawText)
           : { displayText: rawText, hadVisionMarker: false };

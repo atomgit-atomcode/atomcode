@@ -17,6 +17,7 @@ async function main() {
     'daemon-client-error.test.ts',
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
+    'mode-selector-style.test.ts',
   ];
 
   try {

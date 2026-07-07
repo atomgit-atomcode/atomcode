@@ -344,6 +344,61 @@ function testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput() {
   assert.equal(state.messages[0].images?.[0]?.missing, true);
 }
 
+function testHistorySyntheticUserMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'real prompt' },
+      { role: 'user', content: 'You made code edits but have not verified them.', synthetic: true },
+      { role: 'assistant', content: 'reply' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
+    ['user', 'real prompt'],
+    ['assistant', 'reply'],
+  ]);
+}
+
+function testHistoryLegacyInternalUserMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'real prompt' },
+      { role: 'user', content: 'You made code edits but have not verified them. Run a fast check (`cargo check`).' },
+      { role: 'user', content: '<system-reminder>\nCurrent task list\n</system-reminder>' },
+      { role: 'user', content: '[Auto-read from error: src/main.rs]\nfn main() {}' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => msg.text), ['real prompt']);
+}
+
+function testHistoryUserMessageStartingWithLegacyWordsIsVisible() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'Output limit hit when running pytest; how do I debug it?' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => msg.text), [
+    'Output limit hit when running pytest; how do I debug it?',
+  ]);
+}
+
 function testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact() {
   const kind = classifyArtifactRenderKind({
     id: 'artifact-markdown',
@@ -769,6 +824,9 @@ testPermissionRespondStoresExplicitDecision();
 testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion();
 testHistoryMissingImagePlaceholderIsPreserved();
 testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput();
+testHistorySyntheticUserMessagesAreHidden();
+testHistoryLegacyInternalUserMessagesAreHidden();
+testHistoryUserMessageStartingWithLegacyWordsIsVisible();
 testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact();
 testTextArtifactWithDiffContentIsStillRenderedAsDiff();
 testMarkdownArtifactLanguageSentinelBecomesFencedCodeBlock();

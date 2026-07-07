@@ -1426,11 +1426,14 @@ fn restore_images_from_turn_base(
     let final_user_indexes: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter_map(|(idx, msg)| (msg.role == Role::User).then_some(idx))
+        .filter_map(|(idx, msg)| (msg.role == Role::User && !msg.synthetic).then_some(idx))
         .collect();
     let mut final_user_indexes = final_user_indexes.into_iter();
 
-    for original in turn_base.iter().filter(|msg| msg.role == Role::User) {
+    for original in turn_base
+        .iter()
+        .filter(|msg| msg.role == Role::User && !msg.synthetic)
+    {
         let Some(idx) = final_user_indexes.next() else {
             continue;
         };
@@ -2728,6 +2731,49 @@ mod tests {
             &messages[3].content,
             MessageContent::MultiPart { text, images }
                 if text.as_deref() == Some("分析")
+                    && images.len() == 1
+                    && images[0].data == "aW1hZ2U="
+        ));
+    }
+
+    #[test]
+    fn restore_images_from_turn_base_ignores_synthetic_user_ordinals() {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+
+        let image_user = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("分析图片".into()),
+                images: vec![ImagePart {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+            },
+            synthetic: false,
+        };
+        let final_messages = vec![
+            Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
+            Message::new(
+                Role::User,
+                "分析图片\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
+            ),
+            Message::new(Role::Assistant, "done"),
+        ];
+
+        let messages = restore_images_from_turn_base(
+            final_messages,
+            &[Message::synthetic_user("[Auto-read from error: src/main.rs]"), image_user],
+        );
+
+        assert!(messages[0].synthetic);
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text.contains("Auto-read")
+        ));
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::MultiPart { text, images }
+                if text.as_deref() == Some("分析图片")
                     && images.len() == 1
                     && images[0].data == "aW1hZ2U="
         ));

@@ -45,6 +45,7 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -696,6 +697,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const loaded: Message[] = [];
     for (const msg of msgs) {
       if (msg.role === 'user') {
+        if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
         loaded.push({
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],

@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.ui
 import com.atomcode.jetbrains.ui.input.slashCommandPrefix
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -195,6 +196,30 @@ def hello():
     fun `isInternalHistoryUserMessage hides verification nudges`() {
         assertTrue(
             isInternalHistoryUserMessage("You made code edits but have not verified them. Run a fast check (`cargo check`)."),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage hides legacy synthetic prefixes`() {
+        listOf(
+            "Output limit hit — your last response was cut off before finishing.",
+            "Output limit hit. If the task is already complete, just output a short summary.",
+            "[PLAN MODE ACTIVATED] read only",
+            "[Context was compressed] summary",
+            "[Additional context from user]: note",
+            "[SYNTAX CHECK: broken braces]",
+            "[DEV SERVER ERROR in app.log:]",
+            "[Auto-read from error: src/main.rs]",
+            "[Images returned by the tool calls above are attached for you to view.]",
+        ).forEach {
+            assertTrue(isInternalHistoryUserMessage(it), "expected internal prefix: $it")
+        }
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage keeps real user messages with similar wording`() {
+        assertFalse(
+            isInternalHistoryUserMessage("Output limit hit when running pytest; how do I debug it?"),
         )
     }
 }

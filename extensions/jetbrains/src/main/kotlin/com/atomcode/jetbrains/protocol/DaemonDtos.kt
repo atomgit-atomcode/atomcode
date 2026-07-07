@@ -89,6 +89,7 @@ data class SessionDetail(
 data class MessageInfo(
     val role: String,
     val content: String,
+    val synthetic: Boolean = false,
     val toolCalls: List<ToolCallInfo>? = null,
     val toolResult: ToolResultInfo? = null,
     val artifacts: List<ArtifactInfo>? = null,
