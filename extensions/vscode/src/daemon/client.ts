@@ -503,6 +503,17 @@ export class DaemonClient {
       case 'artifact_end':
         callbacks.onArtifactEnd(event.id);
         break;
+      case 'warning':
+        callbacks.onWarning(event.message);
+        break;
+      case 'rate_limited':
+        callbacks.onRateLimited({
+          message: event.message,
+          retryAfterSeconds: event.retry_after_seconds,
+          attempt: event.attempt,
+          maxAttempts: event.max_attempts,
+        });
+        break;
       case 'done':
         callbacks.onDone(event.tokens, event.tool_calls, event.session_id);
         break;

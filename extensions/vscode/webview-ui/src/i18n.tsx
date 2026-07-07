@@ -112,6 +112,11 @@ const zh = {
   'tool.done': '完成',
   'tool.destructive': '破坏性操作',
   'tool.waitingApproval': '待审批',
+  'tool.incomplete': '未完成',
+
+  'stream.rateLimitedRetrying': '触发限流，{seconds} 秒后重试…',
+  'stream.rateLimitedPaused': '触发限流，等待恢复…',
+  'stream.idleNotice': '仍在等待模型响应…',
 
   'permission.deny': '拒绝',
   'permission.allow': '允许',
@@ -267,6 +272,11 @@ const en: Record<MsgKey, string> = {
   'tool.done': 'done',
   'tool.destructive': 'destructive',
   'tool.waitingApproval': 'waiting approval',
+  'tool.incomplete': 'incomplete',
+
+  'stream.rateLimitedRetrying': 'Rate limited. Retrying in {seconds}s...',
+  'stream.rateLimitedPaused': 'Rate limited. Waiting to resume...',
+  'stream.idleNotice': 'Still waiting for the model...',
 
   'permission.deny': 'Deny',
   'permission.allow': 'Allow',

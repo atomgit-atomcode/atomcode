@@ -43,7 +43,7 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
 }
@@ -870,6 +870,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'artifactEnd', data: { id } });
         this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id });
       },
+      onWarning: (message) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'warning', data: { message } });
+        this._postMessageToPanel(streamSessionId, { type: 'warning', message });
+      },
+      onRateLimited: (event) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'rateLimited', data: event });
+        this._postMessageToPanel(streamSessionId, {
+          type: 'rateLimited',
+          message: event.message,
+          retryAfterSeconds: event.retryAfterSeconds,
+          attempt: event.attempt,
+          maxAttempts: event.maxAttempts,
+        });
+      },
       onDone: (tokens, toolCalls, sessionId) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -1502,6 +1520,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'artifactEnd':
           post({ type: 'artifactEnd', id: evt.data.id });
+          break;
+        case 'warning':
+          post({ type: 'warning', message: evt.data.message });
+          break;
+        case 'rateLimited':
+          post({
+            type: 'rateLimited',
+            message: evt.data.message,
+            retryAfterSeconds: evt.data.retryAfterSeconds,
+            attempt: evt.data.attempt,
+            maxAttempts: evt.data.maxAttempts,
+          });
           break;
         case 'tokens':
           post({ type: 'tokens', prompt: evt.data.prompt, completion: evt.data.completion, total: evt.data.total });

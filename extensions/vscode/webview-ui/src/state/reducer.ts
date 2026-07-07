@@ -1,4 +1,4 @@
-import {
+import type {
   ChatState,
   ChatAction,
   ChatMessage,
@@ -7,6 +7,7 @@ import {
   ArtifactData,
   MessageBlock,
   PermissionRequestData,
+  StatusData,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 
@@ -221,6 +222,52 @@ function upsertPermissionBlock(message: ChatMessage, request: PermissionRequestD
     ? blocks.map((block, index) => index === existing && block.type === 'permission' ? { ...block, request } : block)
     : [...blocks, { id: `${message.id}-permission-${request.id}`, type: 'permission' as const, request }];
   return { ...message, blocks: nextBlocks };
+}
+
+function appendStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  return {
+    ...message,
+    blocks: [
+      ...blocks,
+      { id: `${message.id}-status-${status.kind}-${blocks.length}`, type: 'status' as const, status },
+    ],
+  };
+}
+
+function upsertStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'status' && block.status.kind === status.kind);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) => index === existing && block.type === 'status' ? { ...block, status } : block)
+    : [
+        ...blocks,
+        { id: `${message.id}-status-${status.kind}`, type: 'status' as const, status },
+      ];
+  return { ...message, blocks: nextBlocks };
+}
+
+function settleOpenTools(
+  message: ChatMessage,
+  status: 'incomplete' | 'error',
+  output?: string,
+): ChatMessage {
+  const openStatuses = new Set<ToolCallData['status']>(['queued', 'running', 'waiting_approval']);
+  const tools = message.toolCalls?.map((tool) =>
+    openStatuses.has(tool.status)
+      ? {
+          ...tool,
+          status,
+          output: output ?? tool.output,
+          success: status === 'error' ? false : tool.success,
+        }
+      : tool,
+  );
+  if (!tools) return message;
+  return tools.reduce<ChatMessage>(
+    (updatedMessage, tool) => upsertToolBlock(updatedMessage, tool),
+    { ...message, toolCalls: tools },
+  );
 }
 
 function updatePermissionBlock(
@@ -497,6 +544,48 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: msgs };
     }
 
+    case 'STREAM_WARNING': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = appendStatusBlock(assistant, {
+          kind: 'warning',
+          message: action.message,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_RATE_LIMITED': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'rate_limited',
+          message: action.message,
+          retryAfterSeconds: action.retryAfterSeconds,
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_IDLE_NOTICE': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'idle',
+          message: action.message,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
     case 'ARTIFACT_START': {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
@@ -579,7 +668,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
       // action.tokens is a number (total), not a tokenCount object
       const tokenCount = typeof action.tokens === 'number'
@@ -598,7 +687,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
       return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
     }
@@ -608,7 +697,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', action.message);
       }
       const errMsg: ChatMessage = {
         id: nextId(),

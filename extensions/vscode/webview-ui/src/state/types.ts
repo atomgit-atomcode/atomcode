@@ -85,7 +85,7 @@ export interface ToolCallData {
   output?: string;
   success?: boolean;
   durationMs?: number;
-  status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error';
+  status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error' | 'incomplete';
 }
 
 export interface ArtifactData {
@@ -109,11 +109,20 @@ export interface PermissionRequestData {
   error?: string;
 }
 
+export interface StatusData {
+  kind: 'warning' | 'rate_limited' | 'idle';
+  message: string;
+  retryAfterSeconds?: number;
+  attempt?: number;
+  maxAttempts?: number;
+}
+
 export type MessageBlock =
   | { id: string; type: 'text'; content: string }
   | { id: string; type: 'tool'; tool: ToolCallData }
   | { id: string; type: 'artifact'; artifact: ArtifactData }
-  | { id: string; type: 'permission'; request: PermissionRequestData };
+  | { id: string; type: 'permission'; request: PermissionRequestData }
+  | { id: string; type: 'status'; status: StatusData };
 
 /** A single chat message (user or assistant) */
 export interface ChatMessage {
@@ -174,6 +183,9 @@ export type ChatAction =
   | { type: 'TOOL_BATCH_START'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'STREAM_WARNING'; message: string }
+  | { type: 'STREAM_RATE_LIMITED'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
+  | { type: 'STREAM_IDLE_NOTICE'; message: string }
   | { type: 'ARTIFACT_START'; id: string; artifactType: string; language?: string; title?: string }
   | { type: 'ARTIFACT_CONTENT'; id: string; content: string }
   | { type: 'ARTIFACT_END'; id: string }
@@ -219,6 +231,8 @@ export type ExtensionMessage =
   | { type: 'toolBatchStart'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'toolStart'; id?: string; name: string; args: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'warning'; message: string }
+  | { type: 'rateLimited'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
   | { type: 'artifactStart'; id: string; artifactType: string; language?: string; title?: string }
   | { type: 'artifactContent'; id: string; content: string }
   | { type: 'artifactEnd'; id: string }

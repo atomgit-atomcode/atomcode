@@ -12,6 +12,8 @@ import { renderCodeBlockHtml } from '../src/components/codeBlockRendering';
 import { parseDiff } from '../src/components/DiffView';
 import { markdownToHtml } from '../src/components/Markdown';
 import { prepareMarkdownForRender, repairStreamingMarkdown } from '../src/components/streamingMarkdown';
+import { formatToolDuration } from '../src/utils/format';
+import { shouldShowIdleNotice } from '../src/utils/streamStatus';
 
 declare const require: {
   (id: string): typeof import('../src/state/reducer');
@@ -33,6 +35,114 @@ function startAssistantState() {
     messages: [],
     queuedMessages: [],
   }, { type: 'START_GENERATION' });
+}
+
+function testToolDurationFormattingUsesMillisecondsBelowOneSecond() {
+  assert.equal(formatToolDuration(0), '1ms');
+  assert.equal(formatToolDuration(1), '1ms');
+  assert.equal(formatToolDuration(99), '99ms');
+  assert.equal(formatToolDuration(999), '999ms');
+  assert.equal(formatToolDuration(1000), '1.0s');
+  assert.equal(formatToolDuration(1234), '1.2s');
+}
+
+function testWarningAddsStatusBlockToStreamingAssistantMessage() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'APPEND_TEXT', content: 'hello\n' });
+  state = chatReducer(state, { type: 'STREAM_WARNING', message: 'network is slow' });
+
+  const message = state.messages[0];
+  assert.deepEqual(message.blocks?.map((block) => block.type), ['text', 'status']);
+  assert.equal(message.blocks?.[1].type === 'status' ? message.blocks[1].status.kind : undefined, 'warning');
+  assert.equal(message.blocks?.[1].type === 'status' ? message.blocks[1].status.message : undefined, 'network is slow');
+}
+
+function testRateLimitedStatusBlockIsUpdatedInPlace() {
+  let state = startAssistantState();
+  state = chatReducer(state, {
+    type: 'STREAM_RATE_LIMITED',
+    message: 'rate limited',
+    retryAfterSeconds: 3,
+    attempt: 1,
+    maxAttempts: 5,
+  });
+  state = chatReducer(state, {
+    type: 'STREAM_RATE_LIMITED',
+    message: 'rate limited again',
+    retryAfterSeconds: 1,
+    attempt: 2,
+    maxAttempts: 5,
+  });
+
+  const message = state.messages[0];
+  assert.deepEqual(message.blocks?.map((block) => block.type), ['status']);
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.kind : undefined, 'rate_limited');
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.message : undefined, 'rate limited again');
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.retryAfterSeconds : undefined, 1);
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.attempt : undefined, 2);
+}
+
+function testDoneMarksRunningToolsIncompleteWithoutResult() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'tool-1', name: 'read', args: '{"path":"file.ts"}' });
+  state = chatReducer(state, { type: 'GENERATION_DONE', usage: {} });
+
+  const tool = state.messages[0].toolCalls?.[0];
+  assert.equal(tool?.status, 'incomplete');
+  assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'incomplete');
+}
+
+function testErrorMarksRunningToolsError() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'tool-1', name: 'read', args: '{"path":"file.ts"}' });
+  state = chatReducer(state, { type: 'GENERATION_ERROR', message: 'stream closed' });
+
+  const tool = state.messages[0].toolCalls?.[0];
+  assert.equal(tool?.status, 'error');
+  assert.equal(tool?.output, 'stream closed');
+  assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'error');
+}
+
+function testIdleNoticeAddsSingleStatusBlock() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'STREAM_IDLE_NOTICE', message: 'still waiting' });
+  state = chatReducer(state, { type: 'STREAM_IDLE_NOTICE', message: 'still waiting again' });
+
+  const message = state.messages[0];
+  assert.deepEqual(message.blocks?.map((block) => block.type), ['status']);
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.kind : undefined, 'idle');
+  assert.equal(message.blocks?.[0].type === 'status' ? message.blocks[0].status.message : undefined, 'still waiting again');
+}
+
+function testIdleNoticePredicateRequiresGeneratingAndThreshold() {
+  assert.equal(shouldShowIdleNotice({
+    isGenerating: false,
+    lastEventAt: 1_000,
+    now: 16_000,
+    thresholdMs: 15_000,
+    alreadyShown: false,
+  }), false);
+  assert.equal(shouldShowIdleNotice({
+    isGenerating: true,
+    lastEventAt: 1_000,
+    now: 15_999,
+    thresholdMs: 15_000,
+    alreadyShown: false,
+  }), false);
+  assert.equal(shouldShowIdleNotice({
+    isGenerating: true,
+    lastEventAt: 1_000,
+    now: 16_000,
+    thresholdMs: 15_000,
+    alreadyShown: true,
+  }), false);
+  assert.equal(shouldShowIdleNotice({
+    isGenerating: true,
+    lastEventAt: 1_000,
+    now: 16_000,
+    thresholdMs: 15_000,
+    alreadyShown: false,
+  }), true);
 }
 
 function testStreamingBlocksPreserveTextArtifactTextOrder() {
@@ -854,3 +964,10 @@ testMarkdownTableRepairDoesNotChangeFencedCodeSamples();
 testMarkdownTableRepairDoesNotChangeHtmlBlocks();
 testMarkdownTableRepairKeepsMarkedOneColumnRows();
 testGenerationDoneReloadsFinishedSessionHistory();
+testToolDurationFormattingUsesMillisecondsBelowOneSecond();
+testWarningAddsStatusBlockToStreamingAssistantMessage();
+testRateLimitedStatusBlockIsUpdatedInPlace();
+testDoneMarksRunningToolsIncompleteWithoutResult();
+testErrorMarksRunningToolsError();
+testIdleNoticeAddsSingleStatusBlock();
+testIdleNoticePredicateRequiresGeneratingAndThreshold();
