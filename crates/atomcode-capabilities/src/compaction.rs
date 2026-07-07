@@ -121,6 +121,31 @@ const TRUNCATE_MARKER: &str = "\n[truncated: showing ";
 /// nag zone, so the automatic compaction — not the user — manages context.
 const AUTO_DRAIN_UTILIZATION: f32 = 0.78;
 
+/// Fraction of the context window kept VERBATIM as recent turns when a drain
+/// summarizes old history — so a large-context model doesn't lose its recent
+/// working context to a terse summary (the "everything's gone, re-explain the
+/// task" complaint). Mirrors opencode's `preserve_recent_tokens` (~25% of usable,
+/// clamped). Keeping only the active turn (the old `keep=1` behavior) crushed
+/// ~all of a 1M-token session into a ≤16k summary; keeping ~25% turns a drain
+/// into a REDUCTION (e.g. 780k → ~266k) instead of a near-total wipe.
+const RECENT_KEEP_FRACTION: f32 = 0.25;
+/// Floor/ceiling on the verbatim-recent budget. MIN keeps the drain from being a
+/// no-op on tiny windows; MAX caps how much we retain on huge windows so a drain
+/// still meaningfully reduces context.
+const MIN_RECENT_KEEP_TOKENS: usize = 8_000;
+const MAX_RECENT_KEEP_TOKENS: usize = 256_000;
+
+/// Verbatim-recent token budget for the current context window. Never exceeds
+/// half the window, so a drain can always reduce context (the `MIN` floor would
+/// otherwise swallow a pathologically small window whole). For real windows
+/// (≥128k) the half-window cap never binds — the budget is `0.25 * window`.
+fn recent_keep_budget(ctx_window: u32) -> usize {
+    let window = ctx_window as usize;
+    ((window as f32 * RECENT_KEEP_FRACTION) as usize)
+        .clamp(MIN_RECENT_KEEP_TOKENS, MAX_RECENT_KEEP_TOKENS)
+        .min(window / 2)
+}
+
 /// Hard ceiling on a generated summary. A runaway model could emit an enormous summary that
 /// still passes `apply_plan`'s net-loss guard (it's smaller than the drained span) yet bloats
 /// the wire on every subsequent turn (#747). We truncate the accumulated summary at this many
@@ -130,16 +155,19 @@ const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
 const MAX_SUMMARY_TOKENS: u32 = 16_000;
-/// Wall-clock ceiling on the one-shot `/compact` summary LLM call. The provider's stream
-/// timeout is BYTE-IDLE only (300s of silence): a thinking model (e.g. GLM-5.2) on a ~200K
-/// prompt trickles hidden-reasoning bytes for many minutes, so the idle timer never fires and
-/// `/compact` can hang 20+ min. This hard cap bounds it — on expiry we fall back to the gentle
-/// in-place stub policy (keeps every message, folds bloated tool results) instead of hanging.
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Wall-clock ceiling on the summary LLM call (shared by auto / manual `/compact` /
+/// emergency overflow). The provider's stream timeout is BYTE-IDLE only (300s of silence):
+/// a thinking model (e.g. GLM-5.2) trickles hidden-reasoning bytes for many minutes, so the
+/// idle timer never fires and the summary could hang 20+ min. This hard cap bounds it — on
+/// expiry we fall back to the gentle in-place stub (manual/auto) or a plain drain (overflow).
+/// 180s (up from 120s): gives a slow model more room now that the summary INPUT is bounded
+/// (tool outputs truncated — see `SUMMARY_TOOL_OUTPUT_MAX_CHARS`), so a legit slow-but-
+/// progressing summary isn't cut early, while still bounding a genuinely hung call.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
-    "[系统] 本次 /compact 的 AI 摘要超时（>120s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
+    "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
 
 /// System prompt for the anchored compaction summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
@@ -229,6 +257,10 @@ impl OverflowCompaction {
                 CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites, resume_note: None }
             }
             _ => {
+                // Emergency recovery (the provider ALREADY rejected the request as too long)
+                // must be maximally aggressive to fit NOW — keep only the active turn. The
+                // proactive auto/manual drain (manual_plan) keeps ~25% recent for working
+                // context, but the emergency ladder can't afford that headroom.
                 let drain_to = active_turn_start(msgs, 1).max(floor);
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the active turn
@@ -257,18 +289,18 @@ impl OverflowCompaction {
     }
 
     /// `/compact [focus]` — a USER-requested compaction (off both the normal stub path and
-    /// the overflow ladder). Drains everything older than the active turn into ONE LLM
-    /// summary, keeping the active turn intact. This is the v1-parity behavior: plain
-    /// `/compact` (no focus) summarizes just like a focused one — a non-empty `focus` only
-    /// STEERS the summary toward a topic, it does not gate the drain. No provider ⇒
-    /// plain-drain (the net-loss guard refuses it if it wouldn't shrink). `rewrites` is
-    /// empty: the old span is replaced by the summary, the kept span is left untouched (less
-    /// aggressive than overflow, which also stubs the kept span). Falls back to the gentle
-    /// inner stub policy only when there is nothing older than the active turn to drain.
+    /// the overflow ladder). Drains history older than the verbatim-recent window
+    /// (`recent_keep_budget`) into ONE LLM summary, keeping the recent turns intact so the
+    /// model doesn't lose its working context. A non-empty `focus` only STEERS the summary
+    /// toward a topic, it does not gate the drain. No provider ⇒ plain-drain (the net-loss
+    /// guard refuses it if it wouldn't shrink). `rewrites` is empty: the old span is replaced
+    /// by the summary, the kept span is left untouched (less aggressive than overflow, which
+    /// also stubs the kept span). Falls back to the gentle inner stub policy only when there
+    /// is nothing older than the kept-recent window to drain.
     async fn manual_plan(&self, view: &CompactionView<'_>, focus: Option<&str>) -> CompactionPlan {
         let msgs = view.messages;
         let floor = view.sacred_floor;
-        let drain_to = active_turn_start(msgs, 1).max(floor);
+        let drain_to = recent_keep_boundary(msgs, recent_keep_budget(view.ctx_window), floor);
         if drain_to <= floor || !span_has_non_anchor(&msgs[floor..drain_to]) {
             // Nothing older than the active turn, OR the only drainable content is a prior
             // anchor (re-summarizing it alone is wasteful and only degrades it) — fall back
@@ -352,6 +384,34 @@ impl OverflowCompaction {
     }
 }
 
+/// Cap on a single TOOL result's length when rendering the summary INPUT (mirrors
+/// opencode's `TOOL_OUTPUT_MAX_CHARS`). A 50 KB bash dump or a whole-file read being
+/// summarized away doesn't need full fidelity — its head captures what ran, and RECENT
+/// tool outputs stay verbatim (they're outside the drained span). Bounding the summary
+/// input is what keeps the summary LLM call fast + cheap regardless of session size —
+/// an UNBOUNDED input (500k+ tokens on a long 1M session) is the real reason a summary
+/// could crawl toward the wall-clock timeout, not the timeout value itself.
+const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+/// Of the cap, how many chars to keep from the TAIL (the rest is head). Head+tail — not
+/// head-only like opencode — because a failing tool's error line (build error, stack
+/// trace, bash failure banner) usually sits at the END of a long output; head-only would
+/// drop it and the summary would miss the failure.
+const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
+
+/// Bound a TOOL result body for the summary input: keep the head + tail (so a trailing
+/// error survives) with a `[truncated N chars]` marker between. Full text when it fits.
+fn render_tool_body(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= SUMMARY_TOOL_OUTPUT_MAX_CHARS {
+        return text.to_string();
+    }
+    let head_chars = SUMMARY_TOOL_OUTPUT_MAX_CHARS - SUMMARY_TOOL_OUTPUT_TAIL_CHARS;
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text.chars().skip(total - SUMMARY_TOOL_OUTPUT_TAIL_CHARS).collect();
+    let cut = total - SUMMARY_TOOL_OUTPUT_MAX_CHARS;
+    format!("{head}\n[truncated {cut} chars]\n{tail}")
+}
+
 /// Render a message span as a compact role-tagged transcript for the summarizer.
 fn render_transcript(span: &[Message]) -> String {
     let mut s = String::new();
@@ -364,7 +424,16 @@ fn render_transcript(span: &[Message]) -> String {
         };
         s.push_str(role);
         s.push_str(": ");
-        s.push_str(&m.text);
+        if m.role == Role::Tool {
+            // Mark failures so the summary can populate its "Blocked / Critical Context"
+            // sections, and bound the body (head+tail) to keep the summary input small.
+            if m.is_error {
+                s.push_str("[error] ");
+            }
+            s.push_str(&render_tool_body(&m.text));
+        } else {
+            s.push_str(&m.text);
+        }
         s.push('\n');
     }
     s
@@ -490,17 +559,29 @@ impl CompactionStrategy for OverflowCompaction {
     /// True only when `plan` will DRAIN old turns into a summary (the slow path) — for
     /// a manual `/compact`, overflow tier 2, or an AUTO trigger that crossed
     /// `AUTO_DRAIN_UTILIZATION` AND whose drain would actually reduce pressure
-    /// (`auto_drain_would_help`). When there is nothing older than the active turn to
+    /// (`auto_drain_would_help`). When there is nothing older than the kept window to
     /// drain it falls back to the fast inner stub (drain ≤ floor) and is NOT announced.
-    /// CHEAP: just the same `active_turn_start` scan `manual_plan`/`overflow_plan` use.
+    /// Must predict with the SAME boundary each path actually uses: the proactive
+    /// (auto/manual) drain keeps ~25% recent (`recent_keep_boundary`); the emergency
+    /// overflow ladder keeps only the active turn (`active_turn_start(1)`).
     fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
         let floor = view.sacred_floor;
-        let drains = active_turn_start(view.messages, 1).max(floor) > floor;
+        // Mirror the plans' guard exactly: a summarize happens only when the drained span
+        // has NON-anchor content (draining a lone prior anchor falls back to the silent
+        // stub — announcing it would be a spurious "compacting…" banner).
+        let drains = |drain_to: usize| {
+            drain_to > floor && span_has_non_anchor(&view.messages[floor..drain_to])
+        };
+        let proactive_drains =
+            || drains(recent_keep_boundary(view.messages, recent_keep_budget(view.ctx_window), floor));
+        let overflow_drains = || drains(active_turn_start(view.messages, 1).max(floor));
         match &view.trigger {
-            CompactTrigger::Manual { .. } => drains,
-            CompactTrigger::Overflow { attempt } => *attempt >= 2 && drains,
+            CompactTrigger::Manual { .. } => proactive_drains(),
+            CompactTrigger::Overflow { attempt } => *attempt >= 2 && overflow_drains(),
             CompactTrigger::Auto { .. } => {
-                view.utilization >= AUTO_DRAIN_UTILIZATION && drains && auto_drain_would_help(view)
+                view.utilization >= AUTO_DRAIN_UTILIZATION
+                    && proactive_drains()
+                    && auto_drain_would_help(view)
             }
         }
     }
@@ -517,7 +598,11 @@ impl CompactionStrategy for OverflowCompaction {
 /// matching the pre-guard behavior for the normal long-session case.
 fn auto_drain_would_help(view: &CompactionView<'_>) -> bool {
     let floor = view.sacred_floor;
-    let drain_to = active_turn_start(view.messages, 1).max(floor);
+    // Estimate against the ACTUAL drain boundary the AUTO path (manual_plan) will use —
+    // it keeps ~25% recent verbatim, so the surviving remainder is larger than a
+    // keep-only-the-active-turn estimate. Using the wrong (wider) drain span here would
+    // green-light a drain that can't cut pressure → re-summarize + cache-bust every turn.
+    let drain_to = recent_keep_boundary(view.messages, recent_keep_budget(view.ctx_window), floor);
     if drain_to <= floor {
         return false; // nothing drainable
     }
@@ -557,6 +642,48 @@ fn active_turn_start(msgs: &[Message], keep_recent_turns: usize) -> usize {
         return 0; // not enough turns to have anything older than the kept window
     }
     starts[starts.len() - keep_recent_turns]
+}
+
+/// Drain boundary that keeps the most-recent WHOLE turns whose combined token
+/// estimate fits within `keep_budget_tokens` — but ALWAYS at least the active
+/// turn. Turn-aligned (a turn starts at a non-synthetic [`Role::User`] message)
+/// so a drain never splits a turn / orphans a tool call from its result.
+/// `msgs[..boundary]` is drained+summarized; `msgs[boundary..]` is kept verbatim.
+/// Clamped to `>= floor`. Replaces the old `active_turn_start(msgs, 1)` so a big
+/// context window retains proportionally more recent history (see
+/// `recent_keep_budget`); a single turn larger than the budget degrades to
+/// keeping just that active turn.
+fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usize) -> usize {
+    let starts: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User && !m.synthetic)
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&active) = starts.last() else {
+        return floor; // no real turns → nothing to keep-align on
+    };
+    // Always keep the active turn; extend backward turn-by-turn while it fits.
+    let mut boundary = active;
+    let mut kept: usize = msgs[boundary..]
+        .iter()
+        .map(|m| m.estimate_tokens() as usize)
+        .sum();
+    for &s in starts.iter().rev().skip(1) {
+        if s < floor {
+            break; // don't cross the protected prefix
+        }
+        let turn_tokens: usize = msgs[s..boundary]
+            .iter()
+            .map(|m| m.estimate_tokens() as usize)
+            .sum();
+        if kept + turn_tokens > keep_budget_tokens {
+            break;
+        }
+        kept += turn_tokens;
+        boundary = s;
+    }
+    boundary.max(floor)
 }
 
 /// Map each tool-call id → the tool NAME the model used, harvested from the assistant
@@ -905,7 +1032,7 @@ mod tests {
             StubCompaction::default(),
             Some(Arc::new(HangingSummaryProvider)),
         );
-        // start_paused auto-advances virtual time to the 120s cap while the provider hangs.
+        // start_paused auto-advances virtual time to the 180s cap while the provider hangs.
         let plan = strat.plan(&manual_view(&conv.messages, floor, None)).await;
         // Timeout → C fallback: the gentle in-place stub policy (no drain, no LLM summary),
         // so every message survives and old tool results are folded to reclaim tokens.
@@ -1378,12 +1505,14 @@ mod tests {
 
     #[tokio::test]
     async fn successive_compactions_keep_exactly_one_anchor() {
-        // Big old turns so the net-loss guard commits both compactions.
+        // Old turns must exceed the verbatim-recent keep budget (4000 tokens ≈ 16k bytes for
+        // this 8000 ctx_window) so they actually drain; `huge` also satisfies the net-loss guard.
+        let huge = |s: &str| format!("{s}\n{}", "x".repeat(20_000));
         let mut conv = Conversation::new();
         conv.messages = vec![
             Message::system("p"),
-            Message::user(big("u1")),
-            Message::assistant(big("a1"), vec![]),
+            Message::user(huge("u1")),
+            Message::assistant(huge("a1"), vec![]),
             Message::user("u-active"),
         ];
         let floor = conv.sacred_floor();
@@ -1395,11 +1524,87 @@ mod tests {
         assert_eq!(conv.messages.iter().filter(|m| is_anchor_message(m)).count(), 1, "one anchor after #1");
 
         // Add more bulk, then Compaction #2: must UPDATE (drain old anchor, insert new) — still ONE.
-        conv.messages.push(Message::assistant(big("a2"), vec![]));
+        conv.messages.push(Message::assistant(huge("a2"), vec![]));
         conv.messages.push(Message::user("u-active-2"));
         let p2 = strat.plan(&manual_view(&conv.messages, floor, None)).await;
         assert!(conv.apply_plan(p2, floor).committed);
         assert_eq!(conv.messages.iter().filter(|m| is_anchor_message(m)).count(), 1, "still one anchor after #2");
+    }
+
+    #[test]
+    fn recent_keep_budget_scales_with_window_and_caps() {
+        assert_eq!(recent_keep_budget(1_000_000), 250_000, "1M → 25%");
+        assert_eq!(recent_keep_budget(128_000), 32_000, "128k → 25%");
+        assert_eq!(recent_keep_budget(2_000_000), 256_000, "huge window → MAX cap");
+        // Tiny window: 0.25*8k=2k, MIN floors to 8k, half-window (4k) caps it back down.
+        assert_eq!(recent_keep_budget(8_000), 4_000, "half-window cap beats the MIN floor");
+    }
+
+    #[test]
+    fn recent_keep_boundary_is_turn_aligned_and_keeps_active() {
+        // ~1000-token turns (4 bytes/token: text/4 + 4 overhead).
+        let body = |n: usize| "x".repeat(n * 4);
+        let msgs = vec![
+            Message::system("p"),                    // 0
+            Message::user(body(1000)),               // 1  turn1
+            Message::assistant(body(1000), vec![]),  // 2
+            Message::user(body(1000)),               // 3  turn2
+            Message::assistant(body(1000), vec![]),  // 4
+            Message::user(body(25)),                 // 5  turn3 (active, ~29 tok)
+        ];
+        let floor = 1;
+        // Everything fits → keep all (boundary == floor, nothing drained).
+        assert_eq!(recent_keep_boundary(&msgs, 1_000_000, floor), floor);
+        // Zero budget → keep only the active turn (drains turn1 + turn2).
+        assert_eq!(recent_keep_boundary(&msgs, 0, floor), 5);
+        // Budget ~3000: active(~29) + turn2(~2008) = ~2037 ≤ 3000; + turn1(~2008) = ~4045 > 3000.
+        // → keep active + turn2, drain turn1 → boundary at turn2's start (index 3).
+        assert_eq!(recent_keep_boundary(&msgs, 3_000, floor), 3);
+    }
+
+    #[test]
+    fn emergency_boundary_keeps_less_than_proactive() {
+        // Small old turns that FIT the proactive 25% keep budget. The proactive drain
+        // (auto/manual) keeps them (boundary back at the floor); the emergency overflow
+        // ladder keeps ONLY the active turn (boundary at the active user) — it drains more.
+        let msgs = vec![
+            Message::system("p"),
+            Message::user(big("u1")),
+            Message::assistant(big("a1"), vec![]),
+            Message::user("active"), // index 3 — the active turn
+        ];
+        let floor = 1;
+        let proactive = recent_keep_boundary(&msgs, recent_keep_budget(128_000), floor);
+        let emergency = active_turn_start(&msgs, 1).max(floor);
+        assert_eq!(emergency, 3, "emergency keeps only the active turn");
+        assert!(
+            proactive < emergency,
+            "emergency drains more (keeps less) than proactive: {proactive} vs {emergency}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_truncates_large_tool_outputs_head_and_tail() {
+        // Big tool output with a distinctive HEAD and a trailing ERROR line at the TAIL.
+        let big_tool = format!("HEADMARK{}ERRORMARK", "x".repeat(SUMMARY_TOOL_OUTPUT_MAX_CHARS));
+        let big_user = "u".repeat(SUMMARY_TOOL_OUTPUT_MAX_CHARS + 500);
+        let span = vec![
+            Message::user(big_user.clone()),
+            Message::tool_result("call1", big_tool.clone(), true), // an ERROR result
+            Message::tool_result("call2", "small", false),
+        ];
+        let out = render_transcript(&span);
+        // Truncated with a `[truncated N chars]` marker; the full body must NOT appear.
+        assert!(out.contains("[truncated "), "big tool output should be truncated: {out:.80}");
+        assert!(!out.contains(&big_tool), "the full big tool body must NOT appear");
+        // Head AND tail survive — a trailing error line is preserved (head-only would drop it).
+        assert!(out.contains("HEADMARK"), "head preserved");
+        assert!(out.contains("ERRORMARK"), "tail (trailing error) preserved");
+        // is_error is surfaced so the summary can note the failure.
+        assert!(out.contains("TOOL: [error] "), "error tool result is marked");
+        // A small TOOL output is untouched (no spurious marker); user text never truncated.
+        assert!(out.contains("TOOL: small\n"), "small tool output kept verbatim");
+        assert!(out.contains(&big_user), "user text is never truncated");
     }
 }
 
