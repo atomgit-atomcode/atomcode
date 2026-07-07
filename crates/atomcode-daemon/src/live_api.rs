@@ -1309,9 +1309,9 @@ impl TurnExecutor for KernelTurnExecutor {
                         PermissionDecision::Allow => "allow",
                         PermissionDecision::AllowAlways => "always_allow",
                         _ => "deny",
-                    };
+                    };  
                     emit(TurnEvent::ApprovalResolved {
-                        call_id: call_id.clone(),
+                        call_id,
                         decision: decision_str.to_string(),
                     });
                     let cmd = match decision {
