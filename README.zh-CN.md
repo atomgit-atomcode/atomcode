@@ -461,9 +461,9 @@ $ARGUMENTS
 ```bash
 mkdir -p .atomcode/commands
 
-cat > .atomcode/commands/review.md << 'EOF'
+cat > .atomcode/commands/codereview.md << 'EOF'
 ---
-name: review
+name: codereview
 description: 对当前 git diff 进行代码审查
 args: optional
 ---

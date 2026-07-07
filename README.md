@@ -465,9 +465,9 @@ Cover: function signature & parameters, core business logic, data flow & side ef
 ```bash
 mkdir -p .atomcode/commands
 
-cat > .atomcode/commands/review.md << 'EOF'
+cat > .atomcode/commands/codereview.md << 'EOF'
 ---
-name: review
+name: codereview
 description: Review the current git diff
 args: optional
 ---
