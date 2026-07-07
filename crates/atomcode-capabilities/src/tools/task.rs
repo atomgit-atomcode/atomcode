@@ -225,7 +225,13 @@ several. Subagents run in parallel and cannot themselves dispatch."
 
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
-                progress.emit(format!("\u{21bb} {label} · {model}")); // ↻ started
+                // ↻ started — include a compact preview of WHAT this subtask is, so a live
+                // fan-out shows each child's job, not just its number.
+                progress.emit(subtask_progress_line(
+                    &format!("\u{21bb} {label}"),
+                    &model,
+                    &desc,
+                ));
                 let child = Agent::builder()
                     .provider(provider)
                     .tools(tools)
@@ -287,7 +293,11 @@ several. Subagents run in parallel and cannot themselves dispatch."
                 } else {
                     "\u{2717} failed"
                 };
-                progress.emit(format!("{icon} · {label} · {model}"));
+                progress.emit(subtask_progress_line(
+                    &format!("{icon} \u{b7} {label}"),
+                    &model,
+                    &desc,
+                ));
                 (label, desc, model, outcome)
             });
         }
@@ -362,6 +372,26 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
     match serde_json::from_str::<Args>(args) {
         Ok(a) => Ok(a),
         Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
+    }
+}
+
+/// A live-progress line for one subtask: `<head> · <model> · <desc>`. `head` is the
+/// already-composed icon+label (`↻ explore#1`, `✓ done · explore#1`, …) so callers keep
+/// their own icon/label separator. The description is compacted to its first line,
+/// trimmed and length-capped, so a long prompt-like description can't wrap the strip.
+/// Emitted on start and completion so the user sees WHICH job each subtask is.
+fn subtask_progress_line(head: &str, model: &str, desc: &str) -> String {
+    const MAX: usize = 48;
+    let first = desc.lines().next().unwrap_or("").trim();
+    let snippet: String = if first.chars().count() > MAX {
+        format!("{}\u{2026}", first.chars().take(MAX - 1).collect::<String>())
+    } else {
+        first.to_string()
+    };
+    if snippet.is_empty() {
+        format!("{head} \u{b7} {model}")
+    } else {
+        format!("{head} \u{b7} {model} \u{b7} {snippet}")
     }
 }
 
@@ -452,6 +482,26 @@ mod tests {
     #[test]
     fn name_is_task() {
         assert_eq!(dummy().name(), "task");
+    }
+
+    #[test]
+    fn subtask_progress_line_includes_desc_and_truncates() {
+        // Short description → shown verbatim after the model (start-line head style).
+        assert_eq!(
+            subtask_progress_line("\u{21bb} explore#1", "deepseek", "review auth.rs"),
+            "\u{21bb} explore#1 \u{b7} deepseek \u{b7} review auth.rs"
+        );
+        // Multi-line / long description → first line only, capped with an ellipsis.
+        let long = "audit every unwrap() call across the whole crate for panic safety and report\nsecond line";
+        let line = subtask_progress_line("\u{2713} done \u{b7} worker#2", "GLM-5.2", long);
+        assert!(line.starts_with("\u{2713} done \u{b7} worker#2 \u{b7} GLM-5.2 \u{b7} "));
+        assert!(line.ends_with('\u{2026}'), "long desc must be ellipsized: {line}");
+        assert!(!line.contains("second line"), "only first line should show: {line}");
+        // Empty description → no trailing separator after the model.
+        assert_eq!(
+            subtask_progress_line("\u{21bb} explore#1", "deepseek", "  "),
+            "\u{21bb} explore#1 \u{b7} deepseek"
+        );
     }
 
     #[test]
