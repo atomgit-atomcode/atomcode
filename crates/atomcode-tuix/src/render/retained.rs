@@ -1051,6 +1051,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 self.scrolled_off
             );
             self.body_lines.truncate(self.body_lines.len() - remove);
+            // The old strip rows are already gone (truncated above), so clear the count
+            // BEFORE re-pushing: otherwise `push_body_row`'s `lift_inflight_strip` would see
+            // the stale `prev_rows` and pop that many rows of REAL content off the tail.
+            self.inflight_tool_rows = 0;
             for row in new_rows {
                 self.push_body_row(row);
             }
@@ -2522,12 +2526,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         self.inflight_tool_rows = 0;
         // EL-erase the vacated slots for immediate feedback (anti-flash); the next
-        // paint_frame cell-diff also redraws this region. Mirrors clear_live_spinner.
+        // paint_frame cell-diff also redraws this region. Mirrors clear_live_spinner, but
+        // clamped to the screen height so a multi-row strip lifted while the body overflows
+        // (target saturated at the footer boundary) can't erase past the terminal bottom.
         let target = self.next_body_emit_row();
         if target > 0 {
+            let h = self.screen.height();
             let mut seq = String::new();
             for i in 0..n as u16 {
-                seq.push_str(&format!("\x1b[{};1H\x1b[K", target + i));
+                let r = target.saturating_add(i);
+                if r == 0 || r > h {
+                    break;
+                }
+                seq.push_str(&format!("\x1b[{r};1H\x1b[K"));
             }
             let _ = self.out.write_all(seq.as_bytes());
         }
@@ -6524,6 +6535,38 @@ mod tests {
             .filter(|row| text(row).contains("start explore"))
             .count();
         assert_eq!(streamed, 6, "all six streamed lines present above the strip");
+    }
+
+    #[test]
+    fn retained_inflight_fallback_rowcount_change_does_not_pop_real_content() {
+        // Regression for the `lift_inflight_strip` re-entrancy: `render_inflight_tool`'s
+        // FALLBACK branch truncates the old strip manually then re-pushes via `push_body_row`.
+        // If `inflight_tool_rows` isn't zeroed before that loop, push_body_row's new
+        // `lift_inflight_strip` sees the stale count and pops that many rows of REAL content.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let text = |row: &Vec<Cell>| row.iter().map(|c| c.ch).collect::<String>();
+        r.push_body_text("real line A", &CellStyle::default());
+        r.push_body_text("real line B", &CellStyle::default());
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2
+        );
+
+        // 1-row strip (first render → fallback with prev_rows == 0).
+        r.render_inflight_tool("\u{25cf}", "Bash", "short", "");
+        assert_eq!(r.inflight_tool_rows, 1);
+
+        // A detail that WRAPS to multiple rows ⇒ prev_rows(1) != n(>1) ⇒ fallback re-push.
+        let long = "x".repeat(200);
+        r.render_inflight_tool("\u{25cf}", "Bash", &long, "");
+        assert!(r.inflight_tool_rows >= 2, "wrapped strip should be multi-row: {}", r.inflight_tool_rows);
+
+        // Both real lines must survive — the fallback re-push must not have popped them.
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2,
+            "fallback re-push popped real content via a stale inflight_tool_rows"
+        );
     }
 
     /// Regression (datalog 2026-05-08_02-39-44 + screenshots 40.png/41.jpeg):
