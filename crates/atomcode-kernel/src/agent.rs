@@ -274,6 +274,19 @@ fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<Strin
     ))
 }
 
+/// Auto-compaction pressure verdict: `used_tokens / ctx_window >= threshold`.
+/// Recomputed against the LIVE window (not a stored ratio) so a model switch is
+/// re-evaluated each turn — switch to a smaller window ⇒ pressure rises ⇒ compact
+/// proactively; switch to a larger window ⇒ pressure drops ⇒ no needless compaction.
+/// `None` when the window is unknown (`ctx_window == 0`) — can't gauge, so don't act.
+fn auto_compact_trigger(used_tokens: u32, ctx_window: u32, threshold: f32) -> Option<CompactTrigger> {
+    if ctx_window == 0 {
+        return None;
+    }
+    let utilization = used_tokens as f32 / ctx_window as f32;
+    (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
+}
+
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
 ///
 /// Contract:
@@ -626,25 +639,30 @@ impl RunningAgent {
     }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
-    /// `compact_threshold` is configured AND the LAST stored assistant message's
-    /// recorded `meta.utilization` (the prior turn's pressure) is `>= threshold`.
-    /// `None` if no threshold (default → never), or no assistant message yet (no
-    /// pressure fact to gauge), or pressure below the threshold. Pure read — never
-    /// mutates the conversation.
+    /// `compact_threshold` is configured AND the last stored assistant turn's raw
+    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model window
+    /// are `>= threshold`. Reads `used_tokens` — NOT the stored `meta.utilization`
+    /// ratio, which baked in whatever window was active when that turn was recorded;
+    /// switching to a smaller-window model must re-evaluate (the stored ratio, e.g.
+    /// 0.23 against a 1M window, stays below the threshold, so the first send would
+    /// otherwise overflow the new small window instead of compacting to fit first).
+    /// `None` if no threshold (default → never), no assistant turn yet, or below the
+    /// threshold. Pure read — never mutates the conversation.
     fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
         let thresh = self.compact_threshold?;
-        let utilization = convo
+        let (recorded_window, used) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| meta.utilization)?;
-        if utilization >= thresh {
-            Some(CompactTrigger::Auto { utilization })
-        } else {
-            None
-        }
+            .map(|meta| (meta.ctx_window, meta.used_tokens))?;
+        // Prefer the live window; fall back to the recorded one only when the live
+        // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
+        // stored-ratio behavior for the unknown-window case (no regression there).
+        let live = self.provider.context_window();
+        let window = if live > 0 { live } else { recorded_window };
+        auto_compact_trigger(used, window, thresh)
     }
 
     /// Run one compaction: build a read-only `CompactionView` over the current
@@ -660,16 +678,22 @@ impl RunningAgent {
     async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
-        // Pull the small pressure facts from the most recent assistant meta (default
-        // 0 if none recorded yet).
-        let (ctx_window, used_tokens, utilization) = convo
+        // Raw prompt tokens from the most recent assistant meta (default 0 if none yet).
+        let (recorded_window, used_tokens) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
-            .unwrap_or((0, 0, 0.0));
+            .map(|meta| (meta.ctx_window, meta.used_tokens))
+            .unwrap_or((0, 0));
+        // Size this compaction to the CURRENT model window (fall back to the recorded
+        // one only when the live window is unknown), and recompute pressure against it.
+        // A compaction running after a model switch must use the NEW window — otherwise
+        // the keep-budget / drain math would be sized to the previous model's window.
+        let live_window = self.provider.context_window();
+        let ctx_window = if live_window > 0 { live_window } else { recorded_window };
+        let utilization = if ctx_window > 0 { used_tokens as f32 / ctx_window as f32 } else { 0.0 };
         // The view borrows `&convo.messages`; confine that borrow to this block so
         // it is released before the &mut apply below.
         let plan = {
@@ -2619,6 +2643,46 @@ mod over_window_advisory_tests {
             m.contains("上下文窗口"),
             "must name the context window: {m}"
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_compact_trigger_tests {
+    use super::{auto_compact_trigger, CompactTrigger};
+
+    fn fires(used: u32, window: u32, thresh: f32) -> bool {
+        matches!(auto_compact_trigger(used, window, thresh), Some(CompactTrigger::Auto { .. }))
+    }
+
+    #[test]
+    fn switch_to_smaller_window_recomputes_and_fires() {
+        // 229K tokens sat at 23% of a 1M window (no compaction there)…
+        assert!(!fires(229_000, 1_000_000, 0.7), "under a 1M window: no compaction");
+        // …but switching to a 64K window recomputes to 3.6× over → must compact.
+        assert!(fires(229_000, 64_000, 0.7), "switch to 64K window: must compact");
+    }
+
+    #[test]
+    fn switch_to_larger_window_does_not_fire() {
+        // Pressure drops when the window grows — no needless compaction.
+        assert!(!fires(60_000, 1_000_000, 0.7), "60K in a 1M window: no compaction");
+    }
+
+    #[test]
+    fn threshold_boundary_and_unknown_window() {
+        assert!(fires(7_000, 10_000, 0.7), "exactly at threshold fires");
+        assert!(!fires(6_999, 10_000, 0.7), "just below threshold does not");
+        assert!(!fires(999_999, 0, 0.7), "unknown window (0) never fires");
+    }
+
+    #[test]
+    fn carries_the_recomputed_utilization() {
+        match auto_compact_trigger(229_000, 64_000, 0.7) {
+            Some(CompactTrigger::Auto { utilization }) => {
+                assert!((utilization - 229_000.0 / 64_000.0).abs() < 1e-4, "utilization vs CURRENT window");
+            }
+            other => panic!("expected Auto, got {other:?}"),
+        }
     }
 }
 

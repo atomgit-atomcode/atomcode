@@ -531,13 +531,14 @@ impl Conversation {
             self.messages = candidate;
             self.cache_epoch = epoch_before + 1;
             // PRESSURE RELIEF (anti re-fire): the auto task-boundary trigger
-            // (`should_compact`) reads the LAST assistant's frozen `meta.utilization`.
-            // `apply_plan` copies Message structs verbatim and never refreshes meta,
-            // so without this the SAME high utilization would be read at the next
-            // boundary and compaction would re-fire (over-shrink / spam
-            // Compacted{committed:false}) even though the history is now smaller.
-            // Reflect the relieved pressure deterministically: scale the surviving
-            // last assistant's `utilization` and `used_tokens` by the byte-reduction
+            // (`should_compact`) reads the LAST assistant's frozen `meta.used_tokens`
+            // and recomputes pressure against the live window. `apply_plan` copies
+            // Message structs verbatim and never refreshes meta, so without this the
+            // SAME high `used_tokens` would be read at the next boundary and compaction
+            // would re-fire (over-shrink / spam Compacted{committed:false}) even though
+            // the history is now smaller. Reflect the relieved pressure
+            // deterministically: scale the surviving last assistant's `used_tokens`
+            // (and `utilization`, kept in lock-step for display) by the byte-reduction
             // ratio `bytes_after / bytes_before` (< 1 here since we committed). This
             // is an estimate that holds until the real provider reports fresh usage
             // on the next turn. Only on commit.
