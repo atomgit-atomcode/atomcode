@@ -8030,7 +8030,12 @@ pub(super) fn handle_plugin_job_event(
             // Adding a marketplace does NOT install its plugins — list them + the install
             // command so the user isn't left thinking a plugin command (e.g. /wechat) is
             // already usable (a common confusion: `marketplace add` ≠ install).
-            let plugin_list = info.plugins.join(", ");
+            let plugin_list = if info.plugins.len() > 5 {
+                let head = info.plugins[..5].join(", ");
+                format!("{head} …")
+            } else {
+                info.plugins.join(", ")
+            };
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
                     name: &info.name,
