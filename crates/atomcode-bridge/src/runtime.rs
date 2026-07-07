@@ -804,6 +804,12 @@ impl Bridge {
                                 });
                             match active_provider {
                                 Some(ref provider) => {
+                                    // This active_provider is a throwaway built only for the
+                                    // vision-capability check, so it was never session-bound.
+                                    // Bind it here so `maybe_preprocess` forwards the session id
+                                    // onto the one-off VL provider (gateway affinity for this
+                                    // second request of the turn).
+                                    provider.set_session_id(&self.bridge_session);
                                     match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
                                         PreprocessOutcome::Skipped => {
                                             // Model supports vision natively — forward images as-is.
@@ -1205,7 +1211,8 @@ impl Bridge {
                 // Goal supersedes any active /loop (mutually exclusive).
                 self.supersede_loop("superseded by /goal");
                 if self.goal_provider.is_none() {
-                    self.goal_provider = build_goal_provider();
+                    let sid = self.bridge_session.clone();
+                    self.goal_provider = build_goal_provider(&sid);
                 }
                 if self.goal_provider.is_none() {
                     self.emit(CoreEv::Warning(
@@ -1643,8 +1650,9 @@ impl Bridge {
                         if should_attempt(feature_on, self.ai_name_attempted, true) {
                             self.ai_name_attempted = true;
                         let ev_tx = self.ev_tx.clone();
+                        let naming_session = self.bridge_session.clone();
                         tokio::spawn(async move {
-                            let Some(provider) = build_naming_provider() else {
+                            let Some(provider) = build_naming_provider(&naming_session) else {
                                 return;
                             };
                             let prompt = atomcode_core::agent::session_title::session_title_prompt(
@@ -2146,12 +2154,19 @@ fn loop_update_ev(l: &LoopState) -> CoreEv {
 /// Build the goal evaluator provider from config. Prefers the configured
 /// `evaluator_provider`; on ANY failure falls back to the default provider so
 /// `/goal` always arms when `/chat` works. Only a totally unloadable config disarms.
-fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+fn build_goal_provider(
+    session_id: &str,
+) -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
     let try_key = |key: &str| -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
         let pcfg = config.providers.get(key)?;
         let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+        // Ride the conversation's `x-atomcode-session-id` so the evaluator call
+        // shares gateway affinity with the main turn. Empty ⇒ header omitted.
+        if !session_id.is_empty() {
+            provider.set_session_id(session_id);
+        }
         Some(Arc::from(provider))
     };
     // Prefer the configured evaluator_provider; on ANY failure fall back to the
@@ -2168,11 +2183,20 @@ fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>
 /// Build a core provider for the one-off session-title call. Mirrors
 /// `build_goal_provider`: loads config, uses the default provider. Returns
 /// `None` (⇒ naming skipped) if config/provider is unavailable.
-fn build_naming_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+fn build_naming_provider(
+    session_id: &str,
+) -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
     let pcfg = config.providers.get(&config.default_provider)?;
     let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+    // Ride the conversation's `x-atomcode-session-id` so this background
+    // title-generation call — the second litellm request of the first turn —
+    // is pinned to the same upstream account/replica as the main turn instead
+    // of arriving session-less. Empty ⇒ header omitted (unchanged behavior).
+    if !session_id.is_empty() {
+        provider.set_session_id(session_id);
+    }
     Some(Arc::from(provider))
 }
 
