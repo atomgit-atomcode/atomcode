@@ -534,6 +534,13 @@ impl Bridge {
             self.finish_turn(reason, messages);
             return;
         };
+        // `goal_provider` is cached across turns and survives respawn, where
+        // `bridge_session` may have changed (/resume, /model, /clear). Refresh
+        // the session id to the CURRENT conversation before each eval so the
+        // evaluator call rides the live `x-atomcode-session-id`, not a stale one.
+        if !self.bridge_session.is_empty() {
+            provider.set_session_id(&self.bridge_session);
+        }
         let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
         let summary = summarize_for_goal(&messages, prev.as_deref());
         self.pending_goal = Some((reason, messages));
@@ -809,7 +816,9 @@ impl Bridge {
                                     // Bind it here so `maybe_preprocess` forwards the session id
                                     // onto the one-off VL provider (gateway affinity for this
                                     // second request of the turn).
-                                    provider.set_session_id(&self.bridge_session);
+                                    if !self.bridge_session.is_empty() {
+                                        provider.set_session_id(&self.bridge_session);
+                                    }
                                     match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
                                         PreprocessOutcome::Skipped => {
                                             // Model supports vision natively — forward images as-is.
@@ -1211,8 +1220,7 @@ impl Bridge {
                 // Goal supersedes any active /loop (mutually exclusive).
                 self.supersede_loop("superseded by /goal");
                 if self.goal_provider.is_none() {
-                    let sid = self.bridge_session.clone();
-                    self.goal_provider = build_goal_provider(&sid);
+                    self.goal_provider = build_goal_provider();
                 }
                 if self.goal_provider.is_none() {
                     self.emit(CoreEv::Warning(
@@ -2154,19 +2162,16 @@ fn loop_update_ev(l: &LoopState) -> CoreEv {
 /// Build the goal evaluator provider from config. Prefers the configured
 /// `evaluator_provider`; on ANY failure falls back to the default provider so
 /// `/goal` always arms when `/chat` works. Only a totally unloadable config disarms.
-fn build_goal_provider(
-    session_id: &str,
-) -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+// NOTE: the session id is NOT bound here. `goal_provider` is cached and reused
+// across turns and survives respawn (/resume, /cd, /model, /clear reassign
+// `bridge_session`), so binding at build time would go stale. It is refreshed to
+// the current conversation in `spawn_goal_eval`, right before each evaluation.
+fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
     let try_key = |key: &str| -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
         let pcfg = config.providers.get(key)?;
         let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
-        // Ride the conversation's `x-atomcode-session-id` so the evaluator call
-        // shares gateway affinity with the main turn. Empty ⇒ header omitted.
-        if !session_id.is_empty() {
-            provider.set_session_id(session_id);
-        }
         Some(Arc::from(provider))
     };
     // Prefer the configured evaluator_provider; on ANY failure fall back to the
