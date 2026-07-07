@@ -78,6 +78,17 @@ impl CustomCommandRegistry {
         }
     }
 
+    /// Register a single command into the registry. Used by tests and
+    /// plugin installers that build commands programmatically rather than
+    /// reading `.md` files from disk.
+    pub fn register(&mut self, cmd: CustomCommand) {
+        let key = match &cmd.namespace {
+            Some(ns) => format!("{}:{}", ns, cmd.name),
+            None => cmd.name.clone(),
+        };
+        self.commands.insert(key, cmd);
+    }
+
     fn load_from_dir(
         dir: &Path,
         namespace: Option<&str>,

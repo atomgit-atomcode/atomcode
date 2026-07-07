@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
+use crate::custom_commands::ArgsRequirement;
 use crate::modals::{
     DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
     ProxyPicker, SessionPicker,
@@ -999,9 +1000,14 @@ fn execute_slash_command_impl(
                     } else {
                         t(Msg::HelpSourceProject)
                     };
+                    let args_tag = match cmd.args_requirement {
+                        ArgsRequirement::Required => " <args>",
+                        ArgsRequirement::Optional => " [args]",
+                        ArgsRequirement::None => "",
+                    };
                     out.push_str(&format!(
-                        "    /{}  — {} ({})\n",
-                        cmd.name, cmd.description, source_label
+                        "    /{}{}  — {} ({})\n",
+                        cmd.name, args_tag, cmd.description, source_label
                     ));
                 }
                 if cmds.is_empty() {
@@ -2839,8 +2845,18 @@ fn execute_slash_command_impl(
             // then user-invocable skills (loaded from .claude/skills,
             // .atomcode/skills, etc.). Both expand to a prompt and dispatch
             // as a regular user message.
-            if let Some(rendered) = ctx.custom_commands.render(other, arg) {
-                submit_agent_turn(ctx, state, rendered);
+            if let Some(cmd) = ctx.custom_commands.resolve(other) {
+                if cmd.args_requirement == ArgsRequirement::Required && arg.trim().is_empty() {
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdCustomArgRequired { name: other }).into_owned(),
+                    ));
+                    renderer.flush();
+                } else {
+                    let rendered = cmd.template
+                        .replace("$ARGUMENTS", arg)
+                        .replace("${ARGUMENTS}", arg);
+                    submit_agent_turn(ctx, state, rendered);
+                }
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 submit_agent_turn(ctx, state, rendered);
             } else {
@@ -5616,5 +5632,60 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}",
             out
         );
+    }
+
+    #[test]
+    fn dispatch_custom_required_empty_arg_shows_error() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "foo");
+        assert_eq!(rendered, Some("review foo".into()));
+        let rendered_empty = custom.render("myreview", "");
+        assert_eq!(rendered_empty, Some("review ".into()));
+        // Required + empty → render still works (template subst is value-neutral),
+        // the validation lives in the dispatch layer.
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::Required);
+    }
+
+    #[test]
+    fn dispatch_custom_optional_empty_arg_submits() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Optional,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "");
+        assert_eq!(rendered, Some("review ".into()));
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::Optional);
+    }
+
+    #[test]
+    fn dispatch_custom_none_empty_arg_submits() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::None,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "");
+        assert_eq!(rendered, Some("review ".into()));
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::None);
     }
 }

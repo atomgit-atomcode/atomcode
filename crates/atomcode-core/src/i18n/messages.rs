@@ -299,6 +299,8 @@ pub enum Msg<'a> {
     CmdNoProviders,
     CmdNoSessions,
     CmdUnknownCommand { name: &'a str },
+    /// /cmd with args: required but no arguments supplied.
+    CmdCustomArgRequired { name: &'a str },
     CmdLoginFailed { error: &'a str },
     CmdLogoutDone,
     CmdLogoutFailed { error: &'a str },
