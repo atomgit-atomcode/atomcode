@@ -14,6 +14,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+/// Per-subtask wall-clock cap: a stuck/looping child is cancelled + reported as an error
+/// instead of hanging the whole `task` call forever (v1's SubAgentPool had the same guard).
+const DEFAULT_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// After a timed-out child is cancelled, how long to wait for it to unwind cooperatively
+/// and hand back its partial work before we detach it and report a bare timeout.
+const GRACE_AFTER_CANCEL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Hard-denies any child tool call that references a sensitive path (credentials, `~/.ssh`,
 /// `.env`, cloud creds). Mounted on every subagent child. Unlike the parent's
@@ -75,6 +81,7 @@ pub struct TaskTool {
     make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
+    subtask_timeout: std::time::Duration,
 }
 
 impl TaskTool {
@@ -90,7 +97,15 @@ impl TaskTool {
             make_explore_tools: Box::new(make_explore_tools),
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
+            subtask_timeout: DEFAULT_SUBTASK_TIMEOUT,
         }
+    }
+
+    /// Override the per-subtask wall-clock timeout (default 300s). A subtask that exceeds it
+    /// is cancelled and reported as a `<task_error>` — one stuck child can't hang the batch.
+    pub fn with_subtask_timeout(mut self, d: std::time::Duration) -> Self {
+        self.subtask_timeout = d;
+        self
     }
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
@@ -168,7 +183,12 @@ several. Subagents run in parallel and cannot themselves dispatch."
         }
 
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        let timeout_dur = self.subtask_timeout;
         let mut set = tokio::task::JoinSet::new();
+        // Live progress: the whole batch would otherwise be a black box until every subtask
+        // finishes. Emit a header + per-subtask start/done so the driver renders them live.
+        ctx.progress
+            .emit(format!("dispatching {} subtask(s)…", parsed.tasks.len()));
 
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let is_worker = t.subagent_type == "worker";
@@ -189,6 +209,9 @@ several. Subagents run in parallel and cannot themselves dispatch."
             };
             let persona = if is_worker { WORKER_PERSONA } else { EXPLORE_PERSONA }.to_string();
             let child_cancel = ctx.cancel.child_token();
+            // A second handle to fire the child's cancel on timeout (the token given to the
+            // builder is moved in; this clone stays so we can stop a timed-out detached child).
+            let cancel_on_timeout = child_cancel.clone();
             let wd = ctx.working_dir.clone();
             let label = format!(
                 "{}#{}",
@@ -198,9 +221,11 @@ several. Subagents run in parallel and cannot themselves dispatch."
             let prompt = t.prompt;
             let desc = t.description;
             let sem = sem.clone();
+            let progress = ctx.progress.clone();
 
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                progress.emit(format!("\u{21bb} {label} · {model}")); // ↻ started
                 let child = Agent::builder()
                     .provider(provider)
                     .tools(tools)
@@ -216,22 +241,53 @@ several. Subagents run in parallel and cannot themselves dispatch."
                 // cancel propagates only via the child_token.
                 //
                 // NOTE: under `panic = "abort"` (workspace default), a child panic aborts
-                // the whole process before the JoinError can surface, so the Err arm below
-                // cannot fire from a panic.  This is defensive parity with parallel_edit.rs:
-                // it removes the silent-success footgun (Outcome::default() == Stopped) and
-                // makes any future non-panic JoinError (e.g. explicit abort()) visible.
-                let outcome = match tokio::spawn(async move {
+                // the whole process before the JoinError can surface, so the join-Err arm
+                // below cannot fire from a panic. Defensive parity with parallel_edit.rs.
+                // `&mut handle` so a timeout doesn't drop (detach) the handle — we may need to
+                // re-await it below to recover the child's partial work.
+                let mut handle = tokio::spawn(async move {
                     child.run_to_completion(prompt, AutoRespond::AllowAll).await
-                })
-                .await
-                {
-                    Ok(o) => o,
-                    Err(join_err) => Outcome {
+                });
+                let timed_out_msg =
+                    || format!("subagent exceeded the {}s time limit", timeout_dur.as_secs());
+                let outcome = match tokio::time::timeout(timeout_dur, &mut handle).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(join_err)) => Outcome {
                         stop: StopReason::ProviderError,
                         error: Some(format!("subagent task crashed: {join_err}")),
                         ..Default::default()
                     },
+                    Err(_elapsed) => {
+                        // Wall-clock cap hit (#2). Cancel the child so it stops, then give it a
+                        // brief grace window to unwind and hand back whatever partial work it did
+                        // — a worker that edited files before wedging is not a total loss, and the
+                        // renderer's error branch surfaces that partial output (mirrors the
+                        // kernel's own stream-timeout path, which also preserves it).
+                        cancel_on_timeout.cancel();
+                        match tokio::time::timeout(GRACE_AFTER_CANCEL, &mut handle).await {
+                            Ok(Ok(mut o)) => {
+                                // Re-label as a timeout regardless of how the child reported its
+                                // own cancel, so the block shows "(Timeout)" with its partial text.
+                                o.stop = StopReason::Timeout;
+                                o.error.get_or_insert_with(timed_out_msg);
+                                o
+                            }
+                            // Child didn't unwind in the grace window (or join error) → detach it
+                            // and report the timeout with no partial output.
+                            _ => Outcome {
+                                stop: StopReason::Timeout,
+                                error: Some(timed_out_msg()),
+                                ..Default::default()
+                            },
+                        }
+                    }
                 };
+                let icon = if outcome.stop == StopReason::Stopped {
+                    "\u{2713} done"
+                } else {
+                    "\u{2717} failed"
+                };
+                progress.emit(format!("{icon} · {label} · {model}"));
                 (label, desc, model, outcome)
             });
         }
@@ -441,6 +497,95 @@ mod tests {
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error, "expected error result, got: {}", out.content);
         assert!(out.content.contains("<task_error>"), "missing tag: {}", out.content);
+    }
+
+    /// A child whose stream never yields must be capped by the per-subtask
+    /// timeout — one stuck subtask cannot hang the whole batch.
+    #[tokio::test]
+    async fn hanging_subtask_hits_timeout_not_batch() {
+        struct HangProvider;
+        #[async_trait]
+        impl LlmProvider for HangProvider {
+            fn model_name(&self) -> &str {
+                "hang"
+            }
+            async fn chat_stream(
+                &self,
+                _m: &[Message],
+                _t: &[ToolDef],
+                _o: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                // Stream that never yields → child blocks until its cancel fires.
+                Ok(stream::pending::<StreamEvent>().boxed())
+            }
+        }
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(HangProvider) as Arc<dyn LlmProvider>,
+            || Arc::new(HangProvider) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_subtask_timeout(std::time::Duration::from_millis(150));
+        let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
+        // Outer guard: if the per-subtask timeout is broken, this rejects instead of hanging CI.
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), tool.execute(args, &ctx()))
+            .await
+            .expect("execute must return via the per-subtask timeout, not hang");
+        assert!(out.is_error, "expected timeout error, got: {}", out.content);
+        assert!(
+            out.content.contains("time limit"),
+            "should report the time limit: {}",
+            out.content
+        );
+    }
+
+    /// A child that produced real output before wedging must keep that partial work
+    /// in its `<task_error>` block after a timeout — not report a bare time-limit.
+    #[tokio::test]
+    async fn timed_out_subtask_preserves_partial_output() {
+        struct PartialThenHangProvider;
+        #[async_trait]
+        impl LlmProvider for PartialThenHangProvider {
+            fn model_name(&self) -> &str {
+                "partial"
+            }
+            async fn chat_stream(
+                &self,
+                _m: &[Message],
+                _t: &[ToolDef],
+                _o: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                // Emit some text, then hang (no Done) → the child accumulates the text,
+                // then waits forever until its cancel fires on timeout.
+                let evs = stream::once(async { StreamEvent::TextDelta("PARTIAL-EDIT-DONE".into()) })
+                    .chain(stream::pending());
+                Ok(evs.boxed())
+            }
+        }
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(PartialThenHangProvider) as Arc<dyn LlmProvider>,
+            || Arc::new(PartialThenHangProvider) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_subtask_timeout(std::time::Duration::from_millis(150));
+        let args = r#"{"tasks":[{"description":"x","prompt":"p","subagent_type":"explore"}]}"#;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), tool.execute(args, &ctx()))
+            .await
+            .expect("execute must return via the per-subtask timeout, not hang");
+        assert!(out.is_error, "expected timeout error, got: {}", out.content);
+        assert!(out.content.contains("time limit"), "missing time limit: {}", out.content);
+        assert!(
+            out.content.contains("PARTIAL-EDIT-DONE"),
+            "partial output must survive the timeout: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

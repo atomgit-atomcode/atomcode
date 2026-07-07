@@ -8412,6 +8412,9 @@ fn streams_tool_output_by_default(
     show_tool_output
         || call_id.starts_with("local-shell-")
         || tool_display.is_some_and(|d| d == display_tool_name(DISPATCH_TOOL_RAW_NAME))
+        // The `task` subagent tool: its per-subtask ↻/✓/✗ progress is the whole point —
+        // stream it live so a multi-minute fan-out isn't a black box until it returns.
+        || tool_display.is_some_and(|d| d == display_tool_name("task"))
 }
 
 #[cfg(test)]
@@ -8424,6 +8427,15 @@ mod tool_output_stream_gate_tests {
         assert!(
             streams_tool_output_by_default(false, "call-1", Some(&disp)),
             "dispatch tool's progress must stream by default"
+        );
+    }
+
+    #[test]
+    fn task_tool_streams_without_verbose() {
+        let disp = display_tool_name("task");
+        assert!(
+            streams_tool_output_by_default(false, "call-1", Some(&disp)),
+            "task subagent per-subtask progress must stream by default"
         );
     }
 
