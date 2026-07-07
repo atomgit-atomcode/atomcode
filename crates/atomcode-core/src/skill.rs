@@ -123,6 +123,8 @@ fn expand_shell_injections(template: &str) -> String {
 fn run_shell_command(cmd: &str) -> String {
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd);
+    #[cfg(unix)]
+    crate::process_utils::apply_utf8_locale_env_sync(&mut command);
     crate::process_utils::suppress_console_window_sync(&mut command);
     match command.output() {
         Ok(out) => {
@@ -725,6 +727,34 @@ mod tests {
         let mut s = make_skill("dir=${CLAUDE_SKILL_DIR}");
         s.skill_dir = PathBuf::from("/home/user/.claude/skills/my-skill");
         assert_eq!(s.expand("", ""), "dir=/home/user/.claude/skills/my-skill");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn shell_injection_preserves_utf8_paths_when_parent_locale_is_c() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().to_string_lossy().replace('\'', "'\\''");
+        let command = format!(
+            r#"
+            cd '{}'
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#,
+            cwd
+        );
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+
+        let output = run_shell_command(&command);
+
+        assert!(
+            output.contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "output was: {:?}",
+            output
+        );
     }
 
     // --- frontmatter ---

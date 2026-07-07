@@ -120,6 +120,8 @@ fn expand_shell_injections(template: &str) -> String {
 fn run_shell_command(cmd: &str) -> String {
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd);
+    #[cfg(unix)]
+    crate::process_utils::apply_utf8_locale_env_sync(&mut command);
     // No console-window flash when run from a console-less daemon (mirrors core's
     // skill runner); no-op off Windows.
     crate::process_utils::suppress_console_window_sync(&mut command);
