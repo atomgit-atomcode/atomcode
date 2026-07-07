@@ -92,7 +92,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
 | DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
-| 智谱（GLM） | 支持 | GLM-4、GLM-5、GLM-5.2（AtomCode Pro套餐专属模型） |
+| 智谱（GLM） | 支持 |  GLM-4、GLM-5、GLM-5.2（AtomCode Pro套餐专属模型） |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
 | Ollama（本地） | 部分支持 | Llama 3、Qwen2 等 |
@@ -159,3 +159,475 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 cargo install --path crates/atomcode-cli --locked
+```
+
+编译产物位于 `target/release/atomcode`。在 macOS / Linux / HarmonyOS PC 其被安装到 `~/.cargo/bin/atomcode`，
+在 Windows 系统上其被安装到 `$env:USERPROFILE/.cargo/bin/atomcode.exe`。请确保 `~/.cargo/bin`
+（或 `%USERPROFILE%\.cargo\bin`）已经被添加到 `PATH` 环境变量中。
+
+如果只想要编译，不要安装，运行：
+
+```bash
+cargo build --release
+```
+
+编译产物会在 `target/release/atomcode` 生成。
+
+### 包管理器安装
+
+除了从源码构建外，AtomCode CLI 也可以通过以下包管理器安装：
+
+```bash
+# 使用 npm 安装
+npm install -g @atomgit.com/atomcode
+
+# 使用 Homebrew 安装
+brew install --cask atomcode
+```
+
+### 依赖
+
+- Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
+- 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
+
+### 卸载
+
+移除 AtomCode 及（可选）其数据：
+
+```bash
+atomcode uninstall                # 交互模式：分组询问
+atomcode uninstall --keep-data    # 仅删除二进制 + PATH 配置
+atomcode uninstall --purge        # 一并删除 ~/.atomcode/
+atomcode uninstall --dry-run      # 仅打印计划，不实际删除
+```
+
+二进制已损坏或丢失时使用兜底脚本：
+
+```bash
+curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.sh | sh
+# Windows:
+irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall.ps1 | iex
+```
+
+默认保留凭据（`auth.toml`、`mcp.json`、`config.toml`、`ATOMCODE.md`），传 `--purge` 才会一起清除。
+
+## 快速开始
+
+### 1. 首次运行
+
+```bash
+atomcode
+```
+
+首次运行会有一个向导帮你配置模型：
+
+```
+Welcome to AtomCode! Let's set up your first provider.
+
+Select provider:
+  [1] Claude (Anthropic)
+  [2] OpenAI
+  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
+  [4] Ollama (local)
+```
+
+### 2. 配置
+
+配置文件位于 `~/.atomcode/config.toml`，最小单 provider 样例：
+
+```toml
+default_provider = "deepseek"
+
+[providers.deepseek]
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
+context_window = 64000
+```
+
+可以配置多个 provider，用 `/model` 或 `/provider` 切换。完整示例
+（涵盖 Claude / OpenAI / OpenAI-兼容 endpoint 如 DeepSeek / GLM /
+SiliconFlow / OpenRouter / Ollama，以及 `[datalog]` 段）见
+[`docs/config.example.toml`](docs/config.example.toml)——拷出来按需改。
+
+手动改完 `config.toml` 后，在 atomcode 里执行 `/reload` 重新加载配置，
+不用重启。
+
+### 3. 开始编码
+
+```bash
+# 在项目目录下启动
+cd your-project
+atomcode
+
+# 或指定目录
+atomcode -C /path/to/project
+
+# 或指定模型
+atomcode --model gpt-4o
+
+# Headless 模式（单条 prompt，结果输出到 stdout）
+atomcode -p "简要说明这个仓库的 agent loop"
+
+# 从文件读取 prompt
+atomcode --prompt-file task.md
+```
+
+在 headless 模式下，需要确认的 `bash` 会自动批准并写到 stderr；其他需要确认的工具会被拒绝。
+
+然后直接用自然语言描述你想做的事：
+
+```
+> 修复 OAuth 回调后用户被重定向到 404 的登录 bug
+
+> 给设置页加一个深色模式切换
+
+> 把数据库模块重构为使用连接池
+
+> 给支付处理模块写单元测试
+```
+
+## 快捷键
+
+### 输入
+
+| 键位 | 动作 |
+|-----|--------|
+| `Enter` | 发送消息 |
+| `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+J` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
+| `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
+| `Esc` | 清空输入 / 取消流式输出 |
+| `Esc` ×2 | 撤销上一轮 |
+| `Up/Down` | 浏览输入历史 |
+| `Tab` | 接受补全 |
+| `Ctrl+U` | 清空当前行 |
+| `Ctrl+W` | 删除一个单词 |
+| `Ctrl+K` | 删除到行尾 |
+| `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
+
+> **换行快捷键的终端兼容性：**
+> - `Shift+Enter`、`Ctrl+Enter`、`Ctrl+J` 都需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端会把它们都退化成普通 `Enter`（直接发送消息）。
+> - `Alt+Enter` 在多数终端的字节层面就能工作，但 **Windows Terminal 默认把它绑给"切换全屏"** — 在 设置 → 操作 中删掉那条绑定即可释放。
+> - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
+
+> **Windows 下粘贴图片：**
+> Windows Terminal 和 conhost 默认把 `Ctrl+V` 绑给它们自己的 `paste` action — 这个 action 只会从剪贴板读 `CF_UNICODETEXT`，剪贴板上只有图片时它什么都不会发，应用里的 `Ctrl+V` 处理器根本收不到事件。两种解法：
+> 1. 使用 **`/paste`** —— 这个斜杠命令直接读取剪贴板图片并以 `[Image #N]` 的形式附加到输入框，在 Windows Terminal、PowerShell 7、conhost、git bash 等所有终端里都能正常工作。Windows 版的 TUI 右下角会自动显示 `剪贴板有图片 · /paste 粘贴` 作为提示。
+> 2. 若想保留 `Ctrl+V` 的肌肉记忆：打开 Windows Terminal 的 `settings.json`（`Ctrl+,` → 右下角"打开 JSON 文件"），在 `"actions"` 数组里删掉 `{ "command": "paste", "keys": "ctrl+v" }`，或把它改绑到 `ctrl+shift+v`。重启 Windows Terminal 后，`Ctrl+V` 就能透传给 atomcode 了。
+>
+> Git Bash（MinTTY）不拦截 `Ctrl+V`，开箱即用。
+
+### 导航
+
+| 键位 | 动作 |
+|-----|--------|
+| `Ctrl+Up/Down` | 滚动聊天区（3 行） |
+| `PageUp/PageDown` | 滚动聊天区（一页） |
+| `Ctrl+L` | 清空对话 |
+| `Ctrl+Shift+C` | 复制选中内容 |
+| `Ctrl+C` | 取消当前操作（连按两次退出） |
+
+### 斜杠命令
+
+在 TUI 中输入 `/` 即可浏览完整列表并实时补全；`/help` 会列出命令与快捷键。
+
+**会话与工作区**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/resume` | 恢复或切换会话 |
+| `/session` | 创建新会话 |
+| `/rename <名称>` | 重命名当前会话 |
+| `/clear` | 开始新对话（清空上下文与屏幕） |
+| `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
+| `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
+| `/cd` | 切换工作目录 |
+| `/worktree` | Git worktree 隔离（`create` / `list` / `done` / `cleanup`） |
+| `/webui` | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`） |
+| `/sync` | 连接到实时 webui 会话（`/sync off` 断开） |
+
+**模式、自主与审查**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/plan` | 切换到 Plan 模式（只读探索） |
+| `/build` | 切换到 Build 模式（完整执行） |
+| `/goal <目标>` | 设置完成目标——agent 自动循环执行直到条件满足 |
+| `/review` | 代码审查当前改动（`/review` · `/review staged` · `/review <base>`） |
+| `/think` | 控制深度思考（on / off / budget N） |
+| `/effort` | DeepSeek 推理努力控制（high / max / off） |
+
+**Provider 与账号**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/model` | 切换模型 / provider |
+| `/provider` | 管理 provider（添加 / 编辑 / 删除） |
+| `/login` | 通过 AtomGit OAuth 登录 |
+| `/logout` | 退出 AtomGit 登录 |
+| `/whoami` | 查看当前登录用户 |
+| `/status` | 查看登录状态和模型信息 |
+
+**文件、编辑与上下文**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/diff` | 显示当前修改的 git diff |
+| `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
+| `/view <文件路径>` | 在浮层窗口中查看文件内容 |
+| `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/cost` | 显示本次会话的 token 消耗 |
+| `/context` | 查看上下文预算占用明细 |
+| `/compact` | 压缩对话历史 |
+
+**记忆**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/remember <事实>` | 保存一条记忆（`--global` 对所有项目生效） |
+| `/forget <关键词>` | 删除匹配的记忆 |
+| `/memory` | 查看所有已保存的记忆 |
+
+**扩展**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/mcp` | MCP 服务状态（子命令：`reload`、`tools`、`login`、`logout`） |
+| `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `list`） |
+| `/skills` | 浏览已加载的 skills |
+
+**项目与系统**
+
+| 命令 | 动作 |
+|---------|--------|
+| `/init` | 根据工作目录生成 `.atomcode.md` 项目指令 |
+| `/config` | 显示配置文件路径 |
+| `/reload` | 从磁盘重新加载 `~/.atomcode/config.toml` |
+| `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
+| `/setup` | 首次运行：安装推荐 skill 并执行 |
+| `/welcome` | 重新运行引导向导 |
+| `/language` | 切换显示语言 |
+| `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
+| `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
+| `/keys` | 查看键盘快捷键 |
+| `/help` | 查看命令与快捷键 |
+| `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
+
+> **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：
+>
+> ```text
+> /plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
+> /plugin install weixin@atomcode-channel
+> ```
+
+## 架构
+
+AtomCode 是一个 Rust workspace，由四个 crate 组成：
+
+```
+atomcode/
+  crates/
+    atomcode-core/     # 无头核心库，不依赖 TUI
+      agent/           # AgentLoop：自主工具调用循环
+      turn/            # TurnRunner、datalog、权限决策器
+      config/          # 配置加载、provider 配置
+      conversation/    # 消息类型、窗口化上下文
+      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
+      tool/            # Tool trait + 内置工具实现
+      session/         # 持久化会话
+      skill.rs         # 用户自定义 skill
+
+    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
+      event_loop/      # App 状态机、命令分发
+      render/          # cell-level 渲染器、diff、retained-mode 帧循环
+      modals/          # 各种 picker（dir、model、session、provider、issue）
+
+    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
+      main.rs          # CLI 参数、首次运行向导、启动
+      auth/            # AtomGit OAuth 客户端
+
+    atomcode-daemon/   # 基于 atomcode-core 的 HTTP/SSE API 服务
+```
+
+### 设计原则
+
+1. **技术栈无关** —— 核心引擎不硬编码任何特定语言的逻辑，通过 `package.json`、`Cargo.toml`、`pyproject.toml`、`pom.xml` 等描述文件动态探测项目类型。
+
+2. **Agent 解耦** —— `AgentLoop` 作为独立的异步任务运行，通过 channel（`AgentCommand` / `AgentEvent`）与 TUI 通信。核心库完全不依赖 TUI，这也是 daemon 得以存在的基础。
+
+3. **工具安全** —— 所有破坏性操作必须经用户显式确认。工具失败会作为 observation 返回给模型，绝不 panic。
+
+4. **上下文感知** —— token 预算感知的会话窗口、项目文件树注入、每轮系统提醒，在不超出上下文限制的同时让模型保持专注。
+
+## 项目指令文件
+
+在项目根目录创建 `.atomcode.md` 文件，给 AtomCode 提供持久化上下文：
+
+```markdown
+# Project Instructions
+
+本项目是 Vue 3 + TypeScript，使用 Pinia 做状态管理。
+
+- 始终使用 `<script setup>` 风格的 Composition API
+- 样式使用 TailwindCSS，不写内联样式
+- 编辑 .vue/.ts 文件后运行 `npm run lint`
+```
+
+AtomCode 会自动读取这个文件并注入到系统提示中。AtomCode 也支持 `AGENTS.md`（AI 编程代理的[开放标准](https://agents.md/)）作为替代——如果两个文件同时存在，`.atomcode.md` 优先。
+
+## 开发
+
+### 前置条件
+
+- **Rust 1.88+** —— 通过 [rustup](https://rustup.rs/) 安装
+- **Git**
+- 任一支持的模型 API Key（用于运行时测试）
+
+### 从源码构建
+
+```bash
+git clone https://atomgit.com/atomgit_atomcode/atomcode.git
+cd atomcode
+
+# Debug 构建（编译快、运行慢）
+cargo build
+
+# Release 构建（编译慢、运行快）
+cargo build --release
+```
+
+### 开发时运行
+
+```bash
+# 直接运行 TUI（debug 模式）
+cargo run -p atomcode-cli
+
+# 带参数
+cargo run -p atomcode-cli -- -C /path/to/project
+cargo run -p atomcode-cli -- --model gpt-4o
+
+# Headless 模式
+cargo run -p atomcode-cli -- -p "总结一下这个仓库"
+
+# Daemon（HTTP API）
+cargo run -p atomcode-daemon
+```
+
+### 测试
+
+```bash
+# 运行全部测试
+cargo test
+
+# 运行指定 crate 的测试
+cargo test -p atomcode-core
+cargo test -p atomcode-tuix
+
+# 运行指定的用例
+cargo test -p atomcode-core test_name
+```
+
+### 常用命令
+
+```bash
+# 只做类型检查，不生成产物
+cargo check
+
+# 格式化代码
+cargo fmt
+
+# 运行 linter
+cargo clippy
+
+# 构建并安装到 ~/.cargo/bin
+cargo install --path crates/atomcode-cli
+```
+
+## 贡献指南
+
+欢迎贡献！AtomCode 正在积极迭代中。
+
+### 如何贡献
+
+1. 在 AtomGit 上 **Fork** 仓库
+2. 克隆你的 fork：
+   ```bash
+   git clone https://atomgit.com/<你的用户名>/atomcode.git
+   cd atomcode
+   ```
+3. 创建分支：
+   ```bash
+   git checkout -b feat/your-feature
+   # 或
+   git checkout -b fix/your-bugfix
+   ```
+4. 修改代码，确保能编译、测试通过：
+   ```bash
+   cargo build && cargo test && cargo clippy
+   ```
+5. 清晰地写 commit：
+   ```bash
+   git commit -m "feat: add xxx support"
+   ```
+6. **Push** 并向 `main` 分支提交 **Pull Request**
+
+### 分支命名
+
+| 前缀 | 用途 |
+|--------|---------|
+| `feat/` | 新功能 |
+| `fix/` | Bug 修复 |
+| `refactor/` | 重构（不改变行为） |
+| `docs/` | 仅文档 |
+| `chore/` | 构建、CI、工具链 |
+
+### 约定
+
+- 遵守项目的核心原则，尤其是 **技术栈中立**
+  （核心引擎中不写任何针对特定语言/框架的逻辑；通过
+  `package.json` / `Cargo.toml` / `pom.xml` 等探测，并通过 adapter 分发）
+- 工具失败必须优雅处理——把错误作为 observation 返回给模型，绝不 panic
+- 破坏性操作必须需要用户确认
+- 系统提示保持紧凑（约 1.5K tokens）
+- 提交前先跑 `cargo fmt` 和 `cargo clippy`
+
+### 从哪里上手
+
+- **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
+- **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
+- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
+- **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
+
+## 社区交流
+---
+
+用微信扫描下方二维码加入 AtomCode 用户群，反馈问题、分享使用心得，和其他用户、维护者一起交流：
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode 微信用户群二维码" width="220">
+</p>
+
+
+## 打赏
+---
+
+☕ AtomCode 免费用，Coding Plan 也不收费。如果它帮你省下了一点时间，欢迎请作者喝杯咖啡，让我们更有动力把它做下去。
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/alipay_1782981974317.png" alt="AtomCode 支付宝赞赏码" width="220">
+  <img src="https://cdn-news.gitcode.com/news/wechatpay_1782982603403.png" alt="AtomCode 微信赞赏码" width="240">
+</p>
+
+
+## 许可证
+MIT License。详见 [LICENSE](LICENSE)。
+
+---
+
+<p align="center">
+  用 Rust、ratatui 以及无数个深夜构建而成。
+</p>
