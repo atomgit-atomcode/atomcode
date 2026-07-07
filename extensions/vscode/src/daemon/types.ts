@@ -1,3 +1,5 @@
+export type ApprovalMode = 'build' | 'plan' | 'bypass';
+
 // Chat
 export interface ChatRequest {
   message: string;
@@ -5,6 +7,7 @@ export interface ChatRequest {
   provider?: string;
   session_id?: string;
   images?: ImageInput[];
+  approval_mode?: ApprovalMode;
 }
 
 export interface ImageInput {
@@ -16,6 +19,11 @@ export interface ImageInput {
 export interface SkillInfo {
   name: string;
   description: string;
+}
+
+export interface ApprovalModeResponse {
+  ok: boolean;
+  mode: ApprovalMode;
 }
 
 export type ChatEvent =

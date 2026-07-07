@@ -27,8 +27,9 @@
 
 import { VNode } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
+import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -393,7 +394,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
-  const [queued, setQueued] = useState<{ id: number; text: string; images?: ImageData[] }[]>([]);
+  const [queued, setQueued] = useState<{
+    id: number;
+    text: string;
+    images?: ImageData[];
+    approvalMode: ApprovalMode;
+  }[]>([]);
   const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
@@ -401,8 +407,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
   // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
-  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。默认 build。
-  const [mode, setMode] = useState<ApprovalMode>('build');
+  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。confirmedMode 是 daemon 已确认值。
+  const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -557,6 +563,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // Abort the live (/live) stream if the component unmounts while sync is on.
   useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getApprovalMode()
+      .then((current) => {
+        if (!cancelled) setModeState(initModeState(current));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // 斜杠菜单：点击外部关闭
   useEffect(() => {
@@ -755,7 +771,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) setProvider(e.provider);
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
-      if (e.mode) setMode(e.mode);
+      if (e.mode) setModeState(initModeState(e.mode));
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
@@ -773,7 +789,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
     if (e.type === 'mode') {
-      setMode(e.mode);
+      setModeState(initModeState(e.mode));
       return;
     }
     // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
@@ -1100,7 +1116,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
-  async function deliver(text: string, images: ImageData[]) {
+  async function deliver(
+    text: string,
+    images: ImageData[],
+    approvalMode: ApprovalMode = modeState.confirmedMode,
+  ) {
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
@@ -1118,7 +1138,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      await postLiveMessage(
+        text,
+        images.length ? images : undefined,
+        provider ?? undefined,
+        activeIdRef.current,
+      );
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);
@@ -1152,6 +1177,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
+        approval_mode: approvalMode,
       };
 
       await streamChat(body, handleEvent, controller.signal);
@@ -1176,6 +1202,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function sendMessage() {
     const text = input.trim();
     const images = pendingImages;
+    if (modeState.pendingMode) return;
     if (!text && images.length === 0) return;
 
     // 清空输入框（无论立即发送还是排队）。
@@ -1189,7 +1216,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (busy) {
       setQueued((q) => [
         ...q,
-        { id: queueIdRef.current++, text, images: images.length ? images : undefined },
+        {
+          id: queueIdRef.current++,
+          text,
+          images: images.length ? images : undefined,
+          approvalMode: modeState.confirmedMode,
+        },
       ]);
       return;
     }
@@ -1199,13 +1231,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 当前回合结束(done)后，依次发送排队消息；stopped/error/连接错误已清空队列。
   useEffect(() => {
-    if (busy || queued.length === 0) return;
+    if (busy || queued.length === 0 || modeState.pendingMode) return;
     const next = queued[0];
     setQueued((q) => q.slice(1));
-    void deliver(next.text, next.images ?? []);
+    void deliver(next.text, next.images ?? [], next.approvalMode);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, queued]);
+  }, [busy, queued, modeState.pendingMode]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
@@ -1652,12 +1684,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           </span>
         )}
         <ModeSelector
-          value={mode}
+          value={modeState.displayMode}
+          disabled={Boolean(modeState.pendingMode)}
           onChange={(m) => {
-            setMode(m);
+            if (modeState.pendingMode) return;
+            const nextState = beginModeSwitch(modeState, m);
+            if (nextState === modeState) return;
+            setModeState(nextState);
             // 模式是进程级 runtime 状态：立即通知后端（下一轮生效）并广播给其他 tab。
             // 与 provider 不同，无 sync 门控——审批策略是会话级全局，始终上报。
-            void postLiveMode(m);
+            void postLiveMode(m)
+              .then((confirmed) => setModeState((current) => completeModeSwitch(current, confirmed)))
+              .catch(() => {
+                setModeState((current) => failModeSwitch(current));
+              });
           }}
         />
         <ModelSelector
@@ -1676,6 +1716,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               <button
                 class="btn-send"
                 onClick={sendMessage}
+                disabled={Boolean(modeState.pendingMode)}
                 title={t('chat.queue')}
                 aria-label={t('chat.queue')}
               >
@@ -1690,7 +1731,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           <button
             class="btn-send"
             onClick={sendMessage}
-            disabled={!input.trim() && pendingImages.length === 0}
+            disabled={Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
             title={t('chat.send')}
             aria-label={t('chat.send')}
           >

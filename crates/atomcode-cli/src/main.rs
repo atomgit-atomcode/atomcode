@@ -220,7 +220,6 @@ fn scan_argv_for_lang() -> Option<String> {
     None
 }
 
-
 /// Scan the config file (default path only) for the `language` field.
 /// Returns `None` if the config file does not exist, cannot be parsed, or
 /// has no `language` key. This is a lightweight pre-parse -- the full config
@@ -241,7 +240,6 @@ fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
     cfg.language
 }
 
-
 /// Build the top-level clap Command with i18n-localised about and help text.
 /// This replaces the default Cli::parse() flow so that --help output
 /// respects the current locale (set by scan_argv_for_lang above).
@@ -256,20 +254,32 @@ fn build_i18n_command() -> clap::Command {
 
     // Mutate top-level argument help texts
     let cmd = cmd
-        .mut_arg("continue_last", |a| a.help(t(Msg::CliHelpContinue).into_owned()))
+        .mut_arg("continue_last", |a| {
+            a.help(t(Msg::CliHelpContinue).into_owned())
+        })
         .mut_arg("provider", |a| a.help(t(Msg::CliHelpProvider).into_owned()))
         .mut_arg("model", |a| a.help(t(Msg::CliHelpModel).into_owned()))
         .mut_arg("lang", |a| a.help(t(Msg::CliHelpLang).into_owned()))
         .mut_arg("config", |a| a.help(t(Msg::CliHelpConfig).into_owned()))
         .mut_arg("dir", |a| a.help(t(Msg::CliHelpDir).into_owned()))
         .mut_arg("prompt", |a| a.help(t(Msg::CliHelpPrompt).into_owned()))
-        .mut_arg("prompt_file", |a| a.help(t(Msg::CliHelpPromptFile).into_owned()))
+        .mut_arg("prompt_file", |a| {
+            a.help(t(Msg::CliHelpPromptFile).into_owned())
+        })
         .mut_arg("verbose", |a| a.help(t(Msg::CliHelpVerbose).into_owned()))
-        .mut_arg("max_turns", |a| a.help(t(Msg::CliHelpMaxTurns).into_owned()))
+        .mut_arg("max_turns", |a| {
+            a.help(t(Msg::CliHelpMaxTurns).into_owned())
+        })
         .mut_arg("dev", |a| a.help(t(Msg::CliHelpDev).into_owned()))
-        .mut_arg("disable_tools", |a| a.help(t(Msg::CliHelpDisableTools).into_owned()))
-        .mut_arg("no_telemetry", |a| a.help(t(Msg::CliHelpNoTelemetry).into_owned()))
-        .mut_arg("dangerously_skip_permissions", |a| a.help(t(Msg::CliHelpDangerouslySkipPermissions).into_owned()));
+        .mut_arg("disable_tools", |a| {
+            a.help(t(Msg::CliHelpDisableTools).into_owned())
+        })
+        .mut_arg("no_telemetry", |a| {
+            a.help(t(Msg::CliHelpNoTelemetry).into_owned())
+        })
+        .mut_arg("dangerously_skip_permissions", |a| {
+            a.help(t(Msg::CliHelpDangerouslySkipPermissions).into_owned())
+        });
 
     // Mutate subcommand about texts
     let cmd = cmd
@@ -277,14 +287,22 @@ fn build_i18n_command() -> clap::Command {
         .mut_subcommand("logout", |s| s.about(t(Msg::CliAboutLogout).into_owned()))
         .mut_subcommand("status", |s| s.about(t(Msg::CliAboutStatus).into_owned()))
         .mut_subcommand("upgrade", |s| s.about(t(Msg::CliAboutUpgrade).into_owned()))
-        .mut_subcommand("rollback", |s| s.about(t(Msg::CliAboutRollback).into_owned()))
-        .mut_subcommand("fixissue", |s| s.about(t(Msg::CliAboutFixissue).into_owned()))
+        .mut_subcommand("rollback", |s| {
+            s.about(t(Msg::CliAboutRollback).into_owned())
+        })
+        .mut_subcommand("fixissue", |s| {
+            s.about(t(Msg::CliAboutFixissue).into_owned())
+        })
         .mut_subcommand("mcp", |s| s.about(t(Msg::CliAboutMcp).into_owned()))
         .mut_subcommand("daemon", |s| s.about(t(Msg::CliAboutDaemon).into_owned()))
         .mut_subcommand("webui", |s| s.about(t(Msg::CliAboutWebui).into_owned()))
-        .mut_subcommand("telemetry", |s| s.about(t(Msg::CliAboutTelemetry).into_owned()))
+        .mut_subcommand("telemetry", |s| {
+            s.about(t(Msg::CliAboutTelemetry).into_owned())
+        })
         .mut_subcommand("plugin", |s| s.about(t(Msg::CliAboutPlugin).into_owned()))
-        .mut_subcommand("uninstall", |s| s.about(t(Msg::CliAboutUninstall).into_owned()))
+        .mut_subcommand("uninstall", |s| {
+            s.about(t(Msg::CliAboutUninstall).into_owned())
+        })
         .mut_subcommand("setup", |s| s.about(t(Msg::CliAboutSetup).into_owned()))
         .mut_subcommand("hooks", |s| s.about(t(Msg::CliAboutHooks).into_owned()));
 
@@ -1040,7 +1058,8 @@ async fn run() -> Result<i32> {
     let pre_lang = scan_argv_for_lang();
     // Also read config language field so --help respects /language setting.
     let pre_config_lang = scan_config_language();
-    let pre_locale = atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
+    let pre_locale =
+        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
     atomcode_tuix::i18n::set_locale(pre_locale);
 
     // Build the clap Command with i18n-injected about/help text, then parse.
@@ -1049,7 +1068,9 @@ async fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         let help_cmd = build_i18n_command();
-        help_cmd.try_get_matches_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+        help_cmd
+            .try_get_matches_from(std::env::args_os())
+            .unwrap_or_else(|e| e.exit());
         // Unreachable: e.exit() prints the localised help and exits.
     }
 
@@ -1243,6 +1264,7 @@ async fn run() -> Result<i32> {
                     .unwrap_or(30 * 60);
                 let startup_mode = match client.as_deref() {
                     Some("vscode") => atomcode_telemetry::SessionMode::Vscode,
+                    Some("jetbrains") => atomcode_telemetry::SessionMode::Jetbrains,
                     Some("webui") => atomcode_telemetry::SessionMode::Webui,
                     Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
                     _ => atomcode_telemetry::SessionMode::Ide,
@@ -1329,8 +1351,7 @@ async fn run() -> Result<i32> {
                 // model in `config` BEFORE resolving it, so both the EngineConfig
                 // and the built provider pick up the override.
                 if let Some(ref model) = cli.model {
-                    let provider_name =
-                        cli.provider.as_deref().unwrap_or(&config.default_provider);
+                    let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
                     if let Some(p) = config.providers.get_mut(provider_name) {
                         p.model = model.clone();
                     }
@@ -1417,7 +1438,8 @@ async fn run() -> Result<i32> {
     // could be localised. Re-resolve with the full config (which may specify
     // a language key) to honour config-over-env priority.
     if config.language.is_some() {
-        let locale = atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+        let locale =
+            atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
         atomcode_tuix::i18n::set_locale(locale);
     }
 
@@ -1719,7 +1741,10 @@ async fn run() -> Result<i32> {
         .engine
         .clone()
         .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
-    let engine_v1 = matches!(engine_choice.as_deref(), Some("v1" | "1" | "legacy" | "old"));
+    let engine_v1 = matches!(
+        engine_choice.as_deref(),
+        Some("v1" | "1" | "legacy" | "old")
+    );
     let engine_v2 = !engine_v1;
     if engine_v1 {
         eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
@@ -2080,7 +2105,9 @@ fn bridge_config_from(
         telemetry,
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
-        provider_type: p.map(|p| p.provider_type.clone()).unwrap_or_else(|| "openai".into()),
+        provider_type: p
+            .map(|p| p.provider_type.clone())
+            .unwrap_or_else(|| "openai".into()),
         thinking_enabled: p.and_then(|p| p.thinking_enabled),
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
@@ -2398,7 +2425,12 @@ async fn run_headless(
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
             }
-            AgentEvent::RateLimited { reset_at_display, secs_until_reset, auto_resuming, .. } => {
+            AgentEvent::RateLimited {
+                reset_at_display,
+                secs_until_reset,
+                auto_resuming,
+                ..
+            } => {
                 // 429 rate-limit PAUSE/auto-wait notice. Headless: loud to
                 // stderr, no exit-code change, no shutdown — a Pause ends the
                 // turn via the upcoming TurnComplete(RateLimited); a WaitAndRetry
@@ -2417,7 +2449,10 @@ async fn run_headless(
                 } else if let Some(s) = secs_until_reset {
                     // Pause with no wall-clock time but a known remaining duration:
                     // surface the seconds instead of dropping them.
-                    eprintln!("[rate-limited] 5h window exhausted — resets in {}s, retry later", s);
+                    eprintln!(
+                        "[rate-limited] 5h window exhausted — resets in {}s, retry later",
+                        s
+                    );
                 } else {
                     eprintln!("[rate-limited] 5h window exhausted — paused, retry later");
                 }
@@ -2956,9 +2991,13 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
         }
         PluginCli::Install { spec } => {
             match parse_plugin_spec(&spec)? {
-                PluginSpec::Qualified { plugin, marketplace: mp } => {
-                    let info = installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
-                        .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+                PluginSpec::Qualified {
+                    plugin,
+                    marketplace: mp,
+                } => {
+                    let info =
+                        installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                            .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                     println!("  installed `{}@{}`", info.plugin, info.marketplace);
                 }
                 PluginSpec::Bare { plugin } => {
@@ -2969,8 +3008,12 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             let m = &matches[0];
                             let mp = m.marketplace.clone();
                             let resolved_plugin = m.plugin.clone();
-                            let info = installer::install(&resolved_plugin, &mp, atomcode_core::plugin::InstallScope::User)
-                                .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+                            let info = installer::install(
+                                &resolved_plugin,
+                                &mp,
+                                atomcode_core::plugin::InstallScope::User,
+                            )
+                            .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                             println!("  installed `{}@{}`", info.plugin, info.marketplace);
                         }
                         matches if matches.len() > 1 => {
@@ -2979,7 +3022,10 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                                 plugin
                             );
                             for m in &matches {
-                                msg.push_str(&format!("  atomcode plugin install {}@{}\n", m.plugin, m.marketplace));
+                                msg.push_str(&format!(
+                                    "  atomcode plugin install {}@{}\n",
+                                    m.plugin, m.marketplace
+                                ));
                             }
                             anyhow::bail!(msg.trim().to_string());
                         }
@@ -2993,7 +3039,10 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
         }
         PluginCli::Uninstall { spec } => {
             match parse_plugin_spec(&spec)? {
-                PluginSpec::Qualified { plugin, marketplace: mp } => {
+                PluginSpec::Qualified {
+                    plugin,
+                    marketplace: mp,
+                } => {
                     installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                         .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
                     println!("  uninstalled `{}@{}`", plugin, mp);
@@ -3022,7 +3071,10 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                                 plugin
                             );
                             for p in &matches {
-                                msg.push_str(&format!("  atomcode plugin uninstall {}@{}\n", p.plugin, p.marketplace));
+                                msg.push_str(&format!(
+                                    "  atomcode plugin uninstall {}@{}\n",
+                                    p.plugin, p.marketplace
+                                ));
                             }
                             anyhow::bail!(msg.trim().to_string());
                         }

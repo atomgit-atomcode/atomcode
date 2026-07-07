@@ -17,6 +17,9 @@ data class ChatState(
     val pendingPermission: PermissionRequestState? = null,
     val tokens: TokenUsageState? = null,
     val draft: String = "",
+    val approvalMode: String = "build",
+    val confirmedApprovalMode: String = "build",
+    val pendingApprovalMode: String? = null,
 )
 
 data class PermissionRequestState(
@@ -38,6 +41,11 @@ data class TokenUsageState(
 data class QueuedPrompt(
     val id: String,
     val text: String,
+    val approvalMode: String,
+    val images: List<ImageRef> = emptyList(),
+    val contextFiles: List<String> = emptyList(),
+    val sessionId: String? = null,
+    val workingDir: String? = null,
 )
 
 sealed interface GenerationState {

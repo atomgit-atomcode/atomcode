@@ -101,6 +101,12 @@ class DaemonClient(
         post<Map<String, Any>, PermissionDecisionRequest>("/chat/permission", request)
     }
 
+    suspend fun getApprovalMode(): ApprovalModeResponse =
+        get("/approval_mode")
+
+    suspend fun setApprovalMode(mode: ApprovalMode): ApprovalModeResponse =
+        post("/approval_mode", ApprovalModeRequest(mode.wire))
+
     // ── Session ──
 
     suspend fun createSession(workingDir: String?, title: String?): CreateSessionResponse =

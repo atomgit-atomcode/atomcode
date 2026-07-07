@@ -60,6 +60,7 @@ export interface StreamChatBody {
   working_dir?: string;
   provider?: string;
   images?: ImageData[];
+  approval_mode?: ApprovalMode;
 }
 
 export async function stopChat(requestId: string): Promise<void> {
@@ -556,6 +557,11 @@ export async function getSession(
  *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
 export type ApprovalMode = 'build' | 'plan' | 'bypass';
 
+export interface ApprovalModeResponse {
+  ok: boolean;
+  mode: ApprovalMode;
+}
+
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
@@ -653,12 +659,22 @@ export async function postLiveProvider(provider: string): Promise<void> {
 
 /** Switch the approval mode (build / plan / bypass). Runtime session state —
  *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
-export async function postLiveMode(mode: ApprovalMode): Promise<void> {
-  await fetch('/live/mode', {
+export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
+  const resp = await fetch('/approval_mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ mode }),
   });
+  if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
+  const body = (await resp.json()) as ApprovalModeResponse;
+  return body.mode;
+}
+
+export async function getApprovalMode(): Promise<ApprovalMode> {
+  const resp = await fetch('/approval_mode', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
+  const body = (await resp.json()) as ApprovalModeResponse;
+  return body.mode;
 }
 
 /** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is

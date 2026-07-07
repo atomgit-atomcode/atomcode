@@ -22,6 +22,47 @@ class ChatStore(
         _state.update { reduce(it, action, defaultIds) }
     }
 
+    fun setApprovalMode(mode: ApprovalMode) {
+        val currentState = _state.value
+        if (currentState.pendingApprovalMode != null || currentState.approvalMode == mode.wire) return
+        _state.update {
+            it.copy(
+                approvalMode = mode.wire,
+                pendingApprovalMode = mode.wire,
+            )
+        }
+        scope.launch {
+            runCatching { client.setApprovalMode(mode) }
+                .onSuccess { response ->
+                    val applied = response.mode.ifBlank { mode.wire }
+                    _state.update { current ->
+                        if (current.pendingApprovalMode == mode.wire) {
+                            current.copy(
+                                approvalMode = applied,
+                                confirmedApprovalMode = applied,
+                                pendingApprovalMode = null,
+                            )
+                        } else {
+                            current
+                        }
+                    }
+                }
+                .onFailure {
+                    _state.update { current ->
+                        if (current.pendingApprovalMode == mode.wire) {
+                            current.copy(
+                                approvalMode = current.confirmedApprovalMode,
+                                pendingApprovalMode = null,
+                            )
+                        } else {
+                            current
+                        }
+                    }
+                }
+            drainQueueIfReady()
+        }
+    }
+
     fun submitPrompt(
         text: String,
         images: List<ImageRef> = emptyList(),
@@ -30,12 +71,54 @@ class ChatStore(
         workingDir: String? = null
     ) {
         val current = _state.value
-        if (current.generation is GenerationState.Streaming ||
+        if (current.pendingApprovalMode != null ||
+            current.generation is GenerationState.Streaming ||
             current.generation is GenerationState.WaitingPermission) {
-            _state.update { it.copy(queue = it.queue.toMutableList().apply { add(QueuedPrompt(defaultIds("q"), text)) }.toImmutableList()) }
+            enqueuePrompt(text, images, contextFiles, sessionId, workingDir, current.confirmedApprovalMode)
             return
         }
 
+        startPrompt(text, images, contextFiles, sessionId, workingDir, current.confirmedApprovalMode)
+    }
+
+    private fun enqueuePrompt(
+        text: String,
+        images: List<ImageRef>,
+        contextFiles: List<String>,
+        sessionId: String?,
+        workingDir: String?,
+        approvalMode: String,
+    ) {
+        _state.update {
+            it.copy(
+                queue = it.queue.toMutableList()
+                    .apply {
+                        add(
+                            QueuedPrompt(
+                                id = defaultIds("q"),
+                                text = text,
+                                approvalMode = approvalMode,
+                                images = images,
+                                contextFiles = contextFiles,
+                                sessionId = sessionId,
+                                workingDir = workingDir,
+                            )
+                        )
+                    }
+                    .toImmutableList()
+            )
+        }
+    }
+
+    private fun startPrompt(
+        text: String,
+        images: List<ImageRef> = emptyList(),
+        contextFiles: List<String> = emptyList(),
+        sessionId: String? = null,
+        workingDir: String? = null,
+        approvalMode: String,
+    ) {
+        val current = _state.value
         dispatch(ChatAction.SubmitPrompt(text, images, contextFiles))
         val sid = sessionId ?: current.sessionId
 
@@ -45,7 +128,8 @@ class ChatStore(
                     ChatRequest(message = text,
                         images = images.map { ImageInput(it.mediaType, it.data) },
                         sessionId = sid,
-                        workingDir = workingDir)
+                        workingDir = workingDir,
+                        approvalMode = approvalMode)
                 )
                 stream.events().collect { event ->
                     dispatch(ChatAction.DaemonEvent(event))
@@ -92,12 +176,29 @@ class ChatStore(
     }
 
     private fun afterStreamComplete() {
-        val current = _state.value
         _state.update { it.copy(generation = GenerationState.Idle) }
+        drainQueueIfReady()
+    }
+
+    private fun drainQueueIfReady() {
+        val current = _state.value
+        if (current.generation !is GenerationState.Idle ||
+            current.pendingApprovalMode != null ||
+            current.queue.isEmpty()) {
+            return
+        }
+
         if (current.queue.isNotEmpty()) {
             val next = current.queue[0]
             _state.update { it.copy(queue = it.queue.toMutableList().apply { removeAt(0) }.toImmutableList()) }
-            submitPrompt(next.text)
+            startPrompt(
+                text = next.text,
+                images = next.images,
+                contextFiles = next.contextFiles,
+                sessionId = next.sessionId,
+                workingDir = next.workingDir,
+                approvalMode = next.approvalMode,
+            )
         }
     }
 }

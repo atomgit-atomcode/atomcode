@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
-import { ChatState, ChatAction, ExtensionMessage, ImageData } from './types';
+import { ChatState, ChatAction, ExtensionMessage, ImageData, ApprovalMode } from './types';
 import { chatReducer, initialState } from './reducer';
 import { postMessage, getVSCodeApi } from '../vscode';
 import { createTranslator } from '../i18n';
@@ -14,6 +14,7 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   selectReasoningEffort: (provider: string, effort: string | null) => void;
+  selectApprovalMode: (mode: ApprovalMode) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
   openSidebar: () => void;
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
@@ -59,6 +60,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             projectHash: msg.projectHash,
             isSessionList: msg.isSessionList,
             locale: msg.locale,
+            approvalMode: msg.approvalMode,
+            approvalModePending: msg.approvalModePending,
           });
           // Persist session binding so tabs survive VS Code restart
           if (msg.activeSessionId) {
@@ -157,6 +160,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
           break;
+        case 'approvalMode':
+          dispatch({ type: 'SET_APPROVAL_MODE', mode: msg.mode, pending: msg.pending });
+          break;
         case 'providers':
           dispatch({ type: 'SET_PROVIDERS', providers: msg.providers, defaultProvider: msg.defaultProvider });
           break;
@@ -237,6 +243,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const send = useCallback(
     (text: string, images?: ImageData[]) => {
       const state = stateRef.current;
+      if (state.approvalModePending) return;
       const ctx = state.contextFiles.length > 0
         ? state.contextFiles.map((f) => ({
             path: f.path,
@@ -263,6 +270,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         images,
         clientMessageId: isQueued ? clientMessageId : undefined,
         sessionId: state.activeSessionId,
+        approvalMode: state.approvalMode,
       });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
@@ -286,6 +294,11 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const selectReasoningEffort = useCallback((provider: string, effort: string | null) => {
     dispatch({ type: 'SET_REASONING_EFFORT', provider, effort });
     postMessage({ type: 'selectReasoningEffort', provider, effort });
+  }, []);
+
+  const selectApprovalMode = useCallback((mode: ApprovalMode) => {
+    if (stateRef.current.approvalModePending) return;
+    postMessage({ type: 'selectApprovalMode', mode });
   }, []);
 
   const loadSession = useCallback((sessionId: string, projectHash?: string) => {
@@ -358,6 +371,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     newConversation,
     selectModel,
     selectReasoningEffort,
+    selectApprovalMode,
     loadSession,
     openSessionInTab,
     renameSession,

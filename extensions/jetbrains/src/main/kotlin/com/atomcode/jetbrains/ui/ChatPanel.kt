@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.ui
 import com.atomcode.jetbrains.client.ConnectionState
 import com.atomcode.jetbrains.ide.ClipboardService
 import com.atomcode.jetbrains.ide.EditorContext
+import com.atomcode.jetbrains.protocol.ApprovalMode
 import com.atomcode.jetbrains.store.ChatStore
 import com.atomcode.jetbrains.store.SessionStore
 import com.atomcode.jetbrains.store.ProviderStore
@@ -19,6 +20,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.awt.BorderLayout
 import javax.swing.JLabel
+import javax.swing.JComboBox
 import javax.swing.JPanel
 import javax.swing.SwingConstants
 
@@ -44,9 +46,17 @@ class ChatPanel(
     private val headerLabel = JLabel("AtomCode").apply {
         horizontalAlignment = SwingConstants.CENTER
     }
+    private val modePicker = JComboBox(ApprovalMode.values()).apply {
+        selectedItem = ApprovalMode.Build
+        toolTipText = "Approval mode"
+    }
+    private var syncingModePicker = false
 
     private val inputPanel = InputPanel(
-        onSend = { text -> chatStore.submitPrompt(text, workingDir = project.basePath) },
+        onSend = { text ->
+            chatStore.submitPrompt(text, workingDir = project.basePath)
+            true
+        },
         onStop = { chatStore.stop() },
         onAttach = {
             // 打开 IntelliJ 文件选择器 → 附加为上下文
@@ -90,14 +100,41 @@ class ChatPanel(
     )
 
     init {
-        add(headerLabel, BorderLayout.NORTH)
+        val header = JPanel(BorderLayout()).apply {
+            add(headerLabel, BorderLayout.CENTER)
+            add(modePicker, BorderLayout.EAST)
+        }
+        add(header, BorderLayout.NORTH)
         add(chatWebView.createComponent(this), BorderLayout.CENTER)
         add(inputPanel, BorderLayout.SOUTH)
+
+        modePicker.addActionListener {
+            if (syncingModePicker) return@addActionListener
+            (modePicker.selectedItem as? ApprovalMode)?.let(chatStore::setApprovalMode)
+        }
 
         hostBridge.install()
 
         // 观察 store 状态 → 渲染
         scope.launch { throttler.observe(chatStore.state) }
+        scope.launch {
+            chatStore.state.collect { state ->
+                val mode = when (state.approvalMode) {
+                    ApprovalMode.Plan.wire -> ApprovalMode.Plan
+                    ApprovalMode.Bypass.wire -> ApprovalMode.Bypass
+                    else -> ApprovalMode.Build
+                }
+                syncingModePicker = true
+                try {
+                    if (modePicker.selectedItem != mode) {
+                        modePicker.selectedItem = mode
+                    }
+                    modePicker.isEnabled = state.pendingApprovalMode == null
+                } finally {
+                    syncingModePicker = false
+                }
+            }
+        }
 
         // 观察连接状态
         scope.launch {

@@ -281,6 +281,7 @@ class AtomCodeDaemonClient(
             append("\"working_dir\":${request.workingDir.jsonQuoted()},")
             append("\"session_id\":${request.sessionId.jsonQuoted()}")
             request.provider?.let { append(",\"provider\":${it.jsonQuoted()}") }
+            request.approvalMode?.let { append(",\"approval_mode\":${it.jsonQuoted()}") }
             if (request.images.isNotEmpty()) {
                 append(",\"images\":[")
                 request.images.forEachIndexed { index, image ->
@@ -337,6 +338,24 @@ class AtomCodeDaemonClient(
             }
 
         return future
+    }
+
+    fun getApprovalMode(): CompletableFuture<ApprovalModeResponse> =
+        send("GET", "/approval_mode").thenApply {
+            ApprovalModeResponse(
+                ok = it.jsonBoolean("ok") ?: false,
+                mode = it.jsonString("mode").orEmpty(),
+            )
+        }
+
+    fun setApprovalMode(mode: ApprovalMode): CompletableFuture<ApprovalModeResponse> {
+        val body = "{\"mode\":${mode.wire.jsonQuoted()}}"
+        return send("POST", "/approval_mode", body).thenApply {
+            ApprovalModeResponse(
+                ok = it.jsonBoolean("ok") ?: false,
+                mode = it.jsonString("mode").orEmpty(),
+            )
+        }
     }
 
     private fun send(method: String, path: String, body: String? = null): CompletableFuture<String> {

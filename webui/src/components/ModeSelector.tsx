@@ -13,9 +13,11 @@ const MODE_OPTIONS: { val: ApprovalMode; label: MsgKey; desc: MsgKey }[] = [
 
 export function ModeSelector({
   value,
+  disabled = false,
   onChange,
 }: {
   value: ApprovalMode;
+  disabled?: boolean;
   onChange: (m: ApprovalMode) => void;
 }) {
   const t = useT();
@@ -35,7 +37,10 @@ export function ModeSelector({
     <div class="model-selector model-selector-up mode-selector" ref={ref}>
       <button
         class={'model-selector-trigger mode-selector-trigger' + (isBypass ? ' mode-bypass' : '')}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          if (!disabled) setOpen((o) => !o);
+        }}
+        disabled={disabled}
         type="button"
         title={t('mode.label')}
       >
@@ -54,7 +59,9 @@ export function ModeSelector({
                 (o.val === 'bypass' ? ' mode-item-bypass' : '')
               }
               type="button"
+              disabled={disabled}
               onClick={() => {
+                if (disabled) return;
                 onChange(o.val);
                 setOpen(false);
               }}

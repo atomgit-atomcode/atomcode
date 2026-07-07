@@ -19,12 +19,12 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+pub mod approval_mode;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
 pub use live_api::live_set_mode;
-pub use live_api::ApprovalMode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
@@ -989,6 +989,7 @@ fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
         "channel" => SessionMode::Channel,
         "vscode" => SessionMode::Vscode,
+        "jetbrains" => SessionMode::Jetbrains,
         "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
@@ -1019,16 +1020,28 @@ fn is_loopback_authority(authority: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// 渠道客户端是否启用交互式审批。
-/// - webui token 模式(enforce_token)：始终交互（原行为）。
-/// - SessionMode::Channel：仅当 daemon 绑定回环时交互（免 token 故强制回环守卫）。
-fn channel_interactive_permission(
+/// Whether this client can receive interactive approval prompts.
+/// Token-protected webui mode is always interactive. Local known clients are
+/// also allowed on loopback because their UI can answer `/chat/permission`.
+fn client_interactive_permission(
     client_mode: SessionMode,
     enforce_token: bool,
     bind_host: &str,
 ) -> bool {
     enforce_token
-        || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
+        || (matches!(
+            client_mode,
+            SessionMode::Channel
+                | SessionMode::Webui
+                | SessionMode::Vscode
+                | SessionMode::Jetbrains
+        ) && is_loopback_authority(bind_host))
+}
+
+fn effective_chat_approval_mode(
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+) -> crate::approval_mode::ApprovalMode {
+    request_mode.unwrap_or_else(live_api::live_current_approval_mode)
 }
 /// Map a working directory to its physical session-bucket name.
 ///
@@ -1545,9 +1558,9 @@ async fn change_dir(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            crate::live_api::live_switch_session(
-                atomcode_core::session::SessionId::from_string(sid.to_string()),
-            );
+            crate::live_api::live_switch_session(atomcode_core::session::SessionId::from_string(
+                sid.to_string(),
+            ));
         }
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
@@ -1613,8 +1626,14 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                 id: session.id.to_string(),
                 name: session.name,
                 working_dir: session.working_dir,
-                created_at: session.created_at.checked_mul(1000).unwrap_or(session.created_at * 1000),
-                updated_at: session.updated_at.checked_mul(1000).unwrap_or(session.updated_at * 1000),
+                created_at: session
+                    .created_at
+                    .checked_mul(1000)
+                    .unwrap_or(session.created_at * 1000),
+                updated_at: session
+                    .updated_at
+                    .checked_mul(1000)
+                    .unwrap_or(session.updated_at * 1000),
                 message_count: messages.len(),
                 messages,
             };
@@ -1865,7 +1884,11 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
                                     .to_string_lossy()
                                     .to_lowercase()
                                     .contains(&keyword_lower)
-                                || session.id.as_str().to_lowercase().starts_with(&keyword_lower);
+                                || session
+                                    .id
+                                    .as_str()
+                                    .to_lowercase()
+                                    .starts_with(&keyword_lower);
                             if matches {
                                 let mut meta = SessionMeta::from(&session);
                                 meta.file_size = file_size;
@@ -2091,6 +2114,10 @@ pub struct ChatRequest {
     /// (vision_preprocessor) and turned into text, mirroring the TUI.
     #[serde(default)]
     pub images: Vec<ImageInput>,
+    /// Optional per-request approval mode. When absent, the daemon falls back
+    /// to the current runtime mode set via `/approval_mode` or `/live/mode`.
+    #[serde(default)]
+    pub approval_mode: Option<crate::approval_mode::ApprovalMode>,
 }
 
 /// One attached image from the webui (base64-encoded), mapped to core `ImagePart`.
@@ -2547,7 +2574,7 @@ async fn chat_stream(
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
     let interactive_permission =
-        channel_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
+        client_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -2635,6 +2662,7 @@ async fn process_chat_request(
         read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
         web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
+    let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
@@ -2889,49 +2917,46 @@ async fn process_chat_request(
     // `/chat/permission`, which is routed back here via `pending_permissions`.
     // The user-facing notification is the `TurnEvent::ApprovalRequested` event
     // forwarded as a `permission_request` SSE event below.
-    // Only registered in interactive (webui/channel) mode has a human approver
-    // reachable via POST /chat/permission, so only there do we use the blocking
-    // InteractivePermissionDecider + its register/keep-alive/unregister
-    // plumbing. The standalone daemon (VSCode extension, no browser) has no
-    // approver, so it must keep the prior BypassAll behaviour — otherwise any
-    // tool requiring approval would block the turn forever.
-    // A browser is present (interactive) — honour the webui「模式」pill
-    // (LIVE_APPROVAL_MODE), so Plan/Bypass work in the DEFAULT non-sync path too
-    // (this /chat handler), not only in sync mode. Standalone (no browser) keeps
-    // BypassAll — a tool needing approval would otherwise block forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) =
-        if interactive_permission {
-            match live_api::live_current_approval_mode() {
-                live_api::ApprovalMode::Bypass => (
-                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-                    None,
-                ),
-                live_api::ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
-                live_api::ApprovalMode::Build => {
-                    let (perm_req_tx, perm_req_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                    let (perm_resp_tx, perm_resp_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                        atomcode_core::tool::PermissionStore::new(),
-                    ));
-                    pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-                    (
-                        Box::new(InteractivePermissionDecider::new(
-                            perm_req_tx,
-                            perm_resp_rx,
-                            perm_store,
-                        )),
-                        Some(perm_req_rx),
-                    )
-                }
-            }
-        } else {
+    // Interactive local clients (WebUI, channel, VSCode, JetBrains) can answer
+    // approval prompts, so Build uses InteractivePermissionDecider plus the
+    // register/keep-alive/unregister plumbing. Clients without a permission
+    // response channel keep the compatibility BypassAll fallback in Build mode;
+    // Plan and Bypass are explicit modes and never depend on an approver.
+    let registered_permission_responder =
+        interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = match approval_mode {
+        crate::approval_mode::ApprovalMode::Bypass => (
+            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            None,
+        ),
+        crate::approval_mode::ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
+        crate::approval_mode::ApprovalMode::Build if interactive_permission => {
+            let (perm_req_tx, perm_req_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+            let (perm_resp_tx, perm_resp_rx) =
+                tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+            let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                atomcode_core::tool::PermissionStore::new(),
+            ));
+            pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+            (
+                Box::new(InteractivePermissionDecider::new(
+                    perm_req_tx,
+                    perm_resp_rx,
+                    perm_store,
+                )),
+                Some(perm_req_rx),
+            )
+        }
+        crate::approval_mode::ApprovalMode::Build => {
+            // Compatibility for clients without a permission response channel.
+            // Known local IDE/webui clients are classified interactive above.
             (
                 Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
                 None,
             )
-        };
+        }
+    };
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider (the one actually selected for this turn,
     // not config.default_provider), fallback to synthetic 128K config if absent.
@@ -2979,14 +3004,11 @@ async fn process_chat_request(
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
     let mut system_prompt =
         build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
-    // Plan mode (browser present): append the read-only plan instruction so the
-    // model explores + plans instead of firing edits the PlanPermissionDecider
-    // will deny. Mirrors the live path; gated on `interactive_permission` so the
-    // standalone BypassAll path is untouched.
-    if interactive_permission
-        && live_api::live_current_approval_mode() == live_api::ApprovalMode::Plan
-    {
-        system_prompt.push_str(live_api::PLAN_MODE_SYSTEM_SUFFIX);
+    // Plan mode: append the read-only plan instruction so the model explores
+    // and plans instead of firing edits that PlanPermissionDecider will deny.
+    // Mirrors the live path for every client that selects Plan.
+    if approval_mode == crate::approval_mode::ApprovalMode::Plan {
+        system_prompt.push_str(crate::approval_mode::PLAN_MODE_SYSTEM_SUFFIX);
     }
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
@@ -3019,8 +3041,8 @@ async fn process_chat_request(
         });
         // Turn never ran — drop the permission registration and the request
         // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too). Only registered in interactive (webui/channel) mode.
-        if interactive_permission {
+        // dropped here too). Only registered in interactive Build mode.
+        if registered_permission_responder {
             pending_permissions.unregister(&perm_session_key);
         }
         return Ok(());
@@ -3036,11 +3058,15 @@ async fn process_chat_request(
     // stack via atomcode-bridge instead of the v1 TurnRunner; the downstream
     // turn_rx → ChatEvent consumer + persistence are SHARED (they only read turn_rx).
     if live_api::live_engine_v2() {
-        let bridge_cfg =
+        let mut bridge_cfg =
             live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
+        bridge_cfg.dangerously_skip_permissions = approval_mode
+            == crate::approval_mode::ApprovalMode::Bypass
+            || (approval_mode == crate::approval_mode::ApprovalMode::Build
+                && !interactive_permission);
         // Interactive approval: route /chat/permission decisions to the v2 producer
         // (this re-registration supersedes the v1 decider's, which never runs here).
-        let perm_rx = if interactive_permission {
+        let perm_rx = if registered_permission_responder {
             let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
@@ -3051,7 +3077,15 @@ async fn process_chat_request(
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
-                live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
+                live_api::run_chat_turn_v2(
+                    conv,
+                    turn_tx,
+                    cancel,
+                    bridge_cfg,
+                    perm_rx,
+                    approval_mode,
+                )
+                .await;
             })
             .await;
         });
@@ -3107,8 +3141,17 @@ async fn process_chat_request(
                         .await;
                     }
 
+                    let tool_filter =
+                        crate::approval_mode::approval_mode_tool_filter(approval_mode);
                     let result = turn_runner
-                        .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                        .run_with_filter(
+                            &mut conv,
+                            &system_prompt,
+                            "",
+                            &turn_tx,
+                            cancel_token.clone(),
+                            tool_filter,
+                        )
                         .await;
 
                     match result {
@@ -3353,8 +3396,8 @@ async fn process_chat_request(
     });
     // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
     // when the turn task and its turn_tx are dropped). Drop the permission
-    // registration so it doesn't leak. Only registered in interactive (webui/channel) mode.
-    if interactive_permission {
+    // registration so it doesn't leak. Only registered in interactive Build mode.
+    if registered_permission_responder {
         pending_permissions.unregister(&perm_session_key);
     }
     Ok(())
@@ -4617,6 +4660,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
+        .route(
+            "/approval_mode",
+            get(live_api::approval_mode_get).post(live_api::approval_mode_set),
+        )
         // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
         .route("/tunnel/status", get(get_tunnel_status))
         // Live session API (阶段②)
@@ -5278,30 +5325,62 @@ mod channel_mode_tests {
     fn resolve_channel_header() {
         assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
         assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
+        assert_eq!(resolve_client_mode("jetbrains"), SessionMode::Jetbrains);
         assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
     }
 
     #[test]
-    fn channel_interactive_only_on_loopback() {
-        assert!(channel_interactive_permission(
+    fn known_clients_interactive_on_loopback_or_token() {
+        assert!(client_interactive_permission(
             SessionMode::Ide,
             true,
             "0.0.0.0"
         ));
-        assert!(channel_interactive_permission(
+        assert!(client_interactive_permission(
             SessionMode::Channel,
             false,
             "127.0.0.1"
         ));
-        assert!(!channel_interactive_permission(
+        assert!(client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Jetbrains,
+            false,
+            "localhost:17321"
+        ));
+        assert!(!client_interactive_permission(
             SessionMode::Channel,
             false,
             "0.0.0.0"
         ));
-        assert!(!channel_interactive_permission(
+        assert!(!client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!client_interactive_permission(
             SessionMode::Ide,
             false,
             "127.0.0.1"
         ));
+    }
+
+    #[test]
+    fn request_approval_mode_overrides_global_mode() {
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Build);
+        assert_eq!(
+            effective_chat_approval_mode(Some(crate::approval_mode::ApprovalMode::Plan)),
+            crate::approval_mode::ApprovalMode::Plan
+        );
+
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Bypass);
+        assert_eq!(
+            effective_chat_approval_mode(None),
+            crate::approval_mode::ApprovalMode::Bypass
+        );
     }
 }

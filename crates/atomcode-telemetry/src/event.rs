@@ -18,6 +18,7 @@ pub enum SessionMode {
     Tui,
     Ide,
     Vscode,
+    Jetbrains,
     #[serde(rename = "webui")]
     Webui,
     AtomcodeAir,
@@ -372,7 +373,10 @@ mod tests {
         let mut env = sample_envelope();
         // None → field omitted entirely.
         let s = serde_json::to_string(&env).unwrap();
-        assert!(!s.contains("surface"), "a None surface must be omitted; got {s}");
+        assert!(
+            !s.contains("surface"),
+            "a None surface must be omitted; got {s}"
+        );
         // Some → serialized as the raw tag.
         env.surface = Some("code_review".into());
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
@@ -824,12 +828,18 @@ mod tests {
 
     #[test]
     fn session_mode_webui_serializes_as_webui() {
-        assert_eq!(serde_json::to_string(&SessionMode::Webui).unwrap(), "\"webui\"");
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Webui).unwrap(),
+            "\"webui\""
+        );
     }
 
     #[test]
     fn session_mode_channel_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&SessionMode::Channel).unwrap(), "\"channel\"");
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Channel).unwrap(),
+            "\"channel\""
+        );
     }
 }
 
