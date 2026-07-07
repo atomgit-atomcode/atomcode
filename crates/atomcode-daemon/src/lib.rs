@@ -2760,6 +2760,13 @@ async fn process_chat_request(
             // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
             // 用于在对话里渲染缩略图。
             use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+            // Bind the conversation's session id onto the (throwaway) provider so
+            // maybe_preprocess forwards x-atomcode-session-id onto the one-off VL
+            // request (gateway affinity), matching the TUI bridge / live paths.
+            let vl_sid = session.id.as_str();
+            if !vl_sid.is_empty() {
+                provider.set_session_id(vl_sid);
+            }
             let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
                 PreprocessOutcome::Skipped => req.message.clone(),
                 PreprocessOutcome::Replaced { text, vl_key } => {
