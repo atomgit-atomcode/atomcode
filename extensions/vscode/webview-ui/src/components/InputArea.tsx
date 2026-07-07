@@ -3,6 +3,7 @@ import { useChatContext } from '../state/ChatProvider';
 import { formatTokenCount } from '../utils/format';
 import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
+import { ModeSelector } from './ModeSelector';
 import { postMessage } from '../vscode';
 import { ImageData, SkillInfo } from '../state/types';
 import { useT } from '../i18n';
@@ -261,6 +262,7 @@ export function InputArea() {
   }, [t]);
 
   const handleSend = useCallback(() => {
+    if (state.approvalModePending) return;
     const value = textRef.current;
     const trimmed = value.trim();
     if (!trimmed && pendingImages.length === 0) return;
@@ -275,7 +277,7 @@ export function InputArea() {
       inputHistoryRef.current = [...history, trimmed].slice(-MAX_INPUT_HISTORY);
     }
     historyIndexRef.current = -1;
-  }, [pendingImages, send]);
+  }, [pendingImages, send, state.approvalModePending]);
 
   const selectAtItem = useCallback((item: WorkspacePath) => {
     const el = textareaRef.current;
@@ -644,11 +646,12 @@ export function InputArea() {
           </button>
           <span className="footer-spacer" />
           {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total, t)}</span>}
+          <ModeSelector placement="up" onOpen={() => setShowSlash(false)} />
           <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
           {state.isGenerating ? (
             <>
               {hasText && (
-                <button className="btn-send" onClick={handleSend} title={t('input.queueMessage')}>
+                <button className="btn-send" onClick={handleSend} disabled={state.approvalModePending} title={t('input.queueMessage')}>
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                     <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
                   </svg>
@@ -659,7 +662,7 @@ export function InputArea() {
               </button>
             </>
           ) : (
-            <button className="btn-send" onClick={handleSend} disabled={!hasText} title={t('input.send')}>
+            <button className="btn-send" onClick={handleSend} disabled={state.approvalModePending || !hasText} title={t('input.send')}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
               </svg>

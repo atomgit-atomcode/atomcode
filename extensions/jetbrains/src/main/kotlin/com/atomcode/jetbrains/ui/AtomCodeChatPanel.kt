@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.ui
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatStreamListener
 import com.atomcode.jetbrains.daemon.ConnectionState
+import com.atomcode.jetbrains.daemon.ApprovalMode
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
@@ -216,11 +217,16 @@ class AtomCodeChatPanel(
     private val modelPicker = JComboBox<ModelInfo>().apply {
         prototypeDisplayValue = ModelInfo("provider", "model-name", "openai", false)
     }
+    private val modePicker = JComboBox(ApprovalMode.values()).apply {
+        toolTipText = "Approval mode"
+        selectedItem = ApprovalMode.Build
+    }
     private val sessionPicker = JComboBox<SessionMeta>().apply {
         prototypeDisplayValue = SessionMeta("00000000", "Recent conversation title", "", 0L, 99)
     }
     private var loadingSessions = false
     private var loadingModels = false
+    private var loadingMode = false
     private var generating = false
     private var generationSequence = 0L
     private var activeGenerationId: Long? = null
@@ -239,6 +245,9 @@ class AtomCodeChatPanel(
             if (!disposed) {
                 renderConnectionState(event.newValue as ConnectionState)
                 if (event.newValue is ConnectionState.Ready) {
+                    loadingMode = true
+                    modePicker.selectedItem = service.approvalMode
+                    loadingMode = false
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -254,6 +263,7 @@ class AtomCodeChatPanel(
         add(header, BorderLayout.NORTH)
         add(messageView, BorderLayout.CENTER)
         add(inputPanel, BorderLayout.SOUTH)
+        header.setRightComponent(modePicker)
 
         // ── Action bindings ──
         modelPicker.addActionListener {
@@ -264,6 +274,11 @@ class AtomCodeChatPanel(
         sessionPicker.addActionListener {
             if (!loadingSessions) {
                 (sessionPicker.selectedItem as? SessionMeta)?.let(::loadSession)
+            }
+        }
+        modePicker.addActionListener {
+            if (!loadingMode) {
+                (modePicker.selectedItem as? ApprovalMode)?.let(::setApprovalMode)
             }
         }
         installInputKeyBindings()
@@ -456,6 +471,27 @@ class AtomCodeChatPanel(
                 }
                 renderSetupSnapshot(snapshot)
                 addSystemMessage("Default model set to ${model.model}.")
+            }
+        }
+    }
+
+    private fun setApprovalMode(mode: ApprovalMode) {
+        modePicker.isEnabled = false
+        service.setApprovalMode(mode).whenComplete { applied, error ->
+            SwingUtilities.invokeLater {
+                modePicker.isEnabled = true
+                if (error != null) {
+                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to set approval mode")
+                    loadingMode = true
+                    modePicker.selectedItem = service.approvalMode
+                    loadingMode = false
+                    startNextQueuedPromptIfReady()
+                    return@invokeLater
+                }
+                loadingMode = true
+                modePicker.selectedItem = applied
+                loadingMode = false
+                startNextQueuedPromptIfReady()
             }
         }
     }
@@ -924,10 +960,14 @@ class AtomCodeChatPanel(
 
     // ── Send / Chat streaming ──
 
-    private fun handleSend(text: String) {
+    private fun handleSend(text: String): Boolean {
         val prompt = text.trim()
-        if (prompt.isEmpty()) return
-        if (handleLocalInputCommand(prompt)) { inputPanel.clearInput(); return }
+        if (prompt.isEmpty()) return false
+        if (service.approvalModePending) return false
+        if (handleLocalInputCommand(prompt)) {
+            inputPanel.clearInput()
+            return true
+        }
         val transformedPrompt = slashPromptTemplate(prompt) ?: prompt
         val pendingContextForSend = pendingContext.toList()
         val pendingImagesForSend = pendingImages.toList()
@@ -937,17 +977,27 @@ class AtomCodeChatPanel(
         val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
             pendingImagesForSend.map { it.toMessageAttachmentView() }
         val images = pendingImagesForSend.map { it.toImageInput() }
+        val approvalModeForSend = service.confirmedApprovalMode
 
         if (generating) {
-            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, attachments, images)
+            val queued = QueuedPrompt(
+                UUID.randomUUID().toString(),
+                transformedPrompt,
+                message,
+                contextNames,
+                attachments,
+                images,
+                approvalModeForSend,
+            )
             queuedPrompts += queued
             if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
-            return
+            return true
         }
         if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
-        startPrompt(transformedPrompt, message, contextNames, attachments, images)
+        startPrompt(transformedPrompt, message, contextNames, attachments, images, approvalModeForSend)
+        return true
     }
 
     private fun startPrompt(
@@ -956,6 +1006,7 @@ class AtomCodeChatPanel(
         contextNames: List<String>,
         attachments: List<MessageAttachmentView>,
         images: List<ImageInput>,
+        approvalMode: ApprovalMode,
     ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
@@ -997,7 +1048,7 @@ class AtomCodeChatPanel(
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
-        }, provider = provider, images = images).whenComplete { session, error ->
+        }, provider = provider, images = images, approvalMode = approvalMode).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue(generationId)
@@ -1052,7 +1103,7 @@ class AtomCodeChatPanel(
         if (!generating || activeGenerationId != generationId) return
 
         messageView.finishAssistantTurn()
-        val next = if (queuedPrompts.isEmpty()) null else queuedPrompts.removeFirst()
+        val next = nextQueuedPromptIfModeReady()
         if (next == null) {
             finishPrompt(generationId, assistantAlreadyFinished = true)
             return
@@ -1060,9 +1111,31 @@ class AtomCodeChatPanel(
 
         // Keep the composer in its generating state while handing off to the queued
         // prompt. Clearing it for one event-loop turn causes the visible flash.
+        startQueuedPrompt(next)
+    }
+
+    private fun startNextQueuedPromptIfReady() {
+        if (generating) return
+        val next = nextQueuedPromptIfModeReady() ?: return
+        startQueuedPrompt(next)
+    }
+
+    private fun nextQueuedPromptIfModeReady(): QueuedPrompt? {
+        if (service.approvalModePending || queuedPrompts.isEmpty()) return null
+        return queuedPrompts.removeFirst()
+    }
+
+    private fun startQueuedPrompt(next: QueuedPrompt) {
         activeGenerationId = null
         runtime?.removeQueuedPrompt(next.id)
-        startPrompt(next.prompt, next.message, next.contextNames, next.attachments, next.images)
+        startPrompt(
+            next.prompt,
+            next.message,
+            next.contextNames,
+            next.attachments,
+            next.images,
+            next.approvalMode,
+        )
     }
 
     private fun finishPrompt(
@@ -1777,6 +1850,7 @@ private data class QueuedPrompt(
     val contextNames: List<String>,
     val attachments: List<MessageAttachmentView>,
     val images: List<ImageInput>,
+    val approvalMode: ApprovalMode,
 )
 
 private data class PendingImageAttachment(

@@ -3,9 +3,9 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod background;
+pub mod compression;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
-pub mod compression;
 pub mod goal;
 pub mod goal_evaluator;
 pub mod loop_state;
@@ -53,7 +53,8 @@ pub enum AgentCommand {
     SendMessage {
         text: String,
         images: Vec<crate::conversation::message::ImagePart>,
-        #[allow(dead_code)] // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
+        #[allow(dead_code)]
+        // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
         image_markers: Vec<usize>,
     },
     /// Cancel current operation.
@@ -123,7 +124,9 @@ pub enum AgentCommand {
     /// prompt (1-based). `None` targets the last prompt (bare `/undo`). The
     /// agent replies with `AgentEvent::ConversationTruncated` on success or
     /// `AgentEvent::UndoFailed` when `nth` is out of range.
-    UndoToPrompt { nth: Option<usize> },
+    UndoToPrompt {
+        nth: Option<usize>,
+    },
     /// User invoked `!cmd` bash mode. Runs the shell command locally and
     /// injects `<bash-input>/<bash-stdout>/<bash-stderr>` into the
     /// conversation as a User message — WITHOUT starting an LLM turn.
@@ -138,7 +141,9 @@ pub enum AgentCommand {
     /// Clear the active goal.
     ClearGoal,
     /// Start a self-paced /loop with the given prompt.
-    SetLoop { prompt: String },
+    SetLoop {
+        prompt: String,
+    },
     /// Stop the active /loop.
     ClearLoop,
     /// Shutdown the agent.
@@ -290,9 +295,7 @@ pub enum AgentEvent {
     /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
     /// Contains the cleaned conversation state for TUI to sync.
-    TurnCancelled {
-        snapshot: ConversationSnapshot,
-    },
+    TurnCancelled { snapshot: ConversationSnapshot },
     /// Conversation memory was rolled back by `/undo`. Carries the truncated
     /// message list (for the TUI to persist + replay), the removed prompt's
     /// text (to restore into the input box), and turn numbers for the
@@ -310,9 +313,7 @@ pub enum AgentEvent {
     /// conversation state at the time the agent processed the command.
     /// Used by the TUI to sync session state before backgrounding a session
     /// that is mid-turn (e.g. waiting for tool approval).
-    MessagesSync {
-        snapshot: ConversationSnapshot,
-    },
+    MessagesSync { snapshot: ConversationSnapshot },
     /// An error occurred. Carries a snapshot of `conversation.messages`
     /// so the TUI can persist mid-turn state even when the turn dies
     /// before TurnComplete/TurnCancelled fire — without this, a
@@ -373,10 +374,7 @@ pub enum AgentEvent {
     /// conversation history for the main model. `vl_key` is the provider
     /// key from config; `char_count` is `text.chars().count()` so users
     /// can spot zero/near-zero outputs that would mislead the main model.
-    VisionPreprocessSuccess {
-        vl_key: String,
-        char_count: usize,
-    },
+    VisionPreprocessSuccess { vl_key: String, char_count: usize },
     /// Sub-agent batch began. `tasks` is the ordered list of children
     /// the dispatcher is about to fork — same order as the resulting
     /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
@@ -490,6 +488,8 @@ pub enum AgentEvent {
     PeerBusy(bool),
     /// 同步会话的另一视图（webui 下拉框）切换了模型。TUI 据此更新头部显示与活动 provider。
     ProviderChanged(String),
+    /// 同步会话的另一视图（webui 模式下拉框）切换了审批模式。
+    ModeChanged { plan: bool, bypass: bool },
     /// 同步会话的另一视图（webui）创建了新会话。TUI 据此跟随切换到新会话。
     SessionSwitched(String),
     /// daemon 给当前活动会话改名。TUI 据此更新会话选择器与头部显示。
@@ -869,7 +869,6 @@ impl AgentRuntimeFactory {
     }
 }
 
-
 impl AgentLoop {
     /// Create a new agent loop and its corresponding UI handle.
     pub fn new(
@@ -1057,13 +1056,14 @@ impl AgentLoop {
 
         let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
 
-        let interactive_permission =
-            Box::new(crate::turn::permission::InteractivePermissionDecider::new_with_skip_permissions(
+        let interactive_permission = Box::new(
+            crate::turn::permission::InteractivePermissionDecider::new_with_skip_permissions(
                 approval_req_tx,
                 approval_resp_rx,
                 permission_store.clone(),
                 skip_permissions,
-            ));
+            ),
+        );
 
         // Hand the registry handle to ToolContext so active-dispatch tools
         // (parallel_edit_files) can read it at execute time without
@@ -1110,8 +1110,7 @@ impl AgentLoop {
                     skip_tls_verify: false,
                     ephemeral: true,
                     capable_model: None,
-
-}),
+                }),
             };
 
         // Initialize unified HookEngine
@@ -1287,7 +1286,11 @@ impl AgentLoop {
             model_name: self.turn_runner.provider.model_name().to_string(),
             provider_name: self.config.default_provider.clone(),
         };
-        let session_msgs = self.turn_runner.hook_engine.trigger_session_start(&session_ctx).await;
+        let session_msgs = self
+            .turn_runner
+            .hook_engine
+            .trigger_session_start(&session_ctx)
+            .await;
         if !session_msgs.is_empty() {
             // SessionStart hook Modified(msg) are collected and merged into the
             // cached system-prompt extensions so the LLM sees them.  Unlike
@@ -1345,9 +1348,9 @@ impl AgentLoop {
                                 );
                                 eprintln!("{msg}");
                                 let _ = self.event_tx.send(AgentEvent::Error {
-                            error: msg,
-                            snapshot: self.conversation.snapshot(),
-                        });
+                                    error: msg,
+                                    snapshot: self.conversation.snapshot(),
+                                });
                                 self.turn_runner.provider.clone()
                             }
                             Err(join_err) if join_err.is_panic() => {
@@ -1356,9 +1359,9 @@ impl AgentLoop {
                                 );
                                 eprintln!("{msg}");
                                 let _ = self.event_tx.send(AgentEvent::Error {
-                            error: msg,
-                            snapshot: self.conversation.snapshot(),
-                        });
+                                    error: msg,
+                                    snapshot: self.conversation.snapshot(),
+                                });
                                 self.turn_runner.provider.clone()
                             }
                             Err(join_err) => {
@@ -1367,9 +1370,9 @@ impl AgentLoop {
                                 );
                                 eprintln!("{msg}");
                                 let _ = self.event_tx.send(AgentEvent::Error {
-                            error: msg,
-                            snapshot: self.conversation.snapshot(),
-                        });
+                                    error: msg,
+                                    snapshot: self.conversation.snapshot(),
+                                });
                                 self.turn_runner.provider.clone()
                             }
                         }
@@ -1380,7 +1383,11 @@ impl AgentLoop {
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
-            crate::ctrace!("AGT", "outer cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
+            crate::ctrace!(
+                "AGT",
+                "outer cmd_rx pop: {:?}",
+                std::mem::discriminant(&cmd)
+            );
             if self.dispatch_one(cmd).await {
                 break;
             }
@@ -1391,474 +1398,483 @@ impl AgentLoop {
     /// Returns `true` if the agent should shut down (loop should break).
     async fn dispatch_one(&mut self, cmd: AgentCommand) -> bool {
         match cmd {
-                AgentCommand::SendMessage { text, images, image_markers } => {
-                    self.handle_send_message(text, images, image_markers).await;
-                    if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-                        return true;
-                    }
-                }
-                AgentCommand::LocalShell { cmd } => {
-                    self.handle_local_shell(cmd).await;
-                    if self.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-                        return true;
-                    }
-                }
-                AgentCommand::Cancel => {
-                    crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
-                    self.cancel_token.cancel();
-                    self.cancel_token = CancellationToken::new();
-                    self.phase = AgentPhase::Idle;
-                    // Cancel the current turn — preserve completed content, backfill
-                    // (cancelled) for unpaired tool calls, and mark turn as Completed.
-                    self.conversation.cancel_current_turn();
-                    // Ctrl+C/Esc must also halt any /goal auto-continuation
-                    // — otherwise the evaluator schedules a new turn right
-                    // after this cancel and the user sees endless
-                    // "(cancelled)" cycles (CR C3).
-                    if self.goal.active {
-                        self.finalize_goal_cancelled();
-                    }
-                    // Sync the preserved messages to TUI
-                    let snapshot = self.conversation.snapshot();
-                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
-                }
-                AgentCommand::ApproveTool => {
-                    // Approval handled inside run_turn_loop via channels
-                }
-                AgentCommand::ApproveToolAlways => {
-                    // Approval handled inside run_turn_loop via channels
-                }
-                AgentCommand::DenyTool => {
-                    // Denial handled inside run_turn_loop via channels
-                }
-                AgentCommand::ReloadConfig(new_config) => {
-                    let old_provider_name = self.config.default_provider.clone();
-                    let old_type = self
-                        .config
-                        .providers
-                        .get(&old_provider_name)
-                        .map(|p| p.provider_type.clone());
-                    self.config = new_config;
-                    // Config/instructions/model may have changed → rebuild the
-                    // frozen system prompt on the next turn.
-                    self.cached_system_prompt = None;
-                    // Rebuild hook engine from config files.
-                    let wd = self
-                        .turn_runner
-                        .context
-                        .working_dir
-                        .try_read()
-                        .map(|g| g.clone())
-                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let mut new_engine = HookEngine::new();
-                    new_engine.load_all(&wd);
-                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
-                    let new_provider_name = self.config.default_provider.clone();
-                    let new_type = self
-                        .config
-                        .providers
-                        .get(&new_provider_name)
-                        .map(|p| p.provider_type.clone());
-
-                    let should_clear = reload_should_clear_conversation(
-                        &old_provider_name,
-                        old_type.as_deref(),
-                        &new_provider_name,
-                        new_type.as_deref(),
-                    );
-                    if should_clear {
-                        self.conversation.messages.clear();
-                        self.conversation.turn_tracker =
-                            crate::conversation::turn::TurnTracker::new();
-                        self.session_files.clear();
-                    }
-
-                    if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
-                        // Rebuild the context strategy for the new provider.
-                        // Selected once per provider; per-model customizations
-                        // (e.g. Ollama schema trimming, Claude cache markers)
-                        // take effect from the next turn. Assign the same
-                        // `Arc` to both `self.ctx` and `self.turn_runner.ctx`
-                        // so datalog and the send path stay locked together.
-                        let new_ctx = crate::ctx::for_provider(provider_config);
-                        self.ctx = new_ctx.clone();
-                        self.turn_runner.ctx = new_ctx;
-                        match crate::provider::create_provider(provider_config) {
-                            Ok(new_provider) => {
-                                self.turn_runner.provider = std::sync::Arc::from(new_provider);
-                                self.turn_runner.config = self.config.clone();
-                            }
-                            Err(e) => {
-                                let msg = format!("{:#}", e);
-                                let is_auth_gap = msg.contains("Not logged in")
-                                    || msg.contains("Invalid auth.toml")
-                                    || msg.contains("Token expired")
-                                    || msg.contains("Token refresh failed");
-                                if is_auth_gap {
-                                    self.turn_runner.provider = std::sync::Arc::from(
-                                        crate::provider::unavailable_provider(format!(
-                                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
-                                            msg
-                                        )),
-                                    );
-                                    self.turn_runner.config = self.config.clone();
-                                } else {
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                        "**Warning: failed to reload provider: {}**\n\n",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                    } else {
-                        self.turn_runner.provider =
-                            std::sync::Arc::from(crate::provider::unavailable_provider(
-                                "No active provider configured. Use /provider to add one.",
-                            ));
-                        self.turn_runner.config = self.config.clone();
-                    }
-                }
-                AgentCommand::ChangeDir(path) => {
-                    self.change_dir(&path).await;
-                }
-                AgentCommand::AppendInput(text) => {
-                    // Queue user input to be injected before the next LLM call.
-                    if let Some(ref mut existing) = self.pending_input {
-                        existing.push('\n');
-                        existing.push_str(&text);
-                    } else {
-                        self.pending_input = Some(text);
-                    }
-                }
-                AgentCommand::ClearConversation => {
-                    // Clear the conversation history in the agent loop.
-                    self.conversation = Conversation::new();
-                    self.datalog.clear();
-                    // New session → re-snapshot the system prompt next turn.
-                    self.cached_system_prompt = None;
-                    // session_id is NOT reset here: /session pairs this with
-                    // a SetSessionId carrying the new session file's id, and
-                    // that's the single source of truth for the header.
-                }
-                AgentCommand::SetSessionId(id) => {
-                    self.session_id = id;
-                    self.turn_runner
-                        .provider
-                        .set_session_id(&self.session_id);
-                    self.datalog.set_session_id(&self.session_id);
-                    if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
-                        self.turn_runner.context.telemetry.set_session_id(uuid);
-                    }
-                }
-                AgentCommand::SetConversation(snapshot) => {
-                    // Set conversation state from a resumed session.
-                    self.conversation = Conversation::from_snapshot(snapshot);
-                    // NOTE: deliberately do NOT regenerate session_id here.
-                    // SetConversation also fires on `-c`/`--continue` auto-restore
-                    // and `/resume` of the current session — those CONTINUE an
-                    // existing conversation, so a new id would fragment one
-                    // logical session into two on the gateway. Only an explicit
-                    // fresh start (ClearConversation: /session, /clear) resets.
-                }
-                AgentCommand::UndoToPrompt { nth } => {
-                    let available = self.conversation.prompt_count();
-                    let target = nth.unwrap_or(available);
-                    match self.conversation.undo_to_prompt(target) {
-                        Some(restored_prompt) => {
-                            let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
-                                snapshot: self.conversation.snapshot(),
-                                restored_prompt,
-                                target_n: target,
-                                prompts_before: available,
-                            });
-                        }
-                        None => {
-                            let _ = self.event_tx.send(AgentEvent::UndoFailed {
-                                requested: target,
-                                available,
-                            });
-                        }
-                    }
-                }
-                AgentCommand::SetPlanMode(enabled) => {
-                    let changed = self.plan_mode != enabled;
-                    self.plan_mode = enabled;
-                    // Plan mode is communicated to the model via a ONE-TIME
-                    // synthetic history message, NOT the system prompt — keeping
-                    // it out of messages[0] is what stops a plan-mode toggle from
-                    // zeroing the whole prefix cache. The read-only tool gating
-                    // (see `use_read_only`) enforces the constraint every turn
-                    // regardless. We do NOT touch cached_system_prompt here.
-                    if changed {
-                        let note = if enabled {
-                            "[PLAN MODE ACTIVATED] You are now in plan mode. Only read-only \
-                             tools are available — you MUST NOT edit, create, or delete any \
-                             files. Explore and analyze the codebase, then present a detailed \
-                             implementation plan for the user to review before making any changes."
-                        } else {
-                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and \
-                             carry out the plan."
-                        };
-                        self.conversation.add_synthetic_user_message(note);
-                    }
-                }
-                AgentCommand::Compact { prompt } => {
-                    self.run_compact(prompt).await;
-                }
-                AgentCommand::Remember { content, global } => {
-                    use crate::config::memory::MemoryStore;
-                    let store = if global {
-                        MemoryStore::global()
-                    } else {
-                        let wd = self
-                            .turn_runner
-                            .context
-                            .working_dir
-                            .try_read()
-                            .map(|g| g.clone())
-                            .unwrap_or_default();
-                        MemoryStore::project(&wd)
-                    };
-                    match store.append(&content) {
-                        Ok(_) => {
-                            let scope = if global { "global" } else { "project" };
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                "(remembered in {} memory: {})\n",
-                                scope, content
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                "(failed to save memory: {})\n",
-                                e
-                            )));
-                        }
-                    }
-                }
-                AgentCommand::Forget { keyword } => {
-                    use crate::config::memory::MemoryStore;
-                    let wd = self
-                        .turn_runner
-                        .context
-                        .working_dir
-                        .try_read()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
-                    let global = MemoryStore::global();
-                    let project = MemoryStore::project(&wd);
-                    let g_matches = global.find_matching(&keyword);
-                    let p_matches = project.find_matching(&keyword);
-                    if g_matches.is_empty() && p_matches.is_empty() {
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                            "(no memory entries matching '{}')\n",
-                            keyword
-                        )));
-                    } else {
-                        let mut msg = String::new();
-                        for entry in &g_matches {
-                            msg.push_str(&format!("  [global] - {}\n", entry));
-                        }
-                        for entry in &p_matches {
-                            msg.push_str(&format!("  [project] - {}\n", entry));
-                        }
-                        let g_result = global.remove_matching(&keyword);
-                        let p_result = project.remove_matching(&keyword);
-                        if g_result.is_err() || p_result.is_err() {
-                            msg.push_str(
-                                "(warning: some entries could not be removed from disk)\n",
-                            );
-                        }
-                        let total = g_matches.len() + p_matches.len();
-                        msg.push_str(&format!(
-                            "(removed {} matching entr{})\n",
-                            total,
-                            if total == 1 { "y" } else { "ies" }
-                        ));
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
-                    }
-                }
-                AgentCommand::ShowMemory => {
-                    use crate::config::memory::MemoryStore;
-                    let wd = self
-                        .turn_runner
-                        .context
-                        .working_dir
-                        .try_read()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
-                    let global = MemoryStore::global();
-                    let project = MemoryStore::project(&wd);
-                    let g_entries = global.load();
-                    let p_entries = project.load();
-                    if g_entries.is_empty() && p_entries.is_empty() {
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "(no memories saved yet — use /remember <fact> to add one)\n"
-                                .to_string(),
-                        ));
-                    } else {
-                        let mut msg = String::new();
-                        if !g_entries.is_empty() {
-                            msg.push_str(&format!("  [Global] ({})\n", global.path().display()));
-                            for e in &g_entries {
-                                msg.push_str(&format!("    - {}\n", e));
-                            }
-                        }
-                        if !p_entries.is_empty() {
-                            msg.push_str(&format!("  [Project] ({})\n", project.path().display()));
-                            for e in &p_entries {
-                                msg.push_str(&format!("    - {}\n", e));
-                            }
-                        }
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
-                    }
-                }
-                AgentCommand::Background { task } => {
-                    // AcqRel: pair with the spawned task's Release store on
-                    // completion so the next dispatcher sees the cleared flag.
-                    if self.background_running.swap(true, Ordering::AcqRel) {
-                        let _ = self.event_tx.send(AgentEvent::Error {
-                            error: "A background task is already running. Wait for it to finish."
-                                .to_string(),
-                            snapshot: self.conversation.snapshot(),
-                        });
-                    } else {
-                        let provider = self.turn_runner.provider.clone();
-                        let tools = self.turn_runner.tools.clone();
-                        let context = self.turn_runner.context.clone();
-                        let context_for_commit = context.clone();
-                        let config = self.config.clone();
-                        let ctx = self.ctx.clone();
-                        let event_tx = self.event_tx.clone();
-                        let flag = self.background_running.clone();
-                        tokio::spawn(async move {
-                            let result = background::run_background_task(
-                                &task,
-                                provider,
-                                tools,
-                                context,
-                                config,
-                                ctx,
-                                event_tx.clone(),
-                            )
-                            .await;
-                            if let AgentEvent::BackgroundComplete {
-                                files_edited,
-                                success: true,
-                                ..
-                            } = &result
-                            {
-                                if !files_edited.is_empty() {
-                                    let wd = context_for_commit
-                                        .working_dir
-                                        .try_read()
-                                        .map(|g| g.clone())
-                                        .unwrap_or_default();
-                                    match git_auto_commit::auto_commit_edited_files(
-                                        &wd,
-                                        files_edited,
-                                    ) {
-                                        git_auto_commit::AutoCommitOutcome::Committed {
-                                            sha,
-                                            message,
-                                        } => {
-                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
-                                                "\n[auto-commit {sha}] {message}\n"
-                                            )));
-                                        }
-                                        git_auto_commit::AutoCommitOutcome::Failed { reason } => {
-                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
-                                                "\n[auto-commit skipped] {reason}\n"
-                                            )));
-                                        }
-                                        git_auto_commit::AutoCommitOutcome::Skipped { .. } => {}
-                                    }
-                                }
-                            }
-                            let _ = event_tx.send(result);
-                            flag.store(false, Ordering::Release);
-                        });
-                    }
-                }
-                AgentCommand::RefreshContextStats => {
-                    let system_prompt = self.build_system_prompt();
-                    let (msgs, _) = self
-                        .ctx
-                        .build_messages(&self.conversation, &system_prompt, "");
-                    self.emit_rich_context_stats(&self.conversation, &msgs)
-                        .await;
-                }
-                AgentCommand::ReloadHooks => {
-                    // Triggered by /plugin install|uninstall in the TUI so
-                    // newly-contributed hooks (especially UserPromptSubmit)
-                    // fire on the very next user message instead of waiting
-                    // for /cd or restart.
-                    let wd = self
-                        .turn_runner
-                        .context
-                        .working_dir
-                        .try_read()
-                        .map(|g| g.clone())
-                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let mut new_engine = HookEngine::new();
-                    new_engine.load_all(&wd);
-                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
-                }
-                AgentCommand::SyncMessages => {
-                    let snapshot = self.conversation.snapshot();
-                    let _ = self.event_tx.send(AgentEvent::MessagesSync { snapshot });
-                }
-                AgentCommand::SetGoal { condition } => {
-                    let max_rounds = std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                        .filter(|&n| n > 0);
-                    let max_duration = std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                        .filter(|&n| n > 0)
-                        .map(std::time::Duration::from_secs);
-                    self.goal = goal::GoalState::new_with_limits(condition, max_rounds, max_duration);
-                    self.emit_goal_update(true, None);
-                }
-                AgentCommand::ClearGoal => {
-                    let prev_active = self.goal.active;
-                    self.goal.clear();
-                    if prev_active {
-                        self.emit_goal_update(false, Some("cleared by user".into()));
-                    }
-                }
-                AgentCommand::SetLoop { .. } => {
-                    // `/loop` is a v2-only feature (the self-paced driver + the
-                    // `schedule_wakeup` tool live in the bridge/kernel stack). This
-                    // core AgentLoop only runs under the legacy `--engine v1`, so
-                    // reaching here means /loop was invoked on v1: reject with a hint
-                    // instead of half-driving a loop the v1 stack can't sustain.
-                    let _ = self.event_tx.send(AgentEvent::Warning(
-                        "/loop 需要默认引擎（v2）；当前是 --engine v1。请去掉 --engine v1（或 \
-                         ATOMCODE_ENGINE=v1）后重试。".into(),
-                    ));
-                }
-                AgentCommand::ClearLoop => {
-                    // No v1 loop to clear (see SetLoop above) — no-op.
-                }
-                AgentCommand::Shutdown => {
-                    // --- SessionEnd Hook ---
-                    let session_ctx = crate::hook::SessionContext {
-                        session_id: self.session_id.clone(),
-                        working_dir: self
-                            .turn_runner
-                            .context
-                            .working_dir
-                            .try_read()
-                            .map(|g| g.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        model_name: self.turn_runner.provider.model_name().to_string(),
-                        provider_name: self.config.default_provider.clone(),
-                    };
-                    self.turn_runner.hook_engine.trigger_session_end(&session_ctx).await;
+            AgentCommand::SendMessage {
+                text,
+                images,
+                image_markers,
+            } => {
+                self.handle_send_message(text, images, image_markers).await;
+                if self
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
                     return true;
                 }
             }
+            AgentCommand::LocalShell { cmd } => {
+                self.handle_local_shell(cmd).await;
+                if self
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return true;
+                }
+            }
+            AgentCommand::Cancel => {
+                crate::ctrace!(
+                    "AGT",
+                    "outer Cancel -> cancel_token.cancel() (was_cancelled={})",
+                    self.cancel_token.is_cancelled()
+                );
+                self.cancel_token.cancel();
+                self.cancel_token = CancellationToken::new();
+                self.phase = AgentPhase::Idle;
+                // Cancel the current turn — preserve completed content, backfill
+                // (cancelled) for unpaired tool calls, and mark turn as Completed.
+                self.conversation.cancel_current_turn();
+                // Ctrl+C/Esc must also halt any /goal auto-continuation
+                // — otherwise the evaluator schedules a new turn right
+                // after this cancel and the user sees endless
+                // "(cancelled)" cycles (CR C3).
+                if self.goal.active {
+                    self.finalize_goal_cancelled();
+                }
+                // Sync the preserved messages to TUI
+                let snapshot = self.conversation.snapshot();
+                let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
+            }
+            AgentCommand::ApproveTool => {
+                // Approval handled inside run_turn_loop via channels
+            }
+            AgentCommand::ApproveToolAlways => {
+                // Approval handled inside run_turn_loop via channels
+            }
+            AgentCommand::DenyTool => {
+                // Denial handled inside run_turn_loop via channels
+            }
+            AgentCommand::ReloadConfig(new_config) => {
+                let old_provider_name = self.config.default_provider.clone();
+                let old_type = self
+                    .config
+                    .providers
+                    .get(&old_provider_name)
+                    .map(|p| p.provider_type.clone());
+                self.config = new_config;
+                // Config/instructions/model may have changed → rebuild the
+                // frozen system prompt on the next turn.
+                self.cached_system_prompt = None;
+                // Rebuild hook engine from config files.
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let mut new_engine = HookEngine::new();
+                new_engine.load_all(&wd);
+                self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
+                let new_provider_name = self.config.default_provider.clone();
+                let new_type = self
+                    .config
+                    .providers
+                    .get(&new_provider_name)
+                    .map(|p| p.provider_type.clone());
+
+                let should_clear = reload_should_clear_conversation(
+                    &old_provider_name,
+                    old_type.as_deref(),
+                    &new_provider_name,
+                    new_type.as_deref(),
+                );
+                if should_clear {
+                    self.conversation.messages.clear();
+                    self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
+                    self.session_files.clear();
+                }
+
+                if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
+                    // Rebuild the context strategy for the new provider.
+                    // Selected once per provider; per-model customizations
+                    // (e.g. Ollama schema trimming, Claude cache markers)
+                    // take effect from the next turn. Assign the same
+                    // `Arc` to both `self.ctx` and `self.turn_runner.ctx`
+                    // so datalog and the send path stay locked together.
+                    let new_ctx = crate::ctx::for_provider(provider_config);
+                    self.ctx = new_ctx.clone();
+                    self.turn_runner.ctx = new_ctx;
+                    match crate::provider::create_provider(provider_config) {
+                        Ok(new_provider) => {
+                            self.turn_runner.provider = std::sync::Arc::from(new_provider);
+                            self.turn_runner.config = self.config.clone();
+                        }
+                        Err(e) => {
+                            let msg = format!("{:#}", e);
+                            let is_auth_gap = msg.contains("Not logged in")
+                                || msg.contains("Invalid auth.toml")
+                                || msg.contains("Token expired")
+                                || msg.contains("Token refresh failed");
+                            if is_auth_gap {
+                                self.turn_runner.provider = std::sync::Arc::from(
+                                    crate::provider::unavailable_provider(format!(
+                                        "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
+                                        msg
+                                    )),
+                                );
+                                self.turn_runner.config = self.config.clone();
+                            } else {
+                                let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                    "**Warning: failed to reload provider: {}**\n\n",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    self.turn_runner.provider =
+                        std::sync::Arc::from(crate::provider::unavailable_provider(
+                            "No active provider configured. Use /provider to add one.",
+                        ));
+                    self.turn_runner.config = self.config.clone();
+                }
+            }
+            AgentCommand::ChangeDir(path) => {
+                self.change_dir(&path).await;
+            }
+            AgentCommand::AppendInput(text) => {
+                // Queue user input to be injected before the next LLM call.
+                if let Some(ref mut existing) = self.pending_input {
+                    existing.push('\n');
+                    existing.push_str(&text);
+                } else {
+                    self.pending_input = Some(text);
+                }
+            }
+            AgentCommand::ClearConversation => {
+                // Clear the conversation history in the agent loop.
+                self.conversation = Conversation::new();
+                self.datalog.clear();
+                // New session → re-snapshot the system prompt next turn.
+                self.cached_system_prompt = None;
+                // session_id is NOT reset here: /session pairs this with
+                // a SetSessionId carrying the new session file's id, and
+                // that's the single source of truth for the header.
+            }
+            AgentCommand::SetSessionId(id) => {
+                self.session_id = id;
+                self.turn_runner.provider.set_session_id(&self.session_id);
+                self.datalog.set_session_id(&self.session_id);
+                if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
+                    self.turn_runner.context.telemetry.set_session_id(uuid);
+                }
+            }
+            AgentCommand::SetConversation(snapshot) => {
+                // Set conversation state from a resumed session.
+                self.conversation = Conversation::from_snapshot(snapshot);
+                // NOTE: deliberately do NOT regenerate session_id here.
+                // SetConversation also fires on `-c`/`--continue` auto-restore
+                // and `/resume` of the current session — those CONTINUE an
+                // existing conversation, so a new id would fragment one
+                // logical session into two on the gateway. Only an explicit
+                // fresh start (ClearConversation: /session, /clear) resets.
+            }
+            AgentCommand::UndoToPrompt { nth } => {
+                let available = self.conversation.prompt_count();
+                let target = nth.unwrap_or(available);
+                match self.conversation.undo_to_prompt(target) {
+                    Some(restored_prompt) => {
+                        let _ = self.event_tx.send(AgentEvent::ConversationTruncated {
+                            snapshot: self.conversation.snapshot(),
+                            restored_prompt,
+                            target_n: target,
+                            prompts_before: available,
+                        });
+                    }
+                    None => {
+                        let _ = self.event_tx.send(AgentEvent::UndoFailed {
+                            requested: target,
+                            available,
+                        });
+                    }
+                }
+            }
+            AgentCommand::SetPlanMode(enabled) => {
+                let changed = self.plan_mode != enabled;
+                self.plan_mode = enabled;
+                // Plan mode is communicated to the model via a ONE-TIME
+                // synthetic history message, NOT the system prompt — keeping
+                // it out of messages[0] is what stops a plan-mode toggle from
+                // zeroing the whole prefix cache. The read-only tool gating
+                // (see `use_read_only`) enforces the constraint every turn
+                // regardless. We do NOT touch cached_system_prompt here.
+                if changed {
+                    let note = if enabled {
+                        "[PLAN MODE ACTIVATED] You are now in plan mode. Only read-only \
+                             tools are available — you MUST NOT edit, create, or delete any \
+                             files. Explore and analyze the codebase, then present a detailed \
+                             implementation plan for the user to review before making any changes."
+                    } else {
+                        "[PLAN MODE ENDED] Plan mode is off. You may now edit files and \
+                             carry out the plan."
+                    };
+                    self.conversation.add_synthetic_user_message(note);
+                }
+            }
+            AgentCommand::Compact { prompt } => {
+                self.run_compact(prompt).await;
+            }
+            AgentCommand::Remember { content, global } => {
+                use crate::config::memory::MemoryStore;
+                let store = if global {
+                    MemoryStore::global()
+                } else {
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    MemoryStore::project(&wd)
+                };
+                match store.append(&content) {
+                    Ok(_) => {
+                        let scope = if global { "global" } else { "project" };
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                            "(remembered in {} memory: {})\n",
+                            scope, content
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                            "(failed to save memory: {})\n",
+                            e
+                        )));
+                    }
+                }
+            }
+            AgentCommand::Forget { keyword } => {
+                use crate::config::memory::MemoryStore;
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let global = MemoryStore::global();
+                let project = MemoryStore::project(&wd);
+                let g_matches = global.find_matching(&keyword);
+                let p_matches = project.find_matching(&keyword);
+                if g_matches.is_empty() && p_matches.is_empty() {
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                        "(no memory entries matching '{}')\n",
+                        keyword
+                    )));
+                } else {
+                    let mut msg = String::new();
+                    for entry in &g_matches {
+                        msg.push_str(&format!("  [global] - {}\n", entry));
+                    }
+                    for entry in &p_matches {
+                        msg.push_str(&format!("  [project] - {}\n", entry));
+                    }
+                    let g_result = global.remove_matching(&keyword);
+                    let p_result = project.remove_matching(&keyword);
+                    if g_result.is_err() || p_result.is_err() {
+                        msg.push_str("(warning: some entries could not be removed from disk)\n");
+                    }
+                    let total = g_matches.len() + p_matches.len();
+                    msg.push_str(&format!(
+                        "(removed {} matching entr{})\n",
+                        total,
+                        if total == 1 { "y" } else { "ies" }
+                    ));
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                }
+            }
+            AgentCommand::ShowMemory => {
+                use crate::config::memory::MemoryStore;
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let global = MemoryStore::global();
+                let project = MemoryStore::project(&wd);
+                let g_entries = global.load();
+                let p_entries = project.load();
+                if g_entries.is_empty() && p_entries.is_empty() {
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                        "(no memories saved yet — use /remember <fact> to add one)\n".to_string(),
+                    ));
+                } else {
+                    let mut msg = String::new();
+                    if !g_entries.is_empty() {
+                        msg.push_str(&format!("  [Global] ({})\n", global.path().display()));
+                        for e in &g_entries {
+                            msg.push_str(&format!("    - {}\n", e));
+                        }
+                    }
+                    if !p_entries.is_empty() {
+                        msg.push_str(&format!("  [Project] ({})\n", project.path().display()));
+                        for e in &p_entries {
+                            msg.push_str(&format!("    - {}\n", e));
+                        }
+                    }
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                }
+            }
+            AgentCommand::Background { task } => {
+                // AcqRel: pair with the spawned task's Release store on
+                // completion so the next dispatcher sees the cleared flag.
+                if self.background_running.swap(true, Ordering::AcqRel) {
+                    let _ = self.event_tx.send(AgentEvent::Error {
+                        error: "A background task is already running. Wait for it to finish."
+                            .to_string(),
+                        snapshot: self.conversation.snapshot(),
+                    });
+                } else {
+                    let provider = self.turn_runner.provider.clone();
+                    let tools = self.turn_runner.tools.clone();
+                    let context = self.turn_runner.context.clone();
+                    let context_for_commit = context.clone();
+                    let config = self.config.clone();
+                    let ctx = self.ctx.clone();
+                    let event_tx = self.event_tx.clone();
+                    let flag = self.background_running.clone();
+                    tokio::spawn(async move {
+                        let result = background::run_background_task(
+                            &task,
+                            provider,
+                            tools,
+                            context,
+                            config,
+                            ctx,
+                            event_tx.clone(),
+                        )
+                        .await;
+                        if let AgentEvent::BackgroundComplete {
+                            files_edited,
+                            success: true,
+                            ..
+                        } = &result
+                        {
+                            if !files_edited.is_empty() {
+                                let wd = context_for_commit
+                                    .working_dir
+                                    .try_read()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default();
+                                match git_auto_commit::auto_commit_edited_files(&wd, files_edited) {
+                                    git_auto_commit::AutoCommitOutcome::Committed {
+                                        sha,
+                                        message,
+                                    } => {
+                                        let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                            "\n[auto-commit {sha}] {message}\n"
+                                        )));
+                                    }
+                                    git_auto_commit::AutoCommitOutcome::Failed { reason } => {
+                                        let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                            "\n[auto-commit skipped] {reason}\n"
+                                        )));
+                                    }
+                                    git_auto_commit::AutoCommitOutcome::Skipped { .. } => {}
+                                }
+                            }
+                        }
+                        let _ = event_tx.send(result);
+                        flag.store(false, Ordering::Release);
+                    });
+                }
+            }
+            AgentCommand::RefreshContextStats => {
+                let system_prompt = self.build_system_prompt();
+                let (msgs, _) = self
+                    .ctx
+                    .build_messages(&self.conversation, &system_prompt, "");
+                self.emit_rich_context_stats(&self.conversation, &msgs)
+                    .await;
+            }
+            AgentCommand::ReloadHooks => {
+                // Triggered by /plugin install|uninstall in the TUI so
+                // newly-contributed hooks (especially UserPromptSubmit)
+                // fire on the very next user message instead of waiting
+                // for /cd or restart.
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let mut new_engine = HookEngine::new();
+                new_engine.load_all(&wd);
+                self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
+            }
+            AgentCommand::SyncMessages => {
+                let snapshot = self.conversation.snapshot();
+                let _ = self.event_tx.send(AgentEvent::MessagesSync { snapshot });
+            }
+            AgentCommand::SetGoal { condition } => {
+                let max_rounds = std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&n| n > 0);
+                let max_duration = std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .map(std::time::Duration::from_secs);
+                self.goal = goal::GoalState::new_with_limits(condition, max_rounds, max_duration);
+                self.emit_goal_update(true, None);
+            }
+            AgentCommand::ClearGoal => {
+                let prev_active = self.goal.active;
+                self.goal.clear();
+                if prev_active {
+                    self.emit_goal_update(false, Some("cleared by user".into()));
+                }
+            }
+            AgentCommand::SetLoop { .. } => {
+                // `/loop` is a v2-only feature (the self-paced driver + the
+                // `schedule_wakeup` tool live in the bridge/kernel stack). This
+                // core AgentLoop only runs under the legacy `--engine v1`, so
+                // reaching here means /loop was invoked on v1: reject with a hint
+                // instead of half-driving a loop the v1 stack can't sustain.
+                let _ = self.event_tx.send(AgentEvent::Warning(
+                    "/loop 需要默认引擎（v2）；当前是 --engine v1。请去掉 --engine v1（或 \
+                         ATOMCODE_ENGINE=v1）后重试。"
+                        .into(),
+                ));
+            }
+            AgentCommand::ClearLoop => {
+                // No v1 loop to clear (see SetLoop above) — no-op.
+            }
+            AgentCommand::Shutdown => {
+                // --- SessionEnd Hook ---
+                let session_ctx = crate::hook::SessionContext {
+                    session_id: self.session_id.clone(),
+                    working_dir: self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    model_name: self.turn_runner.provider.model_name().to_string(),
+                    provider_name: self.config.default_provider.clone(),
+                };
+                self.turn_runner
+                    .hook_engine
+                    .trigger_session_end(&session_ctx)
+                    .await;
+                return true;
+            }
+        }
         false
     }
 
@@ -1916,12 +1932,13 @@ impl AgentLoop {
             }
             crate::hook::UserPromptHookResult::Warning(msg) => {
                 // Non-fatal: show inline warning + status-bar hint, continue turn.
-                let _ = self.event_tx.send(AgentEvent::Warning(
-                    format!("Hook skipped (error): {}", msg),
-                ));
-                let _ = self.event_tx.send(AgentEvent::HookWarningHint(
-                    format!("Hook error: {}", msg),
-                ));
+                let _ = self.event_tx.send(AgentEvent::Warning(format!(
+                    "Hook skipped (error): {}",
+                    msg
+                )));
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::HookWarningHint(format!("Hook error: {}", msg)));
             }
         }
         // Detect negative feedback — user is unhappy with previous turn's work.
@@ -2044,7 +2061,8 @@ impl AgentLoop {
         let mut vision_warning: Option<String> = None;
         let (clean, images) = if !images.is_empty() {
             use crate::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
+            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await
+            {
                 PreprocessOutcome::Skipped => (clean, images),
                 PreprocessOutcome::Replaced { text, vl_key } => {
                     // Surface a one-line success notice (provider key in
@@ -2100,7 +2118,11 @@ impl AgentLoop {
             let msg = Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if clean.is_empty() { None } else { Some(clean.clone()) },
+                    text: if clean.is_empty() {
+                        None
+                    } else {
+                        Some(clean.clone())
+                    },
                     images,
                 },
                 synthetic: false,
@@ -2223,9 +2245,7 @@ impl AgentLoop {
                     .await
             } else {
                 goal_evaluator::EvalOutcome {
-                    result: goal::GoalResult::Error(anyhow::anyhow!(
-                        "no evaluator configured"
-                    )),
+                    result: goal::GoalResult::Error(anyhow::anyhow!("no evaluator configured")),
                     usage: None,
                 }
             };
@@ -2380,7 +2400,8 @@ impl AgentLoop {
         let snapshot = self.conversation.snapshot();
         let _ = self.event_tx.send(AgentEvent::TurnCancelled { snapshot });
         // finish_turn's bookkeeping without emitting TurnComplete (see doc above).
-        self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+        self.datalog
+            .end_turn(self.turn_tokens, self.tool_call_count);
         self.turn_start = None;
         self.phase = AgentPhase::Idle;
         let _ = self
@@ -2435,7 +2456,10 @@ impl AgentLoop {
                     phase: format!("{:?}", self.phase).to_lowercase(),
                     has_file_context: !self.files_edited_this_turn.is_empty(),
                 };
-                self.turn_runner.hook_engine.trigger_on_turn_start(&turn_ctx).await;
+                self.turn_runner
+                    .hook_engine
+                    .trigger_on_turn_start(&turn_ctx)
+                    .await;
             }
 
             // Decrement diagnosis read-only counter each turn.
@@ -2445,8 +2469,10 @@ impl AgentLoop {
 
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
-                self.conversation
-                    .add_synthetic_user_message(&format!("[Additional context from user]: {}", input));
+                self.conversation.add_synthetic_user_message(&format!(
+                    "[Additional context from user]: {}",
+                    input
+                ));
             }
 
             // Planning phase: inject planning reminder on turn 3.
@@ -3009,7 +3035,10 @@ impl AgentLoop {
                             phase: format!("{:?}", self.phase).to_lowercase(),
                             has_file_context: !self.files_edited_this_turn.is_empty(),
                         };
-                        self.turn_runner.hook_engine.trigger_on_model_response(text, &mctx).await;
+                        self.turn_runner
+                            .hook_engine
+                            .trigger_on_model_response(text, &mctx)
+                            .await;
                     }
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
@@ -3244,8 +3273,7 @@ impl AgentLoop {
                             self.empty_response_retries += 1;
                             // Front-loaded short backoff: 1,1,2,2,3s (~9s for
                             // all 5 attempts vs 18s for the old 3-shot path).
-                            let wait =
-                                (((self.empty_response_retries + 1) / 2).min(3)) as u64;
+                            let wait = (((self.empty_response_retries + 1) / 2).min(3)) as u64;
                             let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                                 "\n[模型返回空响应，重试中({}/{})...]\n",
                                 self.empty_response_retries, EMPTY_RESPONSE_MAX_RETRIES
@@ -3279,15 +3307,13 @@ impl AgentLoop {
                         // open-weight models often enforce far less than
                         // the configured ctx_window — without parsing the
                         // rejection we'd compact toward the wrong target.
-                        let limit = extract_provider_ctx_limit(&e)
-                            .unwrap_or_else(|| self.ctx.ctx_window());
+                        let limit =
+                            extract_provider_ctx_limit(&e).unwrap_or_else(|| self.ctx.ctx_window());
                         // 5K safety buffer — leaves room for the streaming
                         // response and one round of tool results before the
                         // next compact would be needed.
                         let target = limit.saturating_sub(5_000);
-                        let recovered = self
-                            .emergency_compact_to_target(target, &sys_prompt)
-                            .await;
+                        let recovered = self.emergency_compact_to_target(target, &sys_prompt).await;
                         let msg = if recovered {
                             "\n[Context overflow — recovered via layered compact, retrying...]\n"
                                 .to_string()
@@ -3505,7 +3531,12 @@ impl AgentLoop {
     ) -> bool {
         let sys_tokens = system_prompt.len() / 4 + 4;
         let estimate = |conv: &Conversation| -> usize {
-            sys_tokens + conv.messages.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+            sys_tokens
+                + conv
+                    .messages
+                    .iter()
+                    .map(|m| m.estimate_tokens())
+                    .sum::<usize>()
         };
 
         if estimate(&self.conversation) <= target_tokens {
@@ -3635,10 +3666,11 @@ impl AgentLoop {
                 })
                 .into_owned(),
             ));
-            let (msgs, _) =
-                self.ctx
-                    .build_messages(&self.conversation, &system_prompt, "");
-            self.emit_rich_context_stats(&self.conversation, &msgs).await;
+            let (msgs, _) = self
+                .ctx
+                .build_messages(&self.conversation, &system_prompt, "");
+            self.emit_rich_context_stats(&self.conversation, &msgs)
+                .await;
             return;
         }
 
@@ -3856,7 +3888,6 @@ impl AgentLoop {
         self.turn_runner.hook_engine.trigger_on_error(&ctx).await;
     }
 }
-
 
 fn track_tool_modified_files(
     tool_name: &str,
@@ -4078,8 +4109,7 @@ fn hard_truncate_to_target(
         let mt = conv.messages[i].estimate_tokens();
         // Sacred set: first AND last real user messages. Both pass
         // through regardless of remaining budget.
-        let is_sacred =
-            Some(i) == first_real_user_idx || Some(i) == last_real_user_idx;
+        let is_sacred = Some(i) == first_real_user_idx || Some(i) == last_real_user_idx;
         if !is_sacred && kept_tokens + mt > total_budget && keep_from < conv.messages.len() {
             break;
         }
@@ -4341,9 +4371,7 @@ fn public_error_message(e: &str) -> String {
         "上下文过长" => {
             "请求超过了模型上下文长度限制。请减少附加内容或缩短会话历史后重试。".to_string()
         }
-        "余额不足" => {
-            "账户余额不足，请前往模型提供方控制台充值后重试。".to_string()
-        }
+        "余额不足" => "账户余额不足，请前往模型提供方控制台充值后重试。".to_string(),
         "认证失败或无权限" => {
             "认证失败或当前账号无权限访问该模型。请检查 API Key 和提供方权限配置。".to_string()
         }
@@ -4611,10 +4639,14 @@ mod agent_handle_tests {
     /// /cd) may rebuild it.
     #[tokio::test]
     async fn system_prompt_is_frozen_across_model_cwd_change() {
-        let old_wd =
-            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_old_{}", std::process::id()));
-        let new_wd =
-            std::path::PathBuf::from(format!("/tmp/atomcode_sysfreeze_new_{}", std::process::id()));
+        let old_wd = std::path::PathBuf::from(format!(
+            "/tmp/atomcode_sysfreeze_old_{}",
+            std::process::id()
+        ));
+        let new_wd = std::path::PathBuf::from(format!(
+            "/tmp/atomcode_sysfreeze_new_{}",
+            std::process::id()
+        ));
 
         let tool_context = crate::tool::ToolContext::new(old_wd.clone());
         let (mut loop_, _handle) = super::AgentLoop::new_with_shared_parts(
@@ -4703,11 +4735,20 @@ mod agent_handle_tests {
             "build mode must not inject a plan reminder"
         );
         let r = super::plan_mode_turn_reminder(true);
-        assert!(r.contains("PLAN MODE"), "plan reminder must name plan mode: {r:?}");
+        assert!(
+            r.contains("PLAN MODE"),
+            "plan reminder must name plan mode: {r:?}"
+        );
         let low = r.to_lowercase();
         // The exact failure mode: writing the implementation inline as a code block.
-        assert!(low.contains("code block"), "must forbid inline code-block dumps: {r:?}");
-        assert!(low.contains("stop"), "must tell the model to stop after the plan: {r:?}");
+        assert!(
+            low.contains("code block"),
+            "must forbid inline code-block dumps: {r:?}"
+        );
+        assert!(
+            low.contains("stop"),
+            "must tell the model to stop after the plan: {r:?}"
+        );
     }
 
     /// Part-2 (systemA): plan mode must NOT live in the system prompt. Toggling
@@ -4878,7 +4919,9 @@ mod classifier_tests {
         assert!(!msg.contains("illegal") && !msg.contains("messages"));
         // And real errors are not misread as empty responses.
         assert!(!is_empty_response_error("429 Too Many Requests"));
-        assert!(!is_empty_response_error("prompt is too long: 250000 tokens"));
+        assert!(!is_empty_response_error(
+            "prompt is too long: 250000 tokens"
+        ));
     }
 
     #[test]
@@ -4889,7 +4932,8 @@ mod classifier_tests {
     #[test]
     fn extract_glm_proxy_ctx_limit() {
         // From the actual datalog that motivated D2.
-        let msg = "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
+        let msg =
+            "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
                    {\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. \
                    However, you requested 15210 output tokens and your prompt contains at least \
                    50327 input tokens, for a total of at least 65537 tokens.\"}}";
@@ -4926,7 +4970,7 @@ mod classifier_tests {
 
     // ── D2 emergency compact tier helpers ──
 
-    use crate::conversation::{Conversation, message::MessageContent};
+    use crate::conversation::{message::MessageContent, Conversation};
     use crate::tool::{ToolCall, ToolResult};
 
     /// Build a synthetic conversation with `n_turns` turns, each carrying
@@ -5071,7 +5115,10 @@ mod classifier_tests {
             .messages
             .iter()
             .any(|m| matches!(m.role, crate::conversation::message::Role::User));
-        assert!(has_user, "last user message must survive even at tight budget");
+        assert!(
+            has_user,
+            "last user message must survive even at tight budget"
+        );
     }
 
     #[test]
@@ -5184,7 +5231,9 @@ mod classifier_tests {
         assert!(!is_codingplan_unavailable_error(
             "API error (500 Internal Server Error) at `https://api.openai.com/v1/chat/completions`"
         ));
-        assert!(!is_codingplan_unavailable_error("Stream timeout: no event for 300s"));
+        assert!(!is_codingplan_unavailable_error(
+            "Stream timeout: no event for 300s"
+        ));
         assert!(!is_codingplan_unavailable_error(""));
     }
 
@@ -5221,7 +5270,9 @@ mod classifier_tests {
     /// it.
     #[test]
     fn rate_limit_error_detects_chinese_gateway_patterns() {
-        assert!(is_rate_limited_error("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(is_rate_limited_error(
+            "模型「GLM-5.1」的请求负载过高，请稍后再试。"
+        ));
         assert!(is_rate_limited_error("请求过于频繁，请稍后再试"));
         assert!(is_rate_limited_error("服务繁忙"));
         assert!(is_rate_limited_error("当前已被限流"));
@@ -5229,7 +5280,9 @@ mod classifier_tests {
         // limit just because it mentions "请稍后再试" alone
         // (which is generic Chinese "try again later").
         assert!(!is_rate_limited_error("请稍后再试"));
-        assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
+        assert!(!is_rate_limited_error(
+            "API error (500 Internal Server Error)"
+        ));
     }
 
     #[test]
@@ -5444,8 +5497,8 @@ mod bash_deleted_file_tracking_tests {
 #[cfg(test)]
 mod hard_truncate_tests {
     use super::hard_truncate_to_target;
-    use crate::conversation::Conversation;
     use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::conversation::Conversation;
     use crate::tool::{ToolCall, ToolResult};
 
     /// Build a "real prompt → many tool calls → synthetic injection"
@@ -5457,8 +5510,10 @@ mod hard_truncate_tests {
     /// SYNTHETIC injection as "last user" and drop the original prompt.
     fn build_real_then_synthetic_conv() -> Conversation {
         let mut conv = Conversation::new();
-        conv.messages
-            .push(Message::new(Role::User, "ORIGINAL PROMPT: please explore the codebase and explain"));
+        conv.messages.push(Message::new(
+            Role::User,
+            "ORIGINAL PROMPT: please explore the codebase and explain",
+        ));
         // Pad with 10 turns of assistant tool_call + tool_result, each
         // ~80-100 chars so total est ≥ ~300 tokens.
         for i in 0..10 {
@@ -5555,7 +5610,8 @@ mod hard_truncate_tests {
     #[test]
     fn hard_truncate_last_real_user_skips_trailing_synthetic() {
         let mut conv = Conversation::new();
-        conv.messages.push(Message::new(Role::User, "first real prompt"));
+        conv.messages
+            .push(Message::new(Role::User, "first real prompt"));
         for i in 0..6 {
             conv.messages.push(Message {
                 role: Role::Assistant,

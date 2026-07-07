@@ -16,6 +16,7 @@ async function main() {
     'slash-picker-regression.test.ts',
     'daemon-client-error.test.ts',
     'provider-queue-regression.test.ts',
+    'mode-state.test.ts',
   ];
 
   try {

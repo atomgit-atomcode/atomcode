@@ -15,10 +15,18 @@ import {
   ImageInput,
 } from '../daemon/types';
 import { getQuickActionPrompt } from './quickActions';
+import {
+  ApprovalMode,
+  ApprovalModeState,
+  beginApprovalModeSwitch,
+  completeApprovalModeSwitch,
+  failApprovalModeSwitch,
+  initApprovalModeState,
+} from './modeState';
 
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
-type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
+type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string; approvalMode?: ApprovalMode };
 type WorkspacePathItem = { path: string; fileName: string; relativePath: string; isDir: boolean; depth: number };
 type PanelSessionInfo = {
   sessionId: string;
@@ -53,6 +61,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
   private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
+  private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
   public onModelSelected?: (model: string) => void;
 
   constructor(
@@ -262,6 +271,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             msg.images,
             msg.clientMessageId,
             msg.sessionId,
+            msg.approvalMode,
           );
           break;
         case 'stop':
@@ -287,6 +297,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'selectReasoningEffort':
           await this._setReasoningEffort(msg.provider, msg.effort);
+          break;
+        case 'selectApprovalMode':
+          await this._setApprovalMode(msg.mode);
           break;
         case 'authLoginStart':
           await this._startLogin();
@@ -692,6 +705,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     images?: ImageInput[],
     clientMessageId?: string,
     msgSessionId?: string,
+    approvalMode?: ApprovalMode,
   ) {
     const trimmed = text.trim();
     const attachedImages = images?.length ? images : undefined;
@@ -705,7 +719,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt = this._getRuntime(sid);
 
     if (rt.isGenerating) {
-      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId });
+      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId, approvalMode });
       return;
     }
 
@@ -765,6 +779,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       working_dir: workspaceFolder,
       session_id: sid,
       images: attachedImages,
+      approval_mode: approvalMode ?? this._approvalModeState.confirmedMode,
     };
 
     // Capture session ID so callbacks always reference the correct session
@@ -873,16 +888,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _sendNextQueuedMessage(sessionId?: string) {
+    if (this._approvalModeState.pendingMode) return;
     const sid = sessionId ?? this._focusedPanelId;
     if (!sid) return;
     const rt = this._sessionRuntimes.get(sid);
     if (!rt || rt.isGenerating) return;
     const next = rt.queuedMessages.shift();
     if (!next) return;
-    await this._handleSend(next.text, next.context, next.images, next.clientMessageId, sid);
+    await this._handleSend(next.text, next.context, next.images, next.clientMessageId, sid, next.approvalMode);
     const rt2 = this._sessionRuntimes.get(sid);
     if (rt2 && !rt2.isGenerating && rt2.queuedMessages.length > 0) {
       void this._sendNextQueuedMessage(sid);
+    }
+  }
+
+  private _drainReadyQueues() {
+    if (this._approvalModeState.pendingMode) return;
+    for (const [sessionId, rt] of this._sessionRuntimes) {
+      if (!rt.isGenerating && rt.queuedMessages.length > 0) {
+        void this._sendNextQueuedMessage(sessionId);
+      }
     }
   }
 
@@ -971,6 +996,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessage({ type: 'sessions', sessions }, webview);
     } catch {}
 
+    try {
+      const modeResp = await this._client.getApprovalMode();
+      if (!this._approvalModeState.pendingMode) {
+        this._approvalModeState = initApprovalModeState(modeResp.mode);
+        this._postMessage({ type: 'approvalMode', mode: modeResp.mode, pending: false }, webview);
+      } else {
+        this._postMessage({
+          type: 'approvalMode',
+          mode: this._approvalModeState.displayMode,
+          pending: true,
+        }, webview);
+      }
+    } catch {}
+
     this._sendEditorContext(webview);
 
     if (messagesToLoad && mode === 'tab') {
@@ -999,6 +1038,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       projectHash,
       isSessionList: mode === 'sidebar',
       locale: vscode.env.language,
+      approvalMode: this._approvalModeState.displayMode,
+      approvalModePending: Boolean(this._approvalModeState.pendingMode),
     }, webview);
   }
 
@@ -1243,6 +1284,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } catch {
         // Recovery failed — silently ignore
       }
+    }
+  }
+
+  private async _setApprovalMode(mode: ApprovalMode) {
+    const next = beginApprovalModeSwitch(this._approvalModeState, mode);
+    if (next === this._approvalModeState) return;
+    this._approvalModeState = next;
+    this._broadcastMessage({ type: 'approvalMode', mode: next.displayMode, pending: true });
+    try {
+      const resp = await this._client.setApprovalMode(mode);
+      this._approvalModeState = completeApprovalModeSwitch(this._approvalModeState, resp.mode);
+      this._broadcastMessage({
+        type: 'approvalMode',
+        mode: this._approvalModeState.displayMode,
+        pending: false,
+      });
+    } catch {
+      this._approvalModeState = failApprovalModeSwitch(this._approvalModeState);
+      this._broadcastMessage({
+        type: 'approvalMode',
+        mode: this._approvalModeState.displayMode,
+        pending: false,
+      });
+    } finally {
+      this._drainReadyQueues();
     }
   }
 

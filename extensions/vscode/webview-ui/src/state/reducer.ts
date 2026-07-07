@@ -276,6 +276,8 @@ export const initialState: ChatState = {
   searchQuery: '',
   searchOpen: false,
   locale: document.body.dataset.locale,
+  approvalMode: 'build',
+  approvalModePending: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -654,6 +656,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ),
       };
 
+    case 'SET_APPROVAL_MODE':
+      return { ...state, approvalMode: action.mode, approvalModePending: action.pending ?? false };
+
     case 'SET_SESSIONS':
       return { ...state, sessions: action.sessions };
 
@@ -835,6 +840,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
         locale: action.locale ?? state.locale,
+        approvalMode: action.approvalMode ?? state.approvalMode,
+        approvalModePending: action.approvalModePending ?? state.approvalModePending,
       };
 
     default:

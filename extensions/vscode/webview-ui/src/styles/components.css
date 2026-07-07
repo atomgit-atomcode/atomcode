@@ -167,6 +167,14 @@
   font-weight: 600;
 }
 
+.mode-dropdown .model-item.danger {
+  color: var(--vscode-errorForeground, #d93025);
+}
+
+.mode-dropdown .model-item.danger.active {
+  color: var(--app-list-active-foreground);
+}
+
 .model-default-badge {
   font-size: 10px;
   opacity: 0.6;

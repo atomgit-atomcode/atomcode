@@ -21,8 +21,18 @@ data class ChatRequest(
     val workingDir: String? = null,
     val provider: String? = null,
     val sessionId: String? = null,
-    val images: List<ImageInput> = emptyList()
+    val images: List<ImageInput> = emptyList(),
+    val approvalMode: String? = null
 )
+
+enum class ApprovalMode(val wire: String) {
+    Build("build"),
+    Plan("plan"),
+    Bypass("bypass")
+}
+
+data class ApprovalModeRequest(val mode: String)
+data class ApprovalModeResponse(val ok: Boolean, val mode: String)
 
 data class ImageInput(
     val mediaType: String,

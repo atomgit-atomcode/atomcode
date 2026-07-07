@@ -110,6 +110,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
     let mode = match client_mode.as_deref() {
         Some("vscode") => SessionMode::Vscode,
+        Some("jetbrains") => SessionMode::Jetbrains,
         Some("webui") => SessionMode::Webui,
         Some("atomcode-air") => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,

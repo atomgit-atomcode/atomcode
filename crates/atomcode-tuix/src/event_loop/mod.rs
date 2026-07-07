@@ -22,7 +22,9 @@ pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
-use commands::{attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line};
+use commands::{
+    attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
+};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
@@ -251,7 +253,9 @@ fn image_markers_in_order(text: &str) -> Vec<usize> {
             let mut n: usize = 0;
             let mut had_digit = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as usize);
                 j += 1;
                 had_digit = true;
             }
@@ -1710,7 +1714,10 @@ mod buffer_tests {
 
         // Agent payload AND conversation echo: fully expanded (no placeholder).
         let expanded = b.expand_pastes(&folded);
-        assert!(expanded.contains(&body), "echo/payload must carry the full body");
+        assert!(
+            expanded.contains(&body),
+            "echo/payload must carry the full body"
+        );
         assert!(
             !expanded.contains("[Pasted #"),
             "no placeholder may survive in the echo/payload: {expanded:?}"
@@ -1734,10 +1741,16 @@ mod buffer_tests {
         let line = format!("/goal {}", b.text);
         let (cmd, arg) = parse_slash_line(&line).expect("recognised as slash line");
         assert_eq!(cmd, "goal");
-        assert!(arg.contains("[Pasted #1"), "arg still folded pre-expansion: {arg:?}");
+        assert!(
+            arg.contains("[Pasted #1"),
+            "arg still folded pre-expansion: {arg:?}"
+        );
         let expanded = b.expand_pastes(arg);
         assert_eq!(expanded, body, "slash arg must expand to the pasted body");
-        assert!(!expanded.contains("[Pasted #"), "no placeholder should survive");
+        assert!(
+            !expanded.contains("[Pasted #"),
+            "no placeholder should survive"
+        );
     }
 
     #[test]
@@ -1852,7 +1865,10 @@ mod buffer_tests {
         let body = "important data\n".repeat(8);
         b.insert_paste(body.clone());
         let submitted_text = b.text.clone();
-        assert!(submitted_text.contains("[Pasted #1"), "should fold to placeholder");
+        assert!(
+            submitted_text.contains("[Pasted #1"),
+            "should fold to placeholder"
+        );
         let entry = HistoryEntry {
             text: submitted_text.clone(),
             images: vec![],
@@ -1867,7 +1883,10 @@ mod buffer_tests {
         let history = vec![entry];
         let _ = b.apply(Action::HistoryPrev, &history, &reg);
         assert_eq!(b.text, submitted_text, "Up recalls the folded text");
-        assert!(!b.pastes.is_empty(), "registry must be rehydrated on recall");
+        assert!(
+            !b.pastes.is_empty(),
+            "registry must be rehydrated on recall"
+        );
 
         // Submitting now expands back to the real body, not the placeholder.
         let expanded = b.expand_pastes(&b.text);
@@ -1876,7 +1895,10 @@ mod buffer_tests {
             "recalled paste must expand to its body: {}",
             &expanded[..expanded.len().min(120)]
         );
-        assert!(!expanded.contains("[Pasted #"), "no placeholder may survive");
+        assert!(
+            !expanded.contains("[Pasted #"),
+            "no placeholder may survive"
+        );
     }
 
     /// A folded paste in the draft must survive an Up→Down round-trip
@@ -1954,7 +1976,10 @@ mod buffer_tests {
         b.restore_cancelled_text("original prompt".to_string());
         assert_eq!(b.text, "original prompt\nmy new draft");
         assert_eq!(b.cursor, b.text.len(), "cursor at end for edit-and-resend");
-        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+        assert!(
+            b.menu_suppressed(),
+            "restored /command must not pop the menu"
+        );
     }
 
     #[test]
@@ -2199,7 +2224,10 @@ mod menu_tests {
         .expect("directory completion should immediately show child entries");
 
         assert_eq!(
-            items.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "crates/atomcode-bridge/src/",
                 "crates/atomcode-bridge/Cargo.toml",
@@ -2480,7 +2508,11 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -2592,7 +2624,11 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -2614,7 +2650,11 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![], pastes: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
@@ -2626,7 +2666,11 @@ mod menu_tests {
     fn sync_recalled_attachments_mirrors_buffer_history_idx() {
         use crate::input::history::{HistoryEntry, HistoryImageRef};
         let history: Vec<HistoryEntry> = vec![
-            HistoryEntry { text: "no img".into(), images: vec![], pastes: vec![] },
+            HistoryEntry {
+                text: "no img".into(),
+                images: vec![],
+                pastes: vec![],
+            },
             HistoryEntry {
                 text: "with img".into(),
                 images: vec![HistoryImageRef {
@@ -3121,8 +3165,14 @@ mod tool_format_tests {
         // Unknown id ⇒ unchanged id-only detail.
         assert_eq!(enrich_todo_detail("todo", args, &base, &titles), base);
         // Non-update actions and non-todo tools pass through untouched.
-        assert_eq!(enrich_todo_detail("todo", r#"{"action":"add","content":"x"}"#, "x", &titles), "x");
-        assert_eq!(enrich_todo_detail("bash", r#"{"command":"ls"}"#, "ls", &titles), "ls");
+        assert_eq!(
+            enrich_todo_detail("todo", r#"{"action":"add","content":"x"}"#, "x", &titles),
+            "x"
+        );
+        assert_eq!(
+            enrich_todo_detail("bash", r#"{"command":"ls"}"#, "ls", &titles),
+            "ls"
+        );
     }
 
     #[test]
@@ -3380,20 +3430,27 @@ mod tool_format_tests {
     #[test]
     fn web_search_domains_from_inline_text() {
         // Exa-style blob: URLs embedded mid-sentence with trailing punctuation.
-        let out = "See (https://bjeea.cn/page) and http://dxsbb.com/a, also https://bjeea.cn/other.";
-        assert_eq!(web_search_source_domains(out), vec!["bjeea.cn", "dxsbb.com"]);
+        let out =
+            "See (https://bjeea.cn/page) and http://dxsbb.com/a, also https://bjeea.cn/other.";
+        assert_eq!(
+            web_search_source_domains(out),
+            vec!["bjeea.cn", "dxsbb.com"]
+        );
     }
 
     #[test]
     fn web_search_domains_empty_when_no_links() {
         // A link-less Exa text blob or an error message yields no domains.
-        assert!(web_search_source_domains("Exa returned a prose summary with no links.").is_empty());
+        assert!(
+            web_search_source_domains("Exa returned a prose summary with no links.").is_empty()
+        );
         assert!(web_search_source_domains("").is_empty());
     }
 
     #[test]
     fn web_search_suffix_collapses_extra_sources() {
-        let out = "a https://eol.cn/1 b https://gaokao.com/2 c https://bjeea.cn/3 d https://dxsbb.com/4";
+        let out =
+            "a https://eol.cn/1 b https://gaokao.com/2 c https://bjeea.cn/3 d https://dxsbb.com/4";
         // Two shown, the rest collapse into +N.
         assert_eq!(
             web_search_result_suffix(out).as_deref(),
@@ -3847,7 +3904,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // slash command's behaviour: visual replay + AgentCommand::SetConversation.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
-            crate::modals::session_picker::replay_session(renderer, &mut app.state, &session, false);
+            crate::modals::session_picker::replay_session(
+                renderer,
+                &mut app.state,
+                &session,
+                false,
+            );
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
@@ -4944,8 +5006,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // ~5ms via `deferred_render_tick`, so it trips promptly once the deadline
         // passes. Restore the terminal first, then hard-exit (skips Drop, which is
         // exactly why a wedged await can't stop us).
-        if ctx.shutdown_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            crate::tuix_trace!("EXIT", "shutdown watchdog fired -> hard exit (teardown wedged)");
+        if ctx
+            .shutdown_deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            crate::tuix_trace!(
+                "EXIT",
+                "shutdown watchdog fired -> hard exit (teardown wedged)"
+            );
             let _ = ctx.history.save();
             renderer.render(UiLine::ClearTransient);
             renderer.shutdown();
@@ -5310,7 +5378,11 @@ fn handle_input(
             // tool runs (phase == Streaming), so route paste to it regardless of
             // phase — otherwise the pasted password leaks into `buf`. Non-
             // capturing modals keep their Idle-only routing below.
-            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+            if app
+                .active_modal
+                .as_ref()
+                .is_some_and(|m| m.captures_all_keys())
+            {
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action =
@@ -5417,7 +5489,11 @@ fn handle_input(
             // the modal, so the modal's oneshot never fires and the askpass
             // server hangs. Route here BEFORE any phase dispatch. Non-capturing
             // modals (the default) keep their Idle-only routing below.
-            if app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys()) {
+            if app
+                .active_modal
+                .as_ref()
+                .is_some_and(|m| m.captures_all_keys())
+            {
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(
@@ -6063,8 +6139,7 @@ fn handle_idle_key(
                         // (e.g. `crates/atomcode-cli/`); prepend `@` without
                         // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
-                        let replacement =
-                            file_index::format_at_mention_replacement(&selected_path);
+                        let replacement = file_index::format_at_mention_replacement(&selected_path);
                         app.buf.text.replace_range(at_pos..end, &replacement);
                         app.buf.cursor = at_pos + replacement.len();
                         app.menu.selected = 0;
@@ -6789,13 +6864,7 @@ fn handle_idle_key(
                 // `images` / `kept_markers`. `last_submitted_message` was
                 // already cached above from the raw form, so Ctrl+C edit
                 // restores the editable path, not the marker.
-                attach_typed_image_paths(
-                    app,
-                    ctx,
-                    &mut expanded,
-                    &mut images,
-                    &mut kept_markers,
-                );
+                attach_typed_image_paths(app, ctx, &mut expanded, &mut images, &mut kept_markers);
                 if ctx.sync_session.is_none() {
                     // Echo the EXACT text the agent receives (`expanded`): the
                     // full pasted body with `[Pasted #N …]` placeholders expanded
@@ -7011,7 +7080,10 @@ mod bash_input_hint_tests {
     #[test]
     fn shows_only_for_a_nonempty_bang_command() {
         assert!(bash_input_hint("!ls"));
-        assert!(bash_input_hint("! ls"), "space after ! still runs (parse trims)");
+        assert!(
+            bash_input_hint("! ls"),
+            "space after ! still runs (parse trims)"
+        );
         assert!(bash_input_hint("  !git status"), "leading whitespace ok");
         assert!(!bash_input_hint("!"), "bare ! won't run → no hint");
         assert!(!bash_input_hint("!   "), "! + only spaces");
@@ -7123,7 +7195,10 @@ mod image_marker_tests {
     #[test]
     fn extracts_markers_in_order_deduped() {
         assert_eq!(marks("[Image #1] hi"), vec![1]);
-        assert_eq!(marks("[Image #2] and [Image #5] and [Image #2]"), vec![2, 5]);
+        assert_eq!(
+            marks("[Image #2] and [Image #5] and [Image #2]"),
+            vec![2, 5]
+        );
         assert_eq!(marks("no images here"), Vec::<usize>::new());
         // Malformed markers are ignored.
         assert_eq!(marks("[Image #] [Image #x] [Image #3]"), vec![3]);
@@ -7141,7 +7216,11 @@ mod streaming_slash_tests {
         // Streaming where commands are otherwise blocked.
         for sub in ["clear", "stop", "off", "reset", "none", "cancel"] {
             let got = exec(&format!("/goal {sub}"));
-            assert_eq!(got, Some(("goal".to_string(), sub.to_string())), "sub={sub}");
+            assert_eq!(
+                got,
+                Some(("goal".to_string(), sub.to_string())),
+                "sub={sub}"
+            );
         }
     }
 
@@ -7153,7 +7232,11 @@ mod streaming_slash_tests {
         // stopped by command (only Esc), which is the reported bug.
         for sub in ["stop", "off", "clear", "cancel", "reset", "none"] {
             let got = exec(&format!("/loop {sub}"));
-            assert_eq!(got, Some(("loop".to_string(), sub.to_string())), "sub={sub}");
+            assert_eq!(
+                got,
+                Some(("loop".to_string(), sub.to_string())),
+                "sub={sub}"
+            );
         }
         // bare /loop (status) and setting a new loop must NOT run mid-stream.
         assert_eq!(exec("/loop"), None);
@@ -7182,7 +7265,10 @@ mod streaming_slash_tests {
         assert_eq!(exec("/clear"), None);
         assert_eq!(exec("just a message"), None);
         // Case-insensitive command + sub.
-        assert_eq!(exec("/GOAL Clear"), Some(("goal".to_string(), "Clear".to_string())));
+        assert_eq!(
+            exec("/GOAL Clear"),
+            Some(("goal".to_string(), "Clear".to_string()))
+        );
     }
 }
 
@@ -7365,7 +7451,9 @@ fn handle_streaming_key(
         let status = if app.state.show_tool_output {
             format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
         } else {
-            format!("{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n")
+            format!(
+                "{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n"
+            )
         };
         renderer.render(UiLine::CommandOutput(status));
         renderer.flush();
@@ -7713,7 +7801,10 @@ fn clear_capturing_modal_on_cancel(app: &mut App) {
 /// `Password:` line is cleared. No-op unless `Idle` with a capturing modal up.
 fn dismiss_orphan_capturing_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     if matches!(app.state.phase, UiPhase::Idle)
-        && app.active_modal.as_ref().is_some_and(|m| m.captures_all_keys())
+        && app
+            .active_modal
+            .as_ref()
+            .is_some_and(|m| m.captures_all_keys())
     {
         app.active_modal = None;
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -8214,7 +8305,9 @@ fn turn_summary_label(
 }
 
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
-    let Some(ps) = state.pending_separator.take() else { return };
+    let Some(ps) = state.pending_separator.take() else {
+        return;
+    };
     let dur = crate::render::fmt_dur(ps.duration);
     let cached = ps
         .cached_pct
@@ -8319,8 +8412,14 @@ mod approval_retract_tests {
         // A result/cancel arriving while the prompt is still up = resolved without a keypress.
         let retracted = retract_stale_approval(&mut state, &mut r);
         assert!(retracted, "a still-pending approval must be retracted");
-        assert_eq!(r.pops, 1, "the orphaned 'Waiting for approval' body row must be popped");
-        assert!(!matches!(state.phase, UiPhase::Approval), "phase must leave Approval");
+        assert_eq!(
+            r.pops, 1,
+            "the orphaned 'Waiting for approval' body row must be popped"
+        );
+        assert!(
+            !matches!(state.phase, UiPhase::Approval),
+            "phase must leave Approval"
+        );
     }
 
     #[test]
@@ -8364,7 +8463,8 @@ fn empty_completion_notice(
         return None;
     }
     Some(if saw_reasoning {
-        "本轮模型只输出了推理、未给出正文。按 Ctrl+O 可查看推理内容；可直接重试或换个问法。".to_string()
+        "本轮模型只输出了推理、未给出正文。按 Ctrl+O 可查看推理内容；可直接重试或换个问法。"
+            .to_string()
     } else {
         "本轮模型未输出任何正文内容。可直接重试或换个问法。".to_string()
     })
@@ -8379,14 +8479,20 @@ mod empty_completion_notice_tests {
     fn reasoning_only_hidden_gets_ctrl_o_hint() {
         let n = empty_completion_notice(false, 0, true, false, TurnStopReason::Natural)
             .expect("a blank reasoning-only turn must surface a notice");
-        assert!(n.contains("Ctrl+O"), "hidden reasoning should hint at Ctrl+O, got {n:?}");
+        assert!(
+            n.contains("Ctrl+O"),
+            "hidden reasoning should hint at Ctrl+O, got {n:?}"
+        );
     }
 
     #[test]
     fn blank_no_reasoning_gets_generic_notice() {
         let n = empty_completion_notice(false, 0, false, false, TurnStopReason::Natural)
             .expect("a blank turn must surface a notice");
-        assert!(!n.contains("Ctrl+O"), "no reasoning => no Ctrl+O hint, got {n:?}");
+        assert!(
+            !n.contains("Ctrl+O"),
+            "no reasoning => no Ctrl+O hint, got {n:?}"
+        );
     }
 
     #[test]
@@ -8406,7 +8512,9 @@ mod empty_completion_notice_tests {
 
     #[test]
     fn cancelled_turn_suppresses_notice() {
-        assert!(empty_completion_notice(false, 0, true, false, TurnStopReason::Cancelled).is_none());
+        assert!(
+            empty_completion_notice(false, 0, true, false, TurnStopReason::Cancelled).is_none()
+        );
     }
 
     #[test]
@@ -8464,9 +8572,17 @@ mod tool_output_stream_gate_tests {
 
     #[test]
     fn verbose_and_shell_stream_other_tools_dont() {
-        assert!(streams_tool_output_by_default(true, "call-1", Some("ReadFile")));
+        assert!(streams_tool_output_by_default(
+            true,
+            "call-1",
+            Some("ReadFile")
+        ));
         assert!(streams_tool_output_by_default(false, "local-shell-7", None));
-        assert!(!streams_tool_output_by_default(false, "call-1", Some("ReadFile")));
+        assert!(!streams_tool_output_by_default(
+            false,
+            "call-1",
+            Some("ReadFile")
+        ));
         assert!(!streams_tool_output_by_default(false, "call-1", None));
     }
 }
@@ -8954,7 +9070,10 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, snapshot, ..
+            tool_name,
+            call,
+            snapshot,
+            ..
         } => {
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
             // skip the prompt entirely. In LOCAL mode the core decider already
@@ -9186,16 +9305,18 @@ fn handle_agent_event(
                 .as_ref()
                 .map(|c| (c.sent_tokens, c.ctx_window))
                 .unwrap_or((0, 0));
-            ctx.current_session.turn_stats.push(atomcode_core::session::TurnStat {
-                after_message: snapshot.messages.len(),
-                turn_count,
-                tool_call_count,
-                duration_ms: duration.as_millis() as u64,
-                total_tokens,
-                errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
-                used_tokens: last_used,
-                ctx_window: last_window,
-            });
+            ctx.current_session
+                .turn_stats
+                .push(atomcode_core::session::TurnStat {
+                    after_message: snapshot.messages.len(),
+                    turn_count,
+                    tool_call_count,
+                    duration_ms: duration.as_millis() as u64,
+                    total_tokens,
+                    errored: matches!(stop_reason, atomcode_core::agent::TurnStopReason::Error),
+                    used_tokens: last_used,
+                    ctx_window: last_window,
+                });
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, snapshot, renderer);
@@ -9327,7 +9448,8 @@ fn handle_agent_event(
             // /loop so its interval controller can't keep firing into the truncated
             // history (and clear the stale footer).
             commands::stop_active_loop(state, ctx);
-            ctx.current_session.update_from_conversation_snapshot(snapshot);
+            ctx.current_session
+                .update_from_conversation_snapshot(snapshot);
             ctx.current_session
                 .turn_stats
                 .retain(|s| s.after_message <= new_len);
@@ -9344,7 +9466,12 @@ fn handle_agent_event(
             }
             // Redraw scrollback from the truncated history — reuses the
             // /resume replay path (clears screen, re-renders turn dividers).
-            crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+            crate::modals::session_picker::replay_session(
+                renderer,
+                state,
+                &ctx.current_session,
+                true,
+            );
             // Put the rolled-back prompt back in the input box for editing.
             buf.set_restored_text(restored_prompt);
             // Confirmation + disk-divergence warning.
@@ -9558,9 +9685,7 @@ fn handle_agent_event(
             let display = format!("/{}", line.trim().trim_start_matches('/'));
             match commands::run_remote_command(ctx, state, &line) {
                 Some(txt) => {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "（手机端执行 {display}）"
-                    )));
+                    renderer.render(UiLine::CommandOutput(format!("（手机端执行 {display}）")));
                     renderer.render(UiLine::CommandOutput(txt.clone()));
                     renderer.flush();
                     if let Some(live) = &ctx.sync_session {
@@ -9707,7 +9832,9 @@ fn handle_agent_event(
                         // contain whitespace around colons/commas.
                         let action = serde_json::from_str::<serde_json::Value>(&c.arguments)
                             .ok()
-                            .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string));
+                            .and_then(|v| {
+                                v.get("action").and_then(|a| a.as_str()).map(str::to_string)
+                            });
                         match action.as_deref() {
                             Some("add") => {
                                 todo_add_counter += 1;
@@ -9770,17 +9897,22 @@ fn handle_agent_event(
                     (display_tool_name_short(&c.name), detail.clone(), true),
                 );
             }
-            state.active_tool_batches.insert(
-                batch_id.clone(),
-                crate::state::ActiveToolBatch { call_ids },
-            );
+            state
+                .active_tool_batches
+                .insert(batch_id.clone(), crate::state::ActiveToolBatch { call_ids });
             // Anchor the spinner clock to the batch start. The interleaved
             // per-tool events that follow won't reset it (they no-op the reset
             // while a batch is active), so the elapsed-ms ticks steadily instead
             // of flickering 0→N→0.
             state.on_tool_batch_started();
         }
-        AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
+        AgentEvent::GoalUpdate {
+            active,
+            round,
+            condition,
+            last_reason,
+            ..
+        } => {
             if active {
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
@@ -9823,7 +9955,13 @@ fn handle_agent_event(
                 flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
-        AgentEvent::LoopUpdate { active, round, label, last_reason, .. } => {
+        AgentEvent::LoopUpdate {
+            active,
+            round,
+            label,
+            last_reason,
+            ..
+        } => {
             if active {
                 state.loop_label = Some(label);
                 state.loop_round = round;
@@ -9833,12 +9971,11 @@ fn handle_agent_event(
             } else {
                 if state.loop_label.is_some() {
                     if let Some(reason) = last_reason.as_deref() {
-                        let silent = reason.contains("cancelled")
-                            || reason.contains("cleared by user");
+                        let silent =
+                            reason.contains("cancelled") || reason.contains("cleared by user");
                         if !silent {
                             renderer.render(UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::LoopEnded { reason })
-                                    .into_owned(),
+                                crate::i18n::t(crate::i18n::Msg::LoopEnded { reason }).into_owned(),
                             ));
                             renderer.flush();
                         }
@@ -10071,6 +10208,24 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
+        AgentEvent::ModeChanged { plan, bypass } => {
+            state.agent_mode = if plan {
+                crate::state::AgentMode::Plan
+            } else {
+                crate::state::AgentMode::Build
+            };
+            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(plan));
+            let label = if bypass {
+                "Web UI Bypass"
+            } else {
+                state.agent_mode.label()
+            };
+            renderer.render(UiLine::CommandOutput(format!(
+                "  Switched to {} mode.\n",
+                label
+            )));
+            renderer.flush();
+        }
         AgentEvent::SessionSwitched(session_id) => {
             // 另一端（webui 新建对话 / webui 侧栏切到已存在会话）切换了会话，
             // 同步模式的 TUI 跟随。按 session_id 跨项目定位会话文件：
@@ -10078,7 +10233,12 @@ fn handle_agent_event(
             //  - webui 切到「已存在」会话：把该会话的历史一并加载、回放进 TUI。
             // 二者统一走 load_any，省掉「新建/切换」分支。找不到文件（罕见）才退回
             // 到「按指定 id 建空白会话」的旧行为。
-            crate::tuix_trace!("TUI", "SessionSwitched: session_id={}, sync_session={}", session_id, ctx.sync_session.is_some());
+            crate::tuix_trace!(
+                "TUI",
+                "SessionSwitched: session_id={}, sync_session={}",
+                session_id,
+                ctx.sync_session.is_some()
+            );
             let sid = atomcode_core::session::SessionId::from_string(session_id);
             // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
             // 会经 live_switch_session 广播、再经转发器回流到这里。此时本地切换已完成、
@@ -10086,7 +10246,10 @@ fn handle_agent_event(
             // 双重渲染。仅「另一端发起」的切换（id 与当前不同）才走下面的完整跟随逻辑。
             // 与 ProviderChanged 臂同款的自回声去重。
             if ctx.current_session.id == sid {
-                crate::tuix_trace!("TUI", "SessionSwitched: self-echo for current session, ignoring");
+                crate::tuix_trace!(
+                    "TUI",
+                    "SessionSwitched: self-echo for current session, ignoring"
+                );
                 return;
             }
             let loaded = atomcode_core::session::SessionManager::load_any(&sid).ok();
@@ -10173,7 +10336,11 @@ fn handle_agent_event(
                     Some(ctx.current_session.id.clone()),
                     ctx.current_session.messages.clone(),
                 );
-                crate::tuix_trace!("TUI", "SessionSwitched: attaching LiveSession ptr={:#x}", std::sync::Arc::as_ptr(&session) as usize);
+                crate::tuix_trace!(
+                    "TUI",
+                    "SessionSwitched: attaching LiveSession ptr={:#x}",
+                    std::sync::Arc::as_ptr(&session) as usize
+                );
                 attach_live_session(ctx, renderer, session, false);
             }
         }
@@ -10186,7 +10353,12 @@ fn handle_agent_event(
             crate::tuix_trace!("TUI", "SessionRenamed: name={}", name);
             apply_ai_session_name(ctx, name, renderer);
         }
-        AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+        AgentEvent::RateLimited {
+            reset_at_display,
+            reset_label,
+            secs_until_reset,
+            auto_resuming,
+        } => {
             // Non-error pause line: dim/plain body row, never red.
             // auto_resuming=true  (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
             // auto_resuming=false (Pause, has time): "⏸ 5小时窗口已用尽，约 HH:MM 恢复…"
@@ -10194,7 +10366,12 @@ fn handle_agent_event(
             // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
             // Rate-limit is a pause, not an error/warning — it must not
             // render with the yellow `! ` prefix that Warning applies.
-            let line = format_rate_limited_line(&reset_at_display, &reset_label, secs_until_reset, auto_resuming);
+            let line = format_rate_limited_line(
+                &reset_at_display,
+                &reset_label,
+                secs_until_reset,
+                auto_resuming,
+            );
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
@@ -10594,21 +10771,33 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // Active /goal → the dedicated footer goal row (width-truncated by the
     // renderer). Carries the condition text so the user can SEE what the goal
     // is, not just that one is running.
-    let goal = state.goal_condition.as_ref().map(|cond| crate::render::GoalStatus {
-        condition: cond.clone(),
-        // Display 1-based: the engine's round is 0 on the first attempt.
-        round: state.goal_round + 1,
-        elapsed_secs: state.goal_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
-    });
+    let goal = state
+        .goal_condition
+        .as_ref()
+        .map(|cond| crate::render::GoalStatus {
+            condition: cond.clone(),
+            // Display 1-based: the engine's round is 0 on the first attempt.
+            round: state.goal_round + 1,
+            elapsed_secs: state
+                .goal_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0),
+        });
     // Active /loop → the dedicated footer loop row. Mirrors GoalStatus exactly,
     // using the loop label as the condition equivalent. Goal takes priority if
     // somehow both are active simultaneously (they shouldn't be).
-    let loop_status = state.loop_label.as_ref().map(|label| crate::render::LoopStatus {
-        label: label.clone(),
-        // Display 1-based: the engine's round is 0-based internally.
-        round: state.loop_round + 1,
-        elapsed_secs: state.loop_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
-    });
+    let loop_status = state
+        .loop_label
+        .as_ref()
+        .map(|label| crate::render::LoopStatus {
+            label: label.clone(),
+            // Display 1-based: the engine's round is 0-based internally.
+            round: state.loop_round + 1,
+            elapsed_secs: state
+                .loop_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0),
+        });
     // Todo progress for the dedicated footer todo row. Driven PURELY by the live
     // in-flight snapshot (set from the turn's todowrite calls, cleared at turn end
     // in on_turn_complete/cancelled/error) so the row is a live execution
@@ -10696,7 +10885,11 @@ fn draw_spinner_now(
 /// word (e.g. `Pondering`, `Running ReadFile`); ellipsis + elapsed +
 /// queued suffixes are appended here so format is consistent across
 /// every call site.
-fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Option<&str>) -> String {
+fn format_spinner_label(
+    state: &UiState,
+    queue_len: usize,
+    reasoning_effort: Option<&str>,
+) -> String {
     // Compaction takes over the spinner: show "Compacting…" (or a slow variant
     // past the stall threshold) with the phase elapsed appended, instead of a
     // thinking label. Unified for auto + manual /compact.
@@ -11317,8 +11510,10 @@ pub(crate) fn web_search_source_domains(output: &str) -> Vec<String> {
         // the host itself contains non-ASCII (IDN) bytes.
         let end = host_part
             .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | ':' | ')' | ']' | '"' | '\'' | '>' | '<' | ',')
-                    || c.is_whitespace()
+                matches!(
+                    c,
+                    '/' | '?' | '#' | ':' | ')' | ']' | '"' | '\'' | '>' | '<' | ','
+                ) || c.is_whitespace()
             })
             .unwrap_or(host_part.len());
         let host = host_part[..end].trim_end_matches('.');
@@ -11341,7 +11536,12 @@ pub(crate) fn web_search_result_suffix(output: &str) -> Option<String> {
     if domains.is_empty() {
         return None;
     }
-    let head = domains.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    let head = domains
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     let extra = domains.len().saturating_sub(SHOWN);
     Some(if extra > 0 {
         format!("{head} +{extra}")
@@ -11410,8 +11610,10 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         };
         let block = &rest[start..]; // begins with "<task "
         let Some(gt) = block.find('>') else { break }; // end of opening tag
-        // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
-        let Some(close_rel) = block[gt + 1..].find("</task>") else { break };
+                                                       // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
+        let Some(close_rel) = block[gt + 1..].find("</task>") else {
+            break;
+        };
         let close = gt + 1 + close_rel;
         let tag = &block[..gt];
         let body = &block[gt + 1..close];
@@ -11430,7 +11632,9 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
             model: attr(tag, "model").unwrap_or("?").to_string(),
             ok,
             reason,
-            result_lines: inner(body, "task_result").map(|s| s.lines().count()).unwrap_or(0),
+            result_lines: inner(body, "task_result")
+                .map(|s| s.lines().count())
+                .unwrap_or(0),
         });
         rest = &block[close + "</task>".len()..];
     }
@@ -11442,7 +11646,11 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(parsed.len());
     for p in &parsed {
         // "worker#1" → "worker" when there's only one subtask.
-        let id = if single { p.id.split('#').next().unwrap_or(&p.id) } else { p.id.as_str() };
+        let id = if single {
+            p.id.split('#').next().unwrap_or(&p.id)
+        } else {
+            p.id.as_str()
+        };
         let mark = if p.ok {
             "\u{2713} done".to_string()
         } else {
@@ -11527,9 +11735,9 @@ pub(crate) fn install_password_modal(
     prompt: String,
     reply: tokio::sync::oneshot::Sender<Option<String>>,
 ) {
-    app.active_modal = Some(Box::new(
-        crate::modals::password::PasswordModal::new(prompt, reply),
-    ));
+    app.active_modal = Some(Box::new(crate::modals::password::PasswordModal::new(
+        prompt, reply,
+    )));
 }
 
 /// Split a todowrite call's args into per-item display lines (`<glyph> <content>`).
@@ -11547,7 +11755,12 @@ pub(crate) fn todo_block_lines(
     match parse_todos(args) {
         Ok(todos) if !todos.is_empty() => todos
             .into_iter()
-            .map(|t| (t.status, format!("{} {}", todo_glyph(t.status, unicode), t.content)))
+            .map(|t| {
+                (
+                    t.status,
+                    format!("{} {}", todo_glyph(t.status, unicode), t.content),
+                )
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -11583,7 +11796,11 @@ pub(crate) fn todo_progress_from_items(
         .iter()
         .find(|t| t.status == TodoStatus::InProgress)
         .map(|t| t.content.clone());
-    crate::render::TodoProgress { current, completed, total }
+    crate::render::TodoProgress {
+        current,
+        completed,
+        total,
+    }
 }
 
 /// Todo progress for the list carried in a single `todowrite` call's args.
@@ -11623,15 +11840,16 @@ mod todo_block_tests {
         .expect("valid list");
         assert_eq!((p.completed, p.total), (1, 3));
         assert_eq!(p.current.as_deref(), Some("b")); // the in_progress task
-        // No task in progress ⇒ current None, counts still populated.
-        let done = todo_progress_from_args(
-            r#"{"todos":[{"content":"a","status":"completed"}]}"#,
-        )
-        .unwrap();
+                                                     // No task in progress ⇒ current None, counts still populated.
+        let done =
+            todo_progress_from_args(r#"{"todos":[{"content":"a","status":"completed"}]}"#).unwrap();
         assert_eq!((done.completed, done.total, done.current), (1, 1, None));
         // A VALID clear ⇒ Some(total=0) so the footer suppresses the row rather
         // than falling back to the stale (uncommitted) transcript.
-        assert_eq!(todo_progress_from_args(r#"{"todos":[]}"#).map(|p| p.total), Some(0));
+        assert_eq!(
+            todo_progress_from_args(r#"{"todos":[]}"#).map(|p| p.total),
+            Some(0)
+        );
         // Unparseable ⇒ None ⇒ keep whatever the footer already shows.
         assert!(todo_progress_from_args("not json").is_none());
     }
@@ -11648,9 +11866,21 @@ mod todo_block_tests {
             false,
         );
         assert_eq!(out.len(), 3);
-        assert!(out[0].starts_with("\x1b[1m") && out[0].contains('a'), "in-progress bold: {:?}", out[0]);
-        assert!(out[1].starts_with("\x1b[2m") && out[1].contains('b'), "completed faint: {:?}", out[1]);
-        assert!(!out[2].contains("\x1b[") && out[2].contains('c'), "pending plain: {:?}", out[2]);
+        assert!(
+            out[0].starts_with("\x1b[1m") && out[0].contains('a'),
+            "in-progress bold: {:?}",
+            out[0]
+        );
+        assert!(
+            out[1].starts_with("\x1b[2m") && out[1].contains('b'),
+            "completed faint: {:?}",
+            out[1]
+        );
+        assert!(
+            !out[2].contains("\x1b[") && out[2].contains('c'),
+            "pending plain: {:?}",
+            out[2]
+        );
         // Empty on parse failure (caller falls back to the normal tool row).
         assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
     }
@@ -11677,7 +11907,10 @@ mod task_render_tests {
         let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"completed\">\n<summary>d</summary>\n<task_result>\nline1\nline2\n</task_result>\n</task>";
         let s = summarise_task_result(out);
         // single ⇒ "#1" dropped, model shown, line count appended
-        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2713} done (2 lines)");
+        assert_eq!(
+            s,
+            "worker \u{b7} deepseek-v4-flash \u{b7} \u{2713} done (2 lines)"
+        );
     }
 
     #[test]
@@ -11686,7 +11919,10 @@ mod task_render_tests {
         let s = summarise_task_result(out);
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "worker#1 \u{b7} deepseek-v4-flash \u{b7} \u{2713} done");
+        assert_eq!(
+            lines[0],
+            "worker#1 \u{b7} deepseek-v4-flash \u{b7} \u{2713} done"
+        );
         assert_eq!(lines[1], "explore#2 \u{b7} glm-5.2 \u{b7} \u{2713} done");
     }
 
@@ -11695,7 +11931,10 @@ mod task_render_tests {
         // Body format must match TaskTool's emitter: "subagent stopped early (Reason): …".
         let out = "<task id=\"worker#1\" model=\"deepseek-v4-flash\" state=\"error\">\n<summary>d</summary>\n<task_error>\nsubagent stopped early (Timeout): byte-idle\n</task_error>\n</task>";
         let s = summarise_task_result(out);
-        assert_eq!(s, "worker \u{b7} deepseek-v4-flash \u{b7} \u{2717} failed (Timeout)");
+        assert_eq!(
+            s,
+            "worker \u{b7} deepseek-v4-flash \u{b7} \u{2717} failed (Timeout)"
+        );
     }
 
     #[test]
@@ -11740,7 +11979,10 @@ mod task_render_tests {
         let out = "<task id=\"worker#1\" model=\"x\"  (truncated, no gt)";
         let s = summarise_task_result(out);
         assert!(!s.is_empty(), "must not be blank");
-        assert!(s.contains("truncated"), "should fall back to raw summary: {s}");
+        assert!(
+            s.contains("truncated"),
+            "should fall back to raw summary: {s}"
+        );
     }
 }
 

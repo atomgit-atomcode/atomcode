@@ -74,6 +74,8 @@ export interface SkillInfo {
   description: string;
 }
 
+export type ApprovalMode = 'build' | 'plan' | 'bypass';
+
 /** Tool call data (collapsed section in the UI) */
 export interface ToolCallData {
   id: string;
@@ -150,6 +152,8 @@ export interface ChatState {
   searchQuery: string;
   searchOpen: boolean;
   locale?: string;
+  approvalMode: ApprovalMode;
+  approvalModePending: boolean;
 }
 
 // ─── Actions dispatched by the reducer ──────────────────────────
@@ -182,6 +186,7 @@ export type ChatAction =
   | { type: 'SET_CURRENT_MODEL'; model: string }
   | { type: 'SET_CURRENT_PROVIDER'; provider: string; model?: string }
   | { type: 'SET_REASONING_EFFORT'; provider: string; effort: string | null }
+  | { type: 'SET_APPROVAL_MODE'; mode: ApprovalMode; pending?: boolean }
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'SET_ACTIVE_SESSION'; sessionId?: string; projectHash?: string }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
@@ -194,12 +199,12 @@ export type ChatAction =
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string };
+  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string }
+  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean }
   | { type: 'userMessage'; text: string; images?: ImageData[] }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }
@@ -222,6 +227,7 @@ export type ExtensionMessage =
   | { type: 'sessions'; sessions: SessionMeta[] }
   | { type: 'sessionSelected'; sessionId?: string; projectHash?: string }
   | { type: 'models'; models: ModelInfo[] }
+  | { type: 'approvalMode'; mode: ApprovalMode; pending?: boolean }
   | { type: 'providers'; providers: ProviderInfo[]; defaultProvider?: string }
   | { type: 'authStatus'; auth: AuthStatus }
   | { type: 'setupState'; auth?: AuthStatus; providers: ProviderInfo[]; defaultProvider?: string; currentModel?: string; setupRequired: boolean }

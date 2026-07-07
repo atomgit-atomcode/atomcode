@@ -2,6 +2,8 @@ import * as http from 'http';
 import {
   ChatRequest,
   ChatStreamCallbacks,
+  ApprovalMode,
+  ApprovalModeResponse,
   AuthStatusResponse,
   ConfigResponse,
   ChatEvent,
@@ -206,6 +208,14 @@ export class DaemonClient {
       provider,
       reasoning_effort: effort,
     });
+  }
+
+  getApprovalMode(): Promise<ApprovalModeResponse> {
+    return this.get<ApprovalModeResponse>('/approval_mode');
+  }
+
+  setApprovalMode(mode: ApprovalMode): Promise<ApprovalModeResponse> {
+    return this.post<ApprovalModeResponse>('/approval_mode', { mode });
   }
 
   // ── Skills ───────────────────────────────────────────────────

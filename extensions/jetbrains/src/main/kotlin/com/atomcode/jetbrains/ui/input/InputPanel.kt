@@ -51,7 +51,7 @@ import javax.swing.event.DocumentListener
  * 输入区域容器：ContextChips + 输入行 + 底部工具栏。Claude Code 风格。
  */
 class InputPanel(
-    private val onSend: (String) -> Unit,
+    private val onSend: (String) -> Boolean,
     private val onStop: () -> Unit,
     private val onAttach: () -> Unit,
     private val onSlashCommand: () -> Unit,
@@ -495,8 +495,9 @@ class InputPanel(
     private fun fireSend() {
         val text = inputArea.text.trim()
         if (text.isNotEmpty()) {
-            inputArea.text = ""
-            onSend(text)
+            if (onSend(text)) {
+                inputArea.text = ""
+            }
         }
     }
 
