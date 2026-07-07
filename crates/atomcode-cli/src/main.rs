@@ -2571,6 +2571,7 @@ async fn run_headless(
             | AgentEvent::PeerBusy(_)
             | AgentEvent::ProviderChanged(_)
             | AgentEvent::ProjectSwitched(_)
+            | AgentEvent::ModeChanged { .. }
             | AgentEvent::SessionSwitched(_)
             | AgentEvent::SessionRenamed { .. }
             | AgentEvent::RemoteSlashCommand(_) => {
