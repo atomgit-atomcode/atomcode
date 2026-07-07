@@ -389,7 +389,7 @@ atomcode --prompt-file task.md
 | `/model` | 切换模型 / provider |
 | `/provider` | 管理 provider（添加 / 编辑 / 删除） |
 | `/proxy` | 切换出站代理模式 |
-| `/login` | 通过 AtomGit OAuth 登录 |
+| `/login` | 通过 AtomGit OAuth 登录并申领 CodingPlan 免费模型 |
 | `/logout` | 退出 AtomGit 登录 |
 | `/whoami` | 查看当前登录用户 |
 | `/status` | 查看登录状态和模型信息 |
