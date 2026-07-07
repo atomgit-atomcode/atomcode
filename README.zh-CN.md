@@ -432,8 +432,9 @@ atomcode --prompt-file task.md
 
 | 位置 | 作用域 |
 |-----|--------|
-| `~/.atomcode/commands/` | 全局 —— 所有项目生效 |
+| `$ATOMCODE_HOME/commands/`（默认为 `~/.atomcode/commands/`） | 全局 —— 所有项目生效 |
 | `<project>/.atomcode/commands/` | 项目级 —— 覆盖同名的全局命令 |
+| `plugins/<name>/commands/` | 插件贡献 —— 通过 `/plugin install` 安装 |
 
 **文件格式**：
 
@@ -453,7 +454,7 @@ $ARGUMENTS
 
 - **`name`** —— 必填。命令名，输入 `/explain` 触发。
 - **`description`** —— 可选。Tab 补全时显示。
-- **`args`** —— 可选。`required` / `optional` / `none`（默认 `none`）。设为 `required` 时，从补全菜单选中后会自动留出光标等待输入参数。
+- **`args`** —— 可选。`required` / `optional` / `none`（默认 `none`）。保留给未来使用——当前被解析但不影响行为。`$ARGUMENTS` / `${ARGUMENTS}` 始终被替换为用户在命令名后输入的内容（未输入则为空字符串）。注意：`Tab` 键对所有命令（内置和自定义）都会补全命令名并添加尾部空格，而 `Enter` 始终立即执行。
 - **模板正文** —— 输入命令后发送给 AI 的提示词。`$ARGUMENTS` 或 `${ARGUMENTS}` 会被替换为用户输入的命令参数。
 
 **示例：创建一个审查命令**
@@ -473,7 +474,7 @@ args: optional
 EOF
 ```
 
-创建完成后立即生效，无需重启。输入 `/help commands` 可查看所有已加载的自定义命令。
+输入 `/help commands` 可查看所有已加载的自定义命令。
 
 > **优先级规则**：自定义命令名不能覆盖同名内置命令。如果内置已有 `/review`，项目级自定义的 `review.md` 不会出现在补全菜单中，也不会被 dispatch。
 

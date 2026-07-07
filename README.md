@@ -436,8 +436,9 @@ Beyond built-ins and plugin commands, you can define your own slash commands as 
 
 | Location | Scope |
 |---------|-------|
-| `~/.atomcode/commands/` | Global — applies to every project |
+| `$ATOMCODE_HOME/commands/` (default `~/.atomcode/commands/`) | Global — applies to every project |
 | `<project>/.atomcode/commands/` | Project-level — overrides same-named global commands |
+| `plugins/<name>/commands/` | Plugin-contributed — installed via `/plugin install` |
 
 **File format:**
 
@@ -457,7 +458,7 @@ Cover: function signature & parameters, core business logic, data flow & side ef
 
 - **`name`** — Required. The command name; `/explain` triggers it.
 - **`description`** — Optional. Shown in Tab completion.
-- **`args`** — Optional. `required` / `optional` / `none` (default `none`). When set to `required`, selecting the command from the menu inserts a trailing space and parks the cursor for input, instead of firing immediately.
+- **`args`** — Optional. `required` / `optional` / `none` (default `none`). Reserved for future use — currently parsed but has no effect on behavior. `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed). Note: pressing `Tab` inserts a trailing space for all commands (built-in and custom), while pressing `Enter` always fires immediately.
 - **Template body** — The prompt sent to the AI when the command is invoked. `$ARGUMENTS` or `${ARGUMENTS}` is replaced with whatever the user types after the command name.
 
 **Example: create a code-review command**
@@ -477,7 +478,7 @@ If specific files are given, review only: $ARGUMENTS
 EOF
 ```
 
-Custom commands take effect immediately — no restart needed. Run `/help commands` to list all loaded custom commands.
+Run `/help commands` to list all loaded custom commands.
 
 > **Priority rule.** A custom command cannot shadow a built-in command with the same name. If a built-in `/review` already exists, a project-level `review.md` won't appear in completion or dispatch.
 
