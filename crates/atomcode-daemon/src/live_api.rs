@@ -589,7 +589,13 @@ impl TurnExecutor for DaemonTurnExecutor {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         UserInput {
             text,
             images: input.images,
@@ -987,7 +993,13 @@ impl TurnExecutor for KernelTurnExecutor {
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let original_text = input.text.clone();
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
         // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
         let images = if text != original_text {
@@ -2095,6 +2107,7 @@ async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
+    session_id: Option<&str>,
 ) -> String {
     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
@@ -2111,6 +2124,13 @@ async fn preprocess_live_caption(
         Some(Ok(p)) => p,
         _ => return message.to_string(),
     };
+    // Bind the conversation's session id onto this (throwaway) active provider so
+    // `maybe_preprocess` forwards it onto the one-off VL request as
+    // `x-atomcode-session-id` — otherwise the webui/live vision call is the
+    // session-less second request of the turn. Empty ⇒ header omitted.
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        active.set_session_id(sid);
+    }
     match maybe_preprocess(&config, &*active, message, images).await {
         PreprocessOutcome::Skipped => message.to_string(),
         PreprocessOutcome::Replaced { text, vl_key } => {
@@ -2600,7 +2620,7 @@ mod tests {
     // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[], None).await;
+        let out = preprocess_live_caption("看下这个图片", &[], None, None).await;
         assert_eq!(out, "看下这个图片");
     }
 
