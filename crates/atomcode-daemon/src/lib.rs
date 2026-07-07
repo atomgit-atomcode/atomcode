@@ -3296,6 +3296,9 @@ async fn process_chat_request(
                     auto_resuming,
                 });
             }
+            TurnEvent::ApprovalResolved { .. } => {
+                // 审批已由任一端决策，HTTP 客户端通过 chat_event 感知后续工具事件即可。
+            }
         }
     }
 

@@ -2844,6 +2844,10 @@ impl AgentLoop {
                                     datalog.log_warning(&w);
                                     let _ = event_tx.send(AgentEvent::Warning(w));
                                 }
+                                TurnEvent::ApprovalResolved { .. } => {
+                                    // 审批已由任一端决策，其他视图通过 LiveEvent 广播同步，
+                                    // 此处的 agent loop 不需要额外处理。
+                                }
                                 TurnEvent::WorkingDirChanged(new_dir) => {
                                     // A tool (change_dir / bash cd) mutated the shared
                                     // cwd. Surface it so the TUI footer can update.
