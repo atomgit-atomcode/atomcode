@@ -873,8 +873,25 @@ impl Config {
         };
         // Validate by loading (read + toml parse + migrations) before adopting, so a
         // malformed seed can't wedge the user into a broken config.
-        if let Err(e) = Config::load(src) {
-            return SeedOutcome::Invalid(e.to_string());
+        let seed = match Config::load(src) {
+            Ok(c) => c,
+            Err(e) => return SeedOutcome::Invalid(e.to_string()),
+        };
+        // Parse-valid is not enough: a seed whose `default_provider` is empty or
+        // doesn't name a real `[providers.*]` entry (an easy IT typo) would copy in
+        // fine, then launch the user into a config that EXISTS but has no working
+        // provider — and because it exists, onboarding won't fire, so there's no
+        // recovery hint. Reject it here so we fall back to onboarding instead.
+        if seed.default_provider.is_empty() {
+            return SeedOutcome::Invalid(
+                "seed config has no default_provider set".to_string(),
+            );
+        }
+        if !seed.providers.contains_key(&seed.default_provider) {
+            return SeedOutcome::Invalid(format!(
+                "seed config default_provider \"{}\" does not match any [providers.*] entry",
+                seed.default_provider
+            ));
         }
         if let Some(parent) = config_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -966,6 +983,42 @@ mod tests {
         let outcome = Config::seed_user_config(&target, Some(&seed));
         assert!(matches!(outcome, SeedOutcome::Invalid(_)));
         assert!(!target.exists(), "a bad seed must not create a config");
+    }
+
+    #[test]
+    fn seed_rejects_unresolvable_default_provider() {
+        // Parses fine, but default_provider names no [providers.*] entry (IT typo).
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("typo.toml");
+        std::fs::write(
+            &seed,
+            "default_provider = \"glm-internel\"\n\
+             [providers.glm-internal]\n\
+             type = \"openai\"\n\
+             model = \"glm-5.2\"\n",
+        )
+        .unwrap();
+        let target = dir.path().join("config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert!(
+            matches!(outcome, SeedOutcome::Invalid(_)),
+            "unresolvable default_provider must be rejected, got {outcome:?}"
+        );
+        assert!(!target.exists(), "a broken seed must not create a config");
+    }
+
+    #[test]
+    fn seed_rejects_empty_default_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("noprov.toml");
+        // Parses fine (explicit empty string), but names no provider → reject.
+        std::fs::write(&seed, "default_provider = \"\"\n").unwrap();
+        let target = dir.path().join("config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert!(matches!(outcome, SeedOutcome::Invalid(_)));
+        assert!(!target.exists());
     }
 
     #[test]
