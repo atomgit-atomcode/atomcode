@@ -633,11 +633,11 @@ fn render_network_section(cfg: &NetworkConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Network proxy policy shared by all outbound HTTP clients.\n");
     out.push_str("# Modes:\n");
-    out.push_str("# - follow_system  -> follow the launch environment / system proxy state\n");
+    out.push_str("# - follow_system  -> follow the launch environment / system proxy state (default)\n");
     out.push_str(
         "# - default_proxy  -> pin the proxy values below and reuse them on future launches\n",
     );
-    out.push_str("# - no_proxy       -> disable proxy resolution entirely (acv2 default)\n");
+    out.push_str("# - no_proxy       -> disable proxy resolution entirely\n");
     out.push_str("[network.proxy]\n");
     out.push_str(&format!("mode = \"{}\"\n", cfg.proxy.mode.label()));
     match &cfg.proxy.http {
@@ -1229,7 +1229,7 @@ mod tests {
         assert!(reloaded.notifications.enabled);
         assert_eq!(
             reloaded.network.proxy.mode,
-            crate::proxy::ProxyMode::NoProxy
+            crate::proxy::ProxyMode::FollowSystem
         );
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1247,7 +1247,7 @@ mod tests {
     fn render_network_section_emits_proxy_mode() {
         let rendered = render_network_section(&NetworkConfig::default());
         assert!(rendered.contains("[network.proxy]"));
-        assert!(rendered.contains("mode = \"no_proxy\""));
+        assert!(rendered.contains("mode = \"follow_system\""));
     }
 
     #[test]
