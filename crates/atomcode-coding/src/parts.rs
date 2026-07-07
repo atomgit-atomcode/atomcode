@@ -681,6 +681,17 @@ pub fn assemble(
     }
     if let Some(b) = &parts.session {
         builder = builder.session_id(&b.id);
+        // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
+        // `task` fan-out's children run within the SAME gateway window as the main
+        // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
+        // multi-window guard serializes the strong-tier subtasks. (Single-model users already
+        // reuse the host provider, which the kernel binds with this id, so they're unaffected.)
+        if let Some(cell) = &cfg.subagent_fast_provider {
+            cell.set_session_id(&b.id);
+        }
+        if let Some(cell) = &cfg.subagent_capable_provider {
+            cell.set_session_id(&b.id);
+        }
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());
         }
