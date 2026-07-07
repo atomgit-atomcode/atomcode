@@ -2852,9 +2852,7 @@ fn execute_slash_command_impl(
                     ));
                     renderer.flush();
                 } else {
-                    let rendered = cmd.template
-                        .replace("$ARGUMENTS", arg)
-                        .replace("${ARGUMENTS}", arg);
+                    let rendered = cmd.render(arg);
                     submit_agent_turn(ctx, state, rendered);
                 }
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
@@ -5635,7 +5633,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_custom_required_empty_arg_shows_error() {
+    fn custom_required_args_render_and_metadata() {
         let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
         custom.register(crate::custom_commands::CustomCommand {
             name: "myreview".into(),

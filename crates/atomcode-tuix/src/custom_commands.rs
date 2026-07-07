@@ -54,6 +54,24 @@ pub struct CustomCommand {
     pub namespace: Option<String>,
 }
 
+impl CustomCommand {
+    /// The lookup key used in the registry — `"plugin:name"` when namespaced,
+    /// otherwise just `"name"`.
+    pub fn key(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{}:{}", ns, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Render the template, replacing `$ARGUMENTS` / `${ARGUMENTS}` with `args`.
+    pub fn render(&self, args: &str) -> String {
+        self.template
+            .replace("$ARGUMENTS", args)
+            .replace("${ARGUMENTS}", args)
+    }
+}
+
 /// Whether a custom command expects arguments from the user, controlling
 /// both the slash-menu Enter behaviour and dispatch validation:
 ///
@@ -105,10 +123,7 @@ impl CustomCommandRegistry {
     /// plugin installers that build commands programmatically rather than
     /// reading `.md` files from disk.
     pub fn register(&mut self, cmd: CustomCommand) {
-        let key = match &cmd.namespace {
-            Some(ns) => format!("{}:{}", ns, cmd.name),
-            None => cmd.name.clone(),
-        };
+        let key = cmd.key();
         self.commands.insert(key, cmd);
     }
 
@@ -130,10 +145,7 @@ impl CustomCommandRegistry {
                 if let Some(ns) = namespace {
                     cmd.namespace = Some(ns.to_string());
                 }
-                let key = match &cmd.namespace {
-                    Some(ns) => format!("{}:{}", ns, cmd.name),
-                    None => cmd.name.clone(),
-                };
+                let key = cmd.key();
                 commands.insert(key, cmd);
             }
         }
@@ -230,11 +242,7 @@ impl CustomCommandRegistry {
     /// in the dispatch layer (`execute_slash_command_impl`).
     pub fn render(&self, name: &str, args: &str) -> Option<String> {
         let cmd = self.resolve(name)?;
-        Some(
-            cmd.template
-                .replace("$ARGUMENTS", args)
-                .replace("${ARGUMENTS}", args),
-        )
+        Some(cmd.render(args))
     }
 
     /// All commands, sorted by name.
