@@ -5,18 +5,31 @@
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
 use atomcode_kernel::event::StopReason;
+use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
+use atomcode_kernel::message::Message;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::request::RequestCtx;
-use atomcode_kernel::tool::{MountedTools, RiskLevel, Tool, ToolCall, ToolContext, ToolResult};
+use atomcode_kernel::tool::{
+    MountedTools, ProgressSink, RiskLevel, Tool, ToolCall, ToolContext, ToolResult,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+/// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
+/// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
+/// The TUI routes marker-prefixed chunks to the in-place spinner instead of scrollback.
+/// MUST stay in sync with the same literal in atomcode-tuix event_loop (`SUBAGENT_ACTIVITY_MARKER`).
+pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// Per-subtask wall-clock cap: a stuck/looping child is cancelled + reported as an error
 /// instead of hanging the whole `task` call forever (v1's SubAgentPool had the same guard).
-const DEFAULT_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// 900s (15 min) is generous on purpose — this is the TOTAL time for ALL of a subtask's
+/// rounds, and a thorough read-only review on a slow hidden-reasoning model (GLM) can take
+/// many minutes. It only exists to bound a genuinely wedged/looping child. Overridable via
+/// the `ATOMCODE_SUBAGENT_TIMEOUT` env var (see coding/parts.rs `subagent_timeout_from_env`).
+const DEFAULT_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// After a timed-out child is cancelled, how long to wait for it to unwind cooperatively
 /// and hand back its partial work before we detach it and report a bare timeout.
 const GRACE_AFTER_CANCEL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -212,6 +225,8 @@ several. Subagents run in parallel and cannot themselves dispatch."
             // A second handle to fire the child's cancel on timeout (the token given to the
             // builder is moved in; this clone stays so we can stop a timed-out detached child).
             let cancel_on_timeout = child_cancel.clone();
+            // A third handle for the progress hook to short-circuit emits once cancelled.
+            let hook_cancel = child_cancel.clone();
             let wd = ctx.working_dir.clone();
             let label = format!(
                 "{}#{}",
@@ -242,6 +257,13 @@ several. Subagents run in parallel and cannot themselves dispatch."
                     // parent's prompting sensitive-path gate wouldn't protect it. Hard-deny
                     // sensitive-path file ops instead (#1).
                     .middleware(Arc::new(DenySensitivePaths))
+                    // Funnel the child's live activity (thinking / current tool) up to the
+                    // parent progress sink so the TUI spinner shows what this subtask is doing.
+                    .hook(Arc::new(SubtaskProgressHook {
+                        progress: progress.clone(),
+                        label: label.clone(),
+                        cancel: hook_cancel,
+                    }))
                     .build();
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
@@ -368,6 +390,79 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
     match serde_json::from_str::<Args>(args) {
         Ok(a) => Ok(a),
         Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
+    }
+}
+
+/// A one-line preview of what a child is about to do this round — the tool name plus a
+/// concise argument (path / pattern / command / …) when one is present. Best-effort: if the
+/// args aren't parseable JSON or carry no recognisable key, just the tool name.
+fn summarize_tool_call(call: &ToolCall) -> String {
+    const KEYS: &[&str] = &[
+        "path",
+        "file_path",
+        "pattern",
+        "query",
+        "command",
+        "cmd",
+        "url",
+        "description",
+        "name",
+    ];
+    let arg = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|v| {
+            KEYS.iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
+        });
+    match arg.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => {
+            let first = a.lines().next().unwrap_or("").trim();
+            let short: String = if first.chars().count() > 30 {
+                format!("{}\u{2026}", first.chars().take(29).collect::<String>())
+            } else {
+                first.to_string()
+            };
+            format!("{} {}", call.name, short)
+        }
+        None => call.name.clone(),
+    }
+}
+
+/// Child-agent lifecycle hook that funnels a subtask's live activity up to the PARENT's
+/// progress sink as marker-prefixed (ephemeral) lines: `thinking…` before each model round,
+/// then the tool it's about to run. The TUI shows the latest such line in-place on the
+/// spinner so a multi-minute fan-out isn't silent between the ↻ start and ✓ done lines.
+struct SubtaskProgressHook {
+    progress: ProgressSink,
+    /// The subtask label, e.g. `explore#1` — so the footer shows WHICH child is acting.
+    label: String,
+    /// The child's cancel token. A timed-out child is cancelled then DETACHED (it may keep
+    /// running if it ignores cooperative cancel); gate emits on this so a zombie can't
+    /// resurrect stale activity onto the spinner after the parent already moved on.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+#[async_trait]
+impl LifecycleHooks for SubtaskProgressHook {
+    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        self.progress
+            .emit(format!("{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking\u{2026}", self.label));
+    }
+
+    async fn on_model_response(&self, response: &mut Message) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        if let Some(call) = response.tool_calls.first() {
+            self.progress.emit(format!(
+                "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {}",
+                self.label,
+                summarize_tool_call(call)
+            ));
+        }
     }
 }
 
@@ -523,6 +618,34 @@ mod tests {
             Some("exceeded the 300s time limit"),
             "timeout is the authoritative cause once we cancelled it"
         );
+    }
+
+    #[test]
+    fn summarize_tool_call_picks_concise_arg() {
+        let mk = |name: &str, args: &str| ToolCall {
+            id: "x".into(),
+            name: name.into(),
+            arguments: args.into(),
+        };
+        // Recognised key → "name arg".
+        assert_eq!(
+            summarize_tool_call(&mk("read_file", r#"{"path":"src/auth.rs"}"#)),
+            "read_file src/auth.rs"
+        );
+        assert_eq!(
+            summarize_tool_call(&mk("grep", r#"{"pattern":"unwrap("}"#)),
+            "grep unwrap("
+        );
+        // Long arg → truncated with ellipsis.
+        let long = summarize_tool_call(&mk(
+            "bash",
+            r#"{"command":"cargo test --workspace --all-features --verbose now"}"#,
+        ));
+        assert!(long.starts_with("bash "), "{long}");
+        assert!(long.ends_with('\u{2026}'), "{long}");
+        // No recognised key / bad JSON → just the tool name.
+        assert_eq!(summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)), "todowrite");
+        assert_eq!(summarize_tool_call(&mk("weird", "not json")), "weird");
     }
 
     #[test]

@@ -154,6 +154,12 @@ pub struct UiState {
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
     pub compaction_forced_streaming: bool,
+    /// Latest live activity of a running `task` subagent fan-out (e.g.
+    /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
+    /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
+    /// silent `Pondering…`. `None` when no subtask activity is current; cleared
+    /// when the `task` tool finishes and at every turn end/cancel/error.
+    pub subagent_activity: Option<String>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -429,6 +435,7 @@ impl UiState {
             spinner_frame: 0,
             compacting: false,
             compaction_forced_streaming: false,
+            subagent_activity: None,
             unicode_symbols,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -715,6 +722,9 @@ impl UiState {
         // turn (or peer turn / session switch — all funnel through here) is over.
         // Single source of truth so no turn-end path can pin a stale count.
         self.live_turn_todo = None;
+        // Same discipline for the subagent fan-out activity: no turn-end path may
+        // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
+        self.subagent_activity = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -730,6 +740,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.live_turn_todo = None;
+        self.subagent_activity = None;
     }
 
     pub fn on_error(&mut self) {
@@ -740,6 +751,7 @@ impl UiState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         self.live_turn_todo = None;
+        self.subagent_activity = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;

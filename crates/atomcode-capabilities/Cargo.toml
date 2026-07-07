@@ -13,6 +13,10 @@ serde_json = "1"
 futures = "0.3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# `tools` capability: the `task` subagent tool names `CancellationToken` in a struct field
+# (the progress hook gates emits on the child's cancel). Already in-tree via kernel; opt-in
+# so a provider-only embedder skips it.
+tokio-util = { version = "0.7", optional = true }
 # `provider` capability deps (HTTP + SSE). Optional so a downstream embedder that
 # only wants other capabilities does not pull in the TLS/HTTP stack.
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
@@ -70,7 +74,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:globset", "dep:encoding_rs", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
