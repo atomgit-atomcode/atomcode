@@ -8711,13 +8711,14 @@ fn handle_agent_event(
             // marked with SUBAGENT_ACTIVITY_MARKER (single source of truth in the capabilities
             // crate, emitted by `SubtaskProgressHook`). It does NOT belong in scrollback — it
             // updates the spinner in-place (latest-wins) so a fan-out shows what it's doing
-            // without spamming a line per tool call. Scoped to the `task` tool so a non-task
+            // without spamming a line per tool call. Cheap marker check FIRST (every bash
+            // chunk hits this arm); the `display_tool_name("task")` allocation only runs for
+            // the rare marker-prefixed chunk, and scopes it to the `task` tool so a non-task
             // tool that happens to stream a leading U+001E byte can't be hijacked.
-            let is_task = tool_display.is_some_and(|d| d == display_tool_name("task"));
-            if is_task {
-                if let Some(activity) = chunk
-                    .strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
-                {
+            if let Some(activity) =
+                chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
+            {
+                if tool_display.is_some_and(|d| d == display_tool_name("task")) {
                     state.subagent_activity = Some(activity.to_string());
                     // Repaint so the spinner picks up the new activity immediately.
                     renderer.flush();

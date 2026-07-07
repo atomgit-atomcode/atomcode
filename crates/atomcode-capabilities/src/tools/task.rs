@@ -21,7 +21,9 @@ const DEFAULT_MAX_CONCURRENT: usize = 3;
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
 /// The TUI routes marker-prefixed chunks to the in-place spinner instead of scrollback.
-/// MUST stay in sync with the same literal in atomcode-tuix event_loop (`SUBAGENT_ACTIVITY_MARKER`).
+/// atomcode-tuix references THIS const (can't drift). The atomcode-daemon leg has no
+/// dependency on this crate and hard-codes the literal `'\u{1e}'` in `to_wire` (to drop
+/// these lines from the webui) — if you ever change this sentinel, update THAT literal too.
 pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// Per-subtask wall-clock cap: a stuck/looping child is cancelled + reported as an error
 /// instead of hanging the whole `task` call forever (v1's SubAgentPool had the same guard).
@@ -114,7 +116,7 @@ impl TaskTool {
         }
     }
 
-    /// Override the per-subtask wall-clock timeout (default 300s). A subtask that exceeds it
+    /// Override the per-subtask wall-clock timeout (default 900s). A subtask that exceeds it
     /// is cancelled and reported as a `<task_error>` — one stuck child can't hang the batch.
     pub fn with_subtask_timeout(mut self, d: std::time::Duration) -> Self {
         self.subtask_timeout = d;
@@ -414,17 +416,23 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             KEYS.iter()
                 .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
         });
-    match arg.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(a) => {
-            let first = a.lines().next().unwrap_or("").trim();
-            let short: String = if first.chars().count() > 30 {
-                format!("{}\u{2026}", first.chars().take(29).collect::<String>())
-            } else {
-                first.to_string()
-            };
-            format!("{} {}", call.name, short)
-        }
-        None => call.name.clone(),
+    let short = arg.as_deref().map(|a| first_line_capped(a, 30)).unwrap_or_default();
+    if short.is_empty() {
+        call.name.clone()
+    } else {
+        format!("{} {}", call.name, short)
+    }
+}
+
+/// First line of `s`, trimmed, capped to `max` chars with a trailing ellipsis when it's
+/// longer. Char-based (never slices a code point mid-way). Empty first line → empty string.
+/// Shared by the tool-call preview and the subtask progress line so the two can't drift.
+fn first_line_capped(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    if first.chars().count() > max {
+        format!("{}\u{2026}", first.chars().take(max - 1).collect::<String>())
+    } else {
+        first.to_string()
     }
 }
 
@@ -448,8 +456,10 @@ impl LifecycleHooks for SubtaskProgressHook {
         if self.cancel.is_cancelled() {
             return;
         }
+        // No trailing ellipsis: the TUI spinner appends its own `…`, so emitting one
+        // here would double it (`thinking……`).
         self.progress
-            .emit(format!("{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking\u{2026}", self.label));
+            .emit(format!("{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} thinking", self.label));
     }
 
     async fn on_model_response(&self, response: &mut Message) {
@@ -487,13 +497,7 @@ fn finalize_grace_outcome(mut o: Outcome, timed_out_msg: String) -> Outcome {
 /// trimmed and length-capped, so a long prompt-like description can't wrap the strip.
 /// Emitted on start and completion so the user sees WHICH job each subtask is.
 fn subtask_progress_line(head: &str, model: &str, desc: &str) -> String {
-    const MAX: usize = 48;
-    let first = desc.lines().next().unwrap_or("").trim();
-    let snippet: String = if first.chars().count() > MAX {
-        format!("{}\u{2026}", first.chars().take(MAX - 1).collect::<String>())
-    } else {
-        first.to_string()
-    };
+    let snippet = first_line_capped(desc, 48);
     if snippet.is_empty() {
         format!("{head} \u{b7} {model}")
     } else {
@@ -646,6 +650,58 @@ mod tests {
         // No recognised key / bad JSON → just the tool name.
         assert_eq!(summarize_tool_call(&mk("todowrite", r#"{"todos":[]}"#)), "todowrite");
         assert_eq!(summarize_tool_call(&mk("weird", "not json")), "weird");
+    }
+
+    #[tokio::test]
+    async fn subtask_hook_marks_activity_no_double_ellipsis_and_respects_cancel() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let c = captured.clone();
+            ProgressSink::new(Arc::new(move |m: String| c.lock().unwrap().push(m)))
+        };
+        let cancel = CancellationToken::new();
+        let hook = SubtaskProgressHook {
+            progress: sink,
+            label: "explore#1".into(),
+            cancel: cancel.clone(),
+        };
+        let ctx = TurnCtx {
+            session_id: None,
+            turn_id: 1,
+            request_id: 1,
+            round: 1,
+            max_rounds: None,
+            cache_epoch: 0,
+            context_window: 0,
+            used_tokens: 0,
+        };
+
+        hook.pre_request(&mut Vec::new(), &ctx).await;
+        let mut msg = Message::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "x".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            }],
+        );
+        hook.on_model_response(&mut msg).await;
+        {
+            let c = captured.lock().unwrap();
+            assert_eq!(c.len(), 2, "expected thinking + tool lines: {c:?}");
+            assert!(c[0].starts_with(SUBAGENT_ACTIVITY_MARKER), "marker-prefixed: {:?}", c[0]);
+            // The spinner appends its OWN ellipsis — the thinking line must carry none.
+            assert!(!c[0].contains('\u{2026}'), "no ellipsis on thinking line: {:?}", c[0]);
+            assert!(c[0].ends_with("thinking"), "thinking line: {:?}", c[0]);
+            assert!(c[1].contains("read_file a.rs"), "tool line: {:?}", c[1]);
+        }
+
+        // A detached/zombie child cancelled on timeout must emit nothing further.
+        cancel.cancel();
+        hook.pre_request(&mut Vec::new(), &ctx).await;
+        hook.on_model_response(&mut msg).await;
+        assert_eq!(captured.lock().unwrap().len(), 2, "cancelled hook must stay silent");
     }
 
     #[test]
