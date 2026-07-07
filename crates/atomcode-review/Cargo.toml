@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-review"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "L2 review specialization: assembles the neutral kernel + capabilities into a read-only code-review agent that reports structured findings."
 
