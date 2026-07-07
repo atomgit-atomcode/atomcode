@@ -1504,12 +1504,17 @@ impl AgentLoop {
                     let new_ctx = crate::ctx::for_provider(provider_config);
                     self.ctx = new_ctx.clone();
                     self.turn_runner.ctx = new_ctx;
-                    match crate::provider::create_provider(provider_config) {
-                        Ok(new_provider) => {
+                    let provider_result = tokio::task::spawn_blocking({
+                        let provider_config = provider_config.clone();
+                        move || crate::provider::create_provider(&provider_config)
+                    })
+                    .await;
+                    match provider_result {
+                        Ok(Ok(new_provider)) => {
                             self.turn_runner.provider = std::sync::Arc::from(new_provider);
                             self.turn_runner.config = self.config.clone();
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let msg = format!("{:#}", e);
                             let is_auth_gap = msg.contains("Not logged in")
                                 || msg.contains("Invalid auth.toml")
@@ -1529,6 +1534,12 @@ impl AgentLoop {
                                     e
                                 )));
                             }
+                        }
+                        Err(join_err) => {
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                "**Warning: failed to reload provider: {}**\n\n",
+                                join_err
+                            )));
                         }
                     }
                 } else {
