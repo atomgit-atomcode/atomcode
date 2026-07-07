@@ -183,6 +183,95 @@ function testToolBlocksStayBetweenTextChunks() {
   assert.equal(message.blocks?.[1].type === 'tool' ? message.blocks[1].tool.output : undefined, 'ok');
 }
 
+function testPermissionRequestMarksMatchingToolWaitingAndAddsPermissionBlock() {
+  let state = startAssistantState();
+  state = chatReducer(state, {
+    type: 'TOOL_START',
+    id: 'call-1',
+    name: 'write_file',
+    args: '{"path":"README.md"}',
+  });
+  state = chatReducer(state, {
+    type: 'PERMISSION_REQUEST',
+    id: 'call-1',
+    sessionId: 'session-1',
+    toolName: 'write_file',
+    reason: 'Modify workspace file',
+    args: '{"path":"README.md"}',
+    isDestructive: true,
+  });
+
+  const message = state.messages[0];
+  assert.deepEqual(message.blocks?.map((block) => block.type), ['tool', 'permission']);
+  assert.equal(message.toolCalls?.[0]?.status, 'waiting_approval');
+  assert.equal(message.permissionRequest?.id, 'call-1');
+  assert.equal(message.permissionRequest?.sessionId, 'session-1');
+  assert.equal(message.permissionRequest?.reason, 'Modify workspace file');
+}
+
+function testConsecutivePermissionResponsesUpdateOriginalBlockOnly() {
+  let state = startAssistantState();
+  state = chatReducer(state, {
+    type: 'TOOL_START',
+    id: 'call-1',
+    name: 'write_file',
+    args: '{"path":"README.md"}',
+  });
+  state = chatReducer(state, {
+    type: 'PERMISSION_REQUEST',
+    id: 'call-1',
+    sessionId: 'session-1',
+    toolName: 'write_file',
+    reason: 'Modify first file',
+    args: '{"path":"README.md"}',
+    isDestructive: true,
+  });
+  state = chatReducer(state, { type: 'PERMISSION_RESPOND', id: 'call-1', decision: 'allow' });
+  state = chatReducer(state, {
+    type: 'TOOL_START',
+    id: 'call-2',
+    name: 'write_file',
+    args: '{"path":"CHANGELOG.md"}',
+  });
+  state = chatReducer(state, {
+    type: 'PERMISSION_REQUEST',
+    id: 'call-2',
+    sessionId: 'session-1',
+    toolName: 'write_file',
+    reason: 'Modify second file',
+    args: '{"path":"CHANGELOG.md"}',
+    isDestructive: true,
+  });
+  state = chatReducer(state, { type: 'PERMISSION_RESPONSE_RESULT', id: 'call-1', success: true });
+
+  const message = state.messages[0];
+  const permissionBlocks = message.blocks?.filter((block) => block.type === 'permission') ?? [];
+  assert.deepEqual(
+    permissionBlocks.map((block) => block.type === 'permission' ? [block.request.id, block.request.status] : undefined),
+    [['call-1', 'allowed'], ['call-2', 'pending']],
+  );
+  assert.equal(message.permissionRequest?.id, 'call-2');
+  assert.equal(message.permissionRequest?.status, 'pending');
+}
+
+function testPermissionRespondStoresExplicitDecision() {
+  let state = startAssistantState();
+  state = chatReducer(state, {
+    type: 'PERMISSION_REQUEST',
+    id: 'call-1',
+    sessionId: 'session-1',
+    toolName: 'mcp__server__tool',
+    reason: 'Run MCP tool',
+    args: '{}',
+    isDestructive: false,
+  });
+  state = chatReducer(state, { type: 'PERMISSION_RESPOND', id: 'call-1', decision: 'allow_persist' });
+
+  const request = state.messages[0].permissionRequest;
+  assert.equal(request?.status, 'submitting');
+  assert.equal(request?.decision, 'allow_persist');
+}
+
 function testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion() {
   const rawMessage = [
     'The user has attached the following file(s)/selection(s) for context. The content is provided inline below — DO NOT use read_file to re-read them.',
@@ -508,6 +597,20 @@ function testMissingUserImagePlaceholderHasStableThumbnailSizing() {
   assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*height:\s*120px;/s);
 }
 
+function testPermissionCardStaysVisibleWhileDecisionIsSubmitting() {
+  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/AssistantMessage.tsx'), 'utf8');
+
+  assert.match(source, /block\.request\.status === 'pending' \|\| block\.request\.status === 'submitting'/);
+}
+
+function testPermissionCardOffersPersistentDecisionOptions() {
+  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/PermissionRequest.tsx'), 'utf8');
+
+  assert.match(source, /handleRespond\('always_allow'\)/);
+  assert.match(source, /handleRespond\('allow_persist'\)/);
+  assert.match(source, /request\.toolName\.startsWith\('mcp__'\)/);
+}
+
 function testStreamingMarkdownRepairsUnclosedCodeFence() {
   const repaired = repairStreamingMarkdown([
     '说明：',
@@ -660,6 +763,9 @@ testCodeArtifactLanguageSentinelIsRemovedBeforeRendering();
 testTypedCodeArtifactDoesNotStripDifferentLanguageLookingCodeLine();
 testPlainCodeFenceArtifactDoesNotRenderArtifactChrome();
 testToolBlocksStayBetweenTextChunks();
+testPermissionRequestMarksMatchingToolWaitingAndAddsPermissionBlock();
+testConsecutivePermissionResponsesUpdateOriginalBlockOnly();
+testPermissionRespondStoresExplicitDecision();
 testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion();
 testHistoryMissingImagePlaceholderIsPreserved();
 testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput();
@@ -677,6 +783,8 @@ testUserPlainTextCssPreservesLiteralInput();
 testInlineArtifactCodeKeepsCodeBlockBorder();
 testPreCodeDoesNotUseInlineCodePillStyling();
 testMissingUserImagePlaceholderHasStableThumbnailSizing();
+testPermissionCardStaysVisibleWhileDecisionIsSubmitting();
+testPermissionCardOffersPersistentDecisionOptions();
 testStreamingMarkdownRepairsUnclosedCodeFence();
 testStreamingMarkdownLeavesClosedCodeFenceUnchanged();
 testFinalMarkdownProtectsFenceInsideInlineCodeSpan();

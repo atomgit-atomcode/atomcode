@@ -42,10 +42,12 @@ export function ToolCall({ tool }: ToolCallProps) {
   const annotationClass =
     tool.status === 'error' ? 'error' :
     tool.status === 'done' ? 'success' :
-    tool.status === 'queued' ? 'queued' : '';
+    tool.status === 'queued' ? 'queued' :
+    tool.status === 'waiting_approval' ? 'queued' : '';
 
   const annotationText =
     tool.status === 'queued' ? t('tool.waiting') :
+    tool.status === 'waiting_approval' ? t('tool.waitingApproval') :
     tool.status === 'running' ? undefined :
     tool.status === 'error' ? t('tool.error') :
     isEditTool && tool.status === 'done' ? t('tool.applied') :

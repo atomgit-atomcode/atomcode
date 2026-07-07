@@ -203,6 +203,28 @@ function upsertPermissionBlock(message: ChatMessage, request: PermissionRequestD
   return { ...message, blocks: nextBlocks };
 }
 
+function updatePermissionBlock(
+  message: ChatMessage,
+  id: string,
+  update: (request: PermissionRequestData) => PermissionRequestData,
+): ChatMessage {
+  const blocks = currentBlocks(message);
+  let updatedRequest: PermissionRequestData | undefined;
+  const nextBlocks = blocks.map((block) => {
+    if (block.type !== 'permission' || block.request.id !== id) return block;
+    updatedRequest = update(block.request);
+    return { ...block, request: updatedRequest };
+  });
+  if (!updatedRequest) return message;
+  return {
+    ...message,
+    blocks: nextBlocks,
+    permissionRequest: message.permissionRequest?.id === id
+      ? updatedRequest
+      : message.permissionRequest,
+  };
+}
+
 // Matches the prefix emitted in provider.ts _handleSend when context files are attached.
 const ATTACHED_FILES_PREFIX = /^The user has attached the following file\(s\)(?:\/selection\(s\))? for context\./;
 
@@ -798,17 +820,27 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
+        const toolCalls = last.toolCalls?.map((tool) =>
+          tool.id === action.id ? { ...tool, status: 'waiting_approval' as const } : tool,
+        );
         const request: PermissionRequestData = {
           id: action.id,
+          sessionId: action.sessionId,
           toolName: action.toolName,
+          reason: action.reason,
           args: action.args,
           isDestructive: action.isDestructive,
           status: 'pending',
         };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
+        let nextMessage = upsertPermissionBlock({
           ...last,
+          toolCalls,
           permissionRequest: request,
         }, request);
+        for (const tool of toolCalls ?? []) {
+          nextMessage = upsertToolBlock(nextMessage, tool);
+        }
+        msgs[msgs.length - 1] = nextMessage;
       }
       return { ...state, messages: msgs };
     }
@@ -816,15 +848,33 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'PERMISSION_RESPOND': {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant' && last.permissionRequest?.id === action.id) {
-        const request: PermissionRequestData = {
-          ...last.permissionRequest,
-          status: action.allowed ? 'allowed' : 'denied',
-        };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
-          ...last,
-          permissionRequest: request,
-        }, request);
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => ({
+          ...request,
+          status: 'submitting',
+          decision: action.decision,
+          error: undefined,
+        }));
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'PERMISSION_RESPONSE_RESULT': {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => action.success
+          ? {
+              ...request,
+              status: request.decision === 'deny' ? 'denied' : 'allowed',
+              error: undefined,
+            }
+          : {
+              ...request,
+              status: 'pending',
+              decision: undefined,
+              error: action.message || 'Permission response failed',
+            });
       }
       return { ...state, messages: msgs };
     }

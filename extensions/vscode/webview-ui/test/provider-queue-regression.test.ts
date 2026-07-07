@@ -135,10 +135,142 @@ async function testInitialStateDoesNotClearPendingApprovalModeSwitch() {
   );
 }
 
+async function testPermissionRequestFromStreamIsForwardedToPanel() {
+  const posted: unknown[] = [];
+  const client = {
+    streamChat: (_request: unknown, callbacks: {
+      onPermissionRequest: (request: {
+        sessionId: string;
+        toolName: string;
+        reason: string;
+        callId: string;
+        args: string;
+      }) => void;
+    }) => {
+      callbacks.onPermissionRequest({
+        sessionId: 'session-a',
+        toolName: 'write_file',
+        reason: 'Modify workspace file',
+        callId: 'call-1',
+        args: '{"path":"README.md"}',
+      });
+      return new AbortController();
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _handleSend: (...args: unknown[]) => Promise<void>;
+    _postMessage: (msg: unknown) => void;
+    _postMessageToPanel: (sessionId: string, msg: unknown) => void;
+  };
+
+  unsafeProvider._postMessage = () => undefined;
+  unsafeProvider._postMessageToPanel = (_sessionId: string, msg: unknown) => {
+    posted.push(msg);
+  };
+
+  await unsafeProvider._handleSend('please write', undefined, undefined, undefined, 'session-a', 'build');
+
+  assert.deepEqual(posted.find((msg) => (msg as { type?: string }).type === 'permissionRequest'), {
+    type: 'permissionRequest',
+    sessionId: 'session-a',
+    id: 'call-1',
+    toolName: 'write_file',
+    reason: 'Modify workspace file',
+    args: '{"path":"README.md"}',
+    isDestructive: true,
+  });
+}
+
+async function testPermissionResponsePostsDecisionToDaemon() {
+  const calls: unknown[] = [];
+  const posted: unknown[] = [];
+  const client = {
+    sendPermissionDecision: async (...args: unknown[]) => {
+      calls.push(args);
+      return { success: true };
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _handlePermissionResponse: (msg: unknown) => Promise<void>;
+    _postMessageForSession: (sessionId: string, msg: unknown) => void;
+  };
+  unsafeProvider._postMessageForSession = (_sessionId: string, msg: unknown) => {
+    posted.push(msg);
+  };
+
+  await unsafeProvider._handlePermissionResponse({
+    sessionId: 'session-a',
+    id: 'call-1',
+    toolName: 'write_file',
+    allowed: true,
+  });
+
+  assert.deepEqual(calls, [['session-a', 'allow', 'write_file']]);
+  assert.deepEqual(posted, [{
+    type: 'permissionResponseResult',
+    id: 'call-1',
+    success: true,
+    message: undefined,
+  }]);
+}
+
+async function testPermissionResponsePostsExplicitDecisionToDaemon() {
+  const calls: unknown[] = [];
+  const posted: unknown[] = [];
+  const client = {
+    sendPermissionDecision: async (...args: unknown[]) => {
+      calls.push(args);
+      return { success: true };
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _handlePermissionResponse: (msg: unknown) => Promise<void>;
+    _postMessageForSession: (sessionId: string, msg: unknown) => void;
+  };
+  unsafeProvider._postMessageForSession = (_sessionId: string, msg: unknown) => {
+    posted.push(msg);
+  };
+
+  await unsafeProvider._handlePermissionResponse({
+    sessionId: 'session-a',
+    id: 'call-1',
+    toolName: 'mcp__server__tool',
+    decision: 'allow_persist',
+  });
+  await unsafeProvider._handlePermissionResponse({
+    sessionId: 'session-a',
+    id: 'call-2',
+    toolName: 'write_file',
+    decision: 'always_allow',
+  });
+
+  assert.deepEqual(calls, [
+    ['session-a', 'allow_persist', 'mcp__server__tool'],
+    ['session-a', 'always_allow', 'write_file'],
+  ]);
+  assert.deepEqual(posted, [{
+    type: 'permissionResponseResult',
+    id: 'call-1',
+    success: true,
+    message: undefined,
+  }, {
+    type: 'permissionResponseResult',
+    id: 'call-2',
+    success: true,
+    message: undefined,
+  }]);
+}
+
 Promise.resolve()
   .then(testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel)
   .then(testQueuedMessageDoesNotDrainWhileApprovalModeIsPending)
   .then(testInitialStateDoesNotClearPendingApprovalModeSwitch)
+  .then(testPermissionRequestFromStreamIsForwardedToPanel)
+  .then(testPermissionResponsePostsDecisionToDaemon)
+  .then(testPermissionResponsePostsExplicitDecisionToDaemon)
   .catch((err) => {
   console.error(err);
   process.exit(1);

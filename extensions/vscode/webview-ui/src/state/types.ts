@@ -75,6 +75,7 @@ export interface SkillInfo {
 }
 
 export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type PermissionDecision = 'allow' | 'deny' | 'always_allow' | 'allow_persist';
 
 /** Tool call data (collapsed section in the UI) */
 export interface ToolCallData {
@@ -84,7 +85,7 @@ export interface ToolCallData {
   output?: string;
   success?: boolean;
   durationMs?: number;
-  status: 'queued' | 'running' | 'done' | 'error';
+  status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error';
 }
 
 export interface ArtifactData {
@@ -98,10 +99,14 @@ export interface ArtifactData {
 
 export interface PermissionRequestData {
   id: string;
+  sessionId: string;
   toolName: string;
+  reason: string;
   args: string;
   isDestructive: boolean;
-  status: 'pending' | 'allowed' | 'denied';
+  status: 'pending' | 'submitting' | 'allowed' | 'denied';
+  decision?: PermissionDecision;
+  error?: string;
 }
 
 export type MessageBlock =
@@ -194,8 +199,9 @@ export type ChatAction =
   | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'TOGGLE_SETTINGS' }
-  | { type: 'PERMISSION_REQUEST'; id: string; toolName: string; args: string; isDestructive: boolean }
-  | { type: 'PERMISSION_RESPOND'; id: string; allowed: boolean }
+  | { type: 'PERMISSION_REQUEST'; id: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'PERMISSION_RESPOND'; id: string; decision: PermissionDecision }
+  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; success: boolean; message?: string }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
@@ -240,6 +246,7 @@ export type ExtensionMessage =
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string; startLine?: number; endLine?: number }
   | { type: 'insertText'; text: string }
   | { type: 'skills'; skills: SkillInfo[] }
-  | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
+  | { type: 'permissionRequest'; sessionId: string; id: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'permissionResponseResult'; id: string; success: boolean; message?: string }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string };

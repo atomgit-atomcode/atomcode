@@ -13,6 +13,7 @@ import {
   PatchThinkingRequest,
   ProvidersResponse,
   ImageInput,
+  PermissionDecision,
 } from '../daemon/types';
 import { getQuickActionPrompt } from './quickActions';
 import {
@@ -42,9 +43,27 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
     data: any;
   }>;
+}
+
+function isDestructivePermissionTool(toolName: string): boolean {
+  const normalized = toolName.toLowerCase();
+  return normalized.includes('bash')
+    || normalized.includes('execute')
+    || normalized.includes('write')
+    || normalized.includes('edit')
+    || normalized.includes('replace')
+    || normalized.includes('delete')
+    || normalized.includes('parallel_edit');
+}
+
+function isPermissionDecision(value: unknown): value is PermissionDecision {
+  return value === 'allow'
+    || value === 'deny'
+    || value === 'always_allow'
+    || value === 'allow_persist';
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -300,6 +319,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'selectApprovalMode':
           await this._setApprovalMode(msg.mode);
+          break;
+        case 'permissionResponse':
+          await this._handlePermissionResponse(msg);
           break;
         case 'authLoginStart':
           await this._startLogin();
@@ -810,6 +832,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'toolResult', data: { id, name, output, success, durationMs } });
         this._postMessageToPanel(streamSessionId, { type: 'toolResult', id, name, output, success, durationMs });
       },
+      onPermissionRequest: (request) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        const msg = {
+          sessionId: request.sessionId,
+          id: request.callId,
+          toolName: request.toolName,
+          reason: request.reason,
+          args: request.args,
+          isDestructive: isDestructivePermissionTool(request.toolName),
+        };
+        srt.eventBuffer.push({ type: 'permissionRequest', data: msg });
+        this._postMessageToPanel(streamSessionId, { type: 'permissionRequest', ...msg });
+      },
       onTokens: (prompt, completion, total) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -908,6 +944,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!rt.isGenerating && rt.queuedMessages.length > 0) {
         void this._sendNextQueuedMessage(sessionId);
       }
+    }
+  }
+
+  private async _handlePermissionResponse(msg: {
+    sessionId?: string;
+    id?: string;
+    toolName?: string;
+    decision?: unknown;
+    allowed?: boolean;
+    persist?: boolean;
+  }) {
+    if (!msg.sessionId || !msg.id) return;
+    const decision: PermissionDecision | undefined = isPermissionDecision(msg.decision)
+      ? msg.decision
+      : typeof msg.allowed === 'boolean'
+        ? (msg.allowed ? (msg.persist ? 'allow_persist' : 'allow') : 'deny')
+        : undefined;
+
+    if (!decision) {
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: false,
+        message: 'Invalid permission decision',
+      });
+      return;
+    }
+
+    try {
+      const result = await this._client.sendPermissionDecision(
+        msg.sessionId,
+        decision,
+        msg.toolName,
+      );
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: result.success,
+        message: result.error,
+      });
+    } catch (e) {
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: false,
+        message: this._messageFromError(e),
+      });
     }
   }
 
@@ -1407,6 +1490,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
+          break;
+        case 'permissionRequest':
+          post({ type: 'permissionRequest', ...evt.data });
           break;
         case 'artifactStart':
           post({ type: 'artifactStart', id: evt.data.id, artifactType: evt.data.artifactType, language: evt.data.language, title: evt.data.title });

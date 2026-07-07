@@ -15,6 +15,8 @@ import {
   ModelInfo,
   PatchProviderRequest,
   PatchThinkingRequest,
+  PermissionDecision,
+  PermissionDecisionResponse,
   ProjectState,
   ProviderInfo,
   ProvidersResponse,
@@ -216,6 +218,18 @@ export class DaemonClient {
 
   setApprovalMode(mode: ApprovalMode): Promise<ApprovalModeResponse> {
     return this.post<ApprovalModeResponse>('/approval_mode', { mode });
+  }
+
+  sendPermissionDecision(
+    sessionId: string,
+    decision: PermissionDecision,
+    toolName?: string,
+  ): Promise<PermissionDecisionResponse> {
+    return this.post<PermissionDecisionResponse>('/chat/permission', {
+      session_id: sessionId,
+      decision,
+      ...(toolName ? { tool_name: toolName } : {}),
+    });
   }
 
   // ── Skills ───────────────────────────────────────────────────
@@ -467,6 +481,15 @@ export class DaemonClient {
         break;
       case 'tool_result':
         callbacks.onToolResult(event.id, event.name, event.output, event.success, event.duration_ms);
+        break;
+      case 'permission_request':
+        callbacks.onPermissionRequest({
+          sessionId: event.session_id,
+          toolName: event.tool_name,
+          reason: event.reason,
+          callId: event.call_id,
+          args: event.arguments,
+        });
         break;
       case 'tokens':
         callbacks.onTokens(event.prompt, event.completion, event.total);

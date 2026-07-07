@@ -221,9 +221,19 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'PERMISSION_REQUEST',
             id: msg.id,
+            sessionId: msg.sessionId,
             toolName: msg.toolName,
+            reason: msg.reason,
             args: msg.args,
             isDestructive: msg.isDestructive,
+          });
+          break;
+        case 'permissionResponseResult':
+          dispatch({
+            type: 'PERMISSION_RESPONSE_RESULT',
+            id: msg.id,
+            success: msg.success,
+            message: msg.message,
           });
           break;
         case 'focusInput':

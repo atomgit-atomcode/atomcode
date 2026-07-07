@@ -111,9 +111,16 @@ const zh = {
   'tool.applied': '已应用',
   'tool.done': '完成',
   'tool.destructive': '破坏性操作',
+  'tool.waitingApproval': '待审批',
 
   'permission.deny': '拒绝',
   'permission.allow': '允许',
+  'permission.alwaysAllow': '始终允许',
+  'permission.allowPersist': '允许并持久化',
+  'permission.denying': '拒绝中...',
+  'permission.allowing': '允许中...',
+  'permission.alwaysAllowing': '始终允许中...',
+  'permission.persisting': '持久化中...',
 
   'assistant.artifact': '产物',
   'assistant.streaming': '生成中',
@@ -259,9 +266,16 @@ const en: Record<MsgKey, string> = {
   'tool.applied': 'applied',
   'tool.done': 'done',
   'tool.destructive': 'destructive',
+  'tool.waitingApproval': 'waiting approval',
 
   'permission.deny': 'Deny',
   'permission.allow': 'Allow',
+  'permission.alwaysAllow': 'Always Allow',
+  'permission.allowPersist': 'Allow & Persist',
+  'permission.denying': 'Denying...',
+  'permission.allowing': 'Allowing...',
+  'permission.alwaysAllowing': 'Always Allowing...',
+  'permission.persisting': 'Persisting...',
 
   'assistant.artifact': 'artifact',
   'assistant.streaming': 'streaming',

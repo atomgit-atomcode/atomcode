@@ -54,7 +54,9 @@ function AssistantBlock({ block, streaming }: { block: MessageBlock; streaming: 
         ? <ArtifactBlock artifact={block.artifact} />
         : <ArtifactCodeView artifact={block.artifact} />;
     case 'permission':
-      return block.request.status === 'pending' ? <PermissionRequest request={block.request} /> : null;
+      return block.request.status === 'pending' || block.request.status === 'submitting'
+        ? <PermissionRequest request={block.request} />
+        : null;
     default:
       return null;
   }

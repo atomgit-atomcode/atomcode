@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { classifyDaemonStreamError, formatDaemonHttpError } from '../../src/daemon/client';
+import { DaemonClient, classifyDaemonStreamError, formatDaemonHttpError } from '../../src/daemon/client';
 
 function testBodyLimitErrorIsReadable() {
   assert.equal(
@@ -30,8 +30,48 @@ function testNonManualAbortStreamErrorKeepsMessage() {
   });
 }
 
+function testPermissionRequestSseIsForwardedToCallback() {
+  const client = new DaemonClient(13456);
+  let received: unknown;
+  const callbacks = {
+    onText: () => undefined,
+    onToolBatch: () => undefined,
+    onToolStart: () => undefined,
+    onToolResult: () => undefined,
+    onTokens: () => undefined,
+    onArtifactStart: () => undefined,
+    onArtifactContent: () => undefined,
+    onArtifactEnd: () => undefined,
+    onDone: () => undefined,
+    onStopped: () => undefined,
+    onError: () => undefined,
+    onPermissionRequest: (request: unknown) => {
+      received = request;
+    },
+  };
+
+  (client as unknown as { handleSSEData: (data: string, callbacks: unknown) => void })
+    .handleSSEData(JSON.stringify({
+      type: 'permission_request',
+      session_id: 'session-1',
+      tool_name: 'write_file',
+      reason: 'Modify workspace file',
+      call_id: 'call-1',
+      arguments: '{"path":"README.md"}',
+    }), callbacks);
+
+  assert.deepEqual(received, {
+    sessionId: 'session-1',
+    toolName: 'write_file',
+    reason: 'Modify workspace file',
+    callId: 'call-1',
+    args: '{"path":"README.md"}',
+  });
+}
+
 testBodyLimitErrorIsReadable();
 testJsonWrappedBodyLimitErrorIsReadable();
 testRegularErrorsKeepServerMessage();
 testManualAbortStreamErrorIsStopped();
 testNonManualAbortStreamErrorKeepsMessage();
+testPermissionRequestSseIsForwardedToCallback();
