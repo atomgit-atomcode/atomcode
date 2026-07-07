@@ -6333,6 +6333,12 @@ fn handle_idle_key(
             .cmd_tx
             .send(AgentCommand::SetPlanMode(is_plan))
             .ok();
+        // 同步 daemon 的 LIVE_APPROVAL_MODE，使 App 端扫码/重连时拿到正确的模式。
+        if is_plan {
+            atomcode_daemon::live_set_mode(atomcode_daemon::ApprovalMode::Plan);
+        } else {
+            atomcode_daemon::live_set_mode(atomcode_daemon::ApprovalMode::Build);
+        }
         renderer.render(UiLine::CommandOutput(format!(
             "  Switched to {} mode.\n",
             app.state.agent_mode.label()
@@ -9511,6 +9517,24 @@ fn handle_agent_event(
                     }
                 }
             }
+        }
+        AgentEvent::ModeChanged(mode) => {
+            // 手机 App / webui 切换了审批模式 → TUI 跟随更新。
+            let is_plan = mode == "plan";
+            state.agent_mode = if is_plan {
+                crate::state::AgentMode::Plan
+            } else {
+                crate::state::AgentMode::Build
+            };
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetPlanMode(is_plan))
+                .ok();
+            renderer.render(UiLine::CommandOutput(format!(
+                "（手机端切换为 {} 模式）\n",
+                state.agent_mode.label()
+            )));
+            renderer.flush();
         }
         AgentEvent::ContextStats {
             system_tokens,

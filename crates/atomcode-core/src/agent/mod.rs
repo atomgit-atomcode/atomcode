@@ -455,6 +455,8 @@ pub enum AgentEvent {
     /// broadcast back via `LiveEvent::CommandOutput`. Delivered over the
     /// live-sync channel (`LiveEvent::RemoteCommand` → here).
     RemoteSlashCommand(String),
+    /// 手机 App / webui 切换了审批模式（build / plan）→ TUI 跟随更新。
+    ModeChanged(String),
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
