@@ -2574,7 +2574,7 @@ async fn run_headless(
             | AgentEvent::SessionSwitched(_)
             | AgentEvent::SessionRenamed { .. }
             | AgentEvent::RemoteSlashCommand(_)
-            | AgentEvent::ModeChanged(_) => {
+            | AgentEvent::ModeChanged { .. } => {
                 // Live-sync only — not applicable in headless CLI.
             }
             AgentEvent::GoalUpdate { .. } => {

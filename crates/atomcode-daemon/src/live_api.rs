@@ -1305,7 +1305,15 @@ impl TurnExecutor for KernelTurnExecutor {
                         }
                     };
                     // 广播审批已解决，让其他视图（App/WebUI）同步卡片状态。
-                    emit(TurnEvent::ApprovalResolved { call_id: call_id.clone() });
+                    let decision_str = match decision {
+                        PermissionDecision::Allow => "allow",
+                        PermissionDecision::AllowAlways => "always_allow",
+                        _ => "deny",
+                    };
+                    emit(TurnEvent::ApprovalResolved {
+                        call_id: call_id.clone(),
+                        decision: decision_str.to_string(),
+                    });
                     let cmd = match decision {
                         PermissionDecision::Allow => AgentCommand::ApproveTool,
                         PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
@@ -1809,7 +1817,7 @@ pub(crate) enum LiveWireEvent {
         arguments: String,
     },
     #[serde(rename = "permission_resolved")]
-    PermissionResolved { call_id: String },
+    PermissionResolved { call_id: String, decision: String },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -1934,7 +1942,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 call_id: call.id,
                 arguments: call.arguments,
             },
-            TE::ApprovalResolved { call_id } => LiveWireEvent::PermissionResolved { call_id },
+            TE::ApprovalResolved { call_id, decision } => LiveWireEvent::PermissionResolved { call_id, decision },
             TE::RateLimited {
                 reset_at_display,
                 reset_label,
