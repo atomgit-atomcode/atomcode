@@ -6431,6 +6431,12 @@ fn handle_idle_key(
             .cmd_tx
             .send(AgentCommand::SetPlanMode(is_plan))
             .ok();
+        // 同步 daemon 的 LIVE_APPROVAL_MODE，使 App 端扫码/重连时拿到正确的模式。
+        if is_plan {
+            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Plan);
+        } else {
+            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Build);
+        }
         renderer.render(UiLine::CommandOutput(format!(
             "  Switched to {} mode.\n",
             app.state.agent_mode.label()

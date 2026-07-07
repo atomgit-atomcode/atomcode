@@ -19,11 +19,12 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
-mod approval_mode;
+pub mod approval_mode;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
+pub use live_api::live_set_mode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
@@ -3337,6 +3338,9 @@ async fn process_chat_request(
                     secs_until_reset,
                     auto_resuming,
                 });
+            }
+            TurnEvent::ApprovalResolved { .. } => {
+                // 审批已由任一端决策，HTTP 客户端通过 chat_event 感知后续工具事件即可。
             }
         }
     }

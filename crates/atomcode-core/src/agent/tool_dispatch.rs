@@ -268,6 +268,9 @@ impl AgentLoop {
                     auto_resuming,
                 });
             }
+            TurnEvent::ApprovalResolved { .. } => {
+                // 审批已由任一端决策，agent loop 不需要额外处理。
+            }
         }
     }
 

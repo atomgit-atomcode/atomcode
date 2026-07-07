@@ -453,6 +453,7 @@ pub enum AgentEvent {
     /// broadcast back via `LiveEvent::CommandOutput`. Delivered over the
     /// live-sync channel (`LiveEvent::RemoteCommand` → here).
     RemoteSlashCommand(String),
+    /// 手机 App / webui 切换了审批模式（build / plan）→ TUI 跟随更新。
     /// Context budget stats — piped into datalog and cached by the TUI
     /// for `/context`. Emitted after every turn's `ctx.build_messages`
     /// call, so stats reflect the snapshot the model actually saw.
@@ -2867,6 +2868,10 @@ impl AgentLoop {
                                 TurnEvent::Warning(w) => {
                                     datalog.log_warning(&w);
                                     let _ = event_tx.send(AgentEvent::Warning(w));
+                                }
+                                TurnEvent::ApprovalResolved { .. } => {
+                                    // 审批已由任一端决策，其他视图通过 LiveEvent 广播同步，
+                                    // 此处的 agent loop 不需要额外处理。
                                 }
                                 TurnEvent::WorkingDirChanged(new_dir) => {
                                     // A tool (change_dir / bash cd) mutated the shared
