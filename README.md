@@ -458,7 +458,16 @@ Cover: function signature & parameters, core business logic, data flow & side ef
 
 - **`name`** — Required. The command name; `/explain` triggers it.
 - **`description`** — Optional. Shown in Tab completion.
-- **`args`** — Optional. `required` / `optional` / `none` (default `none`). Reserved for future use — currently parsed but has no effect on behavior. `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed). Note: pressing `Tab` inserts a trailing space for all commands (built-in and custom), while pressing `Enter` always fires immediately.
+- **`args`** — Optional. Controls argument expectation and UX:
+
+  | Value | Menu Enter | Empty-arg submit |
+  |-------|-----------|------------------|
+  | `none` (default) | Execute immediately | Accepted (substitutes `""`) |
+  | `optional` | Complete to `/name `, wait for input | Accepted |
+  | `required` | Complete to `/name `, wait for input | Rejected with error message |
+
+  The template variable `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed).
+
 - **Template body** — The prompt sent to the AI when the command is invoked. `$ARGUMENTS` or `${ARGUMENTS}` is replaced with whatever the user types after the command name.
 
 **Example: create a code-review command**

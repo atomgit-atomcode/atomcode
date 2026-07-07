@@ -19,6 +19,22 @@
 // 如有指定文件则只审查: $ARGUMENTS
 // ```
 //
+// The `args` field controls the command's argument expectation:
+//
+//   `none`     (default) — No argument required. Selecting from the slash menu
+//                          executes immediately, same as a built-in command.
+//   `optional`           — Argument may be supplied. Menu selection completes
+//                          to `/name ` so the user can type an argument before
+//                          pressing Enter again to execute.
+//   `required`           — Argument is mandatory. Menu selection completes to
+//                          `/name `, and submitting with an empty argument is
+//                          rejected with an error message.
+//
+// Template variables:
+//
+//   `$ARGUMENTS`  /  `${ARGUMENTS}`   — Replaced with the user-provided text
+//                                        after the command name (if any).
+//
 // The registry is loaded once at startup (or on `/mcp reload`-style events)
 // and queried by the TUI dispatch loop. Custom commands are NOT LLM-invocable
 // — they are user-invocable via `/command_name` in the input, sending the
@@ -38,7 +54,14 @@ pub struct CustomCommand {
     pub namespace: Option<String>,
 }
 
-/// Whether a custom command expects arguments from the user.
+/// Whether a custom command expects arguments from the user, controlling
+/// both the slash-menu Enter behaviour and dispatch validation:
+///
+/// | Value      | Menu Enter          | Empty-arg submit |
+/// |------------|---------------------|------------------|
+/// | `None`     | Execute immediately | Accepted         |
+/// | `Optional` | Complete to `/name `| Accepted         |
+/// | `Required` | Complete to `/name `| Rejected (error) |
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArgsRequirement {
     Required,
@@ -201,6 +224,10 @@ impl CustomCommandRegistry {
     /// Render the template for `name`, replacing `$ARGUMENTS` /
     /// `${ARGUMENTS}` with the provided args string. Name resolution follows
     /// [`resolve`].
+    ///
+    /// Note: this method does NOT validate `args_requirement` — it always
+    /// performs the substitution. Empty-arg validation for `Required` happens
+    /// in the dispatch layer (`execute_slash_command_impl`).
     pub fn render(&self, name: &str, args: &str) -> Option<String> {
         let cmd = self.resolve(name)?;
         Some(
