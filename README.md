@@ -394,7 +394,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/model` | Switch model / provider |
 | `/provider` | Manage providers (add / edit / delete) |
 | `/proxy` | Switch outbound proxy mode |
-| `/login` | Sign in with AtomGit OAuth |
+| `/login` | Sign in with AtomGit OAuth and claim CodingPlan free models |
 | `/logout` | Sign out of AtomGit |
 | `/whoami` | Show the current logged-in user |
 | `/status` | Show login status and model info |

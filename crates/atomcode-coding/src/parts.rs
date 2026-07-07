@@ -281,9 +281,13 @@ pub async fn prepare_with_plugin_hooks(
                 })
             };
 
-            registry.register(Arc::new(TaskTool::new(
-                make_fast, make_capable, make_explore_tools, make_worker_tools,
-            )));
+            let subtask_timeout = subagent_timeout_from_env(
+                std::env::var("ATOMCODE_SUBAGENT_TIMEOUT").ok().as_deref(),
+            );
+            registry.register(Arc::new(
+                TaskTool::new(make_fast, make_capable, make_explore_tools, make_worker_tools)
+                    .with_subtask_timeout(subtask_timeout),
+            ));
             names.push("task".to_string());
             Some(slot)
         } else {
@@ -737,6 +741,20 @@ pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     }
 }
 
+/// Per-subtask wall-clock timeout from env `ATOMCODE_SUBAGENT_TIMEOUT` (whole seconds).
+/// Default 900s (15 min). Unset / empty / unparseable → default. A tiny value would kill
+/// every subtask, so anything below 30s is floored to 30s (a deliberate footgun guard).
+pub fn subagent_timeout_from_env(var: Option<&str>) -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 900;
+    const MIN_SECS: u64 = 30;
+    let secs = var
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(|s| s.max(MIN_SECS))
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +771,22 @@ mod tests {
         assert!(g(Some("1")));
         assert!(g(Some("true")));
         assert!(g(Some("yes")));
+    }
+
+    #[test]
+    fn subagent_timeout_env_parsing() {
+        use super::subagent_timeout_from_env as t;
+        use std::time::Duration;
+        // Default when unset / empty / non-numeric.
+        assert_eq!(t(None), Duration::from_secs(900));
+        assert_eq!(t(Some("")), Duration::from_secs(900));
+        assert_eq!(t(Some("abc")), Duration::from_secs(900));
+        assert_eq!(t(Some("0")), Duration::from_secs(900)); // 0 rejected → default
+        // Valid values, with whitespace tolerated.
+        assert_eq!(t(Some("600")), Duration::from_secs(600));
+        assert_eq!(t(Some("  1200 ")), Duration::from_secs(1200));
+        // Footgun guard: anything under 30s is floored to 30s.
+        assert_eq!(t(Some("5")), Duration::from_secs(30));
     }
 
     #[test]

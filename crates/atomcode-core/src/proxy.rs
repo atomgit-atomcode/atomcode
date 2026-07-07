@@ -20,8 +20,13 @@ pub enum ProxyMode {
 }
 
 impl Default for ProxyMode {
+    // Respect the environment's proxy by default (matches curl / reqwest-native
+    // behavior). A `NoProxy` default silently stripped `https_proxy` and forced
+    // `.no_proxy()` on every client, breaking every corporate-proxy user out of
+    // the box (they'd time out reaching acs.atomgit.com etc.). Users who want to
+    // ignore a system proxy can pick `no_proxy` via `/proxy`.
     fn default() -> Self {
-        Self::NoProxy
+        Self::FollowSystem
     }
 }
 
@@ -224,25 +229,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_mode_default_is_no_proxy() {
-        assert_eq!(ProxyMode::default(), ProxyMode::NoProxy);
+    fn proxy_mode_default_is_follow_system() {
+        // Default respects the environment proxy so corporate-proxy users work
+        // out of the box (see the Default impl rationale).
+        assert_eq!(ProxyMode::default(), ProxyMode::FollowSystem);
     }
 
     #[test]
     fn proxy_summary_reflects_mode() {
         let cfg = ProxyConfig::default();
-        assert_eq!(cfg.summary(), "no_proxy");
+        assert_eq!(cfg.summary(), "follow_system");
 
-        let follow = ProxyConfig {
-            mode: ProxyMode::FollowSystem,
+        let no_proxy = ProxyConfig {
+            mode: ProxyMode::NoProxy,
             ..Default::default()
         };
-        assert_eq!(follow.summary(), "follow_system");
+        assert_eq!(no_proxy.summary(), "no_proxy");
     }
 
     #[test]
-    fn proxy_file_config_defaults_to_no_proxy() {
+    fn proxy_file_config_defaults_to_follow_system() {
         let parsed: ProxyFileConfig = toml::from_str("").expect("parse");
-        assert_eq!(parsed.network.proxy.mode, ProxyMode::NoProxy);
+        assert_eq!(parsed.network.proxy.mode, ProxyMode::FollowSystem);
     }
 }

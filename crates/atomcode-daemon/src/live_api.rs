@@ -1844,7 +1844,17 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 name,
                 arguments,
             },
-            TE::ToolOutputChunk { call_id: _, chunk } => LiveWireEvent::ToolOutput { chunk },
+            TE::ToolOutputChunk { call_id: _, chunk } => {
+                // A leading U+001E marks a `task` subagent's EPHEMERAL live-activity line
+                // (TUI-only, shown in-place on the spinner — see SUBAGENT_ACTIVITY_MARKER in
+                // atomcode-capabilities `SubtaskProgressHook`). The webui has no such surface,
+                // so drop it rather than leak a raw control char + a per-round flood into the
+                // browser transcript.
+                if chunk.starts_with('\u{1e}') {
+                    return None;
+                }
+                LiveWireEvent::ToolOutput { chunk }
+            }
             TE::ToolCallResult {
                 call_id,
                 name,
@@ -2650,6 +2660,27 @@ mod tests {
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
         assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+    }
+
+    // 回归：`task` 子代理的实时活性行（U+001E 前缀）是 TUI 专属的原地 spinner 更新，
+    // webui 没有对应展示面，必须在 to_wire 丢弃 —— 否则浏览器转录里会漏进裸控制符
+    // 和每轮一条的活性刷屏。普通工具输出仍照常下发。
+    #[test]
+    fn subagent_activity_marker_chunk_dropped_normal_output_kept() {
+        // Marker-prefixed → dropped (None).
+        let dropped = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+            call_id: "c1".into(),
+            chunk: "\u{1e}explore#4 · grep unwrap".into(),
+        }));
+        assert!(dropped.is_none(), "marker-prefixed subagent activity must be dropped");
+        // Ordinary tool output → forwarded.
+        let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+            call_id: "c2".into(),
+            chunk: "hello from bash".into(),
+        }))
+        .expect("normal tool output must still reach the webui");
+        let json = serde_json::to_string(&kept).unwrap();
+        assert!(json.contains("hello from bash"), "{json}");
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，

@@ -1606,6 +1606,29 @@ mod buffer_tests {
     }
 
     #[test]
+    fn spinner_label_shows_subagent_activity_when_present() {
+        // While a `task` fan-out is running, the spinner shows the children's latest
+        // live activity in place of the generic thinking word — and reverts when cleared.
+        let mut s = UiState::new();
+        s.on_submit();
+        let thinking = format_spinner_label(&s, 0, None);
+        assert!(!thinking.contains("explore#4"), "baseline must be the thinking word: {thinking:?}");
+
+        s.subagent_activity = Some("explore#4 · grep unwrap".to_string());
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("explore#4 · grep unwrap"),
+            "spinner must surface the subagent activity: {active:?}"
+        );
+
+        // Turn end clears it (single source of truth) → back to a plain thinking word.
+        s.on_turn_complete();
+        s.on_submit();
+        let after = format_spinner_label(&s, 0, None);
+        assert!(!after.contains("explore#4"), "activity must not leak past turn end: {after:?}");
+    }
+
+    #[test]
     fn spinner_label_maps_tool_names_to_thinking_word() {
         // Tool-execution labels must not flash tool names in the footer spinner;
         // they map back to the turn's thinking word. The body ▸ rows carry the
@@ -8418,6 +8441,9 @@ fn streams_tool_output_by_default(
     show_tool_output
         || call_id.starts_with("local-shell-")
         || tool_display.is_some_and(|d| d == display_tool_name(DISPATCH_TOOL_RAW_NAME))
+        // The `task` subagent tool: its per-subtask ↻/✓/✗ progress is the whole point —
+        // stream it live so a multi-minute fan-out isn't a black box until it returns.
+        || tool_display.is_some_and(|d| d == display_tool_name("task"))
 }
 
 #[cfg(test)]
@@ -8430,6 +8456,15 @@ mod tool_output_stream_gate_tests {
         assert!(
             streams_tool_output_by_default(false, "call-1", Some(&disp)),
             "dispatch tool's progress must stream by default"
+        );
+    }
+
+    #[test]
+    fn task_tool_streams_without_verbose() {
+        let disp = display_tool_name("task");
+        assert!(
+            streams_tool_output_by_default(false, "call-1", Some(&disp)),
+            "task subagent per-subtask progress must stream by default"
         );
     }
 
@@ -8677,11 +8712,29 @@ fn handle_agent_event(
             state.on_tool_call_started(&display);
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
+            let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
+            // EPHEMERAL subagent activity: a `task` child's live "current action" line is
+            // marked with SUBAGENT_ACTIVITY_MARKER (single source of truth in the capabilities
+            // crate, emitted by `SubtaskProgressHook`). It does NOT belong in scrollback — it
+            // updates the spinner in-place (latest-wins) so a fan-out shows what it's doing
+            // without spamming a line per tool call. Cheap marker check FIRST (every bash
+            // chunk hits this arm); the `display_tool_name("task")` allocation only runs for
+            // the rare marker-prefixed chunk, and scopes it to the `task` tool so a non-task
+            // tool that happens to stream a leading U+001E byte can't be hijacked.
+            if let Some(activity) =
+                chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
+            {
+                if tool_display.is_some_and(|d| d == display_tool_name("task")) {
+                    state.subagent_activity = Some(activity.to_string());
+                    // Repaint so the spinner picks up the new activity immediately.
+                    renderer.flush();
+                    return;
+                }
+            }
             // Display real-time tool output (e.g., bash stdout/stderr). Normally
             // gated behind Ctrl+O verbose mode, but user-invoked `!` shell commands
             // and the dispatch tool's per-child progress always stream (see
             // `streams_tool_output_by_default`).
-            let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
             if streams_tool_output_by_default(state.show_tool_output, &call_id, tool_display) {
                 // Append to the scrollback as command output
                 renderer.render(UiLine::CommandOutput(chunk));
@@ -8700,6 +8753,12 @@ fn handle_agent_event(
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
             // approval" row first so it doesn't linger above the result.
             retract_stale_approval(state, renderer);
+            // The `task` fan-out finished — drop its live spinner activity so a
+            // completed subtask's last action doesn't linger while the parent
+            // agent keeps working the rest of the turn.
+            if name == "task" {
+                state.subagent_activity = None;
+            }
             // Learn task id → content from every todo result (each action
             // returns the full list). This is what later `todo update`
             // rows look up to show the task NAME instead of a bare id.
@@ -8812,7 +8871,13 @@ fn handle_agent_event(
             // Only suppress on SUCCESS — if the tool returned an error (bad args, etc.)
             // the user must see the error result even though the call was rendered.
             let suppress_body_echo = name == "parallel_edit_files"
-                || (name == "todowrite" && call_rendered && success);
+                || (name == "todowrite" && call_rendered && success)
+                // `task`: the per-subtask ↻/✓/✗ lines already streamed live (see
+                // `streams_tool_output_by_default`), so re-rendering `summarise_task_result`
+                // here would print each subtask's completion a second time. Only suppress when
+                // the output is a real `<task>` result — a plan-mode block (no `<task ` blocks,
+                // nothing streamed) must still show its hint.
+                || (name == "task" && output.contains("<task "));
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
@@ -10674,7 +10739,16 @@ fn format_spinner_label(state: &UiState, queue_len: usize, reasoning_effort: Opt
     // `display_spinner_label` maps `Running X` / `Preparing X` back to the
     // thinking word so the footer never flashes tool names — tool progress is
     // carried by the body `▸ Tool(detail)` rows. Other labels pass through.
-    let base = state.display_spinner_label();
+    //
+    // While a `task` subagent fan-out is running, the parent agent is just
+    // waiting on its children (a generic `Pondering…`). Replace that with the
+    // children's latest live activity (`explore#4 · grep unwrap`) so the
+    // otherwise-silent multi-minute fan-out shows what it's doing — in-place on
+    // the spinner, so it coexists with the goal/todo footer rows for free.
+    let base: &str = state
+        .subagent_activity
+        .as_deref()
+        .unwrap_or_else(|| state.display_spinner_label());
     let mut out = format!("{}{}", base, state.ellipsis());
     // Order matters. The phase clock (`· 372ms`) ticks every frame, and any
     // segment AFTER a rapidly-changing field shifts on every redraw — which

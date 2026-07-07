@@ -171,7 +171,9 @@ background_only = true
 # 网络代理
 # =============================================================================
 [network.proxy]
-mode = "no_proxy"
+# follow_system (default): respect the launch environment / system proxy.
+# default_proxy: pin the values below. no_proxy: bypass all proxies.
+mode = "follow_system"
 # http = "http://127.0.0.1:7890"
 # https = "http://127.0.0.1:7890"
 # all = "socks5://127.0.0.1:7890"

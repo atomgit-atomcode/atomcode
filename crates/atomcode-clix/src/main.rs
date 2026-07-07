@@ -17,7 +17,7 @@ mod tel;
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_review::{build_review_agent_with, Finding, ReviewAgentConfig};
+use atomcode_review::{build_review_agent_with_cancel, shared_review_deadline, Finding, ReviewAgentConfig};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -325,7 +325,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
     tel::maybe_show_notice(telemetry.is_enabled());
     let provider = tel::build_review_provider(&cfg).map_err(|e| anyhow::anyhow!(e))?;
     let provider = tel::meter_provider(provider, &telemetry, &cfg.base_url, &cfg.model);
-    let (agent, report) = build_review_agent_with(&cfg, provider.clone());
+
+    // ONE wall-clock cancel token + ONE timer shared by the first review pass AND the
+    // coverage re-review pass. `--max-duration` is documented as the cap on the WHOLE
+    // review; before this, each `build_review_agent_with` spawned its own timer from
+    // zero, so the re-review could run the FULL duration AGAIN on top of time the
+    // first pass already spent (observed: 200s first pass + 240s re-review = 440s on
+    // a `--max-duration 240` run, blowing the caller's budget and CI timeouts).
+    let review_deadline = shared_review_deadline(cfg.max_turn_duration);
+    let (agent, report) = build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
 
     // Live trace on stderr (stdout stays clean for findings / --json). The run is one LLM
     // turn loop — without this the terminal looks frozen while the model thinks + calls tools.
@@ -368,7 +376,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
                  genuinely clean, that is fine. Each hunk line is prefixed with its real file \
                  line number (`N: `) — use these for `line_start`/`line_end`.\n\n```diff\n{sub}\n```"
             );
-            let (agent2, report2) = build_review_agent_with(&cfg, provider.clone());
+            let (agent2, report2) = build_review_agent_with_cancel(&cfg, provider.clone(), review_deadline.clone());
             let run2 = run_review_streaming(agent2, scoped_task).await;
             if run2.tool_calls > 0 {
                 let profile: Vec<String> = run2.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect();
