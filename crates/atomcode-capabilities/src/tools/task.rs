@@ -271,13 +271,10 @@ several. Subagents run in parallel and cannot themselves dispatch."
                         // kernel's own stream-timeout path, which also preserves it).
                         cancel_on_timeout.cancel();
                         match tokio::time::timeout(GRACE_AFTER_CANCEL, &mut handle).await {
-                            Ok(Ok(mut o)) => {
-                                // Re-label as a timeout regardless of how the child reported its
-                                // own cancel, so the block shows "(Timeout)" with its partial text.
-                                o.stop = StopReason::Timeout;
-                                o.error.get_or_insert_with(timed_out_msg);
-                                o
-                            }
+                            // Child unwound within the grace window — keep a genuine success
+                            // (it beat the cancel), else relabel as a timeout preserving partial
+                            // output. See `finalize_grace_outcome`.
+                            Ok(Ok(o)) => finalize_grace_outcome(o, timed_out_msg()),
                             // Child didn't unwind in the grace window (or join error) → detach it
                             // and report the timeout with no partial output.
                             _ => Outcome {
@@ -288,16 +285,15 @@ several. Subagents run in parallel and cannot themselves dispatch."
                         }
                     }
                 };
-                let icon = if outcome.stop == StopReason::Stopped {
-                    "\u{2713} done"
+                // Include the failure reason on the live ✗ line (e.g. "✗ failed (Timeout)") so
+                // the streamed progress carries WHY a subtask failed — the final block summary is
+                // suppressed in the TUI once these lines stream, so this is the user's only view.
+                let head = if outcome.stop == StopReason::Stopped {
+                    format!("\u{2713} done \u{b7} {label}")
                 } else {
-                    "\u{2717} failed"
+                    format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
-                progress.emit(subtask_progress_line(
-                    &format!("{icon} \u{b7} {label}"),
-                    &model,
-                    &desc,
-                ));
+                progress.emit(subtask_progress_line(&head, &model, &desc));
                 (label, desc, model, outcome)
             });
         }
@@ -373,6 +369,21 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
         Ok(a) => Ok(a),
         Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
     }
+}
+
+/// Decide the final outcome of a child that unwound within the grace window AFTER its
+/// wall-clock timeout fired and we cancelled it. If it actually completed cleanly
+/// (`Stopped`) it beat the cancel — that's a real success, keep it rather than
+/// mislabeling a finished result as a failed timeout. Otherwise (it observed the cancel,
+/// or stopped for some other reason) relabel it as a `Timeout` with our time-limit message
+/// as the authoritative cause, while preserving whatever partial text/tool_results it did.
+fn finalize_grace_outcome(mut o: Outcome, timed_out_msg: String) -> Outcome {
+    if o.stop == StopReason::Stopped {
+        return o;
+    }
+    o.stop = StopReason::Timeout;
+    o.error = Some(timed_out_msg);
+    o
 }
 
 /// A live-progress line for one subtask: `<head> · <model> · <desc>`. `head` is the
@@ -482,6 +493,36 @@ mod tests {
     #[test]
     fn name_is_task() {
         assert_eq!(dummy().name(), "task");
+    }
+
+    #[test]
+    fn finalize_grace_outcome_keeps_success_relabels_others() {
+        // Child that finished cleanly in the grace window → kept as-is (beat the cancel).
+        let ok = Outcome {
+            stop: StopReason::Stopped,
+            text: "real result".into(),
+            ..Default::default()
+        };
+        let out = finalize_grace_outcome(ok, "time limit".into());
+        assert_eq!(out.stop, StopReason::Stopped);
+        assert_eq!(out.text, "real result");
+        assert!(out.error.is_none(), "a genuine success must not gain a timeout error");
+
+        // Child that observed the cancel → relabeled Timeout with our message, partial kept.
+        let cancelled = Outcome {
+            stop: StopReason::Cancelled,
+            text: "partial".into(),
+            error: Some("cancelled by token".into()),
+            ..Default::default()
+        };
+        let out = finalize_grace_outcome(cancelled, "exceeded the 300s time limit".into());
+        assert_eq!(out.stop, StopReason::Timeout);
+        assert_eq!(out.text, "partial", "partial output must survive");
+        assert_eq!(
+            out.error.as_deref(),
+            Some("exceeded the 300s time limit"),
+            "timeout is the authoritative cause once we cancelled it"
+        );
     }
 
     #[test]

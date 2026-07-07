@@ -8818,7 +8818,13 @@ fn handle_agent_event(
             // Only suppress on SUCCESS — if the tool returned an error (bad args, etc.)
             // the user must see the error result even though the call was rendered.
             let suppress_body_echo = name == "parallel_edit_files"
-                || (name == "todowrite" && call_rendered && success);
+                || (name == "todowrite" && call_rendered && success)
+                // `task`: the per-subtask ↻/✓/✗ lines already streamed live (see
+                // `streams_tool_output_by_default`), so re-rendering `summarise_task_result`
+                // here would print each subtask's completion a second time. Only suppress when
+                // the output is a real `<task>` result — a plan-mode block (no `<task ` blocks,
+                // nothing streamed) must still show its hint.
+                || (name == "task" && output.contains("<task "));
 
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
