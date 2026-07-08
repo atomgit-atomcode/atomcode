@@ -31,6 +31,7 @@ export interface SlashHandlers {
   reloadConfig(): void | Promise<void>;
   openSlashSkillsMenu(): void;
   notice(text: string): void;
+  execServerCommand(command: string, arg: string): void | Promise<void>;
   t(key: string, params?: Record<string, string | number>): string;
 }
 
@@ -65,6 +66,20 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (_a, h) => h.openSlashSkillsMenu() },
   { name: 'help', descKey: 'cmd.help.desc', run: (_a, h) => h.notice(buildHelpText(h.t)) },
+  { name: 'undo', descKey: 'cmd.undo.desc', argHint: '[n]', run: (a, h) => h.execServerCommand('undo', a) },
+  {
+    name: 'remember',
+    descKey: 'cmd.remember.desc',
+    argHint: '<fact>',
+    run: (a, h) => (a ? h.execServerCommand('remember', a) : h.notice(h.t('cmd.remember.needArg'))),
+  },
+  {
+    name: 'forget',
+    descKey: 'cmd.forget.desc',
+    argHint: '<keyword>',
+    run: (a, h) => (a ? h.execServerCommand('forget', a) : h.notice(h.t('cmd.forget.needArg'))),
+  },
+  { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
 ];
 
 export function buildCommandMap(defs: SlashCommandDef[]): Map<string, SlashCommandDef> {

@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -1047,10 +1047,44 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
       },
       notice: (text) => pushCommandNotice(text),
+      execServerCommand: async (command, arg) => {
+        let res: CommandResult;
+        try {
+          res = await postCommand({
+            command,
+            arg,
+            session_id: sessionId ?? undefined,
+            working_dir: cwd ?? undefined,
+          });
+        } catch (e) {
+          pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+          return;
+        }
+        if (res.kind === 'error') { pushCommandNotice(res.message); return; }
+        if (res.kind === 'undo') {
+          // Session changed on disk → reload the transcript via the existing session-load path.
+          const projectHash = activeSession?.project_hash;
+          if (projectHash && sessionId) {
+            try {
+              const detail = await getSession(projectHash, sessionId);
+              setMessages(sessionMessagesToDisplay(detail.messages));
+            } catch { /* refresh failure is non-fatal; notice still gives feedback */ }
+          }
+          pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
+          return;
+        }
+        if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+        if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
+        if (res.kind === 'memory') {
+          const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+          pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
+          return;
+        }
+      },
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
