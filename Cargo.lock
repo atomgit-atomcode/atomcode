@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-askpass"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "libc",
  "serde",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-bridge"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-capabilities"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-clix"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-coding"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-kernel"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "async-trait",
  "futures",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-review"
-version = "0.0.0"
+version = "4.25.9"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
