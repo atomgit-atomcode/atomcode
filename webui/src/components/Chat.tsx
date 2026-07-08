@@ -406,6 +406,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  // True for the entire duration of a /compact postCommand await so sendMessage
+  // can refuse to fire while the session .json is being rewritten on disk.
+  const compactingRef = useRef(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
   const [queued, setQueued] = useState<{
     id: number;
@@ -1067,57 +1070,63 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
         }
         if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
-        let res: CommandResult;
+        const isCompact = command === 'compact';
+        if (isCompact) compactingRef.current = true;
         try {
-          res = await postCommand({
-            command,
-            arg,
-            session_id: sessionId ?? undefined,
-            working_dir: cwd ?? undefined,
-            project_hash: activeSession?.project_hash ?? undefined,
-            provider: provider ?? undefined,
-          });
-        } catch (e) {
-          pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
-          return;
-        }
-        if (res.kind === 'error') { pushCommandNotice(res.message); return; }
-        if (res.kind === 'undo') {
-          if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
-          pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
-          return;
-        }
-        if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
-        if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
-        if (res.kind === 'memory') {
-          const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
-          pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
-          return;
-        }
-        if (res.kind === 'compact') {
-          if (res.applied) {
-            if (sessionId) await reloadSessionTranscript(sessionId);
-            pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
-          } else {
-            pushCommandNotice(t('cmd.compact.none'));
+          let res: CommandResult;
+          try {
+            res = await postCommand({
+              command,
+              arg,
+              session_id: sessionId ?? undefined,
+              working_dir: cwd ?? undefined,
+              project_hash: activeSession?.project_hash ?? undefined,
+              provider: provider ?? undefined,
+            });
+          } catch (e) {
+            pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+            return;
           }
-          return;
-        }
-        if (res.kind === 'context') {
-          pushCommandNotice(
-            t('cmd.context.body', {
-              sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
-              cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
-              window: res.ctx_window, name: res.ctx_name,
-            })
-          );
-          return;
+          if (res.kind === 'error') { pushCommandNotice(res.message); return; }
+          if (res.kind === 'undo') {
+            if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
+            pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
+            return;
+          }
+          if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
+          if (res.kind === 'memory') {
+            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+            pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
+            return;
+          }
+          if (res.kind === 'compact') {
+            if (res.applied) {
+              if (sessionId) await reloadSessionTranscript(sessionId);
+              pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+            } else {
+              pushCommandNotice(t('cmd.compact.none'));
+            }
+            return;
+          }
+          if (res.kind === 'context') {
+            pushCommandNotice(
+              t('cmd.context.body', {
+                sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
+                cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+                window: res.ctx_window, name: res.ctx_name,
+              })
+            );
+            return;
+          }
+        } finally {
+          if (isCompact) compactingRef.current = false;
         }
       },
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -1389,6 +1398,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const text = input.trim();
     const images = pendingImages;
     if (modeState.pendingMode) return;
+    if (compactingRef.current) return;
     if (!text && images.length === 0) return;
 
     // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
