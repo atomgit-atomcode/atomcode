@@ -121,6 +121,7 @@ export function buildSlashMenuItems(
     .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
   const skillItems: SlashMenuItem[] = skills
     .filter((s) => s.name.toLowerCase().includes(q))
-    .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }));
+    .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }))
+    .sort((a, b) => a.name.localeCompare(b.name));
   return [...cmdItems, ...skillItems];
 }
