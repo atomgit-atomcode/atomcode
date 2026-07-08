@@ -19,6 +19,7 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod commands;
 pub mod approval_mode;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
@@ -4692,6 +4693,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
         .route("/live/command", post(live_api::live_command))
+        .route("/command", post(commands::run_command))
         .route(
             "/live/switch_session",
             post(live_api::live_switch_session_endpoint),
