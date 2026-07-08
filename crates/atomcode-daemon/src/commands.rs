@@ -2,6 +2,7 @@
 use axum::{extract::State, response::IntoResponse, Json};
 use std::path::Path;
 
+use atomcode_core::agent::compression;
 use atomcode_core::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
@@ -32,11 +33,24 @@ pub(crate) fn apply_undo(session: &mut Session, arg: &str) -> usize {
     let undone = before.saturating_sub(after);
     if undone > 0 {
         // Prune display_messages and turn_stats that reference removed turns.
-        let new_len = session.messages.len();
-        session.display_messages.retain(|d| d.after_message <= new_len);
-        session.turn_stats.retain(|t| t.after_message <= new_len);
+        prune_orphaned_display(session);
     }
     undone
+}
+
+/// 会话 messages 变短后，裁掉锚点越界的 UI 附加消息与轮次统计，避免被撤销/压缩掉的
+/// 回合的通知重现、上下文表尺读到过期 turn_stat。
+fn prune_orphaned_display(session: &mut Session) {
+    let n = session.messages.len();
+    session.display_messages.retain(|d| d.after_message <= n);
+    session.turn_stats.retain(|t| t.after_message <= n);
+}
+
+/// 按会话自身 working_dir 保存（落回正确的桶，跨 /cd 稳定）。
+fn save_command_session(session: &mut Session) -> anyhow::Result<()> {
+    session.touch();
+    SessionManager::new(&session.working_dir).save(session)?;
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -70,6 +84,12 @@ pub(crate) enum CommandResult {
         ctx_window: usize,
         ctx_name: String,
     },
+    Compact {
+        applied: bool,
+        removed_messages: usize,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
     Error { message: String },
 }
 
@@ -97,9 +117,7 @@ fn exec_undo(
     let mut session = load_command_session(working_dir, project_hash, &session_id)?;
     let undone = apply_undo(&mut session, arg);
     if undone > 0 {
-        session.touch();
-        // Save to the session's own bucket (correct even after /cd changes cwd).
-        SessionManager::new(&session.working_dir).save(&session)?;
+        save_command_session(&mut session)?;
     }
     Ok(CommandResult::Undo { undone })
 }
@@ -174,6 +192,81 @@ fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
     })
 }
 
+async fn exec_compact(
+    state: &AppState,
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    session_id: Option<&str>,
+    provider: Option<&str>,
+    arg: &str,
+) -> anyhow::Result<CommandResult> {
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
+    let session_id = SessionId::from_string(sid.to_string());
+    let mut session = load_command_session(working_dir, project_hash, &session_id)?;
+    let parts =
+        crate::live_api::build_turn_parts(working_dir, provider, &state.mcp_cache, state.telemetry.clone())
+            .await?;
+
+    let mut conv = Conversation::from_snapshot(ConversationSnapshot {
+        messages: std::mem::take(&mut session.messages),
+        cold_summaries: session.cold_summaries.clone(),
+    });
+
+    let keep_ceiling = compression::compaction_keep_ceiling(
+        &*parts.ctx,
+        &parts.system_prompt,
+        &*parts.tools,
+        &conv.cold_summaries,
+    )
+    .await;
+
+    let Some((mechanical, n_msgs)) = parts.ctx.compression_plan(&conv, keep_ceiling) else {
+        // 没有可压缩的历史：原样还原，返回 applied=false。
+        let snap = conv.snapshot();
+        session.messages = snap.messages;
+        return Ok(CommandResult::Compact { applied: false, removed_messages: 0, before_tokens: 0, after_tokens: 0 });
+    };
+
+    let summarize_prompt = if arg.trim().is_empty() {
+        compression::default_summarize_prompt(&mechanical)
+    } else {
+        format!(
+            "Summarize this conversation history, focusing on: {}.\n\
+             Keep: file names, what was changed, key decisions, errors encountered.\n\
+             Drop: exact code content, tool arguments, line numbers.\n\n{}",
+            arg.trim(),
+            mechanical
+        )
+    };
+
+    let (summary, _, _, _, _) = compression::run_llm_summary(&*parts.provider, &summarize_prompt).await;
+    let content = if summary.trim().is_empty() { mechanical } else { summary };
+
+    let outcome = compression::try_apply_compression(
+        &*parts.ctx,
+        &mut conv,
+        &parts.system_prompt,
+        n_msgs,
+        content,
+        None,
+    );
+
+    let snap = conv.snapshot();
+    session.messages = snap.messages;
+    session.cold_summaries = snap.cold_summaries;
+    if outcome.applied {
+        prune_orphaned_display(&mut session);
+        save_command_session(&mut session)?;
+    }
+
+    Ok(CommandResult::Compact {
+        applied: outcome.applied,
+        removed_messages: outcome.removed_messages,
+        before_tokens: outcome.before_tokens,
+        after_tokens: outcome.after_tokens,
+    })
+}
+
 pub(crate) async fn run_command(
     State(state): State<AppState>,
     Json(req): Json<CommandReq>,
@@ -188,6 +281,7 @@ pub(crate) async fn run_command(
         "forget" => exec_forget(&working_dir, &req.arg),
         "memory" => exec_memory(&working_dir),
         "context" => exec_context(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref()).await,
+        "compact" => exec_compact(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref(), &req.arg).await,
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
