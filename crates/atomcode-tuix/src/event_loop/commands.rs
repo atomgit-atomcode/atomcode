@@ -2845,77 +2845,122 @@ fn execute_slash_command_impl(
             // then user-invocable skills (loaded from .claude/skills,
             // .atomcode/skills, etc.). Both expand to a prompt and dispatch
             // as a regular user message.
-            if let Some(cmd) = ctx.custom_commands.resolve(other) {
-                if cmd.args_requirement == ArgsRequirement::Required && arg.trim().is_empty() {
+            match decide_custom_command(&ctx.custom_commands, other, arg) {
+                CustomDispatch::Reject => {
                     renderer.render(UiLine::Error(
                         t(Msg::CmdCustomArgRequired { name: other }).into_owned(),
                     ));
                     renderer.flush();
-                } else {
-                    let rendered = cmd.render(arg);
+                }
+                CustomDispatch::Submit(rendered) => {
                     submit_agent_turn(ctx, state, rendered);
                 }
-            } else if let Some(rendered) = expand_skill(ctx, other, arg) {
-                submit_agent_turn(ctx, state, rendered);
-            } else {
-                // Unknown command — emit failure telemetry
-                let available_commands: Vec<&str> = vec![
-                    "help",
-                    "quit",
-                    "exit",
-                    "clear",
-                    "compact",
-                    "reload",
-                    "config",
-                    "plan",
-                    "build",
-                    "session",
-                    "model",
-                    "language",
-                    "resume",
-                    "rename",
-                    "provider",
-                    "status",
-                    "diff",
-                    "undo",
-                    "cost",
-                    "context",
-                    "remember",
-                    "forget",
-                    "memory",
-                    "login",
-                    "logout",
-                    "whoami",
-                    "upgrade",
-                    "issue",
-                    "cd",
-                    "bg",
-                    "codingplan",
-                ];
-                ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
-                    type_: other.to_string(),
-                    success: Some(false),
-                    error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
-                    error_data: Some(
-                        serde_json::json!({
-                            "command": other,
-                            "duration_ms": 0,
-                            "message": format!("Unknown command: {}", other),
-                            "reason": "用户输入了不存在的斜杠命令",
-                            "resolution": "使用 /help 查看所有可用命令",
-                            "available_commands": available_commands,
-                        })
-                        .to_string(),
-                    ),
-                });
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: other }).into_owned(),
-                ));
-                renderer.flush();
+                CustomDispatch::NotFound => {
+                    if let Some(rendered) = expand_skill(ctx, other, arg) {
+                        submit_agent_turn(ctx, state, rendered);
+                    } else {
+                        // Unknown command — emit failure telemetry
+                        let available_commands: Vec<&str> = vec![
+                            "help",
+                            "quit",
+                            "exit",
+                            "clear",
+                            "compact",
+                            "reload",
+                            "config",
+                            "plan",
+                            "build",
+                            "session",
+                            "model",
+                            "language",
+                            "resume",
+                            "rename",
+                            "provider",
+                            "status",
+                            "diff",
+                            "undo",
+                            "cost",
+                            "context",
+                            "remember",
+                            "forget",
+                            "memory",
+                            "login",
+                            "logout",
+                            "whoami",
+                            "upgrade",
+                            "issue",
+                            "cd",
+                            "bg",
+                            "codingplan",
+                        ];
+                        ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
+                            type_: other.to_string(),
+                            success: Some(false),
+                            error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
+                            error_data: Some(
+                                serde_json::json!({
+                                    "command": other,
+                                    "duration_ms": 0,
+                                    "message": format!("Unknown command: {}", other),
+                                    "reason": "用户输入了不存在的斜杠命令",
+                                    "resolution": "使用 /help 查看所有可用命令",
+                                    "available_commands": available_commands,
+                                })
+                                .to_string(),
+                            ),
+                        });
+                        renderer.render(UiLine::Error(
+                            t(Msg::CmdUnknownCommand { name: other }).into_owned(),
+                        ));
+                        renderer.flush();
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Decision returned by [`decide_custom_command`] for the `other` arm of
+/// [`execute_slash_command_impl`]. Separating the pure decision from its
+/// side effects (rendering an error line, submitting an agent turn) lets
+/// the dispatch rule — `Required` + empty arg ⇒ reject — be unit-tested
+/// without constructing a full `LoopCtx`.
+#[derive(Debug)]
+pub(super) enum CustomDispatch {
+    /// `args_requirement == Required` and the user supplied no argument:
+    /// render `CmdCustomArgRequired` and do NOT submit a turn.
+    Reject,
+    /// Custom command resolved; expand its template with `arg` and send
+    /// the rendered text as a user message.
+    Submit(String),
+    /// No custom command matched this name; fall through to the
+    /// user-invocable skill lookup / unknown-command path.
+    NotFound,
+}
+
+/// Resolve `name` against the custom command registry and decide what the
+/// dispatcher should do. Pure: touches neither `LoopCtx` nor the renderer,
+/// so the reject-vs-submit boundary is testable in isolation.
+///
+/// - `Required` + empty/whitespace-only `arg` → `Reject`
+/// - otherwise resolved command → `Submit(render(arg))`
+/// - no match → `NotFound`
+pub(super) fn decide_custom_command(
+    registry: &crate::custom_commands::CustomCommandRegistry,
+    name: &str,
+    arg: &str,
+) -> CustomDispatch {
+    match registry.resolve(name) {
+        Some(cmd) => {
+            if cmd.args_requirement == ArgsRequirement::Required && arg.trim().is_empty() {
+                CustomDispatch::Reject
+            } else {
+                CustomDispatch::Submit(cmd.render(arg))
+            }
+        }
+        None => CustomDispatch::NotFound,
+    }
 }
 
 /// Look up a user-invocable skill by name and expand it with the current
@@ -5685,5 +5730,125 @@ mod tests {
         assert_eq!(rendered, Some("review ".into()));
         let cmd = custom.resolve("myreview").unwrap();
         assert_eq!(cmd.args_requirement, ArgsRequirement::None);
+    }
+
+    // ── dispatch decision: `Required` + empty arg ⇒ Reject ──────────────
+    //
+    // Regression guard for the `other` arm of `execute_slash_command_impl`.
+    // The prior tests above only covered `CustomCommandRegistry::render`'s
+    // template substitution and the `args_requirement` metadata; none
+    // exercised the dispatcher's reject-vs-submit boundary. If a future
+    // refactor drops the `CmdCustomArgRequired` arm or flips the rule so
+    // `Required` + empty silently submits an empty template, the existing
+    // suite would not catch it — these do.
+
+    #[test]
+    fn dispatch_required_empty_arg_is_rejected() {
+        // Trigger: user typed `/myreview` (Required) and pressed Enter
+        // with no argument. Expected: render CmdCustomArgRequired, do
+        // NOT submit an agent turn.
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required command with empty arg must be rejected, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn dispatch_required_whitespace_only_arg_is_rejected() {
+        // The dispatcher trims before checking emptiness, so a bare
+        // space/tab arg should also reject — otherwise the user could
+        // bypass validation by typing `/myreview ` (trailing space gets
+        // injected by the needs_args menu auto-complete path).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "   \t  ");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required command with whitespace-only arg must be rejected, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn dispatch_required_nonempty_arg_submits() {
+        // Sanity counterpart: Required + a real argument must submit the
+        // rendered template, never Reject. Guards against an overly-broad
+        // rejection rule (e.g. someone drops the `arg.trim().is_empty()`
+        // half of the condition).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "foo");
+        match decision {
+            CustomDispatch::Submit(rendered) => assert_eq!(rendered, "review foo"),
+            other => panic!("Required + nonempty arg should Submit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dispatch_optional_and_none_empty_arg_submits() {
+        // Optional / None commands with empty arg must still submit (the
+        // reject rule is scoped to Required only). Locks the boundary so
+        // a regression that rejects all empty-arg dispatches is caught.
+        for requirement in [ArgsRequirement::Optional, ArgsRequirement::None] {
+            let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+            custom.register(crate::custom_commands::CustomCommand {
+                name: "myreview".into(),
+                description: "".into(),
+                args_requirement: requirement.clone(),
+                template: "review $ARGUMENTS".into(),
+                source: PathBuf::from("x"),
+                namespace: None,
+            });
+            let decision = decide_custom_command(&custom, "myreview", "");
+            match decision {
+                CustomDispatch::Submit(rendered) => assert_eq!(
+                    rendered, "review ",
+                    "Optional/None + empty arg should submit rendered template"
+                ),
+                other => panic!(
+                    "{:?} command with empty arg should Submit, got {:?}",
+                    requirement, other
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_command_is_not_found() {
+        // A name that matches neither a custom command nor (in the pure
+        // decision layer) a skill falls through to NotFound, which the
+        // dispatcher translates into the unknown-command telemetry arm.
+        let custom = crate::custom_commands::CustomCommandRegistry::empty();
+        let decision = decide_custom_command(&custom, "does_not_exist", "");
+        assert!(
+            matches!(decision, CustomDispatch::NotFound),
+            "Unregistered command should fall through to NotFound, got {:?}",
+            decision
+        );
     }
 }
