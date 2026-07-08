@@ -433,6 +433,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
+  // The /skills command opens a pure skills browser (no commands). Set while that
+  // browser is showing; cleared as soon as the user types (normal mixed filtering).
+  const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
@@ -1039,12 +1042,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         pushCommandNotice(t('cmd.reload.done'));
       },
       openSlashSkillsMenu: () => {
-        // Behave exactly like typing '/': set input to '/', open the menu with
-        // all commands + skills, and focus the textarea so the user can type to
-        // filter. Trigger the skills fetch if it hasn't been loaded yet.
+        // Open a pure SKILLS browser (not the full '/' command list — that's what
+        // made running /skills look like it "reset to /"). Input stays '/', but the
+        // menu shows only skills; typing anything drops back to normal filtering.
+        // Trigger the skills fetch if it hasn't been loaded yet.
         setInput('/');
         setSlashQuery('');
         setSlashIndex(0);
+        setSlashSkillsOnly(true);
         if (slashSkills === null && !slashLoading) {
           setSlashLoading(true);
           getSkills()
@@ -1476,7 +1481,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
-      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string);
+      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
@@ -1637,6 +1642,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSlashQuery(query);
         setSlashIndex(0);
         setSlashOpen(true);
+        // Any real keystroke exits the pure-skills browser → normal mixed filtering.
+        setSlashSkillsOnly(false);
         return;
       }
     }
@@ -1853,7 +1860,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
-          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string).map((item, i) => (
+          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button
               key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}

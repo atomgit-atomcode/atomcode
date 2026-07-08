@@ -137,11 +137,17 @@ export function buildSlashMenuItems(
   skills: { name: string; description?: string }[],
   query: string,
   t: (key: string) => string,
+  // `skillsOnly` renders a pure skills browser (the /skills command): commands are
+  // dropped so the list is unambiguously skills. Uses the `kind` split rather than
+  // a name prefix so plugin skills (their own namespace, not `skills:`) still show.
+  skillsOnly = false,
 ): SlashMenuItem[] {
   const q = query.toLowerCase();
-  const cmdItems: SlashMenuItem[] = commands
-    .filter((c) => c.name.toLowerCase().includes(q))
-    .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
+  const cmdItems: SlashMenuItem[] = skillsOnly
+    ? []
+    : commands
+        .filter((c) => c.name.toLowerCase().includes(q))
+        .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
   const skillItems: SlashMenuItem[] = skills
     .filter((s) => s.name.toLowerCase().includes(q))
     .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }))
