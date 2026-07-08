@@ -3475,41 +3475,22 @@ impl AgentLoop {
         conv: &Conversation,
         msgs: &[crate::conversation::message::Message],
     ) {
-        let tool_defs = self.turn_runner.tools.get_definitions().await;
-        let tool_defs_tokens: usize = tool_defs
-            .iter()
-            .map(|d| {
-                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
-                (d.name.len() + d.description.len() + params.len()) / 4
-            })
-            .sum();
-        let cold_zone_tokens: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+        let s = compute_rich_context_stats(conv, msgs, &self.turn_runner.tools, &*self.ctx).await;
         let actual_system_prompt = msgs
             .iter()
             .find(|m| matches!(m.role, crate::conversation::message::Role::System))
             .and_then(|m| m.text().map(|s| s.to_string()))
             .unwrap_or_default();
-        let system_tokens_local = msgs
-            .iter()
-            .find(|m| matches!(m.role, crate::conversation::message::Role::System))
-            .map(|m| m.estimate_tokens())
-            .unwrap_or(0);
-        let sent_tokens_local: usize = msgs
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum::<usize>()
-            .saturating_sub(system_tokens_local);
-        let total_messages_local = msgs.len();
         let _ = self.event_tx.send(AgentEvent::ContextStats {
-            system_tokens: system_tokens_local,
-            sent_tokens: sent_tokens_local,
+            system_tokens: s.system_tokens,
+            sent_tokens: s.sent_tokens,
             dropped_tokens: 0,
             working_set_tokens: 0,
-            total_messages: total_messages_local,
-            tool_defs_tokens,
-            cold_zone_tokens,
-            ctx_window: self.ctx.ctx_window(),
-            ctx_name: self.ctx.name().to_string(),
+            total_messages: s.total_messages,
+            tool_defs_tokens: s.tool_defs_tokens,
+            cold_zone_tokens: s.cold_zone_tokens,
+            ctx_window: s.ctx_window,
+            ctx_name: s.ctx_name,
             system_prompt: actual_system_prompt,
         });
     }
@@ -3891,6 +3872,57 @@ impl AgentLoop {
             turn_number: Some(self.turn_count as u32),
         };
         self.turn_runner.hook_engine.trigger_on_error(&ctx).await;
+    }
+}
+
+/// 上下文预算明细（纯计算，无副作用）。TUI 的 emit_rich_context_stats 与
+/// daemon 的 /context 共用同一 token 口径。
+#[derive(Debug, Clone)]
+pub struct RichContextStats {
+    pub system_tokens: usize,
+    pub sent_tokens: usize,
+    pub total_messages: usize,
+    pub tool_defs_tokens: usize,
+    pub cold_zone_tokens: usize,
+    pub ctx_window: usize,
+    pub ctx_name: String,
+}
+
+/// 计算上下文预算明细。`msgs` 应为 `ctx.build_messages(conv, system_prompt, "")` 的产物。
+pub async fn compute_rich_context_stats(
+    conv: &Conversation,
+    msgs: &[crate::conversation::message::Message],
+    tools: &ToolRegistry,
+    ctx: &dyn crate::ctx::CtxBuilder,
+) -> RichContextStats {
+    use crate::conversation::message::Role;
+    let tool_defs = tools.get_definitions().await;
+    let tool_defs_tokens: usize = tool_defs
+        .iter()
+        .map(|d| {
+            let params = serde_json::to_string(&d.parameters).unwrap_or_default();
+            (d.name.len() + d.description.len() + params.len()) / 4
+        })
+        .sum();
+    let cold_zone_tokens: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+    let system_tokens = msgs
+        .iter()
+        .find(|m| matches!(m.role, Role::System))
+        .map(|m| m.estimate_tokens())
+        .unwrap_or(0);
+    let sent_tokens = msgs
+        .iter()
+        .map(|m| m.estimate_tokens())
+        .sum::<usize>()
+        .saturating_sub(system_tokens);
+    RichContextStats {
+        system_tokens,
+        sent_tokens,
+        total_messages: msgs.len(),
+        tool_defs_tokens,
+        cold_zone_tokens,
+        ctx_window: ctx.ctx_window(),
+        ctx_name: ctx.name().to_string(),
     }
 }
 
@@ -5686,5 +5718,48 @@ mod hard_truncate_tests {
         let mut conv = Conversation::new();
         hard_truncate_to_target(&mut conv, 100, 0);
         assert_eq!(conv.messages.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod compute_rich_context_stats_tests {
+    use super::{compute_rich_context_stats, Conversation};
+    use crate::tool::ToolRegistry;
+
+    #[tokio::test]
+    async fn compute_rich_context_stats_counts_system_and_sent() {
+        use crate::conversation::message::{Message, Role};
+        // 一个空工具表 + default ctx，专注验证 system/sent/total 口径。
+        let conv = Conversation::new();
+        let msgs = vec![
+            Message::new(Role::System, "system prompt here"),
+            Message::new(Role::User, "hello world"),
+        ];
+        let tools = ToolRegistry::new();
+        let ctx = crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+            provider_type: String::new(),
+            api_key: None,
+            model: String::new(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: true,
+            capable_model: None,
+        });
+        let s = compute_rich_context_stats(&conv, &msgs, &tools, &*ctx).await;
+        assert_eq!(s.total_messages, 2);
+        assert!(s.system_tokens > 0);
+        assert!(s.sent_tokens > 0);
+        assert_eq!(s.ctx_window, 128_000);
+        assert_eq!(s.tool_defs_tokens, 0); // 空工具表
     }
 }
