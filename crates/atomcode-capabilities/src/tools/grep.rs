@@ -93,11 +93,13 @@ impl Tool for GrepTool {
         let display_path = raw.clone();
         let res = tokio::task::spawn_blocking(move || search(&root, &matcher, max, context, &base)).await;
         match res {
-            Ok((lines, files)) if lines.is_empty() => ok(format!(
+            Ok((lines, _, files)) if lines.is_empty() => ok(format!(
                 "No matches found for '{pattern}' in {display_path} ({files} files searched)"
             )),
-            Ok((lines, _)) => {
-                let capped = lines.len() >= max;
+            Ok((lines, matches, _)) => {
+                // Cap on the real MATCH count — not total output rows, which also include
+                // context + `--` separators (that over-reported "capped" with any context).
+                let capped = matches >= max;
                 let mut out = lines.join("\n");
                 if capped {
                     out.push_str(&format!("\n\n[Results capped at {max} matches]"));
@@ -109,16 +111,17 @@ impl Tool for GrepTool {
     }
 }
 
-/// Returns (formatted match+context lines, files searched). Stops once `max` matches
-/// are collected. Each file is searched by a STREAMING searcher (incremental / mmap) —
-/// it never loads the whole file into memory, so a huge file can't OOM the process.
+/// Returns (formatted match+context lines, match count, files searched). Stops once
+/// `max` matches are collected. Each file is searched by a STREAMING searcher (never
+/// loads the whole file into memory; `heap_limit` caps the per-line buffer), so a huge
+/// file — or a huge single line — can't OOM the process.
 fn search(
     root: &std::path::Path,
     matcher: &RegexMatcher,
     max: usize,
     context: usize,
     base: &std::path::Path,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, usize, usize) {
     let mut out: Vec<String> = Vec::new();
     let mut match_count = 0usize;
     let mut files_searched = 0usize;
@@ -169,7 +172,7 @@ fn search(
         // io / binary / decode errors ⇒ skip the file (same as the old read failure).
         let _ = searcher.search_path(matcher, path, sink);
     }
-    (out, files_searched)
+    (out, match_count, files_searched)
 }
 
 /// Render a raw line (bytes from the searcher) for display: strip the trailing line
@@ -328,6 +331,21 @@ mod tests {
         assert!(!r.is_error, "grep must not error/hang on a giant line");
         assert!(r.content.contains("ok.txt:1:"), "normal match found: {}", &r.content[..r.content.len().min(120)]);
         assert!(!r.content.contains("min.js"), "over-cap single-line file must be skipped");
+    }
+
+    #[tokio::test]
+    async fn capped_message_counts_matches_not_output_rows() {
+        let d = tempfile::tempdir().unwrap();
+        // 3 scattered matches at context 3 → ~23 output ROWS but only 3 MATCHES.
+        let lines: Vec<String> = (1..=30)
+            .map(|i| if i % 10 == 5 { format!("HIT {i}") } else { format!("line {i}") })
+            .collect();
+        std::fs::write(d.path().join("f.txt"), lines.join("\n") + "\n").unwrap();
+        // max_results 10: output rows (23) >= 10 but matches (3) < 10 → must NOT report capped.
+        let r = GrepTool.execute(r#"{"pattern":"HIT","max_results":10,"context":3}"#, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.content.matches("HIT").count(), 3, "exactly 3 matches: {}", r.content);
+        assert!(!r.content.contains("Results capped"), "false 'capped' with only 3<10 matches: {}", r.content);
     }
 
     #[tokio::test]
