@@ -4479,6 +4479,10 @@ async fn fs_mkdir(
     match std::fs::create_dir_all(&dir) {
         Ok(()) => {
             let canon = dir.canonicalize().unwrap_or(dir);
+            // Strip the Windows `\\?\` prefix (parity with fs_list): the returned
+            // path is round-tripped back into /cd, and an unstripped verbatim form
+            // would split the session hash bucket.
+            let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
             Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
         }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),

@@ -64,14 +64,17 @@ impl Tool for WriteFileTool {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return err(format!(
                     "write_file: failed to create parent directory {}: {e}",
-                    parent.display()
+                    crate::pathnorm::to_display(parent)
                 ));
             }
         }
         let new_lines = a.content.lines().count();
         let bytes = a.content.len();
+        // Model-facing paths use forward slashes on Windows so the model can paste
+        // them into a subsequent bash (Git Bash) command without `\` being eaten.
+        let disp = crate::pathnorm::to_display(&path);
         if let Err(e) = tokio::fs::write(&path, &a.content).await {
-            return err(format!("write_file: failed to write {}: {e}", path.display()));
+            return err(format!("write_file: failed to write {disp}: {e}"));
         }
 
         let msg = match old_lines {
@@ -79,7 +82,7 @@ impl Tool for WriteFileTool {
                 let diff = new_lines as i64 - old as i64;
                 let sign = if diff >= 0 { "+" } else { "" };
                 let mut m =
-                    format!("Overwrote {} (was {old} lines, now {new_lines} lines, {sign}{diff})", path.display());
+                    format!("Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff})");
                 // Warn on a large shrink — the model may have dropped content.
                 if old > 20 && new_lines < old / 2 {
                     m.push_str(&format!(
@@ -89,7 +92,7 @@ impl Tool for WriteFileTool {
                 }
                 m
             }
-            None => format!("Created {} ({bytes} bytes, {new_lines} lines)", path.display()),
+            None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
         };
         ok(msg)
     }

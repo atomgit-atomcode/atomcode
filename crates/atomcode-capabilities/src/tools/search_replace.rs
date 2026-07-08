@@ -74,7 +74,7 @@ impl Tool for SearchReplaceTool {
         }
         let root = resolve_path(a.path.as_deref().unwrap_or("."), &ctx.working_dir);
         if !root.exists() {
-            return err(format!("search_replace: directory not found: {}", root.display()));
+            return err(format!("search_replace: directory not found: {}", crate::pathnorm::to_display(&root)));
         }
 
         // Regex mode compiles the pattern; literal mode matches the raw string verbatim
@@ -111,17 +111,17 @@ impl Tool for SearchReplaceTool {
         let mut report = Vec::new();
         for (path, new_content, count) in modified {
             if let Err(e) = tokio::fs::write(&path, &new_content).await {
-                return err(format!("search_replace: failed to write {}: {e}", path.display()));
+                return err(format!("search_replace: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
             }
             total += count;
-            report.push(format!("  {} ({count} replacements)", path.display()));
+            report.push(format!("  {} ({count} replacements)", crate::pathnorm::to_display(&path)));
         }
 
         if report.is_empty() {
             return ok(format!(
                 "No matches for '{}' in {} ({scanned} files scanned).",
                 a.search,
-                root.display()
+                crate::pathnorm::to_display(&root)
             ));
         }
         ok(format!(

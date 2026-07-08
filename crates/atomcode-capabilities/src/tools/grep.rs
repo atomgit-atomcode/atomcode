@@ -63,7 +63,7 @@ impl Tool for GrepTool {
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
         if tokio::fs::metadata(&root).await.is_err() {
-            return err(format!("grep: path not found: {}", root.display()));
+            return err(format!("grep: path not found: {}", crate::pathnorm::to_display(&root)));
         }
         let max = a.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
         let context = a.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
@@ -140,7 +140,7 @@ fn search(root: &std::path::Path, re: &regex::Regex, max: usize, context: usize,
         };
         files_searched += 1;
         let lines: Vec<&str> = content.lines().collect();
-        let rel = path.strip_prefix(base).unwrap_or(path).display().to_string();
+        let rel = crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path));
 
         // Which line indices match.
         let matches: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, _)| i).collect();
