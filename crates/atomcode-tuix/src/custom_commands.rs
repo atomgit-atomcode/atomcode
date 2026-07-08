@@ -399,7 +399,6 @@ mod tests {
         let reg = CustomCommandRegistry::load(dir.path());
         let names: Vec<_> = reg.list().iter().map(|c| c.name.as_str()).collect();
 
-        std::env::remove_var("ATOMCODE_HOME");
         assert_eq!(names, vec!["alpha", "zebra"]);
     }
 
@@ -473,8 +472,6 @@ mod tests {
         let working = tempfile::tempdir().unwrap();
         let reg = CustomCommandRegistry::load(working.path());
         assert!(reg.get("p:greet").is_some());
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
     #[test]
     fn render_resolves_bare_name_for_namespaced_command() {

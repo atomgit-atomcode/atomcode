@@ -700,27 +700,24 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_auth_token_path_consistency() {
-        // `#[serial]`: `auth_file_path()` honours the process-global `ATOMCODE_HOME`,
-        // which other (serial) tests set to a tempdir and clear on drop. Without
-        // serialising, this test can observe their value and see a temp path instead
-        // of `~/.atomcode/auth.toml`.
-        // Both paths should resolve to the same location: ~/.atomcode/auth.toml
+        // `auth_file_path()` must resolve to `<config root>/auth.toml`. Assert the
+        // delegation to `Config::config_dir()` (HOME-agnostic) rather than the
+        // literal `~/.atomcode` — under test isolation ATOMCODE_HOME points at a
+        // temp dir, and the unset→`~/.atomcode` fallback is core's own concern
+        // (covered by `Config::resolve_config_dir` tests).
+        // `#[serial]`: this reads `config_dir()` twice (here and inside
+        // `auth_file_path()`); serialising keeps a parallel test from mutating
+        // ATOMCODE_HOME between the two reads.
         let auth_module_path = crate::auth::auth_file_path();
-        let expected_path = crate::tool::real_home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".atomcode")
-            .join("auth.toml");
+        let expected_path = crate::config::Config::config_dir().join("auth.toml");
 
         assert_eq!(
             auth_module_path, expected_path,
-            "auth_file_path() should always return ~/.atomcode/auth.toml"
+            "auth_file_path() should be config_dir()/auth.toml"
         );
-
-        // Verify the path ends with the expected directory structure
         assert!(
-            auth_module_path.ends_with(".atomcode/auth.toml")
-                || auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
-            "Path should end with .atomcode/auth.toml, got: {}",
+            auth_module_path.ends_with("auth.toml"),
+            "Path should end with auth.toml, got: {}",
             auth_module_path.display()
         );
     }

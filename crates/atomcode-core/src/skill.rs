@@ -1118,8 +1118,6 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
         assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// Regression test: when `load_skills_dir` is given a directory that
@@ -1256,8 +1254,6 @@ mod tests {
             reg.get("andrej-karpathy-skills:karpathy-guidelines").is_some(),
             "CC array plugin: skill should be loaded from direct skill directory"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// Regression test: skill names containing uppercase letters should be

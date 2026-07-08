@@ -1771,6 +1771,10 @@ pub(crate) enum LiveWireEvent {
     Snapshot {
         messages: Vec<crate::MessageInfo>,
         session_id: String,
+        /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
+        /// 已有会话名,不必等 SessionRenamed 事件(切项目场景才有 loadSession 拉名)。
+        /// 加载失败或空会话时为空字符串,App 端回退到项目名。
+        session_name: String,
         project_hash: String,
         provider: String,
         /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
@@ -2042,10 +2046,25 @@ pub(crate) async fn live_stream(
     );
     let (snapshot, replay, mut rx) = session.join_with_replay().await;
 
+    // 用实际生效的 session_id(非查询参数传入的 sid)加载会话名,供 snapshot 携带。
+    // 查询参数 sid 在首次扫码连接时为空,但 LiveSession 一定有真实的 session_id
+    // (已设置到 LIVE_SESSION_ID)。用此 id + load_dir 从 SessionManager 取 name。
+    let live_sid = live_session_id_or_unknown();
+    let sid_for_snapshot = live_sid.clone();
+    let session_name = if live_sid == "unknown" {
+        String::new()
+    } else {
+        atomcode_core::session::SessionManager::new(&snapshot_wd)
+            .load(&atomcode_core::session::SessionId::from_string(live_sid))
+            .ok()
+            .map(|s| s.name)
+            .unwrap_or_default()
+    };
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
-        session_id: live_session_id_or_unknown(),
+        session_id: sid_for_snapshot,
+        session_name,
         project_hash,
         provider: live_current_provider(),
         mode: live_current_mode_wire(),

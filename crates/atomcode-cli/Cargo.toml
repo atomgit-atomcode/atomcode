@@ -68,6 +68,11 @@ winreg = "0.55"
 # Rust, so pulling it in unconditionally on the host side costs ~nothing.
 [dev-dependencies]
 assert_cmd = "2"
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in main.rs's #[cfg(test)] module + every tests/*.rs binary) so tests
+# never persist into the developer's real ~/.atomcode.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"
 predicates = "3"
 tempfile = "3"
 which = "7"
