@@ -2788,7 +2788,9 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 + stats.on_error_hooks
                 + stats.on_user_prompt_submit_hooks
                 + stats.on_tool_call_start_hooks
-                + stats.on_model_response_hooks;
+                + stats.on_model_response_hooks
+                + stats.on_turn_start_hooks
+                + stats.on_turn_complete_hooks;
 
             println!("\nLoaded Hooks:");
             println!("─────────────────────────────────────────────");
@@ -2834,6 +2836,21 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 }
                 if stats.system_prompt_hooks > 0 {
                     println!("  {:<30} {:>5}", "SystemPrompt", stats.system_prompt_hooks);
+                }
+                if stats.on_user_prompt_submit_hooks > 0 {
+                    println!(
+                        "  {:<30} {:>5}",
+                        "UserPromptSubmit", stats.on_user_prompt_submit_hooks
+                    );
+                }
+                if stats.on_turn_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnTurnStart", stats.on_turn_start_hooks);
+                }
+                if stats.on_turn_complete_hooks > 0 {
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnTurnComplete", stats.on_turn_complete_hooks
+                    );
                 }
 
                 println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
