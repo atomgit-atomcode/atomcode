@@ -15,6 +15,16 @@
 //! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
 //! 我们愿意根据再审意见继续优化。
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so the crate's own unit tests never persist sessions/config into the
+// developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
+// win (isolate_home is a no-op when the var is already set).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 mod api_auth;
 mod api_codingplan;
 mod api_config;

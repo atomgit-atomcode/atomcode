@@ -891,8 +891,6 @@ mod tests {
             baseline_hooks + 1,
             "the CC runner is also pushed onto the lifecycle hook chain"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// A canned provider that reports usage then ends — enough for a telemetry
@@ -970,8 +968,6 @@ mod tests {
             llm_chats, 1,
             "review sub-agent LLM round must emit one LlmChat token event"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
@@ -1013,7 +1009,5 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 }

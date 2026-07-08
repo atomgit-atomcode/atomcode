@@ -11,23 +11,25 @@
 
 use std::process::Command;
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so tests never persist into the developer's real home. isolate_home is a
+// no-op when the var is already set.
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 #[test]
 #[serial_test::serial]
 fn add_install_reload_flow() {
-    // Set + unset on drop via this guard mirrors the in-tree
-    // `plugin::test_support::isolated_home`. Test files outside the crate
-    // can't see `pub(crate)` items so we inline the small guard here.
-    // Held only for its `Drop` (removes ATOMCODE_HOME); the TempDir field is
-    // never read directly.
-    struct Guard(#[allow(dead_code)] tempfile::TempDir);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            std::env::remove_var("ATOMCODE_HOME");
-        }
-    }
+    // Point ATOMCODE_HOME at a fresh tempdir for this test. We deliberately do
+    // NOT unset it afterwards: the isolate_home ctor keeps ATOMCODE_HOME pointed
+    // at a temp dir for the whole binary, so unsetting here would leak back to
+    // the real ~/.atomcode. Bind the TempDir to keep it (and its files) alive
+    // for the duration of the test.
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
-    let _guard = Guard(home);
+    let _home = home;
 
     // Build a minimal plugin repo with a skill and a command.
     let workspace = tempfile::tempdir().unwrap();

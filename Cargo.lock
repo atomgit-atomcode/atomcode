@@ -321,9 +321,11 @@ dependencies = [
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
+ "atomcode-test-support",
  "atomcode-tuix",
  "clap",
  "crossterm",
+ "ctor",
  "dirs 6.0.0",
  "is-terminal",
  "libc",
@@ -400,9 +402,11 @@ dependencies = [
  "async-trait",
  "atomcode-askpass",
  "atomcode-kernel",
+ "atomcode-test-support",
  "base64",
  "bytes",
  "chrono",
+ "ctor",
  "dirs 6.0.0",
  "encoding_rs",
  "futures",
@@ -467,7 +471,9 @@ dependencies = [
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
+ "atomcode-test-support",
  "chrono",
+ "ctor",
  "dirs 6.0.0",
  "futures",
  "serde_json",
@@ -489,9 +495,11 @@ dependencies = [
  "async-trait",
  "atomcode-codingplan-crypto",
  "atomcode-telemetry",
+ "atomcode-test-support",
  "base64",
  "bincode",
  "chrono",
+ "ctor",
  "dirs 6.0.0",
  "encoding_rs",
  "fs2",
@@ -547,7 +555,9 @@ dependencies = [
  "atomcode-bridge",
  "atomcode-core",
  "atomcode-telemetry",
+ "atomcode-test-support",
  "axum",
+ "ctor",
  "dirs 5.0.1",
  "futures",
  "mime_guess",
@@ -617,6 +627,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-test-support"
+version = "4.25.9"
+
+[[package]]
 name = "atomcode-tuix"
 version = "4.25.9"
 dependencies = [
@@ -627,9 +641,11 @@ dependencies = [
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
+ "atomcode-test-support",
  "base64",
  "chrono",
  "crossterm",
+ "ctor",
  "dirs 6.0.0",
  "futures",
  "ignore",
@@ -1045,6 +1061,16 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "ctor"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]

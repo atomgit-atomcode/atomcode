@@ -18,6 +18,11 @@ use atomcode_core::conversation::turn::{TurnStatus, TurnTracker};
 use atomcode_core::conversation::Conversation;
 use atomcode_core::tool::{ToolCall, ToolResult};
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 // ---------------------------------------------------------------------------
 // Helper: build a realistic multi-turn conversation
 // ---------------------------------------------------------------------------

@@ -16,6 +16,11 @@ use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
     let mut c = CodingAgentConfig::new("k", "http://unused", "test-model", working_dir);
     c.stream_timeout = Duration::from_secs(5);
@@ -232,6 +237,4 @@ async fn full_assembly_lifecycle() {
     assert_eq!(reqs, 0, "allow-always grant survives the respawn (parts own the store)");
     h4.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h4.task.await;
-
-    std::env::remove_var("ATOMCODE_HOME");
 }

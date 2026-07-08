@@ -13,6 +13,14 @@ use atomcode_kernel::conformance;
 use atomcode_kernel::tool::{ProgressSink, RiskLevel, Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary runs,
+// so a test that resolves the user mcp.json without setting its own ATOMCODE_HOME never
+// touches the developer's real home. Tests that set their own ATOMCODE_HOME still win.
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 /// A stdio server config pointing at the in-tree `mcp-test-server` fixture binary.
 fn test_server_config(name: &str) -> McpServerConfig {
     McpServerConfig {

@@ -50,6 +50,11 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the
+# developer's real ~/.atomcode.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"
 tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
