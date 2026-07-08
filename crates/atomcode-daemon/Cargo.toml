@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 # Engine v2: drive the new stack behind the legacy command/event protocol. The
 # daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
 atomcode-bridge = { path = "../atomcode-bridge" }

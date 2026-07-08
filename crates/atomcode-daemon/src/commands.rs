@@ -118,7 +118,15 @@ pub(crate) enum CommandResult {
     Status { logged_in: bool, username: Option<String>, provider: String, model: String, working_dir: String, config_path: String },
     Config { path: String, provider: String },
     Diff { stat: String },
+    Cost { total_tokens: usize, turn_count: usize },
+    Todo { items: Vec<TodoItemJson> },
     Error { message: String },
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct TodoItemJson {
+    pub status: String,
+    pub content: String,
 }
 
 /// 按会话真实桶加载：优先 project_hash（跨 /cd 稳定），否则回退到 working_dir。
@@ -351,6 +359,68 @@ fn exec_status(working_dir: &std::path::Path, provider: Option<&str>) -> anyhow:
     })
 }
 
+fn exec_cost(
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    session_id: Option<&str>,
+) -> anyhow::Result<CommandResult> {
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
+    let session = load_command_session(working_dir, project_hash, &SessionId::from_string(sid.to_string()))?;
+    // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
+    // accumulated during the turn, saved at TurnComplete). Summing gives session total.
+    let total_tokens: usize = session.turn_stats.iter().map(|t| t.total_tokens).sum();
+    let turn_count = session.turn_stats.len();
+    Ok(CommandResult::Cost { total_tokens, turn_count })
+}
+
+fn exec_todo(
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    session_id: Option<&str>,
+) -> anyhow::Result<CommandResult> {
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for todo"))?;
+    let session = load_command_session(working_dir, project_hash, &SessionId::from_string(sid.to_string()))?;
+
+    // session.messages uses atomcode_core::conversation::message::Message (not
+    // atomcode_kernel::message::Message), so we inline the derivation logic here
+    // rather than calling atomcode_capabilities::tools::todo::derive_current_todos
+    // directly (the two Message types are incompatible across crate boundaries).
+    use atomcode_capabilities::tools::todo::{parse_todos, TodoStatus};
+    use atomcode_core::conversation::message::MessageContent;
+
+    let todos = session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                tool_calls
+                    .iter()
+                    .rev()
+                    .filter(|c| c.name == "todowrite")
+                    .find_map(|c| parse_todos(&c.arguments).ok())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let items = todos
+        .into_iter()
+        .map(|t| TodoItemJson {
+            status: match t.status {
+                TodoStatus::Pending => "pending",
+                TodoStatus::InProgress => "in_progress",
+                TodoStatus::Completed => "completed",
+            }
+            .to_string(),
+            content: t.content,
+        })
+        .collect();
+
+    Ok(CommandResult::Todo { items })
+}
+
 pub(crate) async fn run_command(
     State(state): State<AppState>,
     Json(req): Json<CommandReq>,
@@ -370,6 +440,8 @@ pub(crate) async fn run_command(
         "config" => exec_config(),
         "diff" => exec_diff(&working_dir),
         "status" => exec_status(&working_dir, req.provider.as_deref()),
+        "cost" => exec_cost(&working_dir, req.project_hash.as_deref(), req.session_id.as_deref()),
+        "todo" => exec_todo(&working_dir, req.project_hash.as_deref(), req.session_id.as_deref()),
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
@@ -502,6 +574,94 @@ mod tests {
         // turn_stats: single entry with after_message=3 (2 dropped, 6→3)
         assert_eq!(s.turn_stats.len(), 1);
         assert_eq!(s.turn_stats[0].after_message, 3);
+    }
+
+    #[test]
+    fn cost_sums_turn_stats_tokens() {
+        let mut s = Session::new(std::path::PathBuf::from("/tmp/cost-test"));
+        s.turn_stats.push(TurnStat {
+            after_message: 2,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 100,
+            total_tokens: 100,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        s.turn_stats.push(TurnStat {
+            after_message: 4,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 120,
+            total_tokens: 250,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        let total: usize = s.turn_stats.iter().map(|t| t.total_tokens).sum();
+        assert_eq!(total, 350);
+        assert_eq!(s.turn_stats.len(), 2);
+    }
+
+    #[test]
+    fn todo_derives_from_last_todowrite_call() {
+        use atomcode_core::conversation::message::{MessageContent, Role};
+        use atomcode_core::tool::ToolCall;
+
+        let args = r#"{"todos":[{"content":"写测试","status":"in_progress"},{"content":"提交","status":"pending"}]}"#;
+        let mut s = Session::new(std::path::PathBuf::from("/tmp/todo-test"));
+        s.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call1".into(),
+                    name: "todowrite".into(),
+                    arguments: args.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+        });
+
+        // Inline the same derivation logic as exec_todo (core Message ≠ kernel Message).
+        use atomcode_capabilities::tools::todo::parse_todos;
+        let todos = s.messages.iter().rev().find_map(|m| {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                tool_calls
+                    .iter()
+                    .rev()
+                    .filter(|c| c.name == "todowrite")
+                    .find_map(|c| parse_todos(&c.arguments).ok())
+            } else {
+                None
+            }
+        }).unwrap_or_default();
+
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].content, "写测试");
+        assert_eq!(todos[1].content, "提交");
+    }
+
+    #[test]
+    fn todo_empty_session_returns_empty() {
+        use atomcode_capabilities::tools::todo::parse_todos;
+        use atomcode_core::conversation::message::MessageContent;
+        let s = Session::new(std::path::PathBuf::from("/tmp/todo-empty-test"));
+        let todos: Vec<_> = s.messages.iter().rev().find_map(|m| {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                tool_calls
+                    .iter()
+                    .rev()
+                    .filter(|c| c.name == "todowrite")
+                    .find_map(|c| parse_todos(&c.arguments).ok())
+            } else {
+                None
+            }
+        }).unwrap_or_default();
+        assert!(todos.is_empty());
     }
 
     #[test]
