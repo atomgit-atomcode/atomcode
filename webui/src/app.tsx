@@ -26,6 +26,23 @@ function shortSessionId(id: string): string {
   return id.slice(0, 8);
 }
 
+// Persistent sidebar width (localStorage-backed).
+const SIDEBAR_WIDTH_KEY = 'atomcode-sidebar-width';
+const SIDEBAR_MIN = 180;
+const SIDEBAR_MAX = 500;
+const SIDEBAR_DEFAULT = 280;
+
+function readSidebarWidth(): number {
+  try {
+    const v = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (v) {
+      const n = parseInt(v, 10);
+      if (n >= SIDEBAR_MIN && n <= SIDEBAR_MAX) return n;
+    }
+  } catch { /* ignore */ }
+  return SIDEBAR_DEFAULT;
+}
+
 export function App() {
   const t = useT();
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
@@ -60,6 +77,34 @@ export function App() {
   // 刷新时若 URL 带 session id，先进入「恢复中」态：在按短 id 还原出会话前，
   // 抑制 Chat 的新建落地页，避免「先闪一下新建页再跳到历史」的体验。
   const [restoring, setRestoring] = useState<boolean>(() => readSessionIdFromUrl() != null);
+
+  // ── Sidebar resize (drag handle between sidebar and main column) ──
+  const [sidebarWidth, setSidebarWidth] = useState<number>(readSidebarWidth);
+  const resizingRef = useRef(false);
+  const widthRef = useRef(sidebarWidth);
+  widthRef.current = sidebarWidth;
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      if (!resizingRef.current) return;
+      const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, e.clientX));
+      setSidebarWidth(w);
+    }
+    function onMouseUp() {
+      if (!resizingRef.current) return;
+      resizingRef.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      // Persist the final width.
+      try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(widthRef.current)); } catch { /* ignore */ }
+    }
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
 
   // 关闭表头会话菜单：外部点击 / 滚动 / 缩放（fixed 菜单不跟随锚点，故一并关闭）。
   useEffect(() => {
@@ -324,7 +369,7 @@ export function App() {
   }
 
   return (
-    <div class="app">
+    <div class="app" style={{ '--sidebar-width': `${sidebarWidth}px` } as any}>
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
         activeSessionId={sessionId}
@@ -343,6 +388,19 @@ export function App() {
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
       />
+      {/* Resize handle: invisible drag strip on the sidebar's right edge.
+          Hidden on mobile (sidebar is a drawer) and when collapsed (icon rail). */}
+      {!sidebarCollapsed && (
+        <div
+          class="sidebar-resize-handle"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            resizingRef.current = true;
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+          }}
+        />
+      )}
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
         onClick={() => setSidebarOpen(false)}

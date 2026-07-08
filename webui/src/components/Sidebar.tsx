@@ -836,7 +836,7 @@ export function Sidebar({
           (menuFor === s.id ? ' menu-open' : '')
         }
       >
-        <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
+        <button class="session-item-main" onClick={() => onSelect(s)} title={`${label}\n${dir}`}>
           <span class="session-item-name">{label}</span>
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t)}

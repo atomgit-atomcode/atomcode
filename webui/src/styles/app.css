@@ -913,9 +913,9 @@ body {
 
 /* === Sidebar / session list === */
 .session-list {
-  /* 侧栏随视口适度放宽：≤~1600px 维持 260px 不变，大屏逐步放宽至 320px，
-     避免在 2560px 等大屏上侧栏显得过窄、与主区比例失衡。 */
-  width: clamp(260px, 15vw, 320px);
+  /* 侧栏宽度由 CSS 变量 --sidebar-width 控制（拖拽手柄动态设置），
+     未设置时回退到 clamp 响应式默认值。 */
+  width: var(--sidebar-width, clamp(260px, 15vw, 320px));
   /* 暖色二级背景（比主区略深），与主区形成柔和分层（对齐设计）。 */
   background: var(--app-secondary-background);
   border-right: 1px solid var(--app-primary-border-color);
@@ -923,6 +923,38 @@ body {
   flex-direction: column;
   overflow: hidden;
   flex-shrink: 0;
+}
+
+/* --- Sidebar resize handle (drag strip between sidebar and main column) --- */
+.sidebar-resize-handle {
+  width: 6px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  /* Expand the hit area beyond the visible strip for easier grabbing. */
+  margin-left: -3px;
+  margin-right: -3px;
+}
+.sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--app-secondary-foreground);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.sidebar-resize-handle:hover::after {
+  opacity: 0.4;
+}
+.sidebar-resize-handle:active::after {
+  opacity: 0.6;
+  height: 48px;
 }
 
 /* --- Brand row: diamond logo + "AtomCode" + collapse button --- */
@@ -2337,6 +2369,8 @@ body {
   .session-list.collapsed { display: flex; width: 80vw; max-width: 300px; }
   .session-list.collapsed .sidebar-rail { display: none; }
   .sidebar-backdrop.show { display: block; }
+  /* Resize handle is desktop-only; sidebar is a drawer on mobile. */
+  .sidebar-resize-handle { display: none; }
 
   /* Reduce timeline / input insets */
   .messages-container {
