@@ -1293,7 +1293,7 @@ fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaW
 }
 
 /// Load a specific session
-fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
+pub(crate) fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));

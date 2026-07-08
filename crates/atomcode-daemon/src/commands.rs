@@ -7,7 +7,8 @@ use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// 撤销会话最后若干轮（arg 空 = 最后一轮；否则回退到第 arg 个用户提示之前——对齐 TUI /undo）。
-/// 就地修改 session.messages / cold_summaries，返回被移除的提示数。纯内存，无磁盘/env 依赖。
+/// 就地修改 session.messages / cold_summaries / display_messages / turn_stats，
+/// 返回被移除的提示数。纯内存，无磁盘/env 依赖。
 pub(crate) fn apply_undo(session: &mut Session, arg: &str) -> usize {
     let snapshot = ConversationSnapshot {
         messages: std::mem::take(&mut session.messages),
@@ -27,7 +28,14 @@ pub(crate) fn apply_undo(session: &mut Session, arg: &str) -> usize {
     let s = conv.snapshot();
     session.messages = s.messages;
     session.cold_summaries = s.cold_summaries;
-    before.saturating_sub(after)
+    let undone = before.saturating_sub(after);
+    if undone > 0 {
+        // Prune display_messages and turn_stats that reference removed turns.
+        let new_len = session.messages.len();
+        session.display_messages.retain(|d| d.after_message <= new_len);
+        session.turn_stats.retain(|t| t.after_message <= new_len);
+    }
+    undone
 }
 
 #[derive(serde::Deserialize)]
@@ -39,6 +47,8 @@ pub(crate) struct CommandReq {
     pub session_id: Option<String>,
     #[serde(default)]
     pub working_dir: Option<String>,
+    #[serde(default)]
+    pub project_hash: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -51,15 +61,24 @@ pub(crate) enum CommandResult {
     Error { message: String },
 }
 
-fn exec_undo(working_dir: &Path, session_id: Option<&str>, arg: &str) -> anyhow::Result<CommandResult> {
+fn exec_undo(
+    working_dir: &Path,
+    session_id: Option<&str>,
+    arg: &str,
+    project_hash: Option<&str>,
+) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for undo"))?;
     let session_id = SessionId::from_string(sid.to_string());
-    let manager = SessionManager::new(working_dir);
-    let mut session = manager.load(&session_id)?;
+    let mut session = if let Some(hash) = project_hash {
+        crate::load_session(hash, sid)?
+    } else {
+        SessionManager::new(working_dir).load(&session_id)?
+    };
     let undone = apply_undo(&mut session, arg);
     if undone > 0 {
         session.touch();
-        manager.save(&session)?;
+        // Save to the session's own bucket (correct even after /cd changes cwd).
+        SessionManager::new(&session.working_dir).save(&session)?;
     }
     Ok(CommandResult::Undo { undone })
 }
@@ -112,7 +131,7 @@ pub(crate) async fn run_command(Json(req): Json<CommandReq>) -> impl IntoRespons
         }
     };
     let result = match req.command.as_str() {
-        "undo" => exec_undo(&working_dir, req.session_id.as_deref(), &req.arg),
+        "undo" => exec_undo(&working_dir, req.session_id.as_deref(), &req.arg, req.project_hash.as_deref()),
         "remember" => exec_remember(&working_dir, &req.arg),
         "forget" => exec_forget(&working_dir, &req.arg),
         "memory" => exec_memory(&working_dir),
@@ -129,6 +148,7 @@ mod tests {
     use super::*;
     use atomcode_core::config::memory::MemoryStore;
     use atomcode_core::conversation::message::{Message, Role};
+    use atomcode_core::session::{DisplayMessage, TurnStat};
 
     fn session_with_turns(n: usize) -> Session {
         let mut s = Session::new(std::path::PathBuf::from("/tmp/plan2-test"));
@@ -193,5 +213,51 @@ mod tests {
         let remaining = MemoryStore::project(wd).load();
         assert!(!remaining.iter().any(|e| e.contains("delete-me")));
         assert!(remaining.iter().any(|e| e.contains("keep-me")));
+    }
+
+    #[test]
+    fn undo_prunes_display_messages_and_turn_stats() {
+        // 3 turns = 6 messages. After undo 1 turn → 4 messages remain.
+        // display_messages/turn_stats anchored at <=4 survive; >4 are pruned.
+        let mut s = session_with_turns(3);
+        // Anchored at message 2 (inside surviving turns) — should survive.
+        s.display_messages.push(DisplayMessage {
+            after_message: 2,
+            message: Message::new(Role::Assistant, "keep"),
+        });
+        // Anchored at message 6 (inside the removed turn) — should be pruned.
+        s.display_messages.push(DisplayMessage {
+            after_message: 6,
+            message: Message::new(Role::Assistant, "drop"),
+        });
+        s.turn_stats.push(TurnStat {
+            after_message: 4,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 100,
+            total_tokens: 10,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        s.turn_stats.push(TurnStat {
+            after_message: 6,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 100,
+            total_tokens: 10,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        let removed = apply_undo(&mut s, ""); // undo last 1 turn → 4 messages remain
+        assert_eq!(removed, 1);
+        assert_eq!(s.messages.len(), 4);
+        // display_messages: after_message=2 survives, after_message=6 is pruned.
+        assert_eq!(s.display_messages.len(), 1);
+        assert_eq!(s.display_messages[0].after_message, 2);
+        // turn_stats: after_message=4 survives, after_message=6 is pruned.
+        assert_eq!(s.turn_stats.len(), 1);
+        assert_eq!(s.turn_stats[0].after_message, 4);
     }
 }
