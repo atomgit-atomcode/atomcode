@@ -1760,6 +1760,9 @@ pub(crate) enum LiveWireEvent {
         provider: String,
         /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
         mode: String,
+        /// 当前工作目录，让 App 端能展示项目名。
+        #[serde(rename = "working_dir")]
+        working_dir: String,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
@@ -2011,6 +2014,7 @@ pub(crate) async fn live_stream(
     let sid = parse_session_id(q.session_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
+    let snapshot_wd = working_dir.clone();
     let session = ensure_live_session_global(
         working_dir,
         live_mcp_cache(),
@@ -2030,6 +2034,7 @@ pub(crate) async fn live_stream(
         project_hash,
         provider: live_current_provider(),
         mode: live_current_mode_wire(),
+        working_dir: snapshot_wd.to_string_lossy().to_string(),
     });
     // 进行中回合的事件回放（StateChanged(Running) + 本回合 Turn 事件）：snapshot
     // 只到上一个 turn 边界，这段补上当前回合已发生的执行过程（工具卡片、流式
