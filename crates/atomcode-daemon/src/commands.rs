@@ -63,6 +63,47 @@ fn exec_undo(working_dir: &Path, session_id: Option<&str>, arg: &str) -> anyhow:
     Ok(CommandResult::Undo { undone })
 }
 
+use atomcode_core::config::memory::MemoryStore;
+
+/// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
+pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
+    let arg = arg.trim();
+    if let Some(rest) = arg.strip_prefix("--global") {
+        (true, rest.trim())
+    } else {
+        (false, arg)
+    }
+}
+
+fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
+    let (global, content) = parse_remember_arg(arg);
+    if content.is_empty() {
+        anyhow::bail!("remember needs content");
+    }
+    let store = if global { MemoryStore::global() } else { MemoryStore::project(working_dir) };
+    store.append(content)?;
+    Ok(CommandResult::Remember {
+        scope: if global { "global" } else { "project" }.to_string(),
+    })
+}
+
+fn exec_forget(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
+    let keyword = arg.trim();
+    if keyword.is_empty() {
+        anyhow::bail!("forget needs a keyword");
+    }
+    let mut removed = MemoryStore::global().remove_matching(keyword)?;
+    removed.extend(MemoryStore::project(working_dir).remove_matching(keyword)?);
+    Ok(CommandResult::Forget { removed })
+}
+
+fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
+    Ok(CommandResult::Memory {
+        global: MemoryStore::global().load(),
+        project: MemoryStore::project(working_dir).load(),
+    })
+}
+
 pub(crate) async fn run_command(Json(req): Json<CommandReq>) -> impl IntoResponse {
     let working_dir = match req.working_dir.as_deref() {
         Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
@@ -72,6 +113,9 @@ pub(crate) async fn run_command(Json(req): Json<CommandReq>) -> impl IntoRespons
     };
     let result = match req.command.as_str() {
         "undo" => exec_undo(&working_dir, req.session_id.as_deref(), &req.arg),
+        "remember" => exec_remember(&working_dir, &req.arg),
+        "forget" => exec_forget(&working_dir, &req.arg),
+        "memory" => exec_memory(&working_dir),
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
@@ -83,6 +127,7 @@ pub(crate) async fn run_command(Json(req): Json<CommandReq>) -> impl IntoRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_core::config::memory::MemoryStore;
     use atomcode_core::conversation::message::{Message, Role};
 
     fn session_with_turns(n: usize) -> Session {
@@ -117,5 +162,35 @@ mod tests {
         let mut s = session_with_turns(0);
         assert_eq!(apply_undo(&mut s, ""), 0);
         assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_remember_arg_detects_global() {
+        assert_eq!(parse_remember_arg("--global 记住这个"), (true, "记住这个"));
+        assert_eq!(parse_remember_arg("普通事实"), (false, "普通事实"));
+        assert_eq!(parse_remember_arg("  --global   trimmed  "), (true, "trimmed"));
+    }
+
+    #[test]
+    fn remember_then_memory_roundtrip_project_scope() {
+        // hermetic：project 作用域写到 working_dir/.atomcode/memory.md
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        exec_remember(wd, "阿童木用 Rust 写").unwrap();
+        let store = MemoryStore::project(wd);
+        assert!(store.load().iter().any(|e| e.contains("阿童木用 Rust 写")));
+    }
+
+    #[test]
+    fn forget_removes_project_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        exec_remember(wd, "delete-me fact").unwrap();
+        exec_remember(wd, "keep-me fact").unwrap();
+        // exec_forget 也会扫全局，但全局此刻应无匹配；断言项目侧被删。
+        let _ = exec_forget(wd, "delete-me");
+        let remaining = MemoryStore::project(wd).load();
+        assert!(!remaining.iter().any(|e| e.contains("delete-me")));
+        assert!(remaining.iter().any(|e| e.contains("keep-me")));
     }
 }
