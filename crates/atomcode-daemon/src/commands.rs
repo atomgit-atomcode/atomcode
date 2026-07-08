@@ -114,6 +114,10 @@ pub(crate) enum CommandResult {
         before_tokens: usize,
         after_tokens: usize,
     },
+    Whoami { logged_in: bool, username: Option<String>, name: Option<String>, email: Option<String> },
+    Status { logged_in: bool, username: Option<String>, provider: String, model: String, working_dir: String, config_path: String },
+    Config { path: String, provider: String },
+    Diff { stat: String },
     Error { message: String },
 }
 
@@ -291,6 +295,62 @@ async fn exec_compact(
     })
 }
 
+fn exec_whoami() -> anyhow::Result<CommandResult> {
+    match atomcode_core::auth::get_stored_auth() {
+        Some(auth) => Ok(CommandResult::Whoami {
+            logged_in: true,
+            username: Some(auth.user.username),
+            name: auth.user.name,
+            email: auth.user.email,
+        }),
+        None => Ok(CommandResult::Whoami { logged_in: false, username: None, name: None, email: None }),
+    }
+}
+
+fn exec_config() -> anyhow::Result<CommandResult> {
+    let path = atomcode_core::config::Config::default_path();
+    let provider = atomcode_core::config::Config::load(&path)
+        .map(|c| c.default_provider)
+        .unwrap_or_default();
+    Ok(CommandResult::Config { path: path.display().to_string(), provider })
+}
+
+fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--stat"])
+        .current_dir(working_dir)
+        .output()?;
+    let stat = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    } else {
+        String::from_utf8_lossy(&out.stderr).trim_end().to_string()
+    };
+    Ok(CommandResult::Diff { stat })
+}
+
+fn exec_status(working_dir: &std::path::Path, provider: Option<&str>) -> anyhow::Result<CommandResult> {
+    let config_path = atomcode_core::config::Config::default_path();
+    let config = atomcode_core::config::Config::load(&config_path).ok();
+    let provider_name = provider
+        .map(|s| s.to_string())
+        .or_else(|| config.as_ref().map(|c| c.default_provider.clone()))
+        .unwrap_or_default();
+    let model = config
+        .as_ref()
+        .and_then(|c| c.providers.get(&provider_name))
+        .map(|p| p.model.clone())
+        .unwrap_or_default();
+    let auth = atomcode_core::auth::get_stored_auth();
+    Ok(CommandResult::Status {
+        logged_in: auth.is_some(),
+        username: auth.map(|a| a.user.username),
+        provider: provider_name,
+        model,
+        working_dir: working_dir.display().to_string(),
+        config_path: config_path.display().to_string(),
+    })
+}
+
 pub(crate) async fn run_command(
     State(state): State<AppState>,
     Json(req): Json<CommandReq>,
@@ -306,6 +366,10 @@ pub(crate) async fn run_command(
         "memory" => exec_memory(&working_dir),
         "context" => exec_context(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref()).await,
         "compact" => exec_compact(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref(), &req.arg).await,
+        "whoami" => exec_whoami(),
+        "config" => exec_config(),
+        "diff" => exec_diff(&working_dir),
+        "status" => exec_status(&working_dir, req.provider.as_deref()),
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
@@ -438,6 +502,28 @@ mod tests {
         // turn_stats: single entry with after_message=3 (2 dropped, 6→3)
         assert_eq!(s.turn_stats.len(), 1);
         assert_eq!(s.turn_stats[0].after_message, 3);
+    }
+
+    #[test]
+    fn exec_diff_returns_stat_in_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // init a repo with one committed file + a working-tree change
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap()
+        };
+        run(&["init"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-m", "init"]);
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let res = exec_diff(dir.path()).unwrap();
+        match res {
+            CommandResult::Diff { stat } => assert!(stat.contains("a.txt"), "stat was: {stat}"),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
