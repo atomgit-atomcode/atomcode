@@ -80,6 +80,8 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
     run: (a, h) => (a ? h.execServerCommand('forget', a) : h.notice(h.t('cmd.forget.needArg'))),
   },
   { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
+  { name: 'context', descKey: 'cmd.context.desc', run: (a, h) => h.execServerCommand('context', a) },
+  { name: 'compact', descKey: 'cmd.compact.desc', argHint: '[focus]', run: (a, h) => h.execServerCommand('compact', a) },
 ];
 
 export function buildCommandMap(defs: SlashCommandDef[]): Map<string, SlashCommandDef> {

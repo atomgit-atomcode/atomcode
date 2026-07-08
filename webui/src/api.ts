@@ -674,6 +674,8 @@ export type CommandResult =
   | { kind: 'remember'; scope: 'global' | 'project' }
   | { kind: 'forget'; removed: string[] }
   | { kind: 'memory'; global: string[]; project: string[] }
+  | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
+  | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'error'; message: string };
 
 export async function postCommand(body: {
@@ -682,6 +684,7 @@ export async function postCommand(body: {
   session_id?: string;
   working_dir?: string;
   project_hash?: string;
+  provider?: string;
 }): Promise<CommandResult> {
   const resp = await fetch('/command', {
     method: 'POST',

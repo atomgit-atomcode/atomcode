@@ -1061,10 +1061,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       },
       notice: (text) => pushCommandNotice(text),
       execServerCommand: async (command, arg) => {
-        if (command === 'undo') {
-          if (busyRef.current) { pushCommandNotice(t('cmd.undo.busy')); return; }
-          if (sync) { pushCommandNotice(t('cmd.undo.syncUnsupported')); return; }
+        const SESSION_MUTATING = new Set(['undo', 'compact']);
+        if (SESSION_MUTATING.has(command)) {
+          if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
+          if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
         }
+        if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
         let res: CommandResult;
         try {
           res = await postCommand({
@@ -1073,6 +1075,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             session_id: sessionId ?? undefined,
             working_dir: cwd ?? undefined,
             project_hash: activeSession?.project_hash ?? undefined,
+            provider: provider ?? undefined,
           });
         } catch (e) {
           pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
@@ -1089,6 +1092,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         if (res.kind === 'memory') {
           const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
           pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
+          return;
+        }
+        if (res.kind === 'compact') {
+          if (res.applied) {
+            if (sessionId) await reloadSessionTranscript(sessionId);
+            pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+          } else {
+            pushCommandNotice(t('cmd.compact.none'));
+          }
+          return;
+        }
+        if (res.kind === 'context') {
+          pushCommandNotice(
+            t('cmd.context.body', {
+              sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
+              cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+              window: res.ctx_window, name: res.ctx_name,
+            })
+          );
           return;
         }
       },
