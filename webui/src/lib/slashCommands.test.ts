@@ -107,3 +107,21 @@ test('/help notice lists command names', async () => {
   assert.match(calls[0], /\/plan/);
   assert.match(calls[0], /\/model/);
 });
+
+import { buildSlashMenuItems } from './slashCommands.ts';
+
+test('menu lists matching commands before skills', () => {
+  const skills = [{ name: 'summarize', description: 'sum' }, { name: 'plan-trip', description: 'trip' }];
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, skills, 'pl', (k) => k);
+  // 'pl' 命中命令 plan 与 skill plan-trip；命令在前
+  assert.equal(items[0].kind, 'command');
+  assert.equal(items[0].name, 'plan');
+  assert.ok(items.some((i) => i.kind === 'skill' && i.name === 'plan-trip'));
+});
+
+test('empty query returns all commands then all skills', () => {
+  const skills = [{ name: 's1' }];
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, skills, '', (k) => k);
+  assert.equal(items.filter((i) => i.kind === 'command').length, FRONTEND_COMMANDS.length);
+  assert.equal(items[items.length - 1].kind, 'skill');
+});

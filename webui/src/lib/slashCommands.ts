@@ -102,3 +102,25 @@ export async function dispatchSlashCommand(
   await def.run(parsed.arg, h);
   return { handled: true };
 }
+
+export interface SlashMenuItem {
+  name: string;
+  description: string;
+  kind: 'command' | 'skill';
+}
+
+export function buildSlashMenuItems(
+  commands: SlashCommandDef[],
+  skills: { name: string; description?: string }[],
+  query: string,
+  t: (key: string) => string,
+): SlashMenuItem[] {
+  const q = query.toLowerCase();
+  const cmdItems: SlashMenuItem[] = commands
+    .filter((c) => c.name.toLowerCase().includes(q))
+    .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
+  const skillItems: SlashMenuItem[] = skills
+    .filter((s) => s.name.toLowerCase().includes(q))
+    .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }));
+  return [...cmdItems, ...skillItems];
+}
