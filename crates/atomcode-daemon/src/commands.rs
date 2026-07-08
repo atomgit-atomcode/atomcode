@@ -1,10 +1,11 @@
 //! `POST /command`: 无状态斜杠命令执行器（对已持久化会话/记忆施加一次性变更）。
-use axum::{response::IntoResponse, Json};
+use axum::{extract::State, response::IntoResponse, Json};
 use std::path::Path;
 
 use atomcode_core::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
+use crate::AppState;
 
 /// 撤销会话最后若干轮（arg 空 = 最后一轮；否则回退到第 arg 个用户提示之前——对齐 TUI /undo）。
 /// 就地修改 session.messages / cold_summaries / display_messages / turn_stats，
@@ -49,6 +50,8 @@ pub(crate) struct CommandReq {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub project_hash: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -58,7 +61,29 @@ pub(crate) enum CommandResult {
     Remember { scope: String },
     Forget { removed: Vec<String> },
     Memory { global: Vec<String>, project: Vec<String> },
+    Context {
+        system_tokens: usize,
+        sent_tokens: usize,
+        total_messages: usize,
+        tool_defs_tokens: usize,
+        cold_zone_tokens: usize,
+        ctx_window: usize,
+        ctx_name: String,
+    },
     Error { message: String },
+}
+
+/// 按会话真实桶加载：优先 project_hash（跨 /cd 稳定），否则回退到 working_dir。
+fn load_command_session(
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    session_id: &SessionId,
+) -> anyhow::Result<Session> {
+    if let Some(hash) = project_hash {
+        Ok(crate::load_session(hash, session_id.as_str())?)
+    } else {
+        Ok(SessionManager::new(working_dir).load(session_id)?)
+    }
 }
 
 fn exec_undo(
@@ -69,11 +94,7 @@ fn exec_undo(
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for undo"))?;
     let session_id = SessionId::from_string(sid.to_string());
-    let mut session = if let Some(hash) = project_hash {
-        crate::load_session(hash, sid)?
-    } else {
-        SessionManager::new(working_dir).load(&session_id)?
-    };
+    let mut session = load_command_session(working_dir, project_hash, &session_id)?;
     let undone = apply_undo(&mut session, arg);
     if undone > 0 {
         session.touch();
@@ -81,6 +102,36 @@ fn exec_undo(
         SessionManager::new(&session.working_dir).save(&session)?;
     }
     Ok(CommandResult::Undo { undone })
+}
+
+async fn exec_context(
+    state: &AppState,
+    working_dir: &std::path::Path,
+    project_hash: Option<&str>,
+    session_id: Option<&str>,
+    provider: Option<&str>,
+) -> anyhow::Result<CommandResult> {
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
+    let session_id = SessionId::from_string(sid.to_string());
+    let session = load_command_session(working_dir, project_hash, &session_id)?;
+    let parts =
+        crate::live_api::build_turn_parts(working_dir, provider, &state.mcp_cache, state.telemetry.clone())
+            .await?;
+    let conv = Conversation::from_snapshot(ConversationSnapshot {
+        messages: session.messages.clone(),
+        cold_summaries: session.cold_summaries.clone(),
+    });
+    let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
+    let s = atomcode_core::agent::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx).await;
+    Ok(CommandResult::Context {
+        system_tokens: s.system_tokens,
+        sent_tokens: s.sent_tokens,
+        total_messages: s.total_messages,
+        tool_defs_tokens: s.tool_defs_tokens,
+        cold_zone_tokens: s.cold_zone_tokens,
+        ctx_window: s.ctx_window,
+        ctx_name: s.ctx_name,
+    })
 }
 
 /// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
@@ -123,18 +174,20 @@ fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
     })
 }
 
-pub(crate) async fn run_command(Json(req): Json<CommandReq>) -> impl IntoResponse {
+pub(crate) async fn run_command(
+    State(state): State<AppState>,
+    Json(req): Json<CommandReq>,
+) -> impl IntoResponse {
     let working_dir = match req.working_dir.as_deref() {
         Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
-        _ => {
-            return Json(CommandResult::Error { message: "working_dir required".into() });
-        }
+        _ => return Json(CommandResult::Error { message: "working_dir required".into() }),
     };
     let result = match req.command.as_str() {
         "undo" => exec_undo(&working_dir, req.session_id.as_deref(), &req.arg, req.project_hash.as_deref()),
         "remember" => exec_remember(&working_dir, &req.arg),
         "forget" => exec_forget(&working_dir, &req.arg),
         "memory" => exec_memory(&working_dir),
+        "context" => exec_context(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref()).await,
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
