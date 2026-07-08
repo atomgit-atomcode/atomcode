@@ -957,16 +957,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const slashHandlers: SlashHandlers = useMemo(
     () => ({
       // setMode: 镜像 ModeSelector.onChange 的完整模式切换逻辑。
+      // Notice 只在后端确认成功后发出（不提前、不在 no-op / 失败时发）。
       setMode: (m) => {
         if (modeState.pendingMode) return;
         const nextState = beginModeSwitch(modeState, m);
         if (nextState !== modeState) {
           setModeState(nextState);
           void postLiveMode(m)
-            .then((confirmed) => setModeState((cur) => completeModeSwitch(cur, confirmed)))
+            .then((confirmed) => {
+              setModeState((cur) => completeModeSwitch(cur, confirmed));
+              pushCommandNotice(t('cmd.mode.done', { mode: m }));
+            })
             .catch(() => setModeState((cur) => failModeSwitch(cur)));
         }
-        pushCommandNotice(t('cmd.mode.done', { mode: m }));
       },
       // openModelPicker: ModelSelector 是自包含组件，无法从外部以编程方式打开。
       openModelPicker: () => { pushCommandNotice(t('cmd.model.openHint')); },
