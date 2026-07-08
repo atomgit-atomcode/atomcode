@@ -125,6 +125,24 @@ function ChevronDownIcon() {
   );
 }
 
+/** Collapse a home prefix to `~` for readability; leave everything else verbatim
+ *  (temp dirs like /var/folders/… or /tmp/… stay as-is so they're identifiable). */
+function collapseHomePath(p: string): string {
+  if (!p) return '';
+  return p
+    .replace(/^\/(?:Users|home)\/[^/]+/, '~')
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~');
+}
+
+/** Folder glyph for the project selector. */
+function FolderIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M1.75 4c0-.55.45-1 1-1h3l1.5 1.5h5c.55 0 1 .45 1 1V12c0 .55-.45 1-1 1h-10c-.55 0-1-.45-1-1V4z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
 /** Smartphone glyph for the remote-access button. */
 function SmartphoneIcon() {
   return (
@@ -1066,8 +1084,9 @@ export function Sidebar({
             onClick={() => setProjMenuOpen((o) => !o)}
             aria-haspopup="listbox"
             aria-expanded={projMenuOpen}
-            title={t('sidebar.switchProject')}
+            title={currentViewProject?.working_dir || t('sidebar.switchProject')}
           >
+            <span class="sidebar-project-icon"><FolderIcon /></span>
             <span class="sidebar-project-name">
               {currentViewProject?.name || currentViewProject?.working_dir || t('sidebar.switchProject')}
             </span>
@@ -1075,6 +1094,7 @@ export function Sidebar({
           </button>
           {projMenuOpen && (
             <div class="sidebar-project-menu" role="listbox">
+              <div class="sidebar-project-menu-title">{t('sidebar.switchProject')}</div>
               {projects.map((p) => (
                 <button
                   key={p.hash}
@@ -1087,7 +1107,10 @@ export function Sidebar({
                     setProjMenuOpen(false);
                   }}
                 >
-                  <span class="sidebar-project-item-name">{p.name || p.working_dir}</span>
+                  <span class="sidebar-project-item-main">
+                    <span class="sidebar-project-item-name">{p.name || p.working_dir}</span>
+                    <span class="sidebar-project-item-path">{collapseHomePath(p.working_dir)}</span>
+                  </span>
                   <span class="sidebar-project-item-count">{p.session_count}</span>
                 </button>
               ))}
