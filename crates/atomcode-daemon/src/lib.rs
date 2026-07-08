@@ -15,10 +15,21 @@
 //! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
 //! 我们愿意根据再审意见继续优化。
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so the crate's own unit tests never persist sessions/config into the
+// developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
+// win (isolate_home is a no-op when the var is already set).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod commands;
 pub mod approval_mode;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
@@ -1292,13 +1303,27 @@ fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaW
 }
 
 /// Load a specific session
-fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
+pub(crate) fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
 
     let json = std::fs::read_to_string(path)?;
     serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+/// Save a session to a specific project-hash bucket (symmetric with `load_session`).
+/// Ensures undo/compact write back to the exact file they loaded from.
+pub(crate) fn save_session_to_hash(
+    project_hash: &str,
+    session: &atomcode_core::session::Session,
+) -> std::io::Result<()> {
+    let dir = SessionManager::sessions_root_dir().join(project_hash);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", session.id.as_str()));
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)
 }
 
 // ============== HTTP Handlers ==============
@@ -4692,6 +4717,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
         .route("/live/command", post(live_api::live_command))
+        .route("/command", post(commands::run_command))
         .route(
             "/live/switch_session",
             post(live_api::live_switch_session_endpoint),

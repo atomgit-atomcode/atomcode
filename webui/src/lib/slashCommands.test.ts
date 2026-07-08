@@ -55,6 +55,7 @@ function fakeHandlers(): { h: SlashHandlers; calls: string[] } {
     reloadConfig: () => { calls.push('reloadConfig'); },
     openSlashSkillsMenu: () => { calls.push('openSlashSkillsMenu'); },
     notice: (t) => { calls.push(`notice:${t}`); },
+    execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
     t: (k) => k,
   };
   return { h, calls };
@@ -132,4 +133,61 @@ test('skills are sorted alphabetically by name (commands keep FRONTEND_COMMANDS 
   const skillItems = items.filter((i) => i.kind === 'skill');
   assert.equal(skillItems[0].name, 'apple');
   assert.equal(skillItems[1].name, 'zebra');
+});
+
+test('/undo /remember /forget /memory dispatch to execServerCommand', async () => {
+  const calls: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
+    changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
+    openSlashSkillsMenu: () => {}, notice: (t) => { calls.push(`notice:${t}`); },
+    execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
+    t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  await dispatchSlashCommand('/undo 2', map, h);
+  await dispatchSlashCommand('/memory', map, h);
+  await dispatchSlashCommand('/remember a fact', map, h);
+  await dispatchSlashCommand('/forget stale', map, h);
+  assert.deepEqual(calls, ['exec:undo:2', 'exec:memory:', 'exec:remember:a fact', 'exec:forget:stale']);
+});
+
+test('/context and /compact dispatch to execServerCommand', async () => {
+  const calls: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {}, changeDir: () => {},
+    openSessionSidebar: () => {}, reloadConfig: () => {}, openSlashSkillsMenu: () => {},
+    notice: () => {}, execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); }, t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  await dispatchSlashCommand('/context', map, h);
+  await dispatchSlashCommand('/compact focus on the bug', map, h);
+  assert.deepEqual(calls, ['exec:context:', 'exec:compact:focus on the bug']);
+});
+
+test('display commands dispatch to execServerCommand', async () => {
+  const calls: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {}, changeDir: () => {},
+    openSessionSidebar: () => {}, reloadConfig: () => {}, openSlashSkillsMenu: () => {},
+    notice: () => {}, execServerCommand: (cmd, arg) => { calls.push(`${cmd}:${arg}`); }, t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  for (const c of ['whoami','status','config','diff','cost','todo']) await dispatchSlashCommand(`/${c}`, map, h);
+  assert.deepEqual(calls, ['whoami:','status:','config:','diff:','cost:','todo:']);
+});
+
+test('/remember and /forget without arg emit a notice', async () => {
+  const calls: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
+    changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
+    openSlashSkillsMenu: () => {}, notice: (t) => { calls.push(t); },
+    execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
+    t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  await dispatchSlashCommand('/remember', map, h);
+  await dispatchSlashCommand('/forget', map, h);
+  assert.deepEqual(calls, ['cmd.remember.needArg', 'cmd.forget.needArg']);
 });

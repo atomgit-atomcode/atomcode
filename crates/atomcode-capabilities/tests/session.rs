@@ -13,6 +13,15 @@ use atomcode_kernel::conformance;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::tool::Tool;
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary runs,
+// so tests that persist without setting their own ATOMCODE_HOME never write into the
+// developer's real home. Tests that set their own ATOMCODE_HOME still win (isolate_home
+// is a no-op when the var is already set).
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 struct AtomcodeHomeGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev: Option<std::ffi::OsString>,

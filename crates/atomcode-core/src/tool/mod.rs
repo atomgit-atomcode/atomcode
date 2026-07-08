@@ -668,6 +668,8 @@ fn is_atomcode_owned_path(path: &Path) -> bool {
     let trusted_roots: &[PathBuf] = &[
         home.join(".atomcode").join("plugins"),
         home.join(".atomcode").join("skills"),
+        crate::config::Config::config_dir().join("plugins"),
+        crate::config::Config::config_dir().join("skills"),
     ];
     trusted_roots
         .iter()

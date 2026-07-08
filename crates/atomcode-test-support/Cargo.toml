@@ -1,0 +1,10 @@
+[package]
+name = "atomcode-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Test-only helper: NOT part of default-members, never shipped. Provides
+# `isolate_home()`, which consuming crates call from a `#[ctor]` (in their own
+# test module) so tests can't pollute the developer's real ~/.atomcode.
+
+[dependencies]

@@ -28,6 +28,14 @@
 //! # Ok(()) }
 //! ```
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any unit test runs, so the
+// suite can't persist into the developer's real ~/.atomcode (see atomcode-test-support).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 pub mod config;
 pub mod discipline;
 pub mod parts;

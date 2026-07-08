@@ -31,6 +31,7 @@ export interface SlashHandlers {
   reloadConfig(): void | Promise<void>;
   openSlashSkillsMenu(): void;
   notice(text: string): void;
+  execServerCommand(command: string, arg: string): void | Promise<void>;
   t(key: string, params?: Record<string, string | number>): string;
 }
 
@@ -65,6 +66,28 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (_a, h) => h.openSlashSkillsMenu() },
   { name: 'help', descKey: 'cmd.help.desc', run: (_a, h) => h.notice(buildHelpText(h.t)) },
+  { name: 'undo', descKey: 'cmd.undo.desc', argHint: '[n]', run: (a, h) => h.execServerCommand('undo', a) },
+  {
+    name: 'remember',
+    descKey: 'cmd.remember.desc',
+    argHint: '<fact>',
+    run: (a, h) => (a ? h.execServerCommand('remember', a) : h.notice(h.t('cmd.remember.needArg'))),
+  },
+  {
+    name: 'forget',
+    descKey: 'cmd.forget.desc',
+    argHint: '<keyword>',
+    run: (a, h) => (a ? h.execServerCommand('forget', a) : h.notice(h.t('cmd.forget.needArg'))),
+  },
+  { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
+  { name: 'context', descKey: 'cmd.context.desc', run: (a, h) => h.execServerCommand('context', a) },
+  { name: 'compact', descKey: 'cmd.compact.desc', argHint: '[focus]', run: (a, h) => h.execServerCommand('compact', a) },
+  { name: 'whoami', descKey: 'cmd.whoami.desc', run: (a, h) => h.execServerCommand('whoami', a) },
+  { name: 'status', descKey: 'cmd.status.desc', run: (a, h) => h.execServerCommand('status', a) },
+  { name: 'config', descKey: 'cmd.config.desc', run: (a, h) => h.execServerCommand('config', a) },
+  { name: 'diff', descKey: 'cmd.diff.desc', run: (a, h) => h.execServerCommand('diff', a) },
+  { name: 'cost', descKey: 'cmd.cost.desc', run: (a, h) => h.execServerCommand('cost', a) },
+  { name: 'todo', descKey: 'cmd.todo.desc', run: (a, h) => h.execServerCommand('todo', a) },
 ];
 
 export function buildCommandMap(defs: SlashCommandDef[]): Map<string, SlashCommandDef> {
@@ -114,11 +137,17 @@ export function buildSlashMenuItems(
   skills: { name: string; description?: string }[],
   query: string,
   t: (key: string) => string,
+  // `skillsOnly` renders a pure skills browser (the /skills command): commands are
+  // dropped so the list is unambiguously skills. Uses the `kind` split rather than
+  // a name prefix so plugin skills (their own namespace, not `skills:`) still show.
+  skillsOnly = false,
 ): SlashMenuItem[] {
   const q = query.toLowerCase();
-  const cmdItems: SlashMenuItem[] = commands
-    .filter((c) => c.name.toLowerCase().includes(q))
-    .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
+  const cmdItems: SlashMenuItem[] = skillsOnly
+    ? []
+    : commands
+        .filter((c) => c.name.toLowerCase().includes(q))
+        .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
   const skillItems: SlashMenuItem[] = skills
     .filter((s) => s.name.toLowerCase().includes(q))
     .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }))

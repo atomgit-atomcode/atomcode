@@ -1,8 +1,8 @@
 package com.atomcode.jetbrains.ui
 
-import com.atomcode.jetbrains.core.AtomCodeProjectController
 import com.atomcode.jetbrains.persistence.WorkspaceTabState
 import com.atomcode.jetbrains.session.ChatRuntime
+import com.atomcode.jetbrains.session.SessionWorkspace
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
@@ -27,13 +27,13 @@ private val ATOMCODE_TOOL_WINDOW_MIN_SIZE = Dimension(360, 300)
 
 fun createAtomCodeChatContent(project: Project, toolWindow: ToolWindow, closeable: Boolean): AtomCodeChatPanel {
     val name = nextChatTabName(toolWindow)
-    val runtime = AtomCodeProjectController.getInstance(project).createChatRuntime(name)
+    val runtime = SessionWorkspace.getInstance(project).createRuntime(name)
     return createAtomCodeChatContent(project, toolWindow, closeable, runtime, name)
 }
 
 fun restoreAtomCodeChatContent(project: Project, toolWindow: ToolWindow, tab: WorkspaceTabState): AtomCodeChatPanel {
     val name = tab.title.ifBlank { nextChatTabName(toolWindow) }
-    val runtime = AtomCodeProjectController.getInstance(project).createRestoredChatRuntime(tab)
+    val runtime = SessionWorkspace.getInstance(project).createRuntimeForRestoredTab(tab)
     return createAtomCodeChatContent(project, toolWindow, closeable = true, runtime, name)
 }
 
@@ -194,7 +194,7 @@ private fun installTabPopupMenu(toolWindow: ToolWindow, project: Project) {
 }
 
 private fun closeRuntimeForContent(project: Project, content: Content) {
-    contentTabId(content)?.let { AtomCodeProjectController.getInstance(project).closeChatRuntime(it) }
+    contentTabId(content)?.let { SessionWorkspace.getInstance(project).close(it) }
 }
 
 private fun installContentSelectionListener(toolWindow: ToolWindow, project: Project) {
@@ -202,7 +202,7 @@ private fun installContentSelectionListener(toolWindow: ToolWindow, project: Pro
     toolWindow.component.putClientProperty("atomcode-content-listener-installed", true)
     toolWindow.contentManager.addContentManagerListener(object : ContentManagerListener {
         override fun selectionChanged(event: ContentManagerEvent) {
-            contentTabId(event.content)?.let { AtomCodeProjectController.getInstance(project).selectChatRuntime(it) }
+            contentTabId(event.content)?.let { SessionWorkspace.getInstance(project).select(it) }
         }
 
         override fun contentRemoved(event: ContentManagerEvent) {

@@ -50,3 +50,7 @@ async-trait = "0.1"
 # Serialize tests that mutate the process-global ATOMCODE_HOME env var so they
 # don't race (cache_prefix asserts byte-identical system prompt across assemblies).
 serial_test = "3"
+# Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so tests
+# never persist into the developer's real ~/.atomcode.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"

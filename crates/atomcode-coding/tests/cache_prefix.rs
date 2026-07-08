@@ -18,6 +18,11 @@ use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolDef;
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
     let mut c = CodingAgentConfig::new("k", "http://unused", "test-model", working_dir);
     c.stream_timeout = Duration::from_secs(5);

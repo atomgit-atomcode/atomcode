@@ -67,6 +67,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSS
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in the lib's #[cfg(test)] module + every tests/*.rs binary) so tests
+# that persist commands/plugins/config never write into the developer's real home.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"
 tempfile = "3"
 vte = "0.15.0"
 # Serialize env-var-mutating custom_commands tests (moved from atomcode-core).

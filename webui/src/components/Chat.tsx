@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -406,6 +406,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  // True for the entire duration of a /compact postCommand await so sendMessage
+  // can refuse to fire while the session .json is being rewritten on disk.
+  const compactingRef = useRef(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
   const [queued, setQueued] = useState<{
     id: number;
@@ -430,6 +433,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
+  // The /skills command opens a pure skills browser (no commands). Set while that
+  // browser is showing; cleared as soon as the user types (normal mixed filtering).
+  const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
@@ -966,6 +972,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
 
+  // Reload one session's transcript from disk into the view, guarded against a
+  // session switch racing the async fetch. Mirrors the session-load effect's activeIdRef guard.
+  async function reloadSessionTranscript(id: string) {
+    const projectHash = activeSession?.project_hash;
+    if (!projectHash) return;
+    try {
+      const detail = await getSession(projectHash, id);
+      if (activeIdRef.current === id) {
+        setMessages(sessionMessagesToDisplay(detail.messages));
+      }
+    } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
+  }
+
   // ── Shared mode / provider switch helpers ──────────────────────────────────
   // Defined in render scope (not memoized) so they always close over the latest
   // modeState / sync. Both call sites — ModeSelector.onChange / slashHandlers
@@ -1023,12 +1042,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         pushCommandNotice(t('cmd.reload.done'));
       },
       openSlashSkillsMenu: () => {
-        // Behave exactly like typing '/': set input to '/', open the menu with
-        // all commands + skills, and focus the textarea so the user can type to
-        // filter. Trigger the skills fetch if it hasn't been loaded yet.
+        // Open a pure SKILLS browser (not the full '/' command list — that's what
+        // made running /skills look like it "reset to /"). Input stays '/', but the
+        // menu shows only skills; typing anything drops back to normal filtering.
+        // Trigger the skills fetch if it hasn't been loaded yet.
         setInput('/');
         setSlashQuery('');
         setSlashIndex(0);
+        setSlashSkillsOnly(true);
         if (slashSkills === null && !slashLoading) {
           setSlashLoading(true);
           getSkills()
@@ -1047,10 +1068,92 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
       },
       notice: (text) => pushCommandNotice(text),
+      execServerCommand: async (command, arg) => {
+        const SESSION_MUTATING = new Set(['undo', 'compact']);
+        if (SESSION_MUTATING.has(command)) {
+          if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
+          if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
+        }
+        if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
+        const isCompact = command === 'compact';
+        if (isCompact) compactingRef.current = true;
+        try {
+          let res: CommandResult;
+          try {
+            res = await postCommand({
+              command,
+              arg,
+              session_id: sessionId ?? undefined,
+              working_dir: cwd ?? undefined,
+              project_hash: activeSession?.project_hash ?? undefined,
+              provider: provider ?? undefined,
+            });
+          } catch (e) {
+            pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+            return;
+          }
+          if (res.kind === 'error') { pushCommandNotice(res.message); return; }
+          if (res.kind === 'undo') {
+            if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
+            pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
+            return;
+          }
+          if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
+          if (res.kind === 'memory') {
+            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+            pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
+            return;
+          }
+          if (res.kind === 'compact') {
+            if (res.applied) {
+              if (sessionId) await reloadSessionTranscript(sessionId);
+              pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+            } else {
+              pushCommandNotice(t('cmd.compact.none'));
+            }
+            return;
+          }
+          if (res.kind === 'context') {
+            pushCommandNotice(
+              t('cmd.context.body', {
+                sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
+                cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+                window: res.ctx_window, name: res.ctx_name,
+              })
+            );
+            return;
+          }
+          if (res.kind === 'whoami') {
+            pushCommandNotice(res.logged_in
+              ? t('cmd.whoami.body', { name: res.name ?? res.username ?? '', user: res.username ?? '', email: res.email ?? '—' })
+              : t('cmd.whoami.none'));
+            return;
+          }
+          if (res.kind === 'status') {
+            pushCommandNotice(t('cmd.status.body', {
+              model: res.model || '—', dir: res.working_dir, provider: res.provider || '—',
+              login: res.logged_in ? (res.username ?? '') : t('cmd.status.notLoggedIn'), config: res.config_path,
+            }));
+            return;
+          }
+          if (res.kind === 'config') { pushCommandNotice(t('cmd.config.body', { path: res.path, provider: res.provider || '—' })); return; }
+          if (res.kind === 'diff') { pushCommandNotice(res.stat.trim() ? res.stat : t('cmd.diff.clean')); return; }
+          if (res.kind === 'cost') { pushCommandNotice(t('cmd.cost.body', { tokens: res.total_tokens, turns: res.turn_count })); return; }
+          if (res.kind === 'todo') {
+            if (!res.items.length) { pushCommandNotice(t('cmd.todo.empty')); return; }
+            const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[~]' : '[ ]');
+            pushCommandNotice(`${t('cmd.todo.header')}\n${res.items.map((i) => `${mark(i.status)} ${i.content}`).join('\n')}`);
+            return;
+          }
+        } finally {
+          if (isCompact) compactingRef.current = false;
+        }
+      },
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -1322,6 +1425,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const text = input.trim();
     const images = pendingImages;
     if (modeState.pendingMode) return;
+    if (compactingRef.current) return;
     if (!text && images.length === 0) return;
 
     // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
@@ -1377,7 +1481,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
-      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string);
+      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
@@ -1538,6 +1642,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSlashQuery(query);
         setSlashIndex(0);
         setSlashOpen(true);
+        // Any real keystroke exits the pure-skills browser → normal mixed filtering.
+        setSlashSkillsOnly(false);
         return;
       }
     }
@@ -1754,7 +1860,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
-          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string).map((item, i) => (
+          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button
               key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}

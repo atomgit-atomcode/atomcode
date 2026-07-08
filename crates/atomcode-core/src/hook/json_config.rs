@@ -555,7 +555,5 @@ mod tests {
         let working = tempfile::tempdir().unwrap();
         let hooks = load_hooks_config(working.path());
         assert!(hooks.iter().any(|h| h.command == "echo hi"));
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 }

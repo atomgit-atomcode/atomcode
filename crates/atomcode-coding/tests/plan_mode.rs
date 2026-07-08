@@ -10,6 +10,11 @@ use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 #[tokio::test]
 async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     let home = tempfile::tempdir().unwrap();

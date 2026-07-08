@@ -667,6 +667,40 @@ export async function postLiveProvider(provider: string): Promise<void> {
   });
 }
 
+// --- /command endpoint ---
+
+export type CommandResult =
+  | { kind: 'undo'; undone: number }
+  | { kind: 'remember'; scope: 'global' | 'project' }
+  | { kind: 'forget'; removed: string[] }
+  | { kind: 'memory'; global: string[]; project: string[] }
+  | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
+  | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
+  | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
+  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string }
+  | { kind: 'config'; path: string; provider: string }
+  | { kind: 'diff'; stat: string }
+  | { kind: 'cost'; total_tokens: number; turn_count: number }
+  | { kind: 'todo'; items: { status: string; content: string }[] }
+  | { kind: 'error'; message: string };
+
+export async function postCommand(body: {
+  command: string;
+  arg?: string;
+  session_id?: string;
+  working_dir?: string;
+  project_hash?: string;
+  provider?: string;
+}): Promise<CommandResult> {
+  const resp = await fetch('/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`command failed: ${resp.status}`);
+  return resp.json();
+}
+
 /** Switch the approval mode (build / plan / bypass). Runtime session state —
  *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
 export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
