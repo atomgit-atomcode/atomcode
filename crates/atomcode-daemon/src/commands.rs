@@ -2,6 +2,7 @@
 use axum::{response::IntoResponse, Json};
 use std::path::Path;
 
+use atomcode_core::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
@@ -63,16 +64,15 @@ fn exec_undo(working_dir: &Path, session_id: Option<&str>, arg: &str) -> anyhow:
     Ok(CommandResult::Undo { undone })
 }
 
-use atomcode_core::config::memory::MemoryStore;
-
 /// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
 pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
     let arg = arg.trim();
     if let Some(rest) = arg.strip_prefix("--global") {
-        (true, rest.trim())
-    } else {
-        (false, arg)
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return (true, rest.trim());
+        }
     }
+    (false, arg)
 }
 
 fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
@@ -169,6 +169,7 @@ mod tests {
         assert_eq!(parse_remember_arg("--global 记住这个"), (true, "记住这个"));
         assert_eq!(parse_remember_arg("普通事实"), (false, "普通事实"));
         assert_eq!(parse_remember_arg("  --global   trimmed  "), (true, "trimmed"));
+        assert_eq!(parse_remember_arg("--globalfoo"), (false, "--globalfoo"));
     }
 
     #[test]
