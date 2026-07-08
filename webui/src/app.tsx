@@ -321,6 +321,7 @@ export function App() {
         onSessionDeleted={handleSessionDeleted}
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
+        onOpenCwd={() => setShowCwd(true)}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}

@@ -1332,6 +1332,23 @@ body {
   color: var(--app-secondary-foreground);
   font-size: 11px;
 }
+/* "Open another directory…" — separated action row below the project list. */
+.sidebar-project-item-action {
+  margin-top: 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--app-menu-separator, var(--app-command-menu-hover-background));
+  color: var(--app-secondary-foreground);
+}
+.sidebar-project-item-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--app-secondary-foreground);
+}
+.sidebar-project-item-icon svg { width: 14px; height: 14px; }
 
 .session-group-label {
   letter-spacing: 0.5px;

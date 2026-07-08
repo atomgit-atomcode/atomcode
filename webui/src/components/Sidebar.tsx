@@ -45,6 +45,8 @@ interface SidebarProps {
   onPickSkill?: (name: string) => void;
   /** Open the remote-access dialog (moved from the old top header). */
   onOpenRemote?: () => void;
+  /** Open the working-directory picker (to switch to / start a project in any dir). */
+  onOpenCwd?: () => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -301,6 +303,7 @@ export function Sidebar({
   onSessionDeleted,
   onPickSkill,
   onOpenRemote,
+  onOpenCwd,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
@@ -1114,6 +1117,20 @@ export function Sidebar({
                   <span class="sidebar-project-item-count">{p.session_count}</span>
                 </button>
               ))}
+              {onOpenCwd && (
+                <button
+                  class="sidebar-project-item sidebar-project-item-action"
+                  onClick={() => {
+                    setProjMenuOpen(false);
+                    onOpenCwd();
+                  }}
+                >
+                  <span class="sidebar-project-item-icon"><PlusIcon /></span>
+                  <span class="sidebar-project-item-main">
+                    <span class="sidebar-project-item-name">{t('sidebar.openOtherDir')}</span>
+                  </span>
+                </button>
+              )}
             </div>
           )}
         </div>
