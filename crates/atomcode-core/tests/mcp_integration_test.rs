@@ -7,21 +7,35 @@ use atomcode_core::mcp::transport_stdio::StdioClient;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 /// Point `ATOMCODE_HOME` at an empty tempdir for the duration of the test so
 /// `load_mcp_config` (which always merges the *user* config at
 /// `config_dir()/mcp.json`) can't pick up the developer's real
 /// `~/.atomcode/mcp.json`. Removes the var on drop. Pair with `#[serial]` —
 /// the env var is process-global, so concurrent tests would race the guard.
-struct EmptyHome(#[allow(dead_code)] tempfile::TempDir);
+struct EmptyHome(
+    #[allow(dead_code)] tempfile::TempDir,
+    Option<std::ffi::OsString>,
+);
 impl Drop for EmptyHome {
     fn drop(&mut self) {
-        std::env::remove_var("ATOMCODE_HOME");
+        // Restore the prior value (the ctor-installed temp baseline) instead of
+        // unsetting, so we never leave `ATOMCODE_HOME` pointing at the real home.
+        match &self.1 {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
     }
 }
 fn isolated_empty_home() -> EmptyHome {
+    let prev = std::env::var_os("ATOMCODE_HOME");
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", tmp.path());
-    EmptyHome(tmp)
+    EmptyHome(tmp, prev)
 }
 
 #[test]

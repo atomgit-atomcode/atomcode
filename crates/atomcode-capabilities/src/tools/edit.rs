@@ -78,7 +78,7 @@ impl Tool for EditFileTool {
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return err(format!("edit_file: cannot read {}: {e}", path.display())),
+            Err(e) => return err(format!("edit_file: cannot read {}: {e}", crate::pathnorm::to_display(&path))),
         };
 
         // Line-ending tolerance: read_file shows the model LF-normalized text (it does
@@ -118,12 +118,12 @@ impl Tool for EditFileTool {
                     );
                 }
                 if let Err(e) = tokio::fs::write(&path, &fuzzy_result).await {
-                    return err(format!("edit_file: failed to write {}: {e}", path.display()));
+                    return err(format!("edit_file: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
                 }
                 let diff = build_compact_diff(&a.old_string, &a.new_string);
                 return ok(format!(
                     "Edited {} (fuzzy whitespace match, {fuzzy_count} replacement{})\n{}",
-                    path.display(),
+                    crate::pathnorm::to_display(&path),
                     if fuzzy_count == 1 { "" } else { "s" },
                     diff,
                 ));
@@ -131,7 +131,7 @@ impl Tool for EditFileTool {
             return err(format!(
                 "edit_file: old_string not found in {}. The file was NOT modified. Re-read \
                  the file and copy the exact text (including whitespace).",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         if count > 1 && !a.replace_all {
@@ -139,7 +139,7 @@ impl Tool for EditFileTool {
                 "edit_file: old_string appears {count} times in {} — it must be unique. Add \
                  surrounding context to disambiguate, or set replace_all=true. The file was \
                  NOT modified.",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         if old_match == new_match {
@@ -160,14 +160,14 @@ impl Tool for EditFileTool {
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return err(format!(
                 "edit_file: failed to write {}: {e}",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         let replaced = if a.replace_all { count } else { 1 };
         let diff = build_compact_diff(&a.old_string, &a.new_string);
         ok(format!(
             "Edited {} ({replaced} replacement{})\n{}",
-            path.display(),
+            crate::pathnorm::to_display(&path),
             if replaced == 1 { "" } else { "s" },
             diff,
         ))
@@ -201,6 +201,14 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     }
 
     diff.trim_end().to_string()
+}
+
+/// Number of leading whitespace **characters** in `s`. Counts Unicode
+/// whitespace consistently with `chars().take(n)` — both operate on
+/// characters, not bytes. This is the correct unit for indent arithmetic:
+/// `" ".repeat(n)` and `chars().take(n)` both count characters.
+fn leading_ws_chars(s: &str) -> usize {
+    s.chars().take_while(|c| c.is_whitespace()).count()
 }
 
 /// Whitespace-normalized fuzzy replace (faithful port of the v1 editor's
@@ -268,7 +276,7 @@ fn try_fuzzy_replace(
     let new_base_indent = new_lines
         .iter()
         .find(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| leading_ws_chars(l))
         .unwrap_or(0);
 
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
@@ -276,7 +284,7 @@ fn try_fuzzy_replace(
     let to_replace = if replace_all { &matches[..] } else { &matches[..1] };
     for &(start, end) in to_replace.iter().rev() {
         let original_line = content_lines[start];
-        let file_indent = original_line.len() - original_line.trim_start().len();
+        let file_indent = leading_ws_chars(original_line);
         let file_indent_str: String = original_line.chars().take(file_indent).collect();
 
         let replacement: Vec<String> = new_lines
@@ -285,7 +293,7 @@ fn try_fuzzy_replace(
                 if l.trim().is_empty() {
                     String::new()
                 } else {
-                    let line_indent = l.len() - l.trim_start().len();
+                    let line_indent = leading_ws_chars(l);
                     let signed_relative = line_indent as isize - new_base_indent as isize;
                     let total_indent = if signed_relative >= 0 {
                         // Same/deeper than anchor: keep the file's indent prefix
@@ -557,5 +565,30 @@ mod tests {
             .await;
         assert!(r.is_error, "a short fragment must not fuzzy-match: {}", r.content);
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "\tx\n", "unchanged");
+    }
+
+    // Regression: indent arithmetic must count *characters*, not bytes. When the file
+    // is indented with a multi-byte whitespace char (here U+3000 IDEOGRAPHIC SPACE,
+    // 3 bytes / 1 char), the old byte-based `file_indent` fed into `chars().take(n)`
+    // grabbed content chars into the indent prefix, producing corruption like
+    // "\u{3000}x x = 99". The fix (leading_ws_chars) keeps exactly the whitespace.
+    #[tokio::test]
+    async fn fuzzy_preserves_multibyte_whitespace_indentation() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f.py"), "def f():\n\u{3000}x = 1\n\u{3000}y = 2\n").unwrap();
+        // Model reproduced the body with plain-space indentation → exact match fails,
+        // fuzzy path fires.
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"f.py","old_string":"    x = 1\n    y = 2","new_string":"    x = 99\n    y = 2"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "fuzzy match must succeed: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("f.py")).unwrap(),
+            "def f():\n\u{3000}x = 99\n\u{3000}y = 2\n",
+            "the file's multi-byte whitespace indent must be preserved with no content leaking into it"
+        );
     }
 }

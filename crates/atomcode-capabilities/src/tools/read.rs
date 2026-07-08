@@ -150,7 +150,7 @@ impl Tool for ReadFileTool {
                 return err(format!(
                     "Error: no such file: {} (resolved to {})",
                     a.file_path,
-                    path.display()
+                    crate::pathnorm::to_display(&path)
                 ))
             }
         };
@@ -167,7 +167,7 @@ impl Tool for ReadFileTool {
             entries.sort();
             return ok(format!(
                 "[NOTE: {} is a directory. Its contents:]\n{}",
-                path.display(),
+                crate::pathnorm::to_display(&path),
                 entries.join("\n")
             ));
         }
@@ -185,7 +185,7 @@ impl Tool for ReadFileTool {
 
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(e) => return err(format!("read_file: failed to read {}: {e}", path.display())),
+            Err(e) => return err(format!("read_file: failed to read {}: {e}", crate::pathnorm::to_display(&path))),
         };
         if looks_binary(&bytes) {
             // VISION path: an image file read by a model that can SEE → hand back the

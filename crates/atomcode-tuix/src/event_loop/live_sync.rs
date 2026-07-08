@@ -1,47 +1,107 @@
 //! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 AgentEvent，
 //! 投进现有 runtime_event_tx，复用 handle_agent_event 渲染。
 
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use super::bg_runtime::{RuntimeEvent, RuntimeId};
 use atomcode_core::agent::AgentEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
-use super::bg_runtime::{RuntimeEvent, RuntimeId};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// TurnEvent → 0/1 AgentEvent. UserMessage/StateChanged handled separately in the forwarder.
 pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
     Some(match te {
         TurnEvent::TextDelta(s) => AgentEvent::TextDelta(s),
         TurnEvent::ReasoningDelta(s) => AgentEvent::ReasoningDelta(s),
-        TurnEvent::ToolCallStarted { id, name, arguments } =>
-            AgentEvent::ToolCallStarted { id, name, arguments },
-        TurnEvent::ToolOutputChunk { call_id, chunk } =>
-            AgentEvent::ToolOutputChunk { call_id, chunk },
-        TurnEvent::ToolCallResult { call_id, name, output, success, duration } =>
-            AgentEvent::ToolCallResult { call_id, name, output, success, duration },
-        TurnEvent::TokenUsage { prompt_tokens, completion_tokens, cached_tokens, .. } =>
-            AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-            }),
+        TurnEvent::ToolCallStarted {
+            id,
+            name,
+            arguments,
+        } => AgentEvent::ToolCallStarted {
+            id,
+            name,
+            arguments,
+        },
+        TurnEvent::ToolOutputChunk { call_id, chunk } => {
+            AgentEvent::ToolOutputChunk { call_id, chunk }
+        }
+        TurnEvent::ToolCallResult {
+            call_id,
+            name,
+            output,
+            success,
+            duration,
+        } => AgentEvent::ToolCallResult {
+            call_id,
+            name,
+            output,
+            success,
+            duration,
+        },
+        TurnEvent::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            ..
+        } => AgentEvent::TokenUsage(atomcode_core::stream::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        }),
         // TurnEvent::Error is a tuple variant Error(String)
         TurnEvent::Error(e) => AgentEvent::Error {
             error: e,
             snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
         },
         TurnEvent::Warning(w) => AgentEvent::Warning(w),
-        TurnEvent::ApprovalRequested { tool_name, reason, call, snapshot } =>
-            AgentEvent::ApprovalNeeded { tool_name, reason, call, snapshot },
-        TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } =>
-            AgentEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming },
+        TurnEvent::ApprovalRequested {
+            tool_name,
+            reason,
+            call,
+            snapshot,
+        } => AgentEvent::ApprovalNeeded {
+            tool_name,
+            reason,
+            call,
+            snapshot,
+        },
+        TurnEvent::RateLimited {
+            reset_at_display,
+            reset_label,
+            secs_until_reset,
+            auto_resuming,
+        } => AgentEvent::RateLimited {
+            reset_at_display,
+            reset_label,
+            secs_until_reset,
+            auto_resuming,
+        },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }
         | TurnEvent::ToolBatchStarted { .. }
         | TurnEvent::ToolBatchCompleted { .. }
         | TurnEvent::ContextStats { .. }
-        | TurnEvent::WorkingDirChanged(_) => return None,
+        | TurnEvent::WorkingDirChanged(_)
+        | TurnEvent::ApprovalResolved { .. } => return None,
     })
+}
+
+pub(crate) fn mode_to_agent_event(mode: &str) -> Option<AgentEvent> {
+    match mode {
+        "plan" => Some(AgentEvent::ModeChanged {
+            plan: true,
+            bypass: false,
+        }),
+        "build" => Some(AgentEvent::ModeChanged {
+            plan: false,
+            bypass: false,
+        }),
+        "bypass" => Some(AgentEvent::ModeChanged {
+            plan: false,
+            bypass: true,
+        }),
+        _ => None,
+    }
 }
 
 /// 把 LiveSession 广播转发进 TUI 的 runtime_event_tx（渲染复用现有路径）。
@@ -59,15 +119,31 @@ pub(crate) fn spawn_live_forwarder(
         // these per-event prints flooded the screen and, caught between
         // the renderer's `ESC(0`/`ESC(B` charset switches, rendered as
         // DEC-special-graphics mojibake. See trace.rs for the rationale.
-        crate::tuix_trace!("FWD", "START session_ptr={:#x} runtime_id={:?}", session_ptr, runtime_id);
+        crate::tuix_trace!(
+            "FWD",
+            "START session_ptr={:#x} runtime_id={:?}",
+            session_ptr,
+            runtime_id
+        );
         let (_snapshot, mut rx) = session.join().await;
-        crate::tuix_trace!("FWD", "JOINED session_ptr={:#x} snapshot_len={}", session_ptr, _snapshot.len());
+        crate::tuix_trace!(
+            "FWD",
+            "JOINED session_ptr={:#x} snapshot_len={}",
+            session_ptr,
+            _snapshot.len()
+        );
         loop {
             match rx.recv().await {
                 Ok(LiveEvent::Turn(te)) => {
                     crate::tuix_trace!("FWD", "Turn event: {:?}", std::mem::discriminant(&te));
                     if let Some(ae) = turn_to_agent_event(te) {
-                        if fan_tx.send(RuntimeEvent { runtime_id, event: ae }).is_err() {
+                        if fan_tx
+                            .send(RuntimeEvent {
+                                runtime_id,
+                                event: ae,
+                            })
+                            .is_err()
+                        {
                             crate::tuix_trace!("FWD", "fan_tx closed, breaking");
                             break;
                         }
@@ -76,7 +152,10 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::UserMessage { text, .. }) => {
                     crate::tuix_trace!("FWD", "UserMessage: {} chars", text.len());
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::UserEcho(text) })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::UserEcho(text),
+                        })
                         .is_err()
                     {
                         break;
@@ -86,7 +165,10 @@ pub(crate) fn spawn_live_forwarder(
                     let running = matches!(st, atomcode_core::live::TurnState::Running);
                     crate::tuix_trace!("FWD", "StateChanged: running={}", running);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::PeerBusy(running) })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::PeerBusy(running),
+                        })
                         .is_err()
                     {
                         break;
@@ -95,7 +177,10 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::ProviderChanged(provider)) => {
                     crate::tuix_trace!("FWD", "ProviderChanged: {}", provider);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProviderChanged(provider) })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::ProviderChanged(provider),
+                        })
                         .is_err()
                     {
                         break;
@@ -107,7 +192,10 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::WorkingDirChanged(dir)) => {
                     crate::tuix_trace!("FWD", "WorkingDirChanged: {:?}", dir);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::ProjectSwitched(dir) })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::ProjectSwitched(dir),
+                        })
                         .is_err()
                     {
                         break;
@@ -117,7 +205,10 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::SessionSwitched(session_id)) => {
                     crate::tuix_trace!("FWD", "SessionSwitched: {}", session_id);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionSwitched(session_id) })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::SessionSwitched(session_id),
+                        })
                         .is_err()
                     {
                         break;
@@ -131,7 +222,10 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::SessionRenamed { name, .. }) => {
                     crate::tuix_trace!("FWD", "SessionRenamed: {}", name);
                     if fan_tx
-                        .send(RuntimeEvent { runtime_id, event: AgentEvent::SessionRenamed { name } })
+                        .send(RuntimeEvent {
+                            runtime_id,
+                            event: AgentEvent::SessionRenamed { name },
+                        })
                         .is_err()
                     {
                         break;
@@ -154,6 +248,14 @@ pub(crate) fn spawn_live_forwarder(
                 // 命令输出广播：TUI 自己执行命令时已在本地渲染过（或经
                 // RemoteSlashCommand 路径渲染），这里忽略，避免重复刷屏。
                 Ok(LiveEvent::CommandOutput(_)) => continue,
+                Ok(LiveEvent::ModeChanged(mode)) => {
+                    crate::tuix_trace!("FWD", "ModeChanged: {}", mode);
+                    if let Some(event) = mode_to_agent_event(&mode) {
+                        if fan_tx.send(RuntimeEvent { runtime_id, event }).is_err() {
+                            break;
+                        }
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     crate::tuix_trace!("FWD", "Lagged: {} events lost", n);
                     continue;
@@ -174,12 +276,10 @@ mod tests {
 
     #[test]
     fn maps_text_delta() {
-        assert!(
-            matches!(
-                turn_to_agent_event(TurnEvent::TextDelta("hi".into())),
-                Some(AgentEvent::TextDelta(s)) if s == "hi"
-            )
-        );
+        assert!(matches!(
+            turn_to_agent_event(TurnEvent::TextDelta("hi".into())),
+            Some(AgentEvent::TextDelta(s)) if s == "hi"
+        ));
     }
 
     #[test]
@@ -192,5 +292,31 @@ mod tests {
             total_messages: 0,
         })
         .is_none());
+    }
+
+    #[test]
+    fn maps_mode_changed_events() {
+        assert!(matches!(
+            mode_to_agent_event("plan"),
+            Some(AgentEvent::ModeChanged {
+                plan: true,
+                bypass: false
+            })
+        ));
+        assert!(matches!(
+            mode_to_agent_event("build"),
+            Some(AgentEvent::ModeChanged {
+                plan: false,
+                bypass: false
+            })
+        ));
+        assert!(matches!(
+            mode_to_agent_event("bypass"),
+            Some(AgentEvent::ModeChanged {
+                plan: false,
+                bypass: true
+            })
+        ));
+        assert!(mode_to_agent_event("unknown").is_none());
     }
 }

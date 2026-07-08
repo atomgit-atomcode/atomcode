@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-coding"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "L2 coding specialization: assembles the neutral kernel + capabilities into a runnable, self-correcting coding agent."
 
@@ -36,9 +36,11 @@ dirs = "6"
 # Day-granular date anchor frozen into the persona (system prompt) so the model
 # has a current-date reference on every round — v1 prompt.rs parity.
 chrono = "0.4"
+# Parse the bash tool-call `arguments` JSON in the VerifyCadenceHook to tell a real
+# check from a read-only `ls`/`git diff` dodge (discipline/verify.rs).
+serde_json = "1"
 
 [dev-dependencies]
-serde_json = "1"
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
@@ -48,3 +50,7 @@ async-trait = "0.1"
 # Serialize tests that mutate the process-global ATOMCODE_HOME env var so they
 # don't race (cache_prefix asserts byte-identical system prompt across assemblies).
 serial_test = "3"
+# Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so tests
+# never persist into the developer's real ~/.atomcode.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"

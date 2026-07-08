@@ -8,6 +8,14 @@ export function formatTokenCount(total: number, t?: Translator): string {
   return t ? t('token.countK', { count }) : `${count}k tokens`;
 }
 
+export function formatToolDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs)) return '';
+  if (durationMs < 1000) {
+    return `${Math.max(1, Math.round(durationMs))}ms`;
+  }
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
 function toTimestamp(value?: string | number): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value === 'number') return value < 10_000_000_000 ? value * 1000 : value;

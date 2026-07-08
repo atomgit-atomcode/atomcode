@@ -127,6 +127,13 @@ impl<W: Write + Send> PlainRenderer<W> {
         }
     }
 
+    /// ASCII-downgrade decorative glyphs when the terminal lacks unicode support
+    /// (mirrors the retained renderer; see `crate::glyph`). No-op / zero-copy on
+    /// unicode terminals and pure-ASCII text.
+    fn dg<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        crate::glyph::downgrade_glyphs(s, self.caps.unicode_symbols)
+    }
+
     fn render_user(&mut self, text: &str, attachments: &[usize]) {
         self.drop_transient();
         if !self.interactive_terminal {
@@ -141,14 +148,15 @@ impl<W: Write + Send> PlainRenderer<W> {
                     SGR_BOLD_CYAN,
                     chev,
                     SGR_RESET,
-                    scrub_controls(text)
+                    self.dg(&scrub_controls(text))
                 );
             } else {
-                let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+                let _ = writeln!(self.out, "{}{}", chev, self.dg(&scrub_controls(text)));
             }
         }
         for n in attachments {
-            let _ = writeln!(self.out, "  └ [Image #{}]", n);
+            let branch = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
+            let _ = writeln!(self.out, "  {} [Image #{}]", branch, n);
         }
     }
 }
@@ -179,37 +187,39 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::AssistantText(text) => {
                 self.drop_transient();
-                let _ = self.out.write_all(scrub_controls(&text).as_bytes());
+                let _ = self.out.write_all(self.dg(&scrub_controls(&text)).as_bytes());
             }
             UiLine::ReasoningText(text) => {
                 // Display reasoning in gray/dimmed style
-                let _ = write!(self.out, "\x1b[2m{}\x1b[0m", scrub_controls(&text));
+                let _ = write!(self.out, "\x1b[2m{}\x1b[0m", self.dg(&scrub_controls(&text)));
             }
             UiLine::AssistantLineBreak => {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
+            UiLine::ToolCall { name, detail }
+            | UiLine::ToolCallInFlight { id: _, name, detail, hint: _ } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees
                 // `▸ Name(detail)` once, when the call lands.
                 self.drop_transient();
-                let name = scrub_controls(&name);
-                let detail = scrub_controls(&detail);
+                let name = self.dg(&scrub_controls(&name)).into_owned();
+                let detail = self.dg(&scrub_controls(&detail)).into_owned();
                 let arrow_color = if self.caps.colors { SGR_CYAN } else { "" };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let bullet = if self.caps.unicode_symbols { "\u{25cf}" } else { "*" };
                 // ● (U+25CF) — Geometric Shapes block; broadly available
                 // across Windows monospace fonts. Aligns with retained
                 // and alt-screen renderers (see retained.rs ToolCall
                 // arm for the Windows-font tofu rationale).
                 if detail.is_empty() {
-                    let _ = writeln!(self.out, "{}● {}{}", arrow_color, name, reset);
+                    let _ = writeln!(self.out, "{}{} {}{}", arrow_color, bullet, name, reset);
                 } else {
                     let _ = writeln!(
                         self.out,
-                        "{}● {}{}({})",
-                        arrow_color, name, reset, detail
+                        "{}{} {}{}({})",
+                        arrow_color, bullet, name, reset, detail
                     );
                 }
             }
@@ -225,22 +235,22 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // children, then update lines. Less elegant than
                 // retained's in-place ✓, but functional.
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", header);
+                let _ = writeln!(self.out, "{}", self.dg(&header));
                 for c in children {
-                    let _ = writeln!(self.out, "{}", c.text);
+                    let _ = writeln!(self.out, "{}", self.dg(&c.text));
                 }
             }
             UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", new_text);
+                let _ = writeln!(self.out, "{}", self.dg(&new_text));
             }
             UiLine::ToolGroupSummary { text } => {
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", text);
+                let _ = writeln!(self.out, "{}", self.dg(&text));
             }
             UiLine::ToolResult { success, summary } => {
                 self.drop_transient();
-                let icon = if success { "✓" } else { "✗" };
+                let icon = if self.caps.unicode_symbols { if success { "\u{2713}" } else { "\u{2717}" } } else if success { "v" } else { "x" };
                 let icon_color = if self.caps.colors {
                     if success { SGR_GREEN } else { SGR_RED }
                 } else {
@@ -425,7 +435,8 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // Plain mode echoes attachment markers with the same
                 // 2-space indent as the TTY renderers, then a newline.
                 self.drop_transient();
-                let _ = writeln!(self.out, "  └ [Image #{}]", n);
+                let branch = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
+            let _ = writeln!(self.out, "  {} [Image #{}]", branch, n);
             }
             UiLine::VisionPreprocessSuccess { msg, model } => {
                 // Plain mode loses styling distinctions; print
@@ -532,8 +543,12 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(!s.contains('\x1b'), "dumb mode must emit zero SGR. got: {}", s);
-        assert!(s.contains("● read_file(x.rs)"));
-        assert!(s.contains("✓ done"));
+        // Dumb mode (`!unicode_symbols`) now genuinely lives up to this test's name:
+        // decorative glyphs downgrade to ASCII, so `●`→`*` and `✓`→`v` — no tofu on
+        // fonts that lack them (the reported `✗`→`□` bug). See `crate::glyph`.
+        assert!(s.contains("* read_file(x.rs)"), "● should downgrade to * in dumb mode. got: {}", s);
+        assert!(s.contains("v done"), "✓ should downgrade to v in dumb mode. got: {}", s);
+        assert!(s.is_ascii(), "dumb mode must be pure ASCII. got: {}", s);
     }
 
     #[test]

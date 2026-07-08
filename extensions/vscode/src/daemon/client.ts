@@ -2,6 +2,8 @@ import * as http from 'http';
 import {
   ChatRequest,
   ChatStreamCallbacks,
+  ApprovalMode,
+  ApprovalModeResponse,
   AuthStatusResponse,
   ConfigResponse,
   ChatEvent,
@@ -13,6 +15,8 @@ import {
   ModelInfo,
   PatchProviderRequest,
   PatchThinkingRequest,
+  PermissionDecision,
+  PermissionDecisionResponse,
   ProjectState,
   ProviderInfo,
   ProvidersResponse,
@@ -205,6 +209,26 @@ export class DaemonClient {
     return this.post<{ ok: boolean }>('/live/reasoning_effort', {
       provider,
       reasoning_effort: effort,
+    });
+  }
+
+  getApprovalMode(): Promise<ApprovalModeResponse> {
+    return this.get<ApprovalModeResponse>('/approval_mode');
+  }
+
+  setApprovalMode(mode: ApprovalMode): Promise<ApprovalModeResponse> {
+    return this.post<ApprovalModeResponse>('/approval_mode', { mode });
+  }
+
+  sendPermissionDecision(
+    sessionId: string,
+    decision: PermissionDecision,
+    toolName?: string,
+  ): Promise<PermissionDecisionResponse> {
+    return this.post<PermissionDecisionResponse>('/chat/permission', {
+      session_id: sessionId,
+      decision,
+      ...(toolName ? { tool_name: toolName } : {}),
     });
   }
 
@@ -458,6 +482,15 @@ export class DaemonClient {
       case 'tool_result':
         callbacks.onToolResult(event.id, event.name, event.output, event.success, event.duration_ms);
         break;
+      case 'permission_request':
+        callbacks.onPermissionRequest({
+          sessionId: event.session_id,
+          toolName: event.tool_name,
+          reason: event.reason,
+          callId: event.call_id,
+          args: event.arguments,
+        });
+        break;
       case 'tokens':
         callbacks.onTokens(event.prompt, event.completion, event.total);
         break;
@@ -469,6 +502,17 @@ export class DaemonClient {
         break;
       case 'artifact_end':
         callbacks.onArtifactEnd(event.id);
+        break;
+      case 'warning':
+        callbacks.onWarning(event.message);
+        break;
+      case 'rate_limited':
+        callbacks.onRateLimited({
+          message: event.message,
+          retryAfterSeconds: event.retry_after_seconds,
+          attempt: event.attempt,
+          maxAttempts: event.max_attempts,
+        });
         break;
       case 'done':
         callbacks.onDone(event.tokens, event.tool_calls, event.session_id);

@@ -64,7 +64,7 @@ impl Tool for GlobTool {
         };
         match tokio::fs::metadata(&base).await {
             Ok(m) if m.is_dir() => {}
-            _ => return err(format!("glob: base directory does not exist: {}", base.display())),
+            _ => return err(format!("glob: base directory does not exist: {}", crate::pathnorm::to_display(&base))),
         }
 
         let matcher = match GlobBuilder::new(&match_pattern).literal_separator(true).build() {
@@ -100,7 +100,7 @@ impl Tool for GlobTool {
                 let rel = path.strip_prefix(&base2).unwrap_or(path);
                 if matcher.is_match(rel) {
                     // Display relative to the working dir for usable paths.
-                    let shown = path.strip_prefix(&wd).unwrap_or(path).display().to_string();
+                    let shown = crate::pathnorm::to_display(path.strip_prefix(&wd).unwrap_or(path));
                     hits.push(shown);
                 }
             }

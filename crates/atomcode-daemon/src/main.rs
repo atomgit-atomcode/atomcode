@@ -110,6 +110,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
     let mode = match client_mode.as_deref() {
         Some("vscode") => SessionMode::Vscode,
+        Some("jetbrains") => SessionMode::Jetbrains,
         Some("webui") => SessionMode::Webui,
         Some("atomcode-air") => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
@@ -166,6 +167,8 @@ async fn main() {
         working_dir_override: None,
         // 独立二进制自行 bind host:port，不预绑定。
         prebound_listener: None,
+        // 独立 daemon 模式不需要 app user_id 校验。
+        app_user_id: None,
     })
     .await
     {

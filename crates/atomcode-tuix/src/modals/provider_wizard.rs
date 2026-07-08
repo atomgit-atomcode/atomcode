@@ -68,6 +68,7 @@ pub enum WizardStep {
     BaseUrl,
     ApiKey,
     Model,
+    ContextWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +78,10 @@ pub struct DraftProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Max context tokens. `None` = the user left it blank, so fall back to
+    /// the provider-type default ([`default_context_window_for`]) on Add or
+    /// keep the existing value on Edit.
+    pub context_window: Option<usize>,
 }
 
 impl DraftProvider {
@@ -94,6 +99,9 @@ impl DraftProvider {
         }
         if !self.model.is_empty() {
             base.model = self.model.clone();
+        }
+        if let Some(cw) = self.context_window {
+            base.context_window = cw;
         }
     }
 
@@ -115,7 +123,9 @@ impl DraftProvider {
             },
             system_prompt: None,
             user_agent: None,
-            context_window: default_context_window_for(&provider_type),
+            context_window: self
+                .context_window
+                .unwrap_or_else(|| default_context_window_for(&provider_type)),
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
@@ -125,6 +135,7 @@ impl DraftProvider {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
 
 }
     }
@@ -687,6 +698,17 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
         (WizardStep::Model, Some(p)) =>
             t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
+        (WizardStep::ContextWindow, None) => {
+            use atomcode_core::config::provider::default_context_window_for;
+            // No provider_type here (Add uses show_add_step_prompt); fall back
+            // to the openai default just for the bare prompt.
+            t(Msg::ProviderStepContextWindow {
+                default: default_context_window_for("openai"),
+            })
+            .into_owned()
+        }
+        (WizardStep::ContextWindow, Some(p)) =>
+            t(Msg::ProviderStepContextWindowWithHint { current: p.context_window }).into_owned(),
     }
 }
 
@@ -709,6 +731,13 @@ fn show_add_step_prompt(
     let body = match step {
         WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
         WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
+        WizardStep::ContextWindow => {
+            use atomcode_core::config::provider::default_context_window_for;
+            t(Msg::ProviderStepContextWindow {
+                default: default_context_window_for(&draft.provider_type),
+            })
+            .into_owned()
+        }
         other => step_prompt_text(other, None),
     };
     if matches!(step, WizardStep::Template) || total == 0 {
@@ -820,8 +849,33 @@ fn import_plan(draft: &DraftProvider) -> Vec<WizardStep> {
     if draft.model.is_empty() {
         plan.push(WizardStep::Model);
     }
+    // Always offer the context window (blank keeps the provider-type default),
+    // then confirm the Name last.
+    plan.push(WizardStep::ContextWindow);
     plan.push(WizardStep::Name);
     plan
+}
+
+/// Parse a user-typed context-window size into a token count. Accepts plain
+/// digits, `_` / `,` grouping, and a `k` / `m` suffix (`128k` → 128_000,
+/// `1m` → 1_000_000). Returns `None` for empty, non-numeric, or zero input so
+/// the caller can re-prompt or fall back to a default.
+fn parse_context_window(s: &str) -> Option<usize> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (digits, mult) = match t.chars().last() {
+        Some('k') | Some('K') => (&t[..t.len() - 1], 1_000usize),
+        Some('m') | Some('M') => (&t[..t.len() - 1], 1_000_000usize),
+        _ => (t, 1usize),
+    };
+    let cleaned: String = digits.chars().filter(|c| *c != '_' && *c != ',').collect();
+    if cleaned.is_empty() || !cleaned.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n = cleaned.parse::<usize>().ok()?.checked_mul(mult)?;
+    (n > 0).then_some(n)
 }
 
 /// Seed the Name step's default if it isn't set yet.
@@ -872,6 +926,22 @@ fn store_step(
             };
             draft.name = dedupe_name(&chosen, |n| existing.contains_key(n));
         }
+        WizardStep::ContextWindow => {
+            // Blank keeps the provider-type default (draft stays None);
+            // a non-empty value must parse to a positive token count.
+            if !ans.is_empty() {
+                match parse_context_window(ans) {
+                    Some(n) => draft.context_window = Some(n),
+                    None => {
+                        push(
+                            renderer,
+                            &crate::i18n::t(crate::i18n::Msg::ProviderContextWindowInvalid),
+                        );
+                        return StepOutcome::Retry;
+                    }
+                }
+            }
+        }
         // Template / Base URL / Type are pre-plan steps, never planned.
         WizardStep::Template | WizardStep::BaseUrl | WizardStep::ProviderType => {}
     }
@@ -915,6 +985,23 @@ fn advance_edit(
         }
         WizardStep::Model => {
             draft.model = ans.to_string();
+            Some(WizardStep::ContextWindow)
+        }
+        WizardStep::ContextWindow => {
+            // Blank keeps the existing value (apply_onto leaves it untouched);
+            // a non-empty value must parse, else re-prompt the same step.
+            if !ans.is_empty() {
+                match parse_context_window(ans) {
+                    Some(n) => draft.context_window = Some(n),
+                    None => {
+                        push(
+                            renderer,
+                            &crate::i18n::t(crate::i18n::Msg::ProviderContextWindowInvalid),
+                        );
+                        return Some(WizardStep::ContextWindow);
+                    }
+                }
+            }
             None
         }
     }
@@ -1333,7 +1420,10 @@ chunks = query({
         assert!(d.api_key.is_empty(), "shell-var key must be dropped, got {:?}", d.api_key);
         assert_eq!(d.name, "openrouter");
         // Only gap is the key → plan asks ApiKey then Name.
-        assert_eq!(import_plan(&d), vec![WizardStep::ApiKey, WizardStep::Name]);
+        assert_eq!(
+            import_plan(&d),
+            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
+        );
     }
 
     #[test]
@@ -1425,30 +1515,145 @@ chunks = query({
         assert_eq!(d.base_url, "https://api.anthropic.com");
         assert_eq!(d.provider_type, "claude");
         assert_eq!(d.name, "anthropic"); // derived from host
-        // Manual entry never supplies key/model, so both are asked, then Name.
+        // Manual entry never supplies key/model, so both are asked, then the
+        // context window, then Name.
         assert_eq!(
             import_plan(&d),
-            vec![WizardStep::ApiKey, WizardStep::Model, WizardStep::Name]
+            vec![
+                WizardStep::ApiKey,
+                WizardStep::Model,
+                WizardStep::ContextWindow,
+                WizardStep::Name
+            ]
         );
     }
 
     #[test]
     fn import_plan_only_covers_gaps() {
-        // key + model missing → ask both, then Name.
+        // key + model missing → ask both, then context window, then Name.
         assert_eq!(
             import_plan(&draft_filled("openai", "", "")),
-            vec![WizardStep::ApiKey, WizardStep::Model, WizardStep::Name]
+            vec![
+                WizardStep::ApiKey,
+                WizardStep::Model,
+                WizardStep::ContextWindow,
+                WizardStep::Name
+            ]
         );
-        // everything filled → just confirm Name.
+        // everything filled → still offer the context window, then confirm Name.
         assert_eq!(
             import_plan(&draft_filled("openai", "sk-1", "gpt-4o")),
-            vec![WizardStep::Name]
+            vec![WizardStep::ContextWindow, WizardStep::Name]
         );
-        // model already filled → skip it.
+        // model already filled → skip it, keep context window before Name.
         assert_eq!(
             import_plan(&draft_filled("openai", "", "gpt-4o")),
-            vec![WizardStep::ApiKey, WizardStep::Name]
+            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
         );
+    }
+
+    #[test]
+    fn parse_context_window_accepts_plain_grouping_and_suffixes() {
+        assert_eq!(parse_context_window("128000"), Some(128_000));
+        assert_eq!(parse_context_window("128_000"), Some(128_000));
+        assert_eq!(parse_context_window("128,000"), Some(128_000));
+        assert_eq!(parse_context_window("128k"), Some(128_000));
+        assert_eq!(parse_context_window("200K"), Some(200_000));
+        assert_eq!(parse_context_window("1m"), Some(1_000_000));
+        assert_eq!(parse_context_window("  64000 "), Some(64_000));
+        // Rejections → None (caller re-prompts or uses default).
+        assert_eq!(parse_context_window("0"), None);
+        assert_eq!(parse_context_window("banana"), None);
+        assert_eq!(parse_context_window(""), None);
+        assert_eq!(parse_context_window("12x"), None);
+    }
+
+    #[test]
+    fn store_step_context_window_parses_blank_and_invalid() {
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        // Valid → stored.
+        let mut d = draft_filled("openai", "sk", "gpt-4o");
+        assert_eq!(
+            store_step(&mut d, WizardStep::ContextWindow, "64000", &existing, &mut sink),
+            StepOutcome::Ok
+        );
+        assert_eq!(d.context_window, Some(64_000));
+        // Blank → left None (→ provider-type default at into_config).
+        let mut d2 = draft_filled("openai", "sk", "gpt-4o");
+        assert_eq!(
+            store_step(&mut d2, WizardStep::ContextWindow, "", &existing, &mut sink),
+            StepOutcome::Ok
+        );
+        assert_eq!(d2.context_window, None);
+        // Garbage → Retry, unchanged.
+        let mut d3 = draft_filled("openai", "sk", "gpt-4o");
+        assert_eq!(
+            store_step(&mut d3, WizardStep::ContextWindow, "banana", &existing, &mut sink),
+            StepOutcome::Retry
+        );
+        assert_eq!(d3.context_window, None);
+    }
+
+    #[test]
+    fn into_config_uses_entered_window_else_type_default() {
+        // Entered value wins.
+        let mut d = draft_filled("openai", "sk", "gpt-4o");
+        d.context_window = Some(64_000);
+        assert_eq!(d.into_config().context_window, 64_000);
+        // None → provider-type default (ollama = 8000, openai = 128000).
+        assert_eq!(
+            draft_filled("ollama", "", "llama3").into_config().context_window,
+            8_000
+        );
+        assert_eq!(
+            draft_filled("openai", "sk", "gpt-4o").into_config().context_window,
+            128_000
+        );
+    }
+
+    #[test]
+    fn advance_edit_flows_model_to_context_window_then_ends() {
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let mut d = DraftProvider::default();
+        // Model now advances to ContextWindow (was the terminal step).
+        assert_eq!(
+            advance_edit(&mut d, WizardStep::Model, "gpt-4o", &mut sink),
+            Some(WizardStep::ContextWindow)
+        );
+        // Valid entry → ends, value captured.
+        assert_eq!(
+            advance_edit(&mut d, WizardStep::ContextWindow, "32000", &mut sink),
+            None
+        );
+        assert_eq!(d.context_window, Some(32_000));
+        // Blank → ends, stays None so apply_onto keeps the existing value.
+        let mut d2 = DraftProvider::default();
+        assert_eq!(
+            advance_edit(&mut d2, WizardStep::ContextWindow, "", &mut sink),
+            None
+        );
+        assert_eq!(d2.context_window, None);
+        // Invalid → re-prompt the same step.
+        let mut d3 = DraftProvider::default();
+        assert_eq!(
+            advance_edit(&mut d3, WizardStep::ContextWindow, "xyz", &mut sink),
+            Some(WizardStep::ContextWindow)
+        );
+    }
+
+    #[test]
+    fn apply_onto_sets_context_window_only_when_present() {
+        let mut base = draft_filled("openai", "sk", "gpt-4o").into_config();
+        assert_eq!(base.context_window, 128_000);
+        // None → untouched (empty-Enter keeps existing).
+        DraftProvider::default().apply_onto(&mut base);
+        assert_eq!(base.context_window, 128_000);
+        // Some → applied.
+        let mut d = DraftProvider::default();
+        d.context_window = Some(48_000);
+        d.apply_onto(&mut base);
+        assert_eq!(base.context_window, 48_000);
     }
 
     #[test]
@@ -1480,7 +1685,10 @@ chunks = query({
         assert_eq!(d.model, "qwen3.7-max");
         assert!(d.api_key.is_empty(), "placeholder key must be dropped");
         assert_eq!(d.name, "taotoken");
-        assert_eq!(import_plan(&d), vec![WizardStep::ApiKey, WizardStep::Name]);
+        assert_eq!(
+            import_plan(&d),
+            vec![WizardStep::ApiKey, WizardStep::ContextWindow, WizardStep::Name]
+        );
     }
 
     #[test]

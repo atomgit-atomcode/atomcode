@@ -60,6 +60,7 @@ export interface StreamChatBody {
   working_dir?: string;
   provider?: string;
   images?: ImageData[];
+  approval_mode?: ApprovalMode;
 }
 
 export async function stopChat(requestId: string): Promise<void> {
@@ -192,10 +193,15 @@ export interface ToolResultInfo {
 export interface SessionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  synthetic?: boolean;
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
+  /** Epoch ms this message was authored (PR #562 send-time labels). Absent
+   *  on older daemons and on live/snapshot turns (the webui injects Date.now()
+   *  there). Optional + `?` so historical payloads without it still parse. */
+  created_at?: number;
 }
 
 export interface SessionDetail {
@@ -208,8 +214,48 @@ export interface SessionDetail {
   messages: SessionMessage[];
 }
 
+// NOTE: `/sessions` caps at the 50 most-recent sessions ACROSS ALL projects.
+// For a project's full history use listProjectSessions; for finding a session
+// anywhere use searchSessions. This capped list is only for cross-project
+// lookups where 50 is enough (e.g. URL-restore of a recent session).
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await fetch('/sessions', { headers: authHeaders() });
+  return resp.json();
+}
+
+// A single project's sessions, UNCAPPED (reads one bucket directly). This is
+// what the sidebar shows — the global `/sessions` cap would otherwise starve a
+// project of its own history when many other projects have newer sessions.
+// The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
+// stamp it back on for the client's project-scoped dedup/filter.
+export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+  const resp = await fetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`list project sessions failed: ${resp.status}`);
+  const list: SessionMeta[] = await resp.json();
+  return list.map((m) => ({ ...m, project_hash: projectHash }));
+}
+
+// Cross-project session search by name, UNCAPPED. Backs the search modal so it
+// can find a session in ANY project (the sidebar list itself is per-project).
+export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
+  const resp = await fetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`search sessions failed: ${resp.status}`);
+  return resp.json();
+}
+
+// Resolve a (short) session id to its full record across all projects, UNCAPPED.
+// URL-restore only has a short id from the address bar; the capped `/sessions`
+// can't locate an older session. Returns null when nothing matches.
+export async function resolveSession(id: string): Promise<SessionMetaWithProject | null> {
+  const resp = await fetch(`/sessions/resolve/${encodeURIComponent(id)}`, {
+    headers: authHeaders(),
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`resolve session failed: ${resp.status}`);
   return resp.json();
 }
 
@@ -291,6 +337,15 @@ export async function getConfig(): Promise<ConfigInfo> {
   return resp.json();
 }
 
+/** Trigger a hot-reload of config from disk (POST /config/reload). */
+export async function postConfigReload(): Promise<void> {
+  const resp = await fetch('/config/reload', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`config reload failed: ${resp.status}`);
+}
+
 // --- Projects types ---
 
 export interface ProjectInfo {
@@ -315,6 +370,10 @@ export interface ProjectState {
   previous_dir?: string;
   recent_dirs?: string[];
   name?: string;
+  // Physical session-bucket hash for `working_dir`. The sidebar scopes its
+  // list by this (not the mutable `working_dir` string) so sessions whose
+  // stored working_dir was restamped can't leak across projects.
+  project_hash?: string;
 }
 
 export async function getProject(): Promise<ProjectState> {
@@ -504,9 +563,19 @@ export async function getSession(
 
 // --- Live session (multi-tab real-time sync) ---
 
+/** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,
+ *  'bypass' = auto-approve everything (免审批). Mirrors the daemon `ApprovalMode`. */
+export type ApprovalMode = 'build' | 'plan' | 'bypass';
+
+export interface ApprovalModeResponse {
+  ok: boolean;
+  mode: ApprovalMode;
+}
+
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
+  | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[] }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
@@ -596,6 +665,60 @@ export async function postLiveProvider(provider: string): Promise<void> {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider }),
   });
+}
+
+// --- /command endpoint ---
+
+export type CommandResult =
+  | { kind: 'undo'; undone: number }
+  | { kind: 'remember'; scope: 'global' | 'project' }
+  | { kind: 'forget'; removed: string[] }
+  | { kind: 'memory'; global: string[]; project: string[] }
+  | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
+  | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
+  | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
+  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string }
+  | { kind: 'config'; path: string; provider: string }
+  | { kind: 'diff'; stat: string }
+  | { kind: 'cost'; total_tokens: number; turn_count: number }
+  | { kind: 'todo'; items: { status: string; content: string }[] }
+  | { kind: 'error'; message: string };
+
+export async function postCommand(body: {
+  command: string;
+  arg?: string;
+  session_id?: string;
+  working_dir?: string;
+  project_hash?: string;
+  provider?: string;
+}): Promise<CommandResult> {
+  const resp = await fetch('/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`command failed: ${resp.status}`);
+  return resp.json();
+}
+
+/** Switch the approval mode (build / plan / bypass). Runtime session state —
+ *  the next turn's PermissionDecider follows it; broadcast to other tabs. */
+export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
+  const resp = await fetch('/approval_mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ mode }),
+  });
+  if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
+  const body = (await resp.json()) as ApprovalModeResponse;
+  return body.mode;
+}
+
+export async function getApprovalMode(): Promise<ApprovalMode> {
+  const resp = await fetch('/approval_mode', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
+  const body = (await resp.json()) as ApprovalModeResponse;
+  return body.mode;
 }
 
 /** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is

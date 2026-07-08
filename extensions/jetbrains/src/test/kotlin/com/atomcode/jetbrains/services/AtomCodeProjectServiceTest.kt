@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.services
 
+import com.atomcode.jetbrains.daemon.ApprovalMode
 import com.atomcode.jetbrains.daemon.HealthResponse
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
@@ -9,6 +10,50 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 class AtomCodeProjectServiceTest {
+    @Test
+    fun `approval mode runtime state keeps confirmed mode while switch is pending`() {
+        val state = ApprovalModeRuntimeState()
+
+        assertEquals(true, state.beginSwitch(ApprovalMode.Plan))
+        assertEquals(ApprovalMode.Build, state.confirmedMode)
+        assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertEquals(ApprovalMode.Plan, state.pendingMode)
+
+        assertEquals(false, state.beginSwitch(ApprovalMode.Bypass))
+        assertEquals(ApprovalMode.Build, state.confirmedMode)
+        assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertEquals(ApprovalMode.Plan, state.pendingMode)
+    }
+
+    @Test
+    fun `approval mode runtime state ignores refresh while switch is pending`() {
+        val state = ApprovalModeRuntimeState()
+
+        state.beginSwitch(ApprovalMode.Plan)
+        state.refreshFromDaemon(ApprovalMode.Bypass.wire)
+
+        assertEquals(ApprovalMode.Build, state.confirmedMode)
+        assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertEquals(ApprovalMode.Plan, state.pendingMode)
+    }
+
+    @Test
+    fun `approval mode runtime state completes and rolls back pending switch`() {
+        val state = ApprovalModeRuntimeState()
+
+        state.beginSwitch(ApprovalMode.Plan)
+        assertEquals(ApprovalMode.Plan, state.completeSwitch(ApprovalMode.Plan, ApprovalMode.Plan.wire))
+        assertEquals(ApprovalMode.Plan, state.confirmedMode)
+        assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertNull(state.pendingMode)
+
+        state.beginSwitch(ApprovalMode.Bypass)
+        assertEquals(ApprovalMode.Plan, state.failSwitch(ApprovalMode.Bypass))
+        assertEquals(ApprovalMode.Plan, state.confirmedMode)
+        assertEquals(ApprovalMode.Plan, state.displayMode)
+        assertNull(state.pendingMode)
+    }
+
     @Test
     fun `waitForDaemonHealth retries until daemon reports ready`() {
         val attempts = AtomicInteger(0)

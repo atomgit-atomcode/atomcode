@@ -151,6 +151,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         thinking_budget: req.thinking_budget,
         skip_tls_verify: req.skip_tls_verify,
         ephemeral: false,
+        capable_model: None,
     };
 
     config.providers.insert(name.clone(), provider);

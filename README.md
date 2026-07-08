@@ -92,7 +92,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
 | OpenAI | Yes | GPT-4o, GPT-4.1 |
 | DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
-| Zhipu (GLM) | Yes | GLM-4, GLM-5 |
+| Zhipu (GLM) | Yes | GLM-4, GLM-5, GLM-5.2 |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
 | SiliconFlow | Yes | Various open models |
 | Ollama (local) | Partial | Llama 3, Qwen2, etc. |
@@ -129,7 +129,6 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
 - **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
 - **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
-- **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
 - **Remote commands** — the phone can run `/status`, `/cost`, `/diff`, `/whoami` etc., which execute on the desktop and echo results back
 - **Switch projects / sessions** — switch projects or open a history session on the phone, and the desktop follows immediately
 - **Model sync** — switching models on either end keeps the other in sync
@@ -190,6 +189,29 @@ brew install --cask atomcode
 
 - Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
 - An API key from any supported provider (or an AtomGit account for `/login`)
+
+### Permissions — don't run with `sudo`
+
+Run AtomCode as your **normal user**, never with `sudo`. AtomCode keeps its
+config, sessions, and logs under `~/.atomcode`; running once as root leaves
+root-owned files there, so every later non-root start fails at engine init with:
+
+```
+engine v2 assemble failed: Permission denied (os error 13)
+```
+
+(the message may say `prepare` instead of `assemble` — same cause.) If you hit
+this, reclaim ownership and stop using `sudo`:
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # start WITHOUT sudo
+```
+
+On a Linux guest, a working directory on a VirtualBox shared folder
+(`/media/sf_*`, owned by `root:vboxsf`) can also trigger permission errors — add
+yourself to the group with `sudo usermod -aG vboxsf "$USER"` and re-login, rather
+than using `sudo`.
 
 ### Uninstall
 
@@ -371,7 +393,8 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 |---------|--------|
 | `/model` | Switch model / provider |
 | `/provider` | Manage providers (add / edit / delete) |
-| `/login` | Sign in with AtomGit OAuth |
+| `/proxy` | Switch outbound proxy mode |
+| `/login` | Sign in with AtomGit OAuth and claim CodingPlan free models |
 | `/logout` | Sign out of AtomGit |
 | `/whoami` | Show the current logged-in user |
 | `/status` | Show login status and model info |
@@ -384,6 +407,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/undo` | Undo a turn's file edits (`/undo` or `/undo N`) |
 | `/view <filepath>` | View file content in an overlay modal |
 | `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/copy` | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
 | `/cost` | Show token usage for this session |
 | `/context` | Show the context budget breakdown |
 | `/compact` | Compact conversation history |

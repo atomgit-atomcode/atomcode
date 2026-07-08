@@ -185,6 +185,7 @@ fn test_config() -> Config {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         },
     );
     Config {

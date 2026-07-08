@@ -78,18 +78,20 @@ impl Tool for ChangeDirTool {
 
         let meta = match std::fs::metadata(&target) {
             Ok(m) => m,
-            Err(_) => return err(format!("change_dir: no such directory: {} (resolved to {})", a.path, target.display())),
+            Err(_) => return err(format!("change_dir: no such directory: {} (resolved to {})", a.path, crate::pathnorm::to_display(&target))),
         };
         if !meta.is_dir() {
-            return err(format!("change_dir: not a directory: {}", target.display()));
+            return err(format!("change_dir: not a directory: {}", crate::pathnorm::to_display(&target)));
         }
         // Canonicalize so later by-path lookups are stable (symlink / `..` normalized).
-        let canon = std::fs::canonicalize(&target).unwrap_or(target);
+        // pathnorm::canonicalize strips the Windows `\\?\` prefix so the stored cwd
+        // (and every by-path lookup keyed on it) never carries a verbatim path.
+        let canon = crate::pathnorm::canonicalize(&target).unwrap_or(target);
         match self.cwd.write() {
             Ok(mut g) => *g = canon.clone(),
             Err(_) => return err("change_dir: working-dir lock poisoned"),
         }
-        ok(format!("Working directory changed to {}", canon.display()))
+        ok(format!("Working directory changed to {}", crate::pathnorm::to_display(&canon)))
     }
 }
 

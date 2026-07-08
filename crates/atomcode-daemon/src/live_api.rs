@@ -28,14 +28,24 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{
     ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
+    PermissionDecider, PlanPermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use crate::approval_mode::{
+    approval_mode_tool_filter, approval_mode_wire, ApprovalMode, PLAN_MODE_SYSTEM_SUFFIX,
+};
 use crate::CachedMcpRegistry;
+
+fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
+    match mode {
+        ApprovalMode::Plan => PermissionDecision::Deny,
+        ApprovalMode::Build | ApprovalMode::Bypass => PermissionDecision::Allow,
+    }
+}
 
 // ============================================================================
 // 进程内全局 LiveSession 持有者
@@ -51,6 +61,23 @@ static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 /// webui 每次 /live/message 带上 provider 时更新；DaemonTurnExecutor::run_turn 每轮读取，
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// 当前 LiveSession 的审批模式（webui 底栏「模式」pill 切换，默认 Build）。
+/// `/live/mode` 端点写入；DaemonTurnExecutor::run_turn 每轮读取以选择 PermissionDecider，
+/// 因此在 sync/live 模式下切换模式对下一轮生效（执行器 Arc<dyn> 不可变，沿用 LIVE_PROVIDER
+/// 的进程级覆盖范式）。跨 tab / TUI 通过 LiveEvent::ModeChanged 广播同步。
+static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
+
+/// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
+/// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
+pub(crate) fn live_current_approval_mode() -> ApprovalMode {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
+fn live_current_mode_wire() -> String {
+    approval_mode_wire(live_current_approval_mode()).to_string()
+}
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
 /// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
@@ -101,6 +128,41 @@ pub fn live_set_provider(provider: String) {
     *LIVE_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider.clone());
     if let Some(s) = current_live_session() {
         s.notify_provider_changed(provider);
+    }
+}
+
+/// 设置进程级审批模式并广播给所有视图（webui 底栏 pill / 其他 tab）。下一轮
+/// `run_turn` 读 `LIVE_APPROVAL_MODE` 选 decider。无活动 LiveSession 时仍更新
+/// 状态（下次 ensure 出会话即生效），只是没有订阅者收到广播（无妨）。
+pub fn live_set_mode(mode: ApprovalMode) {
+    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    if let Some(s) = current_live_session() {
+        s.notify_mode_changed(approval_mode_wire(mode).to_string());
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedApprovalModeForTest {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ScopedApprovalModeForTest {
+    pub(crate) fn new() -> Self {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        live_set_mode(ApprovalMode::Build);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedApprovalModeForTest {
+    fn drop(&mut self) {
+        live_set_mode(ApprovalMode::Build);
     }
 }
 
@@ -481,6 +543,7 @@ pub(crate) async fn build_turn_parts(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
+                capable_model: None,
             })
         }
     };
@@ -526,7 +589,13 @@ impl TurnExecutor for DaemonTurnExecutor {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         UserInput {
             text,
             images: input.images,
@@ -549,7 +618,7 @@ impl TurnExecutor for DaemonTurnExecutor {
         // 模式下 /cd 切目录对下一轮的 system prompt / 工具 cwd / 会话落盘全部生效
         // （issue #755）。v1 每轮重建 parts，故读到新目录即重建出新的 system prompt。
         let working_dir = live_current_working_dir(&self.working_dir);
-        let parts = match build_turn_parts(
+        let mut parts = match build_turn_parts(
             &working_dir,
             provider_name,
             &self.mcp_cache,
@@ -565,37 +634,62 @@ impl TurnExecutor for DaemonTurnExecutor {
                 return;
             }
         };
+        // Plan mode: tell the model up-front it's read-only so it explores and
+        // presents a plan instead of firing edits that the DenyAll decider will
+        // reject. `parts.system_prompt` is per-turn (rebuilt every turn from the
+        // current working dir), so appending here never persists into the next
+        // non-plan turn. Mirrors the TUI PlanModeGate's intent for the v1 path.
+        if live_current_approval_mode() == ApprovalMode::Plan && !self.auto_approve {
+            parts.system_prompt.push_str(PLAN_MODE_SYSTEM_SUFFIX);
+        }
         // Build the permission decider. When interactive, mirror process_chat_request:
         // create two channels, register the response sender into the LiveSession approver
         // slot (so any view calling LiveSession.approve() delivers the decision here),
         // and keep the request receiver alive for the duration of the turn (the channel
         // must stay open so InteractivePermissionDecider::decide() can send on it without
         // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
+        // Effective mode: an executor forced to auto-approve (standalone / multi-tab
+        // BypassAll) always bypasses; otherwise honour the webui runtime pill
+        // (`LIVE_APPROVAL_MODE`, default Build). Read per-turn so a mid-session switch
+        // takes effect next turn — same rationale as LIVE_PROVIDER.
+        let effective_mode = if self.auto_approve {
+            ApprovalMode::Bypass
+        } else {
+            live_current_approval_mode()
+        };
         let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
-            if self.auto_approve {
-                (
+            match effective_mode {
+                // 免审批：全放行。
+                ApprovalMode::Bypass => (
                     Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
                     None,
-                )
-            } else {
-                let (perm_req_tx, perm_req_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                let (perm_resp_tx, perm_resp_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
-                // Register the response sender into the LiveSession approver slot.
-                // LiveSession.approve(decision) will take this sender and deliver the decision.
-                *approver.lock().await = Some(perm_resp_tx);
-                let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                    atomcode_core::tool::PermissionStore::new(),
-                ));
-                (
-                    Box::new(InteractivePermissionDecider::new(
-                        perm_req_tx,
-                        perm_resp_rx,
-                        perm_store,
-                    )),
-                    Some(perm_req_rx),
-                )
+                ),
+                // Plan：拒改动类工具（放行只读、拒写/改/bash），配合下方注入的 plan 指令
+                // 让模型只探索+出方案。用 PlanPermissionDecider（而非 DenyAll）——其
+                // will_auto_approve=true 抑制了「等待审批」卡片的闪现（DenyAll 会为每个被
+                // 拒的工具先弹一张随即作废的审批卡）。无交互提示、不注册 approver。
+                ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
+                // Build：交互审批（现状，走 webui PermissionCard）。
+                ApprovalMode::Build => {
+                    let (perm_req_tx, perm_req_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+                    let (perm_resp_tx, perm_resp_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
+                    // Register the response sender into the LiveSession approver slot.
+                    // LiveSession.approve(decision) will take this sender and deliver the decision.
+                    *approver.lock().await = Some(perm_resp_tx);
+                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+                        atomcode_core::tool::PermissionStore::new(),
+                    ));
+                    (
+                        Box::new(InteractivePermissionDecider::new(
+                            perm_req_tx,
+                            perm_resp_rx,
+                            perm_store,
+                        )),
+                        Some(perm_req_rx),
+                    )
+                }
             };
 
         // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
@@ -668,8 +762,16 @@ impl TurnExecutor for DaemonTurnExecutor {
                         .await;
                     }
 
+                    let tool_filter = approval_mode_tool_filter(effective_mode);
                     let result = runner
-                        .run(&mut c, &parts.system_prompt, &turn_tx, cancel.clone())
+                        .run_with_filter(
+                            &mut c,
+                            &parts.system_prompt,
+                            "",
+                            &turn_tx,
+                            cancel.clone(),
+                            tool_filter,
+                        )
                         .await;
                     match result {
                         TurnResult::UsedTools { .. } => continue,
@@ -826,6 +928,7 @@ impl KernelTurnExecutor {
             keep_interrupted_context: config.keep_interrupted_context,
             user_agent: p.user_agent.clone(),
             skip_tls_verify: p.skip_tls_verify,
+            loop_max_rounds: config.loop_config.max_rounds,
         })
     }
 }
@@ -890,7 +993,13 @@ impl TurnExecutor for KernelTurnExecutor {
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let original_text = input.text.clone();
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
         // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
         let images = if text != original_text {
@@ -992,6 +1101,20 @@ impl TurnExecutor for KernelTurnExecutor {
         } else {
             user_images
         };
+        let effective_mode = if self.auto_approve {
+            ApprovalMode::Bypass
+        } else {
+            live_current_approval_mode()
+        };
+        if let Err(event) = send_agent_command(
+            &client,
+            AgentCommand::SetPlanMode(effective_mode == ApprovalMode::Plan),
+            "切换 Plan 模式",
+        ) {
+            *guard = None;
+            emit(event);
+            return;
+        }
 
         if should_seed {
             if let Err(event) = send_agent_command(
@@ -1060,12 +1183,12 @@ impl TurnExecutor for KernelTurnExecutor {
 
         // Interactive approval: register the response sender so any view's
         // `LiveSession.approve()` delivers the decision here.
-        let mut perm_rx = if self.auto_approve {
-            None
-        } else {
+        let mut perm_rx = if effective_mode == ApprovalMode::Build {
             let (tx, rx) = mpsc::unbounded_channel::<PermissionDecision>();
             *approver.lock().await = Some(tx);
             Some(rx)
+        } else {
+            None
         };
 
         let state = guard.as_mut().unwrap();
@@ -1169,6 +1292,7 @@ impl TurnExecutor for KernelTurnExecutor {
                     call,
                     snapshot,
                 } => {
+                    let call_id = call.id.clone();
                     emit(TurnEvent::ApprovalRequested {
                         tool_name,
                         reason,
@@ -1176,8 +1300,7 @@ impl TurnExecutor for KernelTurnExecutor {
                         snapshot,
                     });
                     let decision = match &mut perm_rx {
-                        // auto-approve (no interactive channel): allow.
-                        None => PermissionDecision::Allow,
+                        None => fallback_approval_decision(effective_mode),
                         Some(rx) => {
                             tokio::select! {
                                 _ = cancel.cancelled(), if !cancelled => {
@@ -1193,6 +1316,16 @@ impl TurnExecutor for KernelTurnExecutor {
                             }
                         }
                     };
+                    // 广播审批已解决，让其他视图（App/WebUI）同步卡片状态。
+                    let decision_str = match decision {
+                        PermissionDecision::Allow => "allow",
+                        PermissionDecision::AllowAlways => "always_allow",
+                        _ => "deny",
+                    };  
+                    emit(TurnEvent::ApprovalResolved {
+                        call_id,
+                        decision: decision_str.to_string(),
+                    });
                     let cmd = match decision {
                         PermissionDecision::Allow => AgentCommand::ApproveTool,
                         PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
@@ -1239,7 +1372,9 @@ impl TurnExecutor for KernelTurnExecutor {
                         }
                         Ok(false) => {}
                         Err(e) => {
-                            emit(TurnEvent::Warning(format!("session rename persist failed: {e}")));
+                            emit(TurnEvent::Warning(format!(
+                                "session rename persist failed: {e}"
+                            )));
                         }
                     }
                 }
@@ -1291,11 +1426,14 @@ fn restore_images_from_turn_base(
     let final_user_indexes: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter_map(|(idx, msg)| (msg.role == Role::User).then_some(idx))
+        .filter_map(|(idx, msg)| (msg.role == Role::User && !msg.synthetic).then_some(idx))
         .collect();
     let mut final_user_indexes = final_user_indexes.into_iter();
 
-    for original in turn_base.iter().filter(|msg| msg.role == Role::User) {
+    for original in turn_base
+        .iter()
+        .filter(|msg| msg.role == Role::User && !msg.synthetic)
+    {
         let Some(idx) = final_user_indexes.next() else {
             continue;
         };
@@ -1479,6 +1617,7 @@ pub(crate) fn chat_bridge_config(
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
+        loop_max_rounds: config.loop_config.max_rounds,
     }
 }
 
@@ -1493,6 +1632,7 @@ pub(crate) async fn run_chat_turn_v2(
     cancel: CancellationToken,
     bridge_cfg: atomcode_bridge::BridgeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
+    approval_mode: ApprovalMode,
 ) {
     let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
 
@@ -1521,6 +1661,14 @@ pub(crate) async fn run_chat_turn_v2(
             cold_summaries: vec![],
         }),
         "初始化桥接会话",
+    ) {
+        let _ = turn_tx.send(event);
+        return;
+    }
+    if let Err(event) = send_agent_command(
+        &client,
+        AgentCommand::SetPlanMode(approval_mode == ApprovalMode::Plan),
+        "切换 Plan 模式",
     ) {
         let _ = turn_tx.send(event);
         return;
@@ -1563,7 +1711,7 @@ pub(crate) async fn run_chat_turn_v2(
                     snapshot,
                 });
                 let decision = match &mut perm_rx {
-                    None => PermissionDecision::Allow,
+                    None => fallback_approval_decision(approval_mode),
                     Some(rx) => tokio::select! {
                         _ = cancel.cancelled(), if !cancelled => {
                             cancelled = true;
@@ -1623,11 +1771,23 @@ pub(crate) enum LiveWireEvent {
     Snapshot {
         messages: Vec<crate::MessageInfo>,
         session_id: String,
+        /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
+        /// 已有会话名,不必等 SessionRenamed 事件(切项目场景才有 loadSession 拉名)。
+        /// 加载失败或空会话时为空字符串,App 端回退到项目名。
+        session_name: String,
         project_hash: String,
         provider: String,
+        /// 当前审批模式（build / plan / bypass），让新连上的 tab 立刻显示正确的模式 pill。
+        mode: String,
+        /// 当前工作目录，让 App 端能展示项目名。
+        #[serde(rename = "working_dir")]
+        working_dir: String,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
+    /// 审批模式切换（build / plan / bypass）——webui 各 tab 的「模式」pill 据此同步。
+    #[serde(rename = "mode")]
+    Mode { mode: String },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
     #[serde(rename = "command_output")]
@@ -1678,6 +1838,8 @@ pub(crate) enum LiveWireEvent {
         call_id: String,
         arguments: String,
     },
+    #[serde(rename = "permission_resolved")]
+    PermissionResolved { call_id: String, decision: String },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -1723,6 +1885,8 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             running: matches!(s, TurnState::Running),
         },
         LiveEvent::ProviderChanged(p) => LiveWireEvent::Provider { provider: p },
+        // 审批模式切换：让所有 webui tab 的「模式」pill 跟随。
+        LiveEvent::ModeChanged(mode) => LiveWireEvent::Mode { mode },
         // Carry a cwd switch (TUI `/cd`, webui `/cd`, worktree command) to every
         // webui tab so its path display + session-list filter follow. The
         // sync-mode TUI follows the same LiveEvent in-process via live_sync.
@@ -1750,7 +1914,17 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 name,
                 arguments,
             },
-            TE::ToolOutputChunk { call_id: _, chunk } => LiveWireEvent::ToolOutput { chunk },
+            TE::ToolOutputChunk { call_id: _, chunk } => {
+                // A leading U+001E marks a `task` subagent's EPHEMERAL live-activity line
+                // (TUI-only, shown in-place on the spinner — see SUBAGENT_ACTIVITY_MARKER in
+                // atomcode-capabilities `SubtaskProgressHook`). The webui has no such surface,
+                // so drop it rather than leak a raw control char + a per-round flood into the
+                // browser transcript.
+                if chunk.starts_with('\u{1e}') {
+                    return None;
+                }
+                LiveWireEvent::ToolOutput { chunk }
+            }
             TE::ToolCallResult {
                 call_id,
                 name,
@@ -1790,6 +1964,7 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 call_id: call.id,
                 arguments: call.arguments,
             },
+            TE::ApprovalResolved { call_id, decision } => LiveWireEvent::PermissionResolved { call_id, decision },
             TE::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -1858,6 +2033,7 @@ pub(crate) async fn live_stream(
     let sid = parse_session_id(q.session_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
+    let snapshot_wd = working_dir.clone();
     let session = ensure_live_session_global(
         working_dir,
         live_mcp_cache(),
@@ -1870,12 +2046,29 @@ pub(crate) async fn live_stream(
     );
     let (snapshot, replay, mut rx) = session.join_with_replay().await;
 
+    // 用实际生效的 session_id(非查询参数传入的 sid)加载会话名,供 snapshot 携带。
+    // 查询参数 sid 在首次扫码连接时为空,但 LiveSession 一定有真实的 session_id
+    // (已设置到 LIVE_SESSION_ID)。用此 id + load_dir 从 SessionManager 取 name。
+    let live_sid = live_session_id_or_unknown();
+    let sid_for_snapshot = live_sid.clone();
+    let session_name = if live_sid == "unknown" {
+        String::new()
+    } else {
+        atomcode_core::session::SessionManager::new(&snapshot_wd)
+            .load(&atomcode_core::session::SessionId::from_string(live_sid))
+            .ok()
+            .map(|s| s.name)
+            .unwrap_or_default()
+    };
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
-        session_id: live_session_id_or_unknown(),
+        session_id: sid_for_snapshot,
+        session_name,
         project_hash,
         provider: live_current_provider(),
+        mode: live_current_mode_wire(),
+        working_dir: snapshot_wd.to_string_lossy().to_string(),
     });
     // 进行中回合的事件回放（StateChanged(Running) + 本回合 Turn 事件）：snapshot
     // 只到上一个 turn 边界，这段补上当前回合已发生的执行过程（工具卡片、流式
@@ -1941,6 +2134,7 @@ async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
+    session_id: Option<&str>,
 ) -> String {
     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
@@ -1957,6 +2151,13 @@ async fn preprocess_live_caption(
         Some(Ok(p)) => p,
         _ => return message.to_string(),
     };
+    // Bind the conversation's session id onto this (throwaway) active provider so
+    // `maybe_preprocess` forwards it onto the one-off VL request as
+    // `x-atomcode-session-id` — otherwise the webui/live vision call is the
+    // session-less second request of the turn. Empty ⇒ header omitted.
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        active.set_session_id(sid);
+    }
     match maybe_preprocess(&config, &*active, message, images).await {
         PreprocessOutcome::Skipped => message.to_string(),
         PreprocessOutcome::Replaced { text, vl_key } => {
@@ -2100,6 +2301,48 @@ pub(crate) async fn live_provider(
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct LiveModeReq {
+    /// "build" | "plan" | "bypass"
+    pub mode: ApprovalMode,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ApprovalModeResp {
+    pub ok: bool,
+    pub mode: ApprovalMode,
+}
+
+pub(crate) async fn approval_mode_get() -> impl IntoResponse {
+    Json(ApprovalModeResp {
+        ok: true,
+        mode: live_current_approval_mode(),
+    })
+}
+
+pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
+    live_set_mode(req.mode);
+    Json(ApprovalModeResp {
+        ok: true,
+        mode: req.mode,
+    })
+}
+
+/// POST /live/mode — webui 底栏「模式」pill 切换审批模式（build / plan / bypass）。
+///
+/// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
+/// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
+/// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
+/// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
+/// 「免审批」这种危险态被静默持久化。
+pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
+    live_set_mode(req.mode);
+    Json(ApprovalModeResp {
+        ok: true,
+        mode: req.mode,
+    })
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveReasoningEffortReq {
     /// 目标 provider；None 时取当前默认 provider。
     #[serde(default)]
@@ -2239,6 +2482,75 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 mod tests {
     use super::*;
 
+    /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
+    /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
+    /// union depends on these EXACT strings — lock the wire contract.
+    #[test]
+    fn approval_mode_wire_strings_are_lowercase() {
+        let cases = [
+            (ApprovalMode::Build, "build"),
+            (ApprovalMode::Plan, "plan"),
+            (ApprovalMode::Bypass, "bypass"),
+        ];
+        for (mode, wire) in cases {
+            // Serialize (used by Snapshot.mode + ModeChanged broadcast).
+            assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(wire));
+            // Deserialize (the `/live/mode` request body → LiveModeReq.mode).
+            let back: ApprovalMode = serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(back, mode);
+        }
+        // Default is Build (the safe interactive-approval mode).
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Build);
+    }
+
+    #[test]
+    fn plan_mode_uses_the_read_only_tool_filter() {
+        let filter = approval_mode_tool_filter(ApprovalMode::Plan)
+            .expect("plan mode must filter advertised tools");
+        assert!(filter.contains(&"read_file"));
+        assert!(filter.contains(&"grep"));
+        assert!(filter.contains(&"web_fetch"));
+        assert!(!filter.contains(&"bash"));
+        assert!(!filter.contains(&"edit_file"));
+        assert!(!filter.contains(&"create_file"));
+        assert!(!filter.contains(&"search_replace"));
+
+        assert!(approval_mode_tool_filter(ApprovalMode::Build).is_none());
+        assert!(approval_mode_tool_filter(ApprovalMode::Bypass).is_none());
+    }
+
+    #[test]
+    fn v2_fallback_approval_is_closed_for_plan_mode() {
+        assert!(matches!(
+            fallback_approval_decision(ApprovalMode::Plan),
+            PermissionDecision::Deny
+        ));
+        assert!(matches!(
+            fallback_approval_decision(ApprovalMode::Build),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            fallback_approval_decision(ApprovalMode::Bypass),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_get_returns_current_runtime_mode() {
+        let _mode_guard = ScopedApprovalModeForTest::new();
+        live_set_mode(ApprovalMode::Bypass);
+
+        let response = approval_mode_get().await.into_response();
+        assert_eq!(response.status().as_u16(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("approval mode response json");
+
+        assert_eq!(value, serde_json::json!({ "ok": true, "mode": "bypass" }));
+    }
+
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
     /// top of this file). Under `/webui` the LiveSession path runs IN the TUI
     /// process, so a console print writes straight to the shared terminal and
@@ -2284,8 +2596,12 @@ mod tests {
     #[test]
     fn live_message_parses_provider_and_updates_override() {
         // 带 provider 的请求体被解析。
+        // `approval_mode` is deliberately ignored here: live approval mode is
+        // global runtime state changed only through /approval_mode or /live/mode,
+        // not a per-message override.
         let req: LiveMessageReq =
-            serde_json::from_str(r#"{"message":"hi","provider":"openai"}"#).unwrap();
+            serde_json::from_str(r#"{"message":"hi","provider":"openai","approval_mode":"plan"}"#)
+                .unwrap();
         assert_eq!(req.provider.as_deref(), Some("openai"));
 
         // set_live_provider(Some) 写入覆盖。
@@ -2331,7 +2647,7 @@ mod tests {
     // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[], None).await;
+        let out = preprocess_live_caption("看下这个图片", &[], None, None).await;
         assert_eq!(out, "看下这个图片");
     }
 
@@ -2445,6 +2761,49 @@ mod tests {
     }
 
     #[test]
+    fn restore_images_from_turn_base_ignores_synthetic_user_ordinals() {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+
+        let image_user = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("分析图片".into()),
+                images: vec![ImagePart {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+            },
+            synthetic: false,
+        };
+        let final_messages = vec![
+            Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
+            Message::new(
+                Role::User,
+                "分析图片\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
+            ),
+            Message::new(Role::Assistant, "done"),
+        ];
+
+        let messages = restore_images_from_turn_base(
+            final_messages,
+            &[Message::synthetic_user("[Auto-read from error: src/main.rs]"), image_user],
+        );
+
+        assert!(messages[0].synthetic);
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text.contains("Auto-read")
+        ));
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::MultiPart { text, images }
+                if text.as_deref() == Some("分析图片")
+                    && images.len() == 1
+                    && images[0].data == "aW1hZ2U="
+        ));
+    }
+
+    #[test]
     fn compaction_mark_maps_to_warning_wire_event() {
         // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
         // drivers. The bridge now emits CompactionUi(Mark) instead of the old
@@ -2510,6 +2869,27 @@ mod tests {
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
         assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+    }
+
+    // 回归：`task` 子代理的实时活性行（U+001E 前缀）是 TUI 专属的原地 spinner 更新，
+    // webui 没有对应展示面，必须在 to_wire 丢弃 —— 否则浏览器转录里会漏进裸控制符
+    // 和每轮一条的活性刷屏。普通工具输出仍照常下发。
+    #[test]
+    fn subagent_activity_marker_chunk_dropped_normal_output_kept() {
+        // Marker-prefixed → dropped (None).
+        let dropped = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+            call_id: "c1".into(),
+            chunk: "\u{1e}explore#4 · grep unwrap".into(),
+        }));
+        assert!(dropped.is_none(), "marker-prefixed subagent activity must be dropped");
+        // Ordinary tool output → forwarded.
+        let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+            call_id: "c2".into(),
+            chunk: "hello from bash".into(),
+        }))
+        .expect("normal tool output must still reach the webui");
+        let json = serde_json::to_string(&kept).unwrap();
+        assert!(json.contains("hello from bash"), "{json}");
     }
 
     // 回归：非致命提示（如 "conversation compacted"）必须作为独立的 warning 线事件下发，

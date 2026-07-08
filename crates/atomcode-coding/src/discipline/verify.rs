@@ -6,9 +6,11 @@
 //! message; `None` lets it stop. The kernel's `max_continuations` fuse bounds
 //! the loop, and our own state nudges ONCE per edit-batch so we never spin.
 //!
-//! Language-agnostic: detection keys only on tool NAMES (edit_file / write_file / bash),
-//! never on cargo/npm/etc. The nudge text lists `cargo check` / `tsc --noEmit` only as
-//! examples.
+//! Language-agnostic: detection keys on tool NAMES (edit_file / write_file / bash) and, for
+//! bash, EXCLUDES a small denylist of read-only / navigation commands (`ls`, `echo`, `cat`,
+//! …) so a throwaway `bash ls` after an edit no longer counts as "verified". It never
+//! enumerates build commands (no cargo/npm allowlist) — a real check of ANY language still
+//! counts. The nudge text lists `cargo check` / `tsc --noEmit` only as examples.
 
 use async_trait::async_trait;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -41,12 +43,66 @@ impl VerifyCadenceHook {
     }
 }
 
+/// Extract the `command` string from a bash tool-call's raw JSON `arguments`.
+fn bash_command(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+}
+
+/// Whether a post-edit `bash` command plausibly VERIFIES the edit (runs a build / type-check
+/// / test / lint), as opposed to read-only or review commands a model might run instead. A
+/// command verifies iff at least one of its chained segments runs a NON-read-only command —
+/// so `cd sub && cargo test` verifies, but `git diff`, `ls -la`, and `cat x | grep y` (all
+/// read-only, even chained) do not. Language-agnostic: it excludes known no-ops/review
+/// commands (incl. `git`, which has no build subcommand), never enumerates build commands, so
+/// a real check of any language always counts.
+fn bash_verifies(cmd: &str) -> bool {
+    cmd.split(|c| c == '|' || c == ';' || c == '&')
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .any(segment_is_work)
+}
+
+/// A single command segment does "work" (plausible verification) if its effective head —
+/// after stripping leading `VAR=val` env assignments and known wrappers (`sudo`/`env`/`time`
+/// /`nice`/…) and any path prefix — is NOT a read-only / review command.
+fn segment_is_work(seg: &str) -> bool {
+    // Read-only / review / aggregation commands. `git` included: `git diff|status|log|show`
+    // are review, and git has no build/check subcommand.
+    const READONLY: &[&str] = &[
+        "ls", "cat", "pwd", "echo", "cd", "which", "whoami", "head", "tail", "find", "grep",
+        "rg", "fd", "tree", "stat", "file", "printf", "true", "clear", "date", "sleep", "type",
+        "git", "wc", "sort", "uniq", "awk", "sed", "cut", "diff", "less", "more", "tee",
+        "basename", "dirname", "realpath", "readlink", ":",
+    ];
+    const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "command", "exec"];
+    let mut tokens = seg.split_whitespace();
+    loop {
+        let Some(tok) = tokens.next() else {
+            return false; // only env-assignments / wrappers, no real command → not work
+        };
+        // Skip a leading `VAR=val` env assignment (`FOO=1 cargo test`).
+        if tok.contains('=') && !tok.starts_with('-') {
+            continue;
+        }
+        let head = tok.rsplit('/').next().unwrap_or(tok);
+        if WRAPPERS.contains(&head) {
+            continue; // `sudo`/`env`/`time` … → look at the wrapped command
+        }
+        return !READONLY.contains(&head);
+    }
+}
+
 /// Scan the conversation: returns the tool_call_id of the most recent successful edit
-/// IF it has no successful `bash` after it (i.e. unverified), else `None`.
+/// IF it has no VERIFYING `bash` after it (i.e. unverified), else `None`. A `bash` that is
+/// merely read-only (`ls`/`echo`/…) does not count — see [`bash_verifies`].
 fn unverified_edit_id(convo: &Conversation) -> Option<String> {
     // Tool-call ids are assigned by the assistant message that precedes the matching
     // tool-result message, so a single forward pass can resolve a result's tool name.
     let mut names: HashMap<&str, &str> = HashMap::new();
+    // bash tool_call id → its command string (to tell a real check from an `ls` dodge).
+    let mut bash_cmds: HashMap<&str, String> = HashMap::new();
     let mut last_edit_id: Option<String> = None;
     let mut bash_after_edit = false;
 
@@ -55,6 +111,11 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
             Role::Assistant => {
                 for tc in &msg.tool_calls {
                     names.insert(tc.id.as_str(), tc.name.as_str());
+                    if tc.name == "bash" {
+                        if let Some(cmd) = bash_command(&tc.arguments) {
+                            bash_cmds.insert(tc.id.as_str(), cmd);
+                        }
+                    }
                 }
             }
             Role::Tool => {
@@ -69,7 +130,12 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
                         last_edit_id = Some(id.to_string());
                         bash_after_edit = false;
                     }
-                    Some("bash") => bash_after_edit = true,
+                    // Only a real check counts — a read-only/navigation command does NOT verify.
+                    Some("bash") => {
+                        if bash_cmds.get(id).is_some_and(|c| bash_verifies(c)) {
+                            bash_after_edit = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -117,6 +183,11 @@ mod tests {
     fn assistant_call(id: &str, name: &str) -> Message {
         Message::assistant("", vec![ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }])
     }
+    /// A `bash` tool call carrying a real command (so `bash_verifies` can classify it).
+    fn bash_call(id: &str, cmd: &str) -> Message {
+        let args = serde_json::json!({ "command": cmd }).to_string();
+        Message::assistant("", vec![ToolCall { id: id.into(), name: "bash".into(), arguments: args }])
+    }
     fn tool_result(id: &str, is_error: bool) -> Message {
         Message::tool_result(id, "ok", is_error)
     }
@@ -141,26 +212,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_then_successful_build_does_not_nudge() {
+    async fn edit_then_successful_check_does_not_nudge() {
         let msgs = vec![
             assistant_call("e1", "edit_file"),
             tool_result("e1", false),
-            assistant_call("b1", "bash"),
+            bash_call("b1", "cargo check"),
             tool_result("b1", false),
         ];
-        assert!(nudge_of(msgs).await.1.is_none(), "verified edit must not nudge");
+        assert!(nudge_of(msgs).await.1.is_none(), "a real check after the edit verifies it");
     }
 
     #[tokio::test]
-    async fn failed_build_after_edit_still_nudges() {
+    async fn edit_then_readonly_bash_still_nudges() {
+        // The dodge this change closes: a throwaway `ls`/`echo` after an edit is NOT a check,
+        // so the edit is still unverified and must nudge.
+        for dodge in ["ls -la", "echo done", "cat src/main.rs", "pwd"] {
+            let msgs = vec![
+                assistant_call("e1", "edit_file"),
+                tool_result("e1", false),
+                bash_call("b1", dodge),
+                tool_result("b1", false),
+            ];
+            assert!(
+                nudge_of(msgs).await.1.is_some(),
+                "read-only `{dodge}` must not count as verification"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chained_or_unknown_bash_after_edit_verifies() {
+        // A build behind a `cd`, or any non-denylisted command, counts (conservative).
+        for cmd in ["cd sub && cargo test", "npm run build", "./gradlew build", "pytest -q"] {
+            let msgs = vec![
+                assistant_call("e1", "edit_file"),
+                tool_result("e1", false),
+                bash_call("b1", cmd),
+                tool_result("b1", false),
+            ];
+            assert!(
+                nudge_of(msgs).await.1.is_none(),
+                "real check `{cmd}` must verify the edit"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_verifies_excludes_readonly_but_counts_real_checks() {
+        // Read-only / review — do NOT verify, even chained or piped.
+        assert!(!bash_verifies("ls -la"));
+        assert!(!bash_verifies("echo done"));
+        assert!(!bash_verifies("/usr/bin/cat foo")); // path-stripped head
+        assert!(!bash_verifies("   ")); // empty
+        assert!(!bash_verifies("git diff")); // review, not verification
+        assert!(!bash_verifies("git status && git log")); // all read-only
+        assert!(!bash_verifies("cat x | grep y")); // read-only pipe
+        assert!(!bash_verifies("cd x && ls")); // both segments read-only
+        // Real checks — verify, including behind env prefixes / wrappers / chains.
+        assert!(bash_verifies("cargo check"));
+        assert!(bash_verifies("tsc --noEmit"));
+        assert!(bash_verifies("make test"));
+        assert!(bash_verifies("cd x && cargo check")); // a work segment in the chain
+        assert!(bash_verifies("cargo test | grep -i pass")); // the test DID run
+        assert!(bash_verifies("FOO=1 cargo test")); // env-assign prefix stripped
+        assert!(bash_verifies("env RUST_LOG=info cargo check")); // wrapper + assign
+    }
+
+    #[tokio::test]
+    async fn failed_check_after_edit_still_nudges() {
         // A bash that ERRORED does not count as verification.
         let msgs = vec![
             assistant_call("e1", "edit_file"),
             tool_result("e1", false),
-            assistant_call("b1", "bash"),
+            bash_call("b1", "cargo check"),
             tool_result("b1", true),
         ];
-        assert!(nudge_of(msgs).await.1.is_some(), "errored bash is not verification");
+        assert!(nudge_of(msgs).await.1.is_some(), "errored check is not verification");
     }
 
     #[tokio::test]

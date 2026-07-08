@@ -12,6 +12,7 @@ use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 
 /// Parser state maintained across lines of a streamed response.
+#[derive(Clone)]
 pub struct MdState {
     pub in_code_block: bool,
     /// The fence character that opened the current block (`'`' or `'~'`).

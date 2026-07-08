@@ -5,15 +5,37 @@
 //! The server logic is exposed as a library function [`run_server`] so that
 //! both the standalone `atomcode-daemon` binary and (in the future) the main
 //! `atomcode` program can run the API server in-process.
+//!
+//! ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+//! • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//!       → 本次新 commit 按 bot 推荐的方案 A 统一为毫秒:
+//!         get_session_detail 赋值时 created_at/updated_at 均乘 1000,与 MessageInfo 一致;
+//!         SessionDetail 字段注释标注 epoch ms (见第 262-263 行)。
+//!         kernel 内部 session.created_at/updated_at 仍为秒,仅在 API 响应边界转换。
+//! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
+//! 我们愿意根据再审意见继续优化。
+
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so the crate's own unit tests never persist sessions/config into the
+// developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
+// win (isolate_home is a no-op when the var is already set).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
 
 mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod commands;
+pub mod approval_mode;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
 pub use live_api::live_set_provider;
+pub use live_api::live_set_mode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
@@ -54,7 +76,7 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{
     ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider,
+    PermissionDecider, PlanPermissionDecider,
 };
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
@@ -251,7 +273,9 @@ pub struct SessionDetail {
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
+    /// Epoch milliseconds (统一为毫秒,与 MessageInfo.created_at 一致; kernel 内部 Session.created_at 为秒,此处 API 响应边界转毫秒)。
     pub created_at: u64,
+    /// Epoch milliseconds (同上)。
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
@@ -307,6 +331,10 @@ pub struct AppState {
     /// 仅 webui 模式（启动时提供了 token store）强制 token 鉴权；
     /// 独立 daemon / VSCode 实例不强制，保持原行为。
     pub enforce_token: bool,
+    /// App 远程访问模式的期望 user_id（来自二维码 token 前缀）。
+    /// 非空时强制校验每条请求的 `X-Atom-User-Id` 头，与桌面端登录账号一致才放行。
+    /// 空串表示不校验（未登录 / 非 app 模式）。
+    pub app_user_id: String,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
@@ -361,11 +389,46 @@ fn resolve_initial_working_dir(
     cwd
 }
 
+/// Fold the working directory to its true on-disk case so the webui footer and
+/// newly-created sessions don't drift (e.g. a launcher passing `C:\users\danan`
+/// for a dir the history recorded as `C:\Users\danan`).
+///
+/// Windows-only, and guarded: it adopts the canonical form ONLY when that form
+/// maps to the SAME session bucket as the input. On Windows `hash_path` already
+/// lowercases, so a pure case-fold never changes the bucket — but a junction /
+/// symlink whose resolution WOULD change the bucket (and thus hide existing
+/// sessions) is left untouched. Other platforms keep the path verbatim to avoid
+/// symlink-resolution surprises and bucket orphaning (`hash_path` does not fold
+/// case off Windows).
+#[cfg(windows)]
+fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&p) {
+        Ok(c) => {
+            let c = atomcode_core::tool::strip_verbatim_prefix_path(&c);
+            if hash_path(&c) == hash_path(&p) {
+                c
+            } else {
+                p
+            }
+        }
+        Err(_) => p,
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    p
+}
+
 fn init_project_state(override_dir: Option<PathBuf>) -> ProjectState {
     let config_default = Config::load(&Config::default_path())
         .ok()
         .and_then(|c| c.default_workdir.map(PathBuf::from));
-    let path = resolve_initial_working_dir(override_dir, config_default, default_working_dir());
+    let path = normalize_working_dir_case(resolve_initial_working_dir(
+        override_dir,
+        config_default,
+        default_working_dir(),
+    ));
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -410,6 +473,11 @@ pub struct ToolResultInfo {
 pub struct MessageInfo {
     pub role: String,
     pub content: String,
+    /// True when a `Role::User` message was injected by the agent/runtime rather
+    /// than authored by the human. UI clients use this to avoid rendering
+    /// internal reminders as user input bubbles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     /// Tool result summary (for tool role messages)
@@ -422,6 +490,16 @@ pub struct MessageInfo {
     /// re-render thumbnails when loading history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+    /// Epoch MILLISECONDS this message was authored/received. lets the webui
+    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
+    /// has no per-message clock, so for replayed history we approximate with
+    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
+    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
+    /// keeps old daemons/clients interoperating when the field is absent.
+    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
+    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 /// Serializable image payload returned in session history.
@@ -580,10 +658,12 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         Self {
             role: role.to_string(),
             content,
+            synthetic: msg.synthetic,
             tool_calls,
             tool_result,
             artifacts,
             images,
+            created_at: None,
         }
     }
 }
@@ -926,6 +1006,7 @@ fn resolve_client_mode(header: &str) -> SessionMode {
     match header {
         "channel" => SessionMode::Channel,
         "vscode" => SessionMode::Vscode,
+        "jetbrains" => SessionMode::Jetbrains,
         "webui" => SessionMode::Webui,
         "atomcode-air" => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
@@ -956,41 +1037,40 @@ fn is_loopback_authority(authority: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// 渠道客户端是否启用交互式审批。
-/// - webui token 模式(enforce_token)：始终交互（原行为）。
-/// - SessionMode::Channel：仅当 daemon 绑定回环时交互（免 token 故强制回环守卫）。
-fn channel_interactive_permission(
+/// Whether this client can receive interactive approval prompts.
+/// Token-protected webui mode is always interactive. Local known clients are
+/// also allowed on loopback because their UI can answer `/chat/permission`.
+fn client_interactive_permission(
     client_mode: SessionMode,
     enforce_token: bool,
     bind_host: &str,
 ) -> bool {
     enforce_token
-        || (matches!(client_mode, SessionMode::Channel) && is_loopback_authority(bind_host))
+        || (matches!(
+            client_mode,
+            SessionMode::Channel
+                | SessionMode::Webui
+                | SessionMode::Vscode
+                | SessionMode::Jetbrains
+        ) && is_loopback_authority(bind_host))
 }
+
+fn effective_chat_approval_mode(
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+) -> crate::approval_mode::ApprovalMode {
+    request_mode.unwrap_or_else(live_api::live_current_approval_mode)
+}
+/// Map a working directory to its physical session-bucket name.
+///
+/// MUST match `atomcode_core::session::hash_path` exactly — the core session
+/// store names its `<sessions_root>/<hash>/` directories with that function,
+/// so the daemon has to delegate to it. A previous local copy hashed the
+/// normalized string via `str::hash` instead of `Path::hash`, producing a
+/// DIFFERENT hash for the same path; `/project` then reported a bucket that
+/// did not exist on disk and the webui fell back to matching sessions by the
+/// mutable `working_dir` field, which cross-contaminates projects.
 pub(crate) fn hash_path(path: &std::path::Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Normalize the path before hashing to ensure consistent results across:
-    // - Different path separators (Windows: `\` vs `/`)
-    // - Case sensitivity (Windows paths are case-insensitive)
-    // - Trailing slashes
-    let normalized =
-        atomcode_core::tool::strip_verbatim_prefix(&path.to_string_lossy()).into_owned();
-    let mut normalized = normalized.replace('\\', "/");
-
-    // Remove trailing slash (but keep root "/" or "C:/")
-    if normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-
-    // On Windows, paths are case-insensitive
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
-
-    let mut hasher = DefaultHasher::new();
-    normalized.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    atomcode_core::session::hash_path(path)
 }
 
 /// List all projects (scans sessions directory)
@@ -1154,14 +1234,96 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
     Ok(all_sessions)
 }
 
+/// Resolve a (possibly short) session id to its full record by scanning bucket
+/// directory ENTRIES. The filename is `<id>.json`, so we match on the name and
+/// parse only the ONE file that matches — cheap, and UNCAPPED (unlike
+/// `/sessions`, which truncates to 50 across all projects and so can't locate an
+/// older session). Prefers an exact id match; otherwise the most-recent prefix
+/// match. `project_hash` is the physical bucket the file lives in.
+///
+/// Split from `resolve_session_by_id` so the scan can be unit-tested against a
+/// temp root without touching the real sessions directory.
+fn resolve_session_in_root(
+    sessions_root: &std::path::Path,
+    id_prefix: &str,
+) -> std::io::Result<Option<SessionMetaWithProject>> {
+    if id_prefix.is_empty() || !sessions_root.exists() {
+        return Ok(None);
+    }
+
+    let read_meta = |bucket: &str, path: &std::path::Path| -> Option<SessionMetaWithProject> {
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let json = std::fs::read_to_string(path).ok()?;
+        let session = serde_json::from_str::<Session>(&json).ok()?;
+        let mut meta = SessionMeta::from(&session);
+        meta.file_size = file_size;
+        Some(SessionMetaWithProject {
+            project_hash: bucket.to_string(),
+            meta,
+        })
+    };
+
+    let mut best: Option<SessionMetaWithProject> = None;
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let bucket = dir.file_name().unwrap().to_string_lossy().to_string();
+        for f in std::fs::read_dir(&dir)? {
+            let f = f?;
+            let path = f.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if stem == id_prefix {
+                        // Exact id wins immediately.
+                        if let Some(m) = read_meta(&bucket, &path) {
+                            return Ok(Some(m));
+                        }
+                    } else if stem.starts_with(id_prefix) {
+                        if let Some(m) = read_meta(&bucket, &path) {
+                            let newer = best
+                                .as_ref()
+                                .map_or(true, |b| m.meta.updated_at > b.meta.updated_at);
+                            if newer {
+                                best = Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaWithProject>> {
+    resolve_session_in_root(&SessionManager::sessions_root_dir(), id_prefix)
+}
+
 /// Load a specific session
-fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
+pub(crate) fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
 
     let json = std::fs::read_to_string(path)?;
     serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+/// Save a session to a specific project-hash bucket (symmetric with `load_session`).
+/// Ensures undo/compact write back to the exact file they loaded from.
+pub(crate) fn save_session_to_hash(
+    project_hash: &str,
+    session: &atomcode_core::session::Session,
+) -> std::io::Result<()> {
+    let dir = SessionManager::sessions_root_dir().join(project_hash);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", session.id.as_str()));
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)
 }
 
 // ============== HTTP Handlers ==============
@@ -1276,14 +1438,29 @@ async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"success": true}))
 }
 
+/// Current project state plus the physical session-bucket hash for the
+/// working directory. The webui uses `project_hash` — NOT the mutable
+/// `working_dir` string — to decide which sessions belong to this project,
+/// so it must be the same hash the session store files them under.
+#[derive(Debug, Serialize)]
+struct ProjectStateResponse {
+    working_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_dir: Option<PathBuf>,
+    recent_dirs: Vec<PathBuf>,
+    name: String,
+    project_hash: String,
+}
+
 /// GET /project - Get current project state
 async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.project.read().await;
-    Json(ProjectState {
+    Json(ProjectStateResponse {
         working_dir: state.working_dir.clone(),
         previous_dir: state.previous_dir.clone(),
         recent_dirs: state.recent_dirs.clone(),
         name: state.name.clone(),
+        project_hash: hash_path(&state.working_dir),
     })
 }
 
@@ -1360,6 +1537,9 @@ async fn change_dir(
         // session cwd / hash, so a path that round-tripped through a
         // `canonicalize()`-based client still groups with the plain TUI form.
         let new_path = atomcode_core::tool::strip_verbatim_prefix_path(&new_path);
+        // Fold case to the on-disk truth (Windows, bucket-safe) so a `/cd` with a
+        // differently-cased path doesn't leave the footer/new sessions drifting.
+        let new_path = normalize_working_dir_case(new_path);
 
         // Update state
         let old_dir = project.working_dir.clone();
@@ -1370,8 +1550,12 @@ async fn change_dir(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "project".to_string());
 
-        // Update recent dirs (max 5, deduplicated)
-        project.recent_dirs.retain(|d| d != &new_path);
+        // Update recent dirs (max 5, deduplicated case-insensitively on
+        // case-insensitive filesystems so two cases of one dir don't both linger).
+        let new_key = atomcode_core::tool::path_case_key(&new_path);
+        project
+            .recent_dirs
+            .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
         project.recent_dirs.insert(0, new_path.clone());
         project.recent_dirs.truncate(5);
 
@@ -1405,9 +1589,9 @@ async fn change_dir(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            crate::live_api::live_switch_session(
-                atomcode_core::session::SessionId::from_string(sid.to_string()),
-            );
+            crate::live_api::live_switch_session(atomcode_core::session::SessionId::from_string(
+                sid.to_string(),
+            ));
         }
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
@@ -1444,17 +1628,43 @@ async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// GET /sessions/resolve/:id - Resolve a (short or full) session id to its full
+/// record across all projects. Backs the webui's URL-restore, which carries
+/// only a short id and must find which project bucket owns it without the
+/// 50-session cap of `/sessions`.
+async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
+    match resolve_session_by_id(&id) {
+        Ok(Some(s)) => Json(s).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to resolve session: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match load_session(&hash, &id) {
         Ok(session) => {
             let messages = merge_session_messages_for_display(&session);
+            // bot review P2: 统一时间单位为毫秒。kernel Session.created_at/updated_at 为 epoch seconds,
+            // 此处 API 响应边界乘 1000 转毫秒,与 MessageInfo.created_at 单位一致,前端无需启发式兼容。
+            // bot review P3: checked_mul 在 epoch 秒值上永不溢出 (u64 上限约 5.8e8 年),
+            // unwrap_or 的 fallback 与主路径同溢出行为,仅作为防御性兜底保留;真溢出时 fallback 也是错的,
+            // 但该场景物理不可能,故不 panic。
             let detail = SessionDetail {
                 id: session.id.to_string(),
                 name: session.name,
                 working_dir: session.working_dir,
-                created_at: session.created_at,
-                updated_at: session.updated_at,
+                created_at: session
+                    .created_at
+                    .checked_mul(1000)
+                    .unwrap_or(session.created_at * 1000),
+                updated_at: session
+                    .updated_at
+                    .checked_mul(1000)
+                    .unwrap_or(session.updated_at * 1000),
                 message_count: messages.len(),
                 messages,
             };
@@ -1472,23 +1682,39 @@ fn merge_session_messages_for_display(
 ) -> Vec<MessageInfo> {
     let mut messages = Vec::with_capacity(session.messages.len() + session.display_messages.len());
 
+    // PR #562: stamp every replayed message with the session's last-update time so
+    // the webui can show a send-time label even for history the kernel stored without
+    // a per-message clock. Kernel stores `updated_at` in epoch SECONDS; the webui
+    // works in ms, so multiply here once. Live/snapshot turns inject `Date.now()`
+    // client-side and never read this field.
+    // bot review P3: session.updated_at 在 kernel 中恒有值 (Session::new 时 Instant::now()),
+    // checked_mul(1000) 在 epoch 秒上永不溢出,故 session_ts_ms 恒为 Some;
+    // 下文 info.created_at = session_ts_ms 对所有历史消息统一赋值,不会静默丢失。
+    let session_ts_ms = session.updated_at.checked_mul(1000);
+
     for display in session
         .display_messages
         .iter()
         .filter(|d| d.after_message == 0)
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     for (idx, msg) in session.messages.iter().enumerate() {
         let after_message = idx + 1;
-        messages.push(MessageInfo::from(msg));
+        let mut info = MessageInfo::from(msg);
+        info.created_at = session_ts_ms;
+        messages.push(info);
         for display in session
             .display_messages
             .iter()
             .filter(|d| d.after_message == after_message)
         {
-            messages.push(MessageInfo::from(&display.message));
+            let mut info = MessageInfo::from(&display.message);
+            info.created_at = session_ts_ms;
+            messages.push(info);
         }
     }
 
@@ -1497,7 +1723,9 @@ fn merge_session_messages_for_display(
         .iter()
         .filter(|d| d.after_message > session.messages.len())
     {
-        messages.push(MessageInfo::from(&display.message));
+        let mut info = MessageInfo::from(&display.message);
+        info.created_at = session_ts_ms;
+        messages.push(info);
     }
 
     messages
@@ -1677,8 +1905,22 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
                             if session.messages.is_empty() {
                                 continue;
                             }
-                            // Match keyword in session name (case-insensitive)
-                            if session.name.to_lowercase().contains(&keyword_lower) {
+                            // Match on name / working dir (substring) or id (prefix),
+                            // mirroring the webui's previous client-side filter so
+                            // moving search server-side does not drop the ability to
+                            // find a session by its directory or (short) id.
+                            let matches = session.name.to_lowercase().contains(&keyword_lower)
+                                || session
+                                    .working_dir
+                                    .to_string_lossy()
+                                    .to_lowercase()
+                                    .contains(&keyword_lower)
+                                || session
+                                    .id
+                                    .as_str()
+                                    .to_lowercase()
+                                    .starts_with(&keyword_lower);
+                            if matches {
                                 let mut meta = SessionMeta::from(&session);
                                 meta.file_size = file_size;
                                 results.push(SessionMetaWithProject {
@@ -1903,6 +2145,10 @@ pub struct ChatRequest {
     /// (vision_preprocessor) and turned into text, mirroring the TUI.
     #[serde(default)]
     pub images: Vec<ImageInput>,
+    /// Optional per-request approval mode. When absent, the daemon falls back
+    /// to the current runtime mode set via `/approval_mode` or `/live/mode`.
+    #[serde(default)]
+    pub approval_mode: Option<crate::approval_mode::ApprovalMode>,
 }
 
 /// One attached image from the webui (base64-encoded), mapped to core `ImagePart`.
@@ -2359,7 +2605,7 @@ async fn chat_stream(
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
     let interactive_permission =
-        channel_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
+        client_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -2447,6 +2693,7 @@ async fn process_chat_request(
         read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
         web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
+    let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
@@ -2544,6 +2791,13 @@ async fn process_chat_request(
             // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
             // 用于在对话里渲染缩略图。
             use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+            // Bind the conversation's session id onto the (throwaway) provider so
+            // maybe_preprocess forwards x-atomcode-session-id onto the one-off VL
+            // request (gateway affinity), matching the TUI bridge / live paths.
+            let vl_sid = session.id.as_str();
+            if !vl_sid.is_empty() {
+                provider.set_session_id(vl_sid);
+            }
             let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
                 PreprocessOutcome::Skipped => req.message.clone(),
                 PreprocessOutcome::Replaced { text, vl_key } => {
@@ -2701,14 +2955,20 @@ async fn process_chat_request(
     // `/chat/permission`, which is routed back here via `pending_permissions`.
     // The user-facing notification is the `TurnEvent::ApprovalRequested` event
     // forwarded as a `permission_request` SSE event below.
-    // Only registered in interactive (webui/channel) mode has a human approver
-    // reachable via POST /chat/permission, so only there do we use the blocking
-    // InteractivePermissionDecider + its register/keep-alive/unregister
-    // plumbing. The standalone daemon (VSCode extension, no browser) has no
-    // approver, so it must keep the prior BypassAll behaviour — otherwise any
-    // tool requiring approval would block the turn forever.
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) =
-        if interactive_permission {
+    // Interactive local clients (WebUI, channel, VSCode, JetBrains) can answer
+    // approval prompts, so Build uses InteractivePermissionDecider plus the
+    // register/keep-alive/unregister plumbing. Clients without a permission
+    // response channel keep the compatibility BypassAll fallback in Build mode;
+    // Plan and Bypass are explicit modes and never depend on an approver.
+    let registered_permission_responder =
+        interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = match approval_mode {
+        crate::approval_mode::ApprovalMode::Bypass => (
+            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            None,
+        ),
+        crate::approval_mode::ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
+        crate::approval_mode::ApprovalMode::Build if interactive_permission => {
             let (perm_req_tx, perm_req_rx) =
                 tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
             let (perm_resp_tx, perm_resp_rx) =
@@ -2725,12 +2985,16 @@ async fn process_chat_request(
                 )),
                 Some(perm_req_rx),
             )
-        } else {
+        }
+        crate::approval_mode::ApprovalMode::Build => {
+            // Compatibility for clients without a permission response channel.
+            // Known local IDE/webui clients are classified interactive above.
             (
                 Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
                 None,
             )
-        };
+        }
+    };
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider (the one actually selected for this turn,
     // not config.default_provider), fallback to synthetic 128K config if absent.
@@ -2754,6 +3018,7 @@ async fn process_chat_request(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
+                capable_model: None,
             })
         }
     };
@@ -2775,8 +3040,14 @@ async fn process_chat_request(
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt =
+    let mut system_prompt =
         build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    // Plan mode: append the read-only plan instruction so the model explores
+    // and plans instead of firing edits that PlanPermissionDecider will deny.
+    // Mirrors the live path for every client that selects Plan.
+    if approval_mode == crate::approval_mode::ApprovalMode::Plan {
+        system_prompt.push_str(crate::approval_mode::PLAN_MODE_SYSTEM_SUFFIX);
+    }
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2808,8 +3079,8 @@ async fn process_chat_request(
         });
         // Turn never ran — drop the permission registration and the request
         // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too). Only registered in interactive (webui/channel) mode.
-        if interactive_permission {
+        // dropped here too). Only registered in interactive Build mode.
+        if registered_permission_responder {
             pending_permissions.unregister(&perm_session_key);
         }
         return Ok(());
@@ -2825,11 +3096,15 @@ async fn process_chat_request(
     // stack via atomcode-bridge instead of the v1 TurnRunner; the downstream
     // turn_rx → ChatEvent consumer + persistence are SHARED (they only read turn_rx).
     if live_api::live_engine_v2() {
-        let bridge_cfg =
+        let mut bridge_cfg =
             live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
+        bridge_cfg.dangerously_skip_permissions = approval_mode
+            == crate::approval_mode::ApprovalMode::Bypass
+            || (approval_mode == crate::approval_mode::ApprovalMode::Build
+                && !interactive_permission);
         // Interactive approval: route /chat/permission decisions to the v2 producer
         // (this re-registration supersedes the v1 decider's, which never runs here).
-        let perm_rx = if interactive_permission {
+        let perm_rx = if registered_permission_responder {
             let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
@@ -2840,7 +3115,15 @@ async fn process_chat_request(
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
-                live_api::run_chat_turn_v2(conv, turn_tx, cancel, bridge_cfg, perm_rx).await;
+                live_api::run_chat_turn_v2(
+                    conv,
+                    turn_tx,
+                    cancel,
+                    bridge_cfg,
+                    perm_rx,
+                    approval_mode,
+                )
+                .await;
             })
             .await;
         });
@@ -2896,8 +3179,17 @@ async fn process_chat_request(
                         .await;
                     }
 
+                    let tool_filter =
+                        crate::approval_mode::approval_mode_tool_filter(approval_mode);
                     let result = turn_runner
-                        .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                        .run_with_filter(
+                            &mut conv,
+                            &system_prompt,
+                            "",
+                            &turn_tx,
+                            cancel_token.clone(),
+                            tool_filter,
+                        )
                         .await;
 
                     match result {
@@ -3085,6 +3377,9 @@ async fn process_chat_request(
                     auto_resuming,
                 });
             }
+            TurnEvent::ApprovalResolved { .. } => {
+                // 审批已由任一端决策，HTTP 客户端通过 chat_event 感知后续工具事件即可。
+            }
         }
     }
 
@@ -3139,8 +3434,8 @@ async fn process_chat_request(
     });
     // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
     // when the turn task and its turn_tx are dropped). Drop the permission
-    // registration so it doesn't leak. Only registered in interactive (webui/channel) mode.
-    if interactive_permission {
+    // registration so it doesn't leak. Only registered in interactive Build mode.
+    if registered_permission_responder {
         pending_permissions.unregister(&perm_session_key);
     }
     Ok(())
@@ -3703,6 +3998,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             working_dir_override: std::env::current_dir().ok(),
             // 预绑定的监听器：run_server 直接复用，跳过内部 bind。
             prebound_listener: Some(listener),
+            // webui 模式不需要 app user_id 校验。
+            app_user_id: None,
         };
         let task = tokio::spawn(async move {
             if let Err(e) = run_server(opts).await {
@@ -3821,9 +4118,16 @@ static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex:
 ///   中继的 route token + 本机回环绑定（server 只听 127.0.0.1，仅本机隧道可达）。
 /// - **不开浏览器**：App 用二维码配对，不需要打开网页。
 ///
+/// `user_id`：可选，桌面端当前登录用户 id。传入后将启用 `X-Atom-User-Id` 请求头校验，
+/// 确保请求来自同一账号的手机 App。
+///
 /// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session]），所以
 /// TUI / 浏览器 / App 看到的是**同一段对话**，双向实时同步。
-pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), String> {
+pub async fn ensure_app_server(
+    host: &str,
+    port: u16,
+    user_id: Option<String>,
+) -> Result<(String, u16), String> {
     // 复用仍在运行的实例（含其绑定地址/端口）。
     let reuse = {
         let guard = APP_SERVER.lock().unwrap();
@@ -3852,6 +4156,7 @@ pub async fn ensure_app_server(host: &str, port: u16) -> Result<(String, u16), S
         quiet: true,
         working_dir_override: std::env::current_dir().ok(),
         prebound_listener: Some(listener),
+        app_user_id: user_id,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = run_server(opts).await {
@@ -4199,6 +4504,10 @@ async fn fs_mkdir(
     match std::fs::create_dir_all(&dir) {
         Ok(()) => {
             let canon = dir.canonicalize().unwrap_or(dir);
+            // Strip the Windows `\\?\` prefix (parity with fs_list): the returned
+            // path is round-tripped back into /cd, and an unstripped verbatim form
+            // would split the session hash bucket.
+            let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
             Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
         }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
@@ -4233,6 +4542,8 @@ pub struct ServerOpts {
     /// 预绑定的监听器。进程内 webui 启动器先绑定端口（拿到真实端口、支持动态端口）
     /// 再传入，`run_server` 直接复用、跳过内部 bind。独立二进制传 None，照旧自行 bind。
     pub prebound_listener: Option<tokio::net::TcpListener>,
+    /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-Atom-User-Id` 请求头校验。
+    pub app_user_id: Option<String>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -4258,6 +4569,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         quiet,
         working_dir_override,
         prebound_listener,
+        ..
     } = opts;
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
@@ -4337,6 +4649,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         active_connections: active_connections.clone(),
         enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
+        app_user_id: opts.app_user_id.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
@@ -4366,6 +4679,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Session APIs
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/search", get(search_sessions))
+        .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
         .route("/cd", post(change_dir))
@@ -4388,6 +4702,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
+        .route(
+            "/approval_mode",
+            get(live_api::approval_mode_get).post(live_api::approval_mode_set),
+        )
         // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
         .route("/tunnel/status", get(get_tunnel_status))
         // Live session API (阶段②)
@@ -4396,8 +4714,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/provider", post(live_api::live_provider))
+        .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
         .route("/live/command", post(live_api::live_command))
+        .route("/command", post(commands::run_command))
         .route(
             "/live/switch_session",
             post(live_api::live_switch_session_endpoint),
@@ -4448,6 +4768,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_token::require_webui_token,
+        ))
+        // App 远程访问 user_id 校验（仅 /app 模式启用）。
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_token::require_app_user_id,
         ));
 
     let app = public
@@ -4631,7 +4956,67 @@ mod fs_list_tests {
 mod tests {
     use super::*;
 
-    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发，而不是 error。
+    // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 core 会话存储命名目录
+    // 用的 hash 完全一致。曾经 daemon 自持一份用 `str::hash`（而非 `Path::hash`）的
+    // 拷贝，对同一路径算出不同 hash → `/project` 指向磁盘上不存在的桶 → webui 退化成
+    // 按可变的 `working_dir` 字段匹配会话，导致跨项目串台。
+    #[test]
+    fn daemon_hash_path_matches_core_session_bucket_naming() {
+        for p in [
+            "/Users/theo/Documents/workspace/atomcode",
+            "/Users/theo/Desktop",
+            "/tmp/nested/proj/",
+            "/",
+        ] {
+            let path = std::path::Path::new(p);
+            assert_eq!(
+                hash_path(path),
+                atomcode_core::session::hash_path(path),
+                "daemon hash for {p:?} diverged from core session bucket naming"
+            );
+        }
+    }
+
+    // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions
+    // 的 50 条上限影响)。resolve_session_in_root 按文件名前缀扫桶:短前缀命中、
+    // 完整 id 精确命中、未知 id 返回 None,并回带物理桶作为 project_hash。
+    #[test]
+    fn resolve_session_by_short_and_full_id_across_buckets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |bucket: &str, wd: &str| -> atomcode_core::session::Session {
+            std::fs::create_dir_all(root.join(bucket)).unwrap();
+            let s = atomcode_core::session::Session::new(std::path::PathBuf::from(wd));
+            std::fs::write(
+                root.join(bucket).join(format!("{}.json", s.id.as_str())),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+            s
+        };
+        // A decoy in a different bucket + the real target.
+        let _decoy = mk("bucket_decoy_0000", "/proj/decoy");
+        let target = mk("bucket_target_111", "/proj/target");
+
+        // Short prefix resolves to the target and reports its physical bucket.
+        let short = &target.id.as_str()[..8];
+        let found = resolve_session_in_root(root, short)
+            .unwrap()
+            .expect("short id should resolve");
+        assert_eq!(found.project_hash, "bucket_target_111");
+        assert_eq!(found.meta.id.as_str(), target.id.as_str());
+
+        // Full id resolves exactly.
+        let found_full = resolve_session_in_root(root, target.id.as_str())
+            .unwrap()
+            .expect("full id should resolve");
+        assert_eq!(found_full.meta.id.as_str(), target.id.as_str());
+
+        // Unknown id → None.
+        assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
     // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，
     // 被前端染成红色「[错误: …]」并塞进回复气泡。
     #[test]
@@ -4684,6 +5069,17 @@ mod tests {
             info.images.as_deref(),
             Some([ImageData { missing: true, .. }])
         ));
+    }
+
+    #[test]
+    fn message_info_preserves_synthetic_user_flag() {
+        use atomcode_core::conversation::message::Message;
+
+        let msg = Message::synthetic_user("internal reminder");
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.role, "user");
+        assert!(info.synthetic, "daemon API must expose synthetic provenance");
     }
 
     #[test]
@@ -4983,30 +5379,62 @@ mod channel_mode_tests {
     fn resolve_channel_header() {
         assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
         assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
+        assert_eq!(resolve_client_mode("jetbrains"), SessionMode::Jetbrains);
         assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
     }
 
     #[test]
-    fn channel_interactive_only_on_loopback() {
-        assert!(channel_interactive_permission(
+    fn known_clients_interactive_on_loopback_or_token() {
+        assert!(client_interactive_permission(
             SessionMode::Ide,
             true,
             "0.0.0.0"
         ));
-        assert!(channel_interactive_permission(
+        assert!(client_interactive_permission(
             SessionMode::Channel,
             false,
             "127.0.0.1"
         ));
-        assert!(!channel_interactive_permission(
+        assert!(client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Jetbrains,
+            false,
+            "localhost:17321"
+        ));
+        assert!(!client_interactive_permission(
             SessionMode::Channel,
             false,
             "0.0.0.0"
         ));
-        assert!(!channel_interactive_permission(
+        assert!(!client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!client_interactive_permission(
             SessionMode::Ide,
             false,
             "127.0.0.1"
         ));
+    }
+
+    #[test]
+    fn request_approval_mode_overrides_global_mode() {
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Build);
+        assert_eq!(
+            effective_chat_approval_mode(Some(crate::approval_mode::ApprovalMode::Plan)),
+            crate::approval_mode::ApprovalMode::Plan
+        );
+
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Bypass);
+        assert_eq!(
+            effective_chat_approval_mode(None),
+            crate::approval_mode::ApprovalMode::Bypass
+        );
     }
 }

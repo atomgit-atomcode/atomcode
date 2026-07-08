@@ -95,10 +95,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn atomcode_dir_under_home() {
-        // Note: with no $HOME this returns "./.atomcode" — test passes vacuously then.
-        let p = atomcode_dir();
-        assert!(p.ends_with(".atomcode"), "got {:?}", p);
+    fn atomcode_dir_follows_home() {
+        // `atomcode_dir()` is exactly the resolved config root = ATOMCODE_HOME.
+        // (The unset→`~/.atomcode` fallback lives in core and is covered by
+        // `Config::resolve_config_dir` tests; here we just verify delegation.)
+        // ATOMCODE_HOME is always set in tests (by the test-support ctor, or by a
+        // sibling test), so assert `atomcode_dir()` tracks it.
+        let home = std::env::var("ATOMCODE_HOME").expect("ATOMCODE_HOME set in tests");
+        assert_eq!(atomcode_dir(), std::path::PathBuf::from(home));
     }
 
     #[test]
@@ -108,7 +112,6 @@ mod tests {
         // The legacy ATOMCODE_HOME_OVERRIDE variable is gone.
         std::env::set_var("ATOMCODE_HOME", "/tmp/override");
         assert_eq!(atomcode_dir(), std::path::PathBuf::from("/tmp/override"));
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     #[test]

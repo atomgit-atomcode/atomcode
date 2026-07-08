@@ -167,6 +167,27 @@
   font-weight: 600;
 }
 
+.mode-dropdown .model-item.danger {
+  color: var(--vscode-errorForeground, #d93025);
+}
+
+.mode-dropdown .model-item.danger .model-item-provider {
+  color: var(--vscode-errorForeground, #d93025);
+}
+
+.mode-dropdown .model-item.danger.active {
+  color: var(--app-list-active-foreground);
+}
+
+.model-item.active .model-item-provider {
+  color: var(--app-list-active-foreground);
+  opacity: 1;
+}
+
+.model-item.active .model-default-badge {
+  opacity: 1;
+}
+
 .model-default-badge {
   font-size: 10px;
   opacity: 0.6;

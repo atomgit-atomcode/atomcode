@@ -17,6 +17,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+/// `X-Atom-User-Id` 请求头名，App 端通过中继透传桌面端进行双向校验。
+const APP_USER_ID_HEADER: &str = "x-atom-user-id";
+
 /// Name of the HttpOnly cookie that carries the webui token after the
 /// `/?token=` handoff (see `serve_webui_index` in lib.rs). Keeping the
 /// credential in an HttpOnly cookie — rather than the URL — prevents a
@@ -131,6 +134,41 @@ pub async fn require_webui_token(
     match token {
         Some(tok) if state.webui_tokens.is_valid(&tok) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Axum 中间件：校验 `X-Atom-User-Id` 请求头是否与桌面端当前登录账号一致。
+///
+/// 仅 `/app` 模式下启用（`state.app_user_id` 非空），webui / 独立 daemon 不受影响。
+/// App 端经中继透传此头（中继只过滤 `x-atom-token`，`x-atom-user-id` 原样通过），
+/// 桌面 daemon 借此验证请求确实来自同一账号的手机客户端。
+pub async fn require_app_user_id(
+    State(state): State<crate::AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let expected = &state.app_user_id;
+    if expected.is_empty() {
+        // app_user_id 未设置（非 /app 模式 / 桌面未登录）：不校验，放行。
+        return Ok(next.run(req).await);
+    }
+
+    // 从请求头读取 App 端传来的 user_id
+    let actual = req
+        .headers()
+        .get(APP_USER_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if actual == *expected {
+        Ok(next.run(req).await)
+    } else {
+        tracing::warn!(
+            "app user_id mismatch: expected={:?}, actual={:?}",
+            expected,
+            actual,
+        );
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 

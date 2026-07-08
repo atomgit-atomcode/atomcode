@@ -185,10 +185,11 @@ impl Conversation {
     }
 
     pub fn add_user_message(&mut self, content: &str) {
-        // Merge with last message if it's also User — prevents consecutive User messages
-        // which cause OpenAI-compatible APIs to return empty responses.
+        // Merge only with a prior real user message. Synthetic user-channel
+        // injections must remain distinct in stored history so UI/API layers can
+        // keep them out of human-authored message bubbles.
         if let Some(last) = self.messages.last_mut() {
-            if matches!(last.role, Role::User) {
+            if matches!(last.role, Role::User) && !last.synthetic {
                 if let MessageContent::Text(ref mut text) = last.content {
                     text.push('\n');
                     text.push_str(content);
@@ -206,15 +207,12 @@ impl Conversation {
     /// self-prompts, `[Context was compressed]` state summaries, etc.
     /// See `Message.synthetic` doc for the full rationale.
     ///
-    /// Same API-compat merge behavior as `add_user_message` (avoids two
-    /// consecutive `Role::User` messages which break OpenAI-compatible
-    /// providers), BUT the merge preserves the EXISTING message's
-    /// `synthetic` flag — appending synthetic content to a real user
-    /// prompt doesn't reclassify the real prompt as synthetic. Only a
-    /// freshly-pushed message carries `synthetic = true`.
+    /// Stored history preserves real/synthetic boundaries. Provider/request
+    /// renderers handle any wire-level consecutive-user compatibility when
+    /// building the outgoing request.
     pub fn add_synthetic_user_message(&mut self, content: &str) {
         if let Some(last) = self.messages.last_mut() {
-            if matches!(last.role, Role::User) {
+            if matches!(last.role, Role::User) && last.synthetic {
                 if let MessageContent::Text(ref mut text) = last.content {
                     text.push('\n');
                     text.push_str(content);
@@ -224,7 +222,7 @@ impl Conversation {
         }
         let idx = self.messages.len();
         self.messages.push(Message::synthetic_user(content));
-        self.turn_tracker.on_user_message(idx);
+        self.turn_tracker.on_synthetic_user_message(idx);
     }
 
     /// Cancel the current active turn: save all conversation content up to
@@ -476,7 +474,7 @@ impl Conversation {
         let mut msgs = Vec::with_capacity(self.messages.len() + 1);
         msgs.push(Message::new(Role::System, system_prompt));
         msgs.extend(self.messages.iter().cloned());
-        msgs
+        merge_adjacent_user_messages(msgs)
     }
 
     /// Like to_provider_messages but only sends the last `window` messages.
@@ -520,7 +518,7 @@ impl Conversation {
         let mut msgs = Vec::with_capacity(self.messages.len() - start + 1);
         msgs.push(Message::new(Role::System, system_prompt));
         msgs.extend(self.messages[start..].iter().cloned());
-        msgs
+        merge_adjacent_user_messages(msgs)
     }
 
     /// Apply compression: store summary in cold zone, remove old messages.
@@ -890,6 +888,86 @@ fn strip_orphan_tool_call_xml(text: &str) -> String {
     out = out.replace("<tool_call>", "").replace("</tool_call>", "");
 
     out
+}
+
+fn merge_adjacent_user_messages(messages: Vec<Message>) -> Vec<Message> {
+    let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(last) = merged.last_mut() {
+            if matches!(last.role, Role::User)
+                && matches!(message.role, Role::User)
+                && merge_user_content(&mut last.content, message.content.clone())
+            {
+                last.synthetic = last.synthetic && message.synthetic;
+                continue;
+            }
+        }
+        merged.push(message);
+    }
+    merged
+}
+
+fn merge_user_content(left: &mut MessageContent, right: MessageContent) -> bool {
+    match left {
+        MessageContent::Text(left_text) => match right {
+            MessageContent::Text(right_text) => {
+                append_text(left_text, &right_text);
+                true
+            }
+            MessageContent::MultiPart { text, images } => {
+                let mut text = text;
+                prepend_optional_text(&mut text, std::mem::take(left_text));
+                *left = MessageContent::MultiPart { text, images };
+                true
+            }
+            _ => false,
+        },
+        MessageContent::MultiPart { text, images } => match right {
+            MessageContent::Text(right_text) => {
+                append_optional_text(text, Some(right_text));
+                true
+            }
+            MessageContent::MultiPart { text: right_text, images: mut right_images } => {
+                append_optional_text(text, right_text);
+                images.append(&mut right_images);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn append_text(existing: &mut String, next: &str) {
+    if !existing.is_empty() {
+        existing.push('\n');
+    }
+    existing.push_str(next);
+}
+
+fn append_optional_text(existing: &mut Option<String>, next: Option<String>) {
+    if let Some(next) = next {
+        match existing {
+            Some(existing) => append_text(existing, &next),
+            None => *existing = Some(next),
+        }
+    }
+}
+
+fn prepend_optional_text(existing: &mut Option<String>, previous: String) {
+    if previous.is_empty() {
+        return;
+    }
+    match existing {
+        Some(existing) if !existing.is_empty() => {
+            let mut text = previous;
+            text.push('\n');
+            text.push_str(existing);
+            *existing = text;
+        }
+        Some(existing) => *existing = previous,
+        None => *existing = previous.into(),
+    }
 }
 
 /// Detect output that almost-certainly came from a corrupted provider stream
@@ -1499,9 +1577,8 @@ mod tests {
     fn apply_compression_no_carve_out_when_real_user_after_drain_window() {
         let mut conv = Conversation::new();
         // We want a layout: [synthetic, asst, real_user, asst]. Put an
-        // Assistant between the synthetic and the real user so that
-        // add_user_message doesn't merge them (the merge fires when
-        // the previous message is also User, regardless of `synthetic`).
+        // Assistant between the synthetic and the real user so the synthetic
+        // remains outside the real user's turn.
         conv.messages
             .push(Message::synthetic_user("[synthetic context]")); // idx 0
         conv.messages
@@ -2457,32 +2534,166 @@ mod tests {
         assert!(matches!(last.role, Role::User));
     }
 
-    /// Critical: `add_synthetic_user_message` invoked when the previous
-    /// message is a real user message MUST merge into it (API-compat
-    /// against consecutive User messages) AND keep the existing
-    /// `synthetic=false` flag. Otherwise a real prompt would be
-    /// reclassified as synthetic just because synthetic content was
-    /// appended — exactly the failure mode `synthetic` is meant to
-    /// prevent.
     #[test]
-    fn synthetic_merge_into_real_user_preserves_real_flag() {
+    fn synthetic_user_without_real_prompt_does_not_start_turn() {
+        let mut conv = Conversation::new();
+        conv.add_synthetic_user_message("[Context was compressed]");
+
+        assert_eq!(conv.messages.len(), 1);
+        assert!(conv.messages[0].synthetic);
+        assert!(
+            conv.turn_tracker.turns.is_empty(),
+            "synthetic-only history must not create a human turn"
+        );
+    }
+
+    #[test]
+    fn synthetic_user_extends_completed_turn_without_reopening_it() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real prompt");
+        conv.push_delta("first part");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        conv.add_synthetic_user_message("[Output limit hit]");
+
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        let turn = &conv.turn_tracker.turns[0];
+        assert_eq!(turn.start_idx, 0);
+        assert_eq!(
+            turn.msg_count, 3,
+            "real prompt, first assistant, synthetic continuation"
+        );
+        assert_eq!(turn.status, TurnStatus::Completed);
+    }
+
+    #[test]
+    fn synthetic_user_extends_active_turn_and_keeps_it_active() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real prompt");
+        conv.push_delta("first part");
+        conv.finalize_stream();
+
+        conv.add_synthetic_user_message("[Output limit hit]");
+        conv.push_delta("continued part");
+        conv.finalize_stream();
+
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        let turn = &conv.turn_tracker.turns[0];
+        assert_eq!(turn.start_idx, 0);
+        assert_eq!(
+            turn.msg_count, 4,
+            "real prompt, first assistant, synthetic continuation, continued assistant"
+        );
+        assert_eq!(turn.status, TurnStatus::Active);
+    }
+
+    /// Critical: `add_synthetic_user_message` invoked when the previous
+    /// message is a real user message MUST NOT merge into it. Merging would
+    /// make the internal prompt indistinguishable from human-authored text
+    /// at the history/API/UI layers. Provider-specific wire renderers handle
+    /// consecutive user-message compatibility later.
+    #[test]
+    fn synthetic_after_real_user_stays_separate_and_synthetic() {
         let mut conv = Conversation::new();
         conv.add_user_message("real original prompt");
         conv.add_synthetic_user_message("[Additional context]: synthetic appended");
 
-        assert_eq!(conv.messages.len(), 1, "merge collapses into one message");
+        assert_eq!(conv.messages.len(), 2, "history keeps real and synthetic user messages separate");
         let m = &conv.messages[0];
         assert!(
             !m.synthetic,
-            "merged message keeps existing `synthetic=false` — origin is real"
+            "real user message keeps `synthetic=false`"
         );
         assert!(
             m.text().unwrap().contains("real original prompt"),
             "real text preserved"
         );
+        let synthetic = &conv.messages[1];
         assert!(
-            m.text().unwrap().contains("[Additional context]"),
-            "synthetic body still appended"
+            synthetic.synthetic,
+            "internal continuation must carry synthetic=true"
+        );
+        assert!(
+            synthetic.text().unwrap().contains("[Additional context]"),
+            "synthetic body is stored independently"
+        );
+    }
+
+    #[test]
+    fn real_user_after_synthetic_stays_separate_and_real() {
+        let mut conv = Conversation::new();
+        conv.messages.push(Message::new(Role::Assistant, "ack"));
+        conv.add_synthetic_user_message("[Output limit hit]");
+        conv.add_user_message("real follow-up");
+
+        assert_eq!(conv.messages.len(), 3, "history keeps synthetic and later real user messages separate");
+        assert!(conv.messages[1].synthetic, "synthetic predecessor stays synthetic");
+        assert!(!conv.messages[2].synthetic, "real follow-up stays real");
+        assert_eq!(conv.messages[2].text(), Some("real follow-up"));
+    }
+
+    #[test]
+    fn real_user_merges_only_with_real_user() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("first");
+        conv.add_user_message("second");
+
+        assert_eq!(conv.messages.len(), 1);
+        assert!(!conv.messages[0].synthetic);
+        assert_eq!(
+            conv.messages[0].text(),
+            Some("first\nsecond"),
+            "consecutive real user messages still merge"
+        );
+    }
+
+    #[test]
+    fn provider_messages_merge_adjacent_real_and_synthetic_users() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real prompt");
+        conv.add_synthetic_user_message("[Output limit hit] resume internally");
+
+        assert_eq!(conv.messages.len(), 2, "stored history keeps provenance");
+        assert!(!conv.messages[0].synthetic);
+        assert!(conv.messages[1].synthetic);
+
+        let provider_messages = conv.to_provider_messages("system");
+        for pair in provider_messages.windows(2) {
+            assert!(
+                !(matches!(pair[0].role, Role::User) && matches!(pair[1].role, Role::User)),
+                "provider projection must not contain adjacent user messages: {provider_messages:?}"
+            );
+        }
+
+        let user_text = provider_messages
+            .iter()
+            .find(|message| matches!(message.role, Role::User))
+            .and_then(|message| message.text())
+            .expect("provider projection includes user text");
+        assert!(user_text.contains("real prompt"));
+        assert!(user_text.contains("[Output limit hit]"));
+    }
+
+    #[test]
+    fn provider_messages_windowed_merge_adjacent_real_and_synthetic_users() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real prompt");
+        conv.add_synthetic_user_message("[Output limit hit] resume internally");
+
+        let provider_messages = conv.to_provider_messages_windowed("system", 2);
+        for pair in provider_messages.windows(2) {
+            assert!(
+                !(matches!(pair[0].role, Role::User) && matches!(pair[1].role, Role::User)),
+                "windowed provider projection must not contain adjacent user messages: {provider_messages:?}"
+            );
+        }
+        assert!(
+            provider_messages
+                .iter()
+                .filter_map(|message| message.text())
+                .any(|text| text.contains("real prompt") && text.contains("[Output limit hit]")),
+            "windowed provider projection keeps both real and synthetic text"
         );
     }
 

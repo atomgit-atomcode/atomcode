@@ -8,6 +8,11 @@ use atomcode_core::setup::{self, RunOptions};
 use serial_test::serial;
 use std::path::Path;
 
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 /// 在 tempdir 项目中跑 setup,同时把 `ATOMCODE_HOME` 指向另一个 tempdir。
 /// 返回 (`SetupResult`, 两个 tempdir 守卫)。
 fn run_in_tempdir<F, G>(

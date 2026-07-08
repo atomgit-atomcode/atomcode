@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { ArtifactData, ChatMessage, MessageBlock } from '../state/types';
+import { ArtifactData, ChatMessage, MessageBlock, StatusData } from '../state/types';
 import { Markdown } from './Markdown';
 import { ToolCall } from './ToolCall';
 import { PermissionRequest } from './PermissionRequest';
@@ -30,10 +30,30 @@ function ArtifactBlock({ artifact }: { artifact: ArtifactData }) {
   );
 }
 
+function StatusBlock({ status }: { status: StatusData }) {
+  const t = useT();
+  const message = status.kind === 'rate_limited'
+    ? status.retryAfterSeconds !== undefined
+      ? t('stream.rateLimitedRetrying', { seconds: status.retryAfterSeconds })
+      : t('stream.rateLimitedPaused')
+    : status.message;
+  const attempt = status.kind === 'rate_limited' && status.attempt && status.maxAttempts
+    ? `${status.attempt}/${status.maxAttempts}`
+    : undefined;
+
+  return (
+    <div className={`assistant-status assistant-status-${status.kind}`}>
+      <span className="assistant-status-message">{message}</span>
+      {attempt && <span className="assistant-status-meta">{attempt}</span>}
+    </div>
+  );
+}
+
 function blockCopyText(blocks: MessageBlock[]): string {
   return blocks.map((block) => {
     if (block.type === 'text') return block.content;
     if (block.type === 'artifact') return block.artifact.content;
+    if (block.type === 'status') return block.status.message;
     return '';
   }).filter(Boolean).join('\n\n');
 }
@@ -54,7 +74,11 @@ function AssistantBlock({ block, streaming }: { block: MessageBlock; streaming: 
         ? <ArtifactBlock artifact={block.artifact} />
         : <ArtifactCodeView artifact={block.artifact} />;
     case 'permission':
-      return block.request.status === 'pending' ? <PermissionRequest request={block.request} /> : null;
+      return block.request.status === 'pending' || block.request.status === 'submitting'
+        ? <PermissionRequest request={block.request} />
+        : null;
+    case 'status':
+      return <StatusBlock status={block.status} />;
     default:
       return null;
   }
@@ -69,9 +93,9 @@ function getDotClass(isStreaming: boolean, hasError: boolean): string {
 export function AssistantMessage({ message, className = '' }: AssistantMessageProps) {
   const t = useT();
   const blocks = message.blocks && message.blocks.length > 0 ? message.blocks : blocksFromLegacyMessage(message);
-  const hasError = blocks.some((block) => block.type === 'tool' && block.tool.status === 'error')
-    || message.toolCalls?.some((t) => t.status === 'error');
-  const isStreaming = message.streaming;
+  const hasError = blocks.some((block) => block.type === 'tool' && (block.tool.status === 'error' || block.tool.status === 'incomplete'))
+    || Boolean(message.toolCalls?.some((t) => t.status === 'error' || t.status === 'incomplete'));
+  const isStreaming = Boolean(message.streaming);
   const dotClass = getDotClass(isStreaming, hasError);
   const [copied, setCopied] = useState(false);
 

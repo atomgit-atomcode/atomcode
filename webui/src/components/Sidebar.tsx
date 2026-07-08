@@ -4,12 +4,13 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, getSkills, getMcpStatus, getSession, SkillInfo, McpStatusInfo, SessionMetaWithProject } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, getSession, getProjects, SkillInfo, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
 import { mergeOptimisticSession } from '../lib/sessionList';
+import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -30,8 +31,12 @@ interface SidebarProps {
   optimisticSession?: SessionMetaWithProject | null;
   /** 列表（重新）加载后回传当前会话的真实元数据，供顶部标题头同步自动命名后的标题。 */
   onActiveSessionMeta?: (session: SessionMetaWithProject) => void;
-  /** Only show sessions whose working_dir matches this path (empty = show all) */
+  /** Current working directory, for display + as the fallback session scope. */
   cwd?: string;
+  /** Physical session-bucket hash of the current project. When set, the list is
+   *  scoped to sessions in THIS bucket (robust against `working_dir` restamping);
+   *  sessions lacking a hash fall back to matching `cwd`. Empty = scope by cwd. */
+  projectHash?: string;
   /** Called after a session is renamed (id + new name). */
   onSessionRenamed?: (id: string, name: string) => void;
   /** Called after a session is deleted. */
@@ -40,6 +45,11 @@ interface SidebarProps {
   onPickSkill?: (name: string) => void;
   /** Open the remote-access dialog (moved from the old top header). */
   onOpenRemote?: () => void;
+  /** Open the working-directory picker (to switch to / start a project in any dir). */
+  onOpenCwd?: () => void;
+  /** Switch INTO another project (by its working dir): change cwd + land on a new
+   *  conversation there + reflect it in the URL (survives refresh). */
+  onSwitchProject?: (workingDir: string) => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -116,6 +126,24 @@ function ChevronDownIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Collapse a home prefix to `~` for readability; leave everything else verbatim
+ *  (temp dirs like /var/folders/… or /tmp/… stay as-is so they're identifiable). */
+function collapseHomePath(p: string): string {
+  if (!p) return '';
+  return p
+    .replace(/^\/(?:Users|home)\/[^/]+/, '~')
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~');
+}
+
+/** Folder glyph for the project selector. */
+function FolderIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M1.75 4c0-.55.45-1 1-1h3l1.5 1.5h5c.55 0 1 .45 1 1V12c0 .55-.45 1-1 1h-10c-.55 0-1-.45-1-1V4z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
     </svg>
   );
 }
@@ -273,16 +301,28 @@ export function Sidebar({
   optimisticSession,
   onActiveSessionMeta,
   cwd,
+  projectHash,
   onSessionRenamed,
   onSessionDeleted,
   onPickSkill,
   onOpenRemote,
+  onOpenCwd,
+  onSwitchProject,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
   const auth = useAuth();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
+  // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
+  // is which project is shown — it MIRRORS the real current project (follows the
+  // `projectHash` prop). Picking another project in the dropdown switches INTO it
+  // (via onSwitchProject → cwd + new conversation + URL), which re-pins
+  // `projectHash`, so `viewProjectHash` snaps to the switched-to project.
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [viewProjectHash, setViewProjectHash] = useState(projectHash);
+  const [projMenuOpen, setProjMenuOpen] = useState(false);
+  const projMenuRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -310,6 +350,11 @@ export function Sidebar({
   // family as the rename/delete dialogs), closes on backdrop click / Escape.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // Cross-project search results (the sidebar list itself is per-project, so the
+  // search modal hits the dedicated all-projects endpoint instead of filtering
+  // the loaded list — which would only ever see the current project).
+  const [searchResults, setSearchResults] = useState<SessionMetaWithProject[]>([]);
+  const [searchBusy, setSearchBusy] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
@@ -320,10 +365,24 @@ export function Sidebar({
   const itemMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
 
+  // Guards against out-of-order load responses: switching project sets
+  // projectHash '' → bucket, firing two loads (the capped fallback, then the
+  // per-project fetch). The fallback reads every project and is SLOWER, so
+  // without this it can land last and clobber the correct per-project list with
+  // the capped one. Only the newest load's response is applied.
+  const loadEpochRef = useRef(0);
   function loadSessions() {
+    const epoch = ++loadEpochRef.current;
     setLoading(true);
-    listSessions()
+    // The sidebar shows ONE project's full history. Fetch that bucket directly
+    // (uncapped) once we know its hash; `/sessions` caps at 50 across ALL
+    // projects, which starves a busy project of its own older sessions. Before
+    // the hash is known (pre-/project), fall back to the capped cross-project
+    // list so something shows immediately.
+    const load = viewProjectHash ? listProjectSessions(viewProjectHash) : listSessions();
+    load
       .then((list) => {
+        if (epoch !== loadEpochRef.current) return; // superseded by a newer load
         setSessions(list);
         // 回合落盘后这次刷新会带出已自动命名的当前会话 → 回传给 App 更新标题头。
         if (activeSessionId) {
@@ -331,14 +390,43 @@ export function Sidebar({
           if (found) onActiveSessionMeta?.(found);
         }
       })
-      .catch(() => setSessions([]))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (epoch === loadEpochRef.current) setSessions([]);
+      })
+      .finally(() => {
+        if (epoch === loadEpochRef.current) setLoading(false);
+      });
   }
 
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadKey, viewProjectHash]);
+
+  // The selector defaults to and FOLLOWS the real current project: when the
+  // daemon's project changes (e.g. opening a session in another project), snap
+  // the view back to it rather than leaving a stale browse selection.
+  useEffect(() => {
+    setViewProjectHash(projectHash);
+  }, [projectHash]);
+
+  // Project list for the dropdown (all projects that have sessions). Cheap,
+  // refetched with the session list so newly-created projects appear.
+  useEffect(() => {
+    getProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
   }, [reloadKey]);
+
+  // Close the project dropdown on an outside click.
+  useEffect(() => {
+    if (!projMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!projMenuRef.current?.contains(e.target as Node)) setProjMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [projMenuOpen]);
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -400,45 +488,7 @@ export function Sidebar({
     try {
       const detail = await getSession(session.project_hash, session.id);
       const title = detail.name || detail.id.slice(0, 8);
-      const lines: string[] = [];
-      lines.push(`# ${title}`);
-      lines.push('');
-      for (const msg of detail.messages) {
-        if (msg.role === 'system') continue;
-        if (msg.role === 'user') {
-          lines.push('## User');
-          lines.push('');
-          lines.push(msg.content || '');
-          lines.push('');
-        } else if (msg.role === 'assistant') {
-          lines.push('## Assistant');
-          lines.push('');
-          if (msg.content) {
-            lines.push(msg.content);
-            lines.push('');
-          }
-          if (msg.tool_calls && msg.tool_calls.length > 0) {
-            for (const tc of msg.tool_calls) {
-              lines.push(`### Tool: ${tc.name}`);
-              lines.push('');
-              if (tc.arguments) {
-                lines.push('```json');
-                lines.push(typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments, null, 2));
-                lines.push('```');
-                lines.push('');
-              }
-            }
-          }
-        } else if (msg.role === 'tool' && msg.tool_result) {
-          const tr = msg.tool_result;
-          lines.push(`### Tool Result (${tr.success ? '✓' : '✗'})`);
-          lines.push('');
-          if (tr.summary) {
-            lines.push(tr.summary);
-            lines.push('');
-          }
-        }
-      }
+      const lines = sessionMessagesToMarkdownLines(detail.messages, title);
       const mdContent = lines.join('\n');
       // Trigger browser download
       const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
@@ -617,10 +667,47 @@ export function Sidebar({
     return () => document.removeEventListener('keydown', onKey);
   }, [searchOpen]);
 
-  // Focus the input each time the dialog opens.
+  // Focus the input on open; reset query/results on close so a reopen starts
+  // fresh instead of flashing the previous search's stale results.
   useEffect(() => {
-    if (searchOpen) searchInputRef.current?.focus();
+    if (searchOpen) {
+      searchInputRef.current?.focus();
+    } else {
+      setSearchQuery('');
+      setSearchResults([]);
+      setSearchBusy(false);
+    }
   }, [searchOpen]);
+
+  // Cross-project search: debounce the query and hit the all-projects endpoint.
+  // Empty query → clear (the modal then shows the current project's list).
+  useEffect(() => {
+    if (!searchOpen) return;
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResults([]);
+      setSearchBusy(false);
+      return;
+    }
+    setSearchBusy(true);
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      searchSessions(q)
+        .then((r) => {
+          if (!cancelled) setSearchResults(r);
+        })
+        .catch(() => {
+          if (!cancelled) setSearchResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setSearchBusy(false);
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [searchQuery, searchOpen]);
 
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
@@ -795,12 +882,29 @@ export function Sidebar({
   // 避免出现两条相同会话（刷新才消失）。
   const merged = mergeOptimisticSession(optimisticSession ?? null, sessions);
 
-  // 先按当前工作目录收窄，再按搜索词过滤。
+  // The project the dropdown currently shows (for its button label).
+  const currentViewProject = projects.find((p) => p.hash === viewProjectHash);
+
+  // 先按当前项目收窄，再按搜索词过滤。优先用物理会话桶 project_hash 收窄（不受
+  // daemon 全局 working_dir 被改写影响，避免跨项目串台）；缺 hash 的条目回退按
+  // working_dir==cwd 匹配；projectHash 为空时整体回退到旧的 cwd 过滤。乐观条目
+  // （刚发送、置顶）永远保留：它必属当前项目，但在 /project 解析出 hash 之前其
+  // working_dir/project_hash 还是空的，不豁免会被 hash 过滤误删。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
-  const inCwd = cwdNorm
-    ? merged.filter((s) => normDir(s.working_dir) === cwdNorm)
-    : merged;
+  const optimisticId = optimisticSession?.id;
+  // The optimistic (just-sent) entry belongs to the CURRENT project — only exempt
+  // it from filtering while the dropdown is showing that current project, else it
+  // would leak into another project's list the user is browsing.
+  const viewingCurrent = viewProjectHash === projectHash;
+  const inScope = (s: SessionMetaWithProject): boolean => {
+    if (s.id === optimisticId && viewingCurrent) return true;
+    if (viewProjectHash) {
+      return s.project_hash ? s.project_hash === viewProjectHash : normDir(s.working_dir) === cwdNorm;
+    }
+    return cwdNorm ? normDir(s.working_dir) === cwdNorm : true;
+  };
+  const inCwd = merged.filter(inScope);
 
   const q = query.trim().toLowerCase();
   const filtered = q
@@ -981,6 +1085,65 @@ export function Sidebar({
         </button>
       </div>
 
+      {projects.length > 1 && (
+        <div class="sidebar-project" ref={projMenuRef}>
+          <button
+            class={'sidebar-project-btn' + (projMenuOpen ? ' open' : '')}
+            onClick={() => setProjMenuOpen((o) => !o)}
+            aria-haspopup="listbox"
+            aria-expanded={projMenuOpen}
+            title={currentViewProject?.working_dir || t('sidebar.switchProject')}
+          >
+            <span class="sidebar-project-icon"><FolderIcon /></span>
+            <span class="sidebar-project-name">
+              {currentViewProject?.name || currentViewProject?.working_dir || t('sidebar.switchProject')}
+            </span>
+            <span class="sidebar-project-caret"><ChevronDownIcon /></span>
+          </button>
+          {projMenuOpen && (
+            <div class="sidebar-project-menu" role="listbox">
+              <div class="sidebar-project-menu-title">{t('sidebar.switchProject')}</div>
+              {projects.map((p) => (
+                <button
+                  key={p.hash}
+                  class={'sidebar-project-item' + (p.hash === viewProjectHash ? ' active' : '')}
+                  role="option"
+                  aria-selected={p.hash === viewProjectHash}
+                  title={p.working_dir}
+                  onClick={() => {
+                    setProjMenuOpen(false);
+                    // Re-selecting the project you're already in is a no-op (don't
+                    // drop the active chat for a fresh landing).
+                    if (p.hash === viewProjectHash) return;
+                    onSwitchProject?.(p.working_dir);
+                  }}
+                >
+                  <span class="sidebar-project-item-main">
+                    <span class="sidebar-project-item-name">{p.name || p.working_dir}</span>
+                    <span class="sidebar-project-item-path">{collapseHomePath(p.working_dir)}</span>
+                  </span>
+                  <span class="sidebar-project-item-count">{p.session_count}</span>
+                </button>
+              ))}
+              {onOpenCwd && (
+                <button
+                  class="sidebar-project-item sidebar-project-item-action"
+                  onClick={() => {
+                    setProjMenuOpen(false);
+                    onOpenCwd();
+                  }}
+                >
+                  <span class="sidebar-project-item-icon"><PlusIcon /></span>
+                  <span class="sidebar-project-item-main">
+                    <span class="sidebar-project-item-name">{t('sidebar.openOtherDir')}</span>
+                  </span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <div class="session-group-header">
         <span class="session-group-label">{t('sidebar.recent')}</span>
       </div>
@@ -1078,15 +1241,13 @@ export function Sidebar({
             </div>
             <div class="search-results">
               {(() => {
-                const q = searchQuery.trim().toLowerCase();
-                const results = q
-                  ? sessions.filter(
-                      (s) =>
-                        (s.name || '').toLowerCase().includes(q) ||
-                        s.id.toLowerCase().startsWith(q) ||
-                        (s.working_dir || '').toLowerCase().includes(q),
-                    )
-                  : sessions;
+                const q = searchQuery.trim();
+                // Non-empty query → cross-project results from the endpoint;
+                // empty → the current project's loaded list (recent).
+                const results = q ? searchResults : sessions;
+                if (q && searchBusy && results.length === 0) {
+                  return <div class="search-empty">{t('sidebar.searching')}</div>;
+                }
                 if (results.length === 0) {
                   return <div class="search-empty">{t('sidebar.noMatch')}</div>;
                 }

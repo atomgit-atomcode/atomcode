@@ -154,6 +154,12 @@ pub struct UiState {
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
     pub compaction_forced_streaming: bool,
+    /// Latest live activity of a running `task` subagent fan-out (e.g.
+    /// `explore#4 · grep unwrap`), set from marker-prefixed progress chunks and
+    /// spliced into the spinner label in-place so a multi-minute fan-out isn't a
+    /// silent `Pondering…`. `None` when no subtask activity is current; cleared
+    /// when the `task` tool finishes and at every turn end/cancel/error.
+    pub subagent_activity: Option<String>,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -326,6 +332,13 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
+    /// Live todo progress (current task + completed/total) for the footer todo
+    /// row, captured from the in-flight turn's `todowrite` calls. This is the
+    /// row's SOLE source: cleared on TurnComplete / TurnCancelled / Error so the
+    /// row is a live execution indicator that DISAPPEARS when the turn ends
+    /// (mirroring the goal/loop row). `None` ⇒ no row. At-rest progress is seen
+    /// via the `/todo` command or the inline todowrite block, not this row.
+    pub live_turn_todo: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -334,6 +347,12 @@ pub struct UiState {
     pub goal_round: u32,
     /// When the goal was started, for elapsed-time display.
     pub goal_started_at: Option<std::time::Instant>,
+    /// Active loop label (prompt text), if a `/loop` is running.
+    pub loop_label: Option<String>,
+    /// Current round number of the running loop.
+    pub loop_round: u32,
+    /// When the loop was started, for elapsed-time display.
+    pub loop_started_at: Option<std::time::Instant>,
     /// Per-turn stats buffered from the most recent `TurnComplete`. The
     /// separator line is NOT rendered immediately so that — if the next
     /// event happens to be `GoalUpdate(active=false)` (the goal just
@@ -362,6 +381,9 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/goal` (decides `↻` vs `✓`
     /// when flushed without a goal-end event).
     pub was_goal_round: bool,
+    /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
+    /// vs the normal summary when flushed mid-loop).
+    pub was_loop_round: bool,
     /// Whether the turn ended with `TurnStopReason::Error`. Lets the deferred
     /// flush render the ✗ "stopped" summary instead of a celebratory ✓ under
     /// the red Error line (preserves the pre-/goal-merge behaviour).
@@ -413,6 +435,7 @@ impl UiState {
             spinner_frame: 0,
             compacting: false,
             compaction_forced_streaming: false,
+            subagent_activity: None,
             unicode_symbols,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -449,10 +472,14 @@ impl UiState {
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
+            live_turn_todo: None,
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
             goal_started_at: None,
+            loop_label: None,
+            loop_round: 0,
+            loop_started_at: None,
             pending_separator: None,
         }
     }
@@ -490,7 +517,15 @@ impl UiState {
             .get_or_insert_with(ContextSnapshot::default);
         if is_rich {
             snap.system_tokens = system_tokens;
-            snap.sent_tokens = sent_tokens;
+            // A rich emission with `sent_tokens == 0` means "no completed turn yet
+            // this engine session" (the v2 bridge's `last_usage` is None), NOT a
+            // genuine zero occupancy — `emit_context_stats` never reports a real 0.
+            // Preserve a value restored from the persisted session on resume so
+            // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
+            // the moment the user runs it. A real turn always sends `sent > 0`.
+            if sent_tokens > 0 {
+                snap.sent_tokens = sent_tokens;
+            }
             snap.tool_defs_tokens = tool_defs_tokens;
             snap.cold_zone_tokens = cold_zone_tokens;
             snap.total_messages = total_messages;
@@ -523,6 +558,36 @@ impl UiState {
         // narrow path passes "" and we keep whatever was cached last.
         if !system_prompt.is_empty() {
             snap.system_prompt = system_prompt.to_string();
+        }
+    }
+
+    /// Rehydrate the context gauge for the session being replayed, from its
+    /// persisted last-turn usage (`TurnStat.used_tokens` / `ctx_window`).
+    /// `replay_session` re-renders the transcript but never sees live
+    /// `ContextStats` events, so without this the footer + `/context` read
+    /// `0/100%` after `atomcode -c`, `/resume`, the session picker, or `/bg`
+    /// until the next live turn lands.
+    ///
+    /// `sent_tokens` is set unconditionally (even to `0`): a session switch must
+    /// show THIS session's occupancy, never the previous one's — passing `0` for
+    /// a session with no completed turns correctly clears a stale gauge. The
+    /// window is only filled when none is cached yet: a startup / model-switch
+    /// seed reflects the CURRENT model and is a better denominator than a window
+    /// persisted under a possibly-different model last session.
+    ///
+    /// No-ops only when there is nothing to show AND nothing to clear (`0/0`
+    /// with no cached snapshot) so a fresh session still reads "no turns yet"
+    /// rather than a fabricated `0/0` "waiting for window" state.
+    pub fn restore_context(&mut self, used_tokens: usize, ctx_window: usize) {
+        if used_tokens == 0 && ctx_window == 0 && self.last_context.is_none() {
+            return;
+        }
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        snap.sent_tokens = used_tokens;
+        if ctx_window > 0 && snap.ctx_window == 0 {
+            snap.ctx_window = ctx_window;
         }
     }
 
@@ -652,6 +717,14 @@ impl UiState {
         // reaches here, so the cancelled path naturally leaves this
         // None too.)
         self.last_submitted_message = None;
+        // The footer's live todo snapshot belongs to the turn that produced it;
+        // hand the segment back to the transcript-derived source now that the
+        // turn (or peer turn / session switch — all funnel through here) is over.
+        // Single source of truth so no turn-end path can pin a stale count.
+        self.live_turn_todo = None;
+        // Same discipline for the subagent fan-out activity: no turn-end path may
+        // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
+        self.subagent_activity = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -666,6 +739,8 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.live_turn_todo = None;
+        self.subagent_activity = None;
     }
 
     pub fn on_error(&mut self) {
@@ -675,6 +750,8 @@ impl UiState {
         self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.live_turn_todo = None;
+        self.subagent_activity = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;
@@ -940,6 +1017,75 @@ mod tests {
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.ctx_window, 128_000, "window must follow the new model");
         assert_eq!(snap.sent_tokens, 10_100, "used count must be preserved");
+    }
+
+    #[test]
+    fn restore_context_rehydrates_gauge_after_resume() {
+        // After `/resume`, replay never sees live ContextStats — restore_context
+        // seeds the gauge from the persisted last-turn usage so the footer +
+        // `/context` show the real occupancy immediately.
+        let mut s = UiState::new();
+        assert!(s.last_context.is_none());
+        s.restore_context(42_000, 200_000);
+        let snap = s.last_context.as_ref().expect("gauge rehydrated");
+        assert_eq!(snap.sent_tokens, 42_000);
+        assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn restore_context_noop_for_old_session_without_persisted_usage() {
+        // Sessions saved before the persisted usage fields load as 0/0 — restore
+        // must not fabricate a snapshot (gauge stays empty until the next turn).
+        let mut s = UiState::new();
+        s.restore_context(0, 0);
+        assert!(s.last_context.is_none(), "must not seed a snapshot from 0/0");
+    }
+
+    #[test]
+    fn refresh_with_zero_sent_does_not_clobber_restored_gauge() {
+        // `/context` after resume dispatches RefreshContextStats; the v2 bridge
+        // replies with sent_tokens=0 (last_usage None) but a real window. That
+        // "unknown" 0 must not wipe the value restored from the persisted session.
+        let mut s = UiState::new();
+        s.restore_context(42_000, 200_000);
+        // Simulate the RefreshContextStats reply (rich: window > 0, sent = 0).
+        s.on_context_stats(0, 0, 0, 0, 0, 200_000, "engine-v2", "");
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
+        assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn restore_context_keeps_seeded_window_when_none_persisted() {
+        // If startup already seeded the current model's window, a persisted
+        // used-only restore must fill the used count without zeroing the window.
+        let mut s = UiState::new();
+        s.on_model_window_changed(128_000);
+        s.restore_context(9_000, 0);
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 9_000);
+        assert_eq!(snap.ctx_window, 128_000, "seeded window preserved");
+    }
+
+    #[test]
+    fn restore_context_prefers_seeded_window_over_stale_persisted() {
+        // Current model's window (seeded at startup) beats a window persisted
+        // under a possibly-different model last session.
+        let mut s = UiState::new();
+        s.on_model_window_changed(128_000);
+        s.restore_context(9_000, 1_000_000);
+        assert_eq!(s.last_context.as_ref().unwrap().ctx_window, 128_000);
+    }
+
+    #[test]
+    fn restore_context_clears_previous_session_gauge_on_switch() {
+        // Switching from a big session (A) to one with no completed turns (B)
+        // must reset the gauge to 0, not leave A's occupancy on screen.
+        let mut s = UiState::new();
+        s.on_context_stats(0, 500_000, 0, 0, 0, 1_000_000, "engine-v2", ""); // session A
+        s.restore_context(0, 0); // replay of empty session B
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 0, "A's occupancy must be cleared");
     }
 
     #[test]

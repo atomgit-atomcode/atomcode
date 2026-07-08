@@ -86,6 +86,23 @@ pub fn build_review_agent_with(
     cfg: &ReviewAgentConfig,
     provider: Arc<dyn LlmProvider>,
 ) -> (Agent, ReportFindingTool) {
+    build_review_agent_with_cancel(cfg, provider, None)
+}
+
+/// Same as [`build_review_agent_with`] but wires an EXTERNAL cancel token into the
+/// agent. Used by `atomcode-clix`'s `review` driver so the FIRST review pass and the
+/// coverage RE-REVIEW pass share ONE wall-clock deadline (`--max-duration`), instead
+/// of each agent spawning its own timer from zero (which let the re-review run for
+/// the full `max_turn_duration` AGAIN on top of time the first pass already spent).
+///
+/// `cancel_token = None` ⇒ no external token wired (mirrors the legacy per-agent
+/// timer behavior for callers that don't share a deadline — `build_review_agent_with`
+/// and `build_review_agent`).
+pub fn build_review_agent_with_cancel(
+    cfg: &ReviewAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
     // Auto-degrade the code-graph on huge repos when the caller set a bound. Default
@@ -126,11 +143,15 @@ pub fn build_review_agent_with(
             .max_rounds(n)
             .hook(Arc::new(crate::round_budget::RoundBudgetHook::new()));
     }
-    // Turn total-time cap via the kernel's cancel seam (no kernel change): inject a cancel
-    // token and fire it after the deadline. This trips run_turn's stream-select cancel arm
-    // even while a stalled provider keeps the stream alive — the gap `stream_timeout`/`max_rounds`
-    // leave open. On cancel the turn stops as `StopReason::Cancelled`, keeping findings so far.
-    if let Some(d) = cfg.max_turn_duration {
+    // Turn total-time cap via the kernel's cancel seam. The TOKEN is now caller-owned
+    // (see `build_review_agent_with_cancel`): the driver creates ONE token + ONE timer
+    // for the whole review (first pass + coverage re-review) and passes it in here, so
+    // `--max-duration` is a true wall-clock cap on the entire review, not per-agent-turn.
+    // Legacy callers via `build_review_agent_with` (no external token) still get the
+    // per-agent timer spawned here for backward compatibility.
+    if let Some(t) = cancel_token {
+        builder = builder.cancel_token(t);
+    } else if let Some(d) = cfg.max_turn_duration {
         let token = tokio_util::sync::CancellationToken::new();
         builder = builder.cancel_token(token.clone());
         tokio::spawn(async move {
@@ -140,6 +161,26 @@ pub fn build_review_agent_with(
     }
     let agent = builder.build();
     (agent, report)
+}
+
+/// Create a SHARED wall-clock cancel token for a whole review (first pass + any
+/// coverage re-review), firing after `duration`. Returns `None` when `duration` is
+/// `None` (unbounded). The driver calls this ONCE and passes the token to every
+/// `build_review_agent_with_cancel` call, so `--max-duration` is a true whole-review
+/// cap instead of a per-agent-turn cap (see `build_review_agent_with_cancel` docs).
+///
+/// Exposed so drivers (e.g. `atomcode-clix`) don't need a direct `tokio-util` dep just
+/// to construct a `CancellationToken` + timer.
+pub fn shared_review_deadline(duration: Option<std::time::Duration>) -> Option<tokio_util::sync::CancellationToken> {
+    duration.map(|d| {
+        let token = tokio_util::sync::CancellationToken::new();
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            t.cancel();
+        });
+        token
+    })
 }
 
 /// Register the read-only review toolset (+ the shared `report_finding` instance) and
@@ -184,7 +225,7 @@ mod tests {
     }
 
     /// Scripted provider: round 1 emits a `report_finding` tool call, round 2 a final text.
-    struct ScriptedReviewProvider;
+    pub(super) struct ScriptedReviewProvider;
     #[async_trait]
     impl LlmProvider for ScriptedReviewProvider {
         fn model_name(&self) -> &str {
@@ -441,6 +482,57 @@ mod tests {
         git(&["commit", "-qm", "init"]);
         // Only indexable sources counted: a.rs, b.go, c.py, sub/f.ts = 4 (md/lock excluded).
         assert_eq!(count_indexed_sources(root), 4);
+    }
+}
+
+#[cfg(test)]
+mod shared_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn no_duration_means_no_deadline() {
+        // `None` never reaches the spawn inside `map`, so no runtime is needed.
+        assert!(shared_review_deadline(None).is_none(), "unbounded review → no token");
+    }
+
+    /// The whole-review cap: ONE token, fired once after `duration`, regardless of how
+    /// many passes hold clones of it. Locks the `--max-duration` fix — before it, each
+    /// pass spawned its own timer from zero, so a 240s cap could run 440s across two passes.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_fires_once_for_all_clones() {
+        let token = shared_review_deadline(Some(Duration::from_secs(240))).unwrap();
+        // Both passes hold the SAME deadline (main.rs clones it per pass).
+        let pass1 = token.clone();
+        let pass2 = token.clone();
+
+        // Let the spawned timer task register its sleep at t=0 before moving the clock.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(239)).await;
+        assert!(!pass1.is_cancelled(), "still inside the budget");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // The advance wakes the timer task; yield so it actually runs `cancel()`.
+        tokio::task::yield_now().await;
+        assert!(pass1.is_cancelled(), "first pass stops at the wall-clock cap");
+        assert!(pass2.is_cancelled(), "re-review gets NO fresh budget — same token, already fired");
+    }
+
+    /// External token wins over the config duration: no second per-agent timer may race it.
+    #[tokio::test(start_paused = true)]
+    async fn external_token_suppresses_per_agent_timer() {
+        let mut cfg = ReviewAgentConfig::new("k", "https://x.test", "mock-model", std::env::temp_dir());
+        cfg.max_turn_duration = Some(Duration::from_secs(1));
+        let external = tokio_util::sync::CancellationToken::new();
+        let provider: Arc<dyn LlmProvider> = Arc::new(super::tests::ScriptedReviewProvider);
+        let _agent = build_review_agent_with_cancel(&cfg, provider, Some(external.clone()));
+
+        // Way past cfg's 1s per-agent deadline: if a per-agent timer had been spawned
+        // anyway, it would have cancelled a token by now — but the external one is the
+        // only token wired, and only its owner may fire it.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!external.is_cancelled(), "cfg.max_turn_duration must be ignored when a token is passed in");
     }
 }
 
