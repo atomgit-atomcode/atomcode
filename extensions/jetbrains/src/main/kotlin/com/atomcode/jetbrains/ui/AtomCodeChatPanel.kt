@@ -21,7 +21,6 @@ import com.atomcode.jetbrains.security.SensitivePathClassifier
 import com.atomcode.jetbrains.services.AtomCodeProjectService
 import com.atomcode.jetbrains.services.SessionRefView
 import com.atomcode.jetbrains.session.ChatRuntime
-import com.atomcode.jetbrains.session.ContextItemState
 import com.atomcode.jetbrains.session.SessionWorkspace
 import com.atomcode.jetbrains.settings.AtomCodeContextLevel
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
@@ -199,7 +198,7 @@ class AtomCodeChatPanel(
     private val service = AtomCodeProjectService.getInstance(project)
     private val settings = AtomCodeSettingsState.getInstance()
 
-    // ── New UI components ──
+    // ── UI components ──
     private val header = HeaderPanel()
     private val messageView = JBCefMessageView { action -> handleWelcomeAction(action) }
     private val inputPanel = InputPanel(
@@ -210,23 +209,19 @@ class AtomCodeChatPanel(
         onClearContext = { clearPendingContext() },
         onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
+        onApprovalModeSelect = { mode -> setApprovalMode(mode) },
         onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
-    // ── Data state (preserved from original) ──
+    // ── Data state ──
     private val modelPicker = JComboBox<ModelInfo>().apply {
         prototypeDisplayValue = ModelInfo("provider", "model-name", "openai", false)
-    }
-    private val modePicker = JComboBox(ApprovalMode.values()).apply {
-        toolTipText = "Approval mode"
-        selectedItem = ApprovalMode.Build
     }
     private val sessionPicker = JComboBox<SessionMeta>().apply {
         prototypeDisplayValue = SessionMeta("00000000", "Recent conversation title", "", 0L, 99)
     }
     private var loadingSessions = false
     private var loadingModels = false
-    private var loadingMode = false
     private var generating = false
     private var generationSequence = 0L
     private var activeGenerationId: Long? = null
@@ -245,9 +240,8 @@ class AtomCodeChatPanel(
             if (!disposed) {
                 renderConnectionState(event.newValue as ConnectionState)
                 if (event.newValue is ConnectionState.Ready) {
-                    loadingMode = true
-                    modePicker.selectedItem = service.approvalMode
-                    loadingMode = false
+                    inputPanel.setApprovalMode(service.approvalMode)
+                    inputPanel.setApprovalModeEnabled(!service.approvalModePending)
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -263,7 +257,6 @@ class AtomCodeChatPanel(
         add(header, BorderLayout.NORTH)
         add(messageView, BorderLayout.CENTER)
         add(inputPanel, BorderLayout.SOUTH)
-        header.setRightComponent(modePicker)
 
         // ── Action bindings ──
         modelPicker.addActionListener {
@@ -274,11 +267,6 @@ class AtomCodeChatPanel(
         sessionPicker.addActionListener {
             if (!loadingSessions) {
                 (sessionPicker.selectedItem as? SessionMeta)?.let(::loadSession)
-            }
-        }
-        modePicker.addActionListener {
-            if (!loadingMode) {
-                (modePicker.selectedItem as? ApprovalMode)?.let(::setApprovalMode)
             }
         }
         installInputKeyBindings()
@@ -384,7 +372,6 @@ class AtomCodeChatPanel(
         }
         if (!duplicate) {
             pendingContext += item
-            runtime?.addContext(item.toContextItemState())
         }
         rebuildContext()
         focusInput()
@@ -476,21 +463,17 @@ class AtomCodeChatPanel(
     }
 
     private fun setApprovalMode(mode: ApprovalMode) {
-        modePicker.isEnabled = false
+        inputPanel.setApprovalModeEnabled(false)
         service.setApprovalMode(mode).whenComplete { applied, error ->
             SwingUtilities.invokeLater {
-                modePicker.isEnabled = true
+                inputPanel.setApprovalModeEnabled(true)
                 if (error != null) {
                     addErrorMessage(error.cause?.message ?: error.message ?: "failed to set approval mode")
-                    loadingMode = true
-                    modePicker.selectedItem = service.approvalMode
-                    loadingMode = false
+                    inputPanel.setApprovalMode(service.approvalMode)
                     startNextQueuedPromptIfReady()
                     return@invokeLater
                 }
-                loadingMode = true
-                modePicker.selectedItem = applied
-                loadingMode = false
+                inputPanel.setApprovalMode(applied)
                 startNextQueuedPromptIfReady()
             }
         }
@@ -647,7 +630,6 @@ class AtomCodeChatPanel(
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to create session"); return@invokeLater }
                 currentSession = session
-                runtime?.updateSession(session)
                 persistRuntimeSession()
                 messageView.clear()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
@@ -874,7 +856,6 @@ class AtomCodeChatPanel(
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load session"); return@invokeLater }
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
-                runtime?.loadSession(detail)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
@@ -941,7 +922,6 @@ class AtomCodeChatPanel(
                 if (currentSession?.id != session.id) return@invokeLater
 
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
-                runtime?.loadSession(detail)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id)
@@ -1044,7 +1024,6 @@ class AtomCodeChatPanel(
         }, onSessionReady = { session ->
             SwingUtilities.invokeLater {
                 setCurrentSessionReference(session)
-                runtime?.updateSession(session)
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
@@ -1054,7 +1033,6 @@ class AtomCodeChatPanel(
                     finishPromptAndContinue(generationId)
                 } else if (session != null) {
                     setCurrentSessionReference(session)
-                    runtime?.updateSession(session)
                     replaceSelectedSession(session.id)
                     persistRuntimeSession()
                     rerenderFinishedSessionFromHistory(session)
@@ -1064,7 +1042,6 @@ class AtomCodeChatPanel(
     }
 
     private fun renderChatEvent(event: ChatEvent) {
-        runtime?.applyDaemonEvent(event)
         when (event) {
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
@@ -1127,7 +1104,6 @@ class AtomCodeChatPanel(
 
     private fun startQueuedPrompt(next: QueuedPrompt) {
         activeGenerationId = null
-        runtime?.removeQueuedPrompt(next.id)
         startPrompt(
             next.prompt,
             next.message,
@@ -1191,7 +1167,6 @@ class AtomCodeChatPanel(
             },
         ) { item ->
             queuedPrompts.removeAll { it.id == item.id }
-            runtime?.removeQueuedPrompt(item.id)
             renderQueueState()
         }
         rebuildContext()
@@ -1246,7 +1221,6 @@ class AtomCodeChatPanel(
         val session = currentSession?.takeIf { it.id == sessionId } ?: return
         val normalizedTitle = title.trim().ifBlank { session.id.take(8) }
         currentSession = session.copy(name = normalizedTitle)
-        runtime?.updateSession(currentSession)
         updateAtomCodeChatTabTitle(project, this, normalizedTitle)
         persistRuntimeSession()
     }
@@ -1284,7 +1258,6 @@ class AtomCodeChatPanel(
     private fun clearPendingContext() {
         pendingContext.clear()
         pendingImages.clear()
-        runtime?.clearContext()
         rebuildContext()
     }
 
@@ -1932,16 +1905,6 @@ private val INTERNAL_HISTORY_USER_PREFIXES = listOf(
 
 private val HISTORY_CONTEXT_FILE_PATTERN =
     Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")
-
-private fun ChatContextItem.toContextItemState(): ContextItemState =
-    ContextItemState(
-        id = "$path:${startLine ?: 0}:${endLine ?: 0}:${selection?.hashCode() ?: 0}",
-        path = path,
-        displayName = displayName,
-        language = language,
-        selectionStartLine = startLine,
-        selectionEndLine = endLine,
-    )
 
 internal fun slashPromptTemplate(prompt: String): String? {
     val parts = prompt.split(Regex("\\s+"), limit = 2)

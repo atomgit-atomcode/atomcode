@@ -1,10 +1,11 @@
 package com.atomcode.jetbrains.ui.input
 
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Test
+import com.atomcode.jetbrains.daemon.ApprovalMode
 import java.awt.Container
 import javax.swing.JButton
 import javax.swing.SwingUtilities
+import kotlin.test.Test
+import kotlin.test.assertEquals
 
 class InputPanelTest {
     @Test
@@ -26,6 +27,30 @@ class InputPanelTest {
 
             assertEquals("do not lose this", panel.getInputText())
         }
+    }
+
+    @Test
+    fun `approval mode selector exposes all modes and dispatches selection`() {
+        val selected = mutableListOf<ApprovalMode>()
+        val panel = InputPanel(
+            onSend = { false },
+            onStop = {},
+            onAttach = {},
+            onSlashCommand = {},
+            onClearContext = {},
+            onRemoveContext = {},
+            onModelSelect = {},
+            onApprovalModeSelect = { selected += it },
+            onPasteFromClipboard = { false },
+        )
+
+        assertEquals(listOf("Build", "Plan", "Bypass"), panel.approvalModeOptionsForTest())
+
+        panel.setApprovalMode(ApprovalMode.Plan)
+        assertEquals("Plan ▾", panel.approvalModeDisplayTextForTest())
+
+        panel.selectApprovalModeForTest(ApprovalMode.Bypass)
+        assertEquals(listOf(ApprovalMode.Bypass), selected)
     }
 
     private fun findButton(container: Container, predicate: (JButton) -> Boolean): JButton? {
