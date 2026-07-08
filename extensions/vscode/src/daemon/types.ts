@@ -35,9 +35,19 @@ export type ChatEvent =
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
   | { type: 'artifact_content'; id: string; content: string }
   | { type: 'artifact_end'; id: string }
+  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'warning'; message: string }
+  | { type: 'rate_limited'; message: string; retry_after_seconds?: number; attempt?: number; max_attempts?: number }
   | { type: 'done'; tokens: number; tool_calls: number; session_id?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string };
+
+export type PermissionDecision = 'allow' | 'deny' | 'always_allow' | 'allow_persist';
+
+export interface PermissionDecisionResponse {
+  success: boolean;
+  error?: string;
+}
 
 // Health
 export interface HealthResponse {
@@ -220,6 +230,7 @@ export interface SessionDetail {
 export interface MessageInfo {
   role: string;
   content: string;
+  synthetic?: boolean;
   images?: ImageInput[];
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
@@ -279,10 +290,13 @@ export interface ChatStreamCallbacks {
   onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
+  onPermissionRequest: (request: { sessionId: string; toolName: string; reason: string; callId: string; args: string }) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;
   onArtifactStart: (id: string, type: string, language?: string, title?: string) => void;
   onArtifactContent: (id: string, content: string) => void;
   onArtifactEnd: (id: string) => void;
+  onWarning: (message: string) => void;
+  onRateLimited: (event: { message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }) => void;
   onDone: (tokens: number, toolCalls: number, sessionId?: string) => void;
   onStopped: () => void;
   onError: (message: string) => void;

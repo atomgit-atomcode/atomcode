@@ -78,7 +78,7 @@ impl Tool for EditFileTool {
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return err(format!("edit_file: cannot read {}: {e}", path.display())),
+            Err(e) => return err(format!("edit_file: cannot read {}: {e}", crate::pathnorm::to_display(&path))),
         };
 
         // Line-ending tolerance: read_file shows the model LF-normalized text (it does
@@ -118,12 +118,12 @@ impl Tool for EditFileTool {
                     );
                 }
                 if let Err(e) = tokio::fs::write(&path, &fuzzy_result).await {
-                    return err(format!("edit_file: failed to write {}: {e}", path.display()));
+                    return err(format!("edit_file: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
                 }
                 let diff = build_compact_diff(&a.old_string, &a.new_string);
                 return ok(format!(
                     "Edited {} (fuzzy whitespace match, {fuzzy_count} replacement{})\n{}",
-                    path.display(),
+                    crate::pathnorm::to_display(&path),
                     if fuzzy_count == 1 { "" } else { "s" },
                     diff,
                 ));
@@ -131,7 +131,7 @@ impl Tool for EditFileTool {
             return err(format!(
                 "edit_file: old_string not found in {}. The file was NOT modified. Re-read \
                  the file and copy the exact text (including whitespace).",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         if count > 1 && !a.replace_all {
@@ -139,7 +139,7 @@ impl Tool for EditFileTool {
                 "edit_file: old_string appears {count} times in {} — it must be unique. Add \
                  surrounding context to disambiguate, or set replace_all=true. The file was \
                  NOT modified.",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         if old_match == new_match {
@@ -160,14 +160,14 @@ impl Tool for EditFileTool {
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return err(format!(
                 "edit_file: failed to write {}: {e}",
-                path.display()
+                crate::pathnorm::to_display(&path)
             ));
         }
         let replaced = if a.replace_all { count } else { 1 };
         let diff = build_compact_diff(&a.old_string, &a.new_string);
         ok(format!(
             "Edited {} ({replaced} replacement{})\n{}",
-            path.display(),
+            crate::pathnorm::to_display(&path),
             if replaced == 1 { "" } else { "s" },
             diff,
         ))

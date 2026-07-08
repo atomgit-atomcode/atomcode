@@ -21,6 +21,7 @@ pub enum SessionMode {
     Jetbrains,
     #[serde(rename = "webui")]
     Webui,
+    #[serde(rename = "atomcode_desktop")]
     AtomcodeAir,
     Channel,
 }
@@ -840,6 +841,11 @@ mod tests {
             serde_json::to_string(&SessionMode::Channel).unwrap(),
             "\"channel\""
         );
+    }
+
+    #[test]
+    fn session_mode_atomcode_air_serializes_as_atomcode_desktop() {
+        assert_eq!(serde_json::to_string(&SessionMode::AtomcodeAir).unwrap(), "\"atomcode_desktop\"");
     }
 }
 

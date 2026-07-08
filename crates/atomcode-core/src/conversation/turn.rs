@@ -1,9 +1,9 @@
 //! Turn tracking for conversation context management.
 //!
-//! A "turn" is one user request and everything that follows until the next
-//! user message (assistant text, tool calls, tool results). Tracking turns
-//! allows the windowing algorithm to operate at semantic boundaries instead
-//! of raw message indices.
+//! A "turn" is one real user request and everything that follows until the next
+//! real user message (assistant text, tool calls, tool results, and synthetic
+//! user-channel control messages). Tracking turns allows the windowing
+//! algorithm to operate at semantic boundaries instead of raw message indices.
 
 use super::message::{Message, Role};
 
@@ -59,7 +59,7 @@ impl TurnTracker {
     pub fn rebuild(messages: &[Message]) -> Self {
         let mut tracker = Self::new();
         for (i, msg) in messages.iter().enumerate() {
-            if matches!(msg.role, Role::User) {
+            if matches!(msg.role, Role::User) && !msg.synthetic {
                 // Close the previous turn if any
                 if let Some(prev) = tracker.turns.last_mut() {
                     if prev.status == TurnStatus::Active {
@@ -90,7 +90,7 @@ impl TurnTracker {
         tracker
     }
 
-    /// Notify that a new user message was added at `msg_idx`.
+    /// Notify that a new real user message was added at `msg_idx`.
     /// Closes the previous turn and opens a new Active turn.
     ///
     /// ── SAFETY INVARIANT ──
@@ -114,6 +114,15 @@ impl TurnTracker {
             status: TurnStatus::Active,
             summary: None,
         });
+    }
+
+    /// Notify that a synthetic user-channel message was added at `msg_idx`.
+    /// Synthetic messages are model/runtime control context, not a new human
+    /// turn, so they attach to the current or most recent real user turn.
+    pub fn on_synthetic_user_message(&mut self, msg_idx: usize) {
+        if let Some(current) = self.turns.last_mut() {
+            current.msg_count = msg_idx.saturating_sub(current.start_idx) + 1;
+        }
     }
 
     /// Notify that a message was appended (assistant text, tool call, tool result).
@@ -197,6 +206,47 @@ mod tests {
         assert_eq!(tracker.turns[2].start_idx, 4);
         assert_eq!(tracker.turns[2].msg_count, 1);
         assert_eq!(tracker.turns[2].status, TurnStatus::Active);
+    }
+
+    #[test]
+    fn rebuild_ignores_synthetic_user_as_turn_start() {
+        let messages = vec![
+            Message::synthetic_user("[leading context]"),
+            Message::new(Role::Assistant, "leading assistant"),
+            Message::new(Role::User, "real task 1"),
+            Message::new(Role::Assistant, "done 1"),
+            Message::synthetic_user("[continue internally]"),
+            Message::new(Role::Assistant, "done 1b"),
+            Message::new(Role::User, "real task 2"),
+        ];
+
+        let tracker = TurnTracker::rebuild(&messages);
+
+        assert_eq!(tracker.turns.len(), 2);
+        assert_eq!(tracker.turns[0].start_idx, 2);
+        assert_eq!(
+            tracker.turns[0].msg_count, 4,
+            "first turn includes assistant, synthetic continuation, and continuation reply"
+        );
+        assert_eq!(tracker.turns[0].status, TurnStatus::Completed);
+        assert_eq!(tracker.turns[1].start_idx, 6);
+        assert_eq!(tracker.turns[1].msg_count, 1);
+        assert_eq!(tracker.turns[1].status, TurnStatus::Active);
+    }
+
+    #[test]
+    fn synthetic_user_message_extends_last_turn() {
+        let mut tracker = TurnTracker::new();
+        tracker.on_user_message(0);
+        tracker.on_message_added(1);
+        tracker.complete_current();
+
+        tracker.on_synthetic_user_message(2);
+
+        assert_eq!(tracker.turns.len(), 1);
+        assert_eq!(tracker.turns[0].start_idx, 0);
+        assert_eq!(tracker.turns[0].msg_count, 3);
+        assert_eq!(tracker.turns[0].status, TurnStatus::Completed);
     }
 
     #[test]

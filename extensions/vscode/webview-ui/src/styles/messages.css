@@ -286,6 +286,39 @@
   min-width: 0;
 }
 
+.assistant-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 35%);
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.assistant-status-warning,
+.assistant-status-rate_limited,
+.assistant-status-idle {
+  border-color: color-mix(in srgb, #e1c08d, var(--app-input-border) 45%);
+  color: var(--app-primary-foreground);
+}
+
+.assistant-status-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.assistant-status-meta {
+  flex-shrink: 0;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
+
 .msg-copy-btn {
   display: inline-flex;
   align-items: center;

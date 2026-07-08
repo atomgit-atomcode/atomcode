@@ -150,6 +150,7 @@ data class SessionDetail(
 data class MessageInfo(
     val role: String,
     val content: String,
+    val synthetic: Boolean = false,
 )
 
 data class ChatRequest(

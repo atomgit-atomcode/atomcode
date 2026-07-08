@@ -11,6 +11,7 @@ import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
+import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
@@ -282,45 +283,7 @@ export function App() {
     try {
       const detail = await getSession(activeSession.project_hash, activeSession.id);
       const title = detail.name || detail.id.slice(0, 8);
-      const lines: string[] = [];
-      lines.push(`# ${title}`);
-      lines.push('');
-      for (const msg of detail.messages) {
-        if (msg.role === 'system') continue;
-        if (msg.role === 'user') {
-          lines.push('## User');
-          lines.push('');
-          lines.push(msg.content || '');
-          lines.push('');
-        } else if (msg.role === 'assistant') {
-          lines.push('## Assistant');
-          lines.push('');
-          if (msg.content) {
-            lines.push(msg.content);
-            lines.push('');
-          }
-          if (msg.tool_calls && msg.tool_calls.length > 0) {
-            for (const tc of msg.tool_calls) {
-              lines.push(`### Tool: ${tc.name}`);
-              lines.push('');
-              if (tc.arguments) {
-                lines.push('```json');
-                lines.push(typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments, null, 2));
-                lines.push('```');
-                lines.push('');
-              }
-            }
-          }
-        } else if (msg.role === 'tool' && msg.tool_result) {
-          const tr = msg.tool_result;
-          lines.push(`### Tool Result (${tr.success ? '✓' : '✗'})`);
-          lines.push('');
-          if (tr.summary) {
-            lines.push(tr.summary);
-            lines.push('');
-          }
-        }
-      }
+      const lines = sessionMessagesToMarkdownLines(detail.messages, title);
       const mdContent = lines.join('\n');
       const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
       const url = URL.createObjectURL(blob);

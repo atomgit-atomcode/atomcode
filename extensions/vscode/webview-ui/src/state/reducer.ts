@@ -1,4 +1,4 @@
-import {
+import type {
   ChatState,
   ChatAction,
   ChatMessage,
@@ -7,6 +7,7 @@ import {
   ArtifactData,
   MessageBlock,
   PermissionRequestData,
+  StatusData,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 
@@ -66,6 +67,26 @@ function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' |
     return normalized;
   }
   return 'unknown';
+}
+
+const INTERNAL_USER_PREFIXES = [
+  '<system-reminder>',
+  'You made code edits but have not verified them.',
+  'Output limit hit — your last response was cut off',
+  'Output limit hit. If the task is already complete',
+  '[PLAN MODE',
+  '[Context was compressed',
+  '[Additional context from user]:',
+  '[SYNTAX CHECK:',
+  '[DEV SERVER ERROR',
+  '[Auto-read from error:',
+  '[Images returned by the tool calls above',
+];
+
+function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolean {
+  if (synthetic === true) return true;
+  const trimmed = text.trimStart();
+  return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
 function textFromContent(content: unknown): string {
@@ -201,6 +222,74 @@ function upsertPermissionBlock(message: ChatMessage, request: PermissionRequestD
     ? blocks.map((block, index) => index === existing && block.type === 'permission' ? { ...block, request } : block)
     : [...blocks, { id: `${message.id}-permission-${request.id}`, type: 'permission' as const, request }];
   return { ...message, blocks: nextBlocks };
+}
+
+function appendStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  return {
+    ...message,
+    blocks: [
+      ...blocks,
+      { id: `${message.id}-status-${status.kind}-${blocks.length}`, type: 'status' as const, status },
+    ],
+  };
+}
+
+function upsertStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'status' && block.status.kind === status.kind);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) => index === existing && block.type === 'status' ? { ...block, status } : block)
+    : [
+        ...blocks,
+        { id: `${message.id}-status-${status.kind}`, type: 'status' as const, status },
+      ];
+  return { ...message, blocks: nextBlocks };
+}
+
+function settleOpenTools(
+  message: ChatMessage,
+  status: 'incomplete' | 'error',
+  output?: string,
+): ChatMessage {
+  const openStatuses = new Set<ToolCallData['status']>(['queued', 'running', 'waiting_approval']);
+  const tools = message.toolCalls?.map((tool) =>
+    openStatuses.has(tool.status)
+      ? {
+          ...tool,
+          status,
+          output: output ?? tool.output,
+          success: status === 'error' ? false : tool.success,
+        }
+      : tool,
+  );
+  if (!tools) return message;
+  return tools.reduce<ChatMessage>(
+    (updatedMessage, tool) => upsertToolBlock(updatedMessage, tool),
+    { ...message, toolCalls: tools },
+  );
+}
+
+function updatePermissionBlock(
+  message: ChatMessage,
+  id: string,
+  update: (request: PermissionRequestData) => PermissionRequestData,
+): ChatMessage {
+  const blocks = currentBlocks(message);
+  let updatedRequest: PermissionRequestData | undefined;
+  const nextBlocks = blocks.map((block) => {
+    if (block.type !== 'permission' || block.request.id !== id) return block;
+    updatedRequest = update(block.request);
+    return { ...block, request: updatedRequest };
+  });
+  if (!updatedRequest) return message;
+  return {
+    ...message,
+    blocks: nextBlocks,
+    permissionRequest: message.permissionRequest?.id === id
+      ? updatedRequest
+      : message.permissionRequest,
+  };
 }
 
 // Matches the prefix emitted in provider.ts _handleSend when context files are attached.
@@ -455,6 +544,48 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: msgs };
     }
 
+    case 'STREAM_WARNING': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = appendStatusBlock(assistant, {
+          kind: 'warning',
+          message: action.message,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_RATE_LIMITED': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'rate_limited',
+          message: action.message,
+          retryAfterSeconds: action.retryAfterSeconds,
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_IDLE_NOTICE': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'idle',
+          message: action.message,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
     case 'ARTIFACT_START': {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
@@ -537,7 +668,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
       // action.tokens is a number (total), not a tokenCount object
       const tokenCount = typeof action.tokens === 'number'
@@ -556,7 +687,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
       return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
     }
@@ -566,7 +697,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', action.message);
       }
       const errMsg: ChatMessage = {
         id: nextId(),
@@ -754,6 +885,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
 
         const rawText = textFromContent(m.content);
+        if (role === 'user' && isInternalHistoryUserMessage(rawText, m.synthetic)) {
+          continue;
+        }
         const { displayText: userVisibleText, hadVisionMarker } = role === 'user'
           ? stripVisionPreprocessText(rawText)
           : { displayText: rawText, hadVisionMarker: false };
@@ -798,17 +932,27 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
+        const toolCalls = last.toolCalls?.map((tool) =>
+          tool.id === action.id ? { ...tool, status: 'waiting_approval' as const } : tool,
+        );
         const request: PermissionRequestData = {
           id: action.id,
+          sessionId: action.sessionId,
           toolName: action.toolName,
+          reason: action.reason,
           args: action.args,
           isDestructive: action.isDestructive,
           status: 'pending',
         };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
+        let nextMessage = upsertPermissionBlock({
           ...last,
+          toolCalls,
           permissionRequest: request,
         }, request);
+        for (const tool of toolCalls ?? []) {
+          nextMessage = upsertToolBlock(nextMessage, tool);
+        }
+        msgs[msgs.length - 1] = nextMessage;
       }
       return { ...state, messages: msgs };
     }
@@ -816,15 +960,33 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'PERMISSION_RESPOND': {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant' && last.permissionRequest?.id === action.id) {
-        const request: PermissionRequestData = {
-          ...last.permissionRequest,
-          status: action.allowed ? 'allowed' : 'denied',
-        };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
-          ...last,
-          permissionRequest: request,
-        }, request);
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => ({
+          ...request,
+          status: 'submitting',
+          decision: action.decision,
+          error: undefined,
+        }));
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'PERMISSION_RESPONSE_RESULT': {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => action.success
+          ? {
+              ...request,
+              status: request.decision === 'deny' ? 'denied' : 'allowed',
+              error: undefined,
+            }
+          : {
+              ...request,
+              status: 'pending',
+              decision: undefined,
+              error: action.message || 'Permission response failed',
+            });
       }
       return { ...state, messages: msgs };
     }

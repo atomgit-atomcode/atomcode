@@ -125,7 +125,11 @@ impl AgentLoop {
                         }
                     }
                 }
-                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")).or_else(|| output.find("Created new file ")) {
+                if let Some(pos) = output
+                    .find("Wrote ")
+                    .or_else(|| output.find("Overwrote "))
+                    .or_else(|| output.find("Created new file "))
+                {
                     let keyword_len = if output[pos..].starts_with("Overwrote ") {
                         10
                     } else if output[pos..].starts_with("Created new file ") {
@@ -260,7 +264,12 @@ impl AgentLoop {
                 // mid-turn persistence; the approval flow itself is
                 // managed by the `approval_req_rx` channel.
             }
-            TurnEvent::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+            TurnEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+            } => {
                 let _ = self.event_tx.send(AgentEvent::RateLimited {
                     reset_at_display,
                     reset_label,
@@ -342,7 +351,7 @@ impl AgentLoop {
                     .map(|(path, content)| format!("[Auto-read from error: {}]\n{}", path, content))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                self.conversation.add_user_message(&injection);
+                self.conversation.add_synthetic_user_message(&injection);
             }
         }
     }

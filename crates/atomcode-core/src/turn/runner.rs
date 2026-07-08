@@ -1592,11 +1592,11 @@ impl TurnRunner {
         // Emit ToolCall telemetry event for both success and failure.
         let scrub_home = crate::tool::real_home_dir();
         let output_tail = atomcode_telemetry::scrub::truncate_head(
-            &atomcode_telemetry::scrub::scrub_path(
+            &atomcode_telemetry::scrub::redact_secrets(&atomcode_telemetry::scrub::scrub_path(
                 &tool_result.output,
                 scrub_home.as_deref(),
                 Some(&self.context.working_dir.read().await.clone()),
-            ),
+            )),
             200,
         );
         // Detect warning: exit 0 (success) but stderr present.
@@ -2382,6 +2382,36 @@ mod is_only_placeholder_filler_tests {
 }
 
 #[cfg(test)]
+mod build_args_summary_tests {
+    use super::build_args_summary;
+
+    #[test]
+    fn redacts_secret_in_json_string_arg() {
+        // The reported leak: a bash command embedding a GitHub PAT. The summary
+        // is uploaded on tool-call failure — the token must not survive it.
+        let args = r#"{"command":"curl -s -H \"Authorization: token ghp_Qq1234567890abcdefghijKLMNOP0987654321\""}"#;
+        let out = build_args_summary("bash", args);
+        assert!(!out.contains("ghp_Qq1234567890"), "token leaked: {out}");
+        assert!(out.contains("bash("), "shape preserved: {out}");
+    }
+
+    #[test]
+    fn redacts_secret_in_non_json_fallback() {
+        let args = "raw sk-ant-api03-abcdef_ghijklmnopqrstuvwx-YZ0123456789 blob";
+        let out = build_args_summary("bash", args);
+        assert!(!out.contains("sk-ant-api03-abcdef"), "token leaked: {out}");
+    }
+
+    #[test]
+    fn keeps_ordinary_args_readable() {
+        let args = r#"{"path":"/src/task-manager/main.rs"}"#;
+        let out = build_args_summary("read_file", args);
+        assert!(out.contains("task-manager"), "should not mangle path: {out}");
+        assert!(!out.contains("<REDACTED>"));
+    }
+}
+
+#[cfg(test)]
 mod normalize_tool_args_tests {
     use super::normalize_tool_args;
 
@@ -3145,7 +3175,13 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
                 .map(|(k, v)| {
                     let val_str = match v {
                         serde_json::Value::String(s) => {
-                            atomcode_telemetry::scrub::truncate_head(s, 50)
+                            // Redact secrets (tokens/keys/auth headers) BEFORE
+                            // truncating — a secret near the start survives a
+                            // length cap, so length alone is not privacy.
+                            atomcode_telemetry::scrub::truncate_head(
+                                &atomcode_telemetry::scrub::redact_secrets(s),
+                                50,
+                            )
                         }
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
@@ -3165,10 +3201,13 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
             return format!("{}({})", tool_name, pairs.join(", "));
         }
     }
-    // Fallback: truncate raw args
+    // Fallback: redact secrets, then truncate raw args.
     format!(
         "{}({})",
         tool_name,
-        atomcode_telemetry::scrub::truncate_head(args, 100)
+        atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::redact_secrets(args),
+            100
+        )
     )
 }

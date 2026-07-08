@@ -462,6 +462,11 @@ pub struct ToolResultInfo {
 pub struct MessageInfo {
     pub role: String,
     pub content: String,
+    /// True when a `Role::User` message was injected by the agent/runtime rather
+    /// than authored by the human. UI clients use this to avoid rendering
+    /// internal reminders as user input bubbles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     /// Tool result summary (for tool role messages)
@@ -642,6 +647,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         Self {
             role: role.to_string(),
             content,
+            synthetic: msg.synthetic,
             tool_calls,
             tool_result,
             artifacts,
@@ -2760,6 +2766,13 @@ async fn process_chat_request(
             // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
             // 用于在对话里渲染缩略图。
             use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+            // Bind the conversation's session id onto the (throwaway) provider so
+            // maybe_preprocess forwards x-atomcode-session-id onto the one-off VL
+            // request (gateway affinity), matching the TUI bridge / live paths.
+            let vl_sid = session.id.as_str();
+            if !vl_sid.is_empty() {
+                provider.set_session_id(vl_sid);
+            }
             let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
                 PreprocessOutcome::Skipped => req.message.clone(),
                 PreprocessOutcome::Replaced { text, vl_key } => {
@@ -4466,6 +4479,10 @@ async fn fs_mkdir(
     match std::fs::create_dir_all(&dir) {
         Ok(()) => {
             let canon = dir.canonicalize().unwrap_or(dir);
+            // Strip the Windows `\\?\` prefix (parity with fs_list): the returned
+            // path is round-tripped back into /cd, and an unstripped verbatim form
+            // would split the session hash bucket.
+            let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
             Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
         }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
@@ -5026,6 +5043,17 @@ mod tests {
             info.images.as_deref(),
             Some([ImageData { missing: true, .. }])
         ));
+    }
+
+    #[test]
+    fn message_info_preserves_synthetic_user_flag() {
+        use atomcode_core::conversation::message::Message;
+
+        let msg = Message::synthetic_user("internal reminder");
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.role, "user");
+        assert!(info.synthetic, "daemon API must expose synthetic provenance");
     }
 
     #[test]

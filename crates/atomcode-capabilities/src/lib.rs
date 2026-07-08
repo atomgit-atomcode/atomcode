@@ -52,6 +52,12 @@ pub(crate) mod paths;
 /// console-window flash without `capabilities` depending on `core`.
 pub(crate) mod process_utils;
 
+/// ONE home for Windows path normalization (native-canonical internally,
+/// forward-slash at the LLM/UI boundary). `pub` so the v2 drivers that depend on
+/// capabilities (`review`, `clix`, `bridge`) can reuse it. Local copy of
+/// `core::tool::strip_verbatim_prefix` (L1 must not depend on `core`).
+pub mod pathnorm;
+
 /// Proxy policy for outbound HTTP clients — a self-contained mirror of
 /// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so v2 clients
 /// honor `no_proxy` without `capabilities` depending on `core`. Compiled

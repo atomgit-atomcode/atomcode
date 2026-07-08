@@ -193,6 +193,7 @@ export interface ToolResultInfo {
 export interface SessionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  synthetic?: boolean;
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
@@ -334,6 +335,15 @@ export interface ConfigInfo {
 export async function getConfig(): Promise<ConfigInfo> {
   const resp = await fetch('/config', { headers: authHeaders() });
   return resp.json();
+}
+
+/** Trigger a hot-reload of config from disk (POST /config/reload). */
+export async function postConfigReload(): Promise<void> {
+  const resp = await fetch('/config/reload', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`config reload failed: ${resp.status}`);
 }
 
 // --- Projects types ---

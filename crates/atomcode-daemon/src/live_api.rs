@@ -589,7 +589,13 @@ impl TurnExecutor for DaemonTurnExecutor {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         UserInput {
             text,
             images: input.images,
@@ -987,7 +993,13 @@ impl TurnExecutor for KernelTurnExecutor {
             .clone();
         let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
         let original_text = input.text.clone();
-        let text = preprocess_live_caption(&input.text, &input.images, provider_name).await;
+        let text = preprocess_live_caption(
+            &input.text,
+            &input.images,
+            provider_name,
+            Some(self.session_id.as_str()),
+        )
+        .await;
         // VL 预处理成功后（text 发生了变化），图片已被转成文字，清空 images
         // 以免 kernel 的 provider adapter 把原图发给不支持视觉的模型（导致 400 错误）
         let images = if text != original_text {
@@ -1414,11 +1426,14 @@ fn restore_images_from_turn_base(
     let final_user_indexes: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter_map(|(idx, msg)| (msg.role == Role::User).then_some(idx))
+        .filter_map(|(idx, msg)| (msg.role == Role::User && !msg.synthetic).then_some(idx))
         .collect();
     let mut final_user_indexes = final_user_indexes.into_iter();
 
-    for original in turn_base.iter().filter(|msg| msg.role == Role::User) {
+    for original in turn_base
+        .iter()
+        .filter(|msg| msg.role == Role::User && !msg.synthetic)
+    {
         let Some(idx) = final_user_indexes.next() else {
             continue;
         };
@@ -2118,6 +2133,7 @@ async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
+    session_id: Option<&str>,
 ) -> String {
     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
@@ -2134,6 +2150,13 @@ async fn preprocess_live_caption(
         Some(Ok(p)) => p,
         _ => return message.to_string(),
     };
+    // Bind the conversation's session id onto this (throwaway) active provider so
+    // `maybe_preprocess` forwards it onto the one-off VL request as
+    // `x-atomcode-session-id` — otherwise the webui/live vision call is the
+    // session-less second request of the turn. Empty ⇒ header omitted.
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        active.set_session_id(sid);
+    }
     match maybe_preprocess(&config, &*active, message, images).await {
         PreprocessOutcome::Skipped => message.to_string(),
         PreprocessOutcome::Replaced { text, vl_key } => {
@@ -2623,7 +2646,7 @@ mod tests {
     // （有图的 VL 路径依赖真实 config/provider，覆盖在 vision_preprocessor 的单测里。）
     #[tokio::test]
     async fn preprocess_live_caption_is_passthrough_without_images() {
-        let out = preprocess_live_caption("看下这个图片", &[], None).await;
+        let out = preprocess_live_caption("看下这个图片", &[], None, None).await;
         assert_eq!(out, "看下这个图片");
     }
 
@@ -2731,6 +2754,49 @@ mod tests {
             &messages[3].content,
             MessageContent::MultiPart { text, images }
                 if text.as_deref() == Some("分析")
+                    && images.len() == 1
+                    && images[0].data == "aW1hZ2U="
+        ));
+    }
+
+    #[test]
+    fn restore_images_from_turn_base_ignores_synthetic_user_ordinals() {
+        use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+
+        let image_user = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("分析图片".into()),
+                images: vec![ImagePart {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+            },
+            synthetic: false,
+        };
+        let final_messages = vec![
+            Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
+            Message::new(
+                Role::User,
+                "分析图片\n\n[图片内容（由 vl-provider 识别）]\n一张图片",
+            ),
+            Message::new(Role::Assistant, "done"),
+        ];
+
+        let messages = restore_images_from_turn_base(
+            final_messages,
+            &[Message::synthetic_user("[Auto-read from error: src/main.rs]"), image_user],
+        );
+
+        assert!(messages[0].synthetic);
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text.contains("Auto-read")
+        ));
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::MultiPart { text, images }
+                if text.as_deref() == Some("分析图片")
                     && images.len() == 1
                     && images[0].data == "aW1hZ2U="
         ));

@@ -850,11 +850,186 @@ impl Config {
     pub fn default_path() -> PathBuf {
         Self::config_dir().join("config.toml")
     }
+
+    /// FIRST-RUN ONLY config seed for offline / managed deploys (e.g. a government
+    /// intranet that ships a bundled `atomcode-default-config.toml` next to the
+    /// binary and points `--seed-config` / `ATOMCODE_SEED_CONFIG` at it).
+    ///
+    /// If `config_path` does NOT yet exist and `seed_source` is a readable, parseable
+    /// config, copy it into place so the very first launch is already configured (no
+    /// per-machine setup). The user then owns that writable copy — this NEVER
+    /// overwrites an existing config, so the launcher can pass the flag unconditionally.
+    ///
+    /// Every failure mode is non-fatal and returned (not panicked / logged here) so the
+    /// caller can warn and fall back to normal onboarding — a bad seed must never block
+    /// startup. The raw file is copied verbatim (comments/formatting preserved), only
+    /// after `Config::load` confirms it parses.
+    pub fn seed_user_config(config_path: &Path, seed_source: Option<&Path>) -> SeedOutcome {
+        if config_path.exists() {
+            return SeedOutcome::AlreadyConfigured;
+        }
+        let Some(src) = seed_source else {
+            return SeedOutcome::NoSource;
+        };
+        // Validate by loading (read + toml parse + migrations) before adopting, so a
+        // malformed seed can't wedge the user into a broken config.
+        let seed = match Config::load(src) {
+            Ok(c) => c,
+            Err(e) => return SeedOutcome::Invalid(e.to_string()),
+        };
+        // Parse-valid is not enough: a seed whose `default_provider` is empty or
+        // doesn't name a real `[providers.*]` entry (an easy IT typo) would copy in
+        // fine, then launch the user into a config that EXISTS but has no working
+        // provider — and because it exists, onboarding won't fire, so there's no
+        // recovery hint. Reject it here so we fall back to onboarding instead.
+        if seed.default_provider.is_empty() {
+            return SeedOutcome::Invalid(
+                "seed config has no default_provider set".to_string(),
+            );
+        }
+        if !seed.providers.contains_key(&seed.default_provider) {
+            return SeedOutcome::Invalid(format!(
+                "seed config default_provider \"{}\" does not match any [providers.*] entry",
+                seed.default_provider
+            ));
+        }
+        if let Some(parent) = config_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return SeedOutcome::IoError(e.to_string());
+            }
+        }
+        if let Err(e) = std::fs::copy(src, config_path) {
+            return SeedOutcome::IoError(e.to_string());
+        }
+        SeedOutcome::Seeded
+    }
+}
+
+/// Result of [`Config::seed_user_config`]. Only `Seeded` changed anything on disk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// Copied the seed into `config_path`.
+    Seeded,
+    /// The user already had a config — left untouched (the common steady-state case).
+    AlreadyConfigured,
+    /// No `--seed-config` / `ATOMCODE_SEED_CONFIG` provided (the default for normal builds).
+    NoSource,
+    /// Seed file was unreadable or not a valid config — skipped, keep onboarding.
+    Invalid(String),
+    /// Filesystem error creating/writing the target — skipped, keep onboarding.
+    IoError(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NOTE: the provider-type key in TOML is `type` (ProviderConfig uses
+    // #[serde(rename = "type")]), NOT `provider_type`.
+    const SEED_TOML: &str = "default_provider = \"glm-internal\"\n\
+        [providers.glm-internal]\n\
+        type = \"openai\"\n\
+        base_url = \"http://gw.internal/v1\"\n\
+        model = \"glm-5.2\"\n\
+        api_key = \"internal\"\n";
+
+    #[test]
+    fn seed_copies_when_no_user_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("atomcode-default-config.toml");
+        std::fs::write(&seed, SEED_TOML).unwrap();
+        let target = dir.path().join("home/.atomcode/config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert_eq!(outcome, SeedOutcome::Seeded);
+        assert!(target.exists(), "seed must create the user config");
+        // Copied verbatim + parses to the internal provider default.
+        let loaded = Config::load(&target).unwrap();
+        assert_eq!(loaded.default_provider, "glm-internal");
+    }
+
+    #[test]
+    fn seed_never_overwrites_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed.toml");
+        std::fs::write(&seed, SEED_TOML).unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "default_provider = \"mine\"\n").unwrap();
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert_eq!(outcome, SeedOutcome::AlreadyConfigured);
+        // User's file is untouched.
+        assert!(std::fs::read_to_string(&target).unwrap().contains("mine"));
+    }
+
+    #[test]
+    fn seed_no_source_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        assert_eq!(
+            Config::seed_user_config(&target, None),
+            SeedOutcome::NoSource
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn seed_rejects_malformed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("bad.toml");
+        std::fs::write(&seed, "this = is = not valid toml =\n").unwrap();
+        let target = dir.path().join("config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert!(matches!(outcome, SeedOutcome::Invalid(_)));
+        assert!(!target.exists(), "a bad seed must not create a config");
+    }
+
+    #[test]
+    fn seed_rejects_unresolvable_default_provider() {
+        // Parses fine, but default_provider names no [providers.*] entry (IT typo).
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("typo.toml");
+        std::fs::write(
+            &seed,
+            "default_provider = \"glm-internel\"\n\
+             [providers.glm-internal]\n\
+             type = \"openai\"\n\
+             model = \"glm-5.2\"\n",
+        )
+        .unwrap();
+        let target = dir.path().join("config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert!(
+            matches!(outcome, SeedOutcome::Invalid(_)),
+            "unresolvable default_provider must be rejected, got {outcome:?}"
+        );
+        assert!(!target.exists(), "a broken seed must not create a config");
+    }
+
+    #[test]
+    fn seed_rejects_empty_default_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("noprov.toml");
+        // Parses fine (explicit empty string), but names no provider → reject.
+        std::fs::write(&seed, "default_provider = \"\"\n").unwrap();
+        let target = dir.path().join("config.toml");
+
+        let outcome = Config::seed_user_config(&target, Some(&seed));
+        assert!(matches!(outcome, SeedOutcome::Invalid(_)));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn seed_missing_source_file_is_invalid_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let outcome =
+            Config::seed_user_config(&target, Some(&dir.path().join("nope.toml")));
+        assert!(matches!(outcome, SeedOutcome::Invalid(_)));
+        assert!(!target.exists());
+    }
 
     /// LSP must default to disabled. 5-7 atomgr datalog (build 942b615):
     /// the only `diagnostics` call in 99 turns took 33.6s for a "No

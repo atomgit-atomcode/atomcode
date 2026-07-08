@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-kernel"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "Spike: neutral agent kernel (Phase A0 — design validation, throwaway internals)"
 publish = false

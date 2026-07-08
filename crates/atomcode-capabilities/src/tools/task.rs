@@ -141,7 +141,10 @@ prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard'}. 'explor
 read-only investigation returning findings; 'worker' = edits files then stops (you review \
 the diff afterward). 'simple' runs on the fast model, 'hard' on the capable model. Give \
 each worker a TIGHTLY-specified task and non-overlapping file scopes when dispatching \
-several. Subagents run in parallel and cannot themselves dispatch."
+several. Subagents run in parallel and cannot themselves dispatch. The WHOLE batch is \
+emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small batches \
+(a few at a time): many long prompts in one call can overflow the model's output and be \
+rejected as invalid JSON — prefer several smaller calls over one huge one."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -182,7 +185,12 @@ several. Subagents run in parallel and cannot themselves dispatch."
             Err(e) => {
                 return ToolResult {
                     call_id: String::new(),
-                    content: format!("invalid task args: {e}"),
+                    content: format!(
+                        "invalid task args: {e}\n\nThe arguments were not valid JSON — the output \
+                         was likely truncated (a large batch can exceed the model's output limit) \
+                         or a string contained an unescaped quote. Retry with FEWER subtasks \
+                         and/or SHORTER prompts, and ensure every string value is JSON-escaped."
+                    ),
                     is_error: true,
                     images: vec![],
                 }
@@ -384,7 +392,11 @@ several. Subagents run in parallel and cannot themselves dispatch."
 
 /// Parse the tool args, repairing unescaped control characters on failure (weak
 /// models / gateways sometimes emit a raw newline inside a JSON string value, which
-/// serde rejects). Repairs ONLY on failure, so valid JSON is never altered. Shared by
+/// serde rejects). Repairs ONLY on failure, so valid JSON is never altered. This is
+/// the primary repair for a fresh dispatch — the model's tool-call args arrive
+/// verbatim (no upstream repair on the inbound path). It CANNOT recover a truncated
+/// payload (a large batch hitting the model's output limit) or an unescaped quote;
+/// the tool description advises smaller batches to avoid producing one. Shared by
 /// `risk` and `execute` so both agree on whether a dispatch contains a `worker` — a
 /// mismatch would let a file-editing worker with control-char args skip the approval
 /// gate.

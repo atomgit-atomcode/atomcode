@@ -582,6 +582,17 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// FIRST-RUN ONLY: seed the user's config from this file when they don't yet
+    /// have one (`~/.atomcode/config.toml` absent). Copies it in once, then never
+    /// touches it again — the user owns the writable copy. On read/parse failure,
+    /// falls back to normal onboarding (never blocks startup). For offline/managed
+    /// deploys (e.g. a bundled `atomcode-default-config.toml` shipped next to the
+    /// binary): point this at that file via the launcher. Env: `ATOMCODE_SEED_CONFIG`.
+    /// No-op when the user already has a config, so it's safe to always pass.
+    /// Env `ATOMCODE_SEED_CONFIG` is honored as a fallback when the flag is absent.
+    #[arg(long, value_name = "PATH")]
+    seed_config: Option<PathBuf>,
+
     /// Working directory (defaults to current directory)
     #[arg(long, short = 'C')]
     dir: Option<PathBuf>,
@@ -1421,6 +1432,36 @@ async fn run() -> Result<i32> {
     // Default: start TUI
 
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+
+    // FIRST-RUN seed for offline / managed deploys (e.g. a government intranet
+    // that ships a bundled default config): if the user has no config yet and a
+    // `--seed-config <path>` (or `ATOMCODE_SEED_CONFIG` env) source is given, copy
+    // it into place once. No-op when a config already exists, so it's safe for the
+    // launcher to always pass. Any failure is non-fatal → normal onboarding.
+    let seed_source = cli.seed_config.clone().or_else(|| {
+        std::env::var_os("ATOMCODE_SEED_CONFIG")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+    match atomcode_core::config::Config::seed_user_config(&config_path, seed_source.as_deref()) {
+        atomcode_core::config::SeedOutcome::Seeded => {
+            if let Some(src) = seed_source.as_deref() {
+                eprintln!(
+                    "[seed] initialized {} from {}",
+                    config_path.display(),
+                    src.display()
+                );
+            }
+        }
+        atomcode_core::config::SeedOutcome::Invalid(e) => {
+            eprintln!("Warning: --seed-config ignored (not a valid config): {e}");
+        }
+        atomcode_core::config::SeedOutcome::IoError(e) => {
+            eprintln!("Warning: --seed-config could not be applied: {e}");
+        }
+        // AlreadyConfigured / NoSource → nothing to do, stay quiet.
+        _ => {}
+    }
 
     let mut config = if config_path.exists() {
         Config::load(&config_path).unwrap_or_else(|e| {
@@ -2571,10 +2612,10 @@ async fn run_headless(
             | AgentEvent::PeerBusy(_)
             | AgentEvent::ProviderChanged(_)
             | AgentEvent::ProjectSwitched(_)
+            | AgentEvent::ModeChanged { .. }
             | AgentEvent::SessionSwitched(_)
             | AgentEvent::SessionRenamed { .. }
-            | AgentEvent::RemoteSlashCommand(_)
-            | AgentEvent::ModeChanged { .. } => {
+            | AgentEvent::RemoteSlashCommand(_) => {
                 // Live-sync only — not applicable in headless CLI.
             }
             AgentEvent::GoalUpdate { .. } => {

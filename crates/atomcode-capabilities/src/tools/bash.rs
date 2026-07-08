@@ -89,6 +89,8 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(reason) => return err(reason),
         };
+        #[cfg(unix)]
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
         // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
         // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
         // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
@@ -1485,6 +1487,36 @@ mod tests {
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn execute_preserves_utf8_paths_when_parent_locale_is_c() {
+        let d = tempfile::tempdir().unwrap();
+        let command = r#"
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#;
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+
+        let result = BashTool
+            .execute(
+                &serde_json::json!({ "command": command }).to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(
+            result
+                .content
+                .contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "content was: {:?}",
+            result.content
+        );
     }
 
     // macOS sudo (and some Linux configs) does NOT auto-use SUDO_ASKPASS just because

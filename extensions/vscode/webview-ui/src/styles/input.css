@@ -358,6 +358,10 @@
 .slash-item-label { color: var(--app-brand); font-weight: 600; }
 .slash-item-desc { color: var(--app-secondary-foreground); }
 
+.slash-item.active .slash-item-desc {
+  color: var(--app-command-menu-active-foreground);
+}
+
 .slash-picker.allow-hover .slash-item:hover {
   background: var(--app-command-menu-hover-background);
 }
@@ -431,10 +435,12 @@
 
 .file-picker-item:hover {
   background: var(--app-menu-selection-background);
+  color: var(--app-menu-selection-foreground);
 }
 
 .file-picker-item.active {
   background: var(--app-menu-selection-background);
+  color: var(--app-menu-selection-foreground);
 }
 
 .at-mention-picker {
@@ -480,4 +486,28 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.file-picker-item:hover,
+.file-picker-item:hover .file-picker-item-name {
+  color: var(--app-menu-selection-foreground);
+}
+
+.file-picker-item.active,
+.file-picker-item.active .file-picker-item-name {
+  color: var(--app-menu-selection-foreground);
+}
+
+.file-picker-item:hover .file-picker-item-path,
+.file-picker-item.active .file-picker-item-path {
+  color: var(--app-menu-selection-foreground);
+}
+
+.at-mention-picker .file-picker-item:hover,
+.at-mention-picker .file-picker-item.active,
+.at-mention-picker .file-picker-item:hover .file-picker-item-name,
+.at-mention-picker .file-picker-item.active .file-picker-item-name,
+.at-mention-picker .file-picker-item:hover .file-picker-item-path,
+.at-mention-picker .file-picker-item.active .file-picker-item-path {
+  color: var(--app-command-menu-active-foreground);
 }

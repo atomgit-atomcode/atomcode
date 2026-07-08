@@ -291,52 +291,7 @@ pub(crate) fn attach_live_session(
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(session.snapshot())
             });
-        use atomcode_core::conversation::message::{MessageContent, Role};
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照 —".to_string(),
-        });
-        for m in &snapshot {
-            match (&m.role, &m.content) {
-                (Role::User, MessageContent::Text(s)) => {
-                    renderer.render(UiLine::User(s.clone()));
-                }
-                (Role::Assistant, MessageContent::Text(s)) => {
-                    if !s.is_empty() {
-                        renderer.render(UiLine::AssistantText(s.clone()));
-                        renderer.render(UiLine::AssistantLineBreak);
-                    }
-                }
-                (
-                    Role::Assistant,
-                    MessageContent::AssistantWithToolCalls {
-                        text, tool_calls, ..
-                    },
-                ) => {
-                    if let Some(t) = text {
-                        if !t.is_empty() {
-                            renderer.render(UiLine::AssistantText(t.clone()));
-                            renderer.render(UiLine::AssistantLineBreak);
-                        }
-                    }
-                    for tc in tool_calls {
-                        renderer.render(UiLine::ToolCall {
-                            name: super::display_tool_name(&tc.name),
-                            detail: super::format_tool_detail(&tc.name, &tc.arguments),
-                        });
-                    }
-                }
-                (Role::Tool, MessageContent::ToolResult(r)) => {
-                    renderer.render(UiLine::ToolResult {
-                        success: r.success,
-                        summary: super::summarise(&r.output),
-                    });
-                }
-                _ => {}
-            }
-        }
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照结束 —".to_string(),
-        });
+        render_live_snapshot_messages(renderer, &snapshot);
     }
     let handle = super::live_sync::spawn_live_forwarder(
         session.clone(),
@@ -348,6 +303,58 @@ pub(crate) fn attach_live_session(
     renderer.render(UiLine::CommandOutput(
         "已同步当前会话（与浏览器实时互通）".to_string(),
     ));
+}
+
+fn render_live_snapshot_messages(
+    renderer: &mut dyn Renderer,
+    snapshot: &[atomcode_core::conversation::message::Message],
+) {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    renderer.render(UiLine::TurnSeparator {
+        label: "— 同步快照 —".to_string(),
+    });
+    for m in snapshot {
+        match (&m.role, &m.content) {
+            (Role::User, MessageContent::Text(s)) if !m.synthetic => {
+                renderer.render(UiLine::User(s.clone()));
+            }
+            (Role::Assistant, MessageContent::Text(s)) => {
+                if !s.is_empty() {
+                    renderer.render(UiLine::AssistantText(s.clone()));
+                    renderer.render(UiLine::AssistantLineBreak);
+                }
+            }
+            (
+                Role::Assistant,
+                MessageContent::AssistantWithToolCalls {
+                    text, tool_calls, ..
+                },
+            ) => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        renderer.render(UiLine::AssistantText(t.clone()));
+                        renderer.render(UiLine::AssistantLineBreak);
+                    }
+                }
+                for tc in tool_calls {
+                    renderer.render(UiLine::ToolCall {
+                        name: super::display_tool_name(&tc.name),
+                        detail: super::format_tool_detail(&tc.name, &tc.arguments),
+                    });
+                }
+            }
+            (Role::Tool, MessageContent::ToolResult(r)) => {
+                renderer.render(UiLine::ToolResult {
+                    success: r.success,
+                    summary: super::summarise(&r.output),
+                });
+            }
+            _ => {}
+        }
+    }
+    renderer.render(UiLine::TurnSeparator {
+        label: "— 同步快照结束 —".to_string(),
+    });
 }
 
 /// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
@@ -3225,7 +3232,7 @@ pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<Strin
     if !skill.user_invocable {
         return None;
     }
-    Some(skill.expand(arg, ctx.current_session.id.as_str()))
+    Some(skill.expand_for_injection(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/plugin` subcommands: marketplace add/remove/update/list,
@@ -5981,6 +5988,47 @@ mod tests {
         std::fs::create_dir(&sub).expect("mkdir sub");
         let sub = strip(&sub.canonicalize().expect("canon sub"));
         (tmp, cwd, sub)
+    }
+
+    #[test]
+    fn live_snapshot_replay_skips_synthetic_user_messages() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let snapshot = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::synthetic_user("[Auto-read from error: src/main.rs]"),
+            Message::new(Role::Assistant, "reply"),
+        ];
+        let mut rec = Rec::default();
+
+        render_live_snapshot_messages(&mut rec, &snapshot);
+
+        let users: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["real prompt"]);
     }
 
     /// `resolve_cd` must never return a Windows `\\?\` verbatim / extended-length

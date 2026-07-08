@@ -2,7 +2,8 @@
 //! reasoning content, and a `finish_reason=length` truncation are all first-class
 //! — none silently degrades into an empty SUCCESSFUL turn.
 
-use atomcode_kernel::event::AgentEvent;
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{MockProvider, RecorderHook, ScriptedProvider};
 use atomcode_kernel::tool::ToolRegistry;
@@ -182,14 +183,30 @@ async fn recovered_truncation_continues_without_warning() {
             _ => {}
         }
     }
-    handle.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = handle.task.await;
 
     assert!(
         warning.is_none(),
         "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
     assert!(completed, "the turn still completes after the continuation");
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let snapshot = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Snapshot { snapshot }) => break snapshot.messages,
+            Some(_) => continue,
+            None => panic!("never received a Snapshot reply"),
+        }
+    };
+    assert!(
+        snapshot.iter().any(|m| {
+            m.role == Role::User
+                && m.synthetic
+                && m.text.to_lowercase().contains("output limit")
+        }),
+        "the stored truncation resume nudge must be a synthetic user message: {snapshot:?}"
+    );
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
 
     let calls = received.lock().unwrap();
     assert_eq!(
@@ -266,7 +283,6 @@ async fn repeated_truncation_is_bounded() {
 // --- local helpers (keep each test terse; mirror spike_claims.rs style) ---
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
-use atomcode_kernel::event::AgentCommand;
 use atomcode_kernel::provider::LlmProvider;
 
 fn send(text: &str) -> AgentCommand {
@@ -289,7 +305,6 @@ fn spawn_agent(
 // --- agent-layer visible retry (second tier above the transport retry) ---
 
 use async_trait::async_trait;
-use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::tool::ToolDef;
 use futures::stream::BoxStream;

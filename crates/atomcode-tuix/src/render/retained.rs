@@ -622,6 +622,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Cleared by `ToolCallCommit`, which freezes the row to a static
     /// `▸` icon (no longer live) so the next push_body_row appends
     /// cleanly below it and the spinner can resume on the next tick.
+    /// A body push that arrives while the strip is STILL live (e.g. a
+    /// `task` tool streaming `↻`/`✓` progress rows) no longer buries the
+    /// strip: `push_body_row` calls `lift_inflight_strip` to pop it first
+    /// (keeping `inflight_tool` Some), and the next tick re-emits it at
+    /// the new tail — otherwise each such push orphaned a frozen snapshot.
     /// (call_id, name, detail).
     inflight_tool: Option<(String, String, String)>,
     /// Number of body lines occupied by the multi-line wrapped in-flight
@@ -1046,6 +1051,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 self.scrolled_off
             );
             self.body_lines.truncate(self.body_lines.len() - remove);
+            // The old strip rows are already gone (truncated above), so clear the count
+            // BEFORE re-pushing: otherwise `push_body_row`'s `lift_inflight_strip` would see
+            // the stale `prev_rows` and pop that many rows of REAL content off the tail.
+            self.inflight_tool_rows = 0;
             for row in new_rows {
                 self.push_body_row(row);
             }
@@ -2492,6 +2501,50 @@ impl<W: Write + Send> RetainedRenderer<W> {
         true
     }
 
+    /// Lift the live in-flight tool-call strip off the body tail — the multi-line mirror of
+    /// [`clear_live_spinner`]. Pops the strip's `inflight_tool_rows` rows so a following
+    /// `push_body_row` appends CLEANLY at the tail instead of burying the strip mid-buffer.
+    /// Keeps `inflight_tool` Some and zeroes `inflight_tool_rows`, so the next spinner /
+    /// StreamingBox tick re-emits a fresh strip below the just-pushed row (its `prev_rows == 0`
+    /// path). Without this, a tool that streams body rows WHILE inflight (the `task` fan-out's
+    /// `↻`/`✓` progress lines) orphans one frozen `●Task…` snapshot per streamed line — the
+    /// reported time-lapse trail. Returns true if a strip was lifted.
+    fn lift_inflight_strip(&mut self) -> bool {
+        let n = self.inflight_tool_rows;
+        if n == 0 {
+            return false;
+        }
+        crate::tuix_trace!(
+            "BPOP",
+            "site=inflight len_before={} n={} scrolled_off={}",
+            self.body_lines.len(),
+            n,
+            self.scrolled_off
+        );
+        for _ in 0..n {
+            self.body_lines.pop();
+        }
+        self.inflight_tool_rows = 0;
+        // EL-erase the vacated slots for immediate feedback (anti-flash); the next
+        // paint_frame cell-diff also redraws this region. Mirrors clear_live_spinner, but
+        // clamped to the screen height so a multi-row strip lifted while the body overflows
+        // (target saturated at the footer boundary) can't erase past the terminal bottom.
+        let target = self.next_body_emit_row();
+        if target > 0 {
+            let h = self.screen.height();
+            let mut seq = String::new();
+            for i in 0..n as u16 {
+                let r = target.saturating_add(i);
+                if r == 0 || r > h {
+                    break;
+                }
+                seq.push_str(&format!("\x1b[{r};1H\x1b[K"));
+            }
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
@@ -2552,6 +2605,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // it; its decrement path is now a no-op (kept to avoid a
             // bigger refactor in this combined commit).
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+        }
+        // Same discipline for the live in-flight tool strip: a body push must not bury it
+        // mid-buffer (that orphans a frozen snapshot per push — the `task` streaming trail).
+        // Lift it here; the next tick re-emits it at the new tail below this row.
+        let lifted = self.inflight_tool_rows as u16;
+        if self.lift_inflight_strip() {
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(lifted);
         }
         // Append-only: `next_body_emit_row` checks the cap; emit is
         // a no-op when the footer occupies the whole viewport.
@@ -6444,6 +6504,68 @@ mod tests {
             after_first,
             "body_lines grew across spinner ticks — render_inflight_tool \
              must remove previous inflight rows before re-rendering"
+        );
+    }
+
+    #[test]
+    fn retained_streaming_body_under_inflight_strip_does_not_trail() {
+        // Regression: the `task` fan-out streams `↻`/`✓` progress lines as body rows WHILE its
+        // `● Task(N subtasks)` inflight strip is the live tail. Before `push_body_row` learned to
+        // lift the strip, each streamed line buried + orphaned a frozen `●Task…` snapshot — the
+        // reported time-lapse trail (`Task(5 subtasks) · thinking… · 18.9s / 19.0s / …`). The
+        // strip must be lifted on each body push and re-emitted ONCE at the new tail.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let text = |row: &Vec<Cell>| row.iter().map(|c| c.ch).collect::<String>();
+
+        r.render_inflight_tool("●", "Task", "5 subtasks", "");
+        assert_eq!(r.inflight_tool_rows, 1, "strip established as one live row");
+
+        for i in 0..6 {
+            r.push_body_text(&format!("start explore{i}"), &CellStyle::default());
+            assert_eq!(r.inflight_tool_rows, 0, "a body push must LIFT the live strip");
+            // Next spinner tick re-emits the strip at the new tail.
+            r.render_inflight_tool("●", "Task", "5 subtasks", "");
+        }
+
+        let strip_rows = r.body_lines.iter().filter(|row| text(row).contains("Task")).count();
+        assert_eq!(strip_rows, 1, "exactly ONE live Task strip — no trail; got {strip_rows}");
+        let streamed = r
+            .body_lines
+            .iter()
+            .filter(|row| text(row).contains("start explore"))
+            .count();
+        assert_eq!(streamed, 6, "all six streamed lines present above the strip");
+    }
+
+    #[test]
+    fn retained_inflight_fallback_rowcount_change_does_not_pop_real_content() {
+        // Regression for the `lift_inflight_strip` re-entrancy: `render_inflight_tool`'s
+        // FALLBACK branch truncates the old strip manually then re-pushes via `push_body_row`.
+        // If `inflight_tool_rows` isn't zeroed before that loop, push_body_row's new
+        // `lift_inflight_strip` sees the stale count and pops that many rows of REAL content.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let text = |row: &Vec<Cell>| row.iter().map(|c| c.ch).collect::<String>();
+        r.push_body_text("real line A", &CellStyle::default());
+        r.push_body_text("real line B", &CellStyle::default());
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2
+        );
+
+        // 1-row strip (first render → fallback with prev_rows == 0).
+        r.render_inflight_tool("\u{25cf}", "Bash", "short", "");
+        assert_eq!(r.inflight_tool_rows, 1);
+
+        // A detail that WRAPS to multiple rows ⇒ prev_rows(1) != n(>1) ⇒ fallback re-push.
+        let long = "x".repeat(200);
+        r.render_inflight_tool("\u{25cf}", "Bash", &long, "");
+        assert!(r.inflight_tool_rows >= 2, "wrapped strip should be multi-row: {}", r.inflight_tool_rows);
+
+        // Both real lines must survive — the fallback re-push must not have popped them.
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2,
+            "fallback re-push popped real content via a stale inflight_tool_rows"
         );
     }
 
