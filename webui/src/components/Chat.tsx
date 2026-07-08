@@ -978,8 +978,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setProvider(name);
         if (sync) void postLiveProvider(name);
       },
-      // changeDir: 直接调 api.ts 的 changeDir（POST /cd）。
-      changeDir: async (path) => { await changeDir(path); },
+      // changeDir: 直接调 api.ts 的 changeDir（POST /cd），并把新目录上报给 App。
+      changeDir: async (path) => {
+        const res = await changeDir(path);
+        if (res.success) {
+          onCwdChanged?.(res.current_dir);
+          pushCommandNotice(t('cmd.cd.done', { dir: res.current_dir }));
+        } else {
+          pushCommandNotice(res.message);
+        }
+      },
       // openSessionSidebar: 侧栏开关状态在 App，Chat 无此 prop。
       openSessionSidebar: () => { pushCommandNotice(t('cmd.resume.openHint')); },
       // reloadConfig: POST /config/reload。
@@ -987,12 +995,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         await postConfigReload();
         pushCommandNotice(t('cmd.reload.done'));
       },
-      openSlashSkillsMenu: () => { setSlashOpen(true); },
+      openSlashSkillsMenu: () => { setSlashQuery(''); setSlashIndex(0); setSlashOpen(true); },
       notice: (text) => pushCommandNotice(text),
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync],
+    [t, modeState, sync, onCwdChanged],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -1274,7 +1282,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         setSlashOpen(false);
         setHistoryHint(null);
-        void dispatchSlashCommand(text, slashCommandMap, slashHandlers);
+        void dispatchSlashCommand(text, slashCommandMap, slashHandlers)
+          .catch((e) => pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) })));
         return;
       }
     }
