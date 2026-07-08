@@ -165,6 +165,18 @@ test('/context and /compact dispatch to execServerCommand', async () => {
   assert.deepEqual(calls, ['exec:context:', 'exec:compact:focus on the bug']);
 });
 
+test('display commands dispatch to execServerCommand', async () => {
+  const calls: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {}, changeDir: () => {},
+    openSessionSidebar: () => {}, reloadConfig: () => {}, openSlashSkillsMenu: () => {},
+    notice: () => {}, execServerCommand: (cmd, arg) => { calls.push(`${cmd}:${arg}`); }, t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  for (const c of ['whoami','status','config','diff','cost','todo']) await dispatchSlashCommand(`/${c}`, map, h);
+  assert.deepEqual(calls, ['whoami:','status:','config:','diff:','cost:','todo:']);
+});
+
 test('/remember and /forget without arg emit a notice', async () => {
   const calls: string[] = [];
   const h: SlashHandlers = {

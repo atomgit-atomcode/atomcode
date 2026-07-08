@@ -82,6 +82,12 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
   { name: 'context', descKey: 'cmd.context.desc', run: (a, h) => h.execServerCommand('context', a) },
   { name: 'compact', descKey: 'cmd.compact.desc', argHint: '[focus]', run: (a, h) => h.execServerCommand('compact', a) },
+  { name: 'whoami', descKey: 'cmd.whoami.desc', run: (a, h) => h.execServerCommand('whoami', a) },
+  { name: 'status', descKey: 'cmd.status.desc', run: (a, h) => h.execServerCommand('status', a) },
+  { name: 'config', descKey: 'cmd.config.desc', run: (a, h) => h.execServerCommand('config', a) },
+  { name: 'diff', descKey: 'cmd.diff.desc', run: (a, h) => h.execServerCommand('diff', a) },
+  { name: 'cost', descKey: 'cmd.cost.desc', run: (a, h) => h.execServerCommand('cost', a) },
+  { name: 'todo', descKey: 'cmd.todo.desc', run: (a, h) => h.execServerCommand('todo', a) },
 ];
 
 export function buildCommandMap(defs: SlashCommandDef[]): Map<string, SlashCommandDef> {

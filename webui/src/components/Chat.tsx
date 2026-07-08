@@ -1119,6 +1119,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             );
             return;
           }
+          if (res.kind === 'whoami') {
+            pushCommandNotice(res.logged_in
+              ? t('cmd.whoami.body', { name: res.name ?? res.username ?? '', user: res.username ?? '', email: res.email ?? '—' })
+              : t('cmd.whoami.none'));
+            return;
+          }
+          if (res.kind === 'status') {
+            pushCommandNotice(t('cmd.status.body', {
+              model: res.model || '—', dir: res.working_dir, provider: res.provider || '—',
+              login: res.logged_in ? (res.username ?? '') : t('cmd.status.notLoggedIn'), config: res.config_path,
+            }));
+            return;
+          }
+          if (res.kind === 'config') { pushCommandNotice(t('cmd.config.body', { path: res.path, provider: res.provider || '—' })); return; }
+          if (res.kind === 'diff') { pushCommandNotice(res.stat.trim() ? res.stat : t('cmd.diff.clean')); return; }
+          if (res.kind === 'cost') { pushCommandNotice(t('cmd.cost.body', { tokens: res.total_tokens, turns: res.turn_count })); return; }
+          if (res.kind === 'todo') {
+            if (!res.items.length) { pushCommandNotice(t('cmd.todo.empty')); return; }
+            const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[~]' : '[ ]');
+            pushCommandNotice(`${t('cmd.todo.header')}\n${res.items.map((i) => `${mark(i.status)} ${i.content}`).join('\n')}`);
+            return;
+          }
         } finally {
           if (isCompact) compactingRef.current = false;
         }
