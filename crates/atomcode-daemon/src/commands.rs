@@ -70,10 +70,14 @@ fn reindex_after_front_drain(session: &mut Session, removed: usize) {
     });
 }
 
-/// 按会话自身 working_dir 保存（落回正确的桶，跨 /cd 稳定）。
-fn save_command_session(session: &mut Session) -> anyhow::Result<()> {
+/// 保存到与加载时相同的桶：若有 project_hash 则写 project_hash 桶，否则按 working_dir 桶。
+/// 与 load_command_session 严格对称，防止 undo/compact 写入不同桶产生幽灵副本。
+fn save_command_session(session: &mut Session, project_hash: Option<&str>) -> anyhow::Result<()> {
     session.touch();
-    SessionManager::new(&session.working_dir).save(session)?;
+    match project_hash {
+        Some(hash) => crate::save_session_to_hash(hash, session)?,
+        None => SessionManager::new(&session.working_dir).save(session)?,
+    }
     Ok(())
 }
 
@@ -153,7 +157,7 @@ fn exec_undo(
     let mut session = load_command_session(working_dir, project_hash, &session_id)?;
     let undone = apply_undo(&mut session, arg);
     if undone > 0 {
-        save_command_session(&mut session)?;
+        save_command_session(&mut session, project_hash)?;
     }
     Ok(CommandResult::Undo { undone })
 }
@@ -292,7 +296,7 @@ async fn exec_compact(
     session.cold_summaries = snap.cold_summaries;
     if outcome.applied {
         reindex_after_front_drain(&mut session, outcome.removed_messages);
-        save_command_session(&mut session)?;
+        save_command_session(&mut session, project_hash)?;
     }
 
     Ok(CommandResult::Compact {
@@ -730,5 +734,42 @@ mod tests {
         // turn_stats: after_message=4 survives, after_message=6 is pruned.
         assert_eq!(s.turn_stats.len(), 1);
         assert_eq!(s.turn_stats[0].after_message, 4);
+    }
+
+    /// Verify save_session_to_hash / load_session bucket symmetry:
+    /// writing to a project-hash bucket and reading it back returns the same session.
+    #[test]
+    fn save_session_to_hash_roundtrip() {
+        use std::sync::Mutex as TestMutex;
+        use std::sync::OnceLock;
+
+        // Process-global env lock so ATOMCODE_HOME mutations don't race other tests.
+        fn env_lock() -> &'static TestMutex<()> {
+            static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| TestMutex::new(()))
+        }
+
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        std::env::set_var("ATOMCODE_HOME", dir.path());
+
+        let result = std::panic::catch_unwind(|| {
+            let session = session_with_turns(2);
+            let hash = "deadbeef";
+
+            crate::save_session_to_hash(hash, &session).expect("save_session_to_hash");
+
+            let loaded = crate::load_session(hash, session.id.as_str()).expect("load_session");
+            assert_eq!(loaded.id.as_str(), session.id.as_str());
+            assert_eq!(loaded.messages.len(), session.messages.len());
+        });
+
+        match &prev {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+
+        result.expect("round-trip test panicked");
     }
 }

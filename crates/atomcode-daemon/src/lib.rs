@@ -1302,6 +1302,20 @@ pub(crate) fn load_session(project_hash: &str, session_id: &str) -> std::io::Res
     serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
+/// Save a session to a specific project-hash bucket (symmetric with `load_session`).
+/// Ensures undo/compact write back to the exact file they loaded from.
+pub(crate) fn save_session_to_hash(
+    project_hash: &str,
+    session: &atomcode_core::session::Session,
+) -> std::io::Result<()> {
+    let dir = SessionManager::sessions_root_dir().join(project_hash);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", session.id.as_str()));
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)
+}
+
 // ============== HTTP Handlers ==============
 
 /// Health check response
