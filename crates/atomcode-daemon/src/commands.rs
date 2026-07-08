@@ -46,6 +46,30 @@ fn prune_orphaned_display(session: &mut Session) {
     session.turn_stats.retain(|t| t.after_message <= n);
 }
 
+/// 压缩从 FRONT 排走消息（不同于 undo 从尾部截断），所以 surviving display/turn 锚点
+/// 必须向前平移 `removed`：落在被排走范围内的丢弃，其余减去偏移量。
+/// (`after_message == 0` 表示"第一条消息之前"——无条件保留。)
+fn reindex_after_front_drain(session: &mut Session, removed: usize) {
+    session.display_messages.retain_mut(|d| {
+        if d.after_message == 0 {
+            true
+        } else if d.after_message <= removed {
+            false
+        } else {
+            d.after_message -= removed;
+            true
+        }
+    });
+    session.turn_stats.retain_mut(|t| {
+        if t.after_message <= removed {
+            false
+        } else {
+            t.after_message -= removed;
+            true
+        }
+    });
+}
+
 /// 按会话自身 working_dir 保存（落回正确的桶，跨 /cd 稳定）。
 fn save_command_session(session: &mut Session) -> anyhow::Result<()> {
     session.touch();
@@ -255,7 +279,7 @@ async fn exec_compact(
     session.messages = snap.messages;
     session.cold_summaries = snap.cold_summaries;
     if outcome.applied {
-        prune_orphaned_display(&mut session);
+        reindex_after_front_drain(&mut session, outcome.removed_messages);
         save_command_session(&mut session)?;
     }
 
@@ -360,6 +384,60 @@ mod tests {
         let remaining = MemoryStore::project(wd).load();
         assert!(!remaining.iter().any(|e| e.contains("delete-me")));
         assert!(remaining.iter().any(|e| e.contains("keep-me")));
+    }
+
+    #[test]
+    fn reindex_after_front_drain_shifts_survivors_drops_drained() {
+        // Build a session with 7 messages (simulating post-compaction state where 3 were drained).
+        // Before drain: display_messages had after_message 0 / 2 / 5; turn_stats had 2 / 6.
+        // After draining 3 from the front: 0 stays 0; 2 drops (<=3); 5 shifts to 2.
+        //                                  turn_stats: 2 drops (<=3); 6 shifts to 3.
+        let mut s = session_with_turns(0);
+        // after_message=0: "before the first message" — always kept.
+        s.display_messages.push(DisplayMessage {
+            after_message: 0,
+            message: Message::new(Role::Assistant, "preamble"),
+        });
+        // after_message=2: within the drained range (<=3) — should be dropped.
+        s.display_messages.push(DisplayMessage {
+            after_message: 2,
+            message: Message::new(Role::Assistant, "drained"),
+        });
+        // after_message=5: survivor — shifts to 5-3=2.
+        s.display_messages.push(DisplayMessage {
+            after_message: 5,
+            message: Message::new(Role::Assistant, "keep"),
+        });
+        // turn_stat at 2: drained (<=3) — dropped.
+        s.turn_stats.push(TurnStat {
+            after_message: 2,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 50,
+            total_tokens: 5,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        // turn_stat at 6: survivor — shifts to 6-3=3.
+        s.turn_stats.push(TurnStat {
+            after_message: 6,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 50,
+            total_tokens: 5,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+        reindex_after_front_drain(&mut s, 3);
+        // display_messages: [0, 2] (0 kept, 2 dropped, 5→2)
+        assert_eq!(s.display_messages.len(), 2);
+        assert_eq!(s.display_messages[0].after_message, 0);
+        assert_eq!(s.display_messages[1].after_message, 2);
+        // turn_stats: single entry with after_message=3 (2 dropped, 6→3)
+        assert_eq!(s.turn_stats.len(), 1);
+        assert_eq!(s.turn_stats[0].after_message, 3);
     }
 
     #[test]
