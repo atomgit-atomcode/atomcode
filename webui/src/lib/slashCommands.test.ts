@@ -125,3 +125,11 @@ test('empty query returns all commands then all skills', () => {
   assert.equal(items.filter((i) => i.kind === 'command').length, FRONTEND_COMMANDS.length);
   assert.equal(items[items.length - 1].kind, 'skill');
 });
+
+test('skills are sorted alphabetically by name (commands keep FRONTEND_COMMANDS order)', () => {
+  const skills = [{ name: 'zebra', description: 'z' }, { name: 'apple', description: 'a' }];
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, skills, '', (k) => k);
+  const skillItems = items.filter((i) => i.kind === 'skill');
+  assert.equal(skillItems[0].name, 'apple');
+  assert.equal(skillItems[1].name, 'zebra');
+});

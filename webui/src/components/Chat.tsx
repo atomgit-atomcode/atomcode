@@ -56,7 +56,7 @@ import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
   images?: ImageData[];
   /** Epoch ms this message was sent/received (PR #562 send-time labels).
@@ -402,6 +402,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
+  // without a stale closure (refs always reflect the latest render value).
+  const busyRef = useRef(false);
+  busyRef.current = busy;
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
   const [queued, setQueued] = useState<{
     id: number;
@@ -944,39 +948,62 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
-  // 命令输出以独立 notice 气泡追加进转录（复用 renderAssistantParts 的 kind:'notice'）。
+  // 命令输出以独立 system 消息追加进转录，与 assistant 消息分离。
+  // 若流式 assistant 回复正在进行（busy），把 notice 插到它之前，
+  // 确保 appendToLastAssistant 始终以真正的 assistant 气泡为最后一条。
   function pushCommandNotice(text: string) {
-    setMessages((prev) => [
-      ...prev,
-      { role: 'assistant', parts: [{ kind: 'notice', text }], ts: Date.now() },
-    ]);
+    setMessages((prev) => {
+      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
+      const last = prev[prev.length - 1];
+      // Keep an in-flight streaming assistant reply as the last element so
+      // appendToLastAssistant still targets IT, not this notice.
+      if (last && last.role === 'assistant' && busyRef.current) {
+        return [...prev.slice(0, -1), note, last];
+      }
+      return [...prev, note];
+    });
   }
 
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
 
+  // ── Shared mode / provider switch helpers ──────────────────────────────────
+  // Defined in render scope (not memoized) so they always close over the latest
+  // modeState / sync. Both call sites — ModeSelector.onChange / slashHandlers
+  // and ModelSelector.onChange / slashHandlers — call these directly.
+
+  /** Initiate a mode switch. onConfirmed is called with the server-confirmed
+   *  mode after the backend round-trip completes (used by slash commands to
+   *  emit a notice with the ACTUAL confirmed mode, not the requested one). */
+  function switchMode(m: ApprovalMode, onConfirmed?: (confirmed: ApprovalMode) => void) {
+    if (modeState.pendingMode) return;
+    const nextState = beginModeSwitch(modeState, m);
+    if (nextState === modeState) return;
+    setModeState(nextState);
+    void postLiveMode(m)
+      .then((confirmed) => {
+        setModeState((cur) => completeModeSwitch(cur, confirmed));
+        onConfirmed?.(confirmed);
+      })
+      .catch(() => setModeState((cur) => failModeSwitch(cur)));
+  }
+
+  /** Switch the active provider and notify the backend when in sync mode. */
+  function switchProvider(name: string) {
+    setProvider(name);
+    if (sync) void postLiveProvider(name);
+  }
+
   const slashHandlers: SlashHandlers = useMemo(
     () => ({
-      // setMode: 镜像 ModeSelector.onChange 的完整模式切换逻辑。
-      // Notice 只在后端确认成功后发出（不提前、不在 no-op / 失败时发）。
+      // setMode: 委托给 switchMode；notice 用后端确认的模式（非请求的模式）。
       setMode: (m) => {
-        if (modeState.pendingMode) return;
-        const nextState = beginModeSwitch(modeState, m);
-        if (nextState !== modeState) {
-          setModeState(nextState);
-          void postLiveMode(m)
-            .then((confirmed) => {
-              setModeState((cur) => completeModeSwitch(cur, confirmed));
-              pushCommandNotice(t('cmd.mode.done', { mode: m }));
-            })
-            .catch(() => setModeState((cur) => failModeSwitch(cur)));
-        }
+        switchMode(m, (confirmed) => pushCommandNotice(t('cmd.mode.done', { mode: confirmed })));
       },
       // openModelPicker: ModelSelector 是自包含组件，无法从外部以编程方式打开。
       openModelPicker: () => { pushCommandNotice(t('cmd.model.openHint')); },
-      // setProvider: 镜像 ModelSelector.onChange（实时同步 + 本地状态）。
+      // setProvider: 委托给 switchProvider（实时同步 + 本地状态）。
       setProvider: (name) => {
-        setProvider(name);
-        if (sync) void postLiveProvider(name);
+        switchProvider(name);
       },
       // changeDir: 直接调 api.ts 的 changeDir（POST /cd），并把新目录上报给 App。
       changeDir: async (path) => {
@@ -995,12 +1022,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         await postConfigReload();
         pushCommandNotice(t('cmd.reload.done'));
       },
-      openSlashSkillsMenu: () => { setSlashQuery(''); setSlashIndex(0); setSlashOpen(true); },
+      openSlashSkillsMenu: () => {
+        // Behave exactly like typing '/': set input to '/', open the menu with
+        // all commands + skills, and focus the textarea so the user can type to
+        // filter. Trigger the skills fetch if it hasn't been loaded yet.
+        setInput('/');
+        setSlashQuery('');
+        setSlashIndex(0);
+        if (slashSkills === null && !slashLoading) {
+          setSlashLoading(true);
+          getSkills()
+            .then(setSlashSkills)
+            .catch(() => setSlashSkills([]))
+            .finally(() => setSlashLoading(false));
+        }
+        setSlashOpen(true);
+        requestAnimationFrame(() => {
+          const ta = textareaRef.current;
+          if (!ta) return;
+          ta.focus();
+          ta.setSelectionRange(1, 1);
+          ta.style.height = 'auto';
+          ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+        });
+      },
       notice: (text) => pushCommandNotice(text),
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -1769,28 +1819,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         <ModeSelector
           value={modeState.displayMode}
           disabled={Boolean(modeState.pendingMode)}
-          onChange={(m) => {
-            if (modeState.pendingMode) return;
-            const nextState = beginModeSwitch(modeState, m);
-            if (nextState === modeState) return;
-            setModeState(nextState);
-            // 模式是进程级 runtime 状态：立即通知后端（下一轮生效）并广播给其他 tab。
-            // 与 provider 不同，无 sync 门控——审批策略是会话级全局，始终上报。
-            void postLiveMode(m)
-              .then((confirmed) => setModeState((current) => completeModeSwitch(current, confirmed)))
-              .catch(() => {
-                setModeState((current) => failModeSwitch(current));
-              });
-          }}
+          onChange={(m) => switchMode(m)}
         />
         <ModelSelector
           value={provider}
-          onChange={(p) => {
-            setProvider(p);
-            // 同步模式：下拉框一变就通知后端，TUI 头部与其他端实时跟随
-            // （非同步模式只改本端的待发 provider，发消息时再带上）。
-            if (sync) void postLiveProvider(p);
-          }}
+          onChange={(p) => switchProvider(p)}
         />
         {busy ? (
           <>
@@ -2011,6 +2044,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           // Pre-compute per-turn text for assistant messages: collect all text
           // from consecutive assistant messages between two user messages, so
           // the copy button can copy the entire LLM turn (not just one chunk).
+          // system messages are transparent — they don't end an assistant turn.
           const turnTexts = new Map<number, string>();
           {
             let start = -1;
@@ -2020,7 +2054,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 if (start < 0) start = i;
                 const t = messageFullText(messages[i]);
                 if (t) parts.push(t);
-              } else {
+              } else if (messages[i].role === 'user') {
+                // Only a user message ends the current assistant turn.
                 if (start >= 0) {
                   for (let j = start; j < i; j++) {
                     turnTexts.set(j, parts.join('\n\n'));
@@ -2029,6 +2064,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   parts = [];
                 }
               }
+              // role === 'system': transparent — do not flush the turn.
             }
             // Flush the last turn
             if (start >= 0) {
@@ -2036,6 +2072,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 turnTexts.set(j, parts.join('\n\n'));
               }
             }
+          }
+
+          // Helper: skip system messages when looking for the "next role".
+          // Needed so a trailing system notice doesn't hide the copy button
+          // on the real last AI reply of the turn.
+          function nextNonSystemRole(from: number): string | undefined {
+            for (let k = from; k < messages.length; k++) {
+              if (messages[k].role !== 'system') return messages[k].role;
+            }
+            return undefined;
           }
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
@@ -2047,15 +2093,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} timeLabel={timeLabel} timeFull={timeFull} />;
             }
 
+            // system messages render as a standalone notice row (no copy button,
+            // no turn grouping, no streaming cursor).
+            if (msg.role === 'system') {
+              return (
+                <div class="msg-notice" key={origIdx} ref={setMatchRef}>
+                  {msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('')}
+                </div>
+              );
+            }
+
             // Determine if this assistant message is the last one in the current
-            // turn (i.e. the next message is a user message, or this is the very
-            // last message in the list). Only the last assistant message in a turn
-            // gets the copy button, so one user turn → one copy button.
+            // turn (i.e. the next NON-SYSTEM message is a user message, or there
+            // are no more non-system messages). Only the last assistant message in
+            // a turn gets the copy button, so one user turn → one copy button.
             // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
             // 因为这两者是基于完整 messages 序列算的。
-            const isLastInTurn =
-              origIdx === lastIdx ||
-              messages[origIdx + 1]?.role === 'user';
+            const nextRole = nextNonSystemRole(origIdx + 1);
+            const isLastInTurn = nextRole === 'user' || nextRole === undefined;
 
             return (
               <AssistantMessageView
