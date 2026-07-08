@@ -337,6 +337,14 @@ export async function getConfig(): Promise<ConfigInfo> {
   return resp.json();
 }
 
+/** Trigger a hot-reload of config from disk (POST /config/reload). */
+export async function postConfigReload(): Promise<void> {
+  await fetch('/config/reload', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+}
+
 // --- Projects types ---
 
 export interface ProjectInfo {

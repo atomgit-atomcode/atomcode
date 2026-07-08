@@ -266,6 +266,8 @@ const zh = {
   'cmd.help.desc': '显示可用命令',
   'cmd.help.title': '可用命令：',
   'cmd.mode.done': '已切换到 {mode} 模式',
+  'cmd.model.openHint': '请点击底部模型选择器以切换模型',
+  'cmd.resume.openHint': '请点击侧栏按钮恢复历史会话',
 
   // Common
   'common.readonly': '只读',
@@ -517,6 +519,8 @@ const en: Record<MsgKey, string> = {
   'cmd.help.desc': 'Show available commands',
   'cmd.help.title': 'Available commands:',
   'cmd.mode.done': 'Switched to {mode} mode',
+  'cmd.model.openHint': 'Click the model selector below to switch models',
+  'cmd.resume.openHint': 'Click the sidebar button to resume a session',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',

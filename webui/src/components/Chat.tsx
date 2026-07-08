@@ -27,7 +27,15 @@
 
 import { VNode } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload } from '../api';
+import {
+  parseSlashCommand,
+  buildCommandMap,
+  dispatchSlashCommand,
+  buildSlashMenuItems,
+  FRONTEND_COMMANDS,
+  type SlashHandlers,
+} from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
@@ -936,6 +944,54 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     });
   }
 
+  // 命令输出以独立 notice 气泡追加进转录（复用 renderAssistantParts 的 kind:'notice'）。
+  function pushCommandNotice(text: string) {
+    setMessages((prev) => [
+      ...prev,
+      { role: 'assistant', parts: [{ kind: 'notice', text }], ts: Date.now() },
+    ]);
+  }
+
+  const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
+
+  const slashHandlers: SlashHandlers = useMemo(
+    () => ({
+      // setMode: 镜像 ModeSelector.onChange 的完整模式切换逻辑。
+      setMode: (m) => {
+        if (modeState.pendingMode) return;
+        const nextState = beginModeSwitch(modeState, m);
+        if (nextState !== modeState) {
+          setModeState(nextState);
+          void postLiveMode(m)
+            .then((confirmed) => setModeState((cur) => completeModeSwitch(cur, confirmed)))
+            .catch(() => setModeState((cur) => failModeSwitch(cur)));
+        }
+        pushCommandNotice(t('cmd.mode.done', { mode: m }));
+      },
+      // openModelPicker: ModelSelector 是自包含组件，无法从外部以编程方式打开。
+      openModelPicker: () => { pushCommandNotice(t('cmd.model.openHint')); },
+      // setProvider: 镜像 ModelSelector.onChange（实时同步 + 本地状态）。
+      setProvider: (name) => {
+        setProvider(name);
+        if (sync) void postLiveProvider(name);
+      },
+      // changeDir: 直接调 api.ts 的 changeDir（POST /cd）。
+      changeDir: async (path) => { await changeDir(path); },
+      // openSessionSidebar: 侧栏开关状态在 App，Chat 无此 prop。
+      openSessionSidebar: () => { pushCommandNotice(t('cmd.resume.openHint')); },
+      // reloadConfig: POST /config/reload。
+      reloadConfig: async () => {
+        await postConfigReload();
+        pushCommandNotice(t('cmd.reload.done'));
+      },
+      openSlashSkillsMenu: () => { setSlashOpen(true); },
+      notice: (text) => pushCommandNotice(text),
+      t,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t, modeState, sync],
+  );
+
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
   // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
   function pushNoticeToLastAssistant(text: string) {
@@ -1207,6 +1263,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (modeState.pendingMode) return;
     if (!text && images.length === 0) return;
 
+    // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
+    if (images.length === 0) {
+      const parsed = parseSlashCommand(text);
+      if (parsed && slashCommandMap.has(parsed.name)) {
+        setInput('');
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        setSlashOpen(false);
+        setHistoryHint(null);
+        void dispatchSlashCommand(text, slashCommandMap, slashHandlers);
+        return;
+      }
+    }
+
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
     setPendingImages([]);
@@ -1244,12 +1313,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
 
-    // 斜杠菜单导航
+    // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
-      const filtered = (slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
+      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSlashIndex((i) => Math.min(i + 1, filtered.length - 1));
+        setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -1257,9 +1326,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSlashIndex((i) => Math.max(i - 1, 0));
         return;
       }
-      if (e.key === 'Enter' && filtered.length > 0) {
+      if (e.key === 'Enter' && mergedItems.length > 0) {
         e.preventDefault();
-        insertSkill(filtered[slashIndex].name);
+        insertSkill(mergedItems[slashIndex].name);
         return;
       }
       if (e.key === 'Escape') {
@@ -1623,17 +1692,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
-          {(slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name)).map((s, i) => (
+          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string).map((item, i) => (
             <button
-              key={s.name}
+              key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); insertSkill(s.name); }}
+              onMouseDown={(e) => { e.preventDefault(); insertSkill(item.name); }}
               onMouseEnter={() => setSlashIndex(i)}
               type="button"
-              title={s.description || ''}
+              title={item.description || ''}
             >
-              <span class="slash-name">/{s.name}</span>
-              {s.description && <span class="slash-desc">{s.description}</span>}
+              <span class="slash-name">/{item.name}</span>
+              {item.description && <span class="slash-desc">{item.description}</span>}
             </button>
           ))}
         </div>
