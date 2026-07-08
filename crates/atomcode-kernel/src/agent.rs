@@ -1336,6 +1336,8 @@ impl RunningAgent {
                 }
             };
             let mut assistant_text = String::new();
+            let mut reasoning_started_at: Option<u64> = None;
+            let mut reasoning_elapsed_ms: u64 = 0;
             // ACCUMULATE the model's reasoning/thinking across the stream alongside
             // the visible text. It is STORED on the assistant Message (the live
             // `AgentEvent::Reasoning` channel below is kept too) so a provider
@@ -1404,6 +1406,19 @@ impl RunningAgent {
                         None => break,
                     },
                 };
+                match &ev {
+                    StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. } => {
+                        if reasoning_started_at.is_none() {
+                            reasoning_started_at = Some(self.clock.now_millis());
+                        }
+                    }
+                    StreamEvent::TextDelta(_) | StreamEvent::ToolCall(_) | StreamEvent::ToolCallDelta { .. } => {
+                        if let Some(start) = reasoning_started_at.take() {
+                            reasoning_elapsed_ms = self.clock.now_millis().saturating_sub(start);
+                        }
+                    }
+                    _ => {}
+                }
                 match ev {
                     StreamEvent::TextDelta(mut t) => {
                         // STREAMED-OUTPUT transform seam: run the hook on EACH chunk
@@ -1606,6 +1621,9 @@ impl RunningAgent {
                     }
                 }
             }
+            if let Some(start) = reasoning_started_at.take() {
+                reasoning_elapsed_ms = self.clock.now_millis().saturating_sub(start);
+            }
             // MID-STREAM 429 WaitAndRetry: the stream loop set retry_this_round and
             // broke out. Re-issue the same logical round (round was already
             // incremented at the top of the outer loop, so decrement to neutralize).
@@ -1733,6 +1751,7 @@ impl RunningAgent {
             let meta = MessageMeta {
                 tokens: usage,
                 elapsed_ms: self.clock.now_millis().saturating_sub(start),
+                reasoning_elapsed_ms,
                 ctx_window,
                 used_tokens,
                 utilization,
