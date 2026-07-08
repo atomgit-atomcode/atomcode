@@ -39,7 +39,9 @@
 // explicit Shutdown gives clean "process the last queued line + flush"
 // semantics rather than "drop whatever is still in flight".
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -106,6 +108,15 @@ enum AckOp {
 /// protocol is the same `UiLine` enum.
 pub struct TaskRenderer {
     cmd_tx: mpsc::Sender<RenderCmd>,
+    /// Coalesces the 5ms `FlushDeferred` heartbeat: `true` means one is already
+    /// queued and undrained, so we skip enqueuing another. Without this, when the
+    /// worker's terminal write blocks — classically the Windows console pausing
+    /// output in QuickEdit/mark-selection mode — the ~200/sec heartbeat piles
+    /// unbounded `FlushDeferred`s into the channel until allocation fails and the
+    /// `panic = "abort"` build fast-fails (Windows reports it as a "stack-based
+    /// buffer overrun"). A flush is idempotent, so collapsing redundant ones is
+    /// visually lossless — the single queued flush paints the latest state.
+    flush_pending: Arc<AtomicBool>,
     /// Join handle for the worker thread; `Some` until `Drop` takes it
     /// to `join()`.
     worker: Option<thread::JoinHandle<()>>,
@@ -117,12 +128,15 @@ impl TaskRenderer {
     /// renderer only via the returned facade.
     pub fn new(inner: Box<dyn Renderer>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
+        let flush_pending = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&flush_pending);
         let worker = thread::Builder::new()
             .name("tuix-render".to_string())
-            .spawn(move || run_worker(inner, cmd_rx))
+            .spawn(move || run_worker(inner, cmd_rx, worker_flag))
             .expect("spawn render worker thread");
         Self {
             cmd_tx,
+            flush_pending,
             worker: Some(worker),
         }
     }
@@ -199,7 +213,12 @@ impl Renderer for TaskRenderer {
     }
 
     fn flush_deferred(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::FlushDeferred);
+        // Only enqueue if none is already pending (coalesce the 5ms heartbeat).
+        // See `flush_pending` — prevents unbounded channel growth when the
+        // worker's write is stalled (Windows console pause).
+        if !self.flush_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.cmd_tx.send(RenderCmd::FlushDeferred);
+        }
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
@@ -251,7 +270,11 @@ impl Drop for TaskRenderer {
     }
 }
 
-fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
+fn run_worker(
+    mut inner: Box<dyn Renderer>,
+    cmd_rx: mpsc::Receiver<RenderCmd>,
+    flush_pending: Arc<AtomicBool>,
+) {
     use std::time::Instant;
     while let Ok(cmd) = cmd_rx.recv() {
         // Measure the wall-clock time each terminal I/O takes so the log
@@ -272,6 +295,10 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                 crate::tuix_trace!("REN", "Flush flush={}µs", t0.elapsed().as_micros());
             }
             RenderCmd::FlushDeferred => {
+                // Clear the coalescing flag BEFORE flushing so any render that
+                // arrives during this (possibly slow / blocked) flush can queue a
+                // fresh FlushDeferred and repaint the latest state afterward.
+                flush_pending.store(false, Ordering::Release);
                 // Skip logging when it's a true no-op (no pending payload
                 // and window not elapsed). throttle.rs already logs when
                 // this path actually paints.

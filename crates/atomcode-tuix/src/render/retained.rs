@@ -40,6 +40,11 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
+/// Hard cap on the partial-line buffer for streaming assistant text. It's
+/// normally drained per newline; this bounds a pathological newline-less stream
+/// so it can't grow the buffer until allocation fails. 1 MiB ≫ any real line.
+const ASSISTANT_LINE_BUF_MAX: usize = 1 << 20;
+
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
@@ -3745,6 +3750,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
+                // Safety cap: `flush_assistant_lines` only drains up to a `\n`, so a
+                // stream that dribbles bytes without ever emitting a newline (a hung
+                // keep-alive connection, or a model streaming one enormous single
+                // line) would grow `assistant_line_buf` without bound → OOM →
+                // `panic = "abort"` (surfaces on Windows as a "stack-based buffer
+                // overrun"). Force-flush the partial as a body row once it gets
+                // absurdly large. 1 MiB is orders of magnitude beyond any real line,
+                // so normal replies never hit this.
+                if self.assistant_line_buf.len() > ASSISTANT_LINE_BUF_MAX {
+                    self.flush_assistant_remainder();
+                }
             }
             UiLine::ReasoningText(text) => {
                 // Display reasoning in faint style with word wrapping.
@@ -13091,6 +13107,24 @@ mod tests {
             text, "partial",
             "resize must not append assistant_line_buf into body_log again; \
              AssistantText chunks are already logged before they enter the line buffer"
+        );
+    }
+
+    /// A streaming reply that never emits a newline (hung keep-alive / one giant
+    /// single line) must not grow `assistant_line_buf` without bound — that was an
+    /// OOM → `panic=abort` (Windows "stack-based buffer overrun"). The >1 MiB cap
+    /// force-flushes the partial, keeping the buffer bounded.
+    #[test]
+    fn assistant_line_buf_capped_on_newlineless_stream() {
+        let (mut r, _buf) = new_capturing(40, 10);
+        let chunk = "x".repeat(100 * 1024); // 100 KiB, NO newline
+        for _ in 0..30 {
+            r.render(UiLine::AssistantText(chunk.clone())); // ~3 MiB total, no '\n'
+        }
+        assert!(
+            r.assistant_line_buf.len() <= ASSISTANT_LINE_BUF_MAX + chunk.len(),
+            "assistant_line_buf must stay bounded (cap+one chunk), got {}",
+            r.assistant_line_buf.len()
         );
     }
 
