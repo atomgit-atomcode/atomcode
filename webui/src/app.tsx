@@ -251,7 +251,9 @@ export function App() {
   }
 
   // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
+  // 也是「切换项目」下拉选中另一个项目时的入口（真正切进去，而非只浏览）。
   function handlePickCwd(path: string) {
+    setSidebarOpen(false);
     setCwd(path);
     // We don't know the new dir's bucket hash until the daemon creates a session
     // there; clear it so the sidebar falls back to filtering by `cwd` in the
@@ -322,6 +324,7 @@ export function App() {
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
+        onSwitchProject={handlePickCwd}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}

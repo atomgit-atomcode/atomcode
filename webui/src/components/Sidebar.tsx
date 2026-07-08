@@ -47,6 +47,9 @@ interface SidebarProps {
   onOpenRemote?: () => void;
   /** Open the working-directory picker (to switch to / start a project in any dir). */
   onOpenCwd?: () => void;
+  /** Switch INTO another project (by its working dir): change cwd + land on a new
+   *  conversation there + reflect it in the URL (survives refresh). */
+  onSwitchProject?: (workingDir: string) => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -304,6 +307,7 @@ export function Sidebar({
   onPickSkill,
   onOpenRemote,
   onOpenCwd,
+  onSwitchProject,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
@@ -311,9 +315,10 @@ export function Sidebar({
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
-  // is which project is shown — defaults to (and follows) the real current
-  // project, but the dropdown can point it at any other project so the user can
-  // browse/open sessions from a different working directory without a `/cd`.
+  // is which project is shown — it MIRRORS the real current project (follows the
+  // `projectHash` prop). Picking another project in the dropdown switches INTO it
+  // (via onSwitchProject → cwd + new conversation + URL), which re-pins
+  // `projectHash`, so `viewProjectHash` snaps to the switched-to project.
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [viewProjectHash, setViewProjectHash] = useState(projectHash);
   const [projMenuOpen, setProjMenuOpen] = useState(false);
@@ -1106,8 +1111,11 @@ export function Sidebar({
                   aria-selected={p.hash === viewProjectHash}
                   title={p.working_dir}
                   onClick={() => {
-                    setViewProjectHash(p.hash);
                     setProjMenuOpen(false);
+                    // Re-selecting the project you're already in is a no-op (don't
+                    // drop the active chat for a fresh landing).
+                    if (p.hash === viewProjectHash) return;
+                    onSwitchProject?.(p.working_dir);
                   }}
                 >
                   <span class="sidebar-project-item-main">
