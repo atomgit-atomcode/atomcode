@@ -253,6 +253,20 @@ const zh = {
   'copy.copy': '复制',
   'copy.copied': '已复制',
 
+  // Slash commands
+  'cmd.plan.desc': '切换到 Plan 模式（只读探索）',
+  'cmd.build.desc': '切换到 Build 模式（完整执行）',
+  'cmd.model.desc': '切换模型（带名切换 / 不带名打开选择器）',
+  'cmd.cd.desc': '切换工作目录',
+  'cmd.cd.needArg': '用法：/cd <路径>',
+  'cmd.resume.desc': '打开会话侧栏恢复历史会话',
+  'cmd.reload.desc': '从磁盘重载配置',
+  'cmd.reload.done': '配置已重载',
+  'cmd.skills.desc': '浏览可用技能',
+  'cmd.help.desc': '显示可用命令',
+  'cmd.help.title': '可用命令：',
+  'cmd.mode.done': '已切换到 {mode} 模式',
+
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
@@ -489,6 +503,20 @@ const en: Record<MsgKey, string> = {
   // Copy button
   'copy.copy': 'Copy',
   'copy.copied': 'Copied',
+
+  // Slash commands
+  'cmd.plan.desc': 'Switch to Plan mode (read-only exploration)',
+  'cmd.build.desc': 'Switch to Build mode (full execution)',
+  'cmd.model.desc': 'Switch model (with name / without opens picker)',
+  'cmd.cd.desc': 'Change working directory',
+  'cmd.cd.needArg': 'Usage: /cd <path>',
+  'cmd.resume.desc': 'Open the session sidebar to resume a session',
+  'cmd.reload.desc': 'Reload config from disk',
+  'cmd.reload.done': 'Config reloaded',
+  'cmd.skills.desc': 'Browse available skills',
+  'cmd.help.desc': 'Show available commands',
+  'cmd.help.title': 'Available commands:',
+  'cmd.mode.done': 'Switched to {mode} mode',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',
