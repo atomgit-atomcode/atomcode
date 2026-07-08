@@ -681,6 +681,7 @@ export async function postCommand(body: {
   arg?: string;
   session_id?: string;
   working_dir?: string;
+  project_hash?: string;
 }): Promise<CommandResult> {
   const resp = await fetch('/command', {
     method: 'POST',

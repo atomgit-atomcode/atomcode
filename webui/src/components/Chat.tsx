@@ -966,6 +966,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
 
+  // Reload one session's transcript from disk into the view, guarded against a
+  // session switch racing the async fetch. Mirrors the session-load effect's activeIdRef guard.
+  async function reloadSessionTranscript(id: string) {
+    const projectHash = activeSession?.project_hash;
+    if (!projectHash) return;
+    try {
+      const detail = await getSession(projectHash, id);
+      if (activeIdRef.current === id) {
+        setMessages(sessionMessagesToDisplay(detail.messages));
+      }
+    } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
+  }
+
   // ── Shared mode / provider switch helpers ──────────────────────────────────
   // Defined in render scope (not memoized) so they always close over the latest
   // modeState / sync. Both call sites — ModeSelector.onChange / slashHandlers
@@ -1059,6 +1072,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             arg,
             session_id: sessionId ?? undefined,
             working_dir: cwd ?? undefined,
+            project_hash: activeSession?.project_hash ?? undefined,
           });
         } catch (e) {
           pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
@@ -1066,14 +1080,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         }
         if (res.kind === 'error') { pushCommandNotice(res.message); return; }
         if (res.kind === 'undo') {
-          // Session changed on disk → reload the transcript via the existing session-load path.
-          const projectHash = activeSession?.project_hash;
-          if (projectHash && sessionId) {
-            try {
-              const detail = await getSession(projectHash, sessionId);
-              setMessages(sessionMessagesToDisplay(detail.messages));
-            } catch { /* refresh failure is non-fatal; notice still gives feedback */ }
-          }
+          if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
           pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
           return;
         }
