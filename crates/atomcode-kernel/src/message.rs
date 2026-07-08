@@ -61,6 +61,9 @@ pub struct ReasoningBlock {
 pub struct MessageMeta {
     pub tokens: TokenUsage,
     pub elapsed_ms: u64,
+    /// Thinking/reasoning phase duration in milliseconds.
+    #[serde(default)]
+    pub reasoning_elapsed_ms: u64,
     pub ctx_window: u32,
     pub used_tokens: u32,
     pub utilization: f32,
@@ -982,6 +985,7 @@ mod tests {
         with_meta.meta = Some(MessageMeta {
             tokens: TokenUsage { prompt: 50, completion: 7, cached: 3 },
             elapsed_ms: 123,
+            reasoning_elapsed_ms: 0,
             ctx_window: 1000,
             used_tokens: 50,
             utilization: 0.05,

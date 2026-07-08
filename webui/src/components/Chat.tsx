@@ -1048,6 +1048,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       },
       notice: (text) => pushCommandNotice(text),
       execServerCommand: async (command, arg) => {
+        if (command === 'undo') {
+          if (busyRef.current) { pushCommandNotice(t('cmd.undo.busy')); return; }
+          if (sync) { pushCommandNotice(t('cmd.undo.syncUnsupported')); return; }
+        }
         let res: CommandResult;
         try {
           res = await postCommand({

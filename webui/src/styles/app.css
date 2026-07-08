@@ -1220,6 +1220,91 @@ body {
   padding: 10px 8px 4px;
 }
 
+/* Project selector — dropdown above the session list to browse other projects. */
+.sidebar-project {
+  position: relative;
+  padding: 0 12px 4px;
+  flex-shrink: 0;
+}
+.sidebar-project-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--app-border, transparent);
+  border-radius: var(--corner-radius-medium);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: inherit;
+  text-align: left;
+}
+.sidebar-project-btn:hover,
+.sidebar-project-btn.open { background: var(--app-list-active-background); }
+.sidebar-project-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-project-caret {
+  display: flex;
+  align-items: center;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 0;
+}
+.sidebar-project-menu {
+  position: absolute;
+  top: calc(100% - 2px);
+  left: 12px;
+  right: 12px;
+  z-index: 30;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: var(--corner-radius-medium);
+  background: var(--app-popover-background, var(--app-background));
+  border: 1px solid var(--app-border, rgba(127, 127, 127, 0.2));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+.sidebar-project-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: var(--corner-radius-small, 6px);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: inherit;
+  text-align: left;
+}
+.sidebar-project-item:hover { background: var(--app-list-active-background); }
+.sidebar-project-item.active { background: var(--app-list-active-background); font-weight: 600; }
+.sidebar-project-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-project-item-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  text-align: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--app-list-active-background);
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
+
 .session-group-label {
   letter-spacing: 0.5px;
   font-size: 11px;

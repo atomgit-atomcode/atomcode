@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, getSession, SkillInfo, McpStatusInfo, SessionMetaWithProject } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, getSession, getProjects, SkillInfo, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -289,6 +289,14 @@ export function Sidebar({
   const auth = useAuth();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
+  // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
+  // is which project is shown — defaults to (and follows) the real current
+  // project, but the dropdown can point it at any other project so the user can
+  // browse/open sessions from a different working directory without a `/cd`.
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [viewProjectHash, setViewProjectHash] = useState(projectHash);
+  const [projMenuOpen, setProjMenuOpen] = useState(false);
+  const projMenuRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -345,7 +353,7 @@ export function Sidebar({
     // projects, which starves a busy project of its own older sessions. Before
     // the hash is known (pre-/project), fall back to the capped cross-project
     // list so something shows immediately.
-    const load = projectHash ? listProjectSessions(projectHash) : listSessions();
+    const load = viewProjectHash ? listProjectSessions(viewProjectHash) : listSessions();
     load
       .then((list) => {
         if (epoch !== loadEpochRef.current) return; // superseded by a newer load
@@ -367,7 +375,32 @@ export function Sidebar({
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey, projectHash]);
+  }, [reloadKey, viewProjectHash]);
+
+  // The selector defaults to and FOLLOWS the real current project: when the
+  // daemon's project changes (e.g. opening a session in another project), snap
+  // the view back to it rather than leaving a stale browse selection.
+  useEffect(() => {
+    setViewProjectHash(projectHash);
+  }, [projectHash]);
+
+  // Project list for the dropdown (all projects that have sessions). Cheap,
+  // refetched with the session list so newly-created projects appear.
+  useEffect(() => {
+    getProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
+  }, [reloadKey]);
+
+  // Close the project dropdown on an outside click.
+  useEffect(() => {
+    if (!projMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!projMenuRef.current?.contains(e.target as Node)) setProjMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [projMenuOpen]);
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -823,6 +856,9 @@ export function Sidebar({
   // 避免出现两条相同会话（刷新才消失）。
   const merged = mergeOptimisticSession(optimisticSession ?? null, sessions);
 
+  // The project the dropdown currently shows (for its button label).
+  const currentViewProject = projects.find((p) => p.hash === viewProjectHash);
+
   // 先按当前项目收窄，再按搜索词过滤。优先用物理会话桶 project_hash 收窄（不受
   // daemon 全局 working_dir 被改写影响，避免跨项目串台）；缺 hash 的条目回退按
   // working_dir==cwd 匹配；projectHash 为空时整体回退到旧的 cwd 过滤。乐观条目
@@ -831,10 +867,14 @@ export function Sidebar({
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
   const optimisticId = optimisticSession?.id;
+  // The optimistic (just-sent) entry belongs to the CURRENT project — only exempt
+  // it from filtering while the dropdown is showing that current project, else it
+  // would leak into another project's list the user is browsing.
+  const viewingCurrent = viewProjectHash === projectHash;
   const inScope = (s: SessionMetaWithProject): boolean => {
-    if (s.id === optimisticId) return true;
-    if (projectHash) {
-      return s.project_hash ? s.project_hash === projectHash : normDir(s.working_dir) === cwdNorm;
+    if (s.id === optimisticId && viewingCurrent) return true;
+    if (viewProjectHash) {
+      return s.project_hash ? s.project_hash === viewProjectHash : normDir(s.working_dir) === cwdNorm;
     }
     return cwdNorm ? normDir(s.working_dir) === cwdNorm : true;
   };
@@ -1018,6 +1058,43 @@ export function Sidebar({
           <span class="sidebar-action-caret"><ChevronDownIcon /></span>
         </button>
       </div>
+
+      {projects.length > 1 && (
+        <div class="sidebar-project" ref={projMenuRef}>
+          <button
+            class={'sidebar-project-btn' + (projMenuOpen ? ' open' : '')}
+            onClick={() => setProjMenuOpen((o) => !o)}
+            aria-haspopup="listbox"
+            aria-expanded={projMenuOpen}
+            title={t('sidebar.switchProject')}
+          >
+            <span class="sidebar-project-name">
+              {currentViewProject?.name || currentViewProject?.working_dir || t('sidebar.switchProject')}
+            </span>
+            <span class="sidebar-project-caret"><ChevronDownIcon /></span>
+          </button>
+          {projMenuOpen && (
+            <div class="sidebar-project-menu" role="listbox">
+              {projects.map((p) => (
+                <button
+                  key={p.hash}
+                  class={'sidebar-project-item' + (p.hash === viewProjectHash ? ' active' : '')}
+                  role="option"
+                  aria-selected={p.hash === viewProjectHash}
+                  title={p.working_dir}
+                  onClick={() => {
+                    setViewProjectHash(p.hash);
+                    setProjMenuOpen(false);
+                  }}
+                >
+                  <span class="sidebar-project-item-name">{p.name || p.working_dir}</span>
+                  <span class="sidebar-project-item-count">{p.session_count}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div class="session-group-header">
         <span class="session-group-label">{t('sidebar.recent')}</span>
