@@ -2050,11 +2050,12 @@ pub(crate) async fn live_stream(
     // 查询参数 sid 在首次扫码连接时为空,但 LiveSession 一定有真实的 session_id
     // (已设置到 LIVE_SESSION_ID)。用此 id + load_dir 从 SessionManager 取 name。
     let live_sid = live_session_id_or_unknown();
+    let sid_for_snapshot = live_sid.clone();
     let session_name = if live_sid == "unknown" {
         String::new()
     } else {
         atomcode_core::session::SessionManager::new(&snapshot_wd)
-            .load(&atomcode_core::session::SessionId::from_string(live_sid.clone()))
+            .load(&atomcode_core::session::SessionId::from_string(live_sid))
             .ok()
             .map(|s| s.name)
             .unwrap_or_default()
@@ -2062,7 +2063,7 @@ pub(crate) async fn live_stream(
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let _ = tx.send(LiveWireEvent::Snapshot {
         messages: snapshot.iter().map(crate::MessageInfo::from).collect(),
-        session_id: live_session_id_or_unknown(),
+        session_id: sid_for_snapshot,
         session_name,
         project_hash,
         provider: live_current_provider(),
