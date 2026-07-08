@@ -70,6 +70,61 @@ impl Skill {
 
         result
     }
+
+    /// The expanded skill body PLUS a leading note telling the model where the
+    /// skill's bundled files live. Use this at INJECTION sites (slash command /
+    /// Skill tool); [`expand`](Self::expand) stays a pure template substitution.
+    ///
+    /// Without the note, a directory-style skill that references bundled resources
+    /// with bare relative paths (`scripts/foo.py`, `references/bar.md`) makes the
+    /// model resolve them against the CURRENT WORKING DIRECTORY — where they don't
+    /// exist — so it reports the scripts "missing" and refuses to run (the reported
+    /// bug). The note pins resolution to the skill's own directory instead.
+    pub fn expand_for_injection(&self, arguments: &str, session_id: &str) -> String {
+        let body = self.expand(arguments, session_id);
+        match self.bundled_resource_note() {
+            Some(note) => format!("{note}\n\n{body}"),
+            None => body,
+        }
+    }
+
+    /// A `<system-reminder>` naming the skill's install directory, emitted only for
+    /// directory-style skills (source file literally `SKILL.md`) — those own a
+    /// dedicated folder that can bundle `scripts/` / `references/`. Single-file
+    /// `.md` skills share a skills folder, so a "your files are here" note would
+    /// point at the wrong (shared) directory and is omitted.
+    fn bundled_resource_note(&self) -> Option<String> {
+        if self.source_path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
+            return None;
+        }
+        let dir = display_skill_dir(&self.skill_dir.to_string_lossy(), cfg!(windows));
+        Some(format!(
+            "<system-reminder>\n\
+             This skill is installed at: {dir}\n\
+             Any files it references (e.g. `scripts/…`, `references/…`, templates) live \
+             UNDER that directory, NOT the current working directory. Resolve every \
+             relative path in this skill against the skill directory above — for a \
+             bundled script, run it by its absolute path under that directory. Do not \
+             search the project / working directory for these files.\n\
+             </system-reminder>"
+        ))
+    }
+}
+
+/// Format a skill directory for the base-dir note (see `bundled_resource_note`).
+///
+/// On Windows, convert `\` → `/` so the path works uniformly across `read_file`,
+/// Python, AND Git Bash: a raw backslash path breaks when the model runs a bundled
+/// script via bash (Git Bash treats `\U`/`\s` as escapes and eats them). A Windows
+/// path separator is ALWAYS `\` and filenames cannot contain `\`, so the replace is
+/// lossless. On Unix, `\` is a legal filename character (not a separator), so leave
+/// the path untouched. Note-text only — never fed to any path/IO.
+fn display_skill_dir(raw: &str, is_windows: bool) -> String {
+    if is_windows {
+        raw.replace('\\', "/")
+    } else {
+        raw.to_string()
+    }
 }
 
 /// Replace `$N` (where N matches `n`) only when the character immediately after
@@ -727,6 +782,46 @@ mod tests {
         let mut s = make_skill("dir=${CLAUDE_SKILL_DIR}");
         s.skill_dir = PathBuf::from("/home/user/.claude/skills/my-skill");
         assert_eq!(s.expand("", ""), "dir=/home/user/.claude/skills/my-skill");
+    }
+
+    #[test]
+    fn injection_prepends_skill_dir_note_for_dir_style() {
+        // Directory-style skill (source is SKILL.md) → body gets a base-dir note so
+        // bare `scripts/…` paths resolve against the skill dir, not the cwd.
+        let mut s = make_skill("Run scripts/scan.py then read references/spec.md");
+        s.skill_dir = PathBuf::from("/home/user/.claude/skills/wiki");
+        s.source_path = s.skill_dir.join("SKILL.md");
+        let out = s.expand_for_injection("", "");
+        assert!(out.contains("/home/user/.claude/skills/wiki"), "note must name the skill dir");
+        assert!(out.contains("NOT the current working directory"));
+        // Original body is preserved after the note.
+        assert!(out.trim_end().ends_with("Run scripts/scan.py then read references/spec.md"));
+    }
+
+    #[test]
+    fn display_skill_dir_normalizes_only_on_windows() {
+        // Windows: backslashes → forward slashes (works for read_file, python, and
+        // Git Bash alike; a raw backslash path breaks bash script invocation).
+        assert_eq!(
+            display_skill_dir(r"C:\Users\admin\.claude\skills\wiki", true),
+            "C:/Users/admin/.claude/skills/wiki"
+        );
+        // Unix: untouched — `\` is a legal filename char there, not a separator.
+        assert_eq!(
+            display_skill_dir("/home/u/.claude/skills/wiki", false),
+            "/home/u/.claude/skills/wiki"
+        );
+        assert_eq!(display_skill_dir(r"weird\dir", false), r"weird\dir");
+    }
+
+    #[test]
+    fn injection_no_note_for_single_file_skill() {
+        // Single-file `.md` skill → skill_dir is a SHARED folder, so no note (it
+        // would point at the wrong directory). Body is returned verbatim.
+        let mut s = make_skill("Just a prompt.");
+        s.skill_dir = PathBuf::from("/home/user/.claude/skills");
+        s.source_path = s.skill_dir.join("my-skill.md");
+        assert_eq!(s.expand_for_injection("", ""), "Just a prompt.");
     }
 
     #[test]

@@ -3232,7 +3232,7 @@ pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<Strin
     if !skill.user_invocable {
         return None;
     }
-    Some(skill.expand(arg, ctx.current_session.id.as_str()))
+    Some(skill.expand_for_injection(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/plugin` subcommands: marketplace add/remove/update/list,
