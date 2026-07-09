@@ -835,6 +835,14 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
         Msg::CmdDescTodo => "重新打印当前任务清单（从会话记录中推导）".into(),
+        Msg::CmdDescDesktop =>
+            "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
+        Msg::DesktopOpening { name, path } =>
+            format!("正在打开 {}…\n  {}\n", name, path).into(),
+        Msg::DesktopNotInstalled { url } =>
+            format!("未检测到 AtomCode 桌面端。下载安装：\n  {}\n", url).into(),
+        Msg::DesktopLaunchFailed { path, err } =>
+            format!("找到了应用但启动失败：{}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "当前无任务清单（模型尚未创建 todo）。".into(),
         Msg::TodoListHeader => "当前任务清单:".into(),
         Msg::ViewUsage => "用法：/view <文件路径>".into(),

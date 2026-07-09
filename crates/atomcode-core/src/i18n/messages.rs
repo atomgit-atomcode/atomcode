@@ -666,6 +666,14 @@ pub enum Msg<'a> {
     CmdDescProxy,
     /// Description for the `/todo` slash command — reprint the current task list.
     CmdDescTodo,
+    /// Description for the `/desktop` slash command.
+    CmdDescDesktop,
+    /// `/desktop` — launching the found app (`name` = app, `path` = its location).
+    DesktopOpening { name: &'a str, path: &'a str },
+    /// `/desktop` — app not found; point the user at the download URL.
+    DesktopNotInstalled { url: &'a str },
+    /// `/desktop` — the app was found but the OS launch call failed.
+    DesktopLaunchFailed { path: &'a str, err: &'a str },
     /// `/todo` output when no todowrite call exists in the transcript yet.
     TodoNoList,
     /// `/todo` header line printed before the task list.
