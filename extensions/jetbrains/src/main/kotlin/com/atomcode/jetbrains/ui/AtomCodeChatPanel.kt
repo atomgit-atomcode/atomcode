@@ -639,7 +639,7 @@ class AtomCodeChatPanel(
         }
     }
 
-    private fun showSessionHistory() {
+    internal fun showSessionHistory() {
         service.refreshSessions().whenComplete { sessions, error ->
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load sessions"); return@invokeLater }
@@ -1781,27 +1781,28 @@ class AtomCodeChatPanel(
     // ── Gear menu ──
 
     internal fun showGearMenu() {
+        val labels = gearMenuLabels()
         val menu = JPopupMenu()
-        menu.add(JMenuItem("🔌 Connect / Start").apply { addActionListener { connect() } })
+        menu.add(JMenuItem(labels.connectStart).apply { addActionListener { connect() } })
         menu.add(JSeparator())
-        val providerMenu = JMenu("Provider ▸")
-        providerMenu.add(JMenuItem("Create Provider...").apply { addActionListener { showCreateProviderDialog() } })
-        providerMenu.add(JMenuItem("Edit Provider...").apply { addActionListener { showEditProviderDialog() } })
-        providerMenu.add(JMenuItem("Delete Provider...").apply { addActionListener { deleteSelectedProvider() } })
+        val providerMenu = JMenu(labels.provider)
+        providerMenu.add(JMenuItem(labels.createProvider).apply { addActionListener { showCreateProviderDialog() } })
+        providerMenu.add(JMenuItem(labels.editProvider).apply { addActionListener { showEditProviderDialog() } })
+        providerMenu.add(JMenuItem(labels.deleteProvider).apply { addActionListener { deleteSelectedProvider() } })
         providerMenu.add(JSeparator())
-        providerMenu.add(JMenuItem("Thinking Settings...").apply { addActionListener { showThinkingDialog() } })
+        providerMenu.add(JMenuItem(labels.thinkingSettings).apply { addActionListener { showThinkingDialog() } })
         menu.add(providerMenu); menu.add(JSeparator())
-        menu.add(JMenuItem("🔑 Login").apply { addActionListener { login() } })
-        menu.add(JMenuItem("🚀 CodingPlan Setup").apply { addActionListener { runSetup() } })
+        menu.add(JMenuItem(labels.login).apply { addActionListener { login() } })
+        menu.add(JMenuItem(labels.codingPlanSetup).apply { addActionListener { runSetup() } })
         menu.add(JSeparator())
-        menu.add(JMenuItem("📋 Session History...").apply { addActionListener { showSessionHistory() } })
-        menu.add(JMenuItem("✏️ Rename Session").apply { addActionListener { renameSelectedSession() } })
-        menu.add(JMenuItem("🗑 Delete Session").apply { addActionListener { deleteSelectedSession() } })
-        menu.add(JMenuItem("🔄 Refresh Sessions").apply { addActionListener { refreshSessionList() } })
+        menu.add(JMenuItem(labels.sessionHistory).apply { addActionListener { showSessionHistory() } })
+        menu.add(JMenuItem(labels.renameSession).apply { addActionListener { renameSelectedSession() } })
+        menu.add(JMenuItem(labels.deleteSession).apply { addActionListener { deleteSelectedSession() } })
+        menu.add(JMenuItem(labels.refreshSessions).apply { addActionListener { refreshSessionList() } })
         menu.add(JSeparator())
-        menu.add(JMenuItem("📂 打开变更").apply { addActionListener { openProjectChanges() } })
-        menu.add(JMenuItem("🩺 Diagnostics").apply { addActionListener { showDiagnostics() } })
-        menu.add(JMenuItem("⚙ Settings...").apply { addActionListener { project.openAtomCodeSettings() } })
+        menu.add(JMenuItem(labels.openChanges).apply { addActionListener { openProjectChanges() } })
+        menu.add(JMenuItem(labels.diagnostics).apply { addActionListener { showDiagnostics() } })
+        menu.add(JMenuItem(labels.settings).apply { addActionListener { project.openAtomCodeSettings() } })
         val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
     }
 
