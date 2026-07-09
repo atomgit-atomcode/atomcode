@@ -634,7 +634,7 @@ Contributions are welcome! AtomCode is in active development.
 
 Don't know Rust? No problem! There are many ways to contribute without writing Rust code:
 
-- **📝 Documentation** — Improve the README, fix typos, enhance the [official docs site](https://atomcode.atomgit.com/docs/en/), or add examples. Docs live in the `site/` directory and the main README files.
+- **📝 Documentation** — Improve the README, fix typos, enhance the [official docs site](https://atomcode.atomgit.com/docs/en/), or add examples. Docs live in the root `docs/` directory, `site/docs/`, and the main README files.
 - **🌐 Localization & Translation** — Help translate the docs site, README, or UI strings into more languages. Check `site/docs/` for existing translations.
 - **🧩 Skills & Plugins** — Create new [skills](https://gitcode.com/atomgit_atomcode/atomcode-skills) (Markdown + JSON, no Rust needed) that extend AtomCode's capabilities. Skills are loaded from `~/.atomcode/skills/`.
 - **🐛 Bug Reports** — Found a bug? Open an [Issue](https://atomgit.com/atomgit_atomcode/atomcode/issues) with clear reproduction steps, screenshots, and environment info. High-quality bug reports are invaluable.
