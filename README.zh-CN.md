@@ -625,6 +625,19 @@ cargo install --path crates/atomcode-cli
 - **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 
+### 非 Rust 贡献者
+
+不会 Rust？没关系！有很多方式可以不写 Rust 代码就能参与贡献：
+
+- **📝 文档** — 改进 README、修正错别字、完善[官方文档站](https://atomcode.atomgit.com/docs/zh/)、添加使用示例。文档位于 `site/` 目录和 README 文件中。
+- **🌐 本地化与翻译** — 帮助将文档站、README 或界面文案翻译成更多语言。查看 `site/docs/` 了解现有翻译。
+- **🧩 Skills 与插件** — 创建新的 [skill](https://gitcode.com/atomgit_atomcode/atomcode-skills)（Markdown + JSON，无需 Rust），扩展 AtomCode 的能力。Skill 从 `~/.atomcode/skills/` 加载。
+- **🐛 Bug 报告** — 发现 Bug？在 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 中提交清晰的复现步骤、截图和环境信息。高质量的 Bug 报告非常宝贵。
+- **🧪 测试用例与示例** — 添加测试场景、示例项目或使用演示，帮助验证功能并帮助新用户上手。
+- **💬 社区支持** — 在社区群中回答问题、编写教程或制作视频指南。
+
+每一份贡献，无论是代码还是非代码，都能让 AtomCode 变得更好。不确定从哪里开始？开一个 Issue 或发起讨论吧！
+
 ## 社区交流
 ---
 
