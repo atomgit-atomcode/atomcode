@@ -153,6 +153,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
     Command { name: "todo",    desc: "Reprint the current todo list derived from the session transcript", needs_args: false },
+    Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -215,6 +216,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
         "loop" => Msg::CmdDescLoop,
+        "desktop" => Msg::CmdDescDesktop,
         _ => return None,
     };
     Some(t(msg))

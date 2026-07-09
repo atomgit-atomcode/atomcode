@@ -1737,6 +1737,25 @@ fn execute_slash_command_impl(
             }
             renderer.flush();
         }
+        "desktop" => {
+            // Detect an installed AtomCode desktop app (new "Desktop" preferred
+            // over old "Air"); launch it, or point the user at the download page.
+            let home = crate::platform::home_dir().unwrap_or_default();
+            let env = |k: &str| std::env::var(k).ok();
+            let cands = super::desktop::candidate_apps(&home, &env);
+            let line = match super::desktop::detect(&cands, |p| p.exists()) {
+                Some(c) => {
+                    let path = c.path.display().to_string();
+                    match super::desktop::launch(c) {
+                        Ok(()) => t(Msg::DesktopOpening { name: c.display_name, path: &path }).into_owned(),
+                        Err(e) => t(Msg::DesktopLaunchFailed { path: &path, err: &e.to_string() }).into_owned(),
+                    }
+                }
+                None => t(Msg::DesktopNotInstalled { url: super::desktop::DOWNLOAD_URL }).into_owned(),
+            };
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
+        }
         "app" => {
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
             // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
