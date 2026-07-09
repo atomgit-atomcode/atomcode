@@ -2038,7 +2038,7 @@ pub(crate) async fn live_stream(
     //（TUI 只更新了 ctx.working_dir 和 LIVE_WORKING_DIR，没更新 state.project.working_dir）。
     let snapshot_wd = live_current_working_dir(&working_dir);
     let session = ensure_live_session_global(
-        working_dir,
+        snapshot_wd.clone(),
         live_mcp_cache(),
         state.telemetry.clone(),
         sid,
