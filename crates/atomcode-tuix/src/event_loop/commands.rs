@@ -6511,10 +6511,12 @@ mod tests {
 
 #[cfg(test)]
 mod todo_command_tests {
-    use super::format_todo_command;
+    use super::{decide_custom_command, format_todo_command, CustomDispatch};
+    use crate::custom_commands::ArgsRequirement;
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
     use atomcode_core::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
+    use std::path::PathBuf;
 
     #[test]
     fn todo_command_text_with_and_without_list() {
