@@ -212,11 +212,15 @@ impl Modal for ModelPicker {
         }
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self, ctx);
+        // Show the typed filter query as the editable input line (not the main
+        // buffer, which stays untouched while the modal is open). Typing routes
+        // into `self.query`; rendering `buf.text` here would leave the input box
+        // blank even though filtering works. Mirrors `dir_picker`.
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
