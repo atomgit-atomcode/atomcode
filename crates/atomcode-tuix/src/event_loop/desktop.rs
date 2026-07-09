@@ -10,6 +10,7 @@ pub const DOWNLOAD_URL: &str =
 
 /// How to launch a resolved candidate.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // each variant is constructed only on its own OS (cfg-gated in candidate_apps)
 pub enum LaunchKind {
     /// macOS `.app` bundle — launched with `open <bundle>`.
     MacOpen,
