@@ -22,6 +22,7 @@ pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
+pub(crate) mod desktop;
 use commands::{
     attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
 };
