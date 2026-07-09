@@ -312,6 +312,10 @@ export function Sidebar({
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
   const auth = useAuth();
+  // Bottom-bar login button's idle label: distinct copy when credentials are
+  // present-but-dead vs signed-out. Shared by the tooltip and the visible text
+  // (they only diverge while a login is in flight).
+  const loginIdleLabel = auth.expired ? auth.labels.expired : auth.labels.signIn;
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
@@ -1166,7 +1170,7 @@ export function Sidebar({
       </div>
 
       <div class="sidebar-bottom">
-        {auth.loggedIn ? (
+        {auth.loggedIn && !auth.expired ? (
           <div
             class="sidebar-account"
             title={auth.user?.name || auth.user?.username || 'account'}
@@ -1190,13 +1194,13 @@ export function Sidebar({
           </div>
         ) : (
           <button
-            class="sidebar-account-btn"
+            class={auth.expired ? 'sidebar-account-btn sidebar-account-btn--expired' : 'sidebar-account-btn'}
             onClick={auth.startLogin}
             disabled={auth.busy}
-            title={auth.busy ? auth.labels.hint : auth.labels.signIn}
+            title={auth.busy ? auth.labels.hint : loginIdleLabel}
           >
             <AccountGlyph />
-            <span class="login-name">{auth.busy ? auth.labels.signingIn : auth.labels.signIn}</span>
+            <span class="login-name">{auth.busy ? auth.labels.signingIn : loginIdleLabel}</span>
           </button>
         )}
         <span class="sidebar-bottom-spacer" />

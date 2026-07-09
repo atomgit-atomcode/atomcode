@@ -35,9 +35,24 @@ pub(crate) fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>)
 #[derive(Debug, Serialize)]
 struct AuthStatusResponse {
     logged_in: bool,
+    /// Credentials exist on disk but the token can't be made valid (expired
+    /// and the refresh_token was refused / absent). The sidebar used to show
+    /// "logged in" here while chat returned "登录已过期" — this flag lets the
+    /// frontend surface a distinct "session expired, re-login" state instead.
+    expired: bool,
     auth_path: String,
     user: Option<auth::UserInfo>,
     token: Option<TokenInfo>,
+}
+
+/// Classify the reported auth state from what disk holds (`present`) and
+/// whether that stored token is actually usable (`token_usable` — valid now
+/// or successfully refreshed). `expired` means present-but-dead: the exact
+/// mismatch that made the sidebar disagree with chat.
+fn classify_auth_status(present: bool, token_usable: bool) -> (bool, bool) {
+    let logged_in = present;
+    let expired = present && !token_usable;
+    (logged_in, expired)
 }
 
 #[derive(Debug, Serialize)]
@@ -83,8 +98,21 @@ pub(crate) async fn auth_status() -> impl IntoResponse {
     match auth::get_stored_auth() {
         Some(info) => {
             let has_refresh = info.refresh_token.is_some();
+            // Presence of auth.toml is not the same as a usable session: an
+            // expired token whose refresh_token is dead/absent still parses
+            // fine but every chat turn 401s. Probe real usability the same
+            // way chat does — `get_valid_token` returns the stored token when
+            // valid, refreshes (and saves) near expiry, and errors when it
+            // can't be made valid. It's disk-only in the common case and
+            // network-bounded (5s connect / 10s total) only when a refresh is
+            // actually attempted; run it off the async runtime.
+            let token_usable = tokio::task::spawn_blocking(|| auth::get_valid_token().is_ok())
+                .await
+                .unwrap_or(false);
+            let (logged_in, expired) = classify_auth_status(true, token_usable);
             Json(AuthStatusResponse {
-                logged_in: true,
+                logged_in,
+                expired,
                 auth_path: auth_path_str,
                 user: Some(info.user),
                 token: Some(TokenInfo {
@@ -98,6 +126,7 @@ pub(crate) async fn auth_status() -> impl IntoResponse {
         }
         None => Json(AuthStatusResponse {
             logged_in: false,
+            expired: false,
             auth_path: auth_path_str,
             user: None,
             token: None,
@@ -232,6 +261,7 @@ pub(crate) async fn auth_logout(
                 let auth_path = auth::auth_file_path();
                 Json(AuthStatusResponse {
                     logged_in: false,
+                    expired: false,
                     auth_path: auth_path.to_string_lossy().to_string(),
                     user: None,
                     token: None,
@@ -301,5 +331,34 @@ pub(crate) async fn poll_login_session(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Login poll error: {:#}", e),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The sidebar login indicator reads `/auth/status`. Before the fix it
+    // reported `logged_in` purely from the presence of `auth.toml`, so an
+    // expired/rejected token still showed "logged in" while chat correctly
+    // returned "登录已过期". These lock the three states the classifier must
+    // distinguish so the frontend can tell "present-and-usable" from
+    // "present-but-dead".
+
+    #[test]
+    fn no_credentials_is_logged_out_not_expired() {
+        assert_eq!(classify_auth_status(false, false), (false, false));
+    }
+
+    #[test]
+    fn present_and_usable_token_is_logged_in_not_expired() {
+        assert_eq!(classify_auth_status(true, true), (true, false));
+    }
+
+    #[test]
+    fn present_but_unusable_token_is_expired() {
+        // File on disk exists (so the user "looks" logged in) but the token
+        // can't be made valid — this is the exact sidebar/chat mismatch.
+        assert_eq!(classify_auth_status(true, false), (true, true));
     }
 }
