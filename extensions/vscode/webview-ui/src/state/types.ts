@@ -48,6 +48,9 @@ export interface SessionMeta {
   created_at?: string | number;
   updated_at?: string | number;
   project_hash?: string;
+  working_dir?: string;
+  message_count?: number;
+  file_size?: number;
   isGenerating?: boolean;
   hasUnread?: boolean;
 }

@@ -62,6 +62,7 @@ export interface ProjectState {
   previous_dir?: string;
   recent_dirs: string[];
   name: string;
+  project_hash: string;
 }
 
 export interface ChangeDirResponse {
@@ -211,6 +212,8 @@ export interface CodingPlanSetupResponse {
 export interface SessionMeta {
   id: string;
   name: string;
+  working_dir?: string;
+  project_hash?: string;
   created_at: number;
   updated_at: number;
   message_count: number;

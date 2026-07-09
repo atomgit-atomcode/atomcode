@@ -218,6 +218,11 @@ pub struct SearchQuery {
     pub q: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SessionsByWorkingDirQuery {
+    pub working_dir: PathBuf,
+}
+
 /// Request to create a new session
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -1073,6 +1078,10 @@ pub(crate) fn hash_path(path: &std::path::Path) -> String {
     atomcode_core::session::hash_path(path)
 }
 
+fn response_project_hash(path: &std::path::Path) -> String {
+    hash_path(path)
+}
+
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     let sessions_root = SessionManager::sessions_root_dir();
@@ -1643,6 +1652,29 @@ async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// GET /sessions/by-working-dir?working_dir=/path - List sessions for an explicit working directory
+async fn get_sessions_by_working_dir(
+    Query(query): Query<SessionsByWorkingDirQuery>,
+) -> impl IntoResponse {
+    let hash = hash_path(&query.working_dir);
+    match list_sessions(&hash) {
+        Ok(sessions) => {
+            let sessions: Vec<SessionMetaWithProject> = sessions
+                .into_iter()
+                .map(|meta| SessionMetaWithProject {
+                    project_hash: hash.clone(),
+                    meta,
+                })
+                .collect();
+            Json(sessions).into_response()
+        }
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match load_session(&hash, &id) {
@@ -1787,12 +1819,7 @@ async fn create_session(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
     }
 
-    // Calculate project hash for response
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    working_dir.hash(&mut hasher);
-    let project_hash = format!("{:016x}", hasher.finish());
+    let project_hash = response_project_hash(&working_dir);
 
     let response = CreateSessionResponse {
         id: session.id.to_string(),
@@ -1860,11 +1887,7 @@ async fn append_session_messages(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
     }
 
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    working_dir.hash(&mut hasher);
-    let project_hash = format!("{:016x}", hasher.finish());
+    let project_hash = response_project_hash(&working_dir);
 
     let response = AppendSessionMessagesResponse {
         success: true,
@@ -4678,6 +4701,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
         .route("/sessions", get(get_all_sessions).post(create_session))
+        .route("/sessions/by-working-dir", get(get_sessions_by_working_dir))
         .route("/sessions/search", get(search_sessions))
         .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
@@ -4975,6 +4999,16 @@ mod tests {
                 "daemon hash for {p:?} diverged from core session bucket naming"
             );
         }
+    }
+
+    #[test]
+    fn response_project_hash_matches_session_bucket_hash() {
+        let path = std::path::Path::new("/tmp/nested/proj/");
+        assert_eq!(
+            response_project_hash(path),
+            hash_path(path),
+            "session create/append responses must return the physical session bucket hash"
+        );
     }
 
     // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions
