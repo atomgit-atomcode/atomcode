@@ -52,14 +52,43 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "/.terraform.d",
 ];
 
+/// Placeholder-template `.env` variants committed to version control — they hold only
+/// dummy values, so reading them is not a secret-exfiltration risk and must not prompt.
+/// Matched as the keyword immediately after `.env.` (e.g. `.env.example`, `.env.sample`).
+const ENV_TEMPLATE_SUFFIXES: &[&str] = &["example", "sample", "template", "dist", "defaults"];
+
 /// True if the raw args reference a sensitive path. `.env` is matched only as a FILENAME
 /// (`.env"`, `.env'`, `.env.local…`) so `"environment"` / `.environment/` do not false-trip.
+/// Placeholder templates (`.env.example`, `.env.sample`, …) are excluded — they are
+/// committed to VCS and hold no real secrets, so prompting on them is pure friction.
 pub fn references_sensitive_path(args: &str) -> bool {
     let a = args.to_ascii_lowercase();
-    if a.contains(".env\"") || a.contains(".env'") || a.contains(".env.") {
+    // Bare `.env` filename (quoted in the JSON args).
+    if a.contains(".env\"") || a.contains(".env'") {
+        return true;
+    }
+    // `.env.<suffix>` is sensitive (`.env.local`, `.env.production`, …) UNLESS every
+    // such occurrence is a known non-secret template.
+    if env_dot_reference_is_sensitive(&a) {
         return true;
     }
     SENSITIVE_MARKERS.iter().any(|m| a.contains(m))
+}
+
+/// Scan every `.env.<suffix>` occurrence in the lowercased args; return true if any suffix
+/// is NOT a recognized template keyword (i.e. a real secret variant like `local`/`production`).
+fn env_dot_reference_is_sensitive(a: &str) -> bool {
+    let mut rest = a;
+    while let Some(pos) = rest.find(".env.") {
+        let after = &rest[pos + ".env.".len()..];
+        // Leading alphanumeric run is the variant keyword (stops at quote, dot, slash, …).
+        let suffix: String = after.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        if !ENV_TEMPLATE_SUFFIXES.contains(&suffix.as_str()) {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// The user's real home directory. Used to anchor `~/.ssh` / `~/.aws` / `~/.gnupg`
@@ -206,6 +235,12 @@ mod tests {
         assert!(references_sensitive_path(r#"{"file_path":"/home/u/.ssh"}"#), "the .ssh dir too");
         assert!(references_sensitive_path(r#"{"file_path":"/proj/.env"}"#));
         assert!(references_sensitive_path(r#"{"file_path":"/proj/.env.local"}"#));
+        assert!(references_sensitive_path(r#"{"file_path":"/proj/.env.production"}"#), "real secret variant");
+        // Placeholder templates (committed to VCS, no real secrets) → NOT flagged.
+        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.example"}"#), ".env.example is a template");
+        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.sample"}"#));
+        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.template"}"#));
+        assert!(!references_sensitive_path(r#"{"file_path":"/proj/.env.dist"}"#));
         assert!(references_sensitive_path(r#"{"path":"/home/u/.aws/credentials"}"#));
         assert!(references_sensitive_path(r#"{"file_path":"/etc/ssl/server.pem"}"#));
         assert!(references_sensitive_path(r#"{"file_path":"C:\\Users\\u\\.ssh\\id_ed25519"}"#), "windows key");
