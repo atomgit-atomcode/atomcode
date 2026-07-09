@@ -1,6 +1,7 @@
 //! `StatusReminderHook` — a per-turn `<system-reminder>` tail carrying live runtime status
-//! (date/time, context-window usage, round budget) so the model can pace itself and resolve
+//! (date, context-window usage, round budget) so the model can pace itself and resolve
 //! relative dates ("yesterday") into concrete `after`/`before` for [`recall`](super::recall).
+//! Deliberately DATE-only, no wall-clock time — see `render`.
 //!
 //! Two cache-safety disciplines:
 //!   1. **APPEND-ONLY at the tail** — it never mutates the cached prefix (the changing status
@@ -34,11 +35,13 @@ impl StatusReminderHook {
     /// (clock + ctx injected) so it is unit-testable without a running agent.
     fn render(now: DateTime<Local>, ctx: &TurnCtx) -> String {
         let mut lines = Vec::with_capacity(3);
+        // Date + weekday only — NO wall-clock time. The minute-level clock made chatty weak
+        // models (e.g. deepseek-v4-flash) editorialize about the hour ("要休息了吗？快 1 点了")
+        // instead of working, and relative-date resolution for `recall` needs only the date.
         lines.push(format!(
-            "Current date: {} ({}), local time {}",
+            "Current date: {} ({})",
             now.format("%Y-%m-%d"),
-            now.format("%a"),
-            now.format("%H:%M")
+            now.format("%a")
         ));
         // Context pressure — only when the window is known (0 before any response report).
         if ctx.context_window > 0 {
@@ -99,7 +102,12 @@ mod tests {
             s.starts_with("<system-reminder>") && s.ends_with("</system-reminder>"),
             "must be wrapped so the model knows it's injected: {s}"
         );
-        assert!(s.contains("Current date: 2026-06-15 (Mon), local time 17:34"), "{s}");
+        // Date + weekday only (no wall-clock HH:MM): the minute-level time made chatty weak
+        // models (deepseek-v4-flash) editorialize ("要休息了吗？快 1 点了"), and relative-date
+        // resolution for `recall` needs only the date.
+        assert!(s.contains("Current date: 2026-06-15 (Mon)"), "{s}");
+        assert!(!s.contains("local time"), "must not carry wall-clock time: {s}");
+        assert!(!s.contains("17:34"), "must not carry wall-clock time: {s}");
         assert!(s.contains("Context window: 40000 / 128000 tokens used (31%)"), "usage: {s}");
         assert!(s.contains("Turn round: 3 of 50 (max)"), "round budget: {s}");
     }
