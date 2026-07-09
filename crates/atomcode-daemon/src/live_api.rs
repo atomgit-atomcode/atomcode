@@ -2087,9 +2087,12 @@ pub(crate) async fn live_stream(
     let sid = parse_session_id(q.session_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
-    let snapshot_wd = working_dir.clone();
+    // snapshot 的 working_dir 优先取 LIVE_WORKING_DIR（TUI 的 `/cd` 会更新它），
+    // 没有再回退到 state.project.working_dir。避免 TUI `/cd` 后 app 重连拿到旧目录
+    //（TUI 只更新了 ctx.working_dir 和 LIVE_WORKING_DIR，没更新 state.project.working_dir）。
+    let snapshot_wd = live_current_working_dir(&working_dir);
     let session = ensure_live_session_global(
-        working_dir,
+        snapshot_wd.clone(),
         live_mcp_cache(),
         state.telemetry.clone(),
         sid,

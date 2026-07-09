@@ -4444,15 +4444,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // sessions from the old project because the manager still points at the
     // old hash bucket.
     ctx.session_manager = SessionManager::new(&path);
-    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
-    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
-    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
-    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
-    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
-    // ctx.working_dir already equals `path`.
-    if ctx.sync_session.is_some() {
-        atomcode_daemon::live_set_working_dir(path.clone());
-    }
+    // 通知 daemon 工作目录已切换：更新 LIVE_WORKING_DIR 静态变量，
+    // 使得后续 app 通过 /live 重连时能在 snapshot 中拿到最新的目录。
+    // 不限于 sync 模式 – TUI 独立使用时 app 也应能跟随。
+    atomcode_daemon::live_set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
