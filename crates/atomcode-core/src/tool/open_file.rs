@@ -1,11 +1,16 @@
-//! `open_file` tool — launch a local file in the user's default GUI
-//! application (browser for HTML, viewer for PDF / image / SVG, etc.).
+//! `open_file` tool — launch a local file **or URL** in the user's default GUI
+//! application (browser for HTML/URLs, viewer for PDF / image / SVG, etc.).
 //!
 //! This is a thin cross-platform wrapper that picks the right opener
 //! by inspecting OS + environment variables. The LLM gets one uniform
 //! tool to call; the environment-disambiguation logic lives here so
 //! the model never has to reason about whether `open` vs `xdg-open`
 //! vs `start` is correct for the current host.
+//!
+//! When the file_path starts with `http://` or `https://`, the tool
+//! opens the URL directly in the default browser, skipping file-path
+//! resolution and existence checks — all platform openers (`open`,
+//! `xdg-open`, `start`, `wslview`) handle URLs natively.
 //!
 //! Headless / SSH / CI sessions can't show a window, so the tool
 //! refuses with a human-readable reason in those cases — the LLM can
@@ -183,11 +188,13 @@ impl Tool for OpenFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "open_file",
-            description: "Open a local file (HTML / PDF / image / SVG / etc.) in the user's default GUI application — \
-                          typically a browser for HTML, image viewer for PNG / JPG, PDF reader for PDF.\n\
+            description: "Open a local file or URL (HTML / PDF / image / SVG / etc.) in the user's default GUI application — \
+                          typically a browser for HTML/URLs, image viewer for PNG / JPG, PDF reader for PDF.\n\
+                          \n\
+                          Supports http:// and https:// URLs — they are opened directly in the default browser.\n\
                           \n\
                           USE ONLY WHEN:\n\
-                          1. The user explicitly asks to preview / open / view a file, OR\n\
+                          1. The user explicitly asks to preview / open / view a file or webpage, OR\n\
                           2. Previewing is the obvious next step (e.g. you just generated an HTML mockup the user requested) AND you have ASKED the user first.\n\
                           \n\
                           DO NOT auto-open after every write_file / edit_file. Files existing on disk don't need to pop windows; \
@@ -201,7 +208,7 @@ impl Tool for OpenFileTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "File path to open. Absolute, or relative to the current working directory. Must exist."
+                        "description": "File path to open, or an http:// / https:// URL. Absolute, or relative to the current working directory. Must exist (for file paths)."
                     }
                 },
                 "required": ["file_path"]
@@ -238,6 +245,12 @@ impl Tool for OpenFileTool {
             Ok(p) => p,
             Err(_) => return self.approval(args),
         };
+        // URLs don't need path-based approval — they're opened in the browser
+        // and are as safe as any in-workspace file.
+        let fp = parsed.file_path.trim();
+        if fp.starts_with("http://") || fp.starts_with("https://") {
+            return ApprovalRequirement::AutoApprove;
+        }
         let wd = match ctx.working_dir.try_read() {
             Ok(g) => g.clone(),
             Err(_) => return self.approval(args),
@@ -254,7 +267,13 @@ impl Tool for OpenFileTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: OpenFileArgs = serde_json::from_str(args)?;
-        let path = parsed.file_path.as_str();
+        let path = parsed.file_path.as_str().trim();
+
+        // URL support: http:// / https:// URLs are opened directly in the browser,
+        // skipping file-path resolution and existence checks.
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return open_url(path).await;
+        }
 
         // Resolve relative to working_dir, mirroring every other file tool.
         let wd = ctx.working_dir.read().await.clone();
@@ -342,6 +361,64 @@ impl Tool for OpenFileTool {
                 success: false,
             }),
         }
+    }
+}
+
+/// Open a URL in the default browser. Skips file-path resolution entirely.
+async fn open_url(url: &str) -> Result<ToolResult> {
+    let strategy = pick_open_strategy();
+    let mut cmd = match &strategy {
+        OpenStrategy::MacOpen => {
+            let mut c = Command::new("open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::XdgOpen => {
+            let mut c = Command::new("xdg-open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::WindowsStart => {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "start", "", url]);
+            c
+        }
+        OpenStrategy::Wslview => {
+            let mut c = Command::new("wslview");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::Headless(reason) => {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "Cannot open URL in GUI: {}.\n\nURL for manual access:\n  {}",
+                    reason, url
+                ),
+                success: false,
+            });
+        }
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    match cmd.spawn() {
+        Ok(_child) => Ok(ToolResult {
+            call_id: String::new(),
+            output: format!("Opened URL `{}` via `{}`.", url, strategy_command_name(&strategy)),
+            success: true,
+        }),
+        Err(e) => Ok(ToolResult {
+            call_id: String::new(),
+            output: format!(
+                "Failed to launch `{}` to open URL: {}.\n\nURL for manual access:\n  {}",
+                strategy_command_name(&strategy),
+                e,
+                url
+            ),
+            success: false,
+        }),
     }
 }
 
