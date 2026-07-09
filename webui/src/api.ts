@@ -28,7 +28,14 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean };
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
+  // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
+  // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
+  // these, code block content is silently lost in the WebUI while the TUI sees it fine.
+  | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null }
+  | { type: 'artifact_content'; id: string; content: string }
+  | { type: 'artifact_end'; id: string };
 
 export interface ModelInfo {
   provider: string;

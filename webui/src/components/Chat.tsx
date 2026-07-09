@@ -473,6 +473,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
   // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
   const optimisticFiredRef = useRef(false);
+  // Artifact (code block) streaming: the daemon's ArtifactDetector strips fenced
+  // code blocks from TextDelta and emits them as artifact_start / content / end.
+  // These refs accumulate the language tag and code body for each artifact so
+  // artifact_end can reconstruct the original markdown code block.
+  const artifactLangRef = useRef('');
+  const artifactBufRef = useRef('');
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -770,6 +776,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
+      // NOTE: no artifact_* mapping. This is safe today because the /sync live
+      // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
+      // live_api.rs — it does NOT run text through ArtifactDetector), so the
+      // Markdown renderer sees code blocks directly. The /chat path strips them
+      // into artifact_* events, which handleEvent reconstructs. If the live path
+      // ever adopts the ArtifactDetector, add artifact_start/content/end here or
+      // /sync will silently drop fenced code again.
       default: return null;
     }
   }
@@ -1331,8 +1344,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
       }
 
+      // Artifact events: the daemon's ArtifactDetector strips fenced code blocks
+      // (and HTML/SVG) from TextDelta and emits them as separate artifact_* events.
+      // Without handling these, the code content is silently lost in the WebUI.
+      case 'artifact_start': {
+        artifactLangRef.current = event.language ?? '';
+        artifactBufRef.current = '';
+        break;
+      }
+      case 'artifact_content': {
+        artifactBufRef.current += event.content;
+        break;
+      }
+      case 'artifact_end': {
+        const lang = artifactLangRef.current;
+        const code = artifactBufRef.current;
+        artifactLangRef.current = '';
+        artifactBufRef.current = '';
+        // Reconstruct the fenced code block so the Markdown renderer can process it.
+        // The daemon stripped the ``` fences; we put them back here.
+        const fence = '```';
+        const tag = lang ? fence + lang : fence;
+        // The detector's body already ends with the newline before the closing
+        // fence (find_code_fence_end returns line_start), so only add one if it's
+        // missing — otherwise the block renders with a spurious trailing blank line.
+        const body = code.endsWith('\n') ? code : code + '\n';
+        appendToLastAssistant('\n' + tag + '\n' + body + fence + '\n');
+        break;
+      }
+
       default:
-        // Ignore tool_batch, artifact_*, etc.
+        // Ignore tool_batch, etc.
         break;
     }
   }
