@@ -1494,6 +1494,45 @@ fn restore_images_from_turn_base(
 /// turn (the webui showed only prior completed turns — user-reported bug). Returns the
 /// IO result so the terminal caller can log a failure; the best-effort in-progress
 /// callers ignore it (a transient write miss must never break the turn).
+/// True when persisting `incoming` over `disk` would DROP already-persisted turns — a
+/// staler/divergent write must not silently shrink the on-disk conversation.
+///
+/// The metric is the count of real (non-synthetic) USER messages = completed turns, NOT
+/// total messages. Keying off USER turns is deliberate: within one turn the throttled
+/// Fix-B save persists a PROVISIONAL assistant message that the authoritative terminal
+/// snapshot may legitimately drop (cancel / timeout / rollback) — that lowers the total
+/// message count but keeps the user turns, so it is correctly allowed through. A stale
+/// clobber that loses a whole turn drops a USER message, so it is caught.
+///
+/// Compaction is the one legitimate loss of user turns: it drops old turns but injects a
+/// synthetic `[Context was compressed …]` summary, so its synthetic count grows — that
+/// case is explicitly NOT a net loss and is allowed.
+///
+/// KNOWN BOUND: keys off counts, so a same-length write that SWAPS a persisted turn for a
+/// different one (equal user count) is not caught here. The dominant reported failure is
+/// whole turns vanishing (count drop); the ctrace on refusal is the probe for the rest.
+fn save_would_lose_persisted_turns(
+    disk: &[atomcode_core::conversation::message::Message],
+    incoming: &[atomcode_core::conversation::message::Message],
+) -> bool {
+    use atomcode_core::conversation::message::Role;
+    // (real user turns, synthetic messages) in one pass.
+    let counts = |ms: &[atomcode_core::conversation::message::Message]| {
+        ms.iter().fold((0usize, 0usize), |(turns, synth), m| {
+            if m.synthetic {
+                (turns, synth + 1)
+            } else if m.role == Role::User {
+                (turns + 1, synth)
+            } else {
+                (turns, synth)
+            }
+        })
+    };
+    let (in_turns, in_synth) = counts(incoming);
+    let (disk_turns, disk_synth) = counts(disk);
+    in_turns < disk_turns && in_synth <= disk_synth
+}
+
 fn save_live_session_json(
     working_dir: &std::path::Path,
     session_id: &atomcode_core::session::SessionId,
@@ -1504,6 +1543,21 @@ fn save_live_session_json(
     let mut session = manager
         .load(session_id)
         .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
+    // Net-loss guard: a stuck/divergent turn's later authoritative writeback (from a
+    // stale persistent bridge) could carry fewer turns than durability already saved,
+    // reducing the `.json` to just the first turn AND bumping `updated_at` (re-sorting it
+    // to the sidebar top). Refuse such a write: keep disk untouched, don't `touch()`.
+    // See `save_would_lose_persisted_turns` (webui refresh-mid-turn bug).
+    if save_would_lose_persisted_turns(&session.messages, &messages) {
+        atomcode_core::ctrace!(
+            "LIVE",
+            "save REFUSED net-loss write for {}: disk has {} msgs, incoming {} — keeping disk",
+            session_id,
+            session.messages.len(),
+            messages.len()
+        );
+        return Ok(());
+    }
     session.id = session_id.clone();
     session.messages = messages;
     session.auto_name_from_messages();
@@ -2975,6 +3029,9 @@ mod tests {
             text,
         )
     }
+    fn synthetic_msg(text: &str) -> atomcode_core::conversation::message::Message {
+        atomcode_core::conversation::message::Message::synthetic_user(text)
+    }
 
     // Fix A: persisting just the user message mid-turn makes the unfinished turn
     // durable — load() reads it straight back. Before the fix the .json was never
@@ -3063,5 +3120,156 @@ mod tests {
             "one session, latest snapshot — not appended copies"
         );
         assert_eq!(loaded.messages[1].text(), Some("a1 a2"));
+    }
+
+    // GUARD — webui refresh-mid-turn bug: a stuck turn's later authoritative writeback
+    // (sourced from a divergent persistent bridge) could carry FEWER turns than what
+    // durability already persisted, silently reducing the on-disk `.json` to just the
+    // first turn. A staler write that would DROP already-persisted turns must be refused.
+    #[test]
+    fn save_live_session_json_refuses_net_loss_of_persisted_turns() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard1");
+        let id = SessionId::new();
+
+        // Two full turns durably persisted.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("seed");
+
+        // A stale writeback carrying only the first turn must NOT win (best-effort Ok).
+        save_live_session_json(&dir, &id, vec![user_msg("u1"), assistant_msg("a1")])
+            .expect("stale save is best-effort ok");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            4,
+            "persisted turns must not be dropped by a staler write"
+        );
+        assert_eq!(loaded.messages[2].text(), Some("u2"));
+    }
+
+    // A refused net-loss write must leave `updated_at` untouched — otherwise the sidebar
+    // re-sorts the session to the top (the reported "first execution time got updated")
+    // even though its content just regressed.
+    #[test]
+    fn save_live_session_json_refused_write_keeps_updated_at() {
+        use atomcode_core::session::{Session, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard2");
+        let mgr = SessionManager::new(&dir);
+
+        let mut existing = Session::new(dir.clone());
+        let id = existing.id.clone();
+        existing.messages = vec![
+            user_msg("u1"),
+            assistant_msg("a1"),
+            user_msg("u2"),
+            assistant_msg("a2"),
+        ];
+        existing.updated_at = 1000;
+        mgr.save(&existing).expect("seed");
+
+        save_live_session_json(&dir, &id, vec![user_msg("u1")]).expect("ok");
+
+        let loaded = mgr.load(&id).expect("load");
+        assert_eq!(
+            loaded.updated_at, 1000,
+            "a refused net-loss write must not bump updated_at"
+        );
+    }
+
+    // Intra-turn rollback: a throttled Fix-B save persisted a PROVISIONAL assistant, then
+    // the turn was cancelled / timed out and the authoritative terminal snapshot drops
+    // that partial. The user turns are unchanged, so this is NOT a net loss — the terminal
+    // must win, else disk wedges on a phantom reply the model actually discarded.
+    #[test]
+    fn save_live_session_json_allows_terminal_to_drop_own_provisional_assistant() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard4");
+        let id = SessionId::new();
+
+        // Fix-B provisional save: [u1, a1, u2, partial-a2].
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("partial a2"),
+            ],
+        )
+        .expect("provisional");
+
+        // Terminal after cancel: same 2 user turns, the provisional assistant is gone.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![user_msg("u1"), assistant_msg("a1"), user_msg("u2")],
+        )
+        .expect("terminal");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            3,
+            "terminal snapshot must replace its own provisional save (same user turns)"
+        );
+        assert_eq!(loaded.messages[2].text(), Some("u2"));
+    }
+
+    // Compaction legitimately SHRINKS the message list (drops old turns, injects a
+    // synthetic summary). The guard keys off the synthetic count so it must NOT mistake a
+    // real compaction for a stale clobber.
+    #[test]
+    fn save_live_session_json_allows_compaction_shrink() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard3");
+        let id = SessionId::new();
+
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("seed");
+
+        // Compaction: fewer real messages, but a NEW synthetic summary marks it.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                synthetic_msg("[Context was compressed. ...]"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("compaction save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            3,
+            "compaction shrink (synthetic summary present) must be allowed"
+        );
+        assert!(loaded.messages[0].synthetic);
     }
 }
