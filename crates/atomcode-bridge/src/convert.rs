@@ -8,7 +8,10 @@ use atomcode_core::conversation::message::{
 use atomcode_kernel::message::{ImageContent, Message as KMessage, Role as KRole};
 
 pub fn image_to_kernel(i: &ImagePart) -> ImageContent {
-    ImageContent { media_type: i.media_type.clone(), data: i.data.clone() }
+    ImageContent {
+        media_type: i.media_type.clone(),
+        data: i.data.clone(),
+    }
 }
 
 pub fn role_to_kernel(r: &CoreRole) -> KRole {
@@ -37,7 +40,12 @@ pub fn message_to_kernel(m: &CoreMessage) -> KMessage {
             k.role = role_to_kernel(&m.role);
             k
         }
-        MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content, .. } => {
+        MessageContent::AssistantWithToolCalls {
+            text,
+            tool_calls,
+            reasoning_content,
+            ..
+        } => {
             let calls = tool_calls
                 .iter()
                 .map(|c| atomcode_kernel::tool::ToolCall {
@@ -64,6 +72,7 @@ pub fn message_to_kernel(m: &CoreMessage) -> KMessage {
         ),
     };
     out.synthetic = m.synthetic;
+    out.internal_origin = m.internal_origin.clone();
     out
 }
 
@@ -78,7 +87,11 @@ pub fn message_to_core(m: &KMessage) -> CoreMessage {
         })
     } else if !m.tool_calls.is_empty() {
         MessageContent::AssistantWithToolCalls {
-            text: if m.text.is_empty() { None } else { Some(m.text.clone()) },
+            text: if m.text.is_empty() {
+                None
+            } else {
+                Some(m.text.clone())
+            },
             tool_calls: m
                 .tool_calls
                 .iter()
@@ -93,17 +106,29 @@ pub fn message_to_core(m: &KMessage) -> CoreMessage {
         }
     } else if !m.images.is_empty() {
         MessageContent::MultiPart {
-            text: if m.text.is_empty() { None } else { Some(m.text.clone()) },
+            text: if m.text.is_empty() {
+                None
+            } else {
+                Some(m.text.clone())
+            },
             images: m
                 .images
                 .iter()
-                .map(|i| ImagePart { media_type: i.media_type.clone(), data: i.data.clone() })
+                .map(|i| ImagePart {
+                    media_type: i.media_type.clone(),
+                    data: i.data.clone(),
+                })
                 .collect(),
         }
     } else {
         MessageContent::Text(m.text.clone())
     };
-    CoreMessage { role: role_to_core(&m.role), content, synthetic: m.synthetic }
+    CoreMessage {
+        role: role_to_core(&m.role),
+        content,
+        synthetic: m.synthetic,
+        internal_origin: m.internal_origin.clone(),
+    }
 }
 
 pub fn usage_to_core(u: &atomcode_kernel::stream::TokenUsage) -> atomcode_core::stream::TokenUsage {
@@ -142,5 +167,17 @@ mod tests {
         let k2 = message_to_kernel(&c);
         assert_eq!(k2.tool_call_id.as_deref(), Some("c1"));
         assert_eq!(k2.text, "output");
+    }
+
+    #[test]
+    fn message_roundtrip_preserves_internal_origin() {
+        let mut k = KMessage::assistant("hidden", vec![]);
+        k.internal_origin = Some("verify_cadence".into());
+
+        let c = message_to_core(&k);
+        assert_eq!(c.internal_origin.as_deref(), Some("verify_cadence"));
+
+        let k2 = message_to_kernel(&c);
+        assert_eq!(k2.internal_origin.as_deref(), Some("verify_cadence"));
     }
 }

@@ -474,6 +474,74 @@ function testHistorySyntheticUserMessagesAreHidden() {
   ]);
 }
 
+function testHistoryVerifyCadenceAssistantMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'create f.txt' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'w1', name: 'write_file', arguments: '{}' }] },
+      { role: 'tool', content: 'ok', tool_result: { call_id: 'w1', success: true, summary: 'ok', line_count: 1 } },
+      { role: 'user', content: 'You made code edits but have not verified them.', synthetic: true },
+      { role: 'assistant', content: 'No verification is needed.', internal_origin: 'verify_cadence' },
+      { role: 'user', content: 'what model are you' },
+      { role: 'assistant', content: 'I am AtomCode.' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
+    ['user', 'create f.txt'],
+    ['assistant', ''],
+    ['user', 'what model are you'],
+    ['assistant', 'I am AtomCode.'],
+  ]);
+}
+
+function testHistoryVerifyCadenceCamelCaseAssistantMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'create f.txt' },
+      { role: 'assistant', content: 'No verification is needed.', internalOrigin: 'verify_cadence' },
+      { role: 'assistant', content: 'I am AtomCode.' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
+    ['user', 'create f.txt'],
+    ['assistant', 'I am AtomCode.'],
+  ]);
+}
+
+function testHistoryVerifyCadenceAssistantWithToolCallsIsVisible() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      {
+        role: 'assistant',
+        content: 'Running verification',
+        internal_origin: 'verify_cadence',
+        tool_calls: [{ id: 'b1', name: 'bash', arguments: '{"command":"true"}' }],
+      },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text, msg.toolCalls?.length ?? 0]), [
+    ['assistant', 'Running verification', 1],
+  ]);
+}
+
 function testHistoryLegacyInternalUserMessagesAreHidden() {
   const state = chatReducer({
     ...initialState,
@@ -935,6 +1003,9 @@ testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion();
 testHistoryMissingImagePlaceholderIsPreserved();
 testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput();
 testHistorySyntheticUserMessagesAreHidden();
+testHistoryVerifyCadenceAssistantMessagesAreHidden();
+testHistoryVerifyCadenceCamelCaseAssistantMessagesAreHidden();
+testHistoryVerifyCadenceAssistantWithToolCallsIsVisible();
 testHistoryLegacyInternalUserMessagesAreHidden();
 testHistoryUserMessageStartingWithLegacyWordsIsVisible();
 testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact();

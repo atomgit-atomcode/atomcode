@@ -121,6 +121,10 @@ pub struct Message {
     /// precedes the real prompt is never mistaken for the sacred task anchor.
     #[serde(default)]
     pub synthetic: bool,
+    /// Internal provenance for assistant messages produced by kernel-driven control rounds.
+    /// Empty for normal user/model messages. Example: "verify_cadence".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_origin: Option<String>,
     /// The model's REASONING/THINKING output for an ASSISTANT message — `None` for
     /// non-assistant messages and for assistant responses from non-thinking models.
     /// A purely STORED field: thinking models (Anthropic extended thinking,
@@ -183,18 +187,70 @@ pub struct Message {
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
+        Self {
+            role: Role::System,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: false,
+            internal_origin: None,
+            reasoning: None,
+            images: vec![],
+            reasoning_blocks: vec![],
+        }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
+        Self {
+            role: Role::User,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: false,
+            internal_origin: None,
+            reasoning: None,
+            images: vec![],
+            reasoning_blocks: vec![],
+        }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
+        Self {
+            role: Role::Assistant,
+            text: text.into(),
+            tool_calls,
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: false,
+            internal_origin: None,
+            reasoning: None,
+            images: vec![],
+            reasoning_blocks: vec![],
+        }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
     /// provider) — it was previously dropped, losing tool failure state.
-    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
-        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()), is_error, meta: None, synthetic: false, reasoning: None, images: vec![], reasoning_blocks: vec![] }
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            role: Role::Tool,
+            text: content.into(),
+            tool_calls: vec![],
+            tool_call_id: Some(call_id.into()),
+            is_error,
+            meta: None,
+            synthetic: false,
+            internal_origin: None,
+            reasoning: None,
+            images: vec![],
+            reasoning_blocks: vec![],
+        }
     }
     /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
     /// resume note). It carries `synthetic = true` so `sacred_floor` skips it when
@@ -204,12 +260,36 @@ impl Message {
     /// the whole cached prefix — see `ctx/render.rs` in production. Inserted
     /// after the system message, it preserves the frozen system prefix.
     pub fn synthetic_user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images: vec![], reasoning_blocks: vec![] }
+        Self {
+            role: Role::User,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: true,
+            internal_origin: None,
+            reasoning: None,
+            images: vec![],
+            reasoning_blocks: vec![],
+        }
     }
     /// A user message carrying inline `images` (multimodal input). Identical to
     /// [`Message::user`] when `images` is empty.
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: false, reasoning: None, images, reasoning_blocks: vec![] }
+        Self {
+            role: Role::User,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: false,
+            internal_origin: None,
+            reasoning: None,
+            images,
+            reasoning_blocks: vec![],
+        }
     }
     /// A KERNEL-INJECTED `Role::User` message carrying `images` — used by the agent
     /// loop to surface images a TOOL produced (e.g. `read_file` on a picture) to the
@@ -217,7 +297,19 @@ impl Message {
     /// message. `synthetic = true` so `sacred_floor` skips it when locating the real
     /// task prompt (same rationale as [`Message::synthetic_user`]).
     pub fn synthetic_user_with_images(text: impl Into<String>, images: Vec<ImageContent>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, is_error: false, meta: None, synthetic: true, reasoning: None, images, reasoning_blocks: vec![] }
+        Self {
+            role: Role::User,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            meta: None,
+            synthetic: true,
+            internal_origin: None,
+            reasoning: None,
+            images,
+            reasoning_blocks: vec![],
+        }
     }
 
     /// Approximate token count for this message — a byte heuristic (~4 bytes/token;
@@ -304,7 +396,8 @@ impl Conversation {
 
         // Append one (cancelled) result per dangling call (append-only).
         for id in missing {
-            self.messages.push(Message::tool_result(id, "(cancelled)", true));
+            self.messages
+                .push(Message::tool_result(id, "(cancelled)", true));
         }
     }
 
@@ -347,10 +440,8 @@ impl Conversation {
 
         // The set of result ids that NOW survive (after the scrub) — these are the
         // calls that are already paired.
-        let result_ids: std::collections::HashSet<String> = msgs
-            .iter()
-            .filter_map(|m| m.tool_call_id.clone())
-            .collect();
+        let result_ids: std::collections::HashSet<String> =
+            msgs.iter().filter_map(|m| m.tool_call_id.clone()).collect();
 
         // (b) DANGLING REPAIR. Rebuild, inserting each missing result right after
         // its assistant message so the result FOLLOWS its call.
@@ -383,8 +474,10 @@ impl Conversation {
     /// production `apply_compression`'s sacred carve-out, mapped to this flat Vec.)
     pub fn sacred_floor(&self) -> usize {
         // A leading System message is part of the protected prefix.
-        let lead_system =
-            usize::from(matches!(self.messages.first().map(|m| &m.role), Some(Role::System)));
+        let lead_system = usize::from(matches!(
+            self.messages.first().map(|m| &m.role),
+            Some(Role::System)
+        ));
         // Find the FIRST REAL (non-synthetic) user message; the floor extends
         // through it (index + 1). If none exists, the floor is just the lead
         // system (or 0).
@@ -450,8 +543,11 @@ impl Conversation {
         // count as a reduction, else the strictly-smaller net-loss guard below would
         // REFUSE a genuinely shrinking plan and tool-heavy histories could never compact.
         fn size(m: &Message) -> usize {
-            let tool_calls: usize =
-                m.tool_calls.iter().map(|c| c.id.len() + c.name.len() + c.arguments.len()).sum();
+            let tool_calls: usize = m
+                .tool_calls
+                .iter()
+                .map(|c| c.id.len() + c.name.len() + c.arguments.len())
+                .sum();
             m.text.len()
                 + m.reasoning.as_ref().map_or(0, |r| r.len())
                 + tool_calls
@@ -466,8 +562,11 @@ impl Conversation {
         let drain_from = plan.drain_from.max(floor).min(len_before);
         let drain_to = plan.drain_to.min(len_before);
         // Inverted/empty range → drain nothing.
-        let (drain_from, drain_to) =
-            if drain_from >= drain_to { (drain_from, drain_from) } else { (drain_from, drain_to) };
+        let (drain_from, drain_to) = if drain_from >= drain_to {
+            (drain_from, drain_from)
+        } else {
+            (drain_from, drain_to)
+        };
 
         // 2. Build the candidate (compute-then-commit — never mutate self yet).
         let mut candidate: Vec<Message> = Vec::with_capacity(len_before + 2);
@@ -555,8 +654,7 @@ impl Conversation {
                     .and_then(|m| m.meta.as_mut())
                 {
                     meta.utilization = (meta.utilization as f64 * ratio) as f32;
-                    meta.used_tokens =
-                        (meta.used_tokens as f64 * ratio).round() as u32;
+                    meta.used_tokens = (meta.used_tokens as f64 * ratio).round() as u32;
                 }
             }
             (self.cache_epoch, removed)
@@ -747,7 +845,13 @@ impl SessionSnapshot {
     /// counters derived from the messages' metas).
     pub fn new(messages: Vec<Message>) -> Self {
         let (turn_counter, request_counter) = Self::derive_counters(&messages);
-        Self { version: SNAPSHOT_VERSION, messages, cache_epoch: 0, turn_counter, request_counter }
+        Self {
+            version: SNAPSHOT_VERSION,
+            messages,
+            cache_epoch: 0,
+            turn_counter,
+            request_counter,
+        }
     }
     /// Snapshot a live conversation losslessly at the current version, carrying its
     /// `cache_epoch` so a resume restores the same prefix generation. The id
@@ -770,7 +874,9 @@ impl SessionSnapshot {
         messages
             .iter()
             .filter_map(|m| m.meta.as_ref())
-            .fold((0, 0), |(t, r), meta| (t.max(meta.turn_id), r.max(meta.request_id)))
+            .fold((0, 0), |(t, r), meta| {
+                (t.max(meta.turn_id), r.max(meta.request_id))
+            })
     }
 }
 
@@ -782,7 +888,11 @@ mod tests {
     fn last_pressure_reads_latest_assistant_meta() {
         let mut c = Conversation::new();
         c.push(Message::user("hi"));
-        assert_eq!(c.last_pressure(), (0, 0, 0.0), "no assistant meta yet → zeros");
+        assert_eq!(
+            c.last_pressure(),
+            (0, 0, 0.0),
+            "no assistant meta yet → zeros"
+        );
         let mut a = Message::assistant("ans", vec![]);
         a.meta = Some(MessageMeta {
             ctx_window: 128_000,
@@ -811,18 +921,28 @@ mod tests {
     }
 
     fn call(id: &str, name: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
     }
 
     #[test]
     fn user_with_images_carries_them_else_empty() {
         let m = Message::user_with_images(
             "hi",
-            vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
         );
         assert_eq!(m.images.len(), 1);
         assert_eq!(m.images[0].media_type, "image/png");
-        assert!(Message::user("hi").images.is_empty(), "a plain user message has no images");
+        assert!(
+            Message::user("hi").images.is_empty(),
+            "a plain user message has no images"
+        );
     }
 
     #[test]
@@ -830,11 +950,17 @@ mod tests {
         // An OLD snapshot message (no `images` field) must still deserialize → empty.
         let old = r#"{"role":"User","text":"hi","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}"#;
         let m: Message = serde_json::from_str(old).unwrap();
-        assert!(m.images.is_empty(), "missing images field defaults to empty");
+        assert!(
+            m.images.is_empty(),
+            "missing images field defaults to empty"
+        );
         // A round-trip with images preserves them losslessly.
         let with = Message::user_with_images(
             "x",
-            vec![ImageContent { media_type: "image/png".into(), data: "AA".into() }],
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "AA".into(),
+            }],
         );
         let back: Message = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.images, with.images);
@@ -844,13 +970,18 @@ mod tests {
     fn reasoning_blocks_default_empty_and_serde_additive() {
         // A plain assistant message has no signed reasoning blocks.
         assert!(
-            Message::assistant("ans", vec![]).reasoning_blocks.is_empty(),
+            Message::assistant("ans", vec![])
+                .reasoning_blocks
+                .is_empty(),
             "a plain assistant message carries no reasoning_blocks"
         );
         // An OLD snapshot (no `reasoning_blocks` field) must still deserialize → empty.
         let old = r#"{"role":"Assistant","text":"ans","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}"#;
         let m: Message = serde_json::from_str(old).unwrap();
-        assert!(m.reasoning_blocks.is_empty(), "missing reasoning_blocks defaults to empty");
+        assert!(
+            m.reasoning_blocks.is_empty(),
+            "missing reasoning_blocks defaults to empty"
+        );
         // A round-trip with blocks preserves text + opaque + provider losslessly.
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning_blocks = vec![
@@ -860,7 +991,11 @@ mod tests {
                 provider: Some("anthropic".into()),
             },
             // a redacted block: no readable text, opaque only.
-            ReasoningBlock { text: String::new(), opaque: Some("redacted-data".into()), provider: Some("anthropic".into()) },
+            ReasoningBlock {
+                text: String::new(),
+                opaque: Some("redacted-data".into()),
+                provider: Some("anthropic".into()),
+            },
         ];
         let back: Message = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.reasoning_blocks, with.reasoning_blocks);
@@ -892,11 +1027,12 @@ mod tests {
             assert_eq!(orig.tool_call_id, now.tool_call_id);
         }
 
-        let results: Vec<&Message> =
-            c.messages.iter().filter(|m| m.role == Role::Tool).collect();
+        let results: Vec<&Message> = c.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(results.len(), 2, "exactly two (cancelled) results appended");
-        let ids: Vec<&str> =
-            results.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+        let ids: Vec<&str> = results
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
         assert!(ids.contains(&"call_1"));
         assert!(ids.contains(&"call_2"));
         for r in &results {
@@ -914,9 +1050,15 @@ mod tests {
     fn cancel_preserves_completed_pairs_and_backfills_incomplete() {
         let mut c = Conversation::new();
         c.push(Message::user("read then edit"));
-        c.push(Message::assistant("read", vec![call("call_1", "read_file")]));
+        c.push(Message::assistant(
+            "read",
+            vec![call("call_1", "read_file")],
+        ));
         c.push(Message::tool_result("call_1", "fn main() {}", false));
-        c.push(Message::assistant("edit", vec![call("call_2", "edit_file")]));
+        c.push(Message::assistant(
+            "edit",
+            vec![call("call_2", "edit_file")],
+        ));
         let before = c.messages.clone();
         assert_eq!(c.messages.len(), 4);
 
@@ -942,7 +1084,10 @@ mod tests {
             .iter()
             .filter(|m| m.tool_call_id.as_deref() == Some("call_1"))
             .count();
-        assert_eq!(call1_results, 1, "no duplicate (cancelled) for the completed call");
+        assert_eq!(
+            call1_results, 1,
+            "no duplicate (cancelled) for the completed call"
+        );
     }
 
     // Backfill is idempotent: once every call has a result, a second call adds
@@ -955,7 +1100,11 @@ mod tests {
         let len = c.messages.len();
         assert_eq!(len, 2);
         c.backfill_cancelled_tool_results();
-        assert_eq!(c.messages.len(), len, "no second (cancelled) for an already-paired call");
+        assert_eq!(
+            c.messages.len(),
+            len,
+            "no second (cancelled) for an already-paired call"
+        );
     }
 
     // A full Conversation — system + user + assistant-with-tool_calls + tool_result
@@ -972,8 +1121,16 @@ mod tests {
         c.push(Message::assistant(
             "calling tools",
             vec![
-                ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: "{\"path\":\"/x\"}".into() },
-                ToolCall { id: "call_2".into(), name: "grep".into(), arguments: "{\"q\":\"foo\"}".into() },
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"/x\"}".into(),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "grep".into(),
+                    arguments: "{\"q\":\"foo\"}".into(),
+                },
             ],
         ));
         // a tool_result with tool_call_id set and is_error=true.
@@ -983,7 +1140,11 @@ mod tests {
         // back next turn — the kernel stores it losslessly here).
         let mut with_meta = Message::assistant("done", vec![]);
         with_meta.meta = Some(MessageMeta {
-            tokens: TokenUsage { prompt: 50, completion: 7, cached: 3 },
+            tokens: TokenUsage {
+                prompt: 50,
+                completion: 7,
+                cached: 3,
+            },
             elapsed_ms: 123,
             reasoning_elapsed_ms: 0,
             ctx_window: 1000,
@@ -1000,26 +1161,41 @@ mod tests {
         c.push(with_meta);
 
         let json = serde_json::to_string(&c).expect("Conversation must serialize");
-        let back: Conversation = serde_json::from_str(&json).expect("Conversation must deserialize");
+        let back: Conversation =
+            serde_json::from_str(&json).expect("Conversation must deserialize");
 
         // Whole-conversation equality proves NOTHING was dropped or mangled.
-        assert_eq!(back, c, "round-trip must be lossless (Conversation PartialEq)");
+        assert_eq!(
+            back, c,
+            "round-trip must be lossless (Conversation PartialEq)"
+        );
 
         // Spell out the bits the OLD lossy MessageSnapshot silently dropped, so a
         // regression to a lossy projection fails LOUDLY here:
         let asst = &back.messages[2];
-        assert_eq!(asst.tool_calls.len(), 2, "tool_calls must survive the round-trip");
+        assert_eq!(
+            asst.tool_calls.len(),
+            2,
+            "tool_calls must survive the round-trip"
+        );
         assert_eq!(asst.tool_calls[0].id, "call_1");
         assert_eq!(asst.tool_calls[0].name, "read_file");
         assert_eq!(asst.tool_calls[0].arguments, "{\"path\":\"/x\"}");
         assert_eq!(asst.tool_calls[1].id, "call_2");
 
         let tr = &back.messages[3];
-        assert_eq!(tr.tool_call_id.as_deref(), Some("call_1"), "tool_call_id must survive");
+        assert_eq!(
+            tr.tool_call_id.as_deref(),
+            Some("call_1"),
+            "tool_call_id must survive"
+        );
         assert_eq!(tr.text, "boom");
         // is_error is a REAL semantic property (a real adapter echoes it to the
         // provider). It was silently dropped before; assert it now survives.
-        assert!(tr.is_error, "tool_result is_error must survive the round-trip");
+        assert!(
+            tr.is_error,
+            "tool_result is_error must survive the round-trip"
+        );
 
         assert!(back.messages[4].meta.is_some(), "meta sidecar must survive");
         assert_eq!(back.messages[4].meta.as_ref().unwrap().round, 2);
@@ -1033,8 +1209,14 @@ mod tests {
             "stored reasoning must survive the round-trip"
         );
         // A non-thinking / non-assistant message has no reasoning.
-        assert_eq!(back.messages[1].reasoning, None, "user message has no reasoning");
-        assert_eq!(back.messages[2].reasoning, None, "assistant w/o thinking has None");
+        assert_eq!(
+            back.messages[1].reasoning, None,
+            "user message has no reasoning"
+        );
+        assert_eq!(
+            back.messages[2].reasoning, None,
+            "assistant w/o thinking has None"
+        );
     }
 
     // ADDITIVE serde-default: a v1-style assistant message JSON WITHOUT a
@@ -1044,8 +1226,12 @@ mod tests {
     fn message_without_reasoning_field_defaults_to_none() {
         // No "reasoning" key — exactly what a v1 kernel wrote.
         let v1 = r#"{"role":"Assistant","text":"answer","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null,"synthetic":false}"#;
-        let m: Message = serde_json::from_str(v1).expect("v1 message (no reasoning) must deserialize");
-        assert_eq!(m.reasoning, None, "missing reasoning field defaults to None");
+        let m: Message =
+            serde_json::from_str(v1).expect("v1 message (no reasoning) must deserialize");
+        assert_eq!(
+            m.reasoning, None,
+            "missing reasoning field defaults to None"
+        );
         assert_eq!(m.text, "answer");
 
         // And a stored Some(..) reasoning serializes + round-trips standalone.
@@ -1057,11 +1243,28 @@ mod tests {
         assert_eq!(back, a, "Message with reasoning round-trips losslessly");
     }
 
+    #[test]
+    fn message_without_internal_origin_field_defaults_to_none() {
+        let v1 = r#"{"role":"Assistant","text":"answer","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null,"synthetic":false}"#;
+        let m: Message =
+            serde_json::from_str(v1).expect("v1 message (no internal_origin) must deserialize");
+        assert!(m.internal_origin.is_none());
+
+        let mut a = Message::assistant("No verification is needed.", vec![]);
+        a.internal_origin = Some("verify_cadence".into());
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.internal_origin.as_deref(), Some("verify_cadence"));
+    }
+
     // `Role` serializes to its STABLE variant tag — the derived enum name is the
     // wire contract now (NOT a `{:?}` Debug artifact) — and round-trips.
     #[test]
     fn role_serializes_to_stable_tag() {
-        assert_eq!(serde_json::to_string(&Role::Assistant).unwrap(), "\"Assistant\"");
+        assert_eq!(
+            serde_json::to_string(&Role::Assistant).unwrap(),
+            "\"Assistant\""
+        );
         assert_eq!(serde_json::to_string(&Role::System).unwrap(), "\"System\"");
         assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"User\"");
         assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"Tool\"");
@@ -1079,8 +1282,14 @@ mod tests {
         c.push(Message::user("hi"));
 
         let snap = SessionSnapshot::from_conversation(&c);
-        assert_eq!(snap.version, SNAPSHOT_VERSION, "constructor stamps the current version");
-        assert_eq!(snap.messages, c.messages, "from_conversation carries messages losslessly");
+        assert_eq!(
+            snap.version, SNAPSHOT_VERSION,
+            "constructor stamps the current version"
+        );
+        assert_eq!(
+            snap.messages, c.messages,
+            "from_conversation carries messages losslessly"
+        );
 
         let json = serde_json::to_string(&snap).unwrap();
         let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
@@ -1181,7 +1390,11 @@ mod tests {
         c.push(Message::user("task"));
         c.push(Message::assistant(
             "", // text-light…
-            vec![crate::tool::ToolCall { id: "c1".into(), name: "t".into(), arguments: big_args }], // …tool-call-heavy
+            vec![crate::tool::ToolCall {
+                id: "c1".into(),
+                name: "t".into(),
+                arguments: big_args,
+            }], // …tool-call-heavy
         ));
         c.push(Message::tool_result("c1", "ok", false));
         c.push(Message::user("next"));
@@ -1282,7 +1495,11 @@ mod tests {
         c.push(Message::system("sys"));
         c.push(Message::user("task"));
         c.push(Message::assistant("call", vec![call("c1", "read_file")]));
-        c.push(Message::tool_result("c1", "HUGE TOOL OUTPUT THAT IS LONG", false));
+        c.push(Message::tool_result(
+            "c1",
+            "HUGE TOOL OUTPUT THAT IS LONG",
+            false,
+        ));
         c.push(Message::user("next"));
         let floor = c.sacred_floor();
         let epoch_before = c.cache_epoch;
@@ -1299,7 +1516,11 @@ mod tests {
         assert!(report.committed, "rewrite that shrinks bytes must commit");
         assert_eq!(c.cache_epoch, epoch_before + 1);
         assert_eq!(c.messages[3].text, "[stubbed]");
-        assert_eq!(c.messages[3].tool_call_id.as_deref(), Some("c1"), "other fields untouched");
+        assert_eq!(
+            c.messages[3].tool_call_id.as_deref(),
+            Some("c1"),
+            "other fields untouched"
+        );
         // siblings untouched.
         assert_eq!(c.messages[2].text, "call");
         assert_eq!(c.messages[4].text, "next");
@@ -1310,10 +1531,19 @@ mod tests {
         let mut c2 = c.clone();
         let epoch2 = c2.cache_epoch;
         let report2 = c2.apply_plan(
-            CompactionPlan { drain_from: 0, drain_to: 0, summary: None, rewrites: vec![(999, "x".into())], resume_note: None },
+            CompactionPlan {
+                drain_from: 0,
+                drain_to: 0,
+                summary: None,
+                rewrites: vec![(999, "x".into())],
+                resume_note: None,
+            },
             c2.sacred_floor(),
         );
-        assert!(!report2.committed, "out-of-range rewrite that changes nothing must refuse");
+        assert!(
+            !report2.committed,
+            "out-of-range rewrite that changes nothing must refuse"
+        );
         assert_eq!(c2.cache_epoch, epoch2);
     }
 
@@ -1339,9 +1569,13 @@ mod tests {
         // A v1-style JSON with NO cache_epoch / synthetic fields still loads
         // (serde default → epoch 0, synthetic false).
         let v1 = r#"{"version":1,"messages":[{"role":"User","text":"hi","tool_calls":[],"tool_call_id":null,"is_error":false,"meta":null}]}"#;
-        let loaded: SessionSnapshot = serde_json::from_str(v1).expect("v1 snapshot must still deserialize");
+        let loaded: SessionSnapshot =
+            serde_json::from_str(v1).expect("v1 snapshot must still deserialize");
         assert_eq!(loaded.cache_epoch, 0, "missing cache_epoch defaults to 0");
-        assert!(!loaded.messages[0].synthetic, "missing synthetic defaults to false");
+        assert!(
+            !loaded.messages[0].synthetic,
+            "missing synthetic defaults to false"
+        );
 
         // `new` defaults epoch 0.
         let snap2 = SessionSnapshot::new(vec![Message::user("x")]);
@@ -1380,7 +1614,9 @@ mod tests {
                     a.role == Role::Assistant && a.tool_calls.iter().any(|tc| tc.id == id)
                 });
                 if !preceded {
-                    return Err(format!("tool_result {id} is an ORPHAN (no preceding tool_call)"));
+                    return Err(format!(
+                        "tool_result {id} is an ORPHAN (no preceding tool_call)"
+                    ));
                 }
             }
         }
@@ -1408,7 +1644,10 @@ mod tests {
         ];
         let len = base.len();
         for keep_recent in 0..=len {
-            let mut c = Conversation { messages: base.clone(), cache_epoch: 0 };
+            let mut c = Conversation {
+                messages: base.clone(),
+                cache_epoch: 0,
+            };
             let floor = c.sacred_floor();
             let view = CompactionView {
                 messages: &c.messages,
@@ -1421,7 +1660,10 @@ mod tests {
             let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
             c.apply_plan(plan, floor);
             check_pair_valid(&c.messages).unwrap_or_else(|e| {
-                panic!("keep_recent={keep_recent} produced an INVALID pairing: {e}\n{:#?}", c.messages)
+                panic!(
+                    "keep_recent={keep_recent} produced an INVALID pairing: {e}\n{:#?}",
+                    c.messages
+                )
             });
         }
     }
@@ -1443,7 +1685,9 @@ mod tests {
         check_pair_valid(&msgs).expect("must be pair-valid after repair");
         // Orphan gone.
         assert!(
-            !msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("orphan")),
+            !msgs
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("orphan")),
             "orphan tool_result must be dropped"
         );
         // Dangling backfilled with a (cancelled) result RIGHT AFTER its call.
@@ -1471,7 +1715,10 @@ mod tests {
         ];
         let mut msgs = valid.clone();
         Conversation::repair_pairing(&mut msgs);
-        assert_eq!(msgs, valid, "repair_pairing must be a no-op on an already-valid history");
+        assert_eq!(
+            msgs, valid,
+            "repair_pairing must be a no-op on an already-valid history"
+        );
     }
 
     // ── BLOCKER 2 — rewrites respect the sacred floor ────────────────────────
@@ -1483,7 +1730,10 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::system("SYSTEM-PERSONA"));
         c.push(Message::user("THE-REAL-TASK"));
-        c.push(Message::assistant("middle that is long enough to shrink", vec![]));
+        c.push(Message::assistant(
+            "middle that is long enough to shrink",
+            vec![],
+        ));
         c.push(Message::user("tail"));
         let floor = c.sacred_floor(); // 2
         let sys_before = c.messages[0].clone();
@@ -1504,11 +1754,17 @@ mod tests {
             resume_note: None,
         };
         let report = c.apply_plan(plan, floor);
-        assert!(report.committed, "the in-range shrinking rewrite must commit");
+        assert!(
+            report.committed,
+            "the in-range shrinking rewrite must commit"
+        );
         assert_eq!(c.cache_epoch, epoch_before + 1);
         // Sacred prefix BYTE-IDENTICAL (rewrites ignored).
         assert_eq!(c.messages[0], sys_before, "system must be byte-identical");
-        assert_eq!(c.messages[1], user_before, "first real user must be byte-identical");
+        assert_eq!(
+            c.messages[1], user_before,
+            "first real user must be byte-identical"
+        );
         // The in-range rewrite applied.
         assert_eq!(c.messages[2].text, "short");
     }
@@ -1528,12 +1784,22 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::system("SYS-FROZEN")); // 0 sacred
         c.push(Message::user("THE-TASK")); // 1 sacred (first real user) → floor 2
-        // Drained pair (idx 2,3): assistant call c1 + its result, both inside [2,4).
-        c.push(Message::assistant("drain me A long enough", vec![call("c1", "echo")])); // 2
+                                           // Drained pair (idx 2,3): assistant call c1 + its result, both inside [2,4).
+        c.push(Message::assistant(
+            "drain me A long enough",
+            vec![call("c1", "echo")],
+        )); // 2
         c.push(Message::tool_result("c1", "drain me B also long", false)); // 3
-        // Surviving pair AFTER drain_to (idx 4,5): assistant call c2 + its result.
-        c.push(Message::assistant("SURVIVOR keep me", vec![call("c2", "echo")])); // 4
-        c.push(Message::tool_result("c2", "ORIGINAL TOOL OUTPUT THAT IS LONG ENOUGH", false)); // 5 ← rewrite target
+                                                                           // Surviving pair AFTER drain_to (idx 4,5): assistant call c2 + its result.
+        c.push(Message::assistant(
+            "SURVIVOR keep me",
+            vec![call("c2", "echo")],
+        )); // 4
+        c.push(Message::tool_result(
+            "c2",
+            "ORIGINAL TOOL OUTPUT THAT IS LONG ENOUGH",
+            false,
+        )); // 5 ← rewrite target
         c.push(Message::user("TAIL keep me")); // 6
         let floor = c.sacred_floor(); // 2
         let sys_before = c.messages[0].clone();
@@ -1565,25 +1831,47 @@ mod tests {
         //   [0]=SYS [1]=TASK [2]=summary(synthetic) [3]=SURVIVOR(orig4)
         //   [4]=tool result(orig5, REWRITTEN) [5]=TAIL(orig6)
         // 7 original - 2 drained + 1 summary = 6.
-        assert_eq!(c.messages.len(), 6, "7 original - 2 drained + 1 summary = 6");
+        assert_eq!(
+            c.messages.len(),
+            6,
+            "7 original - 2 drained + 1 summary = 6"
+        );
         // Sacred prefix byte-identical (the (0,..) rewrite was skipped).
-        assert_eq!(c.messages[0], sys_before, "system byte-identical, sacred rewrite skipped");
+        assert_eq!(
+            c.messages[0], sys_before,
+            "system byte-identical, sacred rewrite skipped"
+        );
         assert_eq!(c.messages[1], task_before, "task byte-identical");
         // Summary inserted at the floor.
         assert!(c.messages[2].synthetic && c.messages[2].text == "s");
         // SURVIVOR (orig 4) is unchanged — it was NOT the rewrite target.
-        assert_eq!(c.messages[3], survivor_before, "survivor assistant untouched");
+        assert_eq!(
+            c.messages[3], survivor_before,
+            "survivor assistant untouched"
+        );
         // The CORRECT surviving message (orig 5 → candidate 4) got the rewrite,
         // NOT an off-by-N neighbor.
-        assert_eq!(c.messages[4].text, "[stub]", "rewrite hit the translated index");
-        assert_eq!(c.messages[4].tool_call_id.as_deref(), Some("c2"), "and it is the right message");
+        assert_eq!(
+            c.messages[4].text, "[stub]",
+            "rewrite hit the translated index"
+        );
+        assert_eq!(
+            c.messages[4].tool_call_id.as_deref(),
+            Some("c2"),
+            "and it is the right message"
+        );
         // The drained-index rewrite never resurfaced anywhere.
         assert!(
-            !c.messages.iter().any(|m| m.text == "SHOULD-BE-SKIPPED-DRAINED"),
+            !c.messages
+                .iter()
+                .any(|m| m.text == "SHOULD-BE-SKIPPED-DRAINED"),
             "a rewrite of a drained index must be silently skipped"
         );
         // No message got HACKED.
-        assert!(!c.messages.iter().any(|m| m.text == "HACKED"), "sacred-prefix rewrite skipped");
+        assert!(
+            !c.messages.iter().any(|m| m.text == "HACKED"),
+            "sacred-prefix rewrite skipped"
+        );
         // Tail preserved.
         assert_eq!(c.messages[5], tail_before, "trailing user preserved");
     }

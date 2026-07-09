@@ -32,8 +32,12 @@ pub struct GoalState {
 
 #[derive(Debug)]
 pub enum GoalResult {
-    NotMet { reason: String },
-    Met { reason: String },
+    NotMet {
+        reason: String,
+    },
+    Met {
+        reason: String,
+    },
     /// Evaluator failed to produce a verdict. The wrapper counts these and
     /// gives up after `MAX_EVAL_FAILURES`. Holding `anyhow::Error` preserves
     /// the underlying source chain for diagnostics.
@@ -99,8 +103,16 @@ pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> S
     if !files.is_empty() {
         let head: Vec<&str> = files.iter().take(20).map(String::as_str).collect();
         let more = files.len().saturating_sub(head.len());
-        let extra = if more > 0 { format!(" (+{more} more)") } else { String::new() };
-        sections.push(format!("Files edited this goal: {}{}", head.join(", "), extra));
+        let extra = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        sections.push(format!(
+            "Files edited this goal: {}{}",
+            head.join(", "),
+            extra
+        ));
     }
 
     if let Some(v) = prev_verdict {
@@ -118,8 +130,12 @@ pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> S
             continue;
         }
         let ok = msg.tool_result_success().unwrap_or(true);
-        let snippet: String =
-            msg.tool_result_output().unwrap_or("").chars().take(TOOL_CHARS).collect();
+        let snippet: String = msg
+            .tool_result_output()
+            .unwrap_or("")
+            .chars()
+            .take(TOOL_CHARS)
+            .collect();
         collected.push((idx, ok, snippet.replace('\n', " ")));
     }
     let mut selected: Vec<&(usize, bool, String)> = Vec::new();
@@ -169,7 +185,10 @@ pub fn summarize_for_goal(messages: &[Message], prev_verdict: Option<&str>) -> S
     }
     recent.reverse();
     if !recent.is_empty() {
-        sections.push(format!("Recent assistant replies (oldest → newest):\n{}", recent.join("\n---\n")));
+        sections.push(format!(
+            "Recent assistant replies (oldest → newest):\n{}",
+            recent.join("\n---\n")
+        ));
     }
 
     if sections.is_empty() {
@@ -275,7 +294,10 @@ impl GoalState {
         let elapsed = self.elapsed_secs();
         let mins = elapsed / 60;
         let secs = elapsed % 60;
-        let reason = self.last_eval_reason.as_deref().unwrap_or("(not yet evaluated)");
+        let reason = self
+            .last_eval_reason
+            .as_deref()
+            .unwrap_or("(not yet evaluated)");
         let round = match self.max_rounds {
             Some(max) => format!("{}/{}", self.round, max),
             None => self.round.to_string(),
@@ -315,29 +337,53 @@ mod tests {
             role: Role::Assistant,
             content: MessageContent::AssistantWithToolCalls {
                 text: Some(text.into()),
-                tool_calls: vec![ToolCall { id: "t1".into(), name: name.into(), arguments: args.into() }],
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: name.into(),
+                    arguments: args.into(),
+                }],
                 reasoning_content: None,
                 thinking_blocks: vec![],
             },
             synthetic: false,
+            internal_origin: None,
         }
     }
     fn tool_result(call_id: &str, output: &str, success: bool) -> Message {
-        Message { role: Role::Tool, content: MessageContent::ToolResult(ToolResult {
-            call_id: call_id.into(), output: output.into(), success }), synthetic: false }
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: call_id.into(),
+                output: output.into(),
+                success,
+            }),
+            synthetic: false,
+            internal_origin: None,
+        }
     }
 
     #[test]
     fn summary_includes_edited_files_and_failed_tool_output() {
         let msgs = vec![
-            asst_with_call("writing the file", "write_file", r#"{"file_path":"src/app.rs","content":"x"}"#),
+            asst_with_call(
+                "writing the file",
+                "write_file",
+                r#"{"file_path":"src/app.rs","content":"x"}"#,
+            ),
             tool_result("t1", "wrote 1 line", true),
-            asst_with_call("running tests, all done!", "bash", r#"{"command":"cargo test"}"#),
+            asst_with_call(
+                "running tests, all done!",
+                "bash",
+                r#"{"command":"cargo test"}"#,
+            ),
             tool_result("t1", "test result: FAILED. 2 passed; 3 failed", false),
         ];
         let s = summarize_for_goal(&msgs, Some("no — keep going"));
         assert!(s.contains("src/app.rs"), "edited file missing: {s}");
-        assert!(s.contains("FAILED") || s.contains("3 failed"), "failure signal missing: {s}");
+        assert!(
+            s.contains("FAILED") || s.contains("3 failed"),
+            "failure signal missing: {s}"
+        );
         assert!(s.contains("all done"), "assistant prose missing: {s}");
         assert!(s.contains("no — keep going"), "prev verdict missing: {s}");
     }
@@ -346,11 +392,19 @@ mod tests {
     fn summary_keeps_old_failure_over_newer_successes() {
         // One FAILED result older than 5 newer successes — it must still surface.
         let mut msgs = vec![
-            asst_with_call("ran the failing check", "bash", r#"{"command":"cargo test"}"#),
+            asst_with_call(
+                "ran the failing check",
+                "bash",
+                r#"{"command":"cargo test"}"#,
+            ),
             tool_result("t1", "test result: FAILED. 1 failed", false),
         ];
         for i in 0..5 {
-            msgs.push(asst_with_call("ok step", "bash", r#"{"command":"echo hi"}"#));
+            msgs.push(asst_with_call(
+                "ok step",
+                "bash",
+                r#"{"command":"echo hi"}"#,
+            ));
             msgs.push(tool_result("t1", &format!("ok {i}"), true));
         }
         let s = summarize_for_goal(&msgs, None);
@@ -367,14 +421,23 @@ mod tests {
             r#"{"files":[{"path":"a.rs","instruction":"x"},{"path":"b.rs","instruction":"y"}]}"#,
         )];
         let s = summarize_for_goal(&msgs, None);
-        assert!(s.contains("a.rs") && s.contains("b.rs"), "parallel-edit files missing: {s}");
+        assert!(
+            s.contains("a.rs") && s.contains("b.rs"),
+            "parallel-edit files missing: {s}"
+        );
     }
 
     #[test]
     fn continuation_message_forbids_asking_user() {
         let m = goal_continuation_message("no — tests failing", "make all tests pass");
-        assert!(m.to_lowercase().contains("do not ask") || m.contains("不要"), "must discourage questions: {m}");
-        assert!(m.contains("make all tests pass"), "must restate the goal: {m}");
+        assert!(
+            m.to_lowercase().contains("do not ask") || m.contains("不要"),
+            "must discourage questions: {m}"
+        );
+        assert!(
+            m.contains("make all tests pass"),
+            "must restate the goal: {m}"
+        );
         assert!(m.contains("tests failing"), "must include the verdict: {m}");
     }
 
@@ -395,7 +458,10 @@ mod tests {
         g.tokens_used = 1000;
         g.clear();
         assert!(!g.active);
-        assert_eq!(g.round, 5, "clear must not touch round (UI may still display final state)");
+        assert_eq!(
+            g.round, 5,
+            "clear must not touch round (UI may still display final state)"
+        );
         assert_eq!(g.tokens_used, 1000);
     }
 
@@ -433,7 +499,10 @@ mod tests {
         let s = g.status_line();
         assert!(s.contains("write tests"));
         assert!(s.contains("Round: 3"));
-        assert!(!s.contains("Round: 3/"), "no denominator (CC doesn't bound rounds)");
+        assert!(
+            !s.contains("Round: 3/"),
+            "no denominator (CC doesn't bound rounds)"
+        );
         assert!(s.contains("1234"));
         assert!(s.contains("2 tests still failing"));
     }
@@ -460,7 +529,10 @@ mod tests {
         }
         assert!(g.is_unproductive_exhausted());
         g.note_productive();
-        assert_eq!(g.consecutive_unproductive, 0, "a productive round resets the counter");
+        assert_eq!(
+            g.consecutive_unproductive, 0,
+            "a productive round resets the counter"
+        );
         assert!(!g.is_unproductive_exhausted());
     }
 
@@ -476,7 +548,8 @@ mod tests {
         let g2 = GoalState::new_with_limits("c".into(), None, None);
         assert_eq!(g2.cap_reached(), None);
         // time cap: a deadline already in the past
-        let mut g3 = GoalState::new_with_limits("c".into(), None, Some(std::time::Duration::from_secs(0)));
+        let mut g3 =
+            GoalState::new_with_limits("c".into(), None, Some(std::time::Duration::from_secs(0)));
         // deadline = now + 0 ⇒ already reached
         g3.round = 0;
         assert_eq!(g3.cap_reached(), Some("time limit"));
@@ -486,9 +559,16 @@ mod tests {
     fn status_line_shows_denominator_when_bounded() {
         let mut g = GoalState::new_with_limits("write tests".into(), Some(200), None);
         g.round = 3;
-        assert!(g.status_line().contains("Round: 3/200"), "bounded goal shows denominator: {}", g.status_line());
+        assert!(
+            g.status_line().contains("Round: 3/200"),
+            "bounded goal shows denominator: {}",
+            g.status_line()
+        );
         // unbounded keeps the old terse form
         let g2 = GoalState::new("c".into());
-        assert!(!g2.status_line().contains("/"), "unbounded has no denominator");
+        assert!(
+            !g2.status_line().contains("/"),
+            "unbounded has no denominator"
+        );
     }
 }

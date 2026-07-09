@@ -201,6 +201,8 @@ export interface SessionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   synthetic?: boolean;
+  internal_origin?: string;
+  internalOrigin?: string;
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: unknown;

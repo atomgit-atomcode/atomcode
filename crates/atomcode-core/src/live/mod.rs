@@ -38,7 +38,10 @@ pub enum TurnState {
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     /// 某视图刚提交的用户消息（让其他视图也能渲染出这条用户气泡）。
-    UserMessage { text: String, images: Vec<ImagePart> },
+    UserMessage {
+        text: String,
+        images: Vec<ImagePart>,
+    },
     /// 一次 turn 执行产生的事件（文本增量、工具、审批请求等）。
     Turn(TurnEvent),
     /// turn 状态变化（视图据此禁用/启用输入框）。
@@ -188,10 +191,7 @@ impl LiveSession {
         &self,
     ) -> (Vec<Message>, Vec<LiveEvent>, broadcast::Receiver<LiveEvent>) {
         let snap = self.snapshot.lock().await.clone();
-        let buf = self
-            .turn_buffer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let buf = self.turn_buffer.lock().unwrap_or_else(|e| e.into_inner());
         let rx = self.events.subscribe();
         let replay = buf.clone();
         drop(buf);
@@ -233,7 +233,9 @@ impl LiveSession {
     /// 广播一次模型切换给所有视图（不触碰 turn 状态）。任一端切换模型时调用，
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
-        self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+        self.events
+            .send(LiveEvent::ProviderChanged(provider))
+            .is_ok()
     }
 
     /// 广播一次审批模式切换（build / plan / bypass）给所有视图，让另一端的「模式」
@@ -251,7 +253,9 @@ impl LiveSession {
     /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
     /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_session_switched(&self, session_id: String) -> bool {
-        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
+        self.events
+            .send(LiveEvent::SessionSwitched(session_id))
+            .is_ok()
     }
 
     /// 广播「请在桌面 TUI 执行这条斜杠命令」（手机 App 发起）。返回 false 表示
@@ -316,7 +320,11 @@ async fn coordinator(
     // display (DEC-graphics mojibake / flooding). See trace.rs.
     crate::ctrace!("LIVE", "coordinator START");
     while let Some(input) = input_rx.recv().await {
-        crate::ctrace!("LIVE", "coordinator received input: {} chars", input.text.len());
+        crate::ctrace!(
+            "LIVE",
+            "coordinator received input: {} chars",
+            input.text.len()
+        );
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
@@ -329,7 +337,10 @@ async fn coordinator(
             }
             *st = TurnState::Running;
         }
-        crate::ctrace!("LIVE", "coordinator ACCEPTED input, broadcasting StateChanged(Running)");
+        crate::ctrace!(
+            "LIVE",
+            "coordinator ACCEPTED input, broadcasting StateChanged(Running)"
+        );
         // 回合开始：清回放缓冲并记入 Running——锁内一并广播，与
         // join_with_replay 的「订阅+克隆」互斥，保证晚加入者不丢不重。
         {
@@ -358,6 +369,7 @@ async fn coordinator(
                         images: input.images.clone(),
                     },
                     synthetic: false,
+                    internal_origin: None,
                 });
                 conv.turn_tracker.on_user_message(idx);
             }
@@ -442,7 +454,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
-        crate::ctrace!("LIVE", "coordinator turn done, broadcasting StateChanged(Idle)");
+        crate::ctrace!(
+            "LIVE",
+            "coordinator turn done, broadcasting StateChanged(Idle)"
+        );
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
     crate::ctrace!("LIVE", "coordinator EXIT (input_rx closed)");
@@ -493,7 +508,8 @@ mod tests {
             }
             {
                 let mut c = conv.lock().await;
-                c.messages.push(Message::new(Role::Assistant, self.reply.clone()));
+                c.messages
+                    .push(Message::new(Role::Assistant, self.reply.clone()));
             }
             let _ = events.send(LiveEvent::Turn(TurnEvent::TokenUsage {
                 prompt_tokens: 1,
@@ -505,7 +521,11 @@ mod tests {
     }
 
     fn fake(calls: Arc<AtomicUsize>) -> Arc<dyn TurnExecutor> {
-        Arc::new(FakeExecutor { calls, reply: "hi".to_string(), delay_ms: 0 })
+        Arc::new(FakeExecutor {
+            calls,
+            reply: "hi".to_string(),
+            delay_ms: 0,
+        })
     }
 
     /// 收集广播事件直到收到一个 StateChanged(Idle)（表示一次 turn 收尾）。
@@ -531,13 +551,26 @@ mod tests {
         let session = LiveSession::new(fake(calls.clone()), Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "你好".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "你好".into(),
+            images: vec![]
+        }));
 
         let events = drain_until_idle(&mut rx).await;
-        assert!(matches!(events.first(), Some(LiveEvent::StateChanged(TurnState::Running))));
-        assert!(events.iter().any(|e| matches!(e, LiveEvent::UserMessage { text, .. } if text == "你好")));
-        assert!(events.iter().any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")));
-        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        assert!(matches!(
+            events.first(),
+            Some(LiveEvent::StateChanged(TurnState::Running))
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LiveEvent::UserMessage { text, .. } if text == "你好")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")));
+        assert!(matches!(
+            events.last(),
+            Some(LiveEvent::StateChanged(TurnState::Idle))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let snap = session.snapshot().await;
@@ -547,27 +580,43 @@ mod tests {
     #[tokio::test]
     async fn rejects_input_while_running() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let exec: Arc<dyn TurnExecutor> =
-            Arc::new(FakeExecutor { calls: calls.clone(), reply: "x".into(), delay_ms: 80 });
+        let exec: Arc<dyn TurnExecutor> = Arc::new(FakeExecutor {
+            calls: calls.clone(),
+            reply: "x".into(),
+            delay_ms: 80,
+        });
         let session = LiveSession::new(exec, Vec::new());
         let mut rx = session.subscribe();
 
         // 第一条：开始一个长 turn。
-        assert!(session.send_input(UserInput { text: "first".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "first".into(),
+            images: vec![]
+        }));
         loop {
             if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
                 break;
             }
         }
         // 运行中投第二条：应被忽略（不排队、不作为新 turn 执行）。
-        session.send_input(UserInput { text: "second".into(), images: vec![] });
+        session.send_input(UserInput {
+            text: "second".into(),
+            images: vec![],
+        });
         let _ = drain_until_idle(&mut rx).await; // 第一条 turn 收尾
 
         // 再投第三条合法输入并等其收尾：若 "second" 被正确丢弃，calls 应为 2（first+third）；
         // 若 "second" 漏跑成了第二个 turn，calls 会是 3。事件驱动、无 sleep。
-        assert!(session.send_input(UserInput { text: "third".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "third".into(),
+            images: vec![]
+        }));
         let _ = drain_until_idle(&mut rx).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "运行中投的第二条应被丢弃，仅 first+third 执行");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "运行中投的第二条应被丢弃，仅 first+third 执行"
+        );
     }
 
     #[tokio::test]
@@ -575,7 +624,10 @@ mod tests {
         let session = LiveSession::new(Arc::new(CancellableExecutor), Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "cancel me".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "cancel me".into(),
+            images: vec![]
+        }));
         loop {
             if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
                 break;
@@ -583,10 +635,14 @@ mod tests {
         }
 
         assert!(session.cancel_current_turn().await);
-        let events = tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
-            .await
-            .expect("cancelled turn should become idle promptly");
-        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        let events =
+            tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
+                .await
+                .expect("cancelled turn should become idle promptly");
+        assert!(matches!(
+            events.last(),
+            Some(LiveEvent::StateChanged(TurnState::Idle))
+        ));
         assert!(!session.cancel_current_turn().await);
     }
 
@@ -605,12 +661,18 @@ mod tests {
     #[tokio::test]
     async fn join_with_replay_recovers_in_flight_turn_and_clears_at_boundary() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let exec: Arc<dyn TurnExecutor> =
-            Arc::new(FakeExecutor { calls: calls.clone(), reply: "hi".into(), delay_ms: 120 });
+        let exec: Arc<dyn TurnExecutor> = Arc::new(FakeExecutor {
+            calls: calls.clone(),
+            reply: "hi".into(),
+            delay_ms: 120,
+        });
         let session = LiveSession::new(exec, Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "你好".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "你好".into(),
+            images: vec![]
+        }));
         // 等 TextDelta 上广播（FakeExecutor 先发增量再 sleep），此刻回合仍在进行。
         loop {
             if let Ok(LiveEvent::Turn(TurnEvent::TextDelta(_))) = rx.recv().await {
@@ -622,15 +684,22 @@ mod tests {
         let (snap, replay, _rx2) = session.join_with_replay().await;
         assert_eq!(snap.len(), 1, "进行中：快照只含用户消息（turn 未到边界）");
         assert!(
-            matches!(replay.first(), Some(LiveEvent::StateChanged(TurnState::Running))),
+            matches!(
+                replay.first(),
+                Some(LiveEvent::StateChanged(TurnState::Running))
+            ),
             "回放首条应为 Running，让重连方恢复 streaming 状态"
         );
         assert!(
-            replay.iter().any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")),
+            replay
+                .iter()
+                .any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")),
             "回放应包含已发生的文本增量"
         );
         assert!(
-            !replay.iter().any(|e| matches!(e, LiveEvent::UserMessage { .. })),
+            !replay
+                .iter()
+                .any(|e| matches!(e, LiveEvent::UserMessage { .. })),
             "用户消息已在快照里，回放不应重复携带"
         );
 
