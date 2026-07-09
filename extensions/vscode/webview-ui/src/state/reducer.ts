@@ -89,6 +89,10 @@ function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolea
   return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
+function internalOriginOf(message: { internal_origin?: string; internalOrigin?: string }): string | undefined {
+  return message.internal_origin ?? message.internalOrigin;
+}
+
 function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!content || typeof content !== 'object') return '';
@@ -886,6 +890,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
         const rawText = textFromContent(m.content);
         if (role === 'user' && isInternalHistoryUserMessage(rawText, m.synthetic)) {
+          continue;
+        }
+        const internalOrigin = internalOriginOf(m);
+        if (role === 'assistant' && internalOrigin === 'verify_cadence' && toolCalls.length === 0) {
           continue;
         }
         const { displayText: userVisibleText, hadVisionMarker } = role === 'user'

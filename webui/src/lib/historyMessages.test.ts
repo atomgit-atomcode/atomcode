@@ -31,3 +31,44 @@ test('sessionMessagesToMarkdownLines skips internal user messages', () => {
   assert.doesNotMatch(markdown, /not verified/);
   assert.doesNotMatch(markdown, /Auto-read/);
 });
+
+test('sessionMessagesToMarkdownLines skips verify cadence assistant messages', () => {
+  const messages: SessionMessage[] = [
+    { role: 'user', content: 'create f.txt' },
+    { role: 'assistant', content: 'No verification is needed.', internal_origin: 'verify_cadence' },
+    { role: 'assistant', content: 'I am AtomCode.' },
+  ];
+
+  const markdown = sessionMessagesToMarkdownLines(messages, 'Session').join('\n');
+
+  assert.doesNotMatch(markdown, /No verification is needed/);
+  assert.match(markdown, /I am AtomCode/);
+});
+
+test('sessionMessagesToMarkdownLines skips camel case verify cadence assistant messages', () => {
+  const messages: SessionMessage[] = [
+    { role: 'assistant', content: 'No verification is needed.', internalOrigin: 'verify_cadence' },
+    { role: 'assistant', content: 'I am AtomCode.' },
+  ];
+
+  const markdown = sessionMessagesToMarkdownLines(messages, 'Session').join('\n');
+
+  assert.doesNotMatch(markdown, /No verification is needed/);
+  assert.match(markdown, /I am AtomCode/);
+});
+
+test('sessionMessagesToMarkdownLines keeps verify cadence assistants with tool calls', () => {
+  const messages: SessionMessage[] = [
+    {
+      role: 'assistant',
+      content: 'Running verification',
+      internal_origin: 'verify_cadence',
+      tool_calls: [{ id: 'b1', name: 'bash', arguments: '{"command":"true"}' }],
+    },
+  ];
+
+  const markdown = sessionMessagesToMarkdownLines(messages, 'Session').join('\n');
+
+  assert.match(markdown, /Running verification/);
+  assert.match(markdown, /### Tool: bash/);
+});

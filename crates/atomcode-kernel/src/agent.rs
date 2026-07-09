@@ -1,6 +1,8 @@
 use crate::clock::{Clock, SystemClock};
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
-use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
+use crate::hook::{
+    Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
+};
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
     MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
@@ -279,7 +281,11 @@ fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<Strin
 /// re-evaluated each turn — switch to a smaller window ⇒ pressure rises ⇒ compact
 /// proactively; switch to a larger window ⇒ pressure drops ⇒ no needless compaction.
 /// `None` when the window is unknown (`ctx_window == 0`) — can't gauge, so don't act.
-fn auto_compact_trigger(used_tokens: u32, ctx_window: u32, threshold: f32) -> Option<CompactTrigger> {
+fn auto_compact_trigger(
+    used_tokens: u32,
+    ctx_window: u32,
+    threshold: f32,
+) -> Option<CompactTrigger> {
     if ctx_window == 0 {
         return None;
     }
@@ -692,8 +698,16 @@ impl RunningAgent {
         // A compaction running after a model switch must use the NEW window — otherwise
         // the keep-budget / drain math would be sized to the previous model's window.
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 { live_window } else { recorded_window };
-        let utilization = if ctx_window > 0 { used_tokens as f32 / ctx_window as f32 } else { 0.0 };
+        let ctx_window = if live_window > 0 {
+            live_window
+        } else {
+            recorded_window
+        };
+        let utilization = if ctx_window > 0 {
+            used_tokens as f32 / ctx_window as f32
+        } else {
+            0.0
+        };
         // The view borrows `&convo.messages`; confine that borrow to this block so
         // it is released before the &mut apply below.
         let plan = {
@@ -1069,6 +1083,8 @@ impl RunningAgent {
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
         // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
+        let mut active_internal_continuation: Option<(ContinuationKind, ContinuationVisibility)> =
+            None;
         // SAFETY FUSE counter: how many times THIS turn auto-continued after an
         // output-limit truncation (`finish_reason=length`). Bounded by
         // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
@@ -1336,6 +1352,10 @@ impl RunningAgent {
                 }
             };
             let mut assistant_text = String::new();
+            let suppress_internal_stream = matches!(
+                active_internal_continuation.as_ref(),
+                Some((_, ContinuationVisibility::InternalControl))
+            );
             let mut reasoning_started_at: Option<u64> = None;
             let mut reasoning_elapsed_ms: u64 = 0;
             // ACCUMULATE the model's reasoning/thinking across the stream alongside
@@ -1412,7 +1432,9 @@ impl RunningAgent {
                             reasoning_started_at = Some(self.clock.now_millis());
                         }
                     }
-                    StreamEvent::TextDelta(_) | StreamEvent::ToolCall(_) | StreamEvent::ToolCallDelta { .. } => {
+                    StreamEvent::TextDelta(_)
+                    | StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. } => {
                         if let Some(start) = reasoning_started_at.take() {
                             reasoning_elapsed_ms = self.clock.now_millis().saturating_sub(start);
                         }
@@ -1436,6 +1458,9 @@ impl RunningAgent {
                         saw_stream_content = true;
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
+                            if suppress_internal_stream {
+                                continue;
+                            }
                             assistant_text.push_str(&t);
                             self.rt.emit(AgentEvent::TextDelta(t));
                         }
@@ -1459,6 +1484,9 @@ impl RunningAgent {
                                 saw_suppressed_reasoning_filler = true;
                                 continue;
                             }
+                            if suppress_internal_stream {
+                                continue;
+                            }
                             reasoning.push_str(&t);
                             // Also buffer for the CURRENT signed block (finalized on the
                             // next ReasoningSignature). Uses the POST-hook bytes so a
@@ -1474,6 +1502,9 @@ impl RunningAgent {
                     // — no live event (the text already streamed via Reasoning above).
                     StreamEvent::ReasoningSignature { opaque, provider } => {
                         saw_stream_content = true; // provider streamed a (signed) reasoning block
+                        if suppress_internal_stream {
+                            continue;
+                        }
                         reasoning_blocks.push(crate::message::ReasoningBlock {
                             text: std::mem::take(&mut reasoning_block_text),
                             opaque: Some(opaque),
@@ -1570,12 +1601,20 @@ impl RunningAgent {
                                         assistant_text.clone(),
                                         pending_calls.clone(),
                                     );
-                                    partial.reasoning = if partial_reasoning.is_empty() {
-                                        None
+                                    if suppress_internal_stream {
+                                        partial.internal_origin =
+                                            Some("verify_cadence".to_string());
+                                        partial.text.clear();
+                                        partial.reasoning = None;
+                                        partial.reasoning_blocks.clear();
                                     } else {
-                                        Some(partial_reasoning)
-                                    };
-                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                        partial.reasoning = if partial_reasoning.is_empty() {
+                                            None
+                                        } else {
+                                            Some(partial_reasoning)
+                                        };
+                                        partial.reasoning_blocks = reasoning_blocks.clone();
+                                    }
                                     convo.push(partial);
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
@@ -1795,11 +1834,21 @@ impl RunningAgent {
                 if !promoted.is_empty() {
                     assistant_text = promoted;
                     cleaned_reasoning.clear(); // now the body; do not also store it as reasoning
-                    self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                    if !suppress_internal_stream {
+                        self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                    }
                 }
             }
+            let current_internal_continuation = active_internal_continuation.take();
             let mut assistant_msg =
                 Message::assistant(assistant_text.clone(), pending_calls.clone());
+            if matches!(
+                current_internal_continuation.as_ref(),
+                Some((ContinuationKind::VerifyCadence, _))
+            ) {
+                assistant_msg.internal_origin = Some("verify_cadence".to_string());
+                assistant_msg.text.clear();
+            }
             assistant_msg.meta = Some(meta);
             // STORE the accumulated reasoning losslessly: Some(..) iff the model
             // streamed any thinking this round, else None. It rides on the Message
@@ -1836,7 +1885,7 @@ impl RunningAgent {
                     convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
                     continue;
                 }
-                if let Some(reminder) = self.hooks.offer_continuation(convo).await {
+                if let Some(continuation) = self.hooks.offer_typed_continuation(convo).await {
                     // SAFETY FUSE: a `offer_continuation` that always continues is an infinite
                     // kernel-driven loop with no model agency to stop. Before
                     // continuing, check the cap. `None` = unlimited (opt-out).
@@ -1855,7 +1904,13 @@ impl RunningAgent {
                         }
                     }
                     continuations += 1;
-                    convo.push(Message::synthetic_user(reminder));
+                    let Continuation {
+                        text,
+                        kind,
+                        visibility,
+                    } = continuation;
+                    active_internal_continuation = Some((kind, visibility));
+                    convo.push(Message::synthetic_user(text));
                     continue;
                 }
                 // The turn is ENDING. If it ends because the output was truncated and
@@ -2670,21 +2725,33 @@ mod auto_compact_trigger_tests {
     use super::{auto_compact_trigger, CompactTrigger};
 
     fn fires(used: u32, window: u32, thresh: f32) -> bool {
-        matches!(auto_compact_trigger(used, window, thresh), Some(CompactTrigger::Auto { .. }))
+        matches!(
+            auto_compact_trigger(used, window, thresh),
+            Some(CompactTrigger::Auto { .. })
+        )
     }
 
     #[test]
     fn switch_to_smaller_window_recomputes_and_fires() {
         // 229K tokens sat at 23% of a 1M window (no compaction there)…
-        assert!(!fires(229_000, 1_000_000, 0.7), "under a 1M window: no compaction");
+        assert!(
+            !fires(229_000, 1_000_000, 0.7),
+            "under a 1M window: no compaction"
+        );
         // …but switching to a 64K window recomputes to 3.6× over → must compact.
-        assert!(fires(229_000, 64_000, 0.7), "switch to 64K window: must compact");
+        assert!(
+            fires(229_000, 64_000, 0.7),
+            "switch to 64K window: must compact"
+        );
     }
 
     #[test]
     fn switch_to_larger_window_does_not_fire() {
         // Pressure drops when the window grows — no needless compaction.
-        assert!(!fires(60_000, 1_000_000, 0.7), "60K in a 1M window: no compaction");
+        assert!(
+            !fires(60_000, 1_000_000, 0.7),
+            "60K in a 1M window: no compaction"
+        );
     }
 
     #[test]
@@ -2698,7 +2765,10 @@ mod auto_compact_trigger_tests {
     fn carries_the_recomputed_utilization() {
         match auto_compact_trigger(229_000, 64_000, 0.7) {
             Some(CompactTrigger::Auto { utilization }) => {
-                assert!((utilization - 229_000.0 / 64_000.0).abs() < 1e-4, "utilization vs CURRENT window");
+                assert!(
+                    (utilization - 229_000.0 / 64_000.0).abs() < 1e-4,
+                    "utilization vs CURRENT window"
+                );
             }
             other => panic!("expected Auto, got {other:?}"),
         }

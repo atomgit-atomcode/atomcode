@@ -2,11 +2,11 @@
 use axum::{extract::State, response::IntoResponse, Json};
 use std::path::Path;
 
+use crate::AppState;
 use atomcode_core::agent::compression;
 use atomcode_core::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
-use crate::AppState;
 
 /// 撤销会话最后若干轮（arg 空 = 最后一轮；否则回退到第 arg 个用户提示之前——对齐 TUI /undo）。
 /// 就地修改 session.messages / cold_summaries / display_messages / turn_stats，
@@ -99,10 +99,19 @@ pub(crate) struct CommandReq {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum CommandResult {
-    Undo { undone: usize },
-    Remember { scope: String },
-    Forget { removed: Vec<String> },
-    Memory { global: Vec<String>, project: Vec<String> },
+    Undo {
+        undone: usize,
+    },
+    Remember {
+        scope: String,
+    },
+    Forget {
+        removed: Vec<String>,
+    },
+    Memory {
+        global: Vec<String>,
+        project: Vec<String>,
+    },
     Context {
         system_tokens: usize,
         sent_tokens: usize,
@@ -118,13 +127,37 @@ pub(crate) enum CommandResult {
         before_tokens: usize,
         after_tokens: usize,
     },
-    Whoami { logged_in: bool, username: Option<String>, name: Option<String>, email: Option<String> },
-    Status { logged_in: bool, username: Option<String>, provider: String, model: String, working_dir: String, config_path: String },
-    Config { path: String, provider: String },
-    Diff { stat: String },
-    Cost { total_tokens: usize, turn_count: usize },
-    Todo { items: Vec<TodoItemJson> },
-    Error { message: String },
+    Whoami {
+        logged_in: bool,
+        username: Option<String>,
+        name: Option<String>,
+        email: Option<String>,
+    },
+    Status {
+        logged_in: bool,
+        username: Option<String>,
+        provider: String,
+        model: String,
+        working_dir: String,
+        config_path: String,
+    },
+    Config {
+        path: String,
+        provider: String,
+    },
+    Diff {
+        stat: String,
+    },
+    Cost {
+        total_tokens: usize,
+        turn_count: usize,
+    },
+    Todo {
+        items: Vec<TodoItemJson>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -172,15 +205,21 @@ async fn exec_context(
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
     let session_id = SessionId::from_string(sid.to_string());
     let session = load_command_session(working_dir, project_hash, &session_id)?;
-    let parts =
-        crate::live_api::build_turn_parts(working_dir, provider, &state.mcp_cache, state.telemetry.clone())
-            .await?;
+    let parts = crate::live_api::build_turn_parts(
+        working_dir,
+        provider,
+        &state.mcp_cache,
+        state.telemetry.clone(),
+    )
+    .await?;
     let conv = Conversation::from_snapshot(ConversationSnapshot {
         messages: session.messages.clone(),
         cold_summaries: session.cold_summaries.clone(),
     });
     let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
-    let s = atomcode_core::agent::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx).await;
+    let s =
+        atomcode_core::agent::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
+            .await;
     Ok(CommandResult::Context {
         system_tokens: s.system_tokens,
         sent_tokens: s.sent_tokens,
@@ -208,7 +247,11 @@ fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult>
     if content.is_empty() {
         anyhow::bail!("remember needs content");
     }
-    let store = if global { MemoryStore::global() } else { MemoryStore::project(working_dir) };
+    let store = if global {
+        MemoryStore::global()
+    } else {
+        MemoryStore::project(working_dir)
+    };
     store.append(content)?;
     Ok(CommandResult::Remember {
         scope: if global { "global" } else { "project" }.to_string(),
@@ -243,9 +286,13 @@ async fn exec_compact(
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
     let session_id = SessionId::from_string(sid.to_string());
     let mut session = load_command_session(working_dir, project_hash, &session_id)?;
-    let parts =
-        crate::live_api::build_turn_parts(working_dir, provider, &state.mcp_cache, state.telemetry.clone())
-            .await?;
+    let parts = crate::live_api::build_turn_parts(
+        working_dir,
+        provider,
+        &state.mcp_cache,
+        state.telemetry.clone(),
+    )
+    .await?;
 
     let mut conv = Conversation::from_snapshot(ConversationSnapshot {
         messages: std::mem::take(&mut session.messages),
@@ -264,7 +311,12 @@ async fn exec_compact(
         // 没有可压缩的历史：原样还原，返回 applied=false。
         let snap = conv.snapshot();
         session.messages = snap.messages;
-        return Ok(CommandResult::Compact { applied: false, removed_messages: 0, before_tokens: 0, after_tokens: 0 });
+        return Ok(CommandResult::Compact {
+            applied: false,
+            removed_messages: 0,
+            before_tokens: 0,
+            after_tokens: 0,
+        });
     };
 
     let summarize_prompt = if arg.trim().is_empty() {
@@ -279,8 +331,13 @@ async fn exec_compact(
         )
     };
 
-    let (summary, _, _, _, _) = compression::run_llm_summary(&*parts.provider, &summarize_prompt).await;
-    let content = if summary.trim().is_empty() { mechanical } else { summary };
+    let (summary, _, _, _, _) =
+        compression::run_llm_summary(&*parts.provider, &summarize_prompt).await;
+    let content = if summary.trim().is_empty() {
+        mechanical
+    } else {
+        summary
+    };
 
     let outcome = compression::try_apply_compression(
         &*parts.ctx,
@@ -315,7 +372,12 @@ fn exec_whoami() -> anyhow::Result<CommandResult> {
             name: auth.user.name,
             email: auth.user.email,
         }),
-        None => Ok(CommandResult::Whoami { logged_in: false, username: None, name: None, email: None }),
+        None => Ok(CommandResult::Whoami {
+            logged_in: false,
+            username: None,
+            name: None,
+            email: None,
+        }),
     }
 }
 
@@ -324,7 +386,10 @@ fn exec_config() -> anyhow::Result<CommandResult> {
     let provider = atomcode_core::config::Config::load(&path)
         .map(|c| c.default_provider)
         .unwrap_or_default();
-    Ok(CommandResult::Config { path: path.display().to_string(), provider })
+    Ok(CommandResult::Config {
+        path: path.display().to_string(),
+        provider,
+    })
 }
 
 fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
@@ -340,7 +405,10 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
-fn exec_status(working_dir: &std::path::Path, provider: Option<&str>) -> anyhow::Result<CommandResult> {
+fn exec_status(
+    working_dir: &std::path::Path,
+    provider: Option<&str>,
+) -> anyhow::Result<CommandResult> {
     let config_path = atomcode_core::config::Config::default_path();
     let config = atomcode_core::config::Config::load(&config_path).ok();
     let provider_name = provider
@@ -369,12 +437,19 @@ fn exec_cost(
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
-    let session = load_command_session(working_dir, project_hash, &SessionId::from_string(sid.to_string()))?;
+    let session = load_command_session(
+        working_dir,
+        project_hash,
+        &SessionId::from_string(sid.to_string()),
+    )?;
     // TurnStat.total_tokens stores the per-turn token count (reset to 0 at turn start,
     // accumulated during the turn, saved at TurnComplete). Summing gives session total.
     let total_tokens: usize = session.turn_stats.iter().map(|t| t.total_tokens).sum();
     let turn_count = session.turn_stats.len();
-    Ok(CommandResult::Cost { total_tokens, turn_count })
+    Ok(CommandResult::Cost {
+        total_tokens,
+        turn_count,
+    })
 }
 
 fn exec_todo(
@@ -383,7 +458,11 @@ fn exec_todo(
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for todo"))?;
-    let session = load_command_session(working_dir, project_hash, &SessionId::from_string(sid.to_string()))?;
+    let session = load_command_session(
+        working_dir,
+        project_hash,
+        &SessionId::from_string(sid.to_string()),
+    )?;
 
     // session.messages uses atomcode_core::conversation::message::Message (not
     // atomcode_kernel::message::Message), so we inline the derivation logic here
@@ -431,26 +510,64 @@ pub(crate) async fn run_command(
 ) -> impl IntoResponse {
     let working_dir = match req.working_dir.as_deref() {
         Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
-        _ => return Json(CommandResult::Error { message: "working_dir required".into() }),
+        _ => {
+            return Json(CommandResult::Error {
+                message: "working_dir required".into(),
+            })
+        }
     };
     let result = match req.command.as_str() {
-        "undo" => exec_undo(&working_dir, req.session_id.as_deref(), &req.arg, req.project_hash.as_deref()),
+        "undo" => exec_undo(
+            &working_dir,
+            req.session_id.as_deref(),
+            &req.arg,
+            req.project_hash.as_deref(),
+        ),
         "remember" => exec_remember(&working_dir, &req.arg),
         "forget" => exec_forget(&working_dir, &req.arg),
         "memory" => exec_memory(&working_dir),
-        "context" => exec_context(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref()).await,
-        "compact" => exec_compact(&state, &working_dir, req.project_hash.as_deref(), req.session_id.as_deref(), req.provider.as_deref(), &req.arg).await,
+        "context" => {
+            exec_context(
+                &state,
+                &working_dir,
+                req.project_hash.as_deref(),
+                req.session_id.as_deref(),
+                req.provider.as_deref(),
+            )
+            .await
+        }
+        "compact" => {
+            exec_compact(
+                &state,
+                &working_dir,
+                req.project_hash.as_deref(),
+                req.session_id.as_deref(),
+                req.provider.as_deref(),
+                &req.arg,
+            )
+            .await
+        }
         "whoami" => exec_whoami(),
         "config" => exec_config(),
         "diff" => exec_diff(&working_dir),
         "status" => exec_status(&working_dir, req.provider.as_deref()),
-        "cost" => exec_cost(&working_dir, req.project_hash.as_deref(), req.session_id.as_deref()),
-        "todo" => exec_todo(&working_dir, req.project_hash.as_deref(), req.session_id.as_deref()),
+        "cost" => exec_cost(
+            &working_dir,
+            req.project_hash.as_deref(),
+            req.session_id.as_deref(),
+        ),
+        "todo" => exec_todo(
+            &working_dir,
+            req.project_hash.as_deref(),
+            req.session_id.as_deref(),
+        ),
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
         Ok(r) => Json(r),
-        Err(e) => Json(CommandResult::Error { message: e.to_string() }),
+        Err(e) => Json(CommandResult::Error {
+            message: e.to_string(),
+        }),
     }
 }
 
@@ -465,7 +582,8 @@ mod tests {
         let mut s = Session::new(std::path::PathBuf::from("/tmp/plan2-test"));
         for i in 0..n {
             s.messages.push(Message::new(Role::User, &format!("q{i}")));
-            s.messages.push(Message::new(Role::Assistant, &format!("a{i}")));
+            s.messages
+                .push(Message::new(Role::Assistant, &format!("a{i}")));
         }
         s
     }
@@ -476,7 +594,11 @@ mod tests {
         let removed = apply_undo(&mut s, "");
         assert_eq!(removed, 1);
         // 3 用户提示 → 剩 2；每轮 user+assistant，剩 2 轮 = 4 条消息。
-        let users = s.messages.iter().filter(|m| matches!(m.role, Role::User)).count();
+        let users = s
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .count();
         assert_eq!(users, 2);
     }
 
@@ -499,7 +621,10 @@ mod tests {
     fn parse_remember_arg_detects_global() {
         assert_eq!(parse_remember_arg("--global 记住这个"), (true, "记住这个"));
         assert_eq!(parse_remember_arg("普通事实"), (false, "普通事实"));
-        assert_eq!(parse_remember_arg("  --global   trimmed  "), (true, "trimmed"));
+        assert_eq!(
+            parse_remember_arg("  --global   trimmed  "),
+            (true, "trimmed")
+        );
         assert_eq!(parse_remember_arg("--globalfoo"), (false, "--globalfoo"));
     }
 
@@ -628,21 +753,27 @@ mod tests {
                 thinking_blocks: vec![],
             },
             synthetic: false,
+            internal_origin: None,
         });
 
         // Inline the same derivation logic as exec_todo (core Message ≠ kernel Message).
         use atomcode_capabilities::tools::todo::parse_todos;
-        let todos = s.messages.iter().rev().find_map(|m| {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                tool_calls
-                    .iter()
-                    .rev()
-                    .filter(|c| c.name == "todowrite")
-                    .find_map(|c| parse_todos(&c.arguments).ok())
-            } else {
-                None
-            }
-        }).unwrap_or_default();
+        let todos = s
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                    tool_calls
+                        .iter()
+                        .rev()
+                        .filter(|c| c.name == "todowrite")
+                        .find_map(|c| parse_todos(&c.arguments).ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
 
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].content, "写测试");
@@ -654,17 +785,22 @@ mod tests {
         use atomcode_capabilities::tools::todo::parse_todos;
         use atomcode_core::conversation::message::MessageContent;
         let s = Session::new(std::path::PathBuf::from("/tmp/todo-empty-test"));
-        let todos: Vec<_> = s.messages.iter().rev().find_map(|m| {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                tool_calls
-                    .iter()
-                    .rev()
-                    .filter(|c| c.name == "todowrite")
-                    .find_map(|c| parse_todos(&c.arguments).ok())
-            } else {
-                None
-            }
-        }).unwrap_or_default();
+        let todos: Vec<_> = s
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                    tool_calls
+                        .iter()
+                        .rev()
+                        .filter(|c| c.name == "todowrite")
+                        .find_map(|c| parse_todos(&c.arguments).ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
         assert!(todos.is_empty());
     }
 
@@ -673,10 +809,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // init a repo with one committed file + a working-tree change
         let run = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(dir.path())
-                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-                .output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
         };
         run(&["init"]);
         std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();

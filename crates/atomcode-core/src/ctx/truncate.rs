@@ -232,7 +232,8 @@ mod tests {
         Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(make_result(output)),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 
@@ -249,7 +250,8 @@ mod tests {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 
@@ -261,7 +263,8 @@ mod tests {
                 output: output.to_string(),
                 success: true,
             }),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 

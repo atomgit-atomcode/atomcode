@@ -234,6 +234,8 @@ export interface MessageInfo {
   role: string;
   content: string;
   synthetic?: boolean;
+  internal_origin?: string;
+  internalOrigin?: string;
   images?: ImageInput[];
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;

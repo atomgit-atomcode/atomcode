@@ -29,13 +29,13 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
-mod commands;
 pub mod approval_mode;
+mod commands;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
-pub use live_api::live_set_provider;
 pub use live_api::live_set_mode;
+pub use live_api::live_set_provider;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
@@ -483,6 +483,8 @@ pub struct MessageInfo {
     /// internal reminders as user input bubbles.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     /// Tool result summary (for tool role messages)
@@ -664,6 +666,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             role: role.to_string(),
             content,
             synthetic: msg.synthetic,
+            internal_origin: msg.internal_origin.clone(),
             tool_calls,
             tool_result,
             artifacts,
@@ -2806,6 +2809,7 @@ async fn process_chat_request(
                     images,
                 },
                 synthetic: false,
+                internal_origin: None,
             });
             conv.turn_tracker.on_user_message(idx);
         } else {
@@ -2846,6 +2850,7 @@ async fn process_chat_request(
                     images,
                 },
                 synthetic: false,
+                internal_origin: None,
             });
             conv.turn_tracker.on_user_message(idx);
         }
@@ -5113,7 +5118,21 @@ mod tests {
         let info = MessageInfo::from(&msg);
 
         assert_eq!(info.role, "user");
-        assert!(info.synthetic, "daemon API must expose synthetic provenance");
+        assert!(
+            info.synthetic,
+            "daemon API must expose synthetic provenance"
+        );
+    }
+
+    #[test]
+    fn message_info_preserves_internal_origin() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        let mut msg = Message::new(Role::Assistant, "hidden");
+        msg.internal_origin = Some("verify_cadence".to_string());
+        let info = MessageInfo::from(&msg);
+
+        assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
     }
 
     #[test]

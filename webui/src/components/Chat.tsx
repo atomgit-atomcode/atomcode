@@ -53,7 +53,7 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
-import { isInternalHistoryUserMessage } from '../lib/historyMessages';
+import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -723,6 +723,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           ts: msg.created_at,
         });
       } else if (msg.role === 'assistant') {
+        if (isInternalHistoryAssistantMessage(msg)) continue;
         // Text comes first (the LLM speaks, then calls tools), so the part
         // order for a persisted round is [text, tool, tool, …].
         const parts: MsgPart[] = [];

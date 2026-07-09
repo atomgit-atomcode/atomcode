@@ -13,7 +13,7 @@
 //! counts. The nudge text lists `cargo check` / `tsc --noEmit` only as examples.
 
 use async_trait::async_trait;
-use atomcode_kernel::hook::LifecycleHooks;
+use atomcode_kernel::hook::{Continuation, LifecycleHooks};
 use atomcode_kernel::message::{Conversation, Role};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -31,10 +31,16 @@ pub struct VerifyCadenceHook {
 
 #[derive(Default)]
 struct State {
-    /// The tool_call_id of the last successful edit we ALREADY nudged for. Lets a fresh
-    /// edit (different id) re-trigger, while a repeated stop on the SAME unverified edit
-    /// does not nudge twice (which would loop with no model agency to stop it).
-    nudged_for: Option<String>,
+    /// The current real-user turn and tool_call_id we ALREADY nudged for. Including the
+    /// turn start keeps reused provider ids (`call_0`, `e1`, …) from suppressing a later
+    /// user's fresh edit.
+    nudged_for: Option<NudgedEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NudgedEdit {
+    turn_start: usize,
+    edit_id: String,
 }
 
 impl VerifyCadenceHook {
@@ -47,7 +53,11 @@ impl VerifyCadenceHook {
 fn bash_command(arguments: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
-        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("command")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
 }
 
 /// Whether a post-edit `bash` command plausibly VERIFIES the edit (runs a build / type-check
@@ -71,10 +81,10 @@ fn segment_is_work(seg: &str) -> bool {
     // Read-only / review / aggregation commands. `git` included: `git diff|status|log|show`
     // are review, and git has no build/check subcommand.
     const READONLY: &[&str] = &[
-        "ls", "cat", "pwd", "echo", "cd", "which", "whoami", "head", "tail", "find", "grep",
-        "rg", "fd", "tree", "stat", "file", "printf", "true", "clear", "date", "sleep", "type",
-        "git", "wc", "sort", "uniq", "awk", "sed", "cut", "diff", "less", "more", "tee",
-        "basename", "dirname", "realpath", "readlink", ":",
+        "ls", "cat", "pwd", "echo", "cd", "which", "whoami", "head", "tail", "find", "grep", "rg",
+        "fd", "tree", "stat", "file", "printf", "true", "clear", "date", "sleep", "type", "git",
+        "wc", "sort", "uniq", "awk", "sed", "cut", "diff", "less", "more", "tee", "basename",
+        "dirname", "realpath", "readlink", ":",
     ];
     const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "command", "exec"];
     let mut tokens = seg.split_whitespace();
@@ -94,10 +104,19 @@ fn segment_is_work(seg: &str) -> bool {
     }
 }
 
+fn current_real_user_start(convo: &Conversation) -> usize {
+    convo
+        .messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.synthetic)
+        .unwrap_or(0)
+}
+
 /// Scan the conversation: returns the tool_call_id of the most recent successful edit
 /// IF it has no VERIFYING `bash` after it (i.e. unverified), else `None`. A `bash` that is
 /// merely read-only (`ls`/`echo`/…) does not count — see [`bash_verifies`].
-fn unverified_edit_id(convo: &Conversation) -> Option<String> {
+fn unverified_edit(convo: &Conversation) -> Option<NudgedEdit> {
+    let start = current_real_user_start(convo);
     // Tool-call ids are assigned by the assistant message that precedes the matching
     // tool-result message, so a single forward pass can resolve a result's tool name.
     let mut names: HashMap<&str, &str> = HashMap::new();
@@ -106,7 +125,7 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
     let mut last_edit_id: Option<String> = None;
     let mut bash_after_edit = false;
 
-    for msg in &convo.messages {
+    for msg in &convo.messages[start..] {
         match msg.role {
             Role::Assistant => {
                 for tc in &msg.tool_calls {
@@ -144,9 +163,33 @@ fn unverified_edit_id(convo: &Conversation) -> Option<String> {
     }
 
     match last_edit_id {
-        Some(id) if !bash_after_edit => Some(id),
+        Some(id) if !bash_after_edit => Some(NudgedEdit {
+            turn_start: start,
+            edit_id: id,
+        }),
         _ => None,
     }
+}
+
+fn verify_reminder_already_present(convo: &Conversation, edit: &NudgedEdit) -> bool {
+    let mut after_edit = false;
+    for msg in &convo.messages[edit.turn_start..] {
+        if msg.role == Role::Tool
+            && msg.tool_call_id.as_deref() == Some(edit.edit_id.as_str())
+            && !msg.is_error
+        {
+            after_edit = true;
+            continue;
+        }
+        if after_edit
+            && msg.role == Role::User
+            && msg.synthetic
+            && msg.text.trim_start().starts_with(NUDGE)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[async_trait]
@@ -159,18 +202,28 @@ impl LifecycleHooks for VerifyCadenceHook {
     /// (same conversation → an already-nudged edit must stay nudged).
     async fn session_start(&self, _convo: &mut Conversation, resumed: bool) {
         if !resumed {
-            self.state.lock().unwrap_or_else(|e| e.into_inner()).nudged_for = None;
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .nudged_for = None;
         }
     }
 
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
-        let edit_id = unverified_edit_id(convo)?;
+        self.offer_typed_continuation(convo).await.map(|c| c.text)
+    }
+
+    async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        let edit = unverified_edit(convo)?;
+        if verify_reminder_already_present(convo, &edit) {
+            return None;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.nudged_for.as_deref() == Some(edit_id.as_str()) {
+        if state.nudged_for.as_ref() == Some(&edit) {
             return None; // already nudged for this exact edit — let the turn stop.
         }
-        state.nudged_for = Some(edit_id);
-        Some(NUDGE.to_string())
+        state.nudged_for = Some(edit);
+        Some(Continuation::verify_cadence(NUDGE.to_string()))
     }
 }
 
@@ -181,12 +234,32 @@ mod tests {
     use atomcode_kernel::tool::ToolCall;
 
     fn assistant_call(id: &str, name: &str) -> Message {
-        Message::assistant("", vec![ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }])
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: "{}".into(),
+            }],
+        )
+    }
+    fn user(text: &str) -> Message {
+        Message::user(text)
+    }
+    fn synthetic_user(text: &str) -> Message {
+        Message::synthetic_user(text)
     }
     /// A `bash` tool call carrying a real command (so `bash_verifies` can classify it).
     fn bash_call(id: &str, cmd: &str) -> Message {
         let args = serde_json::json!({ "command": cmd }).to_string();
-        Message::assistant("", vec![ToolCall { id: id.into(), name: "bash".into(), arguments: args }])
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: args,
+            }],
+        )
     }
     fn tool_result(id: &str, is_error: bool) -> Message {
         Message::tool_result(id, "ok", is_error)
@@ -208,7 +281,10 @@ mod tests {
         // Calling again on the SAME conversation must NOT nudge twice.
         let mut convo = Conversation::new();
         convo.messages = msgs;
-        assert!(hook.offer_continuation(&convo).await.is_none(), "must not nudge twice for the same edit");
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "must not nudge twice for the same edit"
+        );
     }
 
     #[tokio::test]
@@ -219,7 +295,10 @@ mod tests {
             bash_call("b1", "cargo check"),
             tool_result("b1", false),
         ];
-        assert!(nudge_of(msgs).await.1.is_none(), "a real check after the edit verifies it");
+        assert!(
+            nudge_of(msgs).await.1.is_none(),
+            "a real check after the edit verifies it"
+        );
     }
 
     #[tokio::test]
@@ -243,7 +322,12 @@ mod tests {
     #[tokio::test]
     async fn chained_or_unknown_bash_after_edit_verifies() {
         // A build behind a `cd`, or any non-denylisted command, counts (conservative).
-        for cmd in ["cd sub && cargo test", "npm run build", "./gradlew build", "pytest -q"] {
+        for cmd in [
+            "cd sub && cargo test",
+            "npm run build",
+            "./gradlew build",
+            "pytest -q",
+        ] {
             let msgs = vec![
                 assistant_call("e1", "edit_file"),
                 tool_result("e1", false),
@@ -267,7 +351,10 @@ mod tests {
         assert!(!bash_verifies("git diff")); // review, not verification
         assert!(!bash_verifies("git status && git log")); // all read-only
         assert!(!bash_verifies("cat x | grep y")); // read-only pipe
-        assert!(!bash_verifies("cd x && ls")); // both segments read-only
+        assert!(
+            !bash_verifies("cd x && ls"),
+            "read-only chained commands do not verify"
+        );
         // Real checks — verify, including behind env prefixes / wrappers / chains.
         assert!(bash_verifies("cargo check"));
         assert!(bash_verifies("tsc --noEmit"));
@@ -287,7 +374,10 @@ mod tests {
             bash_call("b1", "cargo check"),
             tool_result("b1", true),
         ];
-        assert!(nudge_of(msgs).await.1.is_some(), "errored check is not verification");
+        assert!(
+            nudge_of(msgs).await.1.is_some(),
+            "errored check is not verification"
+        );
     }
 
     #[tokio::test]
@@ -303,6 +393,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prior_turn_unverified_edit_does_not_nudge_later_real_user_turn() {
+        let msgs = vec![
+            user("create a file"),
+            assistant_call("e1", "write_file"),
+            tool_result("e1", false),
+            Message::assistant("created", vec![]),
+            user("what model are you"),
+            Message::assistant("I am AtomCode.", vec![]),
+        ];
+
+        assert!(
+            nudge_of(msgs).await.1.is_none(),
+            "verify cadence must not carry a previous real user's edit into a later real user turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_user_message_does_not_reset_current_turn_scope() {
+        let msgs = vec![
+            user("create a file"),
+            assistant_call("e1", "write_file"),
+            tool_result("e1", false),
+            synthetic_user("[Additional context from user]: keep going"),
+        ];
+
+        assert!(
+            nudge_of(msgs).await.1.is_some(),
+            "synthetic context messages attach to the current real user turn and must not hide the edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_verify_reminder_marker_suppresses_repeat_after_resume() {
+        let msgs = vec![
+            user("create a file"),
+            assistant_call("e1", "write_file"),
+            tool_result("e1", false),
+            synthetic_user(NUDGE),
+        ];
+
+        let hook = VerifyCadenceHook::default();
+        let mut convo = Conversation::new();
+        convo.messages = msgs;
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "a persisted synthetic verify reminder means this edit already got one internal verify chance"
+        );
+    }
+
+    #[tokio::test]
     async fn build_then_edit_is_unverified() {
         // bash BEFORE the edit does not verify the later edit.
         let msgs = vec![
@@ -311,7 +451,10 @@ mod tests {
             assistant_call("e1", "edit_file"),
             tool_result("e1", false),
         ];
-        assert!(nudge_of(msgs).await.1.is_some(), "build must come AFTER the edit");
+        assert!(
+            nudge_of(msgs).await.1.is_some(),
+            "build must come AFTER the edit"
+        );
     }
 
     #[tokio::test]
@@ -319,11 +462,48 @@ mod tests {
         let hook = VerifyCadenceHook::new();
         let mut convo = Conversation::new();
         convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
-        assert!(hook.offer_continuation(&convo).await.is_some(), "first edit nudges");
-        assert!(hook.offer_continuation(&convo).await.is_none(), "same edit, no second nudge");
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "first edit nudges"
+        );
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "same edit, no second nudge"
+        );
         // A NEW edit (different id) appears → nudge again.
         convo.messages.push(assistant_call("e2", "edit_file"));
         convo.messages.push(tool_result("e2", false));
-        assert!(hook.offer_continuation(&convo).await.is_some(), "a fresh unverified edit re-triggers");
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "a fresh unverified edit re-triggers"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_call_id_in_new_real_user_turn_still_nudges() {
+        let hook = VerifyCadenceHook::new();
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            user("first edit"),
+            assistant_call("e1", "edit_file"),
+            tool_result("e1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "first turn should nudge"
+        );
+
+        convo.messages.extend([
+            synthetic_user(NUDGE),
+            Message::assistant("No verification is needed.", vec![]),
+            user("second edit"),
+            assistant_call("e1", "edit_file"),
+            tool_result("e1", false),
+        ]);
+
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "same tool_call_id in a new real user turn is a new edit and must nudge"
+        );
     }
 }

@@ -151,6 +151,14 @@ data class MessageInfo(
     val role: String,
     val content: String,
     val synthetic: Boolean = false,
+    val internalOrigin: String? = null,
+    val toolCalls: List<ToolCallInfo> = emptyList(),
+)
+
+data class ToolCallInfo(
+    val id: String?,
+    val name: String,
+    val arguments: String,
 )
 
 data class ChatRequest(

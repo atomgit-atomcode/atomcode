@@ -1321,7 +1321,7 @@ impl TurnExecutor for KernelTurnExecutor {
                         PermissionDecision::Allow => "allow",
                         PermissionDecision::AllowAlways => "always_allow",
                         _ => "deny",
-                    };  
+                    };
                     emit(TurnEvent::ApprovalResolved {
                         call_id,
                         decision: decision_str.to_string(),
@@ -2018,7 +2018,9 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 call_id: call.id,
                 arguments: call.arguments,
             },
-            TE::ApprovalResolved { call_id, decision } => LiveWireEvent::PermissionResolved { call_id, decision },
+            TE::ApprovalResolved { call_id, decision } => {
+                LiveWireEvent::PermissionResolved { call_id, decision }
+            }
             TE::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -2722,6 +2724,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_user = Message::new(
             Role::User,
@@ -2753,6 +2756,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::new(Role::System, "session context"),
@@ -2790,6 +2794,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::new(Role::System, "session context"),
@@ -2831,6 +2836,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
@@ -2843,7 +2849,10 @@ mod tests {
 
         let messages = restore_images_from_turn_base(
             final_messages,
-            &[Message::synthetic_user("[Auto-read from error: src/main.rs]"), image_user],
+            &[
+                Message::synthetic_user("[Auto-read from error: src/main.rs]"),
+                image_user,
+            ],
         );
 
         assert!(messages[0].synthetic);
@@ -2938,7 +2947,10 @@ mod tests {
             call_id: "c1".into(),
             chunk: "\u{1e}explore#4 · grep unwrap".into(),
         }));
-        assert!(dropped.is_none(), "marker-prefixed subagent activity must be dropped");
+        assert!(
+            dropped.is_none(),
+            "marker-prefixed subagent activity must be dropped"
+        );
         // Ordinary tool output → forwarded.
         let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
             call_id: "c2".into(),

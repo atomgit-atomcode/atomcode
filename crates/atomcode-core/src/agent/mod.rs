@@ -2127,6 +2127,7 @@ impl AgentLoop {
                     images,
                 },
                 synthetic: false,
+                internal_origin: None,
             };
             let idx = self.conversation.messages.len();
             self.conversation.messages.push(msg);
@@ -5567,6 +5568,7 @@ mod hard_truncate_tests {
                     thinking_blocks: Vec::new(),
                 },
                 synthetic: false,
+                internal_origin: None,
             });
             conv.messages.push(Message {
                 role: Role::Tool,
@@ -5580,6 +5582,7 @@ mod hard_truncate_tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             });
         }
         // The synthetic injection that triggered the bug. Role::User,
@@ -5663,6 +5666,7 @@ mod hard_truncate_tests {
                     thinking_blocks: Vec::new(),
                 },
                 synthetic: false,
+                internal_origin: None,
             });
             conv.messages.push(Message {
                 role: Role::Tool,
@@ -5672,6 +5676,7 @@ mod hard_truncate_tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             });
         }
         conv.messages

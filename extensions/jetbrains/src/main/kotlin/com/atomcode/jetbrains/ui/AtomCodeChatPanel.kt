@@ -876,10 +876,24 @@ class AtomCodeChatPanel(
                     assistantGroupOpen = false
                 }
                 "assistant" -> {
+                    if (isInternalHistoryAssistantMessage(message)) return@forEach
+                    if (!shouldRenderHistoryAssistantText(message) && message.toolCalls.isEmpty()) {
+                        return@forEach
+                    }
+                    if (!shouldRenderHistoryAssistantText(message)) {
+                        if (!assistantGroupOpen) {
+                            messageView.beginAssistantTurn()
+                        }
+                        renderHistoryAssistantToolCalls(message)
+                        messageView.finishAssistantTurn()
+                        assistantGroupOpen = true
+                        return@forEach
+                    }
                     if (!assistantGroupOpen) {
                         messageView.beginAssistantTurn()
                     }
                     messageView.addAssistantMessage(message.content)
+                    renderHistoryAssistantToolCalls(message)
                     messageView.finishAssistantTurn()
                     assistantGroupOpen = true
                 }
@@ -936,6 +950,18 @@ class AtomCodeChatPanel(
         val detail = content.trim()
         if (detail.isBlank()) return
         messageView.addToolCall("tool", "done", detail, "历史工具结果")
+    }
+
+    private fun renderHistoryAssistantToolCalls(message: MessageInfo) {
+        message.toolCalls.forEach { toolCall ->
+            val detail = toolCall.arguments.trim()
+            messageView.addToolCall(
+                toolCall.name.ifBlank { "tool" },
+                "done",
+                detail.takeIf { it.isNotBlank() },
+                "历史工具调用",
+            )
+        }
     }
 
     // ── Send / Chat streaming ──
@@ -1887,6 +1913,16 @@ internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
 internal fun isInternalHistoryUserMessage(content: String): Boolean {
     val trimmed = content.trim()
     return INTERNAL_HISTORY_USER_PREFIXES.any { trimmed.startsWith(it) }
+}
+
+internal fun isInternalHistoryAssistantMessage(message: MessageInfo): Boolean {
+    return message.role.equals("assistant", ignoreCase = true) &&
+        message.internalOrigin == "verify_cadence" &&
+        message.toolCalls.isEmpty()
+}
+
+internal fun shouldRenderHistoryAssistantText(message: MessageInfo): Boolean {
+    return message.content.isNotBlank()
 }
 
 private val INTERNAL_HISTORY_USER_PREFIXES = listOf(

@@ -103,6 +103,10 @@ pub struct Message {
     /// = false) out of the JSON so existing session files don't bloat.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    /// Internal provenance for messages produced by runtime/kernel control rounds.
+    /// Empty for normal user/model messages. Example: "verify_cadence".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_origin: Option<String>,
 }
 
 impl Message {
@@ -111,6 +115,7 @@ impl Message {
             role,
             content: MessageContent::Text(content.into()),
             synthetic: false,
+            internal_origin: None,
         }
     }
 
@@ -123,6 +128,7 @@ impl Message {
             role: Role::User,
             content: MessageContent::Text(content.into()),
             synthetic: true,
+            internal_origin: None,
         }
     }
 
@@ -227,7 +233,8 @@ impl Message {
                         output: summary,
                         success: r.success,
                     }),
-                                    synthetic: false,
+                    synthetic: false,
+                    internal_origin: None,
                 }
             }
             // ToolResultRef is already condensed (only holds a summary).
@@ -374,7 +381,8 @@ mod tests {
                 output: output.to_string(),
                 success: true,
             }),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 
@@ -508,7 +516,8 @@ mod tests {
                 text: Some("hello".to_string()),
                 images: vec![],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         assert_eq!(msg.text(), Some("hello"));
     }
@@ -521,7 +530,8 @@ mod tests {
                 text: None,
                 images: vec![],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         assert_eq!(msg.text(), None);
     }
@@ -534,7 +544,8 @@ mod tests {
                 text: Some("short".to_string()),
                 images: vec![sample_image_part(), sample_image_part()],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         let tokens = msg.estimate_tokens();
         // 2 images * 1600 = 3200, plus text and message overhead.
@@ -553,12 +564,21 @@ mod tests {
                 text: Some("hello world".to_string()),
                 images: vec![],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         let tokens = msg.estimate_tokens();
         // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
-        assert!(tokens < 100, "no-image multipart should have small token count, got {}", tokens);
-        assert!(tokens >= 5, "should have at least text + overhead, got {}", tokens);
+        assert!(
+            tokens < 100,
+            "no-image multipart should have small token count, got {}",
+            tokens
+        );
+        assert!(
+            tokens >= 5,
+            "should have at least text + overhead, got {}",
+            tokens
+        );
     }
 
     #[test]
@@ -569,7 +589,8 @@ mod tests {
                 text: Some("look at this".to_string()),
                 images: vec![sample_image_part()],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         assert!(!msg.is_tool_result());
     }
@@ -582,7 +603,8 @@ mod tests {
                 text: Some("analyze this".to_string()),
                 images: vec![sample_image_part()],
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         let condensed = msg.condensed("");
         match (&msg.content, &condensed.content) {
@@ -648,6 +670,28 @@ mod tests {
             m.synthetic
         );
         assert_eq!(m.text(), Some("first prompt"));
+    }
+
+    #[test]
+    fn deserializing_legacy_json_without_internal_origin_defaults_to_none() {
+        let legacy_json = r#"{
+            "role":"Assistant",
+            "content":{"Text":"visible reply"}
+        }"#;
+        let m: Message = serde_json::from_str(legacy_json)
+            .expect("legacy JSON without `internal_origin` field must deserialize");
+        assert!(m.internal_origin.is_none());
+    }
+
+    #[test]
+    fn internal_origin_roundtrips_when_present() {
+        let mut m = Message::new(Role::Assistant, "No verification is needed.");
+        m.internal_origin = Some("verify_cadence".to_string());
+
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: Message = serde_json::from_str(&json).expect("roundtrip");
+
+        assert_eq!(back.internal_origin.as_deref(), Some("verify_cadence"));
     }
 
     /// Serializing a non-synthetic message must NOT emit the

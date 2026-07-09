@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.ui
 
+import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.ui.input.slashCommandPrefix
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -220,6 +221,71 @@ def hello():
     fun `isInternalHistoryUserMessage keeps real user messages with similar wording`() {
         assertFalse(
             isInternalHistoryUserMessage("Output limit hit when running pytest; how do I debug it?"),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage hides verify cadence assistants`() {
+        assertTrue(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "No verification is needed.",
+                    internalOrigin = "verify_cadence",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage keeps normal assistants`() {
+        assertFalse(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "I am AtomCode.",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage keeps verify cadence assistants with tool calls`() {
+        assertFalse(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "",
+                    internalOrigin = "verify_cadence",
+                    toolCalls = listOf(
+                        com.atomcode.jetbrains.daemon.ToolCallInfo(
+                            id = "t1",
+                            name = "bash",
+                            arguments = """{"command":"true"}""",
+                        ),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `shouldRenderHistoryAssistantText skips empty assistant text with tool calls`() {
+        assertFalse(
+            shouldRenderHistoryAssistantText(
+                MessageInfo(
+                    role = "assistant",
+                    content = "",
+                    internalOrigin = "verify_cadence",
+                    toolCalls = listOf(
+                        com.atomcode.jetbrains.daemon.ToolCallInfo(
+                            id = "t1",
+                            name = "bash",
+                            arguments = """{"command":"true"}""",
+                        ),
+                    ),
+                ),
+            ),
         )
     }
 }
