@@ -150,6 +150,7 @@ data class SessionDetail(
 data class MessageInfo(
     val role: String,
     val content: String,
+    val synthetic: Boolean = false,
 )
 
 data class ChatRequest(
@@ -158,6 +159,24 @@ data class ChatRequest(
     val sessionId: String,
     val provider: String? = null,
     val images: List<ImageInput> = emptyList(),
+    val approvalMode: String? = null,
+)
+
+enum class ApprovalMode(val wire: String) {
+    Build("build"),
+    Plan("plan"),
+    Bypass("bypass");
+
+    override fun toString(): String = when (this) {
+        Build -> "Build"
+        Plan -> "Plan"
+        Bypass -> "Bypass"
+    }
+}
+
+data class ApprovalModeResponse(
+    val ok: Boolean,
+    val mode: String,
 )
 
 data class ImageInput(

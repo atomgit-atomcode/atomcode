@@ -198,22 +198,8 @@ tasks {
         useJUnitPlatform()
     }
 
-    val buildWebview by registering(Exec::class) {
-        workingDir = file("src/main/resources/webview")
-        commandLine("npm", "run", "build")
-    }
-
     processResources {
-        dependsOn(bundleDaemon, buildWebview)
-        exclude(
-            "webview/.gitignore",
-            "webview/esbuild.config.mjs",
-            "webview/node_modules/**",
-            "webview/package-lock.json",
-            "webview/package.json",
-            "webview/src/**",
-            "webview/tsconfig.json",
-        )
+        dependsOn(bundleDaemon)
         from(bundledDaemonDir)
     }
 

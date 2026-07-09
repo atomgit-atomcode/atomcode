@@ -1,9 +1,20 @@
 // crates/atomcode-tuix/src/lib.rs
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so the crate's own unit tests never persist commands/plugins/config into
+// the developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
+// win (isolate_home is a no-op when the var is already set).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 pub mod commands;
 pub mod custom_commands;
 pub mod event_loop;
 pub mod git;
+pub mod glyph;
 pub mod highlight;
 pub mod i18n;
 pub mod init;
@@ -754,6 +765,7 @@ pub async fn run(
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         #[cfg(unix)]
         askpass_rx,
+        loop_ctrl: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

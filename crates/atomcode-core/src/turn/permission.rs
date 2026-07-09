@@ -73,6 +73,35 @@ impl PermissionDecider for AutoPermissionDecider {
     }
 }
 
+/// Plan-mode decider: denies every approval-requiring (mutating) tool WITHOUT
+/// prompting, while read-only tools (which never reach `decide`) run freely.
+///
+/// Distinct from `AutoPermissionMode::DenyAll`: its `will_auto_approve` returns
+/// `true`, which suppresses the `ApprovalRequested` event (see TurnRunner —
+/// `needs_prompt = !will_auto_approve`). `DenyAll` returns `false`, so a turn
+/// would flash a "waiting for approval" card for each tool that is then
+/// immediately auto-denied — confusing, and pointless since no approver is
+/// registered in plan mode. Returning `true` here means the tool is resolved
+/// deterministically (to Deny) with no user interaction, which is exactly the
+/// plan-mode contract. The read-only constraint is also stated in the plan
+/// system-prompt so the model plans instead of firing denied edits.
+pub struct PlanPermissionDecider;
+
+#[async_trait]
+impl PermissionDecider for PlanPermissionDecider {
+    async fn decide(&self, _call: &ToolCall, _approval: &ApprovalRequirement) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+
+    fn will_auto_approve(&self, _call: &ToolCall, _approval: &ApprovalRequirement) -> bool {
+        // Deterministic (always Deny, never prompts) — suppress the approval
+        // event. NOTE: this widens the documented meaning of `true` from
+        // "will Allow" to "will resolve without a prompt"; safe because the
+        // only caller uses it solely to gate the ApprovalRequested emission.
+        true
+    }
+}
+
 /// Approval request sent to AgentLoop's command loop
 #[derive(Debug)]
 pub struct ApprovalRequest {
@@ -234,6 +263,18 @@ impl PermissionDecider for InteractivePermissionDecider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plan_decider_denies_without_prompting() {
+        let d = PlanPermissionDecider;
+        let call = make_call("edit_file");
+        let approval = ApprovalRequirement::RequireApproval("modifies workspace".into());
+        // Denies the mutating tool...
+        assert!(matches!(d.decide(&call, &approval).await, PermissionDecision::Deny));
+        // ...but `will_auto_approve` returns true so TurnRunner suppresses the
+        // ApprovalRequested event (no spurious "waiting for approval" card).
+        assert!(d.will_auto_approve(&call, &approval));
+    }
 
     fn make_call(name: &str) -> ToolCall {
         ToolCall {

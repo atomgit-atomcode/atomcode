@@ -18,6 +18,17 @@
 //!     and Ollama native (`/api/chat`).
 //!   - (future) `tools`, `mcp`, `skills`, `codeintel`.
 
+// Redirect `ATOMCODE_HOME` to a throwaway temp dir before libtest spawns any thread,
+// so the crate's own unit tests never persist sessions/config/memory into the
+// developer's real `~/.atomcode`. Feature-independent (std + dev-deps only); kept at
+// crate root so it is NOT inside a feature-gated module. Each `tests/*.rs` integration
+// binary carries its own copy (separate binaries don't share this ctor).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 /// Reusable, provider-agnostic [`atomcode_kernel::hook::LifecycleHooks`]
 /// implementations (e.g. [`hooks::WireLogHooks`]). Depends only on the kernel, so it
 /// is always available regardless of which capability features are enabled.
@@ -51,6 +62,12 @@ pub(crate) mod paths;
 /// `core::process_utils` so spawn sites here can stop the Windows
 /// console-window flash without `capabilities` depending on `core`.
 pub(crate) mod process_utils;
+
+/// ONE home for Windows path normalization (native-canonical internally,
+/// forward-slash at the LLM/UI boundary). `pub` so the v2 drivers that depend on
+/// capabilities (`review`, `clix`, `bridge`) can reuse it. Local copy of
+/// `core::tool::strip_verbatim_prefix` (L1 must not depend on `core`).
+pub mod pathnorm;
 
 /// Proxy policy for outbound HTTP clients — a self-contained mirror of
 /// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so v2 clients

@@ -207,6 +207,9 @@ pub enum Msg<'a> {
     ProviderStepApiKeyUnset,
     ProviderStepModel,
     ProviderStepModelWithHint { current: &'a str },
+    ProviderStepContextWindow { default: usize },
+    ProviderStepContextWindowWithHint { current: usize },
+    ProviderContextWindowInvalid,
     ProviderNameEmpty,
     ProviderBaseUrlEmpty,
     ProviderUnknownType,
@@ -503,6 +506,10 @@ pub enum Msg<'a> {
     PluginMarketplaceRemoveFailed { error: &'a str },
     PluginMarketplaceUpdating { name: &'a str },
     PluginMarketplaceListFailed { error: &'a str },
+    /// Calm one-line advisory (yellow) for a NON-FATAL startup marketplace
+    /// auto-update failure. `detail` is the first line of the underlying error.
+    /// Replaces the red multi-line git-stderr dump that reads like a crash.
+    PluginAutoUpdateSkipped { detail: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
     PluginInstallingByName { plugin: &'a str },
     PluginAlreadyInstalled { id: &'a str },
@@ -609,16 +616,40 @@ pub enum Msg<'a> {
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
     /// Description for the `/copy` slash command — copies a code block from the
-    /// last reply to the clipboard.
+    /// last reply to the clipboard, or with `/copy msg` the full reply markdown.
     CmdDescCopy,
     /// `/copy`: confirmation after a code block lands on the clipboard.
     CopyOk { lines: usize, chars: usize },
+    /// `/copy msg`: confirmation after the full reply markdown lands on the
+    /// clipboard. Distinct from `CopyOk` so the hint says "reply" not "code
+    /// block" — the user copied the whole message, not a fenced block.
+    CopyOkMsg { lines: usize, chars: usize },
     /// `/copy`: the last reply has no fenced code block to copy.
     CopyNoCodeBlock,
+    /// `/copy msg`: the reply is empty/whitespace-only, so there is no message
+    /// body to copy. Distinct from `CopyNoCodeBlock` so the hint can say
+    /// "reply is empty" rather than "no code block".
+    CopyMsgEmpty,
     /// `/copy N`: the requested index is out of range; `count` blocks exist.
     CopyBadIndex { count: usize },
     /// `/copy`: the clipboard write failed (no arboard backend — headless/SSH).
     CopyFailed,
+    /// Description for the `/save` slash command — exports the current
+    /// conversation to a local markdown file.
+    CmdDescSave,
+    /// `/save`: the conversation was written to a file; `path` is the resolved
+    /// path (display-only).
+    SaveOk { path: &'a str },
+    /// `/save`: there are no conversation turns to export yet.
+    SaveEmpty,
+    /// `/save`: the filesystem write failed; `error` carries the underlying
+    /// error message.
+    SaveIoError { error: &'a str },
+    /// `/save`: the requested path's parent directory does not exist.
+    SaveInvalidPath { path: &'a str },
+    /// `/save`: the target already exists and is NOT a markdown file — refused
+    /// to overwrite it (likely a typo that would clobber source/config/data).
+    SaveRefuseOverwrite { path: &'a str },
     /// Hint shown after a code block is auto-copied to clipboard (issue #699).
     CodeBlockCopied,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.
@@ -635,6 +666,12 @@ pub enum Msg<'a> {
     CmdDescGoal,
     /// Description for the `/proxy` slash command — switch the outbound proxy mode.
     CmdDescProxy,
+    /// Description for the `/todo` slash command — reprint the current task list.
+    CmdDescTodo,
+    /// `/todo` output when no todowrite call exists in the transcript yet.
+    TodoNoList,
+    /// `/todo` header line printed before the task list.
+    TodoListHeader,
     /// Error shown when `/view` is used without a filepath argument.
     ViewUsage,
     /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
@@ -677,6 +714,11 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+    /// `/paste` on HarmonyOS (ohos): the system clipboard is not
+    /// readable at all (arboard has no ohos backend, and the
+    /// `ohos-pasteboard` CLI ships only in unreleased 7.0), so "no
+    /// image" is misleading — point the user at the file-path workaround.
+    CmdPasteNoImageOhos,
 
     // ── reasoning effort ──
     /// Rendered when the user tries to set reasoning_effort on a
@@ -815,6 +857,32 @@ pub enum Msg<'a> {
     /// Confirmation line after `/goal clear` (and its aliases).
     GoalCleared,
 
+    // ── /loop ──
+    /// `/loop` / `/loop status` while a loop is active. `label` is the loop
+    /// description (e.g. "30s · /foo"), `round`/`mins`/`secs` are counters.
+    LoopStatus { label: &'a str, round: u32, mins: u64, secs: u64 },
+    /// `/loop status` (or bare `/loop`) when no loop is active.
+    LoopNoActive,
+    /// Confirmation line after `/loop stop` (and its aliases).
+    LoopCleared,
+    /// Mid-loop turn-separator banner: `⚡ loop round N · stats`.
+    /// `round` is the 1-based round number; `stats` is the pre-formatted
+    /// stats string (tools · duration · tokens · cached%).
+    LoopRound { round: u32, stats: &'a str },
+    /// Emitted by `handle_loop_decision` when the consecutive-failure limit
+    /// is reached and the interval loop auto-stops.
+    LoopStopped,
+    /// End-of-loop banner emitted by the `LoopUpdate { active: false }` handler
+    /// when the loop ends with a non-cancellation reason.
+    /// `reason` is the internal English identifier from the bridge's loop driver
+    /// (e.g. "completed", "round limit (10)") — kept English as-is.
+    LoopEnded { reason: &'a str },
+    /// One-line hint shown when a `/loop` is armed: the loop is a live-only
+    /// construct and does NOT survive a restart/resume (persistence deferred).
+    LoopNoPersistHint,
+    /// Description for the `/loop` slash command (shown in `/help`).
+    CmdDescLoop,
+
     /// Surfaced when the user pastes/attaches an image but the active
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.
@@ -847,6 +915,10 @@ pub enum Msg<'a> {
     /// "  (press Esc again to undo last turn)\n" — leading indent +
     /// trailing newline are part of the template.
     EscAgainToUndo,
+
+    /// Footer discoverability hint shown while the input starts with `!` — a
+    /// `!<cmd>` line runs a local shell command directly (user-invoked bash).
+    BashInputHint,
 
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the
@@ -997,6 +1069,11 @@ pub enum Msg<'a> {
     /// user isn't logged in — the expected state right after `/logout` or on a
     /// fresh launch before `/login`. Replaces the alarming red init-failure line.
     ProviderInitNeedsLogin,
+    /// Calm advisory (yellow) for a SOURCE (open-source) build whose default
+    /// provider is the AtomGit gateway: the request-signer is a placeholder, so
+    /// no /login fixes it. Points at `/provider` (own api_key) or the official
+    /// build. Replaces the red "模型初始化失败" that reads like a crash.
+    ProviderInitSourceBuild,
     /// The configured `base_url` is an AtomGit gateway that this (open-source)
     /// build can't sign requests for. Points the user at the official binary
     /// or a plain OpenAI-compatible endpoint.

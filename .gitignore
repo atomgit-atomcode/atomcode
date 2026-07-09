@@ -13,6 +13,11 @@ packages/npm/*.tgz
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment variables (may contain secrets)
+.env
 
 # Python (dev scripts)
 __pycache__/
@@ -115,3 +120,5 @@ extensions/vscode/webview/webview.js
 extensions/vscode/webview/webview.js.map
 .hooks.json
 extensions/jetbrains/.spec_docs
+# 本地评测脚手架(A/B 对比脚本、日志、测试仓),不入库
+.aacr-eval/

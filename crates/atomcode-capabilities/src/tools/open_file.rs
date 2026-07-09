@@ -156,9 +156,11 @@ impl Tool for OpenFileTool {
             Err(e) => return err(format!("open_file: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}.")),
         };
         let target = resolve_path(&a.file_path, &ctx.working_dir);
-        let target = std::fs::canonicalize(&target).unwrap_or(target);
+        // Strip the Windows `\\?\` verbatim prefix: `cmd /c start` / Explorer don't
+        // accept extended-length paths, and it would leak into the messages below.
+        let target = crate::pathnorm::canonicalize(&target).unwrap_or(target);
         if !target.exists() {
-            return err(format!("open_file: file not found: {}", target.display()));
+            return err(format!("open_file: file not found: {}", crate::pathnorm::to_display(&target)));
         }
 
         let strategy = pick_open_strategy();
@@ -187,7 +189,7 @@ impl Tool for OpenFileTool {
             OpenStrategy::Headless(reason) => {
                 return err(format!(
                     "open_file: cannot open in GUI: {reason}.\n\nFile path for manual viewing:\n  {}",
-                    target.display()
+                    crate::pathnorm::to_display(&target)
                 ));
             }
         };
@@ -202,11 +204,11 @@ impl Tool for OpenFileTool {
         // spawned from a console-less daemon; the GUI app it hands off to is unaffected.
         crate::process_utils::suppress_console_window_sync(&mut cmd);
         match cmd.spawn() {
-            Ok(_child) => ok(format!("Opened {} via `{}`.", target.display(), strategy_command_name(&strategy))),
+            Ok(_child) => ok(format!("Opened {} via `{}`.", crate::pathnorm::to_display(&target), strategy_command_name(&strategy))),
             Err(e) => err(format!(
                 "open_file: failed to launch `{}`: {e}.\n\nFile path for manual viewing:\n  {}",
                 strategy_command_name(&strategy),
-                target.display()
+                crate::pathnorm::to_display(&target)
             )),
         }
     }

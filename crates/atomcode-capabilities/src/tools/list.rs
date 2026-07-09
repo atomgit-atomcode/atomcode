@@ -57,8 +57,8 @@ impl Tool for ListDirTool {
 
         match tokio::fs::metadata(&root).await {
             Ok(m) if m.is_dir() => {}
-            Ok(_) => return err(format!("Not a directory: {}", root.display())),
-            Err(_) => return err(format!("Directory not found: {}", root.display())),
+            Ok(_) => return err(format!("Not a directory: {}", crate::pathnorm::to_display(&root))),
+            Err(_) => return err(format!("Directory not found: {}", crate::pathnorm::to_display(&root))),
         }
 
         let root2 = root.clone();

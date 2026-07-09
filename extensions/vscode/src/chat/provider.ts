@@ -13,12 +13,21 @@ import {
   PatchThinkingRequest,
   ProvidersResponse,
   ImageInput,
+  PermissionDecision,
 } from '../daemon/types';
 import { getQuickActionPrompt } from './quickActions';
+import {
+  ApprovalMode,
+  ApprovalModeState,
+  beginApprovalModeSwitch,
+  completeApprovalModeSwitch,
+  failApprovalModeSwitch,
+  initApprovalModeState,
+} from './modeState';
 
 type WebviewMode = 'sidebar' | 'tab';
 type ContextItem = { path: string; type: string; fileName?: string; language?: string; selection?: string; startLine?: number; endLine?: number };
-type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string };
+type QueuedChatMessage = { text: string; context?: ContextItem[]; images?: ImageInput[]; clientMessageId?: string; approvalMode?: ApprovalMode };
 type WorkspacePathItem = { path: string; fileName: string; relativePath: string; isDir: boolean; depth: number };
 type PanelSessionInfo = {
   sessionId: string;
@@ -34,9 +43,27 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
+}
+
+function isDestructivePermissionTool(toolName: string): boolean {
+  const normalized = toolName.toLowerCase();
+  return normalized.includes('bash')
+    || normalized.includes('execute')
+    || normalized.includes('write')
+    || normalized.includes('edit')
+    || normalized.includes('replace')
+    || normalized.includes('delete')
+    || normalized.includes('parallel_edit');
+}
+
+function isPermissionDecision(value: unknown): value is PermissionDecision {
+  return value === 'allow'
+    || value === 'deny'
+    || value === 'always_allow'
+    || value === 'allow_persist';
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -53,6 +80,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
   private _workspacePathCache?: { root: string; builtAt: number; items: WorkspacePathItem[] };
+  private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
   public onModelSelected?: (model: string) => void;
 
   constructor(
@@ -262,6 +290,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             msg.images,
             msg.clientMessageId,
             msg.sessionId,
+            msg.approvalMode,
           );
           break;
         case 'stop':
@@ -287,6 +316,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'selectReasoningEffort':
           await this._setReasoningEffort(msg.provider, msg.effort);
+          break;
+        case 'selectApprovalMode':
+          await this._setApprovalMode(msg.mode);
+          break;
+        case 'permissionResponse':
+          await this._handlePermissionResponse(msg);
           break;
         case 'authLoginStart':
           await this._startLogin();
@@ -692,6 +727,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     images?: ImageInput[],
     clientMessageId?: string,
     msgSessionId?: string,
+    approvalMode?: ApprovalMode,
   ) {
     const trimmed = text.trim();
     const attachedImages = images?.length ? images : undefined;
@@ -705,12 +741,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rt = this._getRuntime(sid);
 
     if (rt.isGenerating) {
-      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId });
+      rt.queuedMessages.push({ text: trimmed, context, images: attachedImages, clientMessageId, approvalMode });
       return;
     }
 
     if (clientMessageId) {
-      this._postMessage({ type: 'queuedMessageSent', id: clientMessageId });
+      this._postMessageForSession(sid, { type: 'queuedMessageSent', id: clientMessageId });
     }
 
     if (!attachedImages && await this._handleLocalCommand(trimmed, sid)) {
@@ -765,6 +801,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       working_dir: workspaceFolder,
       session_id: sid,
       images: attachedImages,
+      approval_mode: approvalMode ?? this._approvalModeState.confirmedMode,
     };
 
     // Capture session ID so callbacks always reference the correct session
@@ -795,6 +832,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'toolResult', data: { id, name, output, success, durationMs } });
         this._postMessageToPanel(streamSessionId, { type: 'toolResult', id, name, output, success, durationMs });
       },
+      onPermissionRequest: (request) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        const msg = {
+          sessionId: request.sessionId,
+          id: request.callId,
+          toolName: request.toolName,
+          reason: request.reason,
+          args: request.args,
+          isDestructive: isDestructivePermissionTool(request.toolName),
+        };
+        srt.eventBuffer.push({ type: 'permissionRequest', data: msg });
+        this._postMessageToPanel(streamSessionId, { type: 'permissionRequest', ...msg });
+      },
       onTokens: (prompt, completion, total) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -818,6 +869,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!srt) return;
         srt.eventBuffer.push({ type: 'artifactEnd', data: { id } });
         this._postMessageToPanel(streamSessionId, { type: 'artifactEnd', id });
+      },
+      onWarning: (message) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'warning', data: { message } });
+        this._postMessageToPanel(streamSessionId, { type: 'warning', message });
+      },
+      onRateLimited: (event) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'rateLimited', data: event });
+        this._postMessageToPanel(streamSessionId, {
+          type: 'rateLimited',
+          message: event.message,
+          retryAfterSeconds: event.retryAfterSeconds,
+          attempt: event.attempt,
+          maxAttempts: event.maxAttempts,
+        });
       },
       onDone: (tokens, toolCalls, sessionId) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -844,11 +913,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        this._postMessageToPanel(sessionId || streamSessionId, { type: 'done', tokens, toolCalls, sessionId });
-        void this._reloadFinishedSessionHistory(sessionId || streamSessionId)
+        const doneSessionId = sessionId || streamSessionId;
+        this._postMessageForSession(doneSessionId, { type: 'done', tokens, toolCalls, sessionId });
+        void this._reloadFinishedSessionHistory(doneSessionId)
           .finally(() => {
             void this._refreshSessions();
-            setTimeout(() => void this._sendNextQueuedMessage(), 75);
+            setTimeout(() => void this._sendNextQueuedMessage(doneSessionId), 75);
           });
       },
       onStopped: () => {
@@ -871,17 +941,74 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _sendNextQueuedMessage() {
-    const sid = this._focusedPanelId;
+  private async _sendNextQueuedMessage(sessionId?: string) {
+    if (this._approvalModeState.pendingMode) return;
+    const sid = sessionId ?? this._focusedPanelId;
     if (!sid) return;
     const rt = this._sessionRuntimes.get(sid);
     if (!rt || rt.isGenerating) return;
     const next = rt.queuedMessages.shift();
     if (!next) return;
-    await this._handleSend(next.text, next.context, next.images, next.clientMessageId);
+    await this._handleSend(next.text, next.context, next.images, next.clientMessageId, sid, next.approvalMode);
     const rt2 = this._sessionRuntimes.get(sid);
-    if (rt2 && !rt2.isGenerating) {
-      void this._sendNextQueuedMessage();
+    if (rt2 && !rt2.isGenerating && rt2.queuedMessages.length > 0) {
+      void this._sendNextQueuedMessage(sid);
+    }
+  }
+
+  private _drainReadyQueues() {
+    if (this._approvalModeState.pendingMode) return;
+    for (const [sessionId, rt] of this._sessionRuntimes) {
+      if (!rt.isGenerating && rt.queuedMessages.length > 0) {
+        void this._sendNextQueuedMessage(sessionId);
+      }
+    }
+  }
+
+  private async _handlePermissionResponse(msg: {
+    sessionId?: string;
+    id?: string;
+    toolName?: string;
+    decision?: unknown;
+    allowed?: boolean;
+    persist?: boolean;
+  }) {
+    if (!msg.sessionId || !msg.id) return;
+    const decision: PermissionDecision | undefined = isPermissionDecision(msg.decision)
+      ? msg.decision
+      : typeof msg.allowed === 'boolean'
+        ? (msg.allowed ? (msg.persist ? 'allow_persist' : 'allow') : 'deny')
+        : undefined;
+
+    if (!decision) {
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: false,
+        message: 'Invalid permission decision',
+      });
+      return;
+    }
+
+    try {
+      const result = await this._client.sendPermissionDecision(
+        msg.sessionId,
+        decision,
+        msg.toolName,
+      );
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: result.success,
+        message: result.error,
+      });
+    } catch (e) {
+      this._postMessageForSession(msg.sessionId, {
+        type: 'permissionResponseResult',
+        id: msg.id,
+        success: false,
+        message: this._messageFromError(e),
+      });
     }
   }
 
@@ -970,6 +1097,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessage({ type: 'sessions', sessions }, webview);
     } catch {}
 
+    try {
+      const modeResp = await this._client.getApprovalMode();
+      if (!this._approvalModeState.pendingMode) {
+        this._approvalModeState = initApprovalModeState(modeResp.mode);
+        this._postMessage({ type: 'approvalMode', mode: modeResp.mode, pending: false }, webview);
+      } else {
+        this._postMessage({
+          type: 'approvalMode',
+          mode: this._approvalModeState.displayMode,
+          pending: true,
+        }, webview);
+      }
+    } catch {}
+
     this._sendEditorContext(webview);
 
     if (messagesToLoad && mode === 'tab') {
@@ -998,6 +1139,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       projectHash,
       isSessionList: mode === 'sidebar',
       locale: vscode.env.language,
+      approvalMode: this._approvalModeState.displayMode,
+      approvalModePending: Boolean(this._approvalModeState.pendingMode),
     }, webview);
   }
 
@@ -1245,6 +1388,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async _setApprovalMode(mode: ApprovalMode) {
+    const next = beginApprovalModeSwitch(this._approvalModeState, mode);
+    if (next === this._approvalModeState) return;
+    this._approvalModeState = next;
+    this._broadcastMessage({ type: 'approvalMode', mode: next.displayMode, pending: true });
+    try {
+      const resp = await this._client.setApprovalMode(mode);
+      this._approvalModeState = completeApprovalModeSwitch(this._approvalModeState, resp.mode);
+      this._broadcastMessage({
+        type: 'approvalMode',
+        mode: this._approvalModeState.displayMode,
+        pending: false,
+      });
+    } catch {
+      this._approvalModeState = failApprovalModeSwitch(this._approvalModeState);
+      this._broadcastMessage({
+        type: 'approvalMode',
+        mode: this._approvalModeState.displayMode,
+        pending: false,
+      });
+    } finally {
+      this._drainReadyQueues();
+    }
+  }
+
   private _sendEditorContext(webview?: vscode.Webview) {
     // Only send context when user has an active selection
     const editor = vscode.window.activeTextEditor;
@@ -1341,6 +1509,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
           break;
+        case 'permissionRequest':
+          post({ type: 'permissionRequest', ...evt.data });
+          break;
         case 'artifactStart':
           post({ type: 'artifactStart', id: evt.data.id, artifactType: evt.data.artifactType, language: evt.data.language, title: evt.data.title });
           break;
@@ -1349,6 +1520,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'artifactEnd':
           post({ type: 'artifactEnd', id: evt.data.id });
+          break;
+        case 'warning':
+          post({ type: 'warning', message: evt.data.message });
+          break;
+        case 'rateLimited':
+          post({
+            type: 'rateLimited',
+            message: evt.data.message,
+            retryAfterSeconds: evt.data.retryAfterSeconds,
+            attempt: evt.data.attempt,
+            maxAttempts: evt.data.maxAttempts,
+          });
           break;
         case 'tokens':
           post({ type: 'tokens', prompt: evt.data.prompt, completion: evt.data.completion, total: evt.data.total });
@@ -1829,6 +2012,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (panel) {
       panel.webview.postMessage(msg);
     }
+  }
+
+  private _postMessageForSession(sessionId: string, msg: any) {
+    const panel = this._panels.get(sessionId);
+    if (panel) {
+      panel.webview.postMessage(msg);
+      return;
+    }
+    this._postMessage(msg);
   }
 
   private _broadcastToPanels(msg: any) {

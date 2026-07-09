@@ -46,6 +46,10 @@ pub enum LiveEvent {
     /// 任一视图（webui 下拉框 / TUI /model）切换了模型。其余视图据此同步显示与选中项。
     /// 仅作显示/状态广播——实际下一轮用哪个 provider 由进程级选择（daemon 侧 LIVE_PROVIDER）决定。
     ProviderChanged(String),
+    /// 任一视图（webui 底栏「模式」pill）切换了审批模式（build / plan / bypass）。
+    /// 其余视图据此同步 pill 显示。仅作显示/状态广播——实际下一轮用哪个
+    /// PermissionDecider 由进程级选择（daemon 侧 LIVE_APPROVAL_MODE）决定。
+    ModeChanged(String),
     /// 任一视图（webui /cd）切换了工作目录/项目。其余视图据此跟随：同进程 TUI
     /// 会切到新目录并开一个全新 session（见 event_loop/live_sync 转发）。仅广播
     /// 路径，不触碰 turn 状态。
@@ -230,6 +234,12 @@ impl LiveSession {
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
         self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+    }
+
+    /// 广播一次审批模式切换（build / plan / bypass）给所有视图，让另一端的「模式」
+    /// pill 实时跟随。返回 false 表示当前无订阅者（无妨）。
+    pub fn notify_mode_changed(&self, mode: String) -> bool {
+        self.events.send(LiveEvent::ModeChanged(mode)).is_ok()
     }
 
     /// 广播一次工作目录切换给所有视图（不触碰 turn 状态）。webui /cd 时调用，

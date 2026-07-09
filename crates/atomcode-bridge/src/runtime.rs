@@ -15,6 +15,7 @@ use atomcode_core::agent::{
 };
 use atomcode_core::agent::goal::{goal_continuation_message, summarize_for_goal, GoalResult, GoalState};
 use atomcode_core::agent::goal_evaluator::{EvalOutcome, GoalEvaluator};
+use atomcode_core::agent::loop_state::{LoopState, WakeupRequest};
 use atomcode_core::conversation::ConversationSnapshot;
 use tokio_util::sync::CancellationToken;
 use atomcode_kernel::event::{
@@ -88,6 +89,10 @@ pub struct BridgeConfig {
     /// Threaded so self-signed / internal gateways work under v2 (the legacy engine
     /// honored it via `build_http_client`; v2 had no path for it). Default false.
     pub skip_tls_verify: bool,
+    /// Self-paced `/loop` round cap from `[loop_config] max_rounds`. Threaded so the
+    /// v2 self-paced loop honors the same knob the TUI interval mode already reads;
+    /// previously the bridge hardcoded `LoopState`'s default 100 regardless of config.
+    pub loop_max_rounds: u32,
 }
 
 /// Spawn a new-stack agent presented through the LEGACY channel protocol.
@@ -234,6 +239,42 @@ struct Bridge {
     /// The spawned eval task reports its outcome here; drained by the main loop
     /// as a third event source so commands (Cancel) stay responsive during eval.
     goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
+    /// Active self-paced `/loop` state (round/elapsed/label), or None. Reuses v1's
+    /// [`LoopState`]; mutually exclusive with `goal` (a session runs one or the other).
+    /// The loop is driven from the turn-end Snapshot hook — like goal, but continuation
+    /// is delay-driven (the model's `schedule_wakeup`) instead of an evaluator verdict.
+    loop_state: Option<LoopState>,
+    /// Cancels an in-flight `/loop` (fresh per `SetLoop`). Triggered by
+    /// ClearLoop/Cancel/Shutdown so a pending delayed continuation NEVER fires after
+    /// the loop is stopped (the spawned sleep `select!`s on this token).
+    loop_cancel: CancellationToken,
+    /// The wakeup the model requested THIS turn via `schedule_wakeup` (delivered over
+    /// `wakeup_rx`). Taken by the turn-end Snapshot hook to schedule the next
+    /// continuation; `None` at turn end ⇒ the model didn't reschedule ⇒ the loop ends.
+    pending_wakeup: Option<WakeupRequest>,
+    /// Loop hold-open tracking (the `/loop` analogue of `pending_goal`). Between rounds
+    /// the turn-end Snapshot hook holds the driver turn open (it `return`s WITHOUT
+    /// `finish_turn`, so the footer stays busy during the sleep). `Some` ⇒ a turn is held
+    /// open awaiting the next continuation; the stop paths (ClearLoop / Cancel /
+    /// round-limit) `take()` it and `finish_turn` so the UI leaves Streaming. Without it,
+    /// stopping a SLEEPING loop strands the driver in Streaming forever (the kernel turn
+    /// already completed, so the forwarded KCmd::Cancel is a no-op).
+    loop_pending_finish: Option<Vec<atomcode_core::conversation::message::Message>>,
+    /// The bridge end of the channel the kernel-side [`ScheduleWakeupTool`] sends on.
+    /// Drained by the select loop (a wakeup arriving mid-turn is recorded into
+    /// `pending_wakeup`). The matching sender is mounted into the kernel via the tool.
+    wakeup_rx: mpsc::UnboundedReceiver<WakeupRequest>,
+    /// Sender handed to the `schedule_wakeup` tool at every (re)mount, so a respawn's
+    /// freshly-built tool still reaches THIS bridge. Kept on the struct to clone on
+    /// respawn.
+    wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
+    /// A delayed continuation reached its fire time: the spawned cancel-aware sleep
+    /// (started in the Snapshot hook) sends the wakeup here. The select loop then
+    /// bumps the round and injects the model's prompt as the next turn. Going through
+    /// the loop (instead of `await`ing the sleep inline) keeps commands responsive
+    /// during the wait — the same discipline as `goal_eval_tx`.
+    loop_fire_tx: mpsc::UnboundedSender<WakeupRequest>,
+    loop_fire_rx: mpsc::UnboundedReceiver<WakeupRequest>,
 }
 
 impl Bridge {
@@ -269,6 +310,7 @@ impl Bridge {
         // the bare `reqwest` UA and ignored `skip_tls_verify`.
         coding_cfg.user_agent = cfg.user_agent.clone();
         coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
+        coding_cfg.loop_max_rounds = cfg.loop_max_rounds;
         // Interactive drivers PARK approvals (a present human must not be auto-denied for
         // thinking too long); headless keeps the configured fail-closed timeout. Liveness for
         // a crashed interactive driver is handled by Cancel/Shutdown flushing pending requests.
@@ -276,6 +318,28 @@ impl Bridge {
             coding_cfg.request_timeout = None;
         }
         coding_cfg.keep_interrupted_context = cfg.keep_interrupted_context;
+
+        // Strong/weak routing: when the `task` tool is enabled, give each tier whose
+        // model differs from the host its own SIGNED provider (built here — build_provider
+        // + the atomgit signer live in the bridge). A tier equal to the host, or any
+        // build failure, leaves the field None ⇒ that tier reuses the host provider slot.
+        // Strong/weak routing: create SHARED, swap-aware tier cells. Cheap (config derive
+        // only — the provider builds lazily on first `task` use). Both cells are always
+        // created when the feature is on, so a later `/model` swap can `reset()` them in
+        // place (see `refresh_subagent_tiers`) and routing re-resolves without a respawn.
+        if atomcode_coding::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+            if let Ok(full_cfg) =
+                atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+            {
+                let host_model = coding_cfg.model.clone();
+                let (fast_thunk, cap_thunk) =
+                    resolve_tier_thunks(&coding_cfg, &host_model, &full_cfg);
+                coding_cfg.subagent_fast_provider =
+                    Some(atomcode_coding::TierProvider::new(fast_thunk));
+                coding_cfg.subagent_capable_provider =
+                    Some(atomcode_coding::TierProvider::new(cap_thunk));
+            }
+        }
 
         let opts_template = PrepareOptions {
             session: SessionMode::Fresh,
@@ -301,7 +365,7 @@ impl Bridge {
             Ok(p) => p,
             Err(e) => {
                 let _ = ev_tx.send(CoreEv::Error {
-                    error: format!("engine v2 prepare failed: {e}"),
+                    error: engine_init_error_message("prepare", &e),
                     snapshot: ConversationSnapshot::default(),
                 });
                 // prepare() failed — we can't build a Bridge at all (no parts).
@@ -313,6 +377,16 @@ impl Bridge {
         };
         let bridge_session =
             parts.session.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+        // /loop wiring (mirrors the goal channels): `wakeup_*` carries a model
+        // `schedule_wakeup` from the kernel-side tool back to the bridge; `loop_fire_*`
+        // carries a delayed continuation from its spawned sleep back to the select loop.
+        // Created here so the kernel `schedule_wakeup` tool can be mounted onto `parts`
+        // BEFORE `assemble` snapshots the toolset (an unmounted tool is invisible).
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel::<WakeupRequest>();
+        let (loop_fire_tx, loop_fire_rx) = mpsc::unbounded_channel::<WakeupRequest>();
+        parts.register_extra_tool(Arc::new(crate::schedule_wakeup::ScheduleWakeupTool::new(
+            wakeup_tx.clone(),
+        )));
         let provider = match build_provider(&coding_cfg) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -325,7 +399,7 @@ impl Bridge {
                 Ok(a) => (a.spawn(), false),
                 Err(e) => {
                     let _ = ev_tx.send(CoreEv::Error {
-                        error: format!("engine v2 assemble failed: {e}"),
+                        error: engine_init_error_message("assemble", &e),
                         snapshot: ConversationSnapshot::default(),
                     });
                     (Self::noop_handle(), true)
@@ -364,10 +438,23 @@ impl Bridge {
             goal_cancel: CancellationToken::new(),
             pending_goal: None,
             goal_eval_tx,
+            loop_state: None,
+            loop_cancel: CancellationToken::new(),
+            pending_wakeup: None,
+            loop_pending_finish: None,
+            wakeup_rx,
+            wakeup_tx,
+            loop_fire_tx,
+            loop_fire_rx,
         };
 
         loop {
             tokio::select! {
+                // Deterministic branch order: a loop wakeup/fire that's ready in the
+                // SAME poll as a kernel event MUST be processed first, so `pending_wakeup`
+                // is set before the turn-end Snapshot reads it (else a self-paced loop
+                // could be misjudged as "completed"). cmd_rx stays first for Cancel.
+                biased;
                 cmd = cmd_rx.recv() => match cmd {
                     Some(c) => {
                         if bridge.on_command(c).await {
@@ -381,6 +468,18 @@ impl Bridge {
                 Some(outcome) = goal_eval_rx.recv() => {
                     bridge.on_goal_eval_result(outcome).await;
                 }
+                // The kernel-side schedule_wakeup tool just fired (mid-turn): record
+                // the request. The turn-end Snapshot hook reads `pending_wakeup` to
+                // decide whether to schedule a continuation or end the loop.
+                Some(wake) = bridge.wakeup_rx.recv() => {
+                    bridge.pending_wakeup = Some(wake);
+                }
+                // A delayed continuation reached its fire time (its spawned cancel-aware
+                // sleep sent it here). Inject the model's prompt as the next turn —
+                // off the select branch so it never blocks the loop.
+                Some(wake) = bridge.loop_fire_rx.recv() => {
+                    bridge.on_loop_fire(wake);
+                }
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
@@ -391,6 +490,15 @@ impl Bridge {
                             bridge.finish_turn(reason, Vec::new());
                         } else if bridge.turn_running {
                             bridge.finish_turn(StopReason::Cancelled, Vec::new());
+                        } else if let Some(messages) = bridge.loop_pending_finish.take() {
+                            // A /loop sleeping between rounds holds its turn OPEN
+                            // (pending_finish already consumed, turn_running=false). Without
+                            // this branch the held-open turn never gets a terminal and the
+                            // TUI stays in Streaming forever after the kernel ends.
+                            bridge.finish_turn(StopReason::Cancelled, messages);
+                        } else if let Some((_, messages)) = bridge.pending_goal.take() {
+                            // Same hold-open shape for /goal while the evaluator runs.
+                            bridge.finish_turn(StopReason::Cancelled, messages);
                         }
                         let _ = bridge.ev_tx.send(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
@@ -426,6 +534,13 @@ impl Bridge {
             self.finish_turn(reason, messages);
             return;
         };
+        // `goal_provider` is cached across turns and survives respawn, where
+        // `bridge_session` may have changed (/resume, /model, /clear). Refresh
+        // the session id to the CURRENT conversation before each eval so the
+        // evaluator call rides the live `x-atomcode-session-id`, not a stale one.
+        if !self.bridge_session.is_empty() {
+            provider.set_session_id(&self.bridge_session);
+        }
         let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
         let summary = summarize_for_goal(&messages, prev.as_deref());
         self.pending_goal = Some((reason, messages));
@@ -519,6 +634,99 @@ impl Bridge {
         }
     }
 
+    /// Tear down any active `/loop` because `/goal` is being armed. `/loop` and
+    /// `/goal` are mutually exclusive — the turn-end Snapshot hook drives only one —
+    /// but the command arms never enforced it, so arming a goal over a sleeping loop
+    /// left the loop's cancel-timer alive to fire a stale round after the goal ran.
+    /// Cancels the sleep token, drops loop state + any queued continuation, closes a
+    /// held-open loop turn, and clears the footer. Safe no-op when no loop is active.
+    fn supersede_loop(&mut self, reason: &str) {
+        self.loop_cancel.cancel();
+        self.loop_cancel = CancellationToken::new();
+        while self.loop_fire_rx.try_recv().is_ok() {}
+        while self.wakeup_rx.try_recv().is_ok() {}
+        self.pending_wakeup = None;
+        if let Some(mut l) = self.loop_state.take() {
+            l.clear();
+            l.last_reason = Some(reason.to_string());
+            let ev = loop_update_ev(&l);
+            self.emit(ev);
+        }
+        if let Some(messages) = self.loop_pending_finish.take() {
+            self.finish_turn(StopReason::Cancelled, messages);
+        }
+    }
+
+    /// Symmetric to [`supersede_loop`]: tear down any active `/goal` because `/loop`
+    /// is being armed. Safe no-op when no goal is active.
+    fn supersede_goal(&mut self, reason: &str) {
+        self.goal_cancel.cancel();
+        self.goal_cancel = CancellationToken::new();
+        if let Some(mut g) = self.goal.take() {
+            g.clear();
+            g.last_eval_reason = Some(reason.to_string());
+            let ev = goal_update_ev(&g);
+            self.emit(ev);
+        }
+        if let Some((_, messages)) = self.pending_goal.take() {
+            self.finish_turn(StopReason::Cancelled, messages);
+        }
+    }
+
+    /// A /loop delayed continuation reached its fire time. Bump the round, emit a
+    /// LoopUpdate, and inject the model's chosen prompt as a fresh turn — the v2
+    /// analogue of goal's NotMet continuation, but the model (not an evaluator)
+    /// supplied the prompt and chose the delay. A `None`/inactive `loop_state` means
+    /// the loop was cleared/cancelled after the sleep was spawned but before this
+    /// landed (the cancel token normally pre-empts the sleep; this guards the race).
+    fn on_loop_fire(&mut self, wake: WakeupRequest) {
+        // Mutate loop state inside a tight borrow, deciding whether this fire CONTINUES
+        // the loop or ENDS it (round-limit fuse). Emit happens AFTER the borrow drops so
+        // `self.emit` doesn't conflict with the `&mut self.loop_state` borrow.
+        let hit_limit = match self.loop_state.as_mut() {
+            Some(l) if l.active => {
+                l.round += 1;
+                // `consecutive_failures` is a v1 LoopState field the bridge never
+                // increments (v2 has no evaluator/error retry path), so there is
+                // nothing to reset — left untouched on purpose.
+                l.last_reason = Some(wake.reason);
+                // Round-limit fuse (parity with v1 mod.rs:2345): stop the loop once
+                // `max_rounds` is reached instead of injecting another turn, so a
+                // runaway loop can't burn tokens forever. `max_rounds` comes from
+                // `[loop_config] max_rounds` (threaded via BridgeConfig →
+                // CodingAgentConfig.loop_max_rounds → SetLoop), default 100.
+                if l.round_limit_reached() {
+                    l.active = false;
+                    l.last_reason = Some(format!("round limit ({})", l.max_rounds));
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => return, // loop gone — drop the stale continuation
+        };
+        // Always reflect the new round/active state in the footer.
+        let ev = loop_update_ev(self.loop_state.as_ref().unwrap());
+        self.emit(ev);
+        if hit_limit {
+            // The previous round's turn is held open (the turn-end hook `return`ed without
+            // finish_turn). The loop ends here WITHOUT injecting another turn, so nothing
+            // downstream will close it — we must, or the UI stays stuck in Streaming.
+            let messages = self.loop_pending_finish.take().unwrap_or_default();
+            self.finish_turn(StopReason::Stopped, messages);
+            return; // loop ended — do NOT inject another turn
+        }
+        // A fresh continuation turn starts now → the prior hold-open is superseded by this
+        // turn's own lifecycle. Drop the stale snapshot so a later stop can't finish an
+        // already-replaced turn.
+        self.loop_pending_finish = None;
+        self.start_turn_stats();
+        let _ = self
+            .handle
+            .commands
+            .send(KCmd::SendMessage { text: wake.prompt, images: vec![] });
+    }
+
     // ---------------- legacy commands → kernel ----------------
 
     /// Returns `true` to shut the bridge down.
@@ -603,6 +811,14 @@ impl Bridge {
                                 });
                             match active_provider {
                                 Some(ref provider) => {
+                                    // This active_provider is a throwaway built only for the
+                                    // vision-capability check, so it was never session-bound.
+                                    // Bind it here so `maybe_preprocess` forwards the session id
+                                    // onto the one-off VL provider (gateway affinity for this
+                                    // second request of the turn).
+                                    if !self.bridge_session.is_empty() {
+                                        provider.set_session_id(&self.bridge_session);
+                                    }
                                     match maybe_preprocess(&config, provider.as_ref(), &text, &core_images).await {
                                         PreprocessOutcome::Skipped => {
                                             // Model supports vision natively — forward images as-is.
@@ -669,6 +885,18 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
+                // Esc/Ctrl+C ALSO stops an active /loop (goal/loop are mutually
+                // exclusive, so at most one of these fires). Cancelling `loop_cancel`
+                // makes any in-flight delayed continuation NOT fire; clearing
+                // `pending_wakeup` drops a model schedule from the cancelled turn.
+                self.loop_cancel.cancel();
+                if let Some(mut l) = self.loop_state.take() {
+                    l.clear();
+                    l.last_reason = Some("cancelled".into());
+                    let ev = loop_update_ev(&l);
+                    self.emit(ev);
+                }
+                self.pending_wakeup = None;
                 // Release + clear any parked approval BEFORE forwarding Cancel: the
                 // kernel then backfills the cancelled tool's result, and clearing our
                 // mirror means a later /model swap (which re-reads the snapshot) can't
@@ -679,6 +907,12 @@ impl Bridge {
                 let _ = self.handle.commands.send(KCmd::Cancel);
                 // If an eval was holding a turn open, close it as cancelled.
                 if let Some((_, messages)) = self.pending_goal.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
+                // Same for a held-open /loop turn (goal/loop are mutually exclusive → at
+                // most one fires): a sleeping loop's kernel turn already completed, so the
+                // KCmd::Cancel above is a no-op and WE must close the held-open turn.
+                if let Some(messages) = self.loop_pending_finish.take() {
                     self.finish_turn(StopReason::Cancelled, messages);
                 }
             }
@@ -802,9 +1036,17 @@ impl Bridge {
                 // fresh agent re-triggers on the next prompt.
                 if self.turn_running || self.pending_approval.is_some() {
                     self.settle_in_flight_turn().await;
+                } else if let Some(messages) = self.loop_pending_finish.take() {
+                    // A loop sleeping between rounds holds the turn open (turn_running=false);
+                    // finish it so the post-swap UI returns to Idle instead of stuck Streaming.
+                    self.finish_turn(StopReason::Cancelled, messages);
                 }
                 if let Some(p) = config.providers.get(&config.default_provider) {
                     apply_reload_provider(&mut self.coding_cfg, p);
+                    // Re-resolve the subagent tier cells against the NEW host model so
+                    // strong/weak routing follows a `/model` swap (the cells are shared with
+                    // the already-built TaskTool, so no respawn is needed).
+                    refresh_subagent_tiers(&self.coding_cfg);
                     match build_provider(&self.coding_cfg) {
                         Ok(provider) => {
                             // Assemble BEFORE tearing down the old handle — if
@@ -830,6 +1072,14 @@ impl Bridge {
                                     self.pending_sync = false;
                                     self.pending_undo = None;
                                     self.pending_goal = None;
+                                    // A /model swap starts the new provider on the same
+                                    // conversation but a held-open loop turn is gone; drop
+                                    // the loop and cancel any pending continuation so it
+                                    // can't fire into the swapped session.
+                                    self.loop_cancel.cancel();
+                                    self.loop_state = None;
+                                    self.pending_wakeup = None;
+                                    self.loop_pending_finish = None;
                                 }
                                 Err(e) => {
                                     self.emit(CoreEv::Error {
@@ -936,7 +1186,21 @@ impl Bridge {
                     arguments: serde_json::json!({ "command": cmd }).to_string(),
                 });
                 let start = Instant::now();
-                let (display, context, success) = run_local_shell(&cmd, &cwd).await;
+                // Stream output LIVE (v1 parity): each chunk → ToolOutputChunk, which
+                // the TUI renders for `local-shell-` ids WITHOUT Ctrl+O verbose (see
+                // `streams_tool_output_by_default`). v2 previously ran buffered
+                // (`Command::output()`) and emitted only the collapsed final result, so
+                // `!ls` showed a single line — this restores v1's full live output.
+                let chunk_tx = self.ev_tx.clone();
+                let chunk_id = call_id.clone();
+                let outcome = atomcode_core::tool::bash::run_shell(&cmd, &cwd, 300, move |chunk| {
+                    let _ = chunk_tx.send(CoreEv::ToolOutputChunk {
+                        call_id: chunk_id.clone(),
+                        chunk: chunk.to_string(),
+                    });
+                })
+                .await;
+                let (display, context, success) = format_local_shell(&cmd, &outcome);
                 self.emit(CoreEv::ToolCallResult {
                     call_id,
                     name: "bash".into(),
@@ -953,6 +1217,8 @@ impl Bridge {
                 // sends the condition as a normal message, so the FIRST turn starts on
                 // its own; this just arms the loop, which is driven from the turn-end
                 // Snapshot hook (`maybe_continue_goal`).
+                // Goal supersedes any active /loop (mutually exclusive).
+                self.supersede_loop("superseded by /goal");
                 if self.goal_provider.is_none() {
                     self.goal_provider = build_goal_provider();
                 }
@@ -995,8 +1261,65 @@ impl Bridge {
                     self.finish_turn(StopReason::Cancelled, messages);
                 }
             }
+            CoreCmd::SetLoop { prompt } => {
+                // Self-paced /loop on v2 (parity with the v2 /goal path, but delay-driven
+                // instead of evaluator-judged): reuse v1's LoopState. `/loop <prompt>`
+                // also sends the prompt as a normal message, so the FIRST turn starts on
+                // its own; this just arms the loop, which is driven from the turn-end
+                // Snapshot hook + the model's `schedule_wakeup` calls. No provider /
+                // evaluator to build (the model paces itself).
+                //
+                // Fresh cancel token per loop. Cancel the OLD token first so a prior
+                // loop's in-flight sleep is pre-empted (defensive: the TUI sends
+                // ClearLoop first, but don't rely on caller discipline). A stale wakeup
+                // from a previous loop is discarded so it can't be mistaken for THIS one.
+                // Loop supersedes any active /goal (mutually exclusive).
+                self.supersede_goal("superseded by /loop");
+                self.loop_cancel.cancel();
+                self.loop_cancel = CancellationToken::new();
+                self.pending_wakeup = None;
+                // Drain any continuation/wakeup already queued by the PRIOR loop but not yet
+                // processed. `on_loop_fire`'s only staleness guard is `loop_state.active`, and
+                // we're about to install a fresh active loop — without this drain a queued
+                // fire from the old loop would pass the guard and inject the old prompt (and
+                // bump the round) into the new one. Anything queued here necessarily belongs
+                // to the prior loop; the new loop hasn't scheduled anything yet.
+                while self.loop_fire_rx.try_recv().is_ok() {}
+                while self.wakeup_rx.try_recv().is_ok() {}
+                // Drop any hold-open snapshot from a prior loop; the new loop's first turn
+                // (the prompt sent alongside SetLoop) takes over the driver lifecycle.
+                self.loop_pending_finish = None;
+                let state = LoopState::new_with_limit(prompt, self.coding_cfg.loop_max_rounds);
+                let ev = loop_update_ev(&state);
+                self.emit(ev);
+                self.loop_state = Some(state);
+            }
+            CoreCmd::ClearLoop => {
+                // Cancel any pending delayed continuation IMMEDIATELY (the spawned sleep
+                // select!s on this token → it won't fire) and disarm the loop.
+                self.loop_cancel.cancel();
+                if let Some(mut l) = self.loop_state.take() {
+                    l.clear();
+                    l.last_reason = Some("cleared by user".into());
+                    let ev = loop_update_ev(&l);
+                    self.emit(ev);
+                }
+                self.pending_wakeup = None;
+                // Stop the turn running RIGHT NOW, not just the loop — `/loop clear`
+                // while a round is mid-tool (e.g. a long bash) must interrupt it, exactly
+                // like the goal ClearGoal / Cancel arms (which forward KCmd::Cancel).
+                let _ = self.handle.commands.send(KCmd::Cancel);
+                // If the loop was SLEEPING between rounds, its turn is held open and the
+                // kernel turn already completed → the KCmd::Cancel above is a no-op. WE
+                // must emit the terminal so the TUI leaves Streaming. (Mid-round stop:
+                // loop_pending_finish is None and KCmd::Cancel drives the terminal.)
+                if let Some(messages) = self.loop_pending_finish.take() {
+                    self.finish_turn(StopReason::Cancelled, messages);
+                }
+            }
             CoreCmd::Shutdown => {
                 self.goal_cancel.cancel();
+                self.loop_cancel.cancel();
                 return true;
             }
         }
@@ -1063,6 +1386,11 @@ impl Bridge {
         if self.turn_running || self.pending_approval.is_some() {
             self.pending_approval = None;
             self.finish_turn(StopReason::Cancelled, Vec::new());
+        } else if let Some(messages) = self.loop_pending_finish.take() {
+            // A loop sleeping between rounds holds the driver turn open with
+            // turn_running=false, so the branch above misses it — finish it here or the
+            // post-respawn UI stays stuck in Streaming.
+            self.finish_turn(StopReason::Cancelled, messages);
         }
         let _ = self.handle.commands.send(KCmd::Shutdown);
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
@@ -1117,6 +1445,10 @@ impl Bridge {
                         });
                         self.handle = Self::noop_handle();
                         self.degraded = true;
+                        // Stop any active loop on prepare failure too (parity with Ok).
+                        self.loop_cancel.cancel();
+                        self.loop_state = None;
+                        self.pending_wakeup = None;
                         return;
                     }
                 }
@@ -1127,6 +1459,14 @@ impl Bridge {
         parts.approval = self.parts.approval.clone();
         // Plan mode survives a respawn (/resume, /clear, model swap).
         parts.plan_mode = self.parts.plan_mode.clone();
+        // Re-mount the kernel-side schedule_wakeup tool on the FRESH parts (a respawn
+        // rebuilds `parts` from scratch, so the tool registered in `run` is gone). Hand
+        // it the bridge's stored sender so the new agent's wakeups still reach THIS
+        // bridge. Must precede assemble (it snapshots the toolset). `/loop` therefore
+        // survives /cd, /resume, /clear, /model and /mcp reload.
+        parts.register_extra_tool(Arc::new(crate::schedule_wakeup::ScheduleWakeupTool::new(
+            self.wakeup_tx.clone(),
+        )));
 
         match build_provider(&self.coding_cfg)
             .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
@@ -1149,6 +1489,13 @@ impl Bridge {
                 if want_fresh {
                     self.ai_name_attempted = false;
                 }
+                // A respawn (/cd, /clear, /resume, /undo, /mcp reload) resets or replaces
+                // the conversation, so a held-open loop turn no longer applies. Cancel any
+                // pending continuation and drop the loop so a stale wakeup can't fire into
+                // the new conversation.
+                self.loop_cancel.cancel();
+                self.loop_state = None;
+                self.pending_wakeup = None;
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -1159,6 +1506,12 @@ impl Bridge {
                 // recv() never returns None and kills the process.
                 self.handle = Self::noop_handle();
                 self.degraded = true;
+                // Stop any active loop too (parity with the Ok branch): a respawn
+                // failure must not leave a pending continuation firing into a dead
+                // handle with the footer still showing the loop active.
+                self.loop_cancel.cancel();
+                self.loop_state = None;
+                self.pending_wakeup = None;
             }
         }
     }
@@ -1242,6 +1595,16 @@ impl Bridge {
         // may still be marked running.
         self.turn_running = false;
         self.pending_finish = None;
+        // A schedule_wakeup is strictly turn-scoped: the loop-continuation branch (in the
+        // Snapshot hook) `take()`s it and `return`s WITHOUT reaching here, so any wakeup
+        // still set when we finish belongs to a turn that is NOT continuing the loop (a
+        // non-natural terminal — MaxRounds/error — or the loop already ended). Drop it so
+        // it can't bleed into a later turn.
+        self.pending_wakeup = None;
+        // Drain extra queued wakeups: a turn that called schedule_wakeup more than once
+        // leaves N-1 requests in the channel; without this they'd surface in a LATER
+        // turn's select and be mistaken for that turn's schedule (ghost loop).
+        while self.wakeup_rx.try_recv().is_ok() {}
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
@@ -1295,8 +1658,9 @@ impl Bridge {
                         if should_attempt(feature_on, self.ai_name_attempted, true) {
                             self.ai_name_attempted = true;
                         let ev_tx = self.ev_tx.clone();
+                        let naming_session = self.bridge_session.clone();
                         tokio::spawn(async move {
-                            let Some(provider) = build_naming_provider() else {
+                            let Some(provider) = build_naming_provider(&naming_session) else {
                                 return;
                             };
                             let prompt = atomcode_core::agent::session_title::session_title_prompt(
@@ -1584,6 +1948,54 @@ impl Bridge {
                             }
                         }
                     }
+                    // Loop hook (goal/loop are mutually exclusive — only one of these
+                    // fires). A natural stop with an active /loop continues IF the model
+                    // scheduled the next wakeup this turn, ELSE the loop ends (CC parity:
+                    // omitting schedule_wakeup means "done").
+                    if matches!(reason, StopReason::Stopped)
+                        && self.loop_state.as_ref().map_or(false, |l| l.active)
+                    {
+                        match self.pending_wakeup.take() {
+                            Some(wake) => {
+                                // Model asked to resume → spawn a cancel-aware delay that
+                                // fires the continuation via `loop_fire_tx`. Spawned (NOT
+                                // awaited inline) so the select loop stays responsive to
+                                // commands during the wait — the same discipline as
+                                // `spawn_goal_eval`. ClearLoop/Cancel cancel `loop_cancel`,
+                                // which pre-empts the sleep so the continuation never fires.
+                                let delay = Duration::from_secs(wake.delay_seconds as u64);
+                                let cancel = self.loop_cancel.clone();
+                                let fire_tx = self.loop_fire_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(delay) => {
+                                            let _ = fire_tx.send(wake);
+                                        }
+                                        _ = cancel.cancelled() => {} // loop stopped → no fire
+                                    }
+                                });
+                                // Hold the turn open (like goal) — do NOT finish_turn: the
+                                // driver stays "busy" until the continuation turn ends or
+                                // the loop is cleared. Record the snapshot so the stop paths
+                                // (ClearLoop / Cancel / round-limit) can finish_turn and
+                                // return the UI to Idle — otherwise stopping a sleeping loop
+                                // strands the driver in Streaming forever.
+                                self.loop_pending_finish = Some(messages);
+                                return;
+                            }
+                            None => {
+                                // No schedule → the loop is complete. Deactivate + emit,
+                                // then fall through to finish_turn so the driver returns
+                                // to Idle with the conversation snapshot.
+                                if let Some(mut l) = self.loop_state.take() {
+                                    l.active = false;
+                                    l.last_reason = Some("completed".into());
+                                    let ev = loop_update_ev(&l);
+                                    self.emit(ev);
+                                }
+                            }
+                        }
+                    }
                     self.finish_turn(reason, messages);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
@@ -1734,9 +2146,26 @@ fn goal_turn_disposition(
     }
 }
 
+/// Build the legacy `LoopUpdate` event from /loop state (free fn so callers don't
+/// borrow `self.loop_state` and `self` simultaneously). The parallel of
+/// [`goal_update_ev`] for the self-paced loop; the TUI mirrors round/elapsed/label.
+fn loop_update_ev(l: &LoopState) -> CoreEv {
+    CoreEv::LoopUpdate {
+        active: l.active,
+        round: l.round,
+        elapsed_secs: l.elapsed_secs(),
+        label: l.label.clone(),
+        last_reason: l.last_reason.clone(),
+    }
+}
+
 /// Build the goal evaluator provider from config. Prefers the configured
 /// `evaluator_provider`; on ANY failure falls back to the default provider so
 /// `/goal` always arms when `/chat` works. Only a totally unloadable config disarms.
+// NOTE: the session id is NOT bound here. `goal_provider` is cached and reused
+// across turns and survives respawn (/resume, /cd, /model, /clear reassign
+// `bridge_session`), so binding at build time would go stale. It is refreshed to
+// the current conversation in `spawn_goal_eval`, right before each evaluation.
 fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
@@ -1759,11 +2188,20 @@ fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>
 /// Build a core provider for the one-off session-title call. Mirrors
 /// `build_goal_provider`: loads config, uses the default provider. Returns
 /// `None` (⇒ naming skipped) if config/provider is unavailable.
-fn build_naming_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
+fn build_naming_provider(
+    session_id: &str,
+) -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
         atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
     let pcfg = config.providers.get(&config.default_provider)?;
     let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
+    // Ride the conversation's `x-atomcode-session-id` so this background
+    // title-generation call — the second litellm request of the first turn —
+    // is pinned to the same upstream account/replica as the main turn instead
+    // of arriving session-less. Empty ⇒ header omitted (unchanged behavior).
+    if !session_id.is_empty() {
+        provider.set_session_id(session_id);
+    }
     Some(Arc::from(provider))
 }
 
@@ -1780,60 +2218,40 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Run a `!cmd` local shell in `cwd` (300s cap). Returns
-/// `(display_output, context_block, success)`: the display goes to the driver as the
-/// tool result; the `<bash-*>` context block is injected ahead of the next user
-/// message (clamped so `!cat bigfile` can't blow up the conversation).
-async fn run_local_shell(cmd: &str, cwd: &std::path::Path) -> (String, String, bool) {
-    use tokio::process::Command;
-    let mut c = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
+/// Format a completed `!cmd` [`ShellOutcome`] into `(display, context, success)`:
+/// the display goes to the driver as the tool-result row; the `<bash-*>` context
+/// block is injected ahead of the next user message (clamped so `!cat bigfile`
+/// can't blow up the conversation). PURE — execution + live streaming happen in
+/// the `LocalShell` handler via `atomcode_core::tool::bash::run_shell`.
+fn format_local_shell(
+    cmd: &str,
+    outcome: &atomcode_core::tool::bash::ShellOutcome,
+) -> (String, String, bool) {
+    use atomcode_core::tool::bash::ShellExit;
+    let stdout = outcome.stdout.trim();
+    let stderr = outcome.stderr.trim();
+    let (success, code) = match outcome.exit {
+        ShellExit::Exited { success, code } => (success, code),
+        ShellExit::KilledIdle | ShellExit::KilledTimeout => (false, None),
     };
-    c.current_dir(cwd);
-
-    let out = match tokio::time::timeout(Duration::from_secs(300), c.output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            let m = format!("failed to run: {e}");
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>{}</bash-stderr>",
-                xml_escape(cmd),
-                xml_escape(&m)
-            );
-            return (m, ctx, false);
-        }
-        Err(_) => {
-            let ctx = format!(
-                "<bash-input>{}</bash-input>\n<bash-stderr>command timed out</bash-stderr>",
-                xml_escape(cmd)
-            );
-            return ("command timed out (300s)".into(), ctx, false);
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let code = out.status.code();
-    let success = out.status.success();
 
     // Driver display: full-ish, readable.
     let mut display = String::new();
     if !stdout.is_empty() {
-        display.push_str(&stdout);
+        display.push_str(stdout);
     }
     if !stderr.is_empty() {
         if !display.is_empty() {
             display.push('\n');
         }
-        display.push_str(&stderr);
+        display.push_str(stderr);
     }
-    if !success {
+    if matches!(outcome.exit, ShellExit::KilledTimeout) {
+        if !display.is_empty() {
+            display.push('\n');
+        }
+        display.push_str("[command timed out (300s)]");
+    } else if !success {
         if !display.is_empty() {
             display.push('\n');
         }
@@ -1854,15 +2272,20 @@ async fn run_local_shell(cmd: &str, cwd: &std::path::Path) -> (String, String, b
     };
     let mut ctx = format!("<bash-input>{}</bash-input>", xml_escape(cmd));
     if !stdout.is_empty() {
-        ctx.push_str(&format!("\n<bash-stdout>{}</bash-stdout>", clamp(&stdout)));
+        ctx.push_str(&format!("\n<bash-stdout>{}</bash-stdout>", clamp(stdout)));
     }
     if !stderr.is_empty() {
-        ctx.push_str(&format!("\n<bash-stderr>{}</bash-stderr>", clamp(&stderr)));
+        ctx.push_str(&format!("\n<bash-stderr>{}</bash-stderr>", clamp(stderr)));
     }
-    if let Some(c) = code {
-        if c != 0 {
+    match outcome.exit {
+        ShellExit::Exited { code: Some(c), .. } if c != 0 => {
             ctx.push_str(&format!("\n<bash-exit-code>{c}</bash-exit-code>"));
         }
+        ShellExit::KilledIdle => ctx.push_str("\n<bash-stderr>process killed (stuck)</bash-stderr>"),
+        ShellExit::KilledTimeout => {
+            ctx.push_str("\n<bash-stderr>command timed out (300s)</bash-stderr>")
+        }
+        _ => {}
     }
     (display, ctx, success)
 }
@@ -2043,18 +2466,78 @@ fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
 }
 
+/// Build the user-facing message for an engine-init (`prepare` / `assemble`)
+/// `io::Error`. A bare `Permission denied (os error 13)` gives the user nothing
+/// to act on; on Unix the near-universal cause is a `~/.atomcode` tree left
+/// root-owned by a prior `sudo atomcode` run — root creates config/session files
+/// the non-root user then can't read, so every later non-sudo start fails at the
+/// first disk touch (the session-snapshot load in `assemble`). Append the fix.
+///
+/// Unix-only: the `sudo`/`chown` remedy is meaningless on Windows (no `sudo`, no
+/// root-ownership trap), so there — and for any non-permission error — the
+/// message passes through unchanged. `\n\n` separators so the hint renders as its
+/// own paragraph both in the TUI and the webui (whose Markdown collapses single
+/// newlines to spaces).
+fn engine_init_error_message(stage: &str, e: &std::io::Error) -> String {
+    let base = format!("engine v2 {stage} failed: {e}");
+    if cfg!(unix) && e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{base}\n\n~/.atomcode is not accessible — this usually means a prior `sudo atomcode` \
+             left it root-owned. Fix: run `sudo chown -R \"$(id -un):$(id -gn)\" ~/.atomcode`, \
+             then start WITHOUT sudo.\n\n（~/.atomcode 无权访问，通常是之前用过 sudo atomcode 导致属主变 \
+             root。修复：sudo chown -R \"$(id -un):$(id -gn)\" ~/.atomcode，然后不要再用 sudo 启动。）"
+        )
+    } else {
+        base
+    }
+}
+
+/// A source (open-source) build cannot authenticate to the AtomGit gateway: the
+/// request-signer crate is a placeholder overlaid only by the official-release
+/// build pipeline. Carried as a typed error so `provider_init_event_for` can
+/// downcast it and surface a calm source-build advisory rather than a red
+/// "模型初始化失败" — no login/config change on THIS build fixes it. Display
+/// keeps the detailed gateway message for any plain error-string consumer.
+#[derive(Debug)]
+struct SourceBuildGatewayUnsupported {
+    base_url: String,
+}
+
+impl std::fmt::Display for SourceBuildGatewayUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+                base_url: &self.base_url,
+            })
+        )
+    }
+}
+
+impl std::error::Error for SourceBuildGatewayUnsupported {}
+
 /// Decide how a `build_provider` failure should surface, given whether the user
 /// is logged in. Pure over `logged_in` so the branch is unit-testable without
 /// touching `auth.toml`; the wrapper [`provider_init_event`] supplies the real
 /// login state.
 ///
-/// Not-logged-in is the EXPECTED state right after `/logout` (and on a fresh
-/// launch before `/login`): the gateway signer simply has no token, so the red
-/// "模型初始化失败 / provider init failed" line is noise that looks like a crash.
-/// Surface a calm, localized "run /login" advisory (yellow `Warning`) instead.
-/// A genuine init failure WHILE logged in stays a red `Error`. Keying on
-/// `is_logged_in()` rather than string-matching the signer error keeps this robust.
+/// Three cases, calmest-first:
+///   * Source build hitting the AtomGit gateway → a build limitation, not a
+///     crash and unfixable by /login. Calm yellow advisory pointing at
+///     `/provider` (own api_key) or the official build.
+///   * Not-logged-in (EXPECTED right after `/logout` / before `/login`): the
+///     signer has no token yet → calm "run /login" advisory. The red
+///     "模型初始化失败" line here is noise that looks like a crash.
+///   * A genuine init failure WHILE logged in → stays a red `Error`.
+/// Keying on a typed error / `is_logged_in()` rather than string-matching keeps
+/// this robust across i18n.
 fn provider_init_event_for(logged_in: bool, e: &anyhow::Error) -> CoreEv {
+    if e.downcast_ref::<SourceBuildGatewayUnsupported>().is_some() {
+        return CoreEv::Warning(
+            atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitSourceBuild).into_owned(),
+        );
+    }
     if logged_in {
         CoreEv::Error {
             error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
@@ -2127,6 +2610,13 @@ fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Text-only models must NOT receive image content. The live path VL-preprocesses
+            // a FRESH image into text (see `maybe_preprocess` above), but a RESUMED
+            // conversation's historical image message would still serialize as multimodal and
+            // 400 the whole request every turn (`glm-5.2 is not a multimodal model`). Gate it
+            // with the SAME detector `maybe_preprocess` uses so the two stay consistent.
+            pc.supports_vision =
+                atomcode_core::provider::model_name_suggests_vision(&cfg.model);
             // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
             // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
             pc.max_tokens = Some(default_max_tokens(cfg.context_window));
@@ -2145,12 +2635,14 @@ fn build_provider(
             // feature). Open-source builds have none → fail fast with an actionable message.
             if crypto::is_atomgit_gateway(&cfg.base_url) {
                 if !crypto::signer_available() {
-                    anyhow::bail!(
-                        "{}",
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
-                            base_url: &cfg.base_url,
-                        })
-                    );
+                    // Typed error (not a bare string) so `provider_init_event_for`
+                    // can downcast and surface a CALM source-build advisory instead
+                    // of a red "模型初始化失败" — no /login can fix a placeholder
+                    // signer, so a crash-looking red line is misleading.
+                    return Err(SourceBuildGatewayUnsupported {
+                        base_url: cfg.base_url.clone(),
+                    }
+                    .into());
                 }
                 pc.request_signer = Some(crate::sign::atomgit_signer(&cfg.base_url)?);
             }
@@ -2159,6 +2651,113 @@ fn build_provider(
                 OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?,
             ))
         }
+    }
+}
+
+/// Build a distinct signed provider for a `task`-tool tier whose model differs from
+/// the host model. Returns `None` when the tier's model equals the host (⇒ reuse the
+/// host provider slot) or when construction fails (⇒ graceful collapse to host).
+/// The derived config clears its own injected-provider fields so a tier agent never
+/// recurses. NOTE: the returned provider is RAW (unmetered) — telemetry attribution
+/// for the non-host tier is a known follow-up polish item.
+/// Derive a `CodingAgentConfig` for a `task` tier from a `ProviderConfig`. CHEAP: clone +
+/// field overrides only — NO provider/client construction. The heavy `build_provider`
+/// (fresh reqwest client, slow OS cert load) happens lazily in [`tier_builder`]'s thunk.
+fn derive_tier_cfg(
+    base: &CodingAgentConfig,
+    pc: &atomcode_core::config::provider::ProviderConfig,
+) -> CodingAgentConfig {
+    let mut tier_cfg = base.clone();
+    tier_cfg.model = pc.model.clone();
+    if let Some(bu) = pc.base_url.clone() {
+        tier_cfg.base_url = bu;
+    }
+    if let Some(ak) = pc.api_key.clone() {
+        tier_cfg.api_key = ak;
+    }
+    tier_cfg.provider_type = pc.provider_type.clone();
+    tier_cfg.context_window = pc.context_window as u32;
+    // Use the tier's own per-call output cap, not the host's inherited one (#4). `None`
+    // lets `build_provider` derive a cap from the tier's context_window.
+    tier_cfg.chat_options.max_tokens = pc.max_tokens.map(|n| n as u32);
+    tier_cfg.thinking_type = pc.thinking_type.clone();
+    tier_cfg.thinking_keep = pc.thinking_keep.clone();
+    tier_cfg.reasoning_history = pc.reasoning_history.clone();
+    tier_cfg.thinking_enabled = pc.thinking_enabled;
+    tier_cfg.skip_tls_verify = pc.skip_tls_verify;
+    // Never let a tier agent carry its own injected providers (no recursion).
+    tier_cfg.subagent_fast_provider = None;
+    tier_cfg.subagent_capable_provider = None;
+    tier_cfg
+}
+
+/// Build a LAZY tier-provider thunk for a `task` tier whose model differs from the host.
+/// Returns `None` when the tier's model equals the host (⇒ reuse the host provider slot).
+/// The returned thunk runs `build_provider` ON FIRST `task` USE — deferring the reqwest
+/// client construction (slow OS cert-store load, esp. macOS) off the startup path, matching
+/// how goal/naming/vision providers are built on demand. A build failure inside the thunk
+/// yields `None` ⇒ graceful collapse to the host provider.
+fn tier_builder(
+    base: &CodingAgentConfig,
+    host_model: &str,
+    pc: &atomcode_core::config::provider::ProviderConfig,
+) -> Option<atomcode_coding::SubagentProvider> {
+    if pc.model == host_model {
+        return None; // tier == host → reuse host slot
+    }
+    let tier_cfg = derive_tier_cfg(base, pc);
+    Some(std::sync::Arc::new(move || build_provider(&tier_cfg).ok()))
+}
+
+/// Resolve the two `task` tier THUNKS from a loaded config against `host_model`. Each thunk
+/// builds its tier provider lazily on first call; a tier whose model equals the host yields a
+/// thunk that returns `None` (⇒ the TaskTool falls back to the host slot). Always returns a
+/// thunk for BOTH tiers so the cells exist and can be `reset()` on a `/model` swap.
+fn resolve_tier_thunks(
+    base: &CodingAgentConfig,
+    host_model: &str,
+    full_cfg: &atomcode_core::config::Config,
+) -> (atomcode_coding::SubagentProvider, atomcode_coding::SubagentProvider) {
+    let none_thunk = || -> atomcode_coding::SubagentProvider { std::sync::Arc::new(|| None) };
+    // `None` ⇒ no routing (self-config host / <2 participants) ⇒ both tiers fall back to the
+    // host provider slot (a null thunk makes the TaskTool factory use the host slot).
+    let Some((fast_key, cap_key)) =
+        atomcode_coding::subagent_tiers::resolve_tier_keys(full_cfg, host_model)
+    else {
+        return (none_thunk(), none_thunk());
+    };
+    let thunk_for = |key: &str| -> atomcode_coding::SubagentProvider {
+        full_cfg
+            .providers
+            .get(key)
+            .and_then(|pc| tier_builder(base, host_model, pc))
+            .unwrap_or_else(none_thunk)
+    };
+    (thunk_for(&fast_key), thunk_for(&cap_key))
+}
+
+/// Re-resolve the `task` tier cells against the CURRENT host model and `reset()` them in
+/// place (new thunk + dropped cache), so a mid-session `/model` swap updates strong/weak
+/// routing without re-running `prepare`. No-op when the feature is off (cells are `None`).
+/// The cells are shared `Arc`s, so the already-built TaskTool picks up the change on its
+/// next dispatch.
+fn refresh_subagent_tiers(coding_cfg: &CodingAgentConfig) {
+    if coding_cfg.subagent_fast_provider.is_none() && coding_cfg.subagent_capable_provider.is_none()
+    {
+        return;
+    }
+    let Ok(full_cfg) =
+        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+    else {
+        return; // keep the existing tiers if config can't be read
+    };
+    let host_model = coding_cfg.model.clone();
+    let (fast_thunk, cap_thunk) = resolve_tier_thunks(coding_cfg, &host_model, &full_cfg);
+    if let Some(cell) = &coding_cfg.subagent_fast_provider {
+        cell.reset(fast_thunk);
+    }
+    if let Some(cell) = &coding_cfg.subagent_capable_provider {
+        cell.reset(cap_thunk);
     }
 }
 
@@ -2189,6 +2788,7 @@ pub fn build_provider_for_acp(
     coding_cfg.thinking_keep = cfg.thinking_keep.clone();
     coding_cfg.user_agent = cfg.user_agent.clone();
     coding_cfg.skip_tls_verify = cfg.skip_tls_verify;
+    coding_cfg.loop_max_rounds = cfg.loop_max_rounds;
     build_provider(&coding_cfg)
 }
 
@@ -2290,7 +2890,25 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod provider_init_event_tests {
-    use super::{provider_init_event_for, CoreEv};
+    use super::{provider_init_event_for, CoreEv, SourceBuildGatewayUnsupported};
+
+    #[test]
+    fn source_build_gateway_is_calm_warning_even_when_logged_in() {
+        // A source build can never auth to the AtomGit gateway (placeholder
+        // signer) — no /login fixes it. Must be a CALM Warning pointing at
+        // /provider or the official build, NOT the red "模型初始化失败", even
+        // when logged_in (the case the user hit).
+        let e: anyhow::Error = SourceBuildGatewayUnsupported {
+            base_url: "https://llm-api.atomgit.com/v1".into(),
+        }
+        .into();
+        match provider_init_event_for(true, &e) {
+            CoreEv::Warning(msg) => {
+                assert!(msg.contains("/provider"), "must point at /provider: {msg}");
+            }
+            other => panic!("source-build gateway must be a calm Warning, got {other:?}"),
+        }
+    }
 
     #[test]
     fn not_logged_in_yields_calm_login_advisory_not_red_error() {
@@ -2492,6 +3110,31 @@ mod undo_tests {
     }
 
     #[test]
+    #[cfg(unix)] // the sudo/chown hint is Unix-only (gated by `cfg!(unix)`)
+    fn engine_init_message_augments_permission_denied() {
+        // A bare "Permission denied" is unactionable; the near-universal cause is a
+        // root-owned ~/.atomcode from a prior `sudo atomcode`, so surface the chown fix.
+        let e = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        let msg = super::engine_init_error_message("assemble", &e);
+        assert!(msg.contains("engine v2 assemble failed"), "keeps the base line: {msg}");
+        assert!(msg.contains("~/.atomcode"), "names the offending dir: {msg}");
+        assert!(msg.contains("chown -R"), "includes the actionable fix: {msg}");
+        assert!(msg.contains("sudo"), "names the sudo cause: {msg}");
+    }
+
+    #[test]
+    fn engine_init_message_passthrough_non_permission() {
+        // Non-permission errors must NOT gain the sudo/chown hint.
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let msg = super::engine_init_error_message("prepare", &e);
+        assert_eq!(msg, "engine v2 prepare failed: not found");
+        assert!(!msg.contains("chown"), "no hint for non-permission errors: {msg}");
+    }
+
+    #[test]
     fn reload_provider_refreshes_context_window_and_provider_knobs() {
         let mut cfg = CodingAgentConfig::new("old-key", "https://old.example.com/v1", "old-model", "/tmp");
         cfg.context_window = 16_000;
@@ -2518,6 +3161,7 @@ mod undo_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         };
 
         apply_reload_provider(&mut cfg, &provider);
@@ -2585,19 +3229,38 @@ mod undo_tests {
     }
 
     #[tokio::test]
-    async fn local_shell_runs_and_formats_output() {
-        let (display, ctx, success) =
-            super::run_local_shell("echo hello", std::path::Path::new(".")).await;
+    async fn local_shell_runs_streams_and_formats_output() {
+        // End-to-end: the `!cmd` executor now streams via core `run_shell` (v1 parity)
+        // — the chunk_cb must fire (live output) AND format_local_shell wrap the result.
+        let chunks = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = atomcode_core::tool::bash::run_shell(
+            "echo hello",
+            std::path::Path::new("."),
+            300,
+            |c| chunks.lock().unwrap().push(c.to_string()),
+        )
+        .await;
+        let (display, ctx, success) = super::format_local_shell("echo hello", &outcome);
         assert!(success);
         assert!(display.contains("hello"));
         assert!(ctx.contains("<bash-input>echo hello</bash-input>"));
         assert!(ctx.contains("<bash-stdout>hello</bash-stdout>"));
+        assert!(
+            chunks.lock().unwrap().iter().any(|c| c.contains("hello")),
+            "output must stream via the chunk callback (live display)"
+        );
     }
 
     #[tokio::test]
     async fn local_shell_failure_carries_exit_code() {
-        let (_d, ctx, success) =
-            super::run_local_shell("exit 3", std::path::Path::new(".")).await;
+        let outcome = atomcode_core::tool::bash::run_shell(
+            "exit 3",
+            std::path::Path::new("."),
+            300,
+            |_| {},
+        )
+        .await;
+        let (_d, ctx, success) = super::format_local_shell("exit 3", &outcome);
         assert!(!success);
         assert!(ctx.contains("<bash-exit-code>3</bash-exit-code>"), "ctx={ctx}");
     }
@@ -2632,6 +3295,68 @@ mod undo_tests {
     #[test]
     fn xml_escape_neutralizes_tag_forgery() {
         assert_eq!(super::xml_escape("a</bash-stdout>b"), "a&lt;/bash-stdout&gt;b");
+    }
+
+    #[test]
+    fn format_local_shell_success_shows_stdout_and_wraps_context() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: "file1\nfile2\n".into(),
+            stderr: String::new(),
+            exit: ShellExit::Exited { success: true, code: Some(0) },
+            elapsed_secs: 0.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("ls", &outcome);
+        assert!(success);
+        assert_eq!(display, "file1\nfile2"); // trimmed, full (streaming shows it live)
+        assert!(ctx.contains("<bash-input>ls</bash-input>"));
+        assert!(ctx.contains("<bash-stdout>file1\nfile2</bash-stdout>"));
+        assert!(!ctx.contains("<bash-exit-code>"), "code 0 => no exit-code tag");
+    }
+
+    #[test]
+    fn format_local_shell_failure_shows_exit_code_and_stderr() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: String::new(),
+            stderr: "boom".into(),
+            exit: ShellExit::Exited { success: false, code: Some(2) },
+            elapsed_secs: 0.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("false", &outcome);
+        assert!(!success);
+        assert!(display.contains("boom") && display.contains("[exit 2]"));
+        assert!(ctx.contains("<bash-stderr>boom</bash-stderr>"));
+        assert!(ctx.contains("<bash-exit-code>2</bash-exit-code>"));
+    }
+
+    #[test]
+    fn format_local_shell_empty_output_falls_back() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit: ShellExit::Exited { success: true, code: Some(0) },
+            elapsed_secs: 0.0,
+        };
+        let (display, _ctx, success) = super::format_local_shell("true", &outcome);
+        assert!(success);
+        assert_eq!(display, "(no output)");
+    }
+
+    #[test]
+    fn format_local_shell_timeout_is_marked_failed() {
+        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        let outcome = ShellOutcome {
+            stdout: "partial".into(),
+            stderr: String::new(),
+            exit: ShellExit::KilledTimeout,
+            elapsed_secs: 300.0,
+        };
+        let (display, ctx, success) = super::format_local_shell("sleep 999", &outcome);
+        assert!(!success);
+        assert!(display.contains("[command timed out (300s)]"));
+        assert!(ctx.contains("command timed out (300s)"));
     }
 
     #[test]
@@ -2701,6 +3426,63 @@ mod undo_tests {
         let bridge_flag = true; // stands in for BridgeConfig.keep_interrupted_context
         coding.keep_interrupted_context = bridge_flag;
         assert!(coding.keep_interrupted_context, "flag must propagate to CodingAgentConfig");
+    }
+
+    // Helper: build a minimal ProviderConfig for tier-provider tests.
+    fn tier_pc(model: &str, base_url: &str) -> atomcode_core::config::provider::ProviderConfig {
+        atomcode_core::config::provider::ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-x".into()),
+            model: model.into(),
+            base_url: Some(base_url.into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        }
+    }
+
+    #[test]
+    fn tier_builder_none_when_model_equals_host() {
+        // Short-circuit: tier model == host model ⇒ reuse host slot, no builder.
+        let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("glm-5.2", "https://api.example.com/v1");
+        assert!(
+            super::tier_builder(&base, "glm-5.2", &pc).is_none(),
+            "same model as host must yield no builder (reuse host slot)"
+        );
+    }
+
+    #[test]
+    fn tier_builder_some_and_lazy_build_succeeds_when_model_differs() {
+        // Different model + non-gateway base_url ⇒ a builder is returned, and invoking it
+        // (the deferred build) yields a provider. This proves the lazy path constructs.
+        let base = CodingAgentConfig::new("sk-x", "https://api.example.com/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("deepseek-v4-flash", "https://api.example.com/v1");
+        let builder = super::tier_builder(&base, "glm-5.2", &pc)
+            .expect("distinct model must yield a builder");
+        assert!(builder().is_some(), "lazy build must construct the tier provider");
+    }
+
+    #[test]
+    fn derive_tier_cfg_overrides_model_and_clears_injected() {
+        // The derived config carries the tier's model and no injected providers (no recursion).
+        let base = CodingAgentConfig::new("sk-x", "https://host/v1", "glm-5.2", "/tmp");
+        let pc = tier_pc("deepseek-v4-flash", "https://api.example.com/v1");
+        let derived = super::derive_tier_cfg(&base, &pc);
+        assert_eq!(derived.model, "deepseek-v4-flash");
+        assert_eq!(derived.base_url, "https://api.example.com/v1");
+        assert!(derived.subagent_fast_provider.is_none());
+        assert!(derived.subagent_capable_provider.is_none());
     }
 }
 

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.26.0-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -92,7 +92,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
 | DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
-| 智谱（GLM） | 支持 | GLM-4、GLM-5 |
+| 智谱（GLM） | 支持 | GLM-4、GLM-5、GLM-5.2（AtomCode Pro 套餐专属模型） |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
 | Ollama（本地） | 部分支持 | Llama 3、Qwen2 等 |
@@ -129,7 +129,6 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **`/app`**（TUI 内）开启移动端远程访问，终端打印二维码，用手机 GitCode App 扫码即可在任意网络下连入当前对话
 - **任意网络可达** —— 电脑通过反向 WSS 隧道连接到公网中继，手机经中继访问电脑，不需要公网 IP、DDNS 或路由器端口映射
 - **双向实时同步** —— 任一端发消息，另一端实时显示（AI 流式回复、工具调用卡片、token 用量）
-- **工具审批** —— 电脑执行到需要授权的工具时，手机弹出审批卡片，可直接点允许/拒绝
 - **远程命令** —— 手机端支持 `/status`、`/cost`、`/diff`、`/whoami` 等斜杠命令，在桌面端执行并回显
 - **切项目 / 切会话** —— 手机端切换项目或点开历史对话，桌面端跟随切换
 - **模型双向同步** —— 任一端切换模型，另一端同步跟随
@@ -189,6 +188,28 @@ brew install --cask atomcode
 
 - Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
+
+### 权限 —— 不要用 `sudo` 启动
+
+请用**普通用户**运行 AtomCode，切勿 `sudo`。AtomCode 把配置、会话、日志都放在
+`~/.atomcode`；一旦用 root 跑过一次，就会在那里留下 root 属主的文件，之后非 root
+启动会在引擎初始化阶段报错：
+
+```
+engine v2 assemble failed: Permission denied (os error 13)
+```
+
+（提示里可能是 `prepare` 而非 `assemble`——同一个原因。）遇到这种情况，把属主收回
+并停止使用 `sudo`：
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # 不要再加 sudo
+```
+
+在 Linux 客户机上，工作目录若在 VirtualBox 共享文件夹（`/media/sf_*`，属主
+`root:vboxsf`）也会导致权限错误——用 `sudo usermod -aG vboxsf "$USER"` 把自己加进
+该组（重新登录后生效），而不是用 `sudo`。
 
 ### 卸载
 
@@ -367,7 +388,8 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/model` | 切换模型 / provider |
 | `/provider` | 管理 provider（添加 / 编辑 / 删除） |
-| `/login` | 通过 AtomGit OAuth 登录 |
+| `/proxy` | 切换出站代理模式 |
+| `/login` | 通过 AtomGit OAuth 登录并申领 CodingPlan 免费模型 |
 | `/logout` | 退出 AtomGit 登录 |
 | `/whoami` | 查看当前登录用户 |
 | `/status` | 查看登录状态和模型信息 |
@@ -380,6 +402,7 @@ atomcode --prompt-file task.md
 | `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
 | `/view <文件路径>` | 在浮层窗口中查看文件内容 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/copy` | 从上一条回复复制代码块（`/copy`、`/copy N`、`/copy all`） |
 | `/cost` | 显示本次会话的 token 消耗 |
 | `/context` | 查看上下文预算占用明细 |
 | `/compact` | 压缩对话历史 |

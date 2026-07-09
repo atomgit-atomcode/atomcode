@@ -193,7 +193,6 @@ class JBCefMessageView(
     fun hideStreamingCursor()                   { sendJs("hideStreamingCursor") }
     fun finishAssistantTurn()                   { sendJs("finishAssistantTurn") }
     fun clear()                                 { sendJs("clearMessages") }
-    fun render(model: ChatRenderModel)          { sendRawJs("renderChatModel(${gson.toJson(model)})") }
     fun showWelcomePage(language: String = defaultWelcomeLanguage(), loggedIn: Boolean = false) {
         sendRawJs("showWelcomePage(${gson.toJson(welcomeContent(language, loggedIn))})")
     }
@@ -507,7 +506,7 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 	function md(s){
 		var source=String(s||'');
 		if(typeof marked==='undefined'||typeof DOMPurify==='undefined')return h(source).replace(/\n/g,'<br>');
-		try{return DOMPurify.sanitize(marked.parse(source,{gfm:true,breaks:true,renderer:markdownRenderer()}),{USE_PROFILES:{html:true}})}
+		try{return DOMPurify.sanitize(marked.parse(prepareMarkdownForRender(source,false),{gfm:true,breaks:true,renderer:markdownRenderer()}),{USE_PROFILES:{html:true}})}
 		catch(e){return h(source).replace(/\n/g,'<br>')}
 	}
 	function codeBlockHtml(lang,text){
@@ -562,6 +561,12 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 			if(token&&typeof token==='object'){text=token.text||'';lang=token.lang||''}
 			else{text=String(token||'');lang=String(infostring||'')}
 			return codeBlockHtml(lang,text)
+		};
+		r.html=function(token){
+			var text='';
+			if(token&&typeof token==='object')text=token.raw||token.text||'';
+			else text=String(token||'');
+			return h(text)
 		};
 		return r
 	}
@@ -628,6 +633,117 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		while(j<raw.length&&raw.charAt(j)===state.ch)j++;
 		return j-i>=state.len&&raw.substring(j).trim()===''
 	}
+	function nextInlineCodeDelimiter(line,delimiter){
+		var i=0;
+		while(i<line.length){
+			if(line.charAt(i)!=='`'){i++;continue}
+			var j=i;
+			while(j<line.length&&line.charAt(j)==='`')j++;
+			var len=j-i;
+			if(delimiter===null){if(len<3)delimiter=len}
+			else if(len===delimiter)delimiter=null;
+			i=j
+		}
+		return delimiter
+	}
+	function protectInlineCodeFenceLines(source){
+		var lines=String(source||'').split('\n'),open=null,inlineDelimiter=null,out=[];
+		for(var i=0;i<lines.length;i++){
+			var line=lines[i],output=line,opening;
+			if(open){
+				if(fenceClose(line,open))open=null;
+				out.push(output);
+				continue
+			}
+			opening=fenceOpen(line);
+			if(inlineDelimiter===null&&opening){
+				open=opening;
+				out.push(output);
+				continue
+			}
+			if(inlineDelimiter!==null&&opening)output='\u200b'+line;
+			inlineDelimiter=nextInlineCodeDelimiter(line,inlineDelimiter);
+			out.push(output)
+		}
+		return out.join('\n')
+	}
+	function hasUnescapedPipe(line){
+		var escaped=false;
+		for(var i=0;i<line.length;i++){
+			var ch=line.charAt(i);
+			if(ch==='\\'){escaped=!escaped;continue}
+			if(ch==='|'&&!escaped)return true;
+			escaped=false
+		}
+		return false
+	}
+	function isTableDelimiterLine(line){
+		var cells=String(line||'').trim().replace(/^\|/,'').replace(/\|$/,'').split('|');
+		if(cells.length<2)return false;
+		return cells.every(function(cell){return /^\s*:?-+:?\s*$/.test(cell)})
+	}
+	var HTML_BLOCK_TAGS='address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
+	function htmlBlockOpen(line){
+		var trimmed=String(line||'').replace(/^\s+/,'');
+		if(!/^ {0,3}</.test(line))return null;
+		if(/^<(script|pre|style|textarea)(?=[\s>])/i.test(trimmed)){
+			var match=trimmed.match(/^<([A-Za-z][\w-]*)/i),tag=match?match[1]:'';
+			return {kind:'untilPattern',pattern:new RegExp('</'+tag+'\\s*>','i')}
+		}
+		if(/^<!--/.test(trimmed))return {kind:'untilPattern',pattern:/-->/};
+		if(/^<\?/.test(trimmed))return {kind:'untilPattern',pattern:/\?>/};
+		if(/^<![A-Z]/.test(trimmed))return {kind:'untilPattern',pattern:/>/};
+		if(/^<!\[CDATA\[/.test(trimmed))return {kind:'untilPattern',pattern:/\]\]>/};
+		if(new RegExp('^</?('+HTML_BLOCK_TAGS+')(?=\\s|>|/>)','i').test(trimmed))return {kind:'untilBlank'};
+		return null
+	}
+	function htmlBlockClose(line,state){
+		if(state.kind==='untilBlank')return String(line||'').trim()==='';
+		return state.pattern.test(line)
+	}
+	function isMarkdownBlockStart(line){
+		var trimmed=String(line||'').trim();
+		if(!trimmed)return true;
+		return /^#{1,6}\s/.test(trimmed)||/^>/.test(trimmed)||/^([-+*]|\d+[.)])\s/.test(trimmed)||/^(```|~~~)/.test(trimmed)||/^([-*_]\s*){3,}$/.test(trimmed)||/^<\/?[A-Za-z][\w-]*(\s|>|\/>)/.test(trimmed)
+	}
+	function separateTableFromFollowingParagraph(source){
+		var lines=String(source||'').split('\n'),out=[],inTable=false,open=null,html=null;
+		for(var i=0;i<lines.length;i++){
+			var line=lines[i],next=lines[i+1]||'',opening,openingHtml;
+			if(html){
+				out.push(line);
+				if(htmlBlockClose(line,html))html=null;
+				continue
+			}
+			if(open){
+				out.push(line);
+				if(fenceClose(line,open))open=null;
+				continue
+			}
+			opening=fenceOpen(line);
+			if(opening){
+				if(inTable){out.push('');inTable=false}
+				out.push(line);
+				open=opening;
+				continue
+			}
+			openingHtml=htmlBlockOpen(line);
+			if(openingHtml){
+				out.push(line);
+				html=htmlBlockClose(line,openingHtml)?null:openingHtml;
+				inTable=false;
+				continue
+			}
+			if(inTable&&line.trim()&&!hasUnescapedPipe(line)&&!isMarkdownBlockStart(line)){
+				out.push('');
+				inTable=false
+			}
+			out.push(line);
+			if(hasUnescapedPipe(line)&&isTableDelimiterLine(next))inTable=true;
+			else if(inTable&&(!line.trim()||isMarkdownBlockStart(line)))inTable=false
+		}
+		return out.join('\n')
+	}
 	function newStreamState(target){
 		return {target:target,raw:''}
 	}
@@ -649,8 +765,13 @@ function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 		if(!open)return source;
 		return source+(source.charAt(source.length-1)==='\n'?'':'\n')+new Array(open.len+1).join(open.ch)+'\n'
 	}
+	function prepareMarkdownForRender(source,streaming){
+		var tableSafe=separateTableFromFollowingParagraph(source);
+		var protectedSource=protectInlineCodeFenceLines(tableSafe);
+		return streaming?repairStreamingMarkdown(protectedSource):protectedSource
+	}
 	function renderStreamState(state,final){
-		var source=final?state.raw:repairStreamingMarkdown(state.raw);
+		var source=prepareMarkdownForRender(state.raw,!final);
 		state.target.innerHTML=md(source);
 		enhanceMarkdown(state.target)
 	}
@@ -737,7 +858,6 @@ function addQueuedMessage(t){clearHome();var d=document.createElement('div');d.c
 	function addReasoningBlock(t){var p=parts(),th=p.querySelector('.thp');if(th)th.remove();var d=document.createElement('div');d.className='rm reasoning-content';d.innerHTML=reasoningPreview(t);p.insertBefore(d,p.firstChild);sd()}
 	function updateReasoningBlock(t){var p=parts(),d=p.querySelector('.reasoning-content');if(!d){addReasoningBlock(t);return}d.innerHTML=reasoningPreview(t);sd()}
 	function removeReasoningBlock(){var a=currentAssistant();if(!a)return;var blocks=a.querySelectorAll('.reasoning-content');Array.prototype.forEach.call(blocks,function(x){x.remove()})}
-	function renderChatModel(model){clearMessages();(model.messages||[]).forEach(function(x){if(x.text!==undefined&&x.contextSummary!==undefined)addUserMessage(x.text,x.contextSummary||[]);else if(x.markdown!==undefined)addAssistantMessage(x.markdown);else if(x.toolName!==undefined)addSystemMessage('[Permission] '+x.toolName+': '+(x.reason||''));else if(x.name!==undefined&&x.callId!==undefined){var e=document.createElement('div');setTool(e,x.name,x.status||'',x.output||x.argumentsJson||'', '', false);parts().appendChild(e)}else if(x.text!==undefined)addSystemMessage(x.text)});sd()}
 	function showWelcomePage(c){clearMessages();var d=document.createElement('div');d.className='home';var quick=(c.quickStart||[]).map(function(x){return '<li>'+h(x)+'</li>'}).join('');var actions=(c.actions||[]).map(function(x){return '<div class="action-row"><strong>'+h(x.name)+'</strong><span>'+h(x.label)+'</span></div>'}).join('');var commands=(c.commands||[]).map(function(x){return '<div class="command-row"><button data-action="'+h(x.action)+'">'+h(x.command)+'</button><span>'+h(x.label)+'</span></div>'}).join('');var loginBtn=c.showLogin?'<button class="home-btn" data-action="login">'+h(c.login)+'</button>':'';d.innerHTML='<section class="home-hero"><div class="home-head"><div class="home-brand"><div class="home-title"><span class="home-mark">A</span><span>'+h(c.title)+'</span></div><div class="home-subtitle">'+h(c.subtitle)+'</div></div><span class="home-lang"><span class="home-lang-label">'+h(c.languageLabel)+'</span><button class="home-btn" data-lang="zh">中文</button><button class="home-btn" data-lang="en">English</button></span></div><div class="home-actions"><button class="home-btn primary" data-action="settings">'+h(c.settings)+'</button>'+loginBtn+'<button class="home-btn" data-action="docs">'+h(c.docs)+'</button></div></section><div class="home-grid"><section class="home-section"><h2>'+h(c.quickStartTitle)+'</h2><ul>'+quick+'</ul></section><section class="home-section"><h2>'+h(c.actionsTitle)+'</h2><div class="action-list">'+actions+'</div></section><section class="home-section"><h2>'+h(c.commandsTitle)+'</h2><div class="command-list">'+commands+'</div></section><section class="home-section"><h2>'+h(c.docsTitle)+'</h2><div class="home-doc"><p>'+h(c.docsText)+'</p><button class="home-btn" data-action="docs">'+h(c.docs)+'</button></div></section></div>';m.appendChild(d);Array.prototype.forEach.call(d.querySelectorAll('[data-action]'),function(btn){btn.onclick=function(){host(btn.getAttribute('data-action')||'')}});Array.prototype.forEach.call(d.querySelectorAll('[data-lang]'),function(btn){btn.onclick=function(){switchWelcomeLanguage(btn.getAttribute('data-lang')||'en')}});sd(true)}
 		function clearMessages(){m.innerHTML='';last=null;active=null;ti=-1;cv=false;nb=true;ss=null;useq=0}
 (function find(){for(var k in window){if(k.indexOf('JBCefQuery_')===0&&typeof window[k]==='function'){window[k]('js:ready');return}}setTimeout(find,50)})();

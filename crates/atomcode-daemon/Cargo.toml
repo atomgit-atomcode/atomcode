@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 # Engine v2: drive the new stack behind the legacy command/event protocol. The
 # daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
 atomcode-bridge = { path = "../atomcode-bridge" }
@@ -50,6 +51,11 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the
+# developer's real ~/.atomcode.
+atomcode-test-support = { path = "../atomcode-test-support" }
+ctor = "0.2"
 tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]

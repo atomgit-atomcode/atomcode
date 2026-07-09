@@ -67,7 +67,9 @@ impl SessionContextHook {
         };
         format!(
             "Working directory: {}\nPlatform: {}\nShell: {}",
-            self.working_dir.display(),
+            // Forward-slash on Windows so the model's cwd anchor is bash-safe
+            // (matches the bash tool's "use forward slashes" guidance).
+            crate::pathnorm::to_display(&self.working_dir),
             std::env::consts::OS,
             shell
         )

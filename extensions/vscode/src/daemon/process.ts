@@ -6,6 +6,7 @@ import * as os from 'os';
 import { DaemonClient } from './client';
 import { HealthResponse } from './types';
 import { DEFAULT_PORT } from '../config';
+import { normalizeDaemonEnvForUtf8Locale } from './env';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -204,6 +205,7 @@ export class DaemonProcess {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
+      env: normalizeDaemonEnvForUtf8Locale(process.env),
       ...(cwd ? { cwd } : {}),
     });
     this.process.unref();

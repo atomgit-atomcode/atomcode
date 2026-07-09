@@ -65,6 +65,12 @@ pub enum UiLine {
         id: String,
         name: String,
         detail: String,
+        /// Optional ephemeral hint rendered as part of the inflight strip
+        /// (e.g. the bash "Press Ctrl+o …" line). Kept INSIDE the strip so
+        /// the spinner tick / commit erase cover it atomically — emitting it
+        /// as a separate body row breaks the "inflight strip = body tail"
+        /// invariant and orphans the spinner glyph on commit.
+        hint: Option<String>,
     },
     /// Freeze the most recent `ToolCallInFlight` row to its final
     /// static `▸` icon. Emitted right before `ToolResult` so the
@@ -483,6 +489,13 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
+    /// Active todo list progress, rendered on a DEDICATED footer row above the
+    /// status line (like the goal/loop row) so multi-step progress — including
+    /// which task is running — is visible without the inline todowrite block
+    /// (which scrolls away). `None` ⇒ no todo list, row omitted (no noise for
+    /// conversations that never used todowrite). Carries raw fields; the
+    /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
+    pub todo: Option<TodoProgress>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -491,6 +504,24 @@ pub struct StatusLine {
     /// condition text — so users couldn't reliably see the goal while tool
     /// output scrolled. Its own row fixes that.
     pub goal: Option<GoalStatus>,
+    /// When a `/loop` is active, this carries its live status for the dedicated
+    /// footer loop row (its own full-width line, shown instead of the goal row
+    /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
+    pub loop_status: Option<LoopStatus>,
+}
+
+/// Progress of the active todo list, rendered on the dedicated footer todo row.
+/// The renderer width-truncates `current` to fit; the `completed`/`total` count
+/// always survives (see `todo_row_parts`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TodoProgress {
+    /// The description of the task currently `in_progress` (todowrite enforces
+    /// at most one). `None` when no task is in progress (all pending / all done).
+    pub current: Option<String>,
+    /// Number of tasks marked `completed`.
+    pub completed: usize,
+    /// Total number of tasks in the list.
+    pub total: usize,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated
@@ -504,6 +535,20 @@ pub struct GoalStatus {
     /// The caller adds 1 to the engine's 0-based internal round.
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
+    pub elapsed_secs: u64,
+}
+
+/// Live status of an active `/loop`, rendered on the dedicated footer loop row.
+/// Mirrors `GoalStatus` exactly: the renderer width-truncates `label` to fit,
+/// while `round` and elapsed always survive.
+#[derive(Debug, Clone)]
+pub struct LoopStatus {
+    /// The loop label text (truncated with `…` to fit the row width).
+    pub label: String,
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
+    pub round: u32,
+    /// Wall-clock seconds since the loop was started.
     pub elapsed_secs: u64,
 }
 

@@ -33,6 +33,10 @@ use std::sync::Arc;
 pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     let mut provider_cfg = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     provider_cfg.context_window = cfg.context_window;
+    // Text-only models must NOT receive image content — a resumed conversation whose
+    // history contains an image would otherwise 400 every turn. SAME canonical detector
+    // as the tool-mount / read_file vision gate above.
+    provider_cfg.supports_vision = model_name_suggests_vision(&cfg.model);
     let provider =
         OpenAiCompatProvider::new(provider_cfg).map_err(|e| format!("provider init failed: {}", e.message))?;
     Ok(build_coding_agent_with(&cfg, Arc::new(provider)))
@@ -43,10 +47,16 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// provider yourself; otherwise prefer [`build_coding_agent`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
+    // Single source of truth for the todo switch (`ATOMCODE_TODO` env overrides the
+    // default-on config). Used for BOTH the persona usage-guidance section AND the
+    // TodoHook below, so the system prompt never tells the model to use `todowrite`
+    // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
+    // itself is registered on the same env gate in `atomcode-capabilities`.
+    let todo_enabled = crate::persona::todo_switch_enabled();
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools(model_name_suggests_vision(&cfg.model)))
-        .persona(coding_persona(&cfg.model))
+        .persona(coding_persona(&cfg.model, todo_enabled))
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -77,6 +87,14 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     // answered (interactive). Kernel defaults to unbounded when unset, so None = park.
     if let Some(d) = cfg.request_timeout {
         builder = builder.request_timeout(d);
+    }
+    // Todo-list hook: injects the current todo list as a per-turn <system-reminder> so
+    // the model always sees progress even after compaction. Gated on ATOMCODE_TODO env
+    // (overrides config); cfg_value=true reflects the default-on config.ui.todo default.
+    // CodingAgentConfig doesn't carry ui.todo, so we use the config default (true) here;
+    // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
+    if todo_enabled {
+        builder = builder.hook(Arc::new(crate::todo::TodoHook));
     }
     builder.build()
 }

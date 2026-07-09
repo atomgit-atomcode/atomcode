@@ -1,16 +1,51 @@
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
+//
+// 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
+// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索反查定位
+// (search state + visibleMessages + navMatch + .msg-search-bar)、消息发送
+// 时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
+//
+// ─── bot review 已闭环项 (会话内搜索, PR #602) ───
+//   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
+//   backdrop-filter 前缀 → ad2f8da6; focus-visible 焦点环 → ad2f8da6;
+//   零匹配时隐藏按钮 → ad2f8da6; key={origIdx} → d4f4d3d4;
+//   死代码 backdrop-filter → d4f4d3d4; 导航抽公共函数 → d4f4d3d4;
+//   会话切换重置搜索 → 4dc06a01; Firefox 清除按钮 → 4dc06a01 (type="text");
+//   visibleMessages useMemo + border-radius 死代码.
+//
+// ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+// 每条 bot 审查意见均在代码层响应,对应 commit 与修法如下:
+//   • P2  pointer-events:none 阻断 title tooltip  → ac7d3810  删除该属性,仅留 user-select:none,见 app.css .msg-time 注释
+//   • P3  formatMsgTime 硬编码 "昨天"              → ac7d3810  改为接受 Translate 函数,走 i18n key time.yesterday/sameYear/otherYear
+//   • Low pad 在 formatMsgTime/formatMsgTimeFull 重复 → 603d68f1 提取为模块顶层 pad2
+//   • Low sameDay 在 formatMsgTime 体内重建闭包     → 603d68f1 提取为模块顶层函数
+//   • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//        → 23fb3db4 标注单位差异;统一为毫秒,见 lib.rs get_session_detail
+//   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
+// 我们愿意根据再审意见继续优化。
 
 import { VNode } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir } from '../api';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult } from '../api';
+import {
+  parseSlashCommand,
+  buildCommandMap,
+  dispatchSlashCommand,
+  buildSlashMenuItems,
+  FRONTEND_COMMANDS,
+  type SlashHandlers,
+} from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
+import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
+import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { useT } from '../settings';
+import type { MsgKey } from '../i18n';
 import {
   applyAtMentionSelection,
   detectAtMentionRange,
@@ -18,16 +53,64 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
   images?: ImageData[];
+  /** Epoch ms this message was sent/received (PR #562 send-time labels).
+   *  Live + freshly-typed turns stamp `Date.now()`; history loaded from the
+   *  daemon carries the session's `updated_at` (also ms). Optional so the
+   *  type stays backward-compatible with the few code paths that build a
+   *  Message literal without a clock (e.g. the queued-placeholder). */
+  ts?: number;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
 function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
+const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
+
+/** Whether two dates fall on the same calendar day (Y/M/D all equal). */
+function sameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/** PR #562: format a send-time label for a message bubble.
+ *  - Today → "HH:MM" (compact, the common case)
+ *  - Yesterday → i18n `time.yesterday` + "HH:MM"
+ *  - Same year → i18n `time.sameYear` ({m}月{d}日 {hm} / {m}/{d} {hm})
+ *  - Older / other year → i18n `time.otherYear` ({y}/{m}/{d} {hm})
+ *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
+ *  `t` is the i18n resolver (passed in from the component so this stays a
+ *  pure top-level helper). Local time, because a chat send time is a
+ *  wall-clock fact the user reads the same way they read a timestamp in
+ *  any messaging app. */
+function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
+  // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
+  // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
+  if (ts == null || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  if (sameDay(d, now)) return hm;
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) return t('time.sameYear', { m: d.getMonth() + 1, d: d.getDate(), hm });
+  return t('time.otherYear', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate(), hm });
+}
+
+/** Full local timestamp for the hover tooltip (seconds + full date). */
+function formatMsgTimeFull(ts?: number): string {
+  if (ts == null || !Number.isFinite(ts)) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 /** Format all parts of a message as readable text (including tool calls and their
@@ -319,14 +402,29 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
+  // without a stale closure (refs always reflect the latest render value).
+  const busyRef = useRef(false);
+  busyRef.current = busy;
+  // True for the entire duration of a /compact postCommand await so sendMessage
+  // can refuse to fire while the session .json is being rewritten on disk.
+  const compactingRef = useRef(false);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
-  const [queued, setQueued] = useState<{ id: number; text: string; images?: ImageData[] }[]>([]);
+  const [queued, setQueued] = useState<{
+    id: number;
+    text: string;
+    images?: ImageData[];
+    approvalMode: ApprovalMode;
+  }[]>([]);
   const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  // 审批模式（build / plan / bypass）。进程级 runtime 状态，由 /live snapshot +
+  // 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。confirmedMode 是 daemon 已确认值。
+  const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -335,6 +433,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
+  // The /skills command opens a pure skills browser (no commands). Set while that
+  // browser is showing; cleared as soon as the user types (normal mixed filtering).
+  const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
@@ -350,6 +451,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
+  // ONLY while the user is at the bottom; scrolling up releases the follow so history
+  // stays put. A ref (not state) avoids re-rendering on every scroll event.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const slashRef = useRef<HTMLDivElement>(null);
   const atRef = useRef<HTMLDivElement>(null);
@@ -380,6 +487,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       abortRef.current?.abort();
       setBusy(false);
       setMessages([]);
+      // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+      setSearch('');
+      setMatchIdx(0);
       setTokens(null);
       setHistoryHint(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
@@ -417,6 +527,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
         const loaded = sessionMessagesToDisplay(detail.messages);
         if (loaded.length > 0) {
+          // A newly loaded session starts at the bottom regardless of prior scroll state.
+          atBottomRef.current = true;
           setMessages(loaded);
           setHistoryHint(null);
         } else {
@@ -444,13 +556,42 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }).catch(() => {});
   }, []);
 
-  // Auto-scroll to bottom when messages change
+  // How close to the bottom (px) still counts as "at the bottom" — a small slack so
+  // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
+  const BOTTOM_SLACK = 80;
+  const recomputeAtBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+    atBottomRef.current = atBottom;
+    setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
+  };
+  const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+    atBottomRef.current = true;
+    setShowJumpBtn(false);
+    bottomRef.current?.scrollIntoView({ behavior });
+  };
+
+  // Follow streaming output ONLY while the user is at the bottom. Scrolling up
+  // releases the follow (recomputeAtBottom on the container's scroll event sets
+  // atBottomRef=false), so history stays put mid-stream. Instant behavior so the
+  // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages, tokens]);
 
   // Abort the live (/live) stream if the component unmounts while sync is on.
   useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getApprovalMode()
+      .then((current) => {
+        if (!cancelled) setModeState(initModeState(current));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // 斜杠菜单：点击外部关闭
   useEffect(() => {
@@ -574,10 +715,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const loaded: Message[] = [];
     for (const msg of msgs) {
       if (msg.role === 'user') {
+        if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
         loaded.push({
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
+          ts: msg.created_at,
         });
       } else if (msg.role === 'assistant') {
         // Text comes first (the LLM speaks, then calls tools), so the part
@@ -595,7 +738,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             },
           });
         }
-        loaded.push({ role: 'assistant', parts });
+        loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
         const result = msg.tool_result;
         outer: for (let i = loaded.length - 1; i >= 0; i--) {
@@ -636,11 +779,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
-      const loaded = sessionMessagesToDisplay(e.messages);
+      // bot review P2: live 快照路径后端 MessageInfo.created_at 固为 None
+      // (live_api.rs 的 From impl 未注入),与 /chat 历史加载路径不一致。
+      // 此处在前端注入 Date.now() 作为每条快照消息的 ts,让快照消息也显示时间标签,
+      // 与历史加载路径行为一致 (后者用 session.updated_at * 1000 近似)。
+      const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
+      // Live snapshot (session switch / reconnect) → start at the bottom.
+      atBottomRef.current = true;
       setMessages(loaded.length > 0 ? loaded : []);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) setProvider(e.provider);
+      // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Bypass/Plan）。
+      if (e.mode) setModeState(initModeState(e.mode));
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
@@ -654,6 +805,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 模型切换是进程级（全局），与正在查看哪个会话无关 → 不门控，始终更新下拉框。
     if (e.type === 'provider') {
       setProvider(e.provider);
+      return;
+    }
+    // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
+    if (e.type === 'mode') {
+      setModeState(initModeState(e.mode));
       return;
     }
     // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
@@ -689,6 +845,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (!alreadyViewing) {
         onSessionId(e.session_id);
         setMessages([]);
+        // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
+        setSearch('');
+        setMatchIdx(0);
         setTokens(null);
         setHistoryHint(null);
       }
@@ -712,10 +871,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     switch (e.type) {
       case 'user': {
         // Append the peer's user message + empty assistant placeholder
+        const now = Date.now();
         setMessages((prev) => [
           ...prev,
-          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined },
-          { role: 'assistant', parts: [] },
+          { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined, ts: now },
+          { role: 'assistant', parts: [], ts: now },
         ]);
         break;
       }
@@ -793,6 +953,208 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       return [...prev.slice(0, -1), { ...last, parts }];
     });
   }
+
+  // 命令输出以独立 system 消息追加进转录，与 assistant 消息分离。
+  // 若流式 assistant 回复正在进行（busy），把 notice 插到它之前，
+  // 确保 appendToLastAssistant 始终以真正的 assistant 气泡为最后一条。
+  function pushCommandNotice(text: string) {
+    setMessages((prev) => {
+      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
+      const last = prev[prev.length - 1];
+      // Keep an in-flight streaming assistant reply as the last element so
+      // appendToLastAssistant still targets IT, not this notice.
+      if (last && last.role === 'assistant' && busyRef.current) {
+        return [...prev.slice(0, -1), note, last];
+      }
+      return [...prev, note];
+    });
+  }
+
+  const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
+
+  // Reload one session's transcript from disk into the view, guarded against a
+  // session switch racing the async fetch. Mirrors the session-load effect's activeIdRef guard.
+  async function reloadSessionTranscript(id: string) {
+    const projectHash = activeSession?.project_hash;
+    if (!projectHash) return;
+    try {
+      const detail = await getSession(projectHash, id);
+      if (activeIdRef.current === id) {
+        setMessages(sessionMessagesToDisplay(detail.messages));
+      }
+    } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
+  }
+
+  // ── Shared mode / provider switch helpers ──────────────────────────────────
+  // Defined in render scope (not memoized) so they always close over the latest
+  // modeState / sync. Both call sites — ModeSelector.onChange / slashHandlers
+  // and ModelSelector.onChange / slashHandlers — call these directly.
+
+  /** Initiate a mode switch. onConfirmed is called with the server-confirmed
+   *  mode after the backend round-trip completes (used by slash commands to
+   *  emit a notice with the ACTUAL confirmed mode, not the requested one). */
+  function switchMode(m: ApprovalMode, onConfirmed?: (confirmed: ApprovalMode) => void) {
+    if (modeState.pendingMode) return;
+    const nextState = beginModeSwitch(modeState, m);
+    if (nextState === modeState) return;
+    setModeState(nextState);
+    void postLiveMode(m)
+      .then((confirmed) => {
+        setModeState((cur) => completeModeSwitch(cur, confirmed));
+        onConfirmed?.(confirmed);
+      })
+      .catch(() => setModeState((cur) => failModeSwitch(cur)));
+  }
+
+  /** Switch the active provider and notify the backend when in sync mode. */
+  function switchProvider(name: string) {
+    setProvider(name);
+    if (sync) void postLiveProvider(name);
+  }
+
+  const slashHandlers: SlashHandlers = useMemo(
+    () => ({
+      // setMode: 委托给 switchMode；notice 用后端确认的模式（非请求的模式）。
+      setMode: (m) => {
+        switchMode(m, (confirmed) => pushCommandNotice(t('cmd.mode.done', { mode: confirmed })));
+      },
+      // openModelPicker: ModelSelector 是自包含组件，无法从外部以编程方式打开。
+      openModelPicker: () => { pushCommandNotice(t('cmd.model.openHint')); },
+      // setProvider: 委托给 switchProvider（实时同步 + 本地状态）。
+      setProvider: (name) => {
+        switchProvider(name);
+      },
+      // changeDir: 直接调 api.ts 的 changeDir（POST /cd），并把新目录上报给 App。
+      changeDir: async (path) => {
+        const res = await changeDir(path);
+        if (res.success) {
+          onCwdChanged?.(res.current_dir);
+          pushCommandNotice(t('cmd.cd.done', { dir: res.current_dir }));
+        } else {
+          pushCommandNotice(res.message);
+        }
+      },
+      // openSessionSidebar: 侧栏开关状态在 App，Chat 无此 prop。
+      openSessionSidebar: () => { pushCommandNotice(t('cmd.resume.openHint')); },
+      // reloadConfig: POST /config/reload。
+      reloadConfig: async () => {
+        await postConfigReload();
+        pushCommandNotice(t('cmd.reload.done'));
+      },
+      openSlashSkillsMenu: () => {
+        // Open a pure SKILLS browser (not the full '/' command list — that's what
+        // made running /skills look like it "reset to /"). Input stays '/', but the
+        // menu shows only skills; typing anything drops back to normal filtering.
+        // Trigger the skills fetch if it hasn't been loaded yet.
+        setInput('/');
+        setSlashQuery('');
+        setSlashIndex(0);
+        setSlashSkillsOnly(true);
+        if (slashSkills === null && !slashLoading) {
+          setSlashLoading(true);
+          getSkills()
+            .then(setSlashSkills)
+            .catch(() => setSlashSkills([]))
+            .finally(() => setSlashLoading(false));
+        }
+        setSlashOpen(true);
+        requestAnimationFrame(() => {
+          const ta = textareaRef.current;
+          if (!ta) return;
+          ta.focus();
+          ta.setSelectionRange(1, 1);
+          ta.style.height = 'auto';
+          ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+        });
+      },
+      notice: (text) => pushCommandNotice(text),
+      execServerCommand: async (command, arg) => {
+        const SESSION_MUTATING = new Set(['undo', 'compact']);
+        if (SESSION_MUTATING.has(command)) {
+          if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
+          if (sync) { pushCommandNotice(t('cmd.session.syncUnsupported')); return; }
+        }
+        if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
+        const isCompact = command === 'compact';
+        if (isCompact) compactingRef.current = true;
+        try {
+          let res: CommandResult;
+          try {
+            res = await postCommand({
+              command,
+              arg,
+              session_id: sessionId ?? undefined,
+              working_dir: cwd ?? undefined,
+              project_hash: activeSession?.project_hash ?? undefined,
+              provider: provider ?? undefined,
+            });
+          } catch (e) {
+            pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
+            return;
+          }
+          if (res.kind === 'error') { pushCommandNotice(res.message); return; }
+          if (res.kind === 'undo') {
+            if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
+            pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
+            return;
+          }
+          if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
+          if (res.kind === 'memory') {
+            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+            pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
+            return;
+          }
+          if (res.kind === 'compact') {
+            if (res.applied) {
+              if (sessionId) await reloadSessionTranscript(sessionId);
+              pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+            } else {
+              pushCommandNotice(t('cmd.compact.none'));
+            }
+            return;
+          }
+          if (res.kind === 'context') {
+            pushCommandNotice(
+              t('cmd.context.body', {
+                sent: res.sent_tokens, sys: res.system_tokens, tools: res.tool_defs_tokens,
+                cold: res.cold_zone_tokens, total: res.sent_tokens + res.system_tokens + res.tool_defs_tokens + res.cold_zone_tokens,
+                window: res.ctx_window, name: res.ctx_name,
+              })
+            );
+            return;
+          }
+          if (res.kind === 'whoami') {
+            pushCommandNotice(res.logged_in
+              ? t('cmd.whoami.body', { name: res.name ?? res.username ?? '', user: res.username ?? '', email: res.email ?? '—' })
+              : t('cmd.whoami.none'));
+            return;
+          }
+          if (res.kind === 'status') {
+            pushCommandNotice(t('cmd.status.body', {
+              model: res.model || '—', dir: res.working_dir, provider: res.provider || '—',
+              login: res.logged_in ? (res.username ?? '') : t('cmd.status.notLoggedIn'), config: res.config_path,
+            }));
+            return;
+          }
+          if (res.kind === 'config') { pushCommandNotice(t('cmd.config.body', { path: res.path, provider: res.provider || '—' })); return; }
+          if (res.kind === 'diff') { pushCommandNotice(res.stat.trim() ? res.stat : t('cmd.diff.clean')); return; }
+          if (res.kind === 'cost') { pushCommandNotice(t('cmd.cost.body', { tokens: res.total_tokens, turns: res.turn_count })); return; }
+          if (res.kind === 'todo') {
+            if (!res.items.length) { pushCommandNotice(t('cmd.todo.empty')); return; }
+            const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[~]' : '[ ]');
+            pushCommandNotice(`${t('cmd.todo.header')}\n${res.items.map((i) => `${mark(i.status)} ${i.content}`).join('\n')}`);
+            return;
+          }
+        } finally {
+          if (isCompact) compactingRef.current = false;
+        }
+      },
+      t,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider],
+  );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
   // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
@@ -976,7 +1338,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
-  async function deliver(text: string, images: ImageData[]) {
+  async function deliver(
+    text: string,
+    images: ImageData[],
+    approvalMode: ApprovalMode = modeState.confirmedMode,
+  ) {
+    // Actually sending a message (immediate OR drained from the queue) re-engages
+    // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
+    // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
+    atBottomRef.current = true;
+    setShowJumpBtn(false);
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
     if (!optimisticFiredRef.current && messages.length === 0) {
@@ -989,7 +1360,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(text, images.length ? images : undefined, provider ?? undefined, activeIdRef.current);
+      await postLiveMessage(
+        text,
+        images.length ? images : undefined,
+        provider ?? undefined,
+        activeIdRef.current,
+      );
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);
@@ -1003,10 +1379,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
+    const now = Date.now();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined },
-      { role: 'assistant', parts: [] },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+      { role: 'assistant', parts: [], ts: now },
     ]);
 
     const controller = new AbortController();
@@ -1022,6 +1399,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         ...(cwd ? { working_dir: cwd } : {}),
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
+        approval_mode: approvalMode,
       };
 
       await streamChat(body, handleEvent, controller.signal);
@@ -1046,7 +1424,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function sendMessage() {
     const text = input.trim();
     const images = pendingImages;
+    if (modeState.pendingMode) return;
+    if (compactingRef.current) return;
     if (!text && images.length === 0) return;
+
+    // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
+    if (images.length === 0) {
+      const parsed = parseSlashCommand(text);
+      if (parsed && slashCommandMap.has(parsed.name)) {
+        setInput('');
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        setSlashOpen(false);
+        setHistoryHint(null);
+        void dispatchSlashCommand(text, slashCommandMap, slashHandlers)
+          .catch((e) => pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) })));
+        return;
+      }
+    }
 
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
@@ -1059,7 +1453,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (busy) {
       setQueued((q) => [
         ...q,
-        { id: queueIdRef.current++, text, images: images.length ? images : undefined },
+        {
+          id: queueIdRef.current++,
+          text,
+          images: images.length ? images : undefined,
+          approvalMode: modeState.confirmedMode,
+        },
       ]);
       return;
     }
@@ -1069,23 +1468,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 当前回合结束(done)后，依次发送排队消息；stopped/error/连接错误已清空队列。
   useEffect(() => {
-    if (busy || queued.length === 0) return;
+    if (busy || queued.length === 0 || modeState.pendingMode) return;
     const next = queued[0];
     setQueued((q) => q.slice(1));
-    void deliver(next.text, next.images ?? []);
+    void deliver(next.text, next.images ?? [], next.approvalMode);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, queued]);
+  }, [busy, queued, modeState.pendingMode]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
 
-    // 斜杠菜单导航
+    // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
-      const filtered = (slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
+      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSlashIndex((i) => Math.min(i + 1, filtered.length - 1));
+        setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -1093,9 +1492,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSlashIndex((i) => Math.max(i - 1, 0));
         return;
       }
-      if (e.key === 'Enter' && filtered.length > 0) {
+      if (e.key === 'Enter' && mergedItems.length > 0) {
         e.preventDefault();
-        insertSkill(filtered[slashIndex].name);
+        insertSkill(mergedItems[slashIndex].name);
         return;
       }
       if (e.key === 'Escape') {
@@ -1243,6 +1642,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSlashQuery(query);
         setSlashIndex(0);
         setSlashOpen(true);
+        // Any real keystroke exits the pure-skills browser → normal mixed filtering.
+        setSlashSkillsOnly(false);
         return;
       }
     }
@@ -1341,6 +1742,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
+  // 会话内搜索反查定位:输入关键词过滤时间线到包含该词的消息;↑/↓/Enter 在
+  // 匹配间跳转并滚动到视口中央;清除恢复完整视图。仅前端,不动后端。
+  // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
+  // turnTexts / isLastInTurn(这两个是按原索引算的)。
+  const [search, setSearch] = useState('');
+  const searchTrim = search.trim().toLowerCase();
+  // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
+  const visibleMessages = useMemo(() => searchTrim
+    ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
+    : messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages, searchTrim]);
+  const lastVisibleIdx = visibleMessages.length - 1;
+  // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
+  const matchRefs = useRef<Record<number, HTMLElement | null>>({});
+  const [matchIdx, setMatchIdxState] = useState(0);
+  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到
+  // 最新值,而非闭包里上一次渲染的旧值 (否则连击超过 React 渲染速率时
+  // newIdx 会基于旧 matchIdx 算出,导航"停滞")。setMatchIdx 同步更新 ref
+  // + state,事件处理器读 ref,渲染读 state。
+  const matchIdxRef = useRef(0);
+  const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
+  // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
+  // 三处 (Enter/↑/↓) 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  const navMatch = (delta: number) => {
+    const n = visibleMessages.length;
+    if (n === 0) return;
+    const newIdx = (matchIdxRef.current + delta + n) % n;
+    setMatchIdx(newIdx);
+    const node = matchRefs.current[newIdx];
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
@@ -1428,17 +1860,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
-          {(slashSkills ?? []).filter((s) => s.name.toLowerCase().includes(slashQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name)).map((s, i) => (
+          {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button
-              key={s.name}
+              key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); insertSkill(s.name); }}
+              onMouseDown={(e) => { e.preventDefault(); insertSkill(item.name); }}
               onMouseEnter={() => setSlashIndex(i)}
               type="button"
-              title={s.description || ''}
+              title={item.description || ''}
             >
-              <span class="slash-name">/{s.name}</span>
-              {s.description && <span class="slash-desc">{s.description}</span>}
+              <span class="slash-name">/{item.name}</span>
+              {item.description && <span class="slash-desc">{item.description}</span>}
             </button>
           ))}
         </div>
@@ -1490,14 +1922,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             {(tokens.total / 1000).toFixed(1)}k tokens
           </span>
         )}
+        <ModeSelector
+          value={modeState.displayMode}
+          disabled={Boolean(modeState.pendingMode)}
+          onChange={(m) => switchMode(m)}
+        />
         <ModelSelector
           value={provider}
-          onChange={(p) => {
-            setProvider(p);
-            // 同步模式：下拉框一变就通知后端，TUI 头部与其他端实时跟随
-            // （非同步模式只改本端的待发 provider，发消息时再带上）。
-            if (sync) void postLiveProvider(p);
-          }}
+          onChange={(p) => switchProvider(p)}
         />
         {busy ? (
           <>
@@ -1506,6 +1938,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               <button
                 class="btn-send"
                 onClick={sendMessage}
+                disabled={Boolean(modeState.pendingMode)}
                 title={t('chat.queue')}
                 aria-label={t('chat.queue')}
               >
@@ -1520,7 +1953,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           <button
             class="btn-send"
             onClick={sendMessage}
-            disabled={!input.trim() && pendingImages.length === 0}
+            disabled={Boolean(modeState.pendingMode) || (!input.trim() && pendingImages.length === 0)}
             title={t('chat.send')}
             aria-label={t('chat.send')}
           >
@@ -1628,8 +2061,68 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   return (
     <>
       {/* Message timeline */}
-      <div class="messages-container">
+      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
+        {/* 会话内搜索栏:仅在有历史时显示。sticky 在滚动区顶部,Enter/↑/↓
+            在匹配间跳转并滚动定位(反查定位),清除恢复完整时间线。 */}
+        {messages.length > 0 && (
+          <div class="msg-search-bar">
+            <svg class="msg-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m21 21-4.3-4.3" />
+            </svg>
+            <input
+              class="msg-search-input"
+              // bot review P3: type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
+              // 与自定义 .msg-search-clear 重复。type="text" 全浏览器一致,清除按钮仅走自定义路径。
+              type="text"
+              value={search}
+              placeholder={t('chat.searchPlaceholder')}
+              onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
+                  e.preventDefault();
+                  navMatch(e.shiftKey ? -1 : 1);
+                }
+              }}
+              aria-label={t('chat.searchPlaceholder')}
+            />
+            {searchTrim && (
+              <span class="msg-search-count">
+                {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
+              </span>
+            )}
+            {/* 零匹配时只显示计数+清除,隐藏无效的 ↑/↓ 导航按钮 (bot review Low) */}
+            {searchTrim && visibleMessages.length > 0 && (
+              <>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => navMatch(-1)}
+                  title={t('chat.searchPrev')}
+                  aria-label={t('chat.searchPrev')}
+                  type="button"
+                >↑</button>
+                <button
+                  class="msg-search-nav"
+                  onClick={() => navMatch(1)}
+                  title={t('chat.searchNext')}
+                  aria-label={t('chat.searchNext')}
+                  type="button"
+                >↓</button>
+              </>
+            )}
+            {searchTrim && (
+              <button
+                class="msg-search-clear"
+                onClick={() => { setSearch(''); setMatchIdx(0); }}
+                title={t('chat.searchClear')}
+                aria-label={t('chat.searchClear')}
+                type="button"
+              >×</button>
+            )}
+          </div>
+        )}
+
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -1647,10 +2140,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           </div>
         )}
 
+        {searchTrim && visibleMessages.length === 0 && (
+          <div class="messages-empty">
+            <div>{t('chat.searchNoMatch')}</div>
+          </div>
+        )}
+
         {(() => {
           // Pre-compute per-turn text for assistant messages: collect all text
           // from consecutive assistant messages between two user messages, so
           // the copy button can copy the entire LLM turn (not just one chunk).
+          // system messages are transparent — they don't end an assistant turn.
           const turnTexts = new Map<number, string>();
           {
             let start = -1;
@@ -1660,7 +2160,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 if (start < 0) start = i;
                 const t = messageFullText(messages[i]);
                 if (t) parts.push(t);
-              } else {
+              } else if (messages[i].role === 'user') {
+                // Only a user message ends the current assistant turn.
                 if (start >= 0) {
                   for (let j = start; j < i; j++) {
                     turnTexts.set(j, parts.join('\n\n'));
@@ -1669,6 +2170,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   parts = [];
                 }
               }
+              // role === 'system': transparent — do not flush the turn.
             }
             // Flush the last turn
             if (start >= 0) {
@@ -1678,29 +2180,56 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             }
           }
 
-          return messages.map((msg, idx) => {
-            const isLast = idx === lastIdx;
+          // Helper: skip system messages when looking for the "next role".
+          // Needed so a trailing system notice doesn't hide the copy button
+          // on the real last AI reply of the turn.
+          function nextNonSystemRole(from: number): string | undefined {
+            for (let k = from; k < messages.length; k++) {
+              if (messages[k].role !== 'system') return messages[k].role;
+            }
+            return undefined;
+          }
+
+          return visibleMessages.map(({ msg, origIdx }, idx) => {
+            const isLast = idx === lastVisibleIdx;
+            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
+            const timeLabel = formatMsgTime(msg.ts, t);
+            const timeFull = formatMsgTimeFull(msg.ts);
             if (msg.role === 'user') {
-              return <UserMessageView key={idx} msg={msg} />;
+              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} timeLabel={timeLabel} timeFull={timeFull} />;
+            }
+
+            // system messages render as a standalone notice row (no copy button,
+            // no turn grouping, no streaming cursor).
+            if (msg.role === 'system') {
+              return (
+                <div class="msg-notice" key={origIdx} ref={setMatchRef}>
+                  {msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('')}
+                </div>
+              );
             }
 
             // Determine if this assistant message is the last one in the current
-            // turn (i.e. the next message is a user message, or this is the very
-            // last message in the list). Only the last assistant message in a turn
-            // gets the copy button, so one user turn → one copy button.
-            const isLastInTurn =
-              idx === lastIdx ||
-              messages[idx + 1]?.role === 'user';
+            // turn (i.e. the next NON-SYSTEM message is a user message, or there
+            // are no more non-system messages). Only the last assistant message in
+            // a turn gets the copy button, so one user turn → one copy button.
+            // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
+            // 因为这两者是基于完整 messages 序列算的。
+            const nextRole = nextNonSystemRole(origIdx + 1);
+            const isLastInTurn = nextRole === 'user' || nextRole === undefined;
 
             return (
               <AssistantMessageView
-                key={idx}
+                key={origIdx}
                 msg={msg}
                 isLast={isLast}
                 busy={busy}
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
-                turnText={turnTexts.get(idx) ?? ''}
+                turnText={turnTexts.get(origIdx) ?? ''}
+                searchRef={setMatchRef}
+                timeLabel={timeLabel}
+                timeFull={timeFull}
               />
             );
           });
@@ -1737,6 +2266,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
       </div>
 
+      {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
+      {showJumpBtn && (
+        <button
+          class="jump-to-bottom"
+          onClick={() => scrollToBottom('smooth')}
+          title={t('chat.jumpToBottom')}
+          aria-label={t('chat.jumpToBottom')}
+        >
+          ↓
+        </button>
+      )}
+
       {/* Floating input */}
       <div class="input-container">
         <div class="input-wrap">
@@ -1754,7 +2295,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string }) {
+function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef, timeLabel, timeFull }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -1808,7 +2349,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { m
   ) : null;
 
   return (
-    <div class={cls}>
+    <div class={cls} ref={searchRef}>
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
@@ -1824,6 +2365,12 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText }: { m
         </>
       )}
       {copyBtn}
+      {/* PR #562 send-time label — under the reply, dimmed; full timestamp in
+          the tooltip. Suppressed while streaming (turn isn't done yet), on
+          error turns, and on tool-only turns with no text. */}
+      {timeLabel && !streaming && text && !isError && (
+        <div class="msg-time" title={timeFull}>{timeLabel}</div>
+      )}
     </div>
   );
 }
@@ -1871,7 +2418,7 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
   return out;
 }
 
-function UserMessageView({ msg }: { msg: Message }) {
+function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -1916,7 +2463,7 @@ function UserMessageView({ msg }: { msg: Message }) {
 
   if (skillTitle && !expanded) {
     return (
-      <div class="user-message-wrapper">
+      <div class="user-message-wrapper" ref={searchRef}>
         {images}
         <button
           class="skill-badge"
@@ -1927,12 +2474,13 @@ function UserMessageView({ msg }: { msg: Message }) {
           <span class="skill-badge-label">{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
+        {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
       </div>
     );
   }
 
   return (
-    <div class="user-message-wrapper">
+    <div class="user-message-wrapper" ref={searchRef}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
@@ -1947,6 +2495,9 @@ function UserMessageView({ msg }: { msg: Message }) {
       <div class="msg-actions">
         {copyBtn}
       </div>
+      {/* PR #562 send-time label — below the bubble, right-aligned to match
+          the user side; full timestamp on hover. */}
+      {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
     </div>
   );
 }

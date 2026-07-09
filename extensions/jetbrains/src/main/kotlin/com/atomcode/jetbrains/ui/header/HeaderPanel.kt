@@ -5,6 +5,7 @@ import com.intellij.ui.JBColor
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.FlowLayout
+import java.awt.Component
 import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -78,6 +79,12 @@ class HeaderPanel : JPanel(BorderLayout()) {
             is ConnectionState.SetupRequired -> state.reason
             else -> "Not connected"
         }
+    }
+
+    fun setRightComponent(component: Component) {
+        add(component, BorderLayout.EAST)
+        revalidate()
+        repaint()
     }
 
     companion object {

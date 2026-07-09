@@ -9,8 +9,9 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, listSessions, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
+import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
@@ -36,6 +37,11 @@ export function App() {
   // 覆盖它（Sidebar 按 id 去重，真实条目优先），标题随之从「前 10 字」换成自动命名。
   const [optimisticSession, setOptimisticSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
+  // Physical session-bucket hash of the current project. The sidebar scopes its
+  // list by this (see Sidebar `projectHash`), not by the `cwd` string, so a
+  // session whose stored `working_dir` was restamped by the daemon's global
+  // working_dir can't leak into the wrong project. Tracked alongside `cwd`.
+  const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
@@ -100,7 +106,9 @@ export function App() {
       id: activeSession?.id ?? `optimistic-${now}`,
       name: title,
       working_dir: activeSession?.working_dir ?? cwd,
-      project_hash: activeSession?.project_hash ?? '',
+      // Fall back to the current project's hash (not '') so the optimistic row
+      // survives the sidebar's project_hash filter on a landing-page first send.
+      project_hash: activeSession?.project_hash ?? projectHash,
       created_at: activeSession?.created_at ?? now,
       updated_at: now,
       message_count: 1,
@@ -137,7 +145,9 @@ export function App() {
     let cancelled = false;
     getProject()
       .then((p) => {
-        if (!cancelled && p.working_dir) setCwd((c) => c || p.working_dir);
+        if (cancelled) return;
+        if (p.working_dir) setCwd((c) => c || p.working_dir);
+        if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
       })
       .catch(() => {
         // Ignore; cwd stays empty
@@ -161,24 +171,20 @@ export function App() {
     window.history.replaceState(null, '', url.pathname + url.search + url.hash);
   }, [sessionId]);
 
-  // 刷新后用 URL 里的短 id 去会话列表按前缀还原成完整记录（完整 id + project_hash
-  // + working_dir），再交给 Chat 加载历史。仅在挂载时执行一次。
+  // 刷新后用 URL 里的短 id 还原成完整记录（完整 id + project_hash + working_dir），
+  // 再交给 Chat 加载历史。用 resolveSession（跨所有桶按 id 定位，不受 /sessions 的
+  // 50 条上限影响），否则较旧的会话刷新后会找不到、回落到新建页。仅在挂载时执行一次。
   useEffect(() => {
     const urlSid = urlSessionRef.current;
     if (!urlSid) return;
     let cancelled = false;
-    listSessions()
-      .then((list) => {
-        if (cancelled) return;
-        // 兼容历史上写入的完整 id：优先精确匹配，否则按前缀匹配。
-        const found =
-          list.find((s) => s.id === urlSid) ??
-          list.find((s) => s.id.startsWith(urlSid));
-        if (found) {
-          setSessionId(found.id);
-          setActiveSession(found);
-          if (found.working_dir) setCwd(found.working_dir);
-        }
+    resolveSession(urlSid)
+      .then((found) => {
+        if (cancelled || !found) return;
+        setSessionId(found.id);
+        setActiveSession(found);
+        if (found.working_dir) setCwd(found.working_dir);
+        if (found.project_hash) setProjectHash(found.project_hash);
       })
       .catch(() => {
         /* 找不到就维持现状（回到新建页） */
@@ -215,6 +221,10 @@ export function App() {
           updated_at: data.created_at,
           message_count: 0,
         });
+        // Adopt the freshly-created session's bucket as the current project so
+        // the sidebar filters to it (handlePickCwd cleared it to fall back to
+        // cwd until this resolves).
+        if (data.project_hash) setProjectHash(data.project_hash);
         setSessionListVersion((v) => v + 1);
       })
       .catch((err) => {
@@ -235,12 +245,20 @@ export function App() {
     if (session.working_dir) {
       setCwd(session.working_dir);
     }
+    // Scope the sidebar to the picked session's physical project bucket.
+    if (session.project_hash) setProjectHash(session.project_hash);
     setSidebarOpen(false);
   }
 
   // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
+  // 也是「切换项目」下拉选中另一个项目时的入口（真正切进去，而非只浏览）。
   function handlePickCwd(path: string) {
+    setSidebarOpen(false);
     setCwd(path);
+    // We don't know the new dir's bucket hash until the daemon creates a session
+    // there; clear it so the sidebar falls back to filtering by `cwd` in the
+    // meantime, then openNewSession's response re-pins projectHash.
+    setProjectHash('');
     openNewSession(path || undefined);
   }
 
@@ -267,45 +285,7 @@ export function App() {
     try {
       const detail = await getSession(activeSession.project_hash, activeSession.id);
       const title = detail.name || detail.id.slice(0, 8);
-      const lines: string[] = [];
-      lines.push(`# ${title}`);
-      lines.push('');
-      for (const msg of detail.messages) {
-        if (msg.role === 'system') continue;
-        if (msg.role === 'user') {
-          lines.push('## User');
-          lines.push('');
-          lines.push(msg.content || '');
-          lines.push('');
-        } else if (msg.role === 'assistant') {
-          lines.push('## Assistant');
-          lines.push('');
-          if (msg.content) {
-            lines.push(msg.content);
-            lines.push('');
-          }
-          if (msg.tool_calls && msg.tool_calls.length > 0) {
-            for (const tc of msg.tool_calls) {
-              lines.push(`### Tool: ${tc.name}`);
-              lines.push('');
-              if (tc.arguments) {
-                lines.push('```json');
-                lines.push(typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments, null, 2));
-                lines.push('```');
-                lines.push('');
-              }
-            }
-          }
-        } else if (msg.role === 'tool' && msg.tool_result) {
-          const tr = msg.tool_result;
-          lines.push(`### Tool Result (${tr.success ? '✓' : '✗'})`);
-          lines.push('');
-          if (tr.summary) {
-            lines.push(tr.summary);
-            lines.push('');
-          }
-        }
-      }
+      const lines = sessionMessagesToMarkdownLines(detail.messages, title);
       const mdContent = lines.join('\n');
       const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
       const url = URL.createObjectURL(blob);
@@ -338,10 +318,13 @@ export function App() {
         optimisticSession={optimisticSession}
         onActiveSessionMeta={handleActiveSessionMeta}
         cwd={cwd}
+        projectHash={projectHash}
         onSessionRenamed={handleSessionRenamed}
         onSessionDeleted={handleSessionDeleted}
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
+        onOpenCwd={() => setShowCwd(true)}
+        onSwitchProject={handlePickCwd}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}

@@ -74,6 +74,9 @@ export interface SkillInfo {
   description: string;
 }
 
+export type ApprovalMode = 'build' | 'plan' | 'bypass';
+export type PermissionDecision = 'allow' | 'deny' | 'always_allow' | 'allow_persist';
+
 /** Tool call data (collapsed section in the UI) */
 export interface ToolCallData {
   id: string;
@@ -82,7 +85,7 @@ export interface ToolCallData {
   output?: string;
   success?: boolean;
   durationMs?: number;
-  status: 'queued' | 'running' | 'done' | 'error';
+  status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error' | 'incomplete';
 }
 
 export interface ArtifactData {
@@ -96,17 +99,30 @@ export interface ArtifactData {
 
 export interface PermissionRequestData {
   id: string;
+  sessionId: string;
   toolName: string;
+  reason: string;
   args: string;
   isDestructive: boolean;
-  status: 'pending' | 'allowed' | 'denied';
+  status: 'pending' | 'submitting' | 'allowed' | 'denied';
+  decision?: PermissionDecision;
+  error?: string;
+}
+
+export interface StatusData {
+  kind: 'warning' | 'rate_limited' | 'idle';
+  message: string;
+  retryAfterSeconds?: number;
+  attempt?: number;
+  maxAttempts?: number;
 }
 
 export type MessageBlock =
   | { id: string; type: 'text'; content: string }
   | { id: string; type: 'tool'; tool: ToolCallData }
   | { id: string; type: 'artifact'; artifact: ArtifactData }
-  | { id: string; type: 'permission'; request: PermissionRequestData };
+  | { id: string; type: 'permission'; request: PermissionRequestData }
+  | { id: string; type: 'status'; status: StatusData };
 
 /** A single chat message (user or assistant) */
 export interface ChatMessage {
@@ -150,6 +166,8 @@ export interface ChatState {
   searchQuery: string;
   searchOpen: boolean;
   locale?: string;
+  approvalMode: ApprovalMode;
+  approvalModePending: boolean;
 }
 
 // ─── Actions dispatched by the reducer ──────────────────────────
@@ -165,12 +183,15 @@ export type ChatAction =
   | { type: 'TOOL_BATCH_START'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'STREAM_WARNING'; message: string }
+  | { type: 'STREAM_RATE_LIMITED'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
+  | { type: 'STREAM_IDLE_NOTICE'; message: string }
   | { type: 'ARTIFACT_START'; id: string; artifactType: string; language?: string; title?: string }
   | { type: 'ARTIFACT_CONTENT'; id: string; content: string }
   | { type: 'ARTIFACT_END'; id: string }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
   | { type: 'GENERATION_DONE'; tokens?: number }
-  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
   | { type: 'CLEAR_CHAT' }
@@ -182,6 +203,7 @@ export type ChatAction =
   | { type: 'SET_CURRENT_MODEL'; model: string }
   | { type: 'SET_CURRENT_PROVIDER'; provider: string; model?: string }
   | { type: 'SET_REASONING_EFFORT'; provider: string; effort: string | null }
+  | { type: 'SET_APPROVAL_MODE'; mode: ApprovalMode; pending?: boolean }
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'SET_ACTIVE_SESSION'; sessionId?: string; projectHash?: string }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
@@ -189,17 +211,18 @@ export type ChatAction =
   | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'TOGGLE_SETTINGS' }
-  | { type: 'PERMISSION_REQUEST'; id: string; toolName: string; args: string; isDestructive: boolean }
-  | { type: 'PERMISSION_RESPOND'; id: string; allowed: boolean }
+  | { type: 'PERMISSION_REQUEST'; id: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'PERMISSION_RESPOND'; id: string; decision: PermissionDecision }
+  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; success: boolean; message?: string }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string };
+  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string }
+  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean }
   | { type: 'userMessage'; text: string; images?: ImageData[] }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }
@@ -208,12 +231,14 @@ export type ExtensionMessage =
   | { type: 'toolBatchStart'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'toolStart'; id?: string; name: string; args: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
+  | { type: 'warning'; message: string }
+  | { type: 'rateLimited'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
   | { type: 'artifactStart'; id: string; artifactType: string; language?: string; title?: string }
   | { type: 'artifactContent'; id: string; content: string }
   | { type: 'artifactEnd'; id: string }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
-  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'generationStopped' }
@@ -222,6 +247,7 @@ export type ExtensionMessage =
   | { type: 'sessions'; sessions: SessionMeta[] }
   | { type: 'sessionSelected'; sessionId?: string; projectHash?: string }
   | { type: 'models'; models: ModelInfo[] }
+  | { type: 'approvalMode'; mode: ApprovalMode; pending?: boolean }
   | { type: 'providers'; providers: ProviderInfo[]; defaultProvider?: string }
   | { type: 'authStatus'; auth: AuthStatus }
   | { type: 'setupState'; auth?: AuthStatus; providers: ProviderInfo[]; defaultProvider?: string; currentModel?: string; setupRequired: boolean }
@@ -234,6 +260,7 @@ export type ExtensionMessage =
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string; startLine?: number; endLine?: number }
   | { type: 'insertText'; text: string }
   | { type: 'skills'; skills: SkillInfo[] }
-  | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
+  | { type: 'permissionRequest'; sessionId: string; id: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'permissionResponseResult'; id: string; success: boolean; message?: string }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string };

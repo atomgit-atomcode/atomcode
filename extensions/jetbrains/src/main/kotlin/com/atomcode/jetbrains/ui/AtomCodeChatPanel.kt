@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.ui
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatStreamListener
 import com.atomcode.jetbrains.daemon.ConnectionState
+import com.atomcode.jetbrains.daemon.ApprovalMode
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
@@ -20,7 +21,6 @@ import com.atomcode.jetbrains.security.SensitivePathClassifier
 import com.atomcode.jetbrains.services.AtomCodeProjectService
 import com.atomcode.jetbrains.services.SessionRefView
 import com.atomcode.jetbrains.session.ChatRuntime
-import com.atomcode.jetbrains.session.ContextItemState
 import com.atomcode.jetbrains.session.SessionWorkspace
 import com.atomcode.jetbrains.settings.AtomCodeContextLevel
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
@@ -198,7 +198,7 @@ class AtomCodeChatPanel(
     private val service = AtomCodeProjectService.getInstance(project)
     private val settings = AtomCodeSettingsState.getInstance()
 
-    // ── New UI components ──
+    // ── UI components ──
     private val header = HeaderPanel()
     private val messageView = JBCefMessageView { action -> handleWelcomeAction(action) }
     private val inputPanel = InputPanel(
@@ -209,10 +209,11 @@ class AtomCodeChatPanel(
         onClearContext = { clearPendingContext() },
         onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
+        onApprovalModeSelect = { mode -> setApprovalMode(mode) },
         onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
-    // ── Data state (preserved from original) ──
+    // ── Data state ──
     private val modelPicker = JComboBox<ModelInfo>().apply {
         prototypeDisplayValue = ModelInfo("provider", "model-name", "openai", false)
     }
@@ -239,6 +240,8 @@ class AtomCodeChatPanel(
             if (!disposed) {
                 renderConnectionState(event.newValue as ConnectionState)
                 if (event.newValue is ConnectionState.Ready) {
+                    inputPanel.setApprovalMode(service.approvalMode)
+                    inputPanel.setApprovalModeEnabled(!service.approvalModePending)
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -369,7 +372,6 @@ class AtomCodeChatPanel(
         }
         if (!duplicate) {
             pendingContext += item
-            runtime?.addContext(item.toContextItemState())
         }
         rebuildContext()
         focusInput()
@@ -456,6 +458,23 @@ class AtomCodeChatPanel(
                 }
                 renderSetupSnapshot(snapshot)
                 addSystemMessage("Default model set to ${model.model}.")
+            }
+        }
+    }
+
+    private fun setApprovalMode(mode: ApprovalMode) {
+        inputPanel.setApprovalModeEnabled(false)
+        service.setApprovalMode(mode).whenComplete { applied, error ->
+            SwingUtilities.invokeLater {
+                inputPanel.setApprovalModeEnabled(true)
+                if (error != null) {
+                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to set approval mode")
+                    inputPanel.setApprovalMode(service.approvalMode)
+                    startNextQueuedPromptIfReady()
+                    return@invokeLater
+                }
+                inputPanel.setApprovalMode(applied)
+                startNextQueuedPromptIfReady()
             }
         }
     }
@@ -611,7 +630,6 @@ class AtomCodeChatPanel(
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to create session"); return@invokeLater }
                 currentSession = session
-                runtime?.updateSession(session)
                 persistRuntimeSession()
                 messageView.clear()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
@@ -838,7 +856,6 @@ class AtomCodeChatPanel(
             SwingUtilities.invokeLater {
                 if (error != null) { addErrorMessage(error.cause?.message ?: error.message ?: "failed to load session"); return@invokeLater }
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
-                runtime?.loadSession(detail)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
@@ -853,7 +870,7 @@ class AtomCodeChatPanel(
             val role = message.role.lowercase()
             when (role) {
                 "user" -> {
-                    if (isInternalHistoryUserMessage(message.content)) return@forEach
+                    if (message.synthetic || isInternalHistoryUserMessage(message.content)) return@forEach
                     val restored = decodeHistoryUserMessage(message.content)
                     messageView.addUserMessage(restored.text, restored.contextSummary)
                     assistantGroupOpen = false
@@ -905,7 +922,6 @@ class AtomCodeChatPanel(
                 if (currentSession?.id != session.id) return@invokeLater
 
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
-                runtime?.loadSession(detail)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id)
@@ -924,10 +940,14 @@ class AtomCodeChatPanel(
 
     // ── Send / Chat streaming ──
 
-    private fun handleSend(text: String) {
+    private fun handleSend(text: String): Boolean {
         val prompt = text.trim()
-        if (prompt.isEmpty()) return
-        if (handleLocalInputCommand(prompt)) { inputPanel.clearInput(); return }
+        if (prompt.isEmpty()) return false
+        if (service.approvalModePending) return false
+        if (handleLocalInputCommand(prompt)) {
+            inputPanel.clearInput()
+            return true
+        }
         val transformedPrompt = slashPromptTemplate(prompt) ?: prompt
         val pendingContextForSend = pendingContext.toList()
         val pendingImagesForSend = pendingImages.toList()
@@ -937,17 +957,27 @@ class AtomCodeChatPanel(
         val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
             pendingImagesForSend.map { it.toMessageAttachmentView() }
         val images = pendingImagesForSend.map { it.toImageInput() }
+        val approvalModeForSend = service.confirmedApprovalMode
 
         if (generating) {
-            val queued = QueuedPrompt(UUID.randomUUID().toString(), transformedPrompt, message, contextNames, attachments, images)
+            val queued = QueuedPrompt(
+                UUID.randomUUID().toString(),
+                transformedPrompt,
+                message,
+                contextNames,
+                attachments,
+                images,
+                approvalModeForSend,
+            )
             queuedPrompts += queued
             if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
             inputPanel.clearInput()
             renderQueueState()
-            return
+            return true
         }
         if (pendingContextForSend.isNotEmpty() || pendingImagesForSend.isNotEmpty()) clearPendingContext()
-        startPrompt(transformedPrompt, message, contextNames, attachments, images)
+        startPrompt(transformedPrompt, message, contextNames, attachments, images, approvalModeForSend)
+        return true
     }
 
     private fun startPrompt(
@@ -956,6 +986,7 @@ class AtomCodeChatPanel(
         contextNames: List<String>,
         attachments: List<MessageAttachmentView>,
         images: List<ImageInput>,
+        approvalMode: ApprovalMode,
     ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
@@ -993,17 +1024,15 @@ class AtomCodeChatPanel(
         }, onSessionReady = { session ->
             SwingUtilities.invokeLater {
                 setCurrentSessionReference(session)
-                runtime?.updateSession(session)
                 replaceSelectedSession(session.id)
                 persistRuntimeSession()
             }
-        }, provider = provider, images = images).whenComplete { session, error ->
+        }, provider = provider, images = images, approvalMode = approvalMode).whenComplete { session, error ->
             SwingUtilities.invokeLater {
                 if (error != null) {
                     finishPromptAndContinue(generationId)
                 } else if (session != null) {
                     setCurrentSessionReference(session)
-                    runtime?.updateSession(session)
                     replaceSelectedSession(session.id)
                     persistRuntimeSession()
                     rerenderFinishedSessionFromHistory(session)
@@ -1013,7 +1042,6 @@ class AtomCodeChatPanel(
     }
 
     private fun renderChatEvent(event: ChatEvent) {
-        runtime?.applyDaemonEvent(event)
         when (event) {
             is ChatEvent.Text -> streamHandler.onText(event.content)
             is ChatEvent.Reasoning -> streamHandler.onReasoning(event.content)
@@ -1052,7 +1080,7 @@ class AtomCodeChatPanel(
         if (!generating || activeGenerationId != generationId) return
 
         messageView.finishAssistantTurn()
-        val next = if (queuedPrompts.isEmpty()) null else queuedPrompts.removeFirst()
+        val next = nextQueuedPromptIfModeReady()
         if (next == null) {
             finishPrompt(generationId, assistantAlreadyFinished = true)
             return
@@ -1060,9 +1088,30 @@ class AtomCodeChatPanel(
 
         // Keep the composer in its generating state while handing off to the queued
         // prompt. Clearing it for one event-loop turn causes the visible flash.
+        startQueuedPrompt(next)
+    }
+
+    private fun startNextQueuedPromptIfReady() {
+        if (generating) return
+        val next = nextQueuedPromptIfModeReady() ?: return
+        startQueuedPrompt(next)
+    }
+
+    private fun nextQueuedPromptIfModeReady(): QueuedPrompt? {
+        if (service.approvalModePending || queuedPrompts.isEmpty()) return null
+        return queuedPrompts.removeFirst()
+    }
+
+    private fun startQueuedPrompt(next: QueuedPrompt) {
         activeGenerationId = null
-        runtime?.removeQueuedPrompt(next.id)
-        startPrompt(next.prompt, next.message, next.contextNames, next.attachments, next.images)
+        startPrompt(
+            next.prompt,
+            next.message,
+            next.contextNames,
+            next.attachments,
+            next.images,
+            next.approvalMode,
+        )
     }
 
     private fun finishPrompt(
@@ -1118,7 +1167,6 @@ class AtomCodeChatPanel(
             },
         ) { item ->
             queuedPrompts.removeAll { it.id == item.id }
-            runtime?.removeQueuedPrompt(item.id)
             renderQueueState()
         }
         rebuildContext()
@@ -1173,7 +1221,6 @@ class AtomCodeChatPanel(
         val session = currentSession?.takeIf { it.id == sessionId } ?: return
         val normalizedTitle = title.trim().ifBlank { session.id.take(8) }
         currentSession = session.copy(name = normalizedTitle)
-        runtime?.updateSession(currentSession)
         updateAtomCodeChatTabTitle(project, this, normalizedTitle)
         persistRuntimeSession()
     }
@@ -1211,7 +1258,6 @@ class AtomCodeChatPanel(
     private fun clearPendingContext() {
         pendingContext.clear()
         pendingImages.clear()
-        runtime?.clearContext()
         rebuildContext()
     }
 
@@ -1777,6 +1823,7 @@ private data class QueuedPrompt(
     val contextNames: List<String>,
     val attachments: List<MessageAttachmentView>,
     val images: List<ImageInput>,
+    val approvalMode: ApprovalMode,
 )
 
 private data class PendingImageAttachment(
@@ -1839,22 +1886,25 @@ internal fun decodeHistoryUserMessage(content: String): HistoryUserMessage {
 
 internal fun isInternalHistoryUserMessage(content: String): Boolean {
     val trimmed = content.trim()
-    return trimmed.startsWith("<system-reminder>") ||
-        trimmed.startsWith("You made code edits but have not verified them.")
+    return INTERNAL_HISTORY_USER_PREFIXES.any { trimmed.startsWith(it) }
 }
+
+private val INTERNAL_HISTORY_USER_PREFIXES = listOf(
+    "<system-reminder>",
+    "You made code edits but have not verified them.",
+    "Output limit hit — your last response was cut off",
+    "Output limit hit. If the task is already complete",
+    "[PLAN MODE",
+    "[Context was compressed",
+    "[Additional context from user]:",
+    "[SYNTAX CHECK:",
+    "[DEV SERVER ERROR",
+    "[Auto-read from error:",
+    "[Images returned by the tool calls above",
+)
 
 private val HISTORY_CONTEXT_FILE_PATTERN =
     Regex("(?m)^File: (.+?)(?: \\(lines \\d+-\\d+\\))?\\r?\\n```")
-
-private fun ChatContextItem.toContextItemState(): ContextItemState =
-    ContextItemState(
-        id = "$path:${startLine ?: 0}:${endLine ?: 0}:${selection?.hashCode() ?: 0}",
-        path = path,
-        displayName = displayName,
-        language = language,
-        selectionStartLine = startLine,
-        selectionEndLine = endLine,
-    )
 
 internal fun slashPromptTemplate(prompt: String): String? {
     val parts = prompt.split(Regex("\\s+"), limit = 2)

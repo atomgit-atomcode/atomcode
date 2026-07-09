@@ -89,6 +89,8 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(reason) => return err(reason),
         };
+        #[cfg(unix)]
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
         // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
         // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
         // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
@@ -817,9 +819,140 @@ fn console_codepage() -> u32 {
     0 // no OEM codepage off Windows → decode_oem yields lossy UTF-8
 }
 
+/// CSI parameter/intermediate/final consumption. `start` points just past the
+/// introducer (`ESC [` or C1 `0x9B`). Returns the index one past the final byte.
+/// CSI = (params: 0x30-0x3f) (intermediates: 0x20-0x2f) (final: 0x40-0x7e).
+fn consume_csi(bytes: &[u8], start: usize) -> usize {
+    let mut j = start;
+    while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) {
+        j += 1;
+    }
+    while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) {
+        j += 1;
+    }
+    if j < bytes.len() {
+        j += 1; // consume final byte
+    }
+    j
+}
+
+/// String-sequence consumption for OSC / DCS / SOS / PM / APC. `start` points
+/// just past the introducer; scans to the string terminator and returns the
+/// index one past it. Terminator = BEL (`0x07`), 7-bit ST (`ESC \`), or 8-bit
+/// C1 ST (U+009C, encoded `0xC2 0x9C`). An embedded lone ESC that is not `ESC \`
+/// is skipped (matches xterm behaviour).
+fn consume_string_sequence(bytes: &[u8], start: usize) -> usize {
+    let mut j = start;
+    while j < bytes.len() {
+        if bytes[j] == 0x07 {
+            return j + 1;
+        }
+        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+            return j + 2;
+        }
+        if bytes[j] == 0xc2 && j + 1 < bytes.len() && bytes[j + 1] == 0x9c {
+            return j + 2;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Strip ANSI escape sequences and resolve `\r` progress-line rewrites so bash
+/// output is clean text before it enters the model's context (and, downstream,
+/// the TUI). Without this, git hooks / cargo / docker / progress bars emit CSI
+/// colour+cursor sequences and `\r` cursor-returns: the escape codes waste tokens
+/// and confuse the model, and every intermediate progress-bar frame gets spliced
+/// in verbatim. Extends the v1 editor's `sanitize_terminal_output`
+/// (`atomcode-core/src/tool/bash.rs`) with 8-bit C1 introducers and DCS/SOS/PM/APC
+/// string sequences.
+fn sanitize_terminal_output(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    // Strip ANSI escape sequences in a single byte pass (no `regex` crate). We handle
+    // both introducer forms:
+    //   * 7-bit: `ESC [` (CSI), `ESC ]` (OSC), `ESC P/X/^/_` (DCS/SOS/PM/APC string
+    //     sequences), and any other solo two-byte `ESC X`.
+    //   * 8-bit C1: since `s` is valid UTF-8, C1 controls appear as their two-byte
+    //     encoding `0xC2 0x8_/0x9_` (e.g. U+009B CSI = `0xC2 0x9B`). We route the
+    //     string/CSI introducers accordingly; other lone C1 controls fall through to
+    //     the trailing control-character filter below.
+    let bytes = s.as_bytes();
+    let mut stripped: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    i = consume_csi(bytes, i + 2);
+                    continue;
+                }
+                // OSC and the DCS/SOS/PM/APC string sequences all run to a string
+                // terminator, so share one consumer. (v1 dropped only 2 bytes of
+                // `ESC P/X/^/_`, leaking the payload + ST — fixed here.)
+                b']' | b'P' | b'X' | b'^' | b'_' => {
+                    i = consume_string_sequence(bytes, i + 2);
+                    continue;
+                }
+                _ => {
+                    // Two-byte escape (e.g. ESC =, ESC >, ESC M, …) — drop both.
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        // 8-bit C1 introducers, UTF-8 encoded as `0xC2 0x9_`.
+        if b == 0xc2 && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                0x9b => {
+                    i = consume_csi(bytes, i + 2); // CSI (U+009B)
+                    continue;
+                }
+                // OSC (U+009D) + DCS (U+0090) / SOS (U+0098) / PM (U+009E) / APC (U+009F).
+                0x9d | 0x90 | 0x98 | 0x9e | 0x9f => {
+                    i = consume_string_sequence(bytes, i + 2);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        stripped.push(b);
+        i += 1;
+    }
+    // Lossy decode: the strip phase removes whole escape sequences, but a
+    // pathological ESC followed by a UTF-8 continuation byte could still
+    // produce invalid UTF-8 — lossy keeps us safe without another allocation
+    // in the common case.
+    let cleaned = String::from_utf8_lossy(&stripped).into_owned();
+
+    // Resolve `\r` progress rewrites. For each logical line, when `\r` appears
+    // mid-line the terminal would repaint from column 0, so only the suffix
+    // after the final `\r` is actually visible to the user. We keep just that.
+    let mut out = String::with_capacity(cleaned.len());
+    for (idx, line) in cleaned.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let line = line.trim_end_matches('\r');
+        if let Some(pos) = line.rfind('\r') {
+            out.push_str(&line[pos + 1..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+
+    // Drop any remaining C0 control characters except tab and newline — they
+    // render as glyph garbage and add nothing for the model.
+    out.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 fn format_output(output: &std::process::Output) -> ToolResult {
-    let stdout = decode_output(&output.stdout);
-    let stderr = decode_output(&output.stderr);
+    let stdout = sanitize_terminal_output(&decode_output(&output.stdout));
+    let stderr = sanitize_terminal_output(&decode_output(&output.stderr));
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&stdout);
@@ -1224,6 +1357,64 @@ mod tests {
     use atomcode_kernel::tool::ToolContext;
 
     #[test]
+    fn sanitize_strips_ansi_colour_codes() {
+        // SGR colour/style codes (`ESC [ … m`) must be removed, leaving plain text.
+        assert_eq!(sanitize_terminal_output("\x1b[32m[PASSED]\x1b[0m done"), "[PASSED] done");
+        assert_eq!(sanitize_terminal_output("\x1b[1;31merror\x1b[39m: boom"), "error: boom");
+    }
+
+    #[test]
+    fn sanitize_collapses_carriage_return_progress_lines() {
+        // A `\r` progress rewrite keeps only what the terminal would finally show.
+        assert_eq!(sanitize_terminal_output("Downloading...\rDownloading 100%"), "Downloading 100%");
+    }
+
+    #[test]
+    fn sanitize_handles_mixed_csi_cr_and_erase() {
+        // CSI erase-line (`\x1b[K`) + CSI cursor-up (`\x1b[A`) + `\r` rewrite together.
+        assert_eq!(sanitize_terminal_output("remote: Checking\x1b[K\r\x1b[A[PASSED]"), "[PASSED]");
+    }
+
+    #[test]
+    fn sanitize_leaves_plain_text_and_tabs_untouched() {
+        assert_eq!(sanitize_terminal_output("a\tb\nc"), "a\tb\nc");
+        assert_eq!(sanitize_terminal_output(""), "");
+    }
+
+    #[test]
+    fn sanitize_strips_8bit_c1_csi() {
+        // 8-bit C1 CSI introducer U+009B (encoded 0xC2 0x9B) + SGR must be stripped,
+        // including its payload — the trailing control filter alone would leave "31m".
+        assert_eq!(sanitize_terminal_output("\u{9b}31mRED\u{9b}0m done"), "RED done");
+    }
+
+    #[test]
+    fn sanitize_strips_dcs_and_other_string_sequences() {
+        // 7-bit DCS: ESC P ... ST(ESC \) — v1 leaked the payload; now fully dropped.
+        assert_eq!(sanitize_terminal_output("\x1bP1;2|payload\x1b\\visible"), "visible");
+        // 7-bit APC: ESC _ ... BEL terminator.
+        assert_eq!(sanitize_terminal_output("\x1b_progress\x07visible"), "visible");
+        // 8-bit C1 DCS (U+0090) terminated by 8-bit C1 ST (U+009C).
+        assert_eq!(sanitize_terminal_output("\u{90}data\u{9c}visible"), "visible");
+        // OSC (7-bit) still works via the shared string consumer (BEL-terminated).
+        assert_eq!(sanitize_terminal_output("\x1b]0;window title\x07text"), "text");
+    }
+
+    // End-to-end: format_output must actually run the sanitizer, so a command that
+    // emits colour codes never leaks escape sequences into the tool result (model
+    // context). Guards against someone dropping the sanitize call from format_output.
+    #[tokio::test]
+    async fn colour_output_is_stripped_end_to_end() {
+        let d = tempfile::tempdir().unwrap();
+        let r = BashTool
+            .execute(r#"{"command":"printf '\\033[31mRED\\033[0m\\n'"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("RED"), "content: {:?}", r.content);
+        assert!(!r.content.contains('\x1b'), "escape leaked into result: {:?}", r.content);
+    }
+
+    #[test]
     fn wsl_launcher_excluded_git_bash_and_msys_allowed() {
         use std::path::Path;
         // WSL launcher (System32 / SysWOW64 / Sysnative) — must be rejected.
@@ -1296,6 +1487,36 @@ mod tests {
     }
     fn risk_of(cmd: &str) -> RiskLevel {
         BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn execute_preserves_utf8_paths_when_parent_locale_is_c() {
+        let d = tempfile::tempdir().unwrap();
+        let command = r#"
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#;
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+
+        let result = BashTool
+            .execute(
+                &serde_json::json!({ "command": command }).to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(
+            result
+                .content
+                .contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "content was: {:?}",
+            result.content
+        );
     }
 
     // macOS sudo (and some Linux configs) does NOT auto-use SUDO_ASKPASS just because

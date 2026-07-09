@@ -86,7 +86,7 @@ For NEW code prefer English identifiers, but keep the file's existing naming con
 When searching Chinese content, use Unicode-aware patterns (the grep tool supports Chinese regex).
 
 ## CONTEXT:
-The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. After compression, do NOT assume prior tool results are still available. Re-read files and re-check state before continuing.";
+The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. Do NOT tell the user to start a new conversation or clear the history to manage context — that is handled automatically. After compression, do NOT assume prior tool results are still available. Re-read files and re-check state before continuing.";
 
 #[cfg(test)]
 mod tests {

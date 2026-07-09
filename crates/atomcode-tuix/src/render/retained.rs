@@ -40,6 +40,11 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
+/// Hard cap on the partial-line buffer for streaming assistant text. It's
+/// normally drained per newline; this bounds a pathological newline-less stream
+/// so it can't grow the buffer until allocation fails. 1 MiB ≫ any real line.
+const ASSISTANT_LINE_BUF_MAX: usize = 1 << 20;
+
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
@@ -136,6 +141,127 @@ fn format_goal_row(
 ) -> String {
     let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
     format!("{marker}{cond}{meta}")
+}
+
+/// Loop marker: `⚡` (Lightning, U+26A1, Miscellaneous Symbols) when unicode is
+/// available, `*` fallback for legacy terminals. Width-1 + trailing space,
+/// matching the layout contract of `goal_marker`.
+fn loop_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "⚡ "
+    } else {
+        "* "
+    }
+}
+
+/// The three display segments of the dedicated footer loop row, width-fitted:
+/// `(marker, label, meta)`. Mirrors `goal_row_parts` exactly — marker in Brand
+/// color, label in normal text, meta (` · round N · elapsed`) muted.
+///
+/// `round` is shown verbatim (callers pass a 1-based value). Elapsed `13s`
+/// under a minute else `2m13s`. The meta is RESERVED; label fills the rest and
+/// is truncated with `…`. CJK/width-safe via `crate::width`.
+fn loop_row_parts(
+    label: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = loop_marker(unicode);
+    let m = elapsed_secs / 60;
+    let s = elapsed_secs % 60;
+    let elapsed = if m == 0 { format!("{s}s") } else { format!("{m}m{s}s") };
+    let icon_w = crate::width::display_width(marker);
+    let meta = format!(" · round {round} · {elapsed}");
+    let meta_w = crate::width::display_width(&meta);
+    let label_budget = max_cols.saturating_sub(icon_w).saturating_sub(meta_w);
+    if label_budget == 0 {
+        // Too narrow for any label — drop it, keep marker + round/elapsed.
+        let bare = format!("round {round} · {elapsed}");
+        let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
+        return (marker, String::new(), meta_only);
+    }
+    let lbl = crate::width::truncate_with_ellipsis(label, label_budget);
+    (marker, lbl, meta)
+}
+
+/// Full loop-row text joined. Thin wrapper over [`loop_row_parts`] for tests.
+#[cfg(test)]
+fn format_loop_row(
+    label: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, lbl, meta) = loop_row_parts(label, round, elapsed_secs, max_cols, unicode);
+    format!("{marker}{lbl}{meta}")
+}
+
+/// Todo-row marker: `☑` (Ballot Box With Check, U+2611) when unicode is
+/// available, `+` fallback for legacy terminals. Width-1 + trailing space,
+/// matching the layout contract of `goal_marker`/`loop_marker`. The ASCII
+/// fallback is `+` (not the goal/loop `*`) so a todo row stays distinguishable
+/// from a co-shown goal/loop row on non-unicode terminals.
+fn todo_marker(unicode: bool) -> &'static str {
+    if unicode {
+        "\u{2611} "
+    } else {
+        "+ "
+    }
+}
+
+/// The three display segments of the dedicated footer todo row, width-fitted:
+/// `(marker, current_task, meta)`. Mirrors `goal_row_parts` — marker in Brand,
+/// the running task in normal text, the ` · N/M` count muted. The count is
+/// RESERVED and always survives; the task title fills the rest and is truncated
+/// with `…`. With no task in progress the title is empty and the count renders
+/// bare (no leading separator). CJK/width-safe via `crate::width`.
+fn todo_row_parts(
+    current: Option<&str>,
+    completed: usize,
+    total: usize,
+    max_cols: usize,
+    unicode: bool,
+) -> (&'static str, String, String) {
+    let marker = todo_marker(unicode);
+    let icon_w = crate::width::display_width(marker);
+    let count = format!("{completed}/{total}");
+    match current {
+        Some(task) if !task.is_empty() => {
+            let meta = format!(" · {count}");
+            let title_budget = max_cols
+                .saturating_sub(icon_w)
+                .saturating_sub(crate::width::display_width(&meta));
+            if title_budget == 0 {
+                // Too narrow for the task — keep marker + count only.
+                let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
+                (marker, String::new(), bare)
+            } else {
+                let title = crate::width::truncate_with_ellipsis(task, title_budget);
+                (marker, title, meta)
+            }
+        }
+        // No task in progress → just the bare count (no leading " · ").
+        _ => {
+            let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
+            (marker, String::new(), bare)
+        }
+    }
+}
+
+/// Full todo-row text joined. Thin wrapper over [`todo_row_parts`] for tests.
+#[cfg(test)]
+fn format_todo_row(
+    current: Option<&str>,
+    completed: usize,
+    total: usize,
+    max_cols: usize,
+    unicode: bool,
+) -> String {
+    let (marker, title, meta) = todo_row_parts(current, completed, total, max_cols, unicode);
+    format!("{marker}{title}{meta}")
 }
 
 /// Format a token count using k/m units. `round_clean=true` drops the
@@ -501,12 +627,24 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Cleared by `ToolCallCommit`, which freezes the row to a static
     /// `▸` icon (no longer live) so the next push_body_row appends
     /// cleanly below it and the spinner can resume on the next tick.
+    /// A body push that arrives while the strip is STILL live (e.g. a
+    /// `task` tool streaming `↻`/`✓` progress rows) no longer buries the
+    /// strip: `push_body_row` calls `lift_inflight_strip` to pop it first
+    /// (keeping `inflight_tool` Some), and the next tick re-emits it at
+    /// the new tail — otherwise each such push orphaned a frozen snapshot.
     /// (call_id, name, detail).
     inflight_tool: Option<(String, String, String)>,
     /// Number of body lines occupied by the multi-line wrapped in-flight
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
+    /// Optional ephemeral hint (e.g. the bash "Press Ctrl+o …" line) rendered
+    /// as the LAST row(s) of the inflight strip by `render_inflight_tool`, so
+    /// it's counted in `inflight_tool_rows` and cleared atomically with the
+    /// spinner on commit. Must NOT be pushed as a standalone body row — that
+    /// breaks the "inflight strip = body tail" invariant and orphans the
+    /// spinner glyph next to the committed `●` (bash-only, since the hint is).
+    inflight_hint: Option<String>,
 
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -674,6 +812,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             in_sync_batch: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
+            inflight_hint: None,
             live_group: None,
             modal_overlay: None,
             body_log: Vec::new(),
@@ -785,7 +924,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let detail_style = self.style_for(Role::Secondary);
         let meta_style = self.style_bold(Role::ToolName);
 
-        let new_rows = if safe_detail.is_empty() {
+        let mut new_rows = if safe_detail.is_empty() {
             // No detail: simple path — name + meta, all bold
             self.build_mixed_style_rows(
                 &prefix, &prefix_style,
@@ -811,6 +950,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &full_body,
             )
         };
+
+        // Append the ephemeral hint (bash "Press Ctrl+o …") as the LAST row of
+        // the strip. Kept INSIDE `new_rows` — hence counted in `inflight_tool_rows`
+        // — so the in-place spinner rewrite and `commit_inflight_tool`'s erase
+        // cover it atomically. Rendering it as a standalone body row instead
+        // orphaned the spinner glyph on commit (the reported bug).
+        if let Some(hint) = self.inflight_hint.clone() {
+            let muted = if crate::highlight::theme::is_light_for_render() {
+                self.style_for(Role::Muted)
+            } else {
+                self.style_faint(Role::Muted)
+            };
+            let marker = if self.caps.unicode_symbols { "\u{25cb}" } else { "o" };
+            let hint_text = format!("  {marker} {hint}");
+            let screen_w = self.screen.width();
+            new_rows.push(build_one_row(&hint_text, &muted, screen_w, self.caps.unicode_symbols));
+        }
 
         let prev_rows = self.inflight_tool_rows;
         let n = new_rows.len();
@@ -900,6 +1056,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 self.scrolled_off
             );
             self.body_lines.truncate(self.body_lines.len() - remove);
+            // The old strip rows are already gone (truncated above), so clear the count
+            // BEFORE re-pushing: otherwise `push_body_row`'s `lift_inflight_strip` would see
+            // the stale `prev_rows` and pop that many rows of REAL content off the tail.
+            self.inflight_tool_rows = 0;
             for row in new_rows {
                 self.push_body_row(row);
             }
@@ -923,6 +1083,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         meta_style: &CellStyle,
         full_body: &str,
     ) -> Vec<Vec<Cell>> {
+        // Downgrade decorative glyphs (the `●`/`▸` prefix + any in name/detail) on
+        // non-unicode terminals — 1-col ASCII stand-ins preserve prefix_w alignment.
+        let u = self.caps.unicode_symbols;
+        let prefix_cow = crate::glyph::downgrade_glyphs(prefix, u);
+        let name_cow = crate::glyph::downgrade_glyphs(name, u);
+        let detail_cow = crate::glyph::downgrade_glyphs(detail, u);
+        let meta_cow = crate::glyph::downgrade_glyphs(meta, u);
+        let full_body_cow = crate::glyph::downgrade_glyphs(full_body, u);
+        let (prefix, name, detail, meta, full_body) = (
+            prefix_cow.as_ref(),
+            name_cow.as_ref(),
+            detail_cow.as_ref(),
+            meta_cow.as_ref(),
+            full_body_cow.as_ref(),
+        );
         if detail.is_empty() {
             // No detail: append meta (if any) to name, all in name_style.
             let body = if meta.is_empty() {
@@ -1436,13 +1611,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build the dedicated goal row (one full-width line, shown only while a
-    /// `/goal` loop is active). Sits directly above the status line, with a calm
-    /// hierarchy so it reads as persistent status, not a loud activity line:
-    /// the `◎` marker in `Brand` (a small accent), the condition in normal text,
-    /// and the ` · round N · elapsed` meta in `Muted` gray.
-    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
+    /// Emit one dedicated footer row from its three width-fitted segments,
+    /// with the calm shared hierarchy of the goal/loop/todo rows: `marker` in
+    /// `Brand` (a small accent), `mid` in normal text, `meta` in `Muted` gray.
+    /// Callers produce the tuple via the matching `*_row_parts` fn.
+    fn build_marker_row(&self, marker: &str, mid: &str, meta: &str) -> Vec<Cell> {
         let mut row = Vec::new();
+        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut row, mid, &CellStyle::default());
+        push_str_cells(&mut row, meta, &self.style_for(Role::Muted));
+        row
+    }
+
+    /// Build the dedicated goal row (one full-width line, shown only while a
+    /// `/goal` loop is active). Sits directly above the status line: the `◎`
+    /// marker, the condition, and the ` · round N · elapsed` meta.
+    fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
         let (marker, condition, meta) = goal_row_parts(
             &scrub_controls(&goal.condition),
             goal.round,
@@ -1450,10 +1634,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rule_width.max(1),
             self.caps.unicode_symbols,
         );
-        push_str_cells(&mut row, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut row, &condition, &CellStyle::default());
-        push_str_cells(&mut row, &meta, &self.style_for(Role::Muted));
-        row
+        self.build_marker_row(marker, &condition, &meta)
+    }
+
+    /// Build the dedicated loop row (one full-width line, shown only while a
+    /// `/loop` is active). Sits in the same slot as the goal row — goal and loop
+    /// are mutually exclusive in practice. `⚡` marker, label, ` · round N · elapsed`.
+    fn build_loop_row(&self, ls: &crate::render::LoopStatus, rule_width: usize) -> Vec<Cell> {
+        let (marker, label, meta) = loop_row_parts(
+            &scrub_controls(&ls.label),
+            ls.round,
+            ls.elapsed_secs,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        self.build_marker_row(marker, &label, &meta)
+    }
+
+    /// Build the dedicated todo row (one full-width line, shown while a todo list
+    /// is active). Sits directly above the status line — and above the goal/loop
+    /// row when one is present. `☑` marker, the running task, ` · N/M` count.
+    fn build_todo_row(&self, todo: &crate::render::TodoProgress, rule_width: usize) -> Vec<Cell> {
+        let current = todo.current.as_deref().map(scrub_controls);
+        let (marker, title, meta) = todo_row_parts(
+            current.as_deref(),
+            todo.completed,
+            todo.total,
+            rule_width.max(1),
+            self.caps.unicode_symbols,
+        );
+        self.build_marker_row(marker, &title, &meta)
     }
 
     /// Paint the full footer into `self.screen`. Layout mirrors
@@ -1543,18 +1753,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // Dedicated goal row: one full-width line above the status row, only
-        // while a `/goal` loop is active.
-        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
+        // Dedicated goal/loop row: one full-width line above the status row, shown
+        // while a `/goal` OR `/loop` is active (they are mutually exclusive in
+        // practice, so at most one row is ever reserved here).
+        let goal_rows = if self.status.goal.is_some() || self.status.loop_status.is_some() {
+            1
+        } else {
+            0
+        };
+        // Dedicated todo row: one full-width line above the status row (and above
+        // the goal/loop row when present), shown while a todo list is active.
+        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
         // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
         // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text). The goal row is folded into the
-        // status-rows reservation so the input box height accounts for it too.
+        // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
+        // into the status-rows reservation so the input box height accounts for them.
         let max_input_rows =
-            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows);
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows + todo_rows);
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -1565,7 +1783,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         let total_rows =
-            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + status_rows;
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1598,10 +1816,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let goal_cells = status_clone
-            .goal
+        // Goal and loop rows occupy the same slot (at most one is shown at a
+        // time).  Goal takes priority if somehow both are set.
+        let goal_cells: Option<Vec<Cell>> = if let Some(g) = status_clone.goal.as_ref() {
+            Some(self.build_goal_row(g, rule_width))
+        } else if let Some(ls) = status_clone.loop_status.as_ref() {
+            Some(self.build_loop_row(ls, rule_width))
+        } else {
+            None
+        };
+        let todo_cells: Option<Vec<Cell>> = status_clone
+            .todo
             .as_ref()
-            .map(|g| self.build_goal_row(g, rule_width));
+            .map(|t| self.build_todo_row(t, rule_width));
         let menu_kind = self
             .menu
             .as_ref()
@@ -1677,18 +1904,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
-        // Goal row sits directly above the status line (between the menu and
-        // the status row), so `· menu / goal / status ·`.
+        // Stack above the status line: `· menu / goal|loop / todo / status ·`.
         let goal_top = menu_top + menu_rows;
         if let Some(gr) = goal_cells {
             let mut padded = gr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(goal_top, 0, &padded);
         }
+        let todo_top = goal_top + goal_rows;
+        if let Some(tr) = todo_cells {
+            let mut padded = tr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(todo_top, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
+            self.screen.draw_row(todo_top + todo_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -1744,16 +1976,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let goal_rows = if self.status.goal.is_some() { 1 } else { 0 };
+        let goal_rows = if self.status.goal.is_some() || self.status.loop_status.is_some() {
+            1
+        } else {
+            0
+        };
+        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
-        let capped_middle = middle_rows
-            .min(Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + goal + status.
+        let capped_middle = middle_rows.min(Self::max_input_rows(
+            h,
+            attachment_rows,
+            menu_rows,
+            status_rows + goal_rows + todo_rows,
+        ));
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -2265,6 +2506,50 @@ impl<W: Write + Send> RetainedRenderer<W> {
         true
     }
 
+    /// Lift the live in-flight tool-call strip off the body tail — the multi-line mirror of
+    /// [`clear_live_spinner`]. Pops the strip's `inflight_tool_rows` rows so a following
+    /// `push_body_row` appends CLEANLY at the tail instead of burying the strip mid-buffer.
+    /// Keeps `inflight_tool` Some and zeroes `inflight_tool_rows`, so the next spinner /
+    /// StreamingBox tick re-emits a fresh strip below the just-pushed row (its `prev_rows == 0`
+    /// path). Without this, a tool that streams body rows WHILE inflight (the `task` fan-out's
+    /// `↻`/`✓` progress lines) orphans one frozen `●Task…` snapshot per streamed line — the
+    /// reported time-lapse trail. Returns true if a strip was lifted.
+    fn lift_inflight_strip(&mut self) -> bool {
+        let n = self.inflight_tool_rows;
+        if n == 0 {
+            return false;
+        }
+        crate::tuix_trace!(
+            "BPOP",
+            "site=inflight len_before={} n={} scrolled_off={}",
+            self.body_lines.len(),
+            n,
+            self.scrolled_off
+        );
+        for _ in 0..n {
+            self.body_lines.pop();
+        }
+        self.inflight_tool_rows = 0;
+        // EL-erase the vacated slots for immediate feedback (anti-flash); the next
+        // paint_frame cell-diff also redraws this region. Mirrors clear_live_spinner, but
+        // clamped to the screen height so a multi-row strip lifted while the body overflows
+        // (target saturated at the footer boundary) can't erase past the terminal bottom.
+        let target = self.next_body_emit_row();
+        if target > 0 {
+            let h = self.screen.height();
+            let mut seq = String::new();
+            for i in 0..n as u16 {
+                let r = target.saturating_add(i);
+                if r == 0 || r > h {
+                    break;
+                }
+                seq.push_str(&format!("\x1b[{r};1H\x1b[K"));
+            }
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
@@ -2274,7 +2559,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// erase it first and overwrite in-place: the spinner is
     /// transient, the new row takes its slot without scrolling other
     /// history up by one.
-    fn push_body_row(&mut self, row: Vec<Cell>) {
+    fn push_body_row(&mut self, mut row: Vec<Cell>) {
+        // Cell-level ASCII fallback backstop: every body row funnels through here, so a
+        // single pass catches decorative glyphs built as cells DIRECTLY (rule `─`, tool
+        // `●`/`└`, i18n `✓`/`✗`) that the string-level chokepoints miss. No-op on unicode
+        // terminals. Also fixes width for a downgraded 2-col glyph (emoji → 1-col ASCII).
+        if !self.caps.unicode_symbols {
+            for cell in row.iter_mut() {
+                if let Some(a) = crate::glyph::single_char_ascii(cell.ch) {
+                    cell.ch = a;
+                    cell.width = 1;
+                }
+            }
+        }
         // Diagnostic trace for the user-reported "duplicate rows in
         // scrollback" bug — every push goes through here, so a single
         // log point captures the full sequence. Enable via
@@ -2313,6 +2610,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // it; its decrement path is now a no-op (kept to avoid a
             // bigger refactor in this combined commit).
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+        }
+        // Same discipline for the live in-flight tool strip: a body push must not bury it
+        // mid-buffer (that orphans a frozen snapshot per push — the `task` streaming trail).
+        // Lift it here; the next tick re-emits it at the new tail below this row.
+        let lifted = self.inflight_tool_rows as u16;
+        if self.lift_inflight_strip() {
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(lifted);
         }
         // Append-only: `next_body_emit_row` checks the cap; emit is
         // a no-op when the footer occupies the whole viewport.
@@ -2418,6 +2722,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // Clear any previously rendered inflight tool rows so
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
+            // The hint rode inside the strip (counted in inflight_tool_rows),
+            // so the erase below covers it; just drop the state so it can't
+            // leak onto the next tool's spinner.
+            self.inflight_hint = None;
             let remove = self.inflight_tool_rows.min(self.body_lines.len());
             // CRITICAL: capture the bottom row BEFORE truncating. With
             // the top-anchored body model, `body_bottom_row()` returns
@@ -2542,6 +2850,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// its own body row with a PAD_COL prefix. Used by variants
     /// whose content is plain (assistant text, command output).
     fn push_body_text(&mut self, text: &str, style: &CellStyle) {
+        // ASCII-downgrade decorative glyphs (`✓`/`✗`/`→`/box-drawing …) on non-unicode
+        // terminals so hardcoded-in-i18n marks don't render as `□` tofu (see `glyph`).
+        let text = crate::glyph::downgrade_glyphs(text, self.caps.unicode_symbols);
+        let text = text.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if w == 0 {
             return;
@@ -2577,6 +2889,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// caller has plain text and stays on the simpler
     /// `push_body_text`.
     fn push_body_text_sgr(&mut self, text: &str) {
+        // Downgrade decorative glyphs on non-unicode terminals (see `glyph`). The inline
+        // SGR escapes are ASCII and pass through untouched.
+        let text = crate::glyph::downgrade_glyphs(text, self.caps.unicode_symbols);
+        let text = text.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if w == 0 {
             return;
@@ -2652,6 +2968,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body_style: &CellStyle,
         cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
+        // Downgrade decorative glyphs (the `●`/`▸` prefixes AND any glyphs in the body)
+        // on non-unicode terminals — 1-col ASCII stand-ins keep prefix_w alignment.
+        let u = self.caps.unicode_symbols;
+        let prefix_cow = crate::glyph::downgrade_glyphs(prefix, u);
+        let body_cow = crate::glyph::downgrade_glyphs(body, u);
+        let prefix = prefix_cow.as_ref();
+        let body = body_cow.as_ref();
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
             return Vec::new();
@@ -3208,6 +3531,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_group = None;
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
+        self.inflight_hint = None;
         self.live_spinner_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
@@ -3282,10 +3606,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 status,
                 attachments,
             } => {
-                // Returning to idle input: the spinner row served its
-                // purpose — clear it from both body history and the
-                // terminal so the user sees a clean input prompt, not
-                // a stale `⠋ Pondering…` row above the input box.
+                // Universal safety net for the hidden-caret bug: reaching the
+                // idle input prompt means the turn is over, so no tool can still
+                // be in flight. Any termination path that failed to commit it
+                // (silent non-Stopped stops, goal timeouts, protocol gaps) would
+                // otherwise leave `inflight_tool` Some and `paint_footer`'s
+                // `suppress_cursor` keep the caret hidden. No-op when already
+                // committed; `InputPrompt` is idle-only (streaming type-ahead
+                // renders via `StreamingBox`), so this can never freeze a
+                // genuinely-running tool early.
+                //
+                // Ordered before `clear_live_spinner` defensively: today the two
+                // are mutually exclusive (an inflight tool's spinner ticks route
+                // through `render_inflight_tool`, which never sets
+                // `live_spinner_active`; `ToolCallInFlight` also clears any live
+                // spinner first), so `clear_live_spinner` is a no-op while a tool
+                // is in flight. Committing first keeps that safe even if a future
+                // change lets both be active at once (`clear_live_spinner` pops a
+                // single row; a stale strip would then mis-truncate).
+                self.commit_inflight_tool();
+                // Returning to idle input: any remaining (non-tool) spinner row
+                // served its purpose — clear it so the user sees a clean input
+                // prompt, not a stale `⠋ Pondering…` row above the input box.
                 self.clear_live_spinner();
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
@@ -3357,6 +3699,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::TurnSeparator { label } => {
                 self.last_mark_was_assistant = false;
                 let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                // The summary label bakes `✓`/`✗`/`↻` from i18n — downgrade on non-unicode
+                // terminals (the reported `✗ Stopped` → `□` tofu).
+                let label = crate::glyph::downgrade_glyphs(&label, self.caps.unicode_symbols);
                 let safe = scrub_controls(&label);
                 let lw = crate::width::display_width(&safe);
                 let padded = 1 + lw + 1;
@@ -3405,6 +3750,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
+                // Safety cap: `flush_assistant_lines` only drains up to a `\n`, so a
+                // stream that dribbles bytes without ever emitting a newline (a hung
+                // keep-alive connection, or a model streaming one enormous single
+                // line) would grow `assistant_line_buf` without bound → OOM →
+                // `panic = "abort"` (surfaces on Windows as a "stack-based buffer
+                // overrun"). Force-flush the partial as a body row once it gets
+                // absurdly large. 1 MiB is orders of magnitude beyond any real line,
+                // so normal replies never hit this.
+                if self.assistant_line_buf.len() > ASSISTANT_LINE_BUF_MAX {
+                    self.flush_assistant_remainder();
+                }
             }
             UiLine::ReasoningText(text) => {
                 // Display reasoning in faint style with word wrapping.
@@ -3461,7 +3817,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
 
             // ── body: tools & diffs ──
-            UiLine::ToolCallInFlight { id, name, detail } => {
+            UiLine::ToolCallInFlight { id, name, detail, hint } => {
                 self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
@@ -3475,6 +3831,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // the body transcript) before starting a new one.
                     self.commit_inflight_tool();
                 }
+                // The hint (e.g. bash "Press Ctrl+o …") rides INSIDE the
+                // inflight strip so the spinner tick / commit erase cover it
+                // atomically. Set AFTER the preempt-commit above (which clears
+                // `inflight_hint`) so a tool that preempts a still-running one
+                // keeps ITS OWN hint, and BEFORE render_inflight_tool so the
+                // first paint already includes it.
+                self.inflight_hint = hint;
                 // Use a plausible "still" frame for the initial paint;
                 // the next Spinner / StreamingBox tick (within ~80ms)
                 // overwrites with the real frame, picking up the
@@ -3552,14 +3915,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.style_faint(Role::Muted)
                 };
                 let screen_w = self.screen.width();
-                let header_row = build_one_row(&header, &header_style, screen_w);
+                let header_row = build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
                 self.push_body_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
-                    let row = build_one_row(&c.text, &muted, screen_w);
+                    let row = build_one_row(&c.text, &muted, screen_w, self.caps.unicode_symbols);
                     self.push_body_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
@@ -3615,7 +3978,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     self.style_faint(Role::Muted)
                 };
-                let new_row = build_one_row(&new_text, &muted, self.screen.width());
+                let new_row = build_one_row(&new_text, &muted, self.screen.width(), self.caps.unicode_symbols);
 
                 // Update in-memory.
                 if let Some(slot) = self.body_lines.get_mut(row_idx) {
@@ -3659,7 +4022,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // bug as the header (see header_style comment above for
                 // the full rationale and screenshot).
                 let style = self.style_for(Role::Secondary);
-                let row = build_one_row(&text, &style, self.screen.width());
+                let row = build_one_row(&text, &style, self.screen.width(), self.caps.unicode_symbols);
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
@@ -3782,6 +4145,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("✗ {}", safe)
                 };
+                // This handler builds cells directly (bypassing push_body_text), so
+                // downgrade the `✗` prefix + any glyphs in the summary here.
+                let body_str =
+                    crate::glyph::downgrade_glyphs(&body_str, self.caps.unicode_symbols).into_owned();
                 // Align the `└` glyph with the `B` of the `Bash` (or
                 // any tool name) in the row above: the tool-call row is
                 // `● Bash(...)` with `●` at col 0 and the tool name at
@@ -3807,6 +4174,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // use 4 spaces, same column width as `"  └ "`, so the
                 // text stays aligned under the head text.
                 let mut first_visual = true;
+                // `└` leaf marker, gated for non-unicode terminals (→ ASCII backtick).
+                let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same
@@ -3828,7 +4197,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        let prefix = if first_visual { "  └ " } else { "    " };
+                        let prefix = if first_visual { leaf } else { "    " };
                         push_str_cells(&mut row, prefix, &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
@@ -3975,6 +4344,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::Error(msg) => {
+                // Defense in depth (mirror TurnComplete / TurnCancelled): a turn
+                // that errors while a tool is still in flight — gateway 5xx,
+                // timeout, rate-limit, empty-response error, a failure mid-tool —
+                // must commit it. Otherwise `inflight_tool` stays `Some` and
+                // `paint_footer`'s `suppress_cursor` keeps the input caret hidden
+                // on EVERY repaint (including while the user types), until `/clear`
+                // resets it — the reported "cursor disappears after a while" bug.
+                // Commit BEFORE the error line so the frozen `▸` tool row lands
+                // above it, matching the transcript order of a normal commit.
+                self.flush_assistant_remainder();
+                self.commit_inflight_tool();
                 let err_style = self.style_for(Role::Error);
                 let safe = scrub_controls(&msg);
                 let body = t(Msg::ErrorPrefix { msg: &safe });
@@ -3986,9 +4366,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // with a `!` glyph + bold yellow body. Always-visible:
                 // we deliberately don't dim it because the whole point
                 // is to put a truncating-proxy or similar provider
-                // pathology in front of the user immediately.
+                // pathology in front of the user immediately. Colour is
+                // theme-aware (bright yellow is near-invisible on light
+                // backgrounds — see `warning_for_current_theme`).
                 let warn_style = CellStyle {
-                    fg: Some(crossterm::style::Color::Yellow),
+                    fg: Some(crate::render::theme::warning_for_current_theme()),
                     bold: true,
                     ..CellStyle::default()
                 };
@@ -4857,6 +5239,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // bug). invalidate() must run AFTER resize so its sentinel rows are
         // sized to the new width.
         self.screen.invalidate();
+        // ── Preserve streaming parser state across the reflow. Issue
+        // #950: resize during a streaming turn must not reset mid-stream
+        // markdown parsing (code blocks lose their fence context). The
+        // partial assistant text is already present in `body_log` because
+        // `render()` logs every AssistantText chunk before buffering it, so
+        // do not append `assistant_line_buf` here.
+
+        // Snapshot markdown parser state. The reflow replays each body_log
+        // entry through render() with a freshly-reset md_state, which may
+        // produce different output (e.g. if a code fence was still open).
+        // Restoring the snapshot after reflow means subsequent AssistantText
+        // chunks continue the parse correctly — the replayed body rows are
+        // for display only.
+        let saved_md_state = self.md_state.clone();
+
+        // live_group child_indices reference body_lines positions that are
+        // invalidated by the reflow. The reflow already clears it; do NOT
+        // restore. The next ToolGroupUpdate event from the agent will rebuild
+        // it at correct positions.
+
         // Reflow the ENTIRE transcript at the new width by replaying the
         // semantic `body_log` through `render()`. The old code only
         // rebuilt the welcome banner and CLIPPED every other row to the
@@ -4869,6 +5271,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
+
+        // ── Restore saved state so subsequent streaming events continue
+        // correctly after the reflow ──
+        self.md_state = saved_md_state;
+        // live_spinner_active is NOT restored: the spinner row position
+        // may have changed (different body row count after width change).
+        // The next spinner tick from the agent naturally places it at the
+        // correct position via `push_or_update_live_spinner`.
         crate::tuix_trace!("RSZ", "body reflowed; paint begin");
         self.paint_frame();
         self.flush_frame();
@@ -4933,9 +5343,11 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
 /// and the children to col 4, breaking visual alignment with the
 /// rest of the body which lives at col 0 (user messages, single
 /// tool calls).
-fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
+fn build_one_row(text: &str, style: &CellStyle, screen_w: u16, unicode: bool) -> Vec<Cell> {
     let avail = (screen_w as usize).saturating_sub(PAD_COL);
-    let safe = scrub_controls(text);
+    // Downgrade decorative glyphs (`●` header, `└` child branches) on non-unicode terminals.
+    let text = crate::glyph::downgrade_glyphs(text, unicode);
+    let safe = scrub_controls(&text);
     // Width-aware truncation: CJK glyphs occupy 2 cols each, so a row of
     // 30 汉字 (60 cols) on a 40-col screen must trip truncate and append `…`,
     // not slip past the chars().count() check and leak past the screen edge.
@@ -5251,6 +5663,8 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
+            todo: None,
         }
     }
 
@@ -5276,6 +5690,8 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -5311,6 +5727,27 @@ mod tests {
         );
     }
 
+    /// Dedicated todo row: shows the running task + reserved `N/M` count; the
+    /// count always survives, the title truncates, and with no in-progress task
+    /// the count renders bare (no leading separator).
+    #[test]
+    fn todo_row_parts_shows_task_and_reserved_count() {
+        // Running task + count.
+        let s = format_todo_row(Some("write the parser"), 3, 7, 60, true);
+        assert!(s.contains("write the parser"), "task title present; got {s:?}");
+        assert!(s.contains("3/7"), "count present; got {s:?}");
+        assert!(s.contains(" · 3/7"), "count separated from title; got {s:?}");
+        // No in-progress task → bare count, no leading ' · '.
+        let none = format_todo_row(None, 2, 5, 60, true);
+        assert!(none.contains("2/5"), "count present; got {none:?}");
+        assert!(!none.contains(" · "), "no leading separator when no task; got {none:?}");
+        // Narrow terminal → title dropped, count still survives.
+        let narrow = format_todo_row(Some("a very long task description here"), 4, 9, 10, true);
+        assert!(narrow.contains("4/9"), "count survives narrow width; got {narrow:?}");
+        // ASCII marker fallback for legacy terminals — distinct from goal/loop's `*`.
+        assert!(format_todo_row(Some("x"), 1, 2, 60, false).starts_with("+ "));
+    }
+
     /// Bypass indicator (--dangerously-skip-permissions) renders on the
     /// RIGHT side of the status row, after the model · cwd run. It must
     /// NOT displace the left-aligned PLAN mode indicator.
@@ -5330,6 +5767,8 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -5376,6 +5815,8 @@ mod tests {
             session_name: None,
             reasoning_effort: None,
             goal: None,
+            loop_status: None,
+            todo: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -6082,6 +6523,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_streaming_body_under_inflight_strip_does_not_trail() {
+        // Regression: the `task` fan-out streams `↻`/`✓` progress lines as body rows WHILE its
+        // `● Task(N subtasks)` inflight strip is the live tail. Before `push_body_row` learned to
+        // lift the strip, each streamed line buried + orphaned a frozen `●Task…` snapshot — the
+        // reported time-lapse trail (`Task(5 subtasks) · thinking… · 18.9s / 19.0s / …`). The
+        // strip must be lifted on each body push and re-emitted ONCE at the new tail.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let text = |row: &Vec<Cell>| row.iter().map(|c| c.ch).collect::<String>();
+
+        r.render_inflight_tool("●", "Task", "5 subtasks", "");
+        assert_eq!(r.inflight_tool_rows, 1, "strip established as one live row");
+
+        for i in 0..6 {
+            r.push_body_text(&format!("start explore{i}"), &CellStyle::default());
+            assert_eq!(r.inflight_tool_rows, 0, "a body push must LIFT the live strip");
+            // Next spinner tick re-emits the strip at the new tail.
+            r.render_inflight_tool("●", "Task", "5 subtasks", "");
+        }
+
+        let strip_rows = r.body_lines.iter().filter(|row| text(row).contains("Task")).count();
+        assert_eq!(strip_rows, 1, "exactly ONE live Task strip — no trail; got {strip_rows}");
+        let streamed = r
+            .body_lines
+            .iter()
+            .filter(|row| text(row).contains("start explore"))
+            .count();
+        assert_eq!(streamed, 6, "all six streamed lines present above the strip");
+    }
+
+    #[test]
+    fn retained_inflight_fallback_rowcount_change_does_not_pop_real_content() {
+        // Regression for the `lift_inflight_strip` re-entrancy: `render_inflight_tool`'s
+        // FALLBACK branch truncates the old strip manually then re-pushes via `push_body_row`.
+        // If `inflight_tool_rows` isn't zeroed before that loop, push_body_row's new
+        // `lift_inflight_strip` sees the stale count and pops that many rows of REAL content.
+        let (mut r, _buf) = new_capturing(80, 24);
+        let text = |row: &Vec<Cell>| row.iter().map(|c| c.ch).collect::<String>();
+        r.push_body_text("real line A", &CellStyle::default());
+        r.push_body_text("real line B", &CellStyle::default());
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2
+        );
+
+        // 1-row strip (first render → fallback with prev_rows == 0).
+        r.render_inflight_tool("\u{25cf}", "Bash", "short", "");
+        assert_eq!(r.inflight_tool_rows, 1);
+
+        // A detail that WRAPS to multiple rows ⇒ prev_rows(1) != n(>1) ⇒ fallback re-push.
+        let long = "x".repeat(200);
+        r.render_inflight_tool("\u{25cf}", "Bash", &long, "");
+        assert!(r.inflight_tool_rows >= 2, "wrapped strip should be multi-row: {}", r.inflight_tool_rows);
+
+        // Both real lines must survive — the fallback re-push must not have popped them.
+        assert_eq!(
+            r.body_lines.iter().filter(|row| text(row).contains("real line")).count(),
+            2,
+            "fallback re-push popped real content via a stale inflight_tool_rows"
+        );
+    }
+
     /// Regression (datalog 2026-05-08_02-39-44 + screenshots 40.png/41.jpeg):
     /// the model emitted ONE `cargo build 2>&1 | tail -5` call that ran
     /// for 39.6s, but the user's terminal ended up with 30+ identical
@@ -6218,6 +6721,7 @@ mod tests {
             id: "call-leak".into(),
             name: "Bash".into(),
             detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
+            hint: None,
         });
         // Drive an in-place tick so the icon updates via the in-place
         // path (prev_rows>0). This is what the user's session looks
@@ -6326,6 +6830,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "cargo install cargo-udeps --locked".into(),
+            hint: None,
         });
         r.render(UiLine::Spinner {
             frame: "⠋".into(),
@@ -6407,6 +6912,7 @@ mod tests {
             id: "call_1".into(),
             name: "Bash".into(),
             detail: detail.into(),
+            hint: None,
         });
         // A spinner tick to exercise the in-place branch.
         r.render(UiLine::Spinner {
@@ -6440,6 +6946,95 @@ mod tests {
             vterm.cursor_visible(),
             "terminal cursor must be visible again after the inflight tool \
              commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
+    /// Regression: user reported the input caret vanishing "after running
+    /// a while" (can still type; `/clear` fixes it). Root cause: a turn that
+    /// ERRORS while a tool is in flight never committed `inflight_tool`
+    /// (`UiLine::Error` didn't, unlike TurnComplete/TurnCancelled), so
+    /// `paint_footer`'s `suppress_cursor` kept the caret hidden on every
+    /// repaint. Fix: the Error arm now commits the inflight tool.
+    #[test]
+    fn retained_error_after_inflight_tool_restores_cursor() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!vterm.cursor_visible(), "hidden while tool in flight");
+
+        // Turn errors mid-tool (no ToolCallCommit / TurnComplete arrives).
+        r.render(UiLine::Error("gateway 5xx".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "caret must return after an error commits the orphaned inflight tool"
+        );
+    }
+
+    /// Safety net: any termination path that returns to the idle input prompt
+    /// without committing the inflight tool (silent non-Stopped stops, goal
+    /// timeouts) must not leave the caret suppressed — the idle `InputPrompt`
+    /// redraw commits any orphan.
+    #[test]
+    fn retained_idle_redraw_commits_orphan_inflight_tool() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // A committed body line ABOVE the inflight strip — the orphan commit
+        // must remove only the strip rows, never the real body above them.
+        r.render(UiLine::AssistantText("SENTINEL_KEEP_ME".into()));
+        r.render(UiLine::AssistantLineBreak);
+        // Long detail so the inflight strip wraps to >1 row.
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cd /Users/theo/Documents/workspace/atomcode && cargo test -p atomcode-tuix --lib -- --nocapture 2>&1 | tail -200".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running Bash".into() });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!vterm.cursor_visible(), "hidden while tool in flight");
+
+        // Return to idle WITHOUT a commit/complete/error (silent stop).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "idle redraw must commit the orphan inflight tool and restore the caret"
+        );
+        // Assert on the body MODEL (not scrollback — the sentinel was already
+        // emitted there on first render, so it survives there even when the
+        // model is corrupted). The double-remove truncates the sentinel out of
+        // `body_lines`; a correct commit removes only the strip rows.
+        let body_has_sentinel = r.body_lines.iter().any(|row| {
+            row.iter().map(|c| c.ch).collect::<String>().contains("SENTINEL_KEEP_ME")
+        });
+        assert!(
+            body_has_sentinel,
+            "committing the orphan strip must not eat the real body row above it"
         );
     }
 
@@ -7305,6 +7900,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "test.txt ← \"10\"".into(),
+            hint: None,
         });
         inflight_r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
@@ -8306,6 +8902,7 @@ mod tests {
             id: "call-write-1".into(),
             name: "WriteFile".into(),
             detail: "test.txt".into(),
+            hint: None,
         });
 
         let row_texts: Vec<String> = r
@@ -9941,6 +10538,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "rm -f /tmp/test.txt".into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -10074,6 +10672,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: long_detail.into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -10182,7 +10781,7 @@ mod tests {
         // 30 汉字 = 60 display cols. Screen 40 → avail = 40 - PAD_COL = 38.
         // Row's summed cell widths must fit within avail.
         let text = "你".repeat(30);
-        let row = build_one_row(&text, &CellStyle::default(), 40);
+        let row = build_one_row(&text, &CellStyle::default(), 40, true);
         let total_cols: usize = row.iter().map(|c| c.width as usize).sum();
         assert!(
             total_cols <= 38,
@@ -10966,6 +11565,7 @@ mod tests {
             id: "call-1".into(),
             name: "Bash".into(),
             detail: "ls -la /tmp".into(),
+            hint: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -11000,6 +11600,117 @@ mod tests {
     /// regress this path. With the over-erase removed (or the math
     /// corrected) the test passes for the right reason instead of
     /// being saved by the invalidation hammer.
+    /// Regression: the bash "Press Ctrl+o …" hint must ride INSIDE the
+    /// inflight strip so the commit erase covers it. Previously the hint was a
+    /// separate body row pushed AFTER the strip, breaking the "strip = body
+    /// tail" invariant; on commit the spinner glyph orphaned and lingered next
+    /// to the committed `●` (bash-only, since only bash gets the hint).
+    #[test]
+    fn retained_bash_inflight_hint_is_part_of_strip_and_cleared_on_commit() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Bash inflight WITH the Ctrl+o hint (the bash-only case that regressed).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "grep -n pattern file".into(),
+            hint: Some("Press Ctrl+o to show real-time output while running".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // During flight the hint is visible AND part of the strip (so
+        // inflight_tool_rows counts it — header + hint ≥ 2).
+        assert!(
+            vterm.any_row(|row| row.contains("Press Ctrl+o")),
+            "hint must show during flight:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            r.inflight_tool_rows >= 2,
+            "hint must be part of the inflight strip (rows>=2), got {}",
+            r.inflight_tool_rows
+        );
+
+        // Commit the tool (ToolCallResult → ToolCallCommit).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The committed tool row remains, but the hint is GONE — not orphaned
+        // above the committed `●`.
+        assert!(
+            vterm.any_row(|row| row.contains("Bash")),
+            "committed tool row must remain:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.any_row(|row| row.contains("Press Ctrl+o")),
+            "hint must be cleared on commit, not left orphaned:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// A second inflight tool that PREEMPTS a still-running one (the rare
+    /// parallel-call path) must keep ITS OWN hint. Regression guard: the hint
+    /// must be set AFTER the preempt-commit (which clears `inflight_hint`),
+    /// not before, or the new tool renders without its hint.
+    #[test]
+    fn retained_preempting_inflight_keeps_its_own_hint() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Tool A starts (still inflight — no commit).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-a".into(),
+            name: "Bash".into(),
+            detail: "first cmd".into(),
+            hint: Some("HINT_FOR_A".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Tool B preempts A (arrives before A commits) with ITS OWN hint.
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-b".into(),
+            name: "Bash".into(),
+            detail: "second cmd".into(),
+            hint: Some("HINT_FOR_B".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // B's hint must be visible — not wiped by A's preempt-commit.
+        assert!(
+            vterm.any_row(|row| row.contains("HINT_FOR_B")),
+            "preempting tool must keep its own hint:\n{}",
+            vterm.dump()
+        );
+    }
+
     #[test]
     fn retained_approval_pop_preserves_prior_body() {
         let w: u16 = 80;
@@ -11106,6 +11817,7 @@ mod tests {
             id: "call-7".into(),
             name: "WriteFile".into(),
             detail: "atomcode_smoke_replace.txt".into(),
+            hint: None,
         });
         // Spinner ticks for the inflight tool.
         for frame in ["⠋", "⠙", "⠹"] {
@@ -11182,6 +11894,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "numbers.txt ← \"5\"".into(),
+            hint: None,
         });
         r.flush_deferred();
 
@@ -11262,6 +11975,7 @@ mod tests {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
             detail: "numbers.txt ← \"5\"".into(),
+            hint: None,
         });
         r.flush_deferred();
 
@@ -12373,6 +13087,44 @@ mod tests {
             out.ends_with("\x1b[?2026l"),
             "resize must close with ESU after the final paint: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn retained_resize_does_not_duplicate_partial_assistant_line() {
+        let (mut r, _buf) = new_capturing(40, 10);
+
+        r.render(UiLine::AssistantText("partial".into()));
+
+        r.on_resize(42, 10);
+        r.on_resize(44, 10);
+
+        assert_eq!(r.body_log.len(), 1, "unexpected body_log: {:?}", r.body_log);
+        let UiLine::AssistantText(text) = &r.body_log[0] else {
+            panic!("expected AssistantText entry, got {:?}", r.body_log);
+        };
+        assert_eq!(
+            text, "partial",
+            "resize must not append assistant_line_buf into body_log again; \
+             AssistantText chunks are already logged before they enter the line buffer"
+        );
+    }
+
+    /// A streaming reply that never emits a newline (hung keep-alive / one giant
+    /// single line) must not grow `assistant_line_buf` without bound — that was an
+    /// OOM → `panic=abort` (Windows "stack-based buffer overrun"). The >1 MiB cap
+    /// force-flushes the partial, keeping the buffer bounded.
+    #[test]
+    fn assistant_line_buf_capped_on_newlineless_stream() {
+        let (mut r, _buf) = new_capturing(40, 10);
+        let chunk = "x".repeat(100 * 1024); // 100 KiB, NO newline
+        for _ in 0..30 {
+            r.render(UiLine::AssistantText(chunk.clone())); // ~3 MiB total, no '\n'
+        }
+        assert!(
+            r.assistant_line_buf.len() <= ASSISTANT_LINE_BUF_MAX + chunk.len(),
+            "assistant_line_buf must stay bounded (cap+one chunk), got {}",
+            r.assistant_line_buf.len()
         );
     }
 

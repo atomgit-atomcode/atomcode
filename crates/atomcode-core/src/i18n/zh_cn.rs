@@ -268,6 +268,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModel => "模型？".into(),
         Msg::ProviderStepModelWithHint { current } =>
             format!("模型？[{current}]（留空保持不变）").into(),
+        Msg::ProviderStepContextWindow { default } =>
+            format!("上下文窗口？[{default}] tokens（留空使用默认值；如 128000 / 256000 / 512000 / 1000000，或 128k / 1m）").into(),
+        Msg::ProviderStepContextWindowWithHint { current } =>
+            format!("上下文窗口？[{current}] tokens（留空保持不变；如 128000 / 256000 / 512000 / 1000000，或 128k / 1m）").into(),
+        Msg::ProviderContextWindowInvalid =>
+            "上下文窗口必须是正整数 tokens，例如 128000 或 128k。".into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
@@ -709,6 +715,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("正在更新 marketplace `{name}`…").into(),
         Msg::PluginMarketplaceListFailed { error } =>
             format!("列出 marketplace 失败：{error}").into(),
+        Msg::PluginAutoUpdateSkipped { detail } =>
+            format!("插件市场自动更新已跳过（不影响对话）：{detail}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -807,11 +815,19 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
-        Msg::CmdDescCopy => "复制上一条回复里的代码块到剪贴板（/copy、/copy N、/copy all）".into(),
+        Msg::CmdDescCopy => "复制上一条回复里的代码块，或用 /copy msg 复制整条回复（/copy、/copy N、/copy all、/copy msg）".into(),
         Msg::CopyOk { lines, chars } => format!("已复制代码块到剪贴板（{lines} 行，{chars} 字符）").into(),
+        Msg::CopyOkMsg { lines, chars } => format!("已复制回复到剪贴板（{lines} 行，{chars} 字符）").into(),
         Msg::CopyNoCodeBlock => "上一条回复里没有可复制的代码块".into(),
+        Msg::CopyMsgEmpty => "上一条回复为空，没有可复制的内容".into(),
         Msg::CopyBadIndex { count } => format!("没有这个代码块——上一条回复共 {count} 个（用 /copy N，范围 1..={count}）").into(),
         Msg::CopyFailed => "剪贴板不可用——复制失败".into(),
+        Msg::CmdDescSave => "把当前对话导出为 markdown 文件（/save、/save [文件名]）".into(),
+        Msg::SaveOk { path } => format!("对话已保存到 {path}").into(),
+        Msg::SaveEmpty => "当前没有对话内容可导出".into(),
+        Msg::SaveIoError { error } => format!("保存对话失败：{error}").into(),
+        Msg::SaveInvalidPath { path } => format!("路径无效——目录不存在：{path}").into(),
+        Msg::SaveRefuseOverwrite { path } => format!("目标已存在且非 markdown 文件，已拒绝覆盖（避免误删源码/配置）：{path}。请换个 .md 文件名或新路径。").into(),
         Msg::CodeBlockCopied => "📋 代码块已复制到剪贴板".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
@@ -820,6 +836,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
+        Msg::CmdDescTodo => "重新打印当前任务清单（从会话记录中推导）".into(),
+        Msg::TodoNoList => "当前无任务清单（模型尚未创建 todo）。".into(),
+        Msg::TodoListHeader => "当前任务清单:".into(),
         Msg::ViewUsage => "用法：/view <文件路径>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
@@ -846,6 +865,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdGuideInstallFailed { error } =>
             format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+        Msg::CmdPasteNoImageOhos => {
+            "鸿蒙暂不支持读取系统剪贴板图片。请把图片存成文件，然后粘贴/输入它的绝对路径（如 /storage/.../pic.png）来添加图片。".into()
+        }
 
         // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
@@ -951,6 +973,22 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GoalNoActive =>
             "  当前没有进行中的目标。\n  用法：/goal <条件>   |   /goal help\n".into(),
         Msg::GoalCleared => "  已清除目标。\n".into(),
+
+        // ── /loop ──
+        Msg::LoopStatus { label, round, mins, secs } =>
+            format!("  ↻ loop：{} · 第 {} 轮 · {}分 {}秒\n", label, round, mins, secs).into(),
+        Msg::LoopNoActive =>
+            "  当前没有进行中的 /loop。\n  用法：/loop <间隔> <命令>  或  /loop <任务>\n".into(),
+        Msg::LoopCleared => "  已停止 /loop。\n".into(),
+        Msg::LoopRound { round, stats } =>
+            format!("⚡ loop 第 {} 轮 · {}", round, stats).into(),
+        Msg::LoopStopped => "⚠ loop 已停止（达到次数上限）\n".into(),
+        Msg::LoopEnded { reason } =>
+            format!("  ↻ Loop 已结束：{reason}\n").into(),
+        Msg::LoopNoPersistHint =>
+            "  （提示：重启 / 恢复会话后该 loop 不会保留）".into(),
+        Msg::CmdDescLoop =>
+            "按固定间隔重复执行提示/命令，或让模型自主决定节奏".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
@@ -972,6 +1010,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
 
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
+        Msg::BashInputHint => "回车执行 bash 命令".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \
@@ -1091,6 +1130,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("模型初始化失败：{detail}").into(),
         Msg::ProviderInitNeedsLogin =>
             "尚未登录，模型暂不可用；运行 /login 后可继续对话。".into(),
+        Msg::ProviderInitSourceBuild =>
+            "当前为源码构建，无法使用 AtomGit 免费网关。请用 /provider 配置一个自带 api_key \
+             的模型（如 DeepSeek 官方 / GLM / OpenAI），或改用官方发布版。".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\

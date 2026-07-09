@@ -103,6 +103,8 @@ pub enum TurnEvent {
         call: crate::tool::ToolCall,
         snapshot: crate::conversation::ConversationSnapshot,
     },
+    /// 任一端批准/拒绝了工具审批，广播给所有视图同步卡片状态。
+    ApprovalResolved { call_id: String, decision: String },
 }
 
 /// One call inside a `ToolBatchStarted` payload. Carries everything the UI

@@ -84,7 +84,7 @@ impl Tool for UseSkillTool {
                             success: false,
                         });
                     }
-                    skill.expand(&parsed.arguments, "")
+                    skill.expand_for_injection(&parsed.arguments, "")
                 }
                 None => {
                     let available: Vec<String> = registry

@@ -683,6 +683,7 @@ async fn bash_execute_background(
             .stderr(std::process::Stdio::from(err_file))
             // Must NOT kill on drop — the process is meant to outlive this call.
             .kill_on_drop(false);
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
         unsafe {
             cmd.pre_exec(|| {
                 extern "C" {
@@ -724,7 +725,7 @@ async fn bash_execute_background(
 /// Result of running a shell command, decoupled from tool-result framing.
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
 /// (user-invoked `!` mode) both build on this.
-pub(crate) struct ShellOutcome {
+pub struct ShellOutcome {
     pub stdout: String,
     pub stderr: String,
     pub exit: ShellExit,
@@ -733,7 +734,7 @@ pub(crate) struct ShellOutcome {
 
 /// How the child process ended. Mirrors the three branches the old
 /// `bash_execute` match handled: clean exit, idle-kill, hard-timeout-kill.
-pub(crate) enum ShellExit {
+pub enum ShellExit {
     /// Process exited on its own. `success` is `status.success()`,
     /// `code` is the numeric exit code (None = terminated by signal).
     Exited { success: bool, code: Option<i32> },
@@ -747,7 +748,7 @@ pub(crate) enum ShellExit {
 /// No ToolResult framing, no git snapshot, no error-signature tracking —
 /// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
 /// and stderr chunks prefixed with `[stderr] `.
-pub(crate) async fn run_shell(
+pub async fn run_shell(
     command: &str,
     wd: &std::path::Path,
     timeout_secs: u64,
@@ -801,6 +802,7 @@ pub(crate) async fn run_shell(
             // to bash's whole process group (cargo / ssh / dev-server
             // grandchildren that setsid() detached from us).
             .kill_on_drop(true);
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
         // Detach child from the controlling terminal so neither it nor any
         // grandchild (ssh, git credential helpers, server-side hook output
         // rendered by git) can write directly to /dev/tty.  Without this,
@@ -2608,6 +2610,31 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
         .await;
         assert!(matches!(outcome.exit, ShellExit::Exited { success: true, .. }));
         assert!(seen.lock().unwrap().contains("streamed"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_shell_preserves_utf8_paths_when_parent_locale_is_c() {
+        let dir = TempDir::new().unwrap();
+        let command = r#"
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#;
+
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+        let outcome = run_shell(command, dir.path(), 30, |_| {}).await;
+
+        assert!(
+            outcome
+                .stdout
+                .contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "stdout was: {:?}",
+            outcome.stdout
+        );
     }
 }
 

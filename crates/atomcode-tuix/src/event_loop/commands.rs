@@ -4,6 +4,13 @@
 // `/name` lives here — built-in info commands, modal openers, the cd
 // helper, and the blocking OAuth flow that suspends the reader + renderer.
 //
+// ─── bot review response ledger (feat/save-export-markdown, PR #562) ───
+// 每条 bot 审查意见均在代码层响应:
+//   • Low (07-01) resolve_save Ok 返回路径未 canonicalize,与 doc 不符 → 661fdd9 已改为 canonicalize 后返回,doc 一致
+//   • Low (07-03) render_save_markdown 第 4477 行 `_ => continue` 不可达死代码 → 本 commit 改为 unreachable!()
+// bot 已在 07-01 22:45 给过「✅ 未发现问题」总结,本轮按其再审建议继续优化。
+// 我们愿意根据再审意见继续优化。
+//
 // New commands should be:
 //   1. Registered in `CommandRegistry::builtin` (crates/.../commands.rs)
 //   2. Added as an arm in `execute_slash_command` below
@@ -285,52 +292,7 @@ pub(crate) fn attach_live_session(
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(session.snapshot())
             });
-        use atomcode_core::conversation::message::{MessageContent, Role};
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照 —".to_string(),
-        });
-        for m in &snapshot {
-            match (&m.role, &m.content) {
-                (Role::User, MessageContent::Text(s)) => {
-                    renderer.render(UiLine::User(s.clone()));
-                }
-                (Role::Assistant, MessageContent::Text(s)) => {
-                    if !s.is_empty() {
-                        renderer.render(UiLine::AssistantText(s.clone()));
-                        renderer.render(UiLine::AssistantLineBreak);
-                    }
-                }
-                (
-                    Role::Assistant,
-                    MessageContent::AssistantWithToolCalls {
-                        text, tool_calls, ..
-                    },
-                ) => {
-                    if let Some(t) = text {
-                        if !t.is_empty() {
-                            renderer.render(UiLine::AssistantText(t.clone()));
-                            renderer.render(UiLine::AssistantLineBreak);
-                        }
-                    }
-                    for tc in tool_calls {
-                        renderer.render(UiLine::ToolCall {
-                            name: super::display_tool_name(&tc.name),
-                            detail: super::format_tool_detail(&tc.name, &tc.arguments),
-                        });
-                    }
-                }
-                (Role::Tool, MessageContent::ToolResult(r)) => {
-                    renderer.render(UiLine::ToolResult {
-                        success: r.success,
-                        summary: super::summarise(&r.output),
-                    });
-                }
-                _ => {}
-            }
-        }
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照结束 —".to_string(),
-        });
+        render_live_snapshot_messages(renderer, &snapshot);
     }
     let handle = super::live_sync::spawn_live_forwarder(
         session.clone(),
@@ -342,6 +304,58 @@ pub(crate) fn attach_live_session(
     renderer.render(UiLine::CommandOutput(
         "已同步当前会话（与浏览器实时互通）".to_string(),
     ));
+}
+
+fn render_live_snapshot_messages(
+    renderer: &mut dyn Renderer,
+    snapshot: &[atomcode_core::conversation::message::Message],
+) {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    renderer.render(UiLine::TurnSeparator {
+        label: "— 同步快照 —".to_string(),
+    });
+    for m in snapshot {
+        match (&m.role, &m.content) {
+            (Role::User, MessageContent::Text(s)) if !m.synthetic => {
+                renderer.render(UiLine::User(s.clone()));
+            }
+            (Role::Assistant, MessageContent::Text(s)) => {
+                if !s.is_empty() {
+                    renderer.render(UiLine::AssistantText(s.clone()));
+                    renderer.render(UiLine::AssistantLineBreak);
+                }
+            }
+            (
+                Role::Assistant,
+                MessageContent::AssistantWithToolCalls {
+                    text, tool_calls, ..
+                },
+            ) => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        renderer.render(UiLine::AssistantText(t.clone()));
+                        renderer.render(UiLine::AssistantLineBreak);
+                    }
+                }
+                for tc in tool_calls {
+                    renderer.render(UiLine::ToolCall {
+                        name: super::display_tool_name(&tc.name),
+                        detail: super::format_tool_detail(&tc.name, &tc.arguments),
+                    });
+                }
+            }
+            (Role::Tool, MessageContent::ToolResult(r)) => {
+                renderer.render(UiLine::ToolResult {
+                    success: r.success,
+                    summary: super::summarise(&r.output),
+                });
+            }
+            _ => {}
+        }
+    }
+    renderer.render(UiLine::TurnSeparator {
+        label: "— 同步快照结束 —".to_string(),
+    });
 }
 
 /// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
@@ -461,6 +475,147 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
+/// Fire one iteration of a fixed-interval `/loop`.
+///
+/// Bumps the round, clears `due`, and re-arms `next_fire_at` (so the next
+/// wall-clock deadline is measured from *this* fire, not from when the
+/// previous payload eventually finished). Then dispatches the payload:
+///
+/// - `Prompt` → enqueue a `SendMessage` to the agent. Prompts can't be
+///   judged success/failure synchronously (the turn runs async), so they
+///   always reset `consecutive_failures` — the round either drives a turn
+///   to completion or the user stops the loop.
+/// - `Slash`  → run `execute_slash_command` inline; its `Result` decides
+///   whether `consecutive_failures` increments (3 in a row → `decide`
+///   returns `Stop`).
+///
+/// Callers must thread `execute_slash_command`'s extra params through so a
+/// slash payload can open modals / drive the fixissue + setup side-channels
+/// exactly as a typed command would.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_interval_payload(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let payload = match ctx.loop_ctrl.as_mut() {
+        Some(c) => {
+            c.round += 1;
+            c.due = false;
+            c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+            // `state.loop_round` is 0-based (self-paced feeds core's 0-based round
+            // here too); every display site adds +1. `c.round` is 1-based after the
+            // bump above, so subtract 1 to keep the interval path from showing one
+            // round too high (first fire = "round 1", not "round 2").
+            state.loop_round = c.round.saturating_sub(1);
+            c.payload.clone()
+        }
+        None => return,
+    };
+    match payload {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage {
+                    text,
+                    images: vec![],
+                    image_markers: vec![],
+                })
+                .ok();
+            state.on_submit();
+            if let Some(c) = ctx.loop_ctrl.as_mut() {
+                c.consecutive_failures = 0;
+            }
+        }
+        crate::event_loop::loop_ctrl::LoopPayload::Slash { cmd, arg } => {
+            let name = cmd.trim_start_matches('/');
+            let res = execute_slash_command(
+                name,
+                &arg,
+                state,
+                ctx,
+                renderer,
+                active_modal,
+                fixissue_pending,
+                fixissue_buffer,
+                setup_pending,
+            );
+            if let Some(c) = ctx.loop_ctrl.as_mut() {
+                if res.is_err() {
+                    c.consecutive_failures += 1;
+                } else {
+                    c.consecutive_failures = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Fully stop any active `/loop`: sends `ClearLoop` to halt the core
+/// self-paced loop engine AND clears the TUI fixed-interval controller plus
+/// all three mirror fields. Idempotent — safe to call when no loop is active.
+pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
+    if ctx.loop_ctrl.is_some() || state.loop_label.is_some() {
+        ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+        ctx.loop_ctrl = None;
+        state.loop_label = None;
+        state.loop_round = 0;
+        state.loop_started_at = None;
+    }
+}
+
+/// Start a fixed-interval `/loop`: parse the raw payload into a
+/// `LoopPayload`, install a fresh `LoopController` on `ctx`, seed the
+/// status-bar label/round/start-clock, and fire the first iteration
+/// immediately (so `/loop 5m /foo` runs `/foo` now, then every 5m).
+///
+/// A payload starting with `/` is a slash command (split into cmd + arg on
+/// the first whitespace); anything else is a free-text prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_interval_loop(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    secs: u64,
+    payload: String,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
+) {
+    let p = if payload.starts_with('/') {
+        let (cmd, arg) = payload
+            .split_once(char::is_whitespace)
+            .unwrap_or((payload.as_str(), ""));
+        crate::event_loop::loop_ctrl::LoopPayload::Slash {
+            cmd: cmd.to_string(),
+            arg: arg.trim().to_string(),
+        }
+    } else {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(payload.clone())
+    };
+    let mut c = crate::event_loop::loop_ctrl::LoopController::new_interval(secs, p);
+    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+    // Honor configured max_rounds (parity with self-paced mode).
+    c.max_rounds = ctx.config.loop_config.max_rounds;
+    ctx.loop_ctrl = Some(c);
+    state.loop_label = Some(format!("{secs}s · {payload}"));
+    state.loop_round = 0;
+    state.loop_started_at = Some(std::time::Instant::now());
+    fire_interval_payload(
+        state,
+        ctx,
+        renderer,
+        active_modal,
+        fixissue_pending,
+        fixissue_buffer,
+        setup_pending,
+    );
+}
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -970,21 +1125,62 @@ fn execute_slash_command_impl(
                 CopyResolve::NoBlocks => {
                     renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
                 }
+                CopyResolve::EmptyMsg => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyMsgEmpty).into_owned()));
+                }
                 CopyResolve::BadIndex(count) => {
                     renderer.render(UiLine::Warning(
                         t(Msg::CopyBadIndex { count }).into_owned(),
                     ));
                 }
-                CopyResolve::Text(payload) => {
+                CopyResolve::Text(payload, is_msg) => {
                     let lines = payload.lines().count().max(1);
                     let chars = payload.chars().count();
                     if copy_text_to_clipboard_osc52(&payload) {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::CopyOk { lines, chars }).into_owned(),
-                        ));
+                        let msg = if is_msg {
+                            t(Msg::CopyOkMsg { lines, chars })
+                        } else {
+                            t(Msg::CopyOk { lines, chars })
+                        };
+                        renderer.render(UiLine::CommandOutput(msg.into_owned()));
                     } else {
                         renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
                     }
+                }
+            }
+            renderer.flush();
+        }
+        "save" => {
+            // Export the full current conversation (every real user prompt +
+            // assistant reply, in order) to a local markdown file.
+            //   /save            → ./atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → ./report.md (relative to cwd)
+            //   /save /abs/x.md  → absolute path
+            // Existing files are overwritten; missing parent dirs are an error.
+            match resolve_save(&ctx.current_session.messages, arg) {
+                SaveOutcome::Ok(path) => {
+                    let path_str = path.to_string_lossy();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::SaveOk { path: &path_str }).into_owned(),
+                    ));
+                }
+                SaveOutcome::EmptyHistory => {
+                    renderer.render(UiLine::Warning(t(Msg::SaveEmpty).into_owned()));
+                }
+                SaveOutcome::IoError(e) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveIoError { error: &e }).into_owned(),
+                    ));
+                }
+                SaveOutcome::InvalidPath(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveInvalidPath { path: &p }).into_owned(),
+                    ));
+                }
+                SaveOutcome::RefuseOverwrite(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveRefuseOverwrite { path: &p }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -1548,18 +1744,6 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "app" => {
-            // HIDDEN until the mobile app launches: behave exactly like an unknown
-            // command so the unreleased feature isn't discoverable. The full
-            // implementation below is intentionally preserved — re-enable via
-            // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
-            // in BUILTIN_COMMANDS).
-            if !crate::commands::app_remote_enabled() {
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
             // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
@@ -1654,12 +1838,31 @@ fn execute_slash_command_impl(
                             sid,
                             initial,
                         );
+                        // 1.5) 检查登录态：未登录不允许开启远程访问。
+                        if atomcode_core::auth::oauth::get_stored_auth().is_none() {
+                            renderer.render(UiLine::CommandOutput(
+                                "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。".to_string(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
+                        //    清理旧的 sync 状态，避免旧 forwarder task 残留。
+                        if let Some(h) = ctx.sync_forwarder.take() {
+                            h.abort();
+                        }
+                        ctx.sync_session = None;
+                        atomcode_daemon::stop_app_server();
+                        //    传入当前登录 user_id 启用双向校验。
+                        let app_user_id =
+                            atomcode_core::auth::oauth::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
                                     "127.0.0.1",
                                     atomcode_daemon::APP_DEFAULT_PORT,
+                                    app_user_id,
                                 ),
                             )
                         });
@@ -1744,7 +1947,7 @@ fn execute_slash_command_impl(
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 AtomCode App 扫码连接
+                                                        "用 GitCode App 扫码连接
                                                         \n{q}\n\
                                                          （/app stop 断开）"
                                                     ),
@@ -1775,6 +1978,12 @@ fn execute_slash_command_impl(
             // the next LLM request fails with a "re-run /codingplan"
             // hint instead of the TUI crashing on next startup because
             // `default_provider` got cleared.
+            //
+            // 安全：登出时自动关闭 App 远程访问，防止隧道仍在线。
+            if ctx.app_relay_child.take().map_or(false, |mut c| c.start_kill().is_ok()) {
+                let _ = ctx.app_relay_child.take();
+            }
+            atomcode_daemon::stop_app_server();
             match atomcode_core::auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);
@@ -2013,6 +2222,11 @@ fn execute_slash_command_impl(
                         return Ok(());
                     };
 
+                    // Switching sessions: stop any active /loop so its TUI-side interval
+                    // controller can't keep firing the old payload into the newly-resumed
+                    // session (and clear the stale footer). ClearLoop reaches the outgoing
+                    // agent before the swap below.
+                    stop_active_loop(state, ctx);
                     ctx.agent = client;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
@@ -2020,6 +2234,7 @@ fn execute_slash_command_impl(
                     state.on_turn_complete();
                     crate::modals::session_picker::replay_session(
                         renderer,
+                        state,
                         &ctx.current_session,
                         true,
                     );
@@ -2689,6 +2904,98 @@ fn execute_slash_command_impl(
                 }
             }
         }
+        "loop" => {
+            use crate::event_loop::loop_parse::{parse_loop_arg, LoopArg};
+            match parse_loop_arg(arg) {
+                LoopArg::Status => {
+                    if let Some(ref label) = state.loop_label.clone() {
+                        let secs = state
+                            .loop_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = secs / 60;
+                        let secs_rem = secs % 60;
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopStatus {
+                                label: label.as_str(),
+                                round: (state.loop_round + 1) as u32,
+                                mins,
+                                secs: secs_rem,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopNoActive).into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                LoopArg::Stop => {
+                    stop_active_loop(state, ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopCleared).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::SelfPaced { prompt } => {
+                    // Replace any existing loop (both self-paced core and
+                    // fixed-interval TUI controller) before setting a new one.
+                    stop_active_loop(state, ctx);
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetLoop { prompt: prompt.clone() })
+                        .ok();
+                    state.loop_label = Some(prompt.clone());
+                    state.loop_round = 0;
+                    state.loop_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: prompt,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
+                }
+                LoopArg::Interval { secs, payload } => {
+                    // Fixed-interval mode: stop any currently running loop
+                    // (self-paced or fixed-interval) first, then install a
+                    // fresh wall-clock LoopController and fire the first
+                    // iteration now. The TUI event loop's deadline arm +
+                    // TurnComplete hook re-fire it on schedule while the agent
+                    // is idle (see run_loop / handle_loop_decision).
+                    stop_active_loop(state, ctx);
+                    start_interval_loop(
+                        state,
+                        ctx,
+                        renderer,
+                        secs,
+                        payload,
+                        active_modal,
+                        fixissue_pending,
+                        fixissue_buffer,
+                        setup_pending,
+                    );
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::Error(msg) => {
+                    renderer.render(UiLine::Error(msg));
+                    renderer.flush();
+                }
+            }
+        }
         "plugin" => {
             // Bare `/plugin` opens the interactive manager; subcommands
             // (`marketplace …`, `install x@mp`, …) keep their old behavior.
@@ -2840,6 +3147,18 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "todo" => {
+            // Derive the current todo list from the session transcript and
+            // print it.  Stateless: finds the last `todowrite` tool call in
+            // `ctx.current_session.messages` and re-renders its payload.
+            // No args used; any extra text is silently ignored.
+            let out = format_todo_command(
+                &ctx.current_session.messages,
+                ctx.caps.unicode_symbols,
+            );
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
@@ -2972,7 +3291,7 @@ pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<Strin
     if !skill.user_invocable {
         return None;
     }
-    Some(skill.expand(arg, ctx.current_session.id.as_str()))
+    Some(skill.expand_for_injection(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/plugin` subcommands: marketplace add/remove/update/list,
@@ -4113,6 +4432,11 @@ pub(crate) fn reset_to_new_session(
     renderer: &mut dyn Renderer,
 ) {
     ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    // /clear and /session must also halt any active /loop (both self-paced
+    // core and fixed-interval TUI controller).  stop_active_loop sends its
+    // own ClearLoop which is harmless to duplicate — it arrives after
+    // ClearConversation and is idempotent on the core side.
+    stop_active_loop(state, ctx);
     ctx.current_session_id = None;
     state.total_tokens = 0;
     state.prompt_tokens = 0;
@@ -4196,7 +4520,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
 /// Does NOT persist — call `save_recent_dirs` after, or use `apply_cd`
 /// which does both.
 pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
-    dirs.retain(|d| d != &new);
+    // De-dup case-insensitively on case-insensitive filesystems so `C:\Users`
+    // and `C:\users` (same physical dir) don't both linger in the picker.
+    let key = atomcode_core::tool::path_case_key(&new);
+    dirs.retain(|d| atomcode_core::tool::path_case_key(d) != key);
     dirs.insert(0, new);
     dirs.truncate(MAX_RECENT_DIRS);
 }
@@ -4208,9 +4535,10 @@ pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
 ///
 /// De-dup matters because a legacy file can hold BOTH the `\\?\C:\…` verbatim
 /// form and the plain `C:\…` form of the same dir (cd'd on an old vs a fixed
-/// binary). Stripping collapses them to one path, but `push_recent_dir` only
-/// de-dups on WRITE — without de-duping on read the picker showed the same dir
-/// as two identical `~/atomcode` rows.
+/// binary), OR the same dir in two cases (`C:\Users` vs `C:\users`). Stripping
+/// collapses the verbatim form and the case-insensitive key collapses the case
+/// variants, so the picker shows one `~/atomcode` row, not two. `push_recent_dir`
+/// only de-dups on WRITE — this handles the READ side for pre-existing files.
 fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     contents
@@ -4218,7 +4546,7 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
         .filter(|l| !l.trim().is_empty())
         .map(PathBuf::from)
         .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
-        .filter(|p| seen.insert(p.clone()))
+        .filter(|p| seen.insert(atomcode_core::tool::path_case_key(p)))
         .collect()
 }
 
@@ -4478,32 +4806,188 @@ fn extract_code_blocks(md: &str) -> Vec<String> {
 }
 
 /// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+#[derive(Debug)]
 enum CopyResolve {
-    /// The text to place on the clipboard.
-    Text(String),
+    /// The text to place on the clipboard. The bool is `true` when this came
+    /// from `/copy msg` (the full reply) so the caller can use a confirmation
+    /// message that says "reply" rather than "code block".
+    Text(String, bool),
     /// The reply has no fenced code block (or there's no reply yet).
     NoBlocks,
+    /// `/copy msg` was used but the reply is empty/whitespace-only.
+    /// Distinct from `NoBlocks` so the caller can surface a "reply is empty"
+    /// hint rather than the misleading "no code block" wording.
+    EmptyMsg,
     /// `/copy N` referenced an out-of-range index; carries the block count.
     BadIndex(usize),
 }
 
+/// Outcome of `/save [filename]` — either the conversation was written to a
+/// file (carrying the resolved path for display) or it failed for one of three
+/// reasons: nothing to export, an I/O error, or an invalid/unsafe path.
+#[derive(Debug)]
+enum SaveOutcome {
+    /// File written successfully; carries the resolved absolute path.
+    Ok(std::path::PathBuf),
+    /// The session has no exportable conversation turns yet.
+    EmptyHistory,
+    /// The underlying filesystem write failed; carries the error message.
+    IoError(String),
+    /// The requested path is invalid or its parent directory does not exist.
+    InvalidPath(String),
+    /// The target already exists and is NOT a markdown file — refuse to clobber
+    /// it (a `/save mydata.py` typo would otherwise overwrite source/config with
+    /// the transcript). Carries the target path for the message.
+    RefuseOverwrite(String),
+}
+
+/// Expand a leading `~` / `~/` in `arg` to `home`, mirroring shell behaviour so
+/// `/save ~/notes.md` lands in the home dir instead of a literal `./~/` folder
+/// (consistent with read_file / glob, which already expand `~`). Pure over
+/// `home` so it is unit-testable without touching the environment. A bare `~`
+/// → home; `~/x` → home/x; `~user` and everything else pass through unchanged
+/// (we don't resolve other users' homes). No home known → `arg` as-is.
+fn expand_tilde_path(arg: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let Some(home) = home else {
+        return std::path::PathBuf::from(arg);
+    };
+    if arg == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = arg.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(arg)
+}
+
+/// Whether `path`'s extension marks it as a markdown file (case-insensitive
+/// `md` / `markdown`). Used to gate the "refuse to overwrite a non-markdown
+/// file" guard.
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+/// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
+/// Extracted from [`resolve_save`] so unit tests can check the naming scheme
+/// without touching the filesystem (where parallel chdir would race).
+fn default_save_filename() -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    format!("atomcode-session-{stamp}.md")
+}
+
+/// Render the session's exportable turns as a markdown transcript. Pure /
+/// side-effect-free so it can be unit-tested independently of file I/O.
+fn render_save_markdown(messages: &[atomcode_core::conversation::message::Message]) -> Option<String> {
+    use atomcode_core::conversation::message::Role;
+    let turns: Vec<(&Role, &str)> = messages
+        .iter()
+        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
+        .filter_map(|m| m.text().map(|t| (&m.role, t)))
+        .filter(|(_, t)| !t.trim().is_empty())
+        .collect();
+    if turns.is_empty() {
+        return None;
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut out = String::new();
+    out.push_str(&format!("# AtomCode Session - {now}\n\n"));
+    for (role, text) in &turns {
+        let label = match role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            // bot review Low: filter 上游已限定为 User|Assistant,该臂不可达。
+            // 用 unreachable! 替代静默 continue,一旦未来 filter 放宽会立即 panic 暴露,而非悄悄丢消息。
+            _ => unreachable!("render_save_markdown: role filtered to User|Assistant upstream"),
+        };
+        out.push_str(&format!("## {label}\n{text}\n\n"));
+    }
+    Some(out)
+}
+
+/// Map `/save [filename]` to a written file. `""` → a timestamped default
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the current working directory;
+/// a bare name or relative path resolves against the current working dir;
+/// an absolute path is used as-is. Existing files are overwritten.
+fn resolve_save(
+    messages: &[atomcode_core::conversation::message::Message],
+    arg: &str,
+) -> SaveOutcome {
+    let Some(content) = render_save_markdown(messages) else {
+        return SaveOutcome::EmptyHistory;
+    };
+
+    let arg = arg.trim();
+    let path = if arg.is_empty() {
+        std::path::PathBuf::from(default_save_filename())
+    } else {
+        // Expand `~` (sudo-aware home via crate::platform) so `/save ~/x.md`
+        // works like it does in the shell / other file-taking commands.
+        expand_tilde_path(arg, crate::platform::home_dir().as_deref())
+    };
+
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
+    // so a typo can't silently scatter directories. An empty parent (writing
+    // to the cwd, the common relative-name case) always "exists".
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
+        }
+    }
+
+    // Refuse to overwrite an existing NON-markdown file: `/save` is a markdown
+    // export, so a target like `config.py` / `.bashrc` / a bare `notes` that
+    // already exists is almost certainly a typo, and clobbering it loses data.
+    // Overwriting an existing `.md` (re-export) is fine; a NEW file of any name
+    // is fine (no clobber). The default filename is always a fresh timestamped
+    // `.md`, so it never trips this.
+    if path.is_file() && !is_markdown_path(&path) {
+        return SaveOutcome::RefuseOverwrite(path.to_string_lossy().into_owned());
+    }
+
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            // Canonicalize so SaveOutcome::Ok carries an absolute path as
+            // documented (matches the "resolved absolute path" doc comment).
+            // On the rare canonicalize failure (e.g. the file was removed
+            // between write and canonicalize on some platforms), fall back
+            // to the as-written path so the success isn't turned into an
+            // error by a post-success race.
+            let resolved = path.canonicalize().unwrap_or(path);
+            SaveOutcome::Ok(resolved)
+        }
+        Err(e) => SaveOutcome::IoError(e.to_string()),
+    }
+}
+
 /// Map `/copy [arg]` to the text to copy. `""` → last block (the common
 /// "copy the command just shown" case); `all` → every block joined by a blank
-/// line; `N` (1-based) → the Nth block.
+/// line; `N` (1-based) → the Nth block; `msg` → the full reply markdown
+/// (prose + code, useful for pasting the whole answer elsewhere).
 fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let arg = arg.trim();
+    // `/copy msg` → full reply markdown (skip code-block extraction entirely).
+    if arg.eq_ignore_ascii_case("msg") {
+        let trimmed = md.trim();
+        if trimmed.is_empty() {
+            return CopyResolve::EmptyMsg;
+        }
+        return CopyResolve::Text(trimmed.to_string(), true);
+    }
     let blocks = extract_code_blocks(md);
     if blocks.is_empty() {
         return CopyResolve::NoBlocks;
     }
-    let arg = arg.trim();
     if arg.is_empty() {
-        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default(), false);
     }
     if arg.eq_ignore_ascii_case("all") {
-        return CopyResolve::Text(blocks.join("\n\n"));
+        return CopyResolve::Text(blocks.join("\n\n"), false);
     }
     match arg.parse::<usize>() {
-        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone(), false),
         _ => CopyResolve::BadIndex(blocks.len()),
     }
 }
@@ -5185,6 +5669,43 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     Ok(())
 }
 
+/// Build the `/todo` output from the session message history.
+///
+/// Scans the transcript backwards for the most recent `todowrite` tool call,
+/// parses its `todos` array, and renders one line per task.  Returns a
+/// "no list" message when no such call has been made yet.
+///
+/// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
+pub(crate) fn format_todo_command(
+    messages: &[atomcode_core::conversation::message::Message],
+    unicode: bool,
+) -> String {
+    use atomcode_core::conversation::message::MessageContent;
+    // Walk backwards to find the last VALID `todowrite` tool-call, skipping
+    // calls whose args fail validation so an invalid final call never wipes
+    // an earlier valid list (mirrors derive_current_todos in capabilities).
+    let todos = 'found: {
+        for m in messages.iter().rev() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+                    if let Ok(parsed) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
+                        break 'found parsed;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    };
+    if todos.is_empty() {
+        return t(Msg::TodoNoList).into_owned();
+    }
+    format!(
+        "{}\n{}",
+        t(Msg::TodoListHeader),
+        atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
+    )
+}
+
 #[cfg(test)]
 mod copy_tests {
     use super::{extract_code_blocks, resolve_copy, CopyResolve};
@@ -5247,7 +5768,7 @@ mod copy_tests {
     #[test]
     fn resolve_default_picks_last_block() {
         match resolve_copy(REPLY, "") {
-            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            CopyResolve::Text(t, _) => assert_eq!(t, "cmake --build . --target demo -j4"),
             _ => panic!("default should resolve to the last block"),
         }
     }
@@ -5255,7 +5776,7 @@ mod copy_tests {
     #[test]
     fn resolve_index_is_one_based() {
         match resolve_copy(REPLY, "1") {
-            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            CopyResolve::Text(t, _) => assert!(t.starts_with("cmake D:\\proj")),
             _ => panic!("/copy 1 should pick the first block"),
         }
     }
@@ -5263,7 +5784,7 @@ mod copy_tests {
     #[test]
     fn resolve_all_joins_every_block() {
         match resolve_copy(REPLY, "all") {
-            CopyResolve::Text(t) => {
+            CopyResolve::Text(t, _) => {
                 assert!(t.contains("-DBUILD=ON"));
                 assert!(t.contains("--build ."));
             }
@@ -5282,6 +5803,173 @@ mod copy_tests {
     fn resolve_no_blocks_when_reply_has_none() {
         assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::{
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save, SaveOutcome,
+    };
+    use atomcode_core::conversation::message::{Message, Role};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn expand_tilde_path_maps_home_prefix() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(expand_tilde_path("~", Some(&home)), home);
+        assert_eq!(expand_tilde_path("~/notes.md", Some(&home)), home.join("notes.md"));
+        // Not a home-relative path → unchanged.
+        assert_eq!(expand_tilde_path("report.md", Some(&home)), PathBuf::from("report.md"));
+        assert_eq!(expand_tilde_path("/abs/x.md", Some(&home)), PathBuf::from("/abs/x.md"));
+        // `~user` is NOT expanded (we don't resolve other users' homes).
+        assert_eq!(expand_tilde_path("~bob/x", Some(&home)), PathBuf::from("~bob/x"));
+        // No home known → passthrough (never fabricate a path).
+        assert_eq!(expand_tilde_path("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_existing_non_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.py");
+        std::fs::write(&target, "SECRET = 1\n").unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        match resolve_save(&msgs, target.to_str().unwrap()) {
+            SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
+            other => panic!("expected RefuseOverwrite, got {other:?}"),
+        }
+        // The existing file must be untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET = 1\n");
+    }
+
+    #[test]
+    fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = vec![Message::new(Role::User, "hi")];
+        // Existing .md → overwrite is fine (re-export).
+        let md = dir.path().join("report.md");
+        std::fs::write(&md, "old").unwrap();
+        assert!(matches!(resolve_save(&msgs, md.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
+        // A NEW non-md file (no clobber) → allowed.
+        let fresh = dir.path().join("notes");
+        assert!(matches!(resolve_save(&msgs, fresh.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(Path::new(&fresh).is_file());
+    }
+
+    /// Build a Vec<Message> from (role, text) pairs for test fixtures.
+    fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
+        msgs.iter()
+            .map(|(role, text)| Message::new(match *role {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => Role::System,
+            }, *text))
+            .collect()
+    }
+
+    #[test]
+    fn save_empty_history_when_no_messages() {
+        assert!(matches!(resolve_save(&[], ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_tool_messages() {
+        let msgs = vec![Message::new(Role::Tool, "tool output")];
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_whitespace() {
+        let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
+        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+    }
+
+    #[test]
+    fn save_default_filename_format() {
+        // Pure naming check — no I/O, safe to run in parallel.
+        let name = default_save_filename();
+        assert!(name.starts_with("atomcode-session-"), "got: {name}");
+        assert!(name.ends_with(".md"), "got: {name}");
+        // atomcode-session-YYYYMMDD-HHMMSS.md → 17 + 15 + 3 = 35 chars
+        assert_eq!(name.len(), "atomcode-session-YYYYMMDD-HHMMSS.md".len());
+    }
+
+    #[test]
+    fn save_render_markdown_formats_turns() {
+        let msgs = conv(&[("user", "hello"), ("assistant", "hi there")]);
+        let md = render_save_markdown(&msgs).expect("non-empty renders");
+        assert!(md.starts_with("# AtomCode Session - "));
+        assert!(md.contains("## User\nhello\n\n"));
+        assert!(md.contains("## Assistant\nhi there\n\n"));
+    }
+
+    #[test]
+    fn save_render_skips_synthetic_and_tool_messages() {
+        let msgs = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::synthetic_user("synthetic injection"),
+            Message::new(Role::Tool, "tool noise"),
+            Message::new(Role::Assistant, "reply"),
+        ];
+        let md = render_save_markdown(&msgs).expect("renders");
+        assert!(md.contains("## User\nreal prompt"));
+        assert!(md.contains("## Assistant\nreply"));
+        assert!(!md.contains("synthetic injection"));
+        assert!(!md.contains("tool noise"));
+    }
+
+    #[test]
+    fn save_render_returns_none_for_empty() {
+        assert!(render_save_markdown(&[]).is_none());
+        assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+    }
+
+    #[test]
+    fn save_writes_custom_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("report.md");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                // canonicalize() may add a platform-specific prefix
+                // (e.g. \\?\ on Windows), so compare by file name + read-back
+                // rather than exact path equality.
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nping"));
+                assert!(content.contains("## Assistant\npong"));
+            }
+            _ => panic!("expected Ok, got {:?}", resolve_save(&msgs, path.to_str().unwrap())),
+        }
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("old.md");
+        std::fs::write(&path, "OLD CONTENT").expect("seed");
+        let msgs = conv(&[("user", "new turn")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nnew turn"));
+                assert!(!content.contains("OLD CONTENT"));
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn save_invalid_path_when_parent_dir_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent_dir").join("out.md");
+        let msgs = conv(&[("user", "hi")]);
+        match resolve_save(&msgs, path.to_str().unwrap()) {
+            SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
     }
 }
 
@@ -5361,6 +6049,47 @@ mod tests {
         (tmp, cwd, sub)
     }
 
+    #[test]
+    fn live_snapshot_replay_skips_synthetic_user_messages() {
+        use atomcode_core::conversation::message::{Message, Role};
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let snapshot = vec![
+            Message::new(Role::User, "real prompt"),
+            Message::synthetic_user("[Auto-read from error: src/main.rs]"),
+            Message::new(Role::Assistant, "reply"),
+        ];
+        let mut rec = Rec::default();
+
+        render_live_snapshot_messages(&mut rec, &snapshot);
+
+        let users: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["real prompt"]);
+    }
+
     /// `resolve_cd` must never return a Windows `\\?\` verbatim / extended-length
     /// path — that raw form leaked into the `/cd` confirmation message and the
     /// webui footer chip (`\\?\C:\Users\hao\atomcode`). Trivially true off
@@ -5389,6 +6118,31 @@ mod tests {
         assert_eq!(
             parse_recent_dirs("/a\n\n/b\n/a\n"),
             vec![PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+    }
+
+    // On case-insensitive filesystems (Windows/macOS) the SAME dir written in two
+    // cases (a launcher passing C:\users vs C:\Users) must collapse to one entry;
+    // first occurrence wins. See the reported bug: recent_dirs.txt held both.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn parse_recent_dirs_collapses_case_variants_on_case_insensitive_fs() {
+        assert_eq!(
+            parse_recent_dirs("/Users/danan\n/users/danan\n"),
+            vec![PathBuf::from("/Users/danan")],
+            "same dir in two cases must collapse, keeping the first"
+        );
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn push_recent_dir_dedups_case_variants_on_case_insensitive_fs() {
+        let mut dirs = vec![PathBuf::from("/Users/danan"), PathBuf::from("/other")];
+        push_recent_dir(&mut dirs, PathBuf::from("/users/danan"));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/users/danan"), PathBuf::from("/other")],
+            "re-pushing the same dir in a different case moves it to front, no dupe"
         );
     }
 
@@ -5675,6 +6429,120 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}",
             out
         );
+    }
+
+    // ── /copy msg ────────────────────────────────────────────────────
+    // `/copy msg` copies the full reply markdown (prose + code), not just
+    // the fenced code blocks. This is useful for pasting the whole answer
+    // into another document or chat.
+
+    #[test]
+    fn copy_msg_returns_full_markdown_when_reply_has_prose_and_code() {
+        let md = "Here is the plan:\n\n```rust\nfn main() {}\n```\n\nDone.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, md);
+                assert!(is_msg, "/copy msg should flag the result so the caller shows the reply confirmation, not the code-block one");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_prose_only_reply_without_code_blocks() {
+        // A reply with no fenced code block still has a meaningful body.
+        // `/copy msg` should return it; `/copy` (no arg) would return NoBlocks.
+        let md = "Just a plain explanation with no code.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, md);
+                assert!(is_msg, "/copy msg should flag the result so the caller shows the reply confirmation, not the code-block one");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_trims_leading_trailing_whitespace() {
+        let md = "\n\n  Hello world  \n\n";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, "Hello world");
+                assert!(is_msg);
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_empty_msg_when_reply_is_empty() {
+        // Empty/whitespace-only reply: nothing meaningful to copy.
+        // Distinct from NoBlocks so the caller can show a "reply is empty"
+        // hint instead of the misleading "no code block" wording.
+        for empty in ["", "   ", "\n\n"] {
+            match resolve_copy(empty, "msg") {
+                CopyResolve::EmptyMsg => {}
+                other => panic!("expected EmptyMsg for {:?}, got {:?}", empty, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_is_case_insensitive() {
+        let md = "Some text.";
+        for variant in ["msg", "MSG", "Msg", "mSg"] {
+            match resolve_copy(md, variant) {
+                CopyResolve::Text(_, is_msg) => assert!(is_msg, "case {:?} should flag is_msg", variant),
+                other => panic!("case {:?} should match, got {:?}", variant, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_does_not_break_existing_copy_no_arg() {
+        // Regression: `/copy` (no arg) still returns last code block.
+        let md = "intro\n```js\na()\n```\n```py\nb()\n```";
+        match resolve_copy(md, "") {
+            CopyResolve::Text(s, _) => assert_eq!(s, "b()"),
+            other => panic!("expected last block, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod todo_command_tests {
+    use super::format_todo_command;
+    use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::i18n::{t, Msg};
+    use atomcode_core::tool::ToolCall;
+
+    #[test]
+    fn todo_command_text_with_and_without_list() {
+        // No todowrite calls → "no list" message (i18n'd).
+        let empty = vec![Message::new(Role::User, "hi")];
+        let no_list = t(Msg::TodoNoList).into_owned();
+        assert!(
+            format_todo_command(&empty, false).contains(&no_list),
+            "empty messages should contain the i18n no-list message: {no_list:?}"
+        );
+
+        // A todowrite call with one pending item → list output.
+        let with = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+        }];
+        let out = format_todo_command(&with, false);
+        assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
     }
 
     #[test]

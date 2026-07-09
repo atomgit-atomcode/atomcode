@@ -28,6 +28,14 @@
 //! # Ok(()) }
 //! ```
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any unit test runs, so the
+// suite can't persist into the developer's real ~/.atomcode (see atomcode-test-support).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_test_support::isolate_home();
+}
+
 pub mod config;
 pub mod discipline;
 pub mod parts;
@@ -37,15 +45,18 @@ pub mod telemetry;
 
 mod assemble;
 mod rate_limit;
+mod todo;
+pub mod subagent_tiers;
 
 pub use assemble::{build_coding_agent, build_coding_agent_with};
-pub use config::CodingAgentConfig;
+pub use config::{CodingAgentConfig, SubagentProvider, TierProvider};
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
+pub use todo::TodoHook;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hooks, CodingParts, PrepareOptions, SessionBinding,
-    SessionMode,
+    SessionMode, subagent_enabled_from_env,
 };
 pub use persona::coding_persona;
 

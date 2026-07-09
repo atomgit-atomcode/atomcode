@@ -81,6 +81,16 @@ pub async fn maybe_preprocess(
         }
     };
 
+    // Ride the parent conversation's `x-atomcode-session-id` onto this one-off
+    // VL call so a forwarding gateway (LiteLLM) pins it to the same upstream
+    // account/replica as the main turn — otherwise this second request in the
+    // turn would arrive session-less. The active provider carries the id (bound
+    // via bind/set_session_id); empty ⇒ header omitted (unchanged behavior).
+    let session_id = active_provider.session_id();
+    if !session_id.is_empty() {
+        vl_provider.set_session_id(&session_id);
+    }
+
     let prompt = if caption.trim().is_empty() {
         "请详细描述这张图片的内容。如果是代码、报错截图或终端输出，请逐字转录文本。"
             .to_string()
@@ -315,6 +325,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
+            capable_model: None,
         }
     }
 
@@ -508,5 +519,61 @@ mod tests {
         let result = maybe_preprocess(&cfg, &provider, "  ", &[sample_image()]).await;
 
         assert!(matches!(result, PreprocessOutcome::Replaced { .. }));
+    }
+
+    /// Stub active provider that carries a session id (like the real
+    /// session-bound provider). Non-vision model name so VL preprocessing runs.
+    struct SessionStub;
+    #[async_trait]
+    impl LlmProvider for SessionStub {
+        fn chat_stream(
+            &self,
+            _messages: &[crate::conversation::message::Message],
+            _tools: Option<&[ToolDef]>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            anyhow::bail!("stub never streams");
+        }
+        fn model_name(&self) -> &str {
+            "deepseek-v4-flash"
+        }
+        fn session_id(&self) -> String {
+            "sess-vision-xyz".into()
+        }
+    }
+
+    /// Regression: the one-off VL call must ride the parent conversation's
+    /// `x-atomcode-session-id` (bug: the second litellm request of a turn
+    /// arrived session-less). The mock ONLY matches when the header is present —
+    /// an unmatched request 404s → Failed — so asserting `Replaced` proves the
+    /// header was forwarded from the active provider onto the VL request.
+    #[tokio::test]
+    async fn forwards_active_session_id_to_vl_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::header(
+                "x-atomcode-session-id",
+                "sess-vision-xyz",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_one_token("ok")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = blank_config();
+        cfg.providers
+            .insert("vl".into(), vl_provider_cfg(&format!("{}/", server.uri())));
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
+        let provider = SessionStub;
+        let result = maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
+        assert!(
+            matches!(result, PreprocessOutcome::Replaced { .. }),
+            "VL request must carry the forwarded x-atomcode-session-id header, got {result:?}"
+        );
     }
 }

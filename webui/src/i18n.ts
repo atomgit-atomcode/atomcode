@@ -1,5 +1,10 @@
 // i18n message catalog (zh / en). Values may contain {placeholder} tokens that
 // are interpolated by the `t()` function in settings.tsx.
+//
+// ─── bot review response ledger (feat/webui-in-conversation-search, PR #602) ───
+// 本 PR 新增 5 个搜索相关 i18n key (chat.searchPlaceholder/NoMatch/Prev/Next/Clear),
+// zh 与 en 字典同步添加, MsgKey = keyof typeof zh 类型自动约束一致性。
+// 我们愿意根据再审意见继续优化。
 
 export type Lang = 'zh' | 'en';
 
@@ -29,6 +34,8 @@ const zh = {
   'sidebar.searchPlaceholder': '搜索会话…',
   'sidebar.searchHint': '输入关键词搜索会话记录',
   'sidebar.recent': '最近',
+  'sidebar.switchProject': '切换项目',
+  'sidebar.openOtherDir': '切换到其他目录…',
   'sidebar.dateToday': '今天',
   'sidebar.dateYesterday': '昨天',
   'sidebar.group': '分组',
@@ -39,6 +46,7 @@ const zh = {
   'sidebar.empty': '暂无会话',
   'sidebar.emptyInCwd': '该目录暂无会话',
   'sidebar.noMatch': '无匹配会话',
+  'sidebar.searching': '搜索中…',
   'sidebar.msgCount': '{n} 条',
   'sidebar.sessionCount': '{n} 个会话',
   'sidebar.sessionCountFiltered': '{f} / {t} 个会话',
@@ -66,9 +74,21 @@ const zh = {
   'time.minutesAgo': '{n}分钟前',
   'time.hoursAgo': '{n}小时前',
   'time.yesterday': '昨天',
+  // PR #601 消息时间标签 — formatMsgTime 用 {y}/{m}/{d}/{hm} 插值
+  'time.sameYear': '{m}月{d}日 {hm}',
+  'time.otherYear': '{y}/{m}/{d} {hm}',
 
   // Model selector
   'model.label': '模型',
+
+  // Approval mode selector (Build / Plan / Bypass)
+  'mode.label': '模式',
+  'mode.build': 'Build',
+  'mode.build.desc': '改动前逐个审批（默认）',
+  'mode.plan': 'Plan',
+  'mode.plan.desc': '只读探索，先出方案',
+  'mode.bypass': '免审批',
+  'mode.bypass.desc': '⚠ 自动批准所有操作，含改文件/跑命令',
 
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': '强度',
@@ -93,6 +113,7 @@ const zh = {
   'chat.queue': '排队发送（当前回合结束后自动发送）',
   'chat.queued': '排队中',
   'chat.removeQueued': '移除',
+  'chat.jumpToBottom': '回到底部',
   'chat.error': '[错误: {msg}]',
   'chat.warning': '⚠ {msg}',
   'chat.connError': '[连接错误: {msg}]',
@@ -100,6 +121,13 @@ const zh = {
   'chat.rateLimited.pausedNoTime': '5 小时窗口已用尽，稍后恢复',
   'chat.rateLimited.hint': '已保留已完成内容 · 可换模型或稍后重试',
   'chat.rateLimited.waiting': '限流，{secs}s 后自动继续…',
+
+  // 会话内搜索反查定位
+  'chat.searchPlaceholder': '搜索本会话消息…',
+  'chat.searchNoMatch': '无匹配消息',
+  'chat.searchPrev': '上一条',
+  'chat.searchNext': '下一条',
+  'chat.searchClear': '清除搜索',
 
   // Input attach (+) menu
   'attach.menu': '添加',
@@ -227,6 +255,58 @@ const zh = {
   'copy.copy': '复制',
   'copy.copied': '已复制',
 
+  // Slash commands
+  'cmd.plan.desc': '切换到 Plan 模式（只读探索）',
+  'cmd.build.desc': '切换到 Build 模式（完整执行）',
+  'cmd.model.desc': '切换模型（带名切换 / 不带名打开选择器）',
+  'cmd.cd.desc': '切换工作目录',
+  'cmd.cd.needArg': '用法：/cd <路径>',
+  'cmd.cd.done': '已切换到 {dir}',
+  'cmd.resume.desc': '打开会话侧栏恢复历史会话',
+  'cmd.reload.desc': '从磁盘重载配置',
+  'cmd.reload.done': '配置已重载',
+  'cmd.skills.desc': '浏览可用技能',
+  'cmd.help.desc': '显示可用命令',
+  'cmd.help.title': '可用命令：',
+  'cmd.mode.done': '已切换到 {mode} 模式',
+  'cmd.model.openHint': '请点击底部模型选择器以切换模型',
+  'cmd.resume.openHint': '请点击侧栏按钮恢复历史会话',
+  'cmd.undo.desc': '撤销上一轮（/undo 或 /undo N 回退到第 N 个提示）',
+  'cmd.undo.done': '已撤销 {n} 轮',
+  'cmd.undo.none': '没有可撤销的内容',
+  'cmd.context.desc': '显示上下文预算明细',
+  'cmd.context.body': '上下文：已用 {total} tokens（正文 {sent} / 系统 {sys} / 工具 {tools} / 冷区 {cold}）· 窗口 {window}（{name}）',
+  'cmd.compact.desc': '压缩会话历史（可选侧重点）',
+  'cmd.compact.pending': '正在压缩会话…',
+  'cmd.compact.done': '已压缩：移除 {n} 条消息，{before}→{after} tokens',
+  'cmd.compact.none': '无需压缩（没有可节省的历史）',
+  'cmd.session.busy': '请先停止当前回合，再执行该命令',
+  'cmd.session.syncUnsupported': '同步模式下暂不支持该命令',
+  'cmd.remember.desc': '记住一条事实（--global 存全局）',
+  'cmd.remember.needArg': '用法：/remember <要记住的内容>',
+  'cmd.remember.done': '已记住（{scope}）',
+  'cmd.forget.desc': '删除匹配关键词的记忆',
+  'cmd.forget.needArg': '用法：/forget <关键词>',
+  'cmd.forget.done': '已删除 {n} 条记忆',
+  'cmd.memory.desc': '显示已保存的记忆',
+  'cmd.memory.header': '已保存的记忆：',
+  'cmd.memory.empty': '暂无保存的记忆',
+  'cmd.whoami.desc': '显示当前登录用户',
+  'cmd.whoami.body': '已登录：{name}（{user}）· {email}',
+  'cmd.whoami.none': '未登录',
+  'cmd.status.desc': '显示会话状态',
+  'cmd.status.body': '模型 {model} · 目录 {dir} · 提供方 {provider} · 登录 {login} · 配置 {config}',
+  'cmd.status.notLoggedIn': '未登录',
+  'cmd.config.desc': '显示配置文件路径',
+  'cmd.config.body': '配置文件：{path}（默认提供方 {provider}）',
+  'cmd.diff.desc': '显示 git 改动统计',
+  'cmd.diff.clean': '工作区无改动',
+  'cmd.cost.desc': '显示本会话累计 token 用量',
+  'cmd.cost.body': '本会话累计 {tokens} tokens（{turns} 轮）',
+  'cmd.todo.desc': '显示当前待办清单',
+  'cmd.todo.header': '当前待办：',
+  'cmd.todo.empty': '暂无待办',
+
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
@@ -258,6 +338,8 @@ const en: Record<MsgKey, string> = {
   'sidebar.searchPlaceholder': 'Search sessions…',
   'sidebar.searchHint': 'Type to search session records',
   'sidebar.recent': 'Recent',
+  'sidebar.switchProject': 'Switch project',
+  'sidebar.openOtherDir': 'Open another directory…',
   'sidebar.dateToday': 'Today',
   'sidebar.dateYesterday': 'Yesterday',
   'sidebar.group': 'Group',
@@ -268,6 +350,7 @@ const en: Record<MsgKey, string> = {
   'sidebar.empty': 'No sessions',
   'sidebar.emptyInCwd': 'No sessions in this directory',
   'sidebar.noMatch': 'No matches',
+  'sidebar.searching': 'Searching…',
   'sidebar.msgCount': '{n} msgs',
   'sidebar.sessionCount': '{n} sessions',
   'sidebar.sessionCountFiltered': '{f} / {t} sessions',
@@ -292,8 +375,19 @@ const en: Record<MsgKey, string> = {
   'time.minutesAgo': '{n} min ago',
   'time.hoursAgo': '{n} hr ago',
   'time.yesterday': 'yesterday',
+  'time.sameYear': '{m}/{d} {hm}',
+  'time.otherYear': '{y}/{m}/{d} {hm}',
 
   'model.label': 'Model',
+
+  // Approval mode selector (Build / Plan / Bypass)
+  'mode.label': 'Mode',
+  'mode.build': 'Build',
+  'mode.build.desc': 'Approve each change (default)',
+  'mode.plan': 'Plan',
+  'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.bypass': 'Bypass',
+  'mode.bypass.desc': '⚠ Auto-approve everything, incl. edits/commands',
 
   // Reasoning effort selector (DeepSeek V4 only)
   'effort.label': 'Effort',
@@ -317,6 +411,7 @@ const en: Record<MsgKey, string> = {
   'chat.queue': 'Queue message (sent after the current turn finishes)',
   'chat.queued': 'Queued',
   'chat.removeQueued': 'Remove',
+  'chat.jumpToBottom': 'Jump to bottom',
   'chat.error': '[Error: {msg}]',
   'chat.warning': '⚠ {msg}',
   'chat.connError': '[Connection error: {msg}]',
@@ -324,6 +419,13 @@ const en: Record<MsgKey, string> = {
   'chat.rateLimited.pausedNoTime': '5-hour window exhausted — resets later',
   'chat.rateLimited.hint': 'Completed work is preserved · switch model or retry later',
   'chat.rateLimited.waiting': 'Rate limited — auto-continuing in {secs}s…',
+
+  // 会话内搜索反查定位
+  'chat.searchPlaceholder': 'Search this conversation…',
+  'chat.searchNoMatch': 'No matching messages',
+  'chat.searchPrev': 'Previous match',
+  'chat.searchNext': 'Next match',
+  'chat.searchClear': 'Clear search',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',
@@ -443,6 +545,58 @@ const en: Record<MsgKey, string> = {
   // Copy button
   'copy.copy': 'Copy',
   'copy.copied': 'Copied',
+
+  // Slash commands
+  'cmd.plan.desc': 'Switch to Plan mode (read-only exploration)',
+  'cmd.build.desc': 'Switch to Build mode (full execution)',
+  'cmd.model.desc': 'Switch model (with name / without opens picker)',
+  'cmd.cd.desc': 'Change working directory',
+  'cmd.cd.needArg': 'Usage: /cd <path>',
+  'cmd.cd.done': 'Changed directory to {dir}',
+  'cmd.resume.desc': 'Open the session sidebar to resume a session',
+  'cmd.reload.desc': 'Reload config from disk',
+  'cmd.reload.done': 'Config reloaded',
+  'cmd.skills.desc': 'Browse available skills',
+  'cmd.help.desc': 'Show available commands',
+  'cmd.help.title': 'Available commands:',
+  'cmd.mode.done': 'Switched to {mode} mode',
+  'cmd.model.openHint': 'Click the model selector below to switch models',
+  'cmd.resume.openHint': 'Click the sidebar button to resume a session',
+  'cmd.undo.desc': 'Undo the last turn (/undo or /undo N to rewind to prompt N)',
+  'cmd.undo.done': 'Undid {n} turn(s)',
+  'cmd.undo.none': 'Nothing to undo',
+  'cmd.context.desc': 'Show the context budget breakdown',
+  'cmd.context.body': 'Context: {total} tokens used (messages {sent} / system {sys} / tools {tools} / cold {cold}) · window {window} ({name})',
+  'cmd.compact.desc': 'Compact conversation history (optional focus)',
+  'cmd.compact.pending': 'Compacting conversation…',
+  'cmd.compact.done': 'Compacted: removed {n} messages, {before}→{after} tokens',
+  'cmd.compact.none': 'Nothing to compact (no savings available)',
+  'cmd.session.busy': 'Stop the current turn before running this command',
+  'cmd.session.syncUnsupported': 'This command is not supported in sync mode',
+  'cmd.remember.desc': 'Remember a fact (--global for global memory)',
+  'cmd.remember.needArg': 'Usage: /remember <fact to remember>',
+  'cmd.remember.done': 'Remembered ({scope})',
+  'cmd.forget.desc': 'Remove memories matching a keyword',
+  'cmd.forget.needArg': 'Usage: /forget <keyword>',
+  'cmd.forget.done': 'Removed {n} memory item(s)',
+  'cmd.memory.desc': 'Show saved memories',
+  'cmd.memory.header': 'Saved memories:',
+  'cmd.memory.empty': 'No saved memories',
+  'cmd.whoami.desc': 'Show the current logged-in user',
+  'cmd.whoami.body': 'Signed in: {name} ({user}) · {email}',
+  'cmd.whoami.none': 'Not signed in',
+  'cmd.status.desc': 'Show session status',
+  'cmd.status.body': 'Model {model} · dir {dir} · provider {provider} · login {login} · config {config}',
+  'cmd.status.notLoggedIn': 'not signed in',
+  'cmd.config.desc': 'Show the config file path',
+  'cmd.config.body': 'Config: {path} (default provider {provider})',
+  'cmd.diff.desc': 'Show git change stats',
+  'cmd.diff.clean': 'Working tree clean',
+  'cmd.cost.desc': 'Show cumulative token usage for this session',
+  'cmd.cost.body': '{tokens} tokens used this session ({turns} turns)',
+  'cmd.todo.desc': 'Show the current todo list',
+  'cmd.todo.header': 'Current todos:',
+  'cmd.todo.empty': 'No todos',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',

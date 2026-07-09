@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.ui.input
 
+import com.atomcode.jetbrains.daemon.ApprovalMode
 import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ide.PasteProvider
 import com.intellij.openapi.actionSystem.DataContext
@@ -51,13 +52,14 @@ import javax.swing.event.DocumentListener
  * 输入区域容器：ContextChips + 输入行 + 底部工具栏。Claude Code 风格。
  */
 class InputPanel(
-    private val onSend: (String) -> Unit,
+    private val onSend: (String) -> Boolean,
     private val onStop: () -> Unit,
     private val onAttach: () -> Unit,
     private val onSlashCommand: () -> Unit,
     private val onClearContext: () -> Unit,
     private val onRemoveContext: (ChatContextItem) -> Unit,
     private val onModelSelect: () -> Unit,
+    private val onApprovalModeSelect: (ApprovalMode) -> Unit = {},
     private val onPasteFromClipboard: (Transferable?) -> Boolean,
 ) : JPanel(BorderLayout()), DataProvider, PasteProvider {
 
@@ -119,6 +121,20 @@ class InputPanel(
         })
     }
 
+    private val approvalModeLabel = JLabel("${ApprovalMode.Build} ▾").apply {
+        font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
+        isOpaque = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        toolTipText = "模式"
+        accessibleContext.accessibleName = "Approval mode"
+        border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (isEnabled) showApprovalModeMenu()
+            }
+        })
+    }
+
     private val actionCards = CardLayout()
     private val actionPanel = JPanel(actionCards).apply {
         isOpaque = false
@@ -158,6 +174,7 @@ class InputPanel(
                     attachButton,
                     commandButton,
                     tokenLabel,
+                    approvalModeLabel,
                     modelLabel,
                     actionPanel,
                 )
@@ -170,6 +187,7 @@ class InputPanel(
             add(attachButton)
             add(commandButton)
             add(tokenLabel)
+            add(approvalModeLabel)
             add(modelLabel)
             add(actionPanel)
         }
@@ -363,6 +381,28 @@ class InputPanel(
         modelLabel.parent?.revalidate()
     }
 
+    fun setApprovalMode(mode: ApprovalMode) {
+        approvalModeLabel.text = "$mode ▾"
+        approvalModeLabel.parent?.revalidate()
+        approvalModeLabel.repaint()
+    }
+
+    fun setApprovalModeEnabled(enabled: Boolean) {
+        approvalModeLabel.isEnabled = enabled
+        approvalModeLabel.foreground = if (enabled) MODEL_FG else DISABLED_FG
+        approvalModeLabel.repaint()
+    }
+
+    internal fun approvalModeOptionsForTest(): List<String> =
+        ApprovalMode.values().map { it.toString() }
+
+    internal fun approvalModeDisplayTextForTest(): String =
+        approvalModeLabel.text
+
+    internal fun selectApprovalModeForTest(mode: ApprovalMode) {
+        onApprovalModeSelect(mode)
+    }
+
     fun setTokenCount(current: Int, max: Int) {
         tokenLabel.text = if (max > 0) "$current/$max" else ""
         tokenLabel.parent?.revalidate()
@@ -492,11 +532,22 @@ class InputPanel(
         inputArea.requestFocusInWindow()
     }
 
+    private fun showApprovalModeMenu() {
+        val menu = JPopupMenu()
+        ApprovalMode.values().forEach { mode ->
+            menu.add(JMenuItem(mode.toString()).apply {
+                addActionListener { onApprovalModeSelect(mode) }
+            })
+        }
+        menu.show(approvalModeLabel, 0, -menu.preferredSize.height)
+    }
+
     private fun fireSend() {
         val text = inputArea.text.trim()
         if (text.isNotEmpty()) {
-            inputArea.text = ""
-            onSend(text)
+            if (onSend(text)) {
+                inputArea.text = ""
+            }
         }
     }
 
@@ -610,6 +661,7 @@ class InputPanel(
         attach: Component,
         command: Component,
         token: Component,
+        mode: Component,
         model: Component,
         action: Component,
     ) {
@@ -621,7 +673,7 @@ class InputPanel(
         val height = (toolbar.height - insets.top - insets.bottom).coerceAtLeast(0)
         val gap = 8
 
-        listOf(attach, command, token, model, action).forEach { it.isVisible = false }
+        listOf(attach, command, token, mode, model, action).forEach { it.isVisible = false }
 
         val actionSize = action.preferredSize
         val actionWidth = actionSize.width.coerceAtMost((right - left).coerceAtLeast(0))
@@ -653,6 +705,7 @@ class InputPanel(
             rightX = x - gap
         }
         placeRight(model)
+        placeRight(mode)
         placeRight(token)
     }
 
@@ -707,6 +760,8 @@ class InputPanel(
         tokenLabel.foreground = TOKEN_FG
         modelLabel.foreground = MODEL_FG
         modelLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        approvalModeLabel.foreground = if (approvalModeLabel.isEnabled) MODEL_FG else DISABLED_FG
+        approvalModeLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
         stopButton.foreground = STOP_FG
         stopButton.background = STOP_BG
         stopButton.border = clickableBorder(horizontal = 12)
@@ -730,6 +785,7 @@ class InputPanel(
         private val INPUT_FG get() = UIManager.getColor("TextArea.foreground") ?: JBColor(0x333333, 0xD4D4D4)
         private val COMPOSER_BORDER get() = UIManager.getColor("Component.borderColor") ?: JBColor(0xC9C9C9, 0x454545)
         private val SECONDARY_FG = JBColor(0x5F6368, 0xA0A0A0)
+        private val DISABLED_FG = JBColor(0x8A8F96, 0x6F7378)
         private val PLACEHOLDER_FG = JBColor(0x7A7F86, 0x8F949B)
         private val PLACEHOLDER_SECONDARY_FG = JBColor(0x9AA0A7, 0x70757C)
         private val TOKEN_FG = JBColor(0x999999, 0x666666)

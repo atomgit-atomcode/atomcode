@@ -1,6 +1,6 @@
 [package]
 name = "atomcode-askpass"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 
 [dependencies]

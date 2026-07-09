@@ -134,6 +134,11 @@ pub struct CodingParts {
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
     pub review_provider: Option<SharedReviewProvider>,
+    /// Provider slot for the `task` subagent tool, FILLED by [`assemble`] like
+    /// `review_provider`. Both tiers currently reuse the host provider (strong/weak
+    /// routing is a follow-up that adds a second signed provider in the bridge).
+    /// `None` when the `ATOMCODE_SUBAGENT` env gate is off.
+    pub subagent_provider: Option<SharedReviewProvider>,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -218,6 +223,76 @@ pub async fn prepare_with_plugin_hooks(
     } else {
         None
     };
+
+    // `task` subagent tool (env-gated, default off). Reuses the HOST provider for both
+    // tiers via a slot filled at assemble (mirrors `review_provider`); strong/weak model
+    // routing is a follow-up. Child tools: read-only `explore` vs edit-capable `worker`.
+    let subagent_provider: Option<SharedReviewProvider> =
+        if subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+            use atomcode_capabilities::tools::TaskTool;
+
+            let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
+
+            // Child subagent tool registry (mount a subset per type).
+            let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
+            atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
+            let child_reg = Arc::new(child_reg);
+
+            let explore_names: Vec<String> =
+                ["read_file", "grep", "glob", "list_directory"].iter().map(|s| s.to_string()).collect();
+            let worker_names: Vec<String> = [
+                "read_file", "edit_file", "write_file", "bash", "grep", "glob", "search_replace",
+                "list_directory",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+            let reg_e = child_reg.clone();
+            let reg_w = child_reg.clone();
+            let make_explore_tools = move || {
+                let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
+                reg_e.mount(&refs)
+            };
+            let make_worker_tools = move || {
+                let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
+                reg_w.mount(&refs)
+            };
+
+            // Prefer a bridge-injected tier provider, else fall back to the host-provider
+            // slot (filled at assemble — the single-model / same-as-host collapse path). The
+            // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
+            // first `task` use (startup never pays the reqwest-client cost) and its cache is
+            // reset by the bridge on a `/model` swap, so routing re-resolves without a respawn.
+            let fast_cell = cfg.subagent_fast_provider.clone();
+            let cap_cell = cfg.subagent_capable_provider.clone();
+            let slot_fast = slot.clone();
+            let slot_cap = slot.clone();
+            let make_fast = move || {
+                fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                    slot_fast.read().ok().and_then(|g| g.clone())
+                        .expect("subagent provider slot filled at assemble before any turn")
+                })
+            };
+            let make_capable = move || {
+                cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                    slot_cap.read().ok().and_then(|g| g.clone())
+                        .expect("subagent provider slot filled at assemble before any turn")
+                })
+            };
+
+            let subtask_timeout = subagent_timeout_from_env(
+                std::env::var("ATOMCODE_SUBAGENT_TIMEOUT").ok().as_deref(),
+            );
+            registry.register(Arc::new(
+                TaskTool::new(make_fast, make_capable, make_explore_tools, make_worker_tools)
+                    .with_subtask_timeout(subtask_timeout),
+            ));
+            names.push("task".to_string());
+            Some(slot)
+        } else {
+            None
+        };
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
@@ -353,6 +428,7 @@ pub async fn prepare_with_plugin_hooks(
         mcp_registry,
         mcp_events,
         review_provider,
+        subagent_provider,
         cc_external_hooks: cc_external,
     })
 }
@@ -363,6 +439,27 @@ impl CodingParts {
     fn mount(&self) -> MountedTools {
         let names: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
         self.registry.mount(&names)
+    }
+
+    /// Register an EXTRA driver-contributed tool into the kernel toolset, so it is
+    /// both resolvable during a turn AND exposed to the model (added to `tool_names`,
+    /// which [`mount`](Self::mount) reads). The `registry` / `tool_names` fields are
+    /// crate-private — this is the supported seam for a driver (the bridge) to inject
+    /// a tool the always-on capability set doesn't include.
+    ///
+    /// Idempotent on name: re-registering the same name (e.g. on a respawn that
+    /// re-injects the bridge's `schedule_wakeup`) replaces the tool in the registry
+    /// and does NOT duplicate the name, keeping the mounted tool list (a cache prefix)
+    /// byte-stable across respawns.
+    ///
+    /// Call BEFORE [`assemble`] (it snapshots the toolset via `mount`). The bridge
+    /// uses this for its kernel-side `schedule_wakeup` (`/loop`).
+    pub fn register_extra_tool(&mut self, tool: Arc<dyn atomcode_kernel::tool::Tool>) {
+        let name = tool.name().to_string();
+        if !self.tool_names.iter().any(|n| n == &name) {
+            self.tool_names.push(name);
+        }
+        self.registry.register(tool);
     }
 }
 
@@ -460,13 +557,33 @@ pub fn assemble(
         }
     }
 
+    if let Some(slot) = &parts.subagent_provider {
+        let sub_provider: Arc<dyn LlmProvider> = match &cfg.telemetry {
+            Some(tel) => Arc::new(
+                crate::telemetry::MeteredProvider::new(
+                    provider.clone(),
+                    tel.clone(),
+                    cfg.provider_type.as_str(),
+                    &cfg.base_url,
+                    &cfg.model,
+                    parts.session.as_ref().map(|b| b.id.as_str()),
+                )
+                .with_surface("subagent"),
+            ),
+            None => provider.clone(),
+        };
+        if let Ok(mut g) = slot.write() {
+            *g = Some(sub_provider);
+        }
+    }
+
     // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
     // likewise counted.
     let summary_provider = metered_provider;
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona(&cfg.model));
+        .persona(coding_persona(&cfg.model, crate::persona::todo_switch_enabled()));
     // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
     // or blocks — so its position does not affect the approve-what-runs contract (an
     // ARG-REWRITING gate, e.g. CC PreToolUse `updatedInput`, must instead sit BEFORE
@@ -564,6 +681,17 @@ pub fn assemble(
     }
     if let Some(b) = &parts.session {
         builder = builder.session_id(&b.id);
+        // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
+        // `task` fan-out's children run within the SAME gateway window as the main
+        // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
+        // multi-window guard serializes the strong-tier subtasks. (Single-model users already
+        // reuse the host provider, which the kernel binds with this id, so they're unaffected.)
+        if let Some(cell) = &cfg.subagent_fast_provider {
+            cell.set_session_id(&b.id);
+        }
+        if let Some(cell) = &cfg.subagent_capable_provider {
+            cell.set_session_id(&b.id);
+        }
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());
         }
@@ -578,7 +706,7 @@ const ATOMCODE_PERSONA_PREFIX: &str =
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
 fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
-    let persona = coding_persona(model);
+    let persona = coding_persona(model, crate::persona::todo_switch_enabled());
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
     };
@@ -615,10 +743,62 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
+/// env `ATOMCODE_SUBAGENT` gate: default OFF; `0`/`false`/`off`/empty (case-insensitive)
+/// = off, any other non-empty value = on. (Opposite default from `ATOMCODE_TODO`.)
+pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
+    match var {
+        None => false,
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off"),
+    }
+}
+
+/// Per-subtask wall-clock timeout from env `ATOMCODE_SUBAGENT_TIMEOUT` (whole seconds).
+/// Default 900s (15 min). Unset / empty / unparseable → default. A tiny value would kill
+/// every subtask, so anything below 30s is floored to 30s (a deliberate footgun guard).
+pub fn subagent_timeout_from_env(var: Option<&str>) -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 900;
+    const MIN_SECS: u64 = 30;
+    let secs = var
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(|s| s.max(MIN_SECS))
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+
+    #[test]
+    fn subagent_env_gate() {
+        use super::subagent_enabled_from_env as g;
+        assert!(!g(None));
+        assert!(!g(Some("0")));
+        assert!(!g(Some("false")));
+        assert!(!g(Some("off")));
+        assert!(!g(Some("")));
+        assert!(g(Some("1")));
+        assert!(g(Some("true")));
+        assert!(g(Some("yes")));
+    }
+
+    #[test]
+    fn subagent_timeout_env_parsing() {
+        use super::subagent_timeout_from_env as t;
+        use std::time::Duration;
+        // Default when unset / empty / non-numeric.
+        assert_eq!(t(None), Duration::from_secs(900));
+        assert_eq!(t(Some("")), Duration::from_secs(900));
+        assert_eq!(t(Some("abc")), Duration::from_secs(900));
+        assert_eq!(t(Some("0")), Duration::from_secs(900)); // 0 rejected → default
+        // Valid values, with whitespace tolerated.
+        assert_eq!(t(Some("600")), Duration::from_secs(600));
+        assert_eq!(t(Some("  1200 ")), Duration::from_secs(1200));
+        // Footgun guard: anything under 30s is floored to 30s.
+        assert_eq!(t(Some("5")), Duration::from_secs(30));
+    }
 
     #[test]
     fn resume_adds_persona_before_legacy_session_context() {
@@ -634,7 +814,7 @@ mod tests {
     #[test]
     fn model_switch_replaces_persona_without_duplication() {
         let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(coding_persona("old-model")),
+            Message::system(coding_persona("old-model", crate::persona::todo_switch_enabled())),
             Message::system("SESSION CONTEXT"),
         ]);
 
@@ -653,7 +833,7 @@ mod tests {
 
     #[test]
     fn current_persona_keeps_snapshot_byte_stable() {
-        let persona = coding_persona("deepseek-v4-flash");
+        let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),
             Message::system("SESSION CONTEXT"),
@@ -711,8 +891,6 @@ mod tests {
             baseline_hooks + 1,
             "the CC runner is also pushed onto the lifecycle hook chain"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// A canned provider that reports usage then ends — enough for a telemetry
@@ -790,8 +968,6 @@ mod tests {
             llm_chats, 1,
             "review sub-agent LLM round must emit one LlmChat token event"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 
     /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
@@ -833,7 +1009,5 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
-
-        std::env::remove_var("ATOMCODE_HOME");
     }
 }

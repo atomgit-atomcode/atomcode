@@ -9,15 +9,14 @@
 //! `atomcode-telemetry` (`sender/http.rs`), which sits below core for the same
 //! layering reason.
 //!
-//! Default = bypass. `no_proxy` is the app's documented default, so when the
-//! mode is `no_proxy` OR the env var is **unset** we call `.no_proxy()` on the
-//! builder — the unset case matters because a host that never published the var
-//! (a standalone embedder, or `cargo test`, where `apply_process_proxy_config`
-//! never runs) must still fall back to the NoProxy default rather than silently
-//! honoring the developer's ambient `HTTP_PROXY`/`ALL_PROXY`. This matches v1's
-//! `apply_async_proxy_policy`, which lazily applies the same NoProxy default via
-//! `ensure_runtime_initialized()` on an unset var. For the explicit
-//! `follow_system` / `default_proxy` modes the builder is returned untouched and
+//! We call `.no_proxy()` ONLY when the mode is explicitly `no_proxy`. The app's
+//! default is `follow_system` (respect the environment proxy — corporate-proxy
+//! users would otherwise time out), so an **unset** env var (standalone embedder,
+//! or `cargo test`, where `apply_process_proxy_config` never runs) falls back to
+//! honoring the ambient proxy rather than bypassing it — matching core's
+//! `apply_async_proxy_policy`, which lazily installs the same follow_system
+//! default via `ensure_runtime_initialized()` on an unset var. For
+//! `follow_system` / `default_proxy` the builder is returned untouched and
 //! reqwest's default env-based proxy detection picks up the published vars.
 
 use std::env;
@@ -29,10 +28,10 @@ const NO_PROXY_MODE: &str = "no_proxy";
 
 /// Whether outbound clients must bypass all proxies, given the published proxy
 /// mode (`None` = env var unset). Pure so it is testable without mutating the
-/// process environment. Bypass when the mode is explicitly `no_proxy` OR unset
-/// (the unset case falls back to the app's documented NoProxy default).
+/// process environment. Bypass ONLY when the mode is explicitly `no_proxy`; an
+/// unset var falls back to the app's `follow_system` default (honor env proxy).
 fn mode_disables_proxy(mode: Option<&str>) -> bool {
-    matches!(mode, None | Some(NO_PROXY_MODE))
+    matches!(mode, Some(NO_PROXY_MODE))
 }
 
 /// Whether outbound clients must bypass all proxies for the current process.
@@ -69,14 +68,14 @@ mod tests {
     // Pure predicate test — no process-env mutation, so it cannot race or leak
     // state into the sibling tests that build reqwest clients in this binary.
     #[test]
-    fn mode_disables_proxy_for_no_proxy_and_unset() {
+    fn mode_disables_proxy_only_for_explicit_no_proxy() {
         assert!(
             mode_disables_proxy(Some(NO_PROXY_MODE)),
             "explicit no_proxy bypasses"
         );
         assert!(
-            mode_disables_proxy(None),
-            "unset falls back to the NoProxy default (bypass)"
+            !mode_disables_proxy(None),
+            "unset falls back to follow_system (honor env proxy), not bypass"
         );
         assert!(
             !mode_disables_proxy(Some("follow_system")),

@@ -62,7 +62,164 @@ pub fn shell_command(command: &str) -> tokio::process::Command {
 pub fn shell_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
+    #[cfg(unix)]
+    apply_utf8_locale_env(&mut cmd);
     cmd
+}
+
+#[cfg(test)]
+pub(crate) fn locale_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn new(keys: &[&'static str]) -> Self {
+        let lock = locale_env_test_lock();
+        let saved = keys
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect();
+        Self { saved, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const UTF8_CTYPE_FALLBACK: &str = "UTF-8";
+#[cfg(target_os = "macos")]
+const UTF8_LANG_FALLBACK: &str = "en_US.UTF-8";
+#[cfg(target_os = "macos")]
+const ALLOW_BARE_UTF8_CTYPE: bool = true;
+#[cfg(all(unix, not(target_os = "macos")))]
+const UTF8_CTYPE_FALLBACK: &str = "C.UTF-8";
+#[cfg(all(unix, not(target_os = "macos")))]
+const UTF8_LANG_FALLBACK: &str = "C.UTF-8";
+#[cfg(all(unix, not(target_os = "macos")))]
+const ALLOW_BARE_UTF8_CTYPE: bool = false;
+
+#[cfg(unix)]
+fn is_c_locale(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("C") || trimmed.eq_ignore_ascii_case("POSIX")
+}
+
+#[cfg(unix)]
+fn is_utf8_locale(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.contains("utf-8") || lower.contains("utf8")
+}
+
+#[cfg(unix)]
+fn is_bare_utf8_locale(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower == "utf-8" || lower == "utf8"
+}
+
+/// Normalize locale environment variables so POSIX tools can print Unicode paths.
+#[cfg(unix)]
+pub fn normalize_utf8_locale_env(env: &mut std::collections::BTreeMap<String, String>) {
+    normalize_utf8_locale_env_for_platform(
+        env,
+        UTF8_CTYPE_FALLBACK,
+        UTF8_LANG_FALLBACK,
+        ALLOW_BARE_UTF8_CTYPE,
+    );
+}
+
+#[cfg(unix)]
+fn normalize_utf8_locale_env_for_platform(
+    env: &mut std::collections::BTreeMap<String, String>,
+    ctype_fallback: &str,
+    lang_fallback: &str,
+    allow_bare_utf8_ctype: bool,
+) {
+    let lc_all = env.get("LC_ALL").map(String::as_str);
+    if lc_all.is_some_and(|value| is_utf8_locale(value) && !is_bare_utf8_locale(value)) {
+        return;
+    }
+    if lc_all.is_some_and(|value| is_c_locale(value) || is_bare_utf8_locale(value)) {
+        env.remove("LC_ALL");
+    }
+
+    let has_utf8_ctype = env.get("LC_CTYPE").is_some_and(|value| {
+        is_utf8_locale(value) && (allow_bare_utf8_ctype || !is_bare_utf8_locale(value))
+    });
+    if !has_utf8_ctype {
+        env.insert("LC_CTYPE".to_string(), ctype_fallback.to_string());
+    }
+
+    let should_patch_lang = env
+        .get("LANG")
+        .map(|value| is_c_locale(value) || is_bare_utf8_locale(value))
+        .unwrap_or(true);
+    if should_patch_lang {
+        env.insert("LANG".to_string(), lang_fallback.to_string());
+    }
+}
+
+/// Apply a UTF-8-capable locale to subprocesses spawned from GUI hosts.
+#[cfg(unix)]
+pub fn apply_utf8_locale_env(cmd: &mut tokio::process::Command) {
+    let mut env = std::collections::BTreeMap::new();
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(key.to_string(), value.into_string().unwrap_or_default());
+        }
+    }
+    normalize_utf8_locale_env(&mut env);
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        match env.get(key) {
+            Some(value) => {
+                cmd.env(key, value);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+}
+
+/// Apply a UTF-8-capable locale to synchronous subprocesses spawned from GUI hosts.
+#[cfg(unix)]
+pub fn apply_utf8_locale_env_sync(cmd: &mut std::process::Command) {
+    let mut env = std::collections::BTreeMap::new();
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(key.to_string(), value.into_string().unwrap_or_default());
+        }
+    }
+    normalize_utf8_locale_env(&mut env);
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        match env.get(key) {
+            Some(value) => {
+                cmd.env(key, value);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
 }
 
 /// Decode raw bytes captured from a subprocess's stdout / stderr.
@@ -213,6 +370,7 @@ pub fn is_running_as_admin() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn decode_passes_through_ascii() {
@@ -240,5 +398,140 @@ mod tests {
     #[test]
     fn decode_empty_input_is_empty_string() {
         assert_eq!(decode_subprocess_output(b""), "");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_utf8_locale_env_replaces_c_locale() {
+        let mut env = BTreeMap::from([
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+        ]);
+
+        normalize_utf8_locale_env(&mut env);
+
+        assert!(env
+            .values()
+            .any(|value| value.to_ascii_lowercase().contains("utf")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_utf8_locale_env_preserves_existing_utf8_locale() {
+        let mut env = BTreeMap::from([
+            ("LC_ALL".to_string(), "zh_CN.UTF-8".to_string()),
+            ("LANG".to_string(), "zh_CN.UTF-8".to_string()),
+        ]);
+
+        normalize_utf8_locale_env(&mut env);
+
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("zh_CN.UTF-8"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_utf8_locale_env_sets_ctype_when_only_lang_mentions_utf8() {
+        let mut env = BTreeMap::from([("LANG".to_string(), "UTF-8".to_string())]);
+
+        normalize_utf8_locale_env(&mut env);
+
+        assert!(env
+            .get("LC_CTYPE")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("utf")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_utf8_locale_env_for_non_macos_replaces_bare_utf8_ctype() {
+        let mut env = BTreeMap::from([
+            ("LC_CTYPE".to_string(), "UTF-8".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+        ]);
+
+        normalize_utf8_locale_env_for_platform(&mut env, "C.UTF-8", "C.UTF-8", false);
+
+        assert_eq!(env.get("LC_CTYPE").map(String::as_str), Some("C.UTF-8"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_utf8_locale_env_for_macos_preserves_bare_utf8_ctype() {
+        let mut env = BTreeMap::from([
+            ("LC_CTYPE".to_string(), "UTF-8".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+        ]);
+
+        normalize_utf8_locale_env_for_platform(&mut env, "UTF-8", "en_US.UTF-8", true);
+
+        assert_eq!(env.get("LC_CTYPE").map(String::as_str), Some("UTF-8"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn locale_env_guard_restores_values_after_panic() {
+        std::env::set_var("ATOMCODE_ENV_GUARD_TEST", "before");
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::new(&["ATOMCODE_ENV_GUARD_TEST"]);
+            std::env::set_var("ATOMCODE_ENV_GUARD_TEST", "during");
+            panic!("trigger restore");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::env::var("ATOMCODE_ENV_GUARD_TEST").as_deref(),
+            Ok("before")
+        );
+        std::env::remove_var("ATOMCODE_ENV_GUARD_TEST");
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn shell_command_preserves_utf8_paths_when_parent_locale_is_c() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let command = r#"
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#;
+
+        let _guard = EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+        let output = shell_command(command)
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let stdout = decode_subprocess_output(&output.stdout);
+        assert!(
+            stdout.contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "stdout was: {:?}",
+            stdout
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_utf8_locale_env_ignores_unrelated_non_utf8_environment_variables() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = EnvVarGuard::new(&["ATOMCODE_NON_UTF8_TEST"]);
+        std::env::set_var(
+            "ATOMCODE_NON_UTF8_TEST",
+            OsString::from_vec(vec![b'o', b'k', 0x80]),
+        );
+
+        let result = std::panic::catch_unwind(|| {
+            let mut cmd = tokio::process::Command::new("sh");
+            apply_utf8_locale_env(&mut cmd);
+        });
+
+        assert!(result.is_ok());
     }
 }

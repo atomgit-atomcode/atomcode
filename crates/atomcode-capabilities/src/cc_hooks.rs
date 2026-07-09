@@ -266,6 +266,8 @@ async fn run_command_hook(hook: &HookConfig, stdin_json: &str) -> Option<(Option
     use tokio::io::AsyncWriteExt;
 
     let mut cmd = shell_command(&hook.command);
+    #[cfg(unix)]
+    crate::process_utils::apply_utf8_locale_env(&mut cmd);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -959,6 +961,41 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
         let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
         cc.before(&mut call, &tool, &rt).await
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn command_hook_preserves_utf8_paths_when_parent_locale_is_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().replace('\'', "'\\''");
+        let command = format!(
+            r#"
+            cd '{}'
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#,
+            cwd
+        );
+        let hook = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command,
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+
+        let (_code, stdout, _stderr) = run_command_hook(&hook, "{}").await.unwrap();
+
+        assert!(
+            stdout.contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "stdout was: {:?}",
+            stdout
+        );
     }
 
     /// Exit 2 WITH a deliberate reason DOES block (CC's bare exit-2 contract), and the

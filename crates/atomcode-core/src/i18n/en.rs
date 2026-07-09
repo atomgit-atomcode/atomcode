@@ -278,6 +278,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModel => "Model?".into(),
         Msg::ProviderStepModelWithHint { current } =>
             format!("Model? [{current}] (blank to keep)").into(),
+        Msg::ProviderStepContextWindow { default } =>
+            format!("Context window? [{default}] tokens (blank to use default; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
+        Msg::ProviderStepContextWindowWithHint { current } =>
+            format!("Context window? [{current}] tokens (blank to keep; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
+        Msg::ProviderContextWindowInvalid =>
+            "Context window must be a positive number of tokens, e.g. 128000 or 128k.".into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
@@ -722,6 +728,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("updating marketplace `{name}`…").into(),
         Msg::PluginMarketplaceListFailed { error } =>
             format!("list marketplaces: {error}").into(),
+        Msg::PluginAutoUpdateSkipped { detail } =>
+            format!("Marketplace auto-update skipped (chat unaffected): {detail}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
@@ -820,11 +828,19 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
-        Msg::CmdDescCopy => "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all)".into(),
+        Msg::CmdDescCopy => "Copy a code block, or the full reply with /copy msg (/copy, /copy N, /copy all, /copy msg)".into(),
         Msg::CopyOk { lines, chars } => format!("Copied code block to clipboard ({lines} lines, {chars} chars)").into(),
+        Msg::CopyOkMsg { lines, chars } => format!("Copied reply to clipboard ({lines} lines, {chars} chars)").into(),
         Msg::CopyNoCodeBlock => "No code block in the last reply to copy".into(),
+        Msg::CopyMsgEmpty => "The last reply is empty — nothing to copy".into(),
         Msg::CopyBadIndex { count } => format!("No such code block — the last reply has {count} (use /copy N, 1..={count})").into(),
         Msg::CopyFailed => "Clipboard unavailable — could not copy".into(),
+        Msg::CmdDescSave => "Save the current conversation to a markdown file (/save, /save [filename])".into(),
+        Msg::SaveOk { path } => format!("Conversation saved to {path}").into(),
+        Msg::SaveEmpty => "No conversation to export yet".into(),
+        Msg::SaveIoError { error } => format!("Failed to save conversation: {error}").into(),
+        Msg::SaveInvalidPath { path } => format!("Invalid path — directory does not exist: {path}").into(),
+        Msg::SaveRefuseOverwrite { path } => format!("Target exists and isn't a markdown file — refused to overwrite it (avoids clobbering source/config): {path}. Use a .md filename or a new path.").into(),
         Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
@@ -833,6 +849,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
         Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
         Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
+        Msg::CmdDescTodo => "Reprint the current todo list (derived from session transcript)".into(),
+        Msg::TodoNoList => "No task list yet (the model hasn't created todos).".into(),
+        Msg::TodoListHeader => "Current tasks:".into(),
         Msg::ViewUsage => "Usage: /view <filepath>".into(),
         Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
@@ -859,6 +878,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdGuideInstallFailed { error } =>
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+        Msg::CmdPasteNoImageOhos => {
+            "HarmonyOS can't read images from the system clipboard yet. Save the image to a file, then paste/type its absolute path (e.g. /storage/.../pic.png) to attach it.".into()
+        }
 
         // ── reasoning effort ──
         Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
@@ -968,6 +990,22 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GoalNoActive =>
             "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n".into(),
         Msg::GoalCleared => "  Goal cleared.\n".into(),
+
+        // ── /loop ──
+        Msg::LoopStatus { label, round, mins, secs } =>
+            format!("  ↻ loop: {} · round {} · {}m {}s\n", label, round, mins, secs).into(),
+        Msg::LoopNoActive =>
+            "  No active /loop.\n  Usage: /loop <interval> <cmd>  or  /loop <prompt>\n".into(),
+        Msg::LoopCleared => "  /loop stopped.\n".into(),
+        Msg::LoopRound { round, stats } =>
+            format!("⚡ loop round {} · {}", round, stats).into(),
+        Msg::LoopStopped => "⚠ loop stopped (limit reached)\n".into(),
+        Msg::LoopEnded { reason } =>
+            format!("  ↻ Loop ended: {reason}\n").into(),
+        Msg::LoopNoPersistHint =>
+            "  (note: the loop won't survive a restart / resume)".into(),
+        Msg::CmdDescLoop =>
+            "Repeat a prompt/command on an interval, or let the model self-pace".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \
@@ -991,6 +1029,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
 
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
+        Msg::BashInputHint => "Enter to run as a bash command".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
@@ -1110,6 +1149,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("provider init failed: {detail}").into(),
         Msg::ProviderInitNeedsLogin =>
             "Not signed in — model unavailable. Run /login to continue.".into(),
+        Msg::ProviderInitSourceBuild =>
+            "This is a source build — the AtomGit free gateway isn't available. Use /provider to \
+             configure a model with your own api_key (e.g. DeepSeek / GLM / OpenAI), or switch to \
+             an official release build.".into(),
         Msg::GatewayAuthUnavailable { base_url } =>
             format!(
                 "provider base_url '{base_url}' is an AtomGit gateway this build can't \
