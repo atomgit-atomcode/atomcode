@@ -379,8 +379,13 @@ async fn open_url(url: &str) -> Result<ToolResult> {
             c
         }
         OpenStrategy::WindowsStart => {
+            // Quote the URL to protect cmd.exe shell metacharacters (&, |, %, ^).
+            // cmd /c start "" "url" — the empty "" is the required window title.
+            // Without quotes, & in query strings (e.g. ?a=1&b=2) would be treated
+            // as command separators, truncating the URL.
+            let quoted = format!("\"{}\"", url.replace('"', "\"\""));
             let mut c = Command::new("cmd");
-            c.args(["/c", "start", "", url]);
+            c.args(["/c", "start", "", &quoted]);
             c
         }
         OpenStrategy::Wslview => {
