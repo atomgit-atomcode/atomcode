@@ -2954,8 +2954,347 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
             Ok(())
         }
         HookCommands::Test { name } => {
-            println!("Testing hook: {}", name);
-            println!("(TODO: Implement hook testing)");
+            use atomcode_core::hook::config_loader::load_script_hooks_with_names;
+            use atomcode_core::hook::json_config::load_hooks_config_with_names;
+            use atomcode_core::hook::{HookConfig, HookContext, HookCtx, HookEvent};
+            use serde_json::json;
+            use std::process::Stdio;
+            use std::time::Instant;
+            use tokio::io::AsyncWriteExt;
+            use tokio::time::timeout;
+
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let json_hooks = load_hooks_config_with_names(&cwd);
+            let script_hooks = load_script_hooks_with_names(&cwd);
+
+            // Try JSON hooks first
+            let json_match = json_hooks.iter().find(|(n, _)| n == &name);
+            // Then TOML script hooks
+            let script_match = script_hooks.iter().find(|(n, _)| n == &name);
+
+            enum TestedHook<'a> {
+                Json(&'a String, &'a HookConfig),
+                Script(&'a String, &'a atomcode_core::hook::script_runner::ScriptHookConfig),
+            }
+
+            let tested = json_match.map(TestedHook::Json)
+                .or_else(|| script_match.map(TestedHook::Script));
+
+            match tested {
+                None => {
+                    // ── Not found in either source ────────────────
+                    println!("❌ Hook '{}' not found.", name);
+
+                    let has_json = !json_hooks.is_empty();
+                    let has_script = !script_hooks.is_empty();
+
+                    // Check for built-in / webhook hooks via the engine
+                    let mut engine = atomcode_core::hook::HookEngine::new();
+                    engine.load_all(&cwd);
+                    let engine_names = engine.list_hook_names();
+                    let other_names: Vec<&String> = engine_names.iter()
+                        .filter(|n| {
+                            // ShellCommandHook.name() == command field (engine.rs:568),
+                            // so match against both JSON key AND command string
+                            !json_hooks.iter().any(|(jn, jh)| jn == *n || &jh.command == *n)
+                            && !script_hooks.iter().any(|(sn, _)| sn == *n)
+                        })
+                        .collect();
+                    let has_other = !other_names.is_empty();
+
+                    if !has_json && !has_script && !has_other {
+                        println!("\n  (No hooks loaded. Check your configuration files.)");
+                    } else {
+                        if has_json {
+                            println!("\nAvailable JSON hooks:");
+                            for (n, h) in &json_hooks {
+                                let event_str: String = serde_json::to_value(&h.event)
+                                    .and_then(|v| Ok(v.as_str().unwrap_or("?").to_string()))
+                                    .unwrap_or_else(|_| "?".into());
+                                println!("  🔹 {:<28} (event: {}, command: {})",
+                                    n, event_str, h.command);
+                            }
+                        }
+                        if has_script {
+                            println!("\nAvailable TOML script hooks:");
+                            for (n, h) in &script_hooks {
+                                println!("  🔹 {:<28} (event: {}, script: {})",
+                                    n, h.trigger, h.script.display());
+                            }
+                        }
+                        if has_other {
+                            println!("\n  Other loaded hooks (built-in/webhook, not testable via CLI):");
+                            for n in &other_names {
+                                println!("  ⚡ {}", n);
+                            }
+                        }
+                    }
+                }
+                Some(TestedHook::Json((hook_name, hook))) => {
+                    // ── JSON hook test (existing logic) ──────────
+                    let event_str: String = serde_json::to_value(&hook.event)
+                        .and_then(|v| Ok(v.as_str().unwrap_or("?").to_string()))
+                        .unwrap_or_else(|_| "?".into());
+
+                    let is_tool_event = matches!(&hook.event,
+                        HookEvent::PreToolUse | HookEvent::PostToolUse);
+
+                    let ctx = if is_tool_event {
+                        HookContext {
+                            event: event_str.clone(),
+                            tool_name: Some("bash".into()),
+                            tool_args: Some(json!({"command": "echo hello"})),
+                            tool_result: None,
+                            tool_success: None,
+                            session_id: "test-session-0000".into(),
+                            working_dir: cwd.display().to_string(),
+                        }
+                    } else {
+                        HookContext {
+                            event: event_str.clone(),
+                            tool_name: None,
+                            tool_args: None,
+                            tool_result: None,
+                            tool_success: None,
+                            session_id: "test-session-0000".into(),
+                            working_dir: cwd.display().to_string(),
+                        }
+                    };
+
+                    // ── Show hook info ───────────────────────────────
+                    println!("\n🔧 Testing Hook: {} (JSON)", hook_name);
+                    println!("  Event:     {}", event_str);
+                    println!("  Command:   {}", hook.command);
+                    println!("  Timeout:   {} ms", hook.timeout_ms);
+                    if let Some(ref m) = hook.matcher {
+                        println!("  Matcher:   {}", m);
+                    }
+                    if let Some(ref root) = hook.plugin_root {
+                        println!("  Plugin:    {}", root.display());
+                    }
+                    println!();
+
+                    // ── Build the command ────────────────────────────
+                    let ctx_json = serde_json::to_string(&ctx)
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                    let mut cmd = atomcode_core::process_utils::shell_command(&hook.command);
+                    cmd.env("ATOMCODE_HOOK_EVENT", &event_str)
+                        .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
+                        .kill_on_drop(true);
+
+                    if let Some(ref name) = ctx.tool_name {
+                        cmd.env("ATOMCODE_TOOL_NAME", name);
+                    }
+
+                    if let Some(ref root) = hook.plugin_root {
+                        let s = root.as_os_str();
+                        cmd.env("CLAUDE_PLUGIN_ROOT", s);
+                        cmd.env("ATOMCODE_PLUGIN_ROOT", s);
+                    }
+
+                    atomcode_core::process_utils::suppress_console_window(&mut cmd);
+
+                    // ── Run with timeout ─────────────────────────────
+                    let start = Instant::now();
+                    let timeout_dur = std::time::Duration::from_millis(hook.timeout_ms);
+
+                    match timeout(timeout_dur, cmd.output()).await {
+                        Ok(Ok(output)) => {
+                            let elapsed = start.elapsed();
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+
+                            let status_str = match output.status.code() {
+                                Some(code) => format!("exit code {}", code),
+                                None => "terminated by signal".into(),
+                            };
+
+                            println!("📋 Result:");
+                            println!("  Duration:  {:?}", elapsed);
+                            println!("  Status:    {} ({})",
+                                if output.status.success() { "✅ SUCCESS" } else { "❌ FAILURE" },
+                                status_str);
+
+                            if !stdout.is_empty() {
+                                println!("  ── stdout ──");
+                                for line in stdout.trim_end().lines() {
+                                    println!("  │ {}", line);
+                                }
+                            }
+                            if !stderr.is_empty() {
+                                println!("  ── stderr ──");
+                                for line in stderr.trim_end().lines() {
+                                    println!("  │ {}", line);
+                                }
+                            }
+
+                            if output.status.success() {
+                                println!("\n  ✅ Hook '{}' executed successfully.", hook_name);
+                            } else {
+                                println!("\n  ⚠️  Hook '{}' exited with non-zero status.", hook_name);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            let elapsed = start.elapsed();
+                            println!("📋 Result:");
+                            println!("  Duration:  {:?}", elapsed);
+                            println!("  ❌ ERROR:  failed to spawn hook: {}", e);
+                        }
+                        Err(_) => {
+                            println!("📋 Result:");
+                            println!("  ⏱ TIMEOUT after {} ms", hook.timeout_ms);
+                            println!("  The hook command was killed because it exceeded the configured timeout.");
+                        }
+                    }
+                }
+                Some(TestedHook::Script((hook_name, hook))) => {
+                    // ── TOML script hook test (aligned with script_runner.rs production) ──
+                    let trigger_display = match hook.trigger.as_str() {
+                        "pre_tool" | "pre_tool_execution" => "pre_tool_use",
+                        "post_tool" | "post_tool_execution" => "post_tool_use",
+                        other => other,
+                    };
+
+                    let is_tool_event = matches!(hook.trigger.as_str(),
+                        "pre_tool" | "pre_tool_execution" | "post_tool" | "post_tool_execution");
+
+                    // Build HookCtx (matching script_runner.rs PreToolExecutionHook.on_pre_execute)
+                    let ctx = if is_tool_event {
+                        HookCtx::new(
+                            "bash".into(),
+                            r#"{"command":"echo hello"}"#.into(),
+                            cwd.display().to_string(),
+                        )
+                        .with_session("test-session-0000".into())
+                        .with_turn(0)
+                    } else {
+                        HookCtx::new(
+                            "".into(),
+                            "".into(),
+                            cwd.display().to_string(),
+                        )
+                        .with_session("test-session-0000".into())
+                        .with_turn(0)
+                    };
+
+                    // ── Show hook info ───────────────────────────────
+                    println!("\n🔧 Testing Hook: {} (TOML script)", hook_name);
+                    println!("  Event:     {}", trigger_display);
+                    println!("  Script:    {}", hook.script.display());
+                    println!("  Type:      {}", hook.script_type);
+                    println!("  Timeout:   {} ms", hook.timeout_secs * 1000);
+                    if !hook.description.is_empty() {
+                        println!("  Description: {}", hook.description);
+                    }
+                    println!();
+
+                    // ── Build the command (matching script_runner.rs:68-78) ──
+                    let script_path = &hook.script;
+                    if !script_path.exists() {
+                        println!("❌ Script not found: {}", script_path.display());
+                        return Ok(());
+                    }
+
+                    let (cmd, args) = match hook.script_type.as_str() {
+                        "python" => ("python", vec![script_path.to_string_lossy().to_string()]),
+                        "shell" | "bash" => {
+                            if cfg!(windows) {
+                                ("cmd", vec!["/C".to_string(), script_path.to_string_lossy().to_string()])
+                            } else {
+                                ("sh", vec![script_path.to_string_lossy().to_string()])
+                            }
+                        }
+                        _ => {
+                            println!("❌ Unsupported script type: {}", hook.script_type);
+                            return Ok(());
+                        }
+                    };
+
+                    let ctx_json = serde_json::to_string(&ctx)
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                    let mut cmd_builder = tokio::process::Command::new(cmd);
+                    cmd_builder
+                        .args(&args)
+                        .kill_on_drop(true)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
+                    atomcode_core::process_utils::suppress_console_window(&mut cmd_builder);
+
+                    // ── Run with timeout (matching script_runner.rs:80-109) ──
+                    let start = Instant::now();
+                    let timeout_dur = std::time::Duration::from_millis(hook.timeout_secs * 1000);
+
+                    let run = async {
+                        let mut child = cmd_builder
+                            .spawn()
+                            .map_err(|e| format!("Failed to spawn script: {}", e))?;
+
+                        // Write HookCtx JSON to stdin (matching script_runner.rs:94-98)
+                        if let Some(mut stdin) = child.stdin.take() {
+                            stdin.write_all(ctx_json.as_bytes())
+                                .await
+                                .map_err(|e| format!("Failed to write to script stdin: {}", e))?;
+                        }
+
+                        child.wait_with_output().await
+                            .map_err(|e| format!("Failed to wait for script: {}", e))
+                    };
+
+                    match timeout(timeout_dur, run).await {
+                        Ok(Ok(output)) => {
+                            let elapsed = start.elapsed();
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+
+                            let status_str = match output.status.code() {
+                                Some(code) => format!("exit code {}", code),
+                                None => "terminated by signal".into(),
+                            };
+
+                            println!("📋 Result:");
+                            println!("  Duration:  {:?}", elapsed);
+                            println!("  Status:    {} ({})",
+                                if output.status.success() { "✅ SUCCESS" } else { "❌ FAILURE" },
+                                status_str);
+
+                            if !stdout.is_empty() {
+                                println!("  ── stdout ──");
+                                for line in stdout.trim_end().lines() {
+                                    println!("  │ {}", line);
+                                }
+                            }
+                            if !stderr.is_empty() {
+                                println!("  ── stderr ──");
+                                for line in stderr.trim_end().lines() {
+                                    println!("  │ {}", line);
+                                }
+                            }
+
+                            if output.status.success() {
+                                println!("\n  ✅ Hook '{}' executed successfully.", hook_name);
+                            } else {
+                                println!("\n  ⚠️  Hook '{}' exited with non-zero status.", hook_name);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            let elapsed = start.elapsed();
+                            println!("📋 Result:");
+                            println!("  Duration:  {:?}", elapsed);
+                            println!("  ❌ ERROR:  {}", e);
+                        }
+                        Err(_) => {
+                            println!("📋 Result:");
+                            println!("  ⏱ TIMEOUT after {} ms", hook.timeout_secs * 1000);
+                            println!("  The hook command was killed because it exceeded the configured timeout.");
+                        }
+                    }
+                }
+            }
+
             Ok(())
         }
         HookCommands::Paths => {
