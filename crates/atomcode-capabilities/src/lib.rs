@@ -26,7 +26,7 @@
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 /// Reusable, provider-agnostic [`atomcode_kernel::hook::LifecycleHooks`]

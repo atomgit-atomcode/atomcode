@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 // touches the developer's real home. Tests that set their own ATOMCODE_HOME still win.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 /// A stdio server config pointing at the in-tree `mcp-test-server` fixture binary.

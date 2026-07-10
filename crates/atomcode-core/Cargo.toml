@@ -97,7 +97,7 @@ wiremock = "0.6"
 serial_test = "3"
 # Redirects ATOMCODE_HOME to a temp dir at test startup so tests don't pollute
 # the real ~/.atomcode (see the `#[ctor]` in lib.rs / the crate docs).
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 # `test-util` enables tokio's paused-clock test helpers (start_paused /
 # time::pause / advance) used by the self-paced /loop wrapper tests. Dev-only:

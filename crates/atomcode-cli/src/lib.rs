@@ -9,9 +9,15 @@
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 pub mod uninstall;
 #[cfg(unix)]
 pub mod askpass;
+
+/// ACP (Agent Client Protocol) stdio server — lets atomcode be driven by Zed /
+/// multi-agent orchestrators over stdin/stdout. Wired up by the `atomcode acp`
+/// subcommand in `main.rs`; the engine/dispatch/translate/permission internals
+/// live here. Does not depend on `atomcode-core` (v2 stack only).
+pub mod acp;

@@ -13,15 +13,22 @@
 //! `set_var`, which races under the parallel harness). Tests that set their own
 //! `ATOMCODE_HOME` still win.
 //!
-//! Usage — in each crate that persists in tests, add BOTH `atomcode-test-support`
-//! and `ctor` as dev-dependencies, then in the crate's `#[cfg(test)]` module (and
-//! every `tests/*.rs` integration binary):
+//! Gated behind the `test-support` cargo feature so the env-mutating helper never
+//! enters a normal (non-test) build. Consuming crates enable it via a
+//! dev-dependency and call it from a `#[ctor]` in their own `#[cfg(test)]` module
+//! (and every `tests/*.rs` integration binary):
 //!
+//! ```ignore
+//! // Cargo.toml
+//! [dev-dependencies]
+//! atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+//! ctor = "0.2"
+//! ```
 //! ```ignore
 //! #[cfg(test)]
 //! #[ctor::ctor]
 //! fn _isolate_atomcode_home() {
-//!     atomcode_test_support::isolate_home();
+//!     atomcode_kernel::test_support::isolate_home();
 //! }
 //! ```
 //!

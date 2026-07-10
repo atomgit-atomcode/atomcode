@@ -71,7 +71,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module + every tests/*.rs binary) so tests
 # that persist commands/plugins/config never write into the developer's real home.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 tempfile = "3"
 vte = "0.15.0"

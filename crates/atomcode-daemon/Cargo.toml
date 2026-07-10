@@ -54,7 +54,7 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the
 # developer's real ~/.atomcode.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 tempfile = "3"
 

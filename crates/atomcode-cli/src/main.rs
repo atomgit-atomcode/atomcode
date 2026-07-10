@@ -22,7 +22,7 @@ use atomcode::uninstall;
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 use atomcode_core::agent::{AgentCommand, AgentEvent};
@@ -1361,7 +1361,7 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 };
-                let engine = atomcode_acp::engine::EngineConfig {
+                let engine = atomcode::acp::engine::EngineConfig {
                     api_key: bridge_cfg.api_key,
                     base_url: bridge_cfg.base_url,
                     model: bridge_cfg.model,
@@ -1373,7 +1373,7 @@ async fn run() -> Result<i32> {
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
-                return atomcode_acp::serve_stdio(atomcode_acp::AcpServeOptions {
+                return atomcode::acp::serve_stdio(atomcode::acp::AcpServeOptions {
                     engine: Some(engine),
                     provider: Some(provider),
                     auto_approve,

@@ -5,7 +5,7 @@
 //! Harness decision (Task 1 spike): the `agent-client-protocol` crate exposes
 //! `Channel::duplex() -> (Channel, Channel)`, two endpoints wired to each other,
 //! each implementing `ConnectTo<R>` for any role. We run the real agent
-//! (`atomcode_acp::serve_over`) over one endpoint and a `Client.builder()` over
+//! (`atomcode::acp::serve_over`) over one endpoint and a `Client.builder()` over
 //! the other — the same handlers production uses, just over an in-memory pipe.
 //!
 //! The stub is `atomcode_kernel::testkit::MockProvider`, the kernel's own
@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
-use atomcode_acp::engine::EngineConfig;
-use atomcode_acp::{serve_over, AcpServeOptions};
+use atomcode::acp::engine::EngineConfig;
+use atomcode::acp::{serve_over, AcpServeOptions};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::MockProvider;
 
@@ -42,7 +42,12 @@ fn dummy_engine() -> EngineConfig {
     }
 }
 
+// `#[serial]`: both tests in this binary mutate the process-global `ATOMCODE_HOME`
+// (each to its own tempdir); libtest runs them on parallel threads, so without
+// serialization one test's `prepare()` could read the other's `set_var` value and
+// write its snapshot into the wrong tempdir. Serializing them closes that race.
 #[tokio::test]
+#[serial_test::serial]
 async fn initialize_new_prompt_streams_and_stops() {
     // Isolate global config (memory/hooks/MCP) so `prepare` is fast & hermetic:
     // an empty ATOMCODE_HOME means no global memory.md, no hooks.json, no MCP.
@@ -162,6 +167,7 @@ async fn initialize_new_prompt_streams_and_stops() {
 /// SAME session scripts a normal `"hello"` + end_turn. The test asserts turn 2 is
 /// NOT poisoned: it ends `end_turn` AND streams the "hello" chunk.
 #[tokio::test]
+#[serial_test::serial]
 async fn error_turn_does_not_poison_next_prompt_on_same_session() {
     let home = tempfile::tempdir().expect("home tempdir");
     std::env::set_var("ATOMCODE_HOME", home.path());
