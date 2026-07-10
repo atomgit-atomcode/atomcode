@@ -84,6 +84,14 @@ pub(crate) mod pathutil;
 #[cfg(feature = "provider")]
 pub mod provider;
 
+/// Askpass: a Unix-domain-socket server + wrapper script that redirect the password
+/// prompts of `sudo`/`ssh` children (spawned by the [`tools`] `bash` capability) to the
+/// host UI instead of the tty. Unix-only — `sudo`/`ssh`'s `*_ASKPASS` mechanism does not
+/// exist on Windows. The host (TUI/daemon) drives [`askpass::server::start`] +
+/// [`askpass::set_env`]; the `bash` tool reads [`askpass::current_env`] to inject the env.
+#[cfg(unix)]
+pub mod askpass;
+
 /// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
 /// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic
 /// [`ApprovalMiddleware`](tools::ApprovalMiddleware). Each runs against the kernel's

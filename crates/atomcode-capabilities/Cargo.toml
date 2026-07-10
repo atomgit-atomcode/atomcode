@@ -134,8 +134,13 @@ session = ["dep:dirs", "dep:chrono"]
 memory = ["dep:dirs"]
 
 [target.'cfg(unix)'.dependencies]
-# Askpass: inject SUDO_ASKPASS/SSH_ASKPASS into bash children (unix only).
-atomcode-askpass = { path = "../atomcode-askpass" }
+# Askpass (the `askpass` module): a Unix-socket server + wrapper script that route
+# sudo/ssh password prompts to the host UI. Unix-only — `*_ASKPASS` has no Windows
+# analogue. Needs the UDS server (tokio net/io-util, unioned onto the base tokio
+# features above), `umask`/`/dev/urandom` (libc), and a zeroized password cache.
+tokio = { version = "1", features = ["net", "io-util"] }
+libc = "0.2"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }

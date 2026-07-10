@@ -949,7 +949,7 @@ pub struct LoopCtx {
     /// the real value); `None` means the arm is inert. Unix-only — sudo/SSH
     /// askpass is not supported on Windows.
     #[cfg(unix)]
-    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>,
+    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>,
     /// Active fixed-interval loop controller. `None` when no `/loop N …` is
     /// running. Task 12 wires the timer that flips `due` and fires the payload.
     pub loop_ctrl: Option<loop_ctrl::LoopController>,

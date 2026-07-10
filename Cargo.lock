@@ -316,8 +316,8 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "atomcode-acp",
- "atomcode-askpass",
  "atomcode-bridge",
+ "atomcode-capabilities",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-telemetry",
@@ -363,17 +363,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-askpass"
-version = "4.26.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "tokio",
- "zeroize",
-]
-
-[[package]]
 name = "atomcode-bridge"
 version = "4.26.0"
 dependencies = [
@@ -400,7 +389,6 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "atomcode-askpass",
  "atomcode-kernel",
  "atomcode-test-support",
  "base64",
@@ -414,6 +402,7 @@ dependencies = [
  "grep",
  "httpdate",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",
@@ -439,6 +428,7 @@ dependencies = [
  "uuid",
  "which",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -637,7 +627,6 @@ version = "4.26.0"
 dependencies = [
  "anyhow",
  "arboard",
- "atomcode-askpass",
  "atomcode-capabilities",
  "atomcode-core",
  "atomcode-daemon",

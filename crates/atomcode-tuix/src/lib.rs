@@ -661,16 +661,16 @@ pub async fn run(
     // We bind it in the outer `run()` scope and explicitly reference it after
     // `run_loop` returns so the compiler does not drop it early.
     #[cfg(unix)]
-    let _askpass_guard: Option<atomcode_askpass::server::AskpassServerGuard>;
+    let _askpass_guard: Option<atomcode_capabilities::askpass::server::AskpassServerGuard>;
     #[cfg(unix)]
-    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>;
+    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>;
 
     #[cfg(unix)]
     {
         let cache = std::sync::Arc::new(
-            atomcode_askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
+            atomcode_capabilities::askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
         );
-        match atomcode_askpass::server::start(cache) {
+        match atomcode_capabilities::askpass::server::start(cache) {
             Ok((mut env, rx, guard)) => {
                 // Write the wrapper script next to the socket.  On failure,
                 // degrade (no askpass) rather than crashing the TUI.
@@ -680,12 +680,12 @@ pub async fn run(
                         env.sock_path
                             .parent()
                             .and_then(|dir| {
-                                atomcode_askpass::wrapper::write_askpass_script(&exe, dir).ok()
+                                atomcode_capabilities::askpass::wrapper::write_askpass_script(&exe, dir).ok()
                             })
                     });
                 if let Some(script) = script_result {
                     env.askpass_script = script;
-                    atomcode_askpass::set_env(env);
+                    atomcode_capabilities::askpass::set_env(env);
                 }
                 askpass_rx = Some(rx);
                 _askpass_guard = Some(guard);

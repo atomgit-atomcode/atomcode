@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use crate::cache::PasswordCache;
+use super::cache::PasswordCache;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,7 +101,7 @@ async fn handle_connection(
         return;
     }
 
-    let req: crate::protocol::Request = match serde_json::from_str(line.trim_end()) {
+    let req: super::protocol::Request = match serde_json::from_str(line.trim_end()) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -116,7 +116,7 @@ async fn handle_connection(
 
     // Cache hit: respond immediately without queuing a prompt.
     if let Some(pw) = cache.get(&key, now) {
-        let resp = crate::protocol::Response { password: Some(pw.as_str().to_string()) };
+        let resp = super::protocol::Response { password: Some(pw.as_str().to_string()) };
         if let Ok(s) = serde_json::to_string(&resp) {
             let _ = w.write_all(s.as_bytes()).await;
             let _ = w.write_all(b"\n").await;
@@ -130,7 +130,7 @@ async fn handle_connection(
 
     if tx.send(prompt_msg).await.is_err() {
         // No consumer; respond with None.
-        let resp = crate::protocol::Response { password: None };
+        let resp = super::protocol::Response { password: None };
         if let Ok(s) = serde_json::to_string(&resp) {
             let _ = w.write_all(s.as_bytes()).await;
             let _ = w.write_all(b"\n").await;
@@ -145,7 +145,7 @@ async fn handle_connection(
         cache.put(&key, Zeroizing::new(pw.clone()), Instant::now());
     }
 
-    let resp = crate::protocol::Response { password };
+    let resp = super::protocol::Response { password };
     if let Ok(s) = serde_json::to_string(&resp) {
         let _ = w.write_all(s.as_bytes()).await;
         let _ = w.write_all(b"\n").await;
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_prompts_then_caches() {
-        let cache = std::sync::Arc::new(crate::cache::PasswordCache::new(Duration::from_secs(300)));
+        let cache = std::sync::Arc::new(crate::askpass::cache::PasswordCache::new(Duration::from_secs(300)));
         let (env, mut rx, _guard) = start(cache).unwrap();
 
         // Consumer (stands in for the event loop): answer the first prompt, then expect cache hit (no 2nd prompt).
@@ -246,7 +246,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let stream = tokio::net::UnixStream::connect(&env.sock_path).await.unwrap();
         let (r, mut w) = stream.into_split();
-        let req = serde_json::to_string(&crate::protocol::Request {
+        let req = serde_json::to_string(&crate::askpass::protocol::Request {
             token: env.token.clone(),
             prompt: prompt.to_string(),
         })
@@ -256,7 +256,7 @@ mod tests {
         w.flush().await.unwrap();
         let mut line = String::new();
         BufReader::new(r).read_line(&mut line).await.unwrap();
-        let resp: crate::protocol::Response = serde_json::from_str(line.trim_end()).unwrap();
+        let resp: crate::askpass::protocol::Response = serde_json::from_str(line.trim_end()).unwrap();
         resp.password
     }
 }

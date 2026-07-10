@@ -22,7 +22,6 @@ distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-atomcode-askpass = { path = "../atomcode-askpass" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
 # ACP (Agent Client Protocol) stdio server mode.
@@ -50,6 +49,11 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# The `atomcode __askpass` helper (src/askpass.rs, unix-only) talks the askpass
+# protocol, which now lives in atomcode-capabilities::askpass (cfg(unix)-gated, not
+# feature-gated). Default features — same as every other dependent (tuix pulls
+# `tools`); feature unification builds capabilities once regardless.
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc

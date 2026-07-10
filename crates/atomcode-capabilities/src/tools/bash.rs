@@ -77,7 +77,7 @@ impl Tool for BashTool {
         // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
         // the askpass helper is actually active; off Windows the command is untouched.
         #[cfg(unix)]
-        let effective_command = if atomcode_askpass::current_env().is_some() {
+        let effective_command = if crate::askpass::current_env().is_some() {
             rewrite_sudo_for_askpass(&a.command)
         } else {
             a.command.clone()
@@ -129,7 +129,7 @@ impl Tool for BashTool {
         // for /dev/tty, and inject the askpass env vars so they use our password prompt.
         #[cfg(unix)]
         {
-            if let Some(env) = atomcode_askpass::current_env() {
+            if let Some(env) = crate::askpass::current_env() {
                 apply_askpass_env(&mut cmd, env);
             }
             // Mirror exactly how atomcode-core/src/tool/bash.rs attaches setsid:
@@ -273,7 +273,7 @@ fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str 
 /// Set the five askpass/socket env vars on the command so sudo/ssh use our TUI
 /// password prompt instead of fighting the TUI for /dev/tty.
 #[cfg(unix)]
-fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &atomcode_askpass::server::AskpassEnv) {
+fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &crate::askpass::server::AskpassEnv) {
     cmd.env("SUDO_ASKPASS", &env.askpass_script)
         .env("SSH_ASKPASS", &env.askpass_script)
         .env("SSH_ASKPASS_REQUIRE", "force")
@@ -1337,7 +1337,7 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
 #[cfg(all(test, unix))]
 #[test]
 fn apply_askpass_env_sets_sudo_ssh_vars() {
-    use atomcode_askpass::server::AskpassEnv;
+    use crate::askpass::server::AskpassEnv;
     let env = AskpassEnv { sock_path: "/run/x.sock".into(), token: "tok".into(), askpass_script: "/run/askpass.sh".into() };
     let mut cmd = tokio::process::Command::new("bash");
     apply_askpass_env(&mut cmd, &env);
