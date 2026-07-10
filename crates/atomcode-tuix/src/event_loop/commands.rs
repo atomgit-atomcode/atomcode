@@ -701,7 +701,11 @@ fn resolve_relay_client_bin() -> String {
     }
 
     // 3) PATH 兜底。
-    BARE.to_string()
+    if cfg!(windows) {
+        "atomcode-relay-client.exe".to_string()
+    } else {
+        BARE.to_string()
+    }
 }
 
 /// 中继客户端 oss 下载地址。
@@ -723,7 +727,7 @@ const FALLBACK_BINARIES: &[(&str, &str, u64)] = &[
     ("x86_64-macos", "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03", 4916448),
     ("x86_64-linux", "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94", 5263216),
     ("aarch64-linux", "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d", 4661464),
-    ("aarch64-ohos", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
+    ("ohos-arm64", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
     ("x86_64-win", "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e", 5683344),
 ];
 
@@ -776,7 +780,7 @@ fn relay_client_target() -> &'static str {
     #[cfg(target_env = "ohos")]
     {
         return match std::env::consts::ARCH {
-            "aarch64" | "arm64" => "aarch64-ohos",
+            "aarch64" | "arm64" => "ohos-arm64",
             _ => "unknown",
         };
     }
