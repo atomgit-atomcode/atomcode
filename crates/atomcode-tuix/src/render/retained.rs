@@ -4035,43 +4035,85 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let detail_style = self.style_for(Role::Secondary);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
-                let body_str = if safe_detail.is_empty() {
-                    safe_name.clone()
-                } else {
-                    format!("{}({})", safe_name, safe_detail)
-                };
-                // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-                // commands) from producing hundreds of terminal lines.
-                let body_str = truncate_body_str(&body_str, 500);
-                // ● (U+25CF, Geometric Shapes block) replaces the
-                // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
-                // Mono but is missing from Consolas / NSimSun /
-                // legacy conhost defaults — Windows users saw the
-                // tool-call row prefixed by `□` tofu (screenshot
-                // bug report). ● has near-universal monospace
-                // coverage, same reason state.tick_spinner picked
-                // half-moons over Braille (state.rs:528-544). Bonus:
-                // unifies the visual anchor with the parallel-batch
-                // header (also ●), matching Claude Code's single-glyph
-                // model for tool-call entries.
-                if safe_detail.is_empty() {
-                    self.push_body_prefixed(
-                        "● ",
-                        &bullet_style,
-                        &body_str,
-                        &tool_name_style,
+
+                // Bash command: render `● bash` header then command lines
+                // via `format_shell_command` (shell-boundary wrapping, no
+                // truncation). The magenta `$ ` prefix (Role::Brand) signals
+                // "this is a shell command" at a glance, matching the codex
+                // visual convention.
+                let is_bash = safe_name.eq_ignore_ascii_case("bash");
+                if is_bash && !safe_detail.is_empty() {
+                    // Header: `● bash`
+                    self.push_body_prefixed("● ", &bullet_style, &safe_name, &tool_name_style);
+                    // Command lines: `$ <line0>` at col 0 (no leading spaces),
+                    // continuation lines use `  ` indent.
+                    //
+                    // NOTE: col 0 must be `$` (not `' '`): `pop_approval_prompt`
+                    // walks backwards popping rows whose col-0 is `'▶'` or `' '`
+                    // (space). A space-leading bash row would be silently consumed by
+                    // that pop. Placing `$` at col 0 makes the sentinel unambiguous.
+                    let dollar_style = self.style_for(Role::Brand);
+                    let cmd_style = self.style_for(Role::Secondary);
+                    // Reserve prefix width from available: `$ ` = 2 cols for line 0,
+                    // `  ` = 2 cols for continuations; both equal PAD_COL so the
+                    // same budget works for both.
+                    let width = (self.screen.width() as usize)
+                        .saturating_sub(PAD_COL)
+                        .max(8);
+                    let safe_cmd = crate::glyph::downgrade_glyphs(
+                        &safe_detail,
+                        self.caps.unicode_symbols,
                     );
-                } else {
-                    let detail_str = format!("({})", safe_detail);
-                    let rows = self.build_mixed_style_rows(
-                        "● ", &bullet_style,
-                        &safe_name, &tool_name_style,
-                        &detail_str, &detail_style,
-                        "", &tool_name_style,
-                        &body_str,
-                    );
-                    for row in rows {
+                    let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
+                    for (idx, line) in lines.iter().enumerate() {
+                        let mut row = Vec::new();
+                        if idx == 0 {
+                            push_str_cells(&mut row, "$ ", &dollar_style);
+                        } else {
+                            push_str_cells(&mut row, "  ", &cmd_style);
+                        }
+                        push_str_cells(&mut row, line, &cmd_style);
                         self.push_body_row(row);
+                    }
+                } else {
+                    let body_str = if safe_detail.is_empty() {
+                        safe_name.clone()
+                    } else {
+                        format!("{}({})", safe_name, safe_detail)
+                    };
+                    // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+                    // commands) from producing hundreds of terminal lines.
+                    let body_str = truncate_body_str(&body_str, 500);
+                    // ● (U+25CF, Geometric Shapes block) replaces the
+                    // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
+                    // Mono but is missing from Consolas / NSimSun /
+                    // legacy conhost defaults — Windows users saw the
+                    // tool-call row prefixed by `□` tofu (screenshot
+                    // bug report). ● has near-universal monospace
+                    // coverage, same reason state.tick_spinner picked
+                    // half-moons over Braille (state.rs:528-544). Bonus:
+                    // unifies the visual anchor with the parallel-batch
+                    // header (also ●), matching Claude Code's single-glyph
+                    // model for tool-call entries.
+                    if safe_detail.is_empty() {
+                        self.push_body_prefixed(
+                            "● ",
+                            &bullet_style,
+                            &body_str,
+                            &tool_name_style,
+                        );
+                    } else {
+                        let detail_str = format!("({})", safe_detail);
+                        let rows = self.build_mixed_style_rows(
+                            "● ", &bullet_style,
+                            &safe_name, &tool_name_style,
+                            &detail_str, &detail_style,
+                            "", &tool_name_style,
+                            &body_str,
+                        );
+                        for row in rows {
+                            self.push_body_row(row);
+                        }
                     }
                 }
             }
@@ -7632,10 +7674,14 @@ mod tests {
     fn retained_resize_clips_wide_body_rows_to_new_width() {
         let (mut r, buf) = new_capturing(120, 24);
 
-        // Seed body with a long tool call: a `▸ Name(payload)` row whose
+        // Seed body with a long tool call: a `● Name(payload)` row whose
         // display width far exceeds any sane "shrink-to" target.
+        // Use "EditFile" (not "Bash") so the generic inline render path is
+        // exercised — bash now wraps at shell boundaries (format_shell_command),
+        // and a 100-char single-token command intentionally stays one line even
+        // at narrow widths (never splits mid-token by design).
         r.render(UiLine::ToolCall {
-            name: "Bash".into(),
+            name: "EditFile".into(),
             detail: "X".repeat(100),
         });
         r.render(UiLine::InputPrompt {
@@ -7828,8 +7874,8 @@ mod tests {
         );
     }
 
-    /// ToolCall: `● name(detail)` formatted. Grid-verifies the
-    /// marker + name + parens appear together on one row.
+    /// ToolCall bash: renders `● bash` header + `$ ls -la` command row
+    /// (new two-part shape instead of old inline `● bash(ls -la)`).
     #[test]
     fn retained_tool_call_renders_via_vterm() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -7848,13 +7894,21 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm
-            .any_row(|row| row.contains("●") && row.contains("bash") && row.contains("ls -la"));
-        assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
+        // Header row: `● bash` (no inline paren command).
+        assert!(
+            vterm.any_row(|row| row.contains("●") && row.contains("bash") && !row.contains("bash(")),
+            "bash header row missing\ndump:\n{}", vterm.dump()
+        );
+        // Command row: `$ ls -la`.
+        assert!(
+            vterm.any_row(|row| row.contains("$ ls -la")),
+            "bash command row with $ prefix missing\ndump:\n{}", vterm.dump()
+        );
     }
 
     /// ToolCall glyph `●` must sit at col 0, same baseline as user
-    /// echo and input chevron.
+    /// echo and input chevron. With bash two-part rendering, the header
+    /// row (`● bash`) carries the glyph.
     #[test]
     fn retained_tool_call_arrow_at_col_0() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -7874,9 +7928,10 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
+        // The header row is `● bash` (no inline command) — glyph at col 0.
         let row_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains("bash"))
-            .unwrap_or_else(|| panic!("tool call row missing\ndump:\n{}", vterm.dump()));
+            .unwrap_or_else(|| panic!("tool call header row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 0).ch,
             '●',
@@ -7934,6 +7989,28 @@ mod tests {
             !static_detail.style.bold,
             "tool-call detail must use normal foreground, not highlighted text"
         );
+    }
+
+    /// Bash ToolCall renders `● bash` header + `$ command` lines,
+    /// wrapping along shell boundaries (not mid-token), with no truncation.
+    #[test]
+    fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "cd /tmp && sed -i '' \\ -e 's/mb-2.5/mb-[10px]/g' \\ -e 's/mb-3.5/mb-[14px]/g'".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
+            "header is `● Bash` without inline paren command\ndump:\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| row.contains("$ cd /tmp")),
+            "command line with $ prefix\ndump:\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
+            "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
+        assert!(!vterm.any_row(|row| row.contains("truncated")),
+            "no truncation\ndump:\n{}", vterm.dump());
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure
