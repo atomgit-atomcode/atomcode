@@ -320,8 +320,8 @@ dependencies = [
  "atomcode-capabilities",
  "atomcode-core",
  "atomcode-daemon",
+ "atomcode-kernel",
  "atomcode-telemetry",
- "atomcode-test-support",
  "atomcode-tuix",
  "clap",
  "crossterm",
@@ -390,7 +390,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "atomcode-kernel",
- "atomcode-test-support",
  "base64",
  "bytes",
  "chrono",
@@ -461,7 +460,6 @@ dependencies = [
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
- "atomcode-test-support",
  "chrono",
  "ctor",
  "dirs 6.0.0",
@@ -484,8 +482,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-codingplan-crypto",
+ "atomcode-kernel",
  "atomcode-telemetry",
- "atomcode-test-support",
  "base64",
  "bincode",
  "chrono",
@@ -545,8 +543,8 @@ dependencies = [
  "atomcode-bridge",
  "atomcode-capabilities",
  "atomcode-core",
+ "atomcode-kernel",
  "atomcode-telemetry",
- "atomcode-test-support",
  "axum",
  "ctor",
  "dirs 5.0.1",
@@ -618,10 +616,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-test-support"
-version = "4.26.0"
-
-[[package]]
 name = "atomcode-tuix"
 version = "4.26.0"
 dependencies = [
@@ -630,8 +624,8 @@ dependencies = [
  "atomcode-capabilities",
  "atomcode-core",
  "atomcode-daemon",
+ "atomcode-kernel",
  "atomcode-telemetry",
- "atomcode-test-support",
  "base64",
  "chrono",
  "crossterm",

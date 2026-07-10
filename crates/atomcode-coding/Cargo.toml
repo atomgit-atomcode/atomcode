@@ -52,5 +52,5 @@ async-trait = "0.1"
 serial_test = "3"
 # Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so tests
 # never persist into the developer's real ~/.atomcode.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"

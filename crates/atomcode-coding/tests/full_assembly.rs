@@ -18,7 +18,7 @@ use atomcode_kernel::tool::ToolCall;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {

@@ -9,7 +9,7 @@ use std::path::Path;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 /// Point `ATOMCODE_HOME` at an empty tempdir for the duration of the test so
