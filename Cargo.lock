@@ -313,11 +313,12 @@ dependencies = [
 name = "atomcode"
 version = "4.26.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "assert_cmd",
- "atomcode-acp",
  "atomcode-bridge",
  "atomcode-capabilities",
+ "atomcode-coding",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-kernel",
@@ -346,20 +347,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
  "winresource",
-]
-
-[[package]]
-name = "atomcode-acp"
-version = "4.26.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-kernel",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

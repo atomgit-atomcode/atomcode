@@ -5,7 +5,7 @@
 //! Harness decision (Task 1 spike): the `agent-client-protocol` crate exposes
 //! `Channel::duplex() -> (Channel, Channel)`, two endpoints wired to each other,
 //! each implementing `ConnectTo<R>` for any role. We run the real agent
-//! (`atomcode_acp::serve_over`) over one endpoint and a `Client.builder()` over
+//! (`atomcode::acp::serve_over`) over one endpoint and a `Client.builder()` over
 //! the other — the same handlers production uses, just over an in-memory pipe.
 //!
 //! The stub is `atomcode_kernel::testkit::MockProvider`, the kernel's own
@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
-use atomcode_acp::engine::EngineConfig;
-use atomcode_acp::{serve_over, AcpServeOptions};
+use atomcode::acp::engine::EngineConfig;
+use atomcode::acp::{serve_over, AcpServeOptions};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::MockProvider;
 

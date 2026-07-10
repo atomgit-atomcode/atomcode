@@ -69,7 +69,7 @@ fn is_atomgit_gateway(base_url: &str) -> bool {
 /// Build a provider adapter for the given config.
 ///
 /// Mirrors `atomcode-bridge::runtime::build_provider` but without the AtomGit
-/// gateway signer — `atomcode-acp` does not depend on `atomcode-core`, and ACP
+/// gateway signer — the `acp` module does not use `atomcode-core`, and ACP
 /// sessions must use an externally-issued `api_key` rather than a signed gateway.
 ///
 /// The three branches (anthropic / ollama / openai-compat) are kept in sync with

@@ -24,11 +24,17 @@ distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
 atomcode-core = { path = "../atomcode-core" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
-# ACP (Agent Client Protocol) stdio server mode.
-atomcode-acp = { path = "../atomcode-acp" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
+# ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine
+# lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
+# uses (kernel + coding + capabilities) + the protocol SDK. capabilities is all-platform
+# here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.
+agent-client-protocol = { workspace = true }
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding" }
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
@@ -49,11 +55,9 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# The `atomcode __askpass` helper (src/askpass.rs, unix-only) talks the askpass
-# protocol, which now lives in atomcode-capabilities::askpass (cfg(unix)-gated, not
-# feature-gated). Default features — same as every other dependent (tuix pulls
-# `tools`); feature unification builds capabilities once regardless.
-atomcode-capabilities = { path = "../atomcode-capabilities" }
+# NOTE: the `atomcode __askpass` helper (src/askpass.rs, unix-only) uses
+# atomcode-capabilities::askpass — now covered by the all-platform capabilities dep
+# in [dependencies] above (pulled in for ACP), so no unix-specific entry needed here.
 
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc

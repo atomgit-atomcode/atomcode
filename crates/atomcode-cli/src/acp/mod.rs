@@ -3,7 +3,7 @@
 // 1. Handler closure ergonomics (actual signatures confirmed by source + compile):
 //
 //    responder.respond(response):
-//      fn respond(self, response: T) -> Result<(), crate::Error>
+//      fn respond(self, response: T) -> Result<(), agent_client_protocol::Error>
 //      where T = Req::Response for request handlers
 //
 //    on_receive_request!() macro expands to:
@@ -14,7 +14,7 @@
 //      |f: &mut _, dispatch, cx| Box::pin(f(dispatch, cx))
 //
 //    util::internal_error(message):
-//      fn internal_error(message: impl ToString) -> crate::Error
+//      fn internal_error(message: impl ToString) -> agent_client_protocol::Error
 //      (calls Error::internal_error().data(message.to_string()))
 //
 // 2. Dispatch loop concurrency:
@@ -44,7 +44,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Dispatch, Handled, Stdio};
 use atomcode_kernel::provider::LlmProvider;
 
-use crate::dispatch::{handle_cancel, handle_new_session, Sessions};
+use crate::acp::dispatch::{handle_cancel, handle_new_session, Sessions};
 
 /// Options for the ACP stdio server.
 ///
@@ -55,7 +55,7 @@ use crate::dispatch::{handle_cancel, handle_new_session, Sessions};
 pub struct AcpServeOptions {
     /// Provider + model config for session spawning.  `None` → handler returns
     /// an error telling the user to run via `atomcode acp`.
-    pub engine: Option<crate::engine::EngineConfig>,
+    pub engine: Option<crate::acp::engine::EngineConfig>,
     /// Pre-built (authenticated) provider, e.g. the AtomGit gateway signer.
     /// When `Some`, forwarded to each `spawn_session` call verbatim.
     /// When `None`, `engine::build_provider` builds a fallback per session.

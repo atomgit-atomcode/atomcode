@@ -1,7 +1,7 @@
 //! Session table and `session/new` handler.
 //!
 //! Owns the shared [`Sessions`] map and the monotone session counter.  The
-//! handler is wired into the ACP builder in [`crate::serve_stdio`]; Tasks 7-9
+//! handler is wired into the ACP builder in [`crate::acp::serve_stdio`]; Tasks 7-9
 //! add their own handlers that share the same table and counter.
 
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 
-use crate::engine::EngineConfig;
+use crate::acp::engine::EngineConfig;
 
 // ── Session table ─────────────────────────────────────────────────────────────
 
@@ -72,7 +72,7 @@ pub fn new_session_id(n: u64) -> SessionId {
 /// fresh [`SessionId`] to the client.
 ///
 /// `provider` — when `Some`, the pre-built (authenticated) provider is used
-/// directly; when `None`, [`crate::engine::build_provider`] constructs a
+/// directly; when `None`, [`crate::acp::engine::build_provider`] constructs a
 /// fallback from the engine config (valid for non-gateway endpoints only).
 pub async fn handle_new_session(
     engine: &EngineConfig,
@@ -86,7 +86,7 @@ pub async fn handle_new_session(
     // provider is the CLI-built, authenticated provider (Task 10); cloned per
     // session (Arc clone is cheap). engine::spawn_session falls back to its own
     // build_provider only when None (non-gateway test/dev paths).
-    let handle = crate::engine::spawn_session(engine, req.cwd.clone(), provider)
+    let handle = crate::acp::engine::spawn_session(engine, req.cwd.clone(), provider)
         .await
         .map_err(|e| agent_client_protocol::util::internal_error(format!("{e}")))?;
     let AgentHandle {
@@ -133,7 +133,7 @@ pub fn prompt_text(req: &PromptRequest) -> (String, Vec<ImageContent>) {
 /// Drive one `session/prompt` turn to completion.
 ///
 /// Runs **off** the dispatch event loop (spawned via `cx.spawn` by the handler
-/// in [`crate::serve_stdio`]) so a mid-turn `session/cancel` and the client's
+/// in [`crate::acp::serve_stdio`]) so a mid-turn `session/cancel` and the client's
 /// permission responses can still be processed by the loop. This function owns
 /// the deferred [`Responder`] and answers it exactly once on every exit path.
 ///
@@ -204,7 +204,7 @@ pub async fn run_prompt_turn(
                         value: serde_json::json!({"decision": "allow"}),
                     });
                 } else if let Err(e) =
-                    crate::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await
+                    crate::acp::permission::handle_approval(&cx, &sid, &cmd_tx, id, payload).await
                 {
                     // Defense-in-depth: `handle_approval` already fails closed internally
                     // and returns `Ok`, but a `?` here would tear the WHOLE connection down
@@ -234,7 +234,7 @@ pub async fn run_prompt_turn(
                 last_error = Some(message);
             }
             Some(other) => {
-                if let Some(update) = crate::translate::event_to_update(&other) {
+                if let Some(update) = crate::acp::translate::event_to_update(&other) {
                     cx.send_notification(SessionNotification::new(sid.clone(), update))?;
                 }
             }
@@ -245,7 +245,7 @@ pub async fn run_prompt_turn(
     if let Some(msg) = last_error {
         responder.respond_with_internal_error(msg)
     } else {
-        match crate::translate::stop_reason(stop) {
+        match crate::acp::translate::stop_reason(stop) {
             Ok(sr) => responder.respond(PromptResponse::new(sr)),
             Err(msg) => responder.respond_with_internal_error(msg),
         }
