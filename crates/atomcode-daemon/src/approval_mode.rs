@@ -11,27 +11,6 @@ pub enum ApprovalMode {
     Bypass,
 }
 
-const READ_ONLY_TOOL_FILTER: &[&str] = &[
-    "read_file",
-    "grep",
-    "glob",
-    "list_directory",
-    "web_search",
-    "web_fetch",
-    "trace_callees",
-    "trace_callers",
-    "trace_chain",
-    "file_dependencies",
-    "blast_radius",
-];
-
-pub(crate) fn approval_mode_tool_filter(mode: ApprovalMode) -> Option<&'static [&'static str]> {
-    match mode {
-        ApprovalMode::Plan => Some(READ_ONLY_TOOL_FILTER),
-        ApprovalMode::Build | ApprovalMode::Bypass => None,
-    }
-}
-
 pub(crate) fn approval_mode_wire(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Build => "build",
@@ -69,21 +48,5 @@ mod tests {
         }
 
         assert_eq!(ApprovalMode::default(), ApprovalMode::Build);
-    }
-
-    #[test]
-    fn plan_mode_uses_the_read_only_tool_filter() {
-        let filter =
-            approval_mode_tool_filter(ApprovalMode::Plan).expect("plan mode should restrict tools");
-
-        assert!(filter.contains(&"read_file"));
-        assert!(filter.contains(&"grep"));
-        assert!(filter.contains(&"list_directory"));
-        assert!(!filter.contains(&"write_file"));
-        assert!(!filter.contains(&"edit_file"));
-        assert!(!filter.contains(&"bash"));
-
-        assert!(approval_mode_tool_filter(ApprovalMode::Build).is_none());
-        assert!(approval_mode_tool_filter(ApprovalMode::Bypass).is_none());
     }
 }

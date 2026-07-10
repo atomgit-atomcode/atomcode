@@ -73,7 +73,7 @@ use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
+use atomcode_core::turn::event::TurnEvent;
 use atomcode_core::turn::permission::{
     ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
     PermissionDecider, PlanPermissionDecider,
@@ -2799,14 +2799,11 @@ async fn process_chat_request(
 
     // Create conversation from session messages
     let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
-    // 构造用户消息：带图走 MultiPart（vision）；模型不支持视觉时经 vision_preprocessor
-    // 用 VL 模型把图片转文字（与 TUI/agent 行为一致）。无图则纯文本。
-    //
-    // v2 引擎时跳过 VL 预处理——bridge 的 on_command 会在收到 SendMessage 时
-    // 调用 maybe_preprocess，此时再做一次是冗余的（VL 模型会被多调一次）。
-    // v2 路径直接把原文 + 原图写入 MultiPart，bridge 收到后负责 VL 转换并清空
-    // images 发给 kernel；conversation 中保留原图用于 webui 缩略图渲染。
-    let engine_v2 = live_api::live_engine_v2();
+    // 构造用户消息：带图走 MultiPart（vision）。跳过 VL 预处理——bridge 的
+    // on_command 会在收到 SendMessage 时调用 maybe_preprocess，此时再做一次是
+    // 冗余的（VL 模型会被多调一次）。直接把原文 + 原图写入 MultiPart，bridge
+    // 收到后负责 VL 转换并清空 images 发给 kernel；conversation 中保留原图用于
+    // webui 缩略图渲染。无图则纯文本。
     {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
@@ -2822,9 +2819,9 @@ async fn process_chat_request(
         let mut conv = conversation.lock().await;
         if images.is_empty() {
             conv.add_user_message(&req.message);
-        } else if engine_v2 {
-            // v2 引擎：跳过 VL 预处理，直接用原文 + 原图写入 MultiPart。
-            // bridge 的 on_command 会负责 VL 预处理并清空发给 kernel 的 images。
+        } else {
+            // 跳过 VL 预处理，直接用原文 + 原图写入 MultiPart。bridge 的
+            // on_command 会负责 VL 预处理并清空发给 kernel 的 images。
             let idx = conv.messages.len();
             conv.messages.push(Message {
                 role: Role::User,
@@ -2834,47 +2831,6 @@ async fn process_chat_request(
                     } else {
                         Some(req.message.clone())
                     },
-                    images,
-                },
-                synthetic: false,
-                internal_origin: None,
-            });
-            conv.turn_tracker.on_user_message(idx);
-        } else {
-            // v1 引擎：在此做 VL 预处理。VL 文本决定喂给模型的 `text`；
-            // 原图始终保留在 MultiPart 里。非视觉模型在 provider 层会把
-            // MultiPart 降级为纯文本（VL 文本得以送达），而会话/历史保留原图，
-            // 用于在对话里渲染缩略图。
-            use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-            // Bind the conversation's session id onto the (throwaway) provider so
-            // maybe_preprocess forwards x-atomcode-session-id onto the one-off VL
-            // request (gateway affinity), matching the TUI bridge / live paths.
-            let vl_sid = session.id.as_str();
-            if !vl_sid.is_empty() {
-                provider.set_session_id(vl_sid);
-            }
-            let text = match maybe_preprocess(&config, &*provider, &req.message, &images).await {
-                PreprocessOutcome::Skipped => req.message.clone(),
-                PreprocessOutcome::Replaced { text, vl_key } => {
-                    if req.message.trim().is_empty() {
-                        format!("[图片内容（由 {vl_key} 识别）]\n{text}")
-                    } else {
-                        format!("{}\n\n[图片内容（由 {vl_key} 识别）]\n{text}", req.message)
-                    }
-                }
-                PreprocessOutcome::Failed { .. } => {
-                    if req.message.trim().is_empty() {
-                        "[图片识别失败]".to_string()
-                    } else {
-                        format!("{}\n\n[图片识别失败]", req.message)
-                    }
-                }
-            };
-            let idx = conv.messages.len();
-            conv.messages.push(Message {
-                role: Role::User,
-                content: MessageContent::MultiPart {
-                    text: if text.is_empty() { None } else { Some(text) },
                     images,
                 },
                 synthetic: false,
@@ -3018,7 +2974,7 @@ async fn process_chat_request(
     // Plan and Bypass are explicit modes and never depend on an approver.
     let registered_permission_responder =
         interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
-    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = match approval_mode {
+    let (permission, _perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = match approval_mode {
         crate::approval_mode::ApprovalMode::Bypass => (
             Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             None,
@@ -3082,7 +3038,7 @@ async fn process_chat_request(
     // mirroring the TUI agent so daemon/WebUI turns stay hook-aware.
     let mut hook_engine = atomcode_core::hook::HookEngine::new();
     hook_engine.load_all(&working_dir);
-    let mut turn_runner = TurnRunner {
+    let _turn_runner = TurnRunner {
         provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
@@ -3142,16 +3098,14 @@ async fn process_chat_request(
         return Ok(());
     }
 
-    // Clone conversation Arc for the spawn task
-    let conversation_clone = conversation.clone();
+    let _conversation_clone = conversation.clone();
 
     // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
     let tel_ctx = CurrentContext::current();
 
-    // Run turn(s) in a background task. Engine v2 ($ATOMCODE_ENGINE=v2) drives the new
-    // stack via atomcode-bridge instead of the v1 TurnRunner; the downstream
-    // turn_rx → ChatEvent consumer + persistence are SHARED (they only read turn_rx).
-    if live_api::live_engine_v2() {
+    // Run turn(s) in a background task on the kernel stack via atomcode-bridge; the
+    // downstream turn_rx → ChatEvent consumer + persistence only read turn_rx.
+    {
         let mut bridge_cfg =
             live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
         bridge_cfg.dangerously_skip_permissions = approval_mode
@@ -3180,94 +3134,6 @@ async fn process_chat_request(
                     approval_mode,
                 )
                 .await;
-            })
-            .await;
-        });
-    } else {
-        tokio::spawn(async move {
-            // Keep the ApprovalRequest receiver alive for the entire turn. The
-            // InteractivePermissionDecider (inside turn_runner) sends on the paired
-            // sender; if this receiver were dropped, every `send` would fail and the
-            // decider would auto-deny EVERY tool. We never read from it — the browser
-            // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
-            // In standalone (BypassAll) mode there is no channel — this is `None`.
-            let _keep_perm_req_rx = perm_req_rx;
-            CurrentContext::scope(tel_ctx, || async move {
-                let mut conv = conversation_clone.lock().await;
-
-                // Loop until LLM produces text without tool calls
-                loop {
-                    // ── Context compression check before each turn ──
-                    // Uses the same two-tier strategy as CLI (T1: tool_result stubs,
-                    // T2: LLM summarization into cold zone).
-                    // Task hint is extracted dynamically from the last non-synthetic
-                    // user message so it stays current across multi-tool turns and
-                    // includes VL-preprocessed image descriptions (matching live_api.rs).
-                    {
-                        let task_hint = conv
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|m| {
-                                matches!(m.role, atomcode_core::conversation::message::Role::User)
-                                    && !m.synthetic
-                            })
-                            .and_then(|m| m.text())
-                            .map(|text| {
-                                if text.chars().count() > 200 {
-                                    format!(
-                                        "TASK: {}...",
-                                        text.chars().take(197).collect::<String>()
-                                    )
-                                } else {
-                                    format!("TASK: {}", text)
-                                }
-                            });
-                        let state_hint = task_hint.as_deref();
-                        atomcode_core::agent::compression::maybe_compress_history(
-                            &*turn_runner.ctx,
-                            &mut conv,
-                            &*turn_runner.provider,
-                            &turn_runner.tools,
-                            &system_prompt,
-                            state_hint,
-                        )
-                        .await;
-                    }
-
-                    let tool_filter =
-                        crate::approval_mode::approval_mode_tool_filter(approval_mode);
-                    let result = turn_runner
-                        .run_with_filter(
-                            &mut conv,
-                            &system_prompt,
-                            "",
-                            &turn_tx,
-                            cancel_token.clone(),
-                            tool_filter,
-                        )
-                        .await;
-
-                    match result {
-                        TurnResult::Responded { .. } => {
-                            // LLM produced text, turn is complete
-                            break;
-                        }
-                        TurnResult::UsedTools { .. } => {
-                            // Truncation of tool outputs is handled inside
-                            // TurnRunner::run_with_filter now. Nothing to do
-                            // here — just loop back for the next LLM call.
-                            continue;
-                        }
-                        TurnResult::Failed(e) => {
-                            let _ = turn_tx.send(TurnEvent::Error(e));
-                            break;
-                        }
-                        TurnResult::Cancelled => {
-                            break;
-                        }
-                    }
-                }
             })
             .await;
         });
