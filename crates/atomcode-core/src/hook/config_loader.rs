@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -182,6 +183,65 @@ impl HooksConfig {
         // Note: "message" / "user_prompt_submit" webhook support requires an
         // OnMessageReceivedHook slot in HookEngine (TODO: follow-up PR).
     }
+}
+
+/// Load all enabled script hooks from TOML configs (global + project),
+/// preserving their names. Project hooks override global hooks by name.
+///
+/// This is the TOML counterpart of [`json_config::load_hooks_config_with_names`],
+/// used by `hook test <name>` to support testing TOML-configured hooks.
+pub fn load_script_hooks_with_names(project_dir: &Path) -> Vec<(String, ScriptHookConfig)> {
+    let mut merged: BTreeMap<String, ScriptHookConfig> = BTreeMap::new();
+
+    // Global hooks: ~/.atomcode/hooks/hooks.toml
+    if let Some(home) = dirs::home_dir() {
+        let global_dir = home.join(".atomcode").join("hooks");
+        match HooksConfig::from_dir(&global_dir) {
+            Ok(config) => {
+                for mut hook in config.hooks {
+                    if hook.enabled {
+                        if !hook.script.is_absolute() {
+                            hook.script = global_dir.join(&hook.script);
+                        }
+                        merged.insert(hook.name.clone(), hook);
+                    }
+                }
+            }
+            Err(e) => {
+                if global_dir.exists() {
+                    tracing::warn!(
+                        "[Hook] Failed to load global TOML hook config from {}: {}",
+                        global_dir.display(), e
+                    );
+                }
+            }
+        }
+    }
+
+    // Project hooks: <cwd>/.atomcode/hooks/hooks.toml — override global by name
+    let project_hooks_dir = project_dir.join(".atomcode").join("hooks");
+    match HooksConfig::from_dir(&project_hooks_dir) {
+        Ok(config) => {
+            for mut hook in config.hooks {
+                if hook.enabled {
+                    if !hook.script.is_absolute() {
+                        hook.script = project_hooks_dir.join(&hook.script);
+                    }
+                    merged.insert(hook.name.clone(), hook);
+                }
+            }
+        }
+        Err(e) => {
+            if project_hooks_dir.exists() {
+                tracing::warn!(
+                    "[Hook] Failed to load project TOML hook config from {}: {}",
+                    project_hooks_dir.display(), e
+                );
+            }
+        }
+    }
+
+    merged.into_iter().collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────

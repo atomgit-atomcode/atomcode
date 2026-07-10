@@ -404,6 +404,35 @@ impl HookEngine {
         }
     }
 
+    /// Collect names of all registered hooks across every slot.
+    /// Used by `hook test <name>` to show available hooks when the
+    /// requested name is not found in JSON configs.
+    pub fn list_hook_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        macro_rules! collect_names {
+            ($field:ident) => {
+                for h in &self.$field {
+                    names.push(h.name().to_string());
+                }
+            };
+        }
+        collect_names!(pre_tool_hooks);
+        collect_names!(post_tool_hooks);
+        collect_names!(post_turn_hooks);
+        collect_names!(system_prompt_hooks);
+        collect_names!(on_session_start_hooks);
+        collect_names!(on_session_end_hooks);
+        collect_names!(on_error_hooks);
+        collect_names!(on_user_prompt_submit_hooks);
+        collect_names!(on_turn_start_hooks);
+        collect_names!(on_turn_complete_hooks);
+        collect_names!(on_tool_call_start_hooks);
+        collect_names!(on_model_response_hooks);
+        names.sort();
+        names.dedup();
+        names
+    }
+
     // ── 加载 / 注册内置 Hook ──────────────────────────────────────
 
     /// 统一加载：JSON + TOML + 内置 + Webhook
