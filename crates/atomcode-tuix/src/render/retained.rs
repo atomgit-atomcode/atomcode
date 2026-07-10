@@ -3545,6 +3545,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
+        // After a resize the approval prompt rows are NOT in body_log, so
+        // the reflow above does not rebuild them.  Setting Some(0) marks the
+        // block as "already consumed", making the next pop_approval_prompt a
+        // clean noop instead of falling through to the legacy heuristic
+        // (which could mistake space-padded body rows for approval chips).
+        // None would re-enable the heuristic, which is unsafe here.
+        if self.approval_block_rows.is_some() {
+            self.approval_block_rows = Some(0);
+        }
         self.live_spinner_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
@@ -4638,7 +4647,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
                 // Mark as consumed so the next call is a noop.
                 self.approval_block_rows = Some(0);
-                to_pop as u16
+                to_pop.min(u16::MAX as usize) as u16
             }
             None => {
                 // Fallback: legacy walk-back heuristic.
@@ -8772,6 +8781,60 @@ mod tests {
         assert!(
             fgs.contains(&Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A }),
             "Deny chip must be truecolor red, got fgs: {fgs:?}",
+        );
+    }
+
+    /// Regression: resize-during-approval must reset `approval_block_rows` to
+    /// `None` so that a subsequent `pop_approval_prompt` falls back to the
+    /// legacy heuristic (safe noop) rather than popping stale-count rows of
+    /// real body content.
+    ///
+    /// Scenario:
+    ///   1. Render real body content (ToolCall + AssistantText).
+    ///   2. Render an ApprovalPrompt → sets `approval_block_rows = Some(n)`.
+    ///   3. Simulate a window resize via `on_resize`.
+    ///   4. Call `pop_approval_prompt` — must NOT eat real body rows.
+    #[test]
+    fn approval_resize_resets_stale_count() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        // Render real body content so body_lines is non-empty.
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        r.render(UiLine::AssistantText("some important output".into()));
+        r.render(UiLine::AssistantLineBreak);
+
+        // Render approval prompt — this sets approval_block_rows = Some(n).
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        // Confirm approval_block_rows is set (Some(n > 0)).
+        assert!(
+            matches!(r.approval_block_rows, Some(n) if n > 0),
+            "approval_block_rows should be Some(n>0) after render, got {:?}",
+            r.approval_block_rows
+        );
+
+        // Simulate a resize — this triggers reflow_body_to_current_width which
+        // clears body_lines and replays body_log (ApprovalPrompt is NOT in
+        // body_log so it won't be rebuilt).
+        r.on_resize(60, 24);
+
+        // After resize: body_lines does NOT include the approval rows anymore.
+        // Record how many body rows exist now (all real content).
+        let body_after_resize = r.body_lines.len();
+
+        // pop_approval_prompt: must be a safe noop — must NOT pop real content.
+        r.pop_approval_prompt();
+        let body_after_pop = r.body_lines.len();
+
+        assert_eq!(
+            body_after_pop, body_after_resize,
+            "pop_approval_prompt after resize must not eat real body rows \
+             (stale count data-loss bug): before={body_after_resize} after={body_after_pop}"
         );
     }
 
