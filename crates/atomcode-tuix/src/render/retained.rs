@@ -4043,20 +4043,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // visual convention.
                 let is_bash = safe_name.eq_ignore_ascii_case("bash");
                 if is_bash && !safe_detail.is_empty() {
-                    // Header: `● bash`
+                    // Header: `● Bash`
                     self.push_body_prefixed("● ", &bullet_style, &safe_name, &tool_name_style);
-                    // Command lines: `$ <line0>` at col 0 (no leading spaces),
-                    // continuation lines use `  ` indent.
-                    //
-                    // NOTE: col 0 must be `$` (not `' '`): `pop_approval_prompt`
-                    // walks backwards popping rows whose col-0 is `'▶'` or `' '`
-                    // (space). A space-leading bash row would be silently consumed by
-                    // that pop. Placing `$` at col 0 makes the sentinel unambiguous.
+                    // Command lines via `format_shell_command` (shell-boundary wrapping).
+                    // Line 0: `$ ` prefix (magenta, Role::Brand) at col 0 — the `$`
+                    // sentinel at col 0 ensures `pop_approval_prompt` stops here and
+                    // never eats bash command rows (it pops only `▶`-or-space col-0 rows).
+                    // Continuation lines (idx > 0): format_shell_command adds 4-space indent;
+                    // we prepend a non-breaking-space (U+00A0) sentinel at col 0 so they
+                    // are equally safe from the pop (which only stops on U+0020 space and
+                    // `▶`; any other char — including NBSP — hits the `_ => break` arm).
                     let dollar_style = self.style_for(Role::Brand);
                     let cmd_style = self.style_for(Role::Secondary);
-                    // Reserve prefix width from available: `$ ` = 2 cols for line 0,
-                    // `  ` = 2 cols for continuations; both equal PAD_COL so the
-                    // same budget works for both.
+                    // Width budget: `$ ` = 2 cols consumed, so reserve PAD_COL from
+                    // available (PAD_COL = 2, matching the `$ ` prefix width).
                     let width = (self.screen.width() as usize)
                         .saturating_sub(PAD_COL)
                         .max(8);
@@ -4070,7 +4070,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         if idx == 0 {
                             push_str_cells(&mut row, "$ ", &dollar_style);
                         } else {
-                            push_str_cells(&mut row, "  ", &cmd_style);
+                            // NBSP sentinel at col 0 so this row is safe from
+                            // `pop_approval_prompt` (which only pops U+0020 rows).
+                            // The rest of the indent comes from format_shell_command's
+                            // own 4-space lead (trimmed here: col 1 is a regular space
+                            // for the visual gap after the sentinel).
+                            push_str_cells(&mut row, "\u{00A0} ", &cmd_style);
+                            // format_shell_command continuation lines start with "    "
+                            // (4 spaces). Skip those leading spaces so the text aligns
+                            // under the command (col 3 matches col 2 of `$ cmd`).
+                            let trimmed = line.trim_start_matches(' ');
+                            push_str_cells(&mut row, trimmed, &cmd_style);
+                            self.push_body_row(row);
+                            continue;
                         }
                         push_str_cells(&mut row, line, &cmd_style);
                         self.push_body_row(row);
@@ -13586,5 +13598,79 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    /// Regression: bash command rows rendered above an approval block must
+    /// SURVIVE `pop_approval_prompt`. The pop walks backwards from the tail
+    /// popping space-prefixed and `▶`-prefixed rows; it stops as soon as it
+    /// hits the `▶` header, so bash rows above the approval strip are never
+    /// reached — regardless of whether the `$` sits at col 0 or col 2.
+    #[test]
+    fn bash_command_rows_survive_approval_pop() {
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+
+        // Render input prompt first (mirrors real usage).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Render a bash ToolCall with a long multi-segment command that WILL
+        // wrap at width 40 (the screen width minus prefix overhead).
+        let long_cmd = "cd /tmp && sed -i '' \\ -e 's/aaaa/bbbb/g' \\ -e 's/cccc/dddd/g' \\ -e 's/eeee/ffff/g'";
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: long_cmd.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The command should wrap to multiple rows — verify at least one
+        // wrapped segment is present before the pop.
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
+            "wrapped segment must be visible before pop\ndump:\n{}",
+            vterm.dump()
+        );
+
+        // Now render an approval prompt on top.
+        r.render(UiLine::ApprovalPrompt {
+            tool: "Bash".into(),
+            detail: long_cmd.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Pop the approval block.
+        r.pop_approval_prompt();
+        // Force a repaint cycle (mirrors real Y/A/N handling).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // CRITICAL: bash command rows MUST survive the pop.
+        assert!(
+            vterm.any_row(|row| row.contains("$ cd /tmp")),
+            "bash $ command line must survive approval pop\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
+            "wrapped bash segment must survive approval pop\ndump:\n{}",
+            vterm.dump()
+        );
     }
 }
