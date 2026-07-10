@@ -33,9 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{
-    AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
-};
+use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
 use atomcode_core::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -711,12 +709,10 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
-/// Optional override for spawning agent runtimes. `None` ⇒ use
-/// `runtime_factory.spawn_runtime` (the v1 engine). When set, in-TUI session
-/// switches (`/session`, `/bg`, disk `/resume`) spawn through it instead — the
-/// cli injects the engine-v2 bridge here. It receives the CURRENT config +
-/// working dir (so it tracks `/model` / `/provider` / `/cd`) and returns the same
-/// `(client, event_rx)` pair the factory does.
+/// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
+/// `/resume`). The cli injects the engine-v2 bridge here. It receives the
+/// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
+/// and returns the `(client, event_rx)` pair.
 pub type RuntimeSpawnOverride = std::sync::Arc<
     dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
         + Send
@@ -736,10 +732,8 @@ pub struct LoopCtx {
     /// restart path deliberately does NOT arm this — it needs the normal
     /// `ExitReason::UpgradeRestart` return to re-exec the new binary.
     pub shutdown_deadline: Option<std::time::Instant>,
-    pub runtime_factory: AgentRuntimeFactory,
-    /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
-    /// [`RuntimeSpawnOverride`].
-    pub runtime_spawn_override: Option<RuntimeSpawnOverride>,
+    /// Engine-v2 spawner for in-TUI session switches. See [`RuntimeSpawnOverride`].
+    pub runtime_spawn_override: RuntimeSpawnOverride,
     pub bg_manager: bg_runtime::BgRuntimeManager,
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -5075,7 +5069,6 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     let path = atomcode_core::config::Config::default_path();
     if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
         ctx.config = fresh;
-        ctx.runtime_factory.set_config(ctx.config.clone());
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
@@ -7338,7 +7331,6 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     match ctx.config.save(&path) {
         Ok(()) => {
             atomcode_core::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
                 .cmd_tx
@@ -9669,14 +9661,13 @@ fn handle_agent_event(
             let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
-                ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
             // live-sync forwarder in sync mode). Follow it: change cwd like
-            // `/cd` (updates runtime_factory + @-file index + recent dirs +
+            // `/cd` (updates working_dir + @-file index + recent dirs +
             // tells the running agent), THEN open a fresh session in the new
             // dir like `/session`. Distinct from WorkingDirChanged (agent's own
             // `cd`, conversation preserved). No-op when already there to avoid
@@ -10209,7 +10200,6 @@ fn handle_agent_event(
                 // model_picker) — otherwise the denominator lags a turn behind
                 // a webui-driven model change.
                 state.on_model_window_changed(ctx.config.default_context_window());
-                ctx.runtime_factory.set_config(ctx.config.clone());
                 let _ = ctx
                     .agent
                     .cmd_tx

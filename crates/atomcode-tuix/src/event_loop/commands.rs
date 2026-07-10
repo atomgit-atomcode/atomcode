@@ -32,7 +32,6 @@ use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 use crate::markdown::{fence_start, is_closing_fence};
@@ -155,13 +154,10 @@ fn spawn_runtime(
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    // Engine v2: spawn through the injected bridge so in-TUI session switches run
-    // on the new stack too. The override reads the CURRENT config/working_dir (the
-    // same values the v1 factory would), keeping /model /provider /cd honoured.
-    let (client, event_rx) = match &ctx.runtime_spawn_override {
-        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
-        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
-    };
+    // Spawn through the injected engine-v2 bridge so in-TUI session switches run
+    // on the new stack too. It reads the CURRENT config/working_dir, keeping
+    // /model /provider /cd honoured.
+    let (client, event_rx) = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
     bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
     (runtime_id, client, session)
 }
@@ -1414,7 +1410,6 @@ fn execute_slash_command_impl(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
-                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     // Refresh the footer context window now (see model_picker
                     // Enter handler) — no turn fires here either, so the cached
@@ -4455,7 +4450,6 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
-    ctx.runtime_factory.set_working_dir(path.clone());
     // Re-index the @-mention file index for the new working directory.
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.

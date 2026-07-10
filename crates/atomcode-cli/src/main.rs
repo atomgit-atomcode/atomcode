@@ -25,10 +25,9 @@ fn _isolate_atomcode_home() {
     atomcode_test_support::isolate_home();
 }
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
+use atomcode_core::agent::{AgentCommand, AgentEvent};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
@@ -562,13 +561,6 @@ const VERSION: &str = concat!(
 #[derive(Parser)]
 #[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
-    /// Engine selection: "v2" (new kernel stack via atomcode-bridge) is the
-    /// DEFAULT. Opt out to the legacy engine with "v1" (or "legacy"/"old").
-    /// Also settable via $ATOMCODE_ENGINE. v2 runs the same drivers (headless +
-    /// TUI, incl. in-TUI /session and /resume) over the new engine.
-    #[arg(long)]
-    engine: Option<String>,
-
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -1588,7 +1580,10 @@ async fn run() -> Result<i32> {
     // so the TUI boots. The Welcome-wizard / status-row hints will
     // nudge the user to `/login`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
-    let (provider, model_name) = if let Some(reason) = unavailable_reason {
+    // The engine-v2 bridge builds its own provider from config; this binding is
+    // retained because it also resolves `model_name` and detects the onboarding
+    // (empty model_name) case. The provider object itself is unused.
+    let (_provider, model_name) = if let Some(reason) = unavailable_reason {
         (unavailable_provider(reason), model_name)
     } else {
         match create_provider(&provider_config) {
@@ -1765,72 +1760,36 @@ async fn run() -> Result<i32> {
         None
     };
 
-    // Start with a fresh conversation each session. When `session_to_continue`
-    // is present (via `-c` / `--continue`), the TUI replays the prior session's
-    // messages into scrollback AND sends them to the agent via
-    // `AgentCommand::SetMessages` so the model context is fully restored.
-    // Bare `atomcode` (no `-c`) starts completely fresh.
-    let conversation = Conversation::new();
-
-    let (mut agent_loop, agent_handle) = AgentLoop::new_with_skip_permissions(
-        config.clone(),
-        provider,
-        tool_registry,
-        tool_context.clone(),
-        conversation,
+    // The engine-v2 bridge (atomcode-bridge) builds its own provider + tools from
+    // config, so the `tool_registry`/`tool_context` assembled above are no longer
+    // wired to an agent loop; they remain constructed (unchanged lifetime) pending
+    // a follow-up cleanup.
+    let bridge_cfg = bridge_config_from(
+        &config,
+        &working_dir,
+        cli.provider.as_deref(),
+        Some(telemetry.clone()),
         cli.dangerously_skip_permissions,
+        // Interactive (TUI) ⇒ approvals park until answered; headless (`-p`) keeps the
+        // fail-closed timeout so an unanswered approval can't park the run forever.
+        !is_headless,
     );
-    agent_loop.set_max_turns(cli.max_turns);
-    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
+    eprintln!("[engine] active (model {})", bridge_cfg.model);
+    let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> =
+        Some(atomcode_core::agent::AgentHandle { client, event_rx });
 
-    // ── Engine selection (the strangler switch) ──────────────────────────────
-    // v2 = the NEW stack behind the legacy channel protocol (atomcode-bridge) and
-    // is now the DEFAULT. The legacy engine stays reachable as the rollback escape
-    // hatch (--engine v1 / $ATOMCODE_ENGINE=v1) until it is removed in a later phase.
-    // The drivers below (headless loop / tuix) are untouched either way.
-    let engine_choice = cli
-        .engine
-        .clone()
-        .or_else(|| std::env::var("ATOMCODE_ENGINE").ok());
-    let engine_v1 = matches!(
-        engine_choice.as_deref(),
-        Some("v1" | "1" | "legacy" | "old")
-    );
-    let engine_v2 = !engine_v1;
-    if engine_v1 {
-        eprintln!("[engine v1] legacy stack active (opt-out via --engine v1)");
-    }
-    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> = if engine_v2 {
-        let bridge_cfg = bridge_config_from(
-            &config,
-            &working_dir,
-            cli.provider.as_deref(),
-            Some(telemetry.clone()),
-            cli.dangerously_skip_permissions,
-            // Interactive (TUI) ⇒ approvals park until answered; headless (`-p`) keeps the
-            // fail-closed timeout so an unanswered approval can't park the run forever.
-            !is_headless,
-        );
-        eprintln!("[engine v2] new stack active (model {})", bridge_cfg.model);
-        let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
-        Some(atomcode_core::agent::AgentHandle { client, event_rx })
-    } else {
-        None
-    };
-    // Engine-v2 spawner for in-TUI session switches (/session, /bg, disk /resume):
-    // each one builds a fresh bridge from the CURRENT config, so the new engine —
-    // not the v1 factory — backs those runtimes too. `None` in v1 keeps the factory.
-    let runtime_spawn_override: Option<atomcode_tuix::RuntimeSpawnOverride> = if engine_v2 {
+    // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
+    // builds a fresh bridge from the CURRENT config, so a /provider switch inside
+    // the session takes effect (the launch-time --provider override only seeds the
+    // initial handle above).
+    let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
         let tel = telemetry.clone();
-        // Capture the bypass flag so in-TUI re-spawns (/session, /bg, disk /resume)
-        // also honor --dangerously-skip-permissions — not just the launch handle.
+        // Capture the bypass flag so in-TUI re-spawns also honor
+        // --dangerously-skip-permissions — not just the launch handle.
         let skip_perms = cli.dangerously_skip_permissions;
-        Some(std::sync::Arc::new(
+        std::sync::Arc::new(
             move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
-                // In-TUI re-spawns (/session, /bg, disk /resume) follow the
-                // config's CURRENT default_provider (None) so a /provider switch
-                // inside the session takes effect — the launch-time --provider
-                // override only seeds the initial handle above.
                 atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
                     config,
                     working_dir,
@@ -1841,9 +1800,7 @@ async fn run() -> Result<i32> {
                     true,
                 ))
             },
-        ))
-    } else {
-        None
+        )
     };
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
@@ -1902,11 +1859,12 @@ async fn run() -> Result<i32> {
         // Headless `-c`: the TUI rebinds itself, so only push to the agent
         // here, so the continued session's id reaches the header + datalog.
         if effective_prompt.is_some() {
-            agent_handle
-                .client
-                .cmd_tx
-                .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
-                .ok();
+            if let Some(h) = v2_handle.as_ref() {
+                h.client
+                    .cmd_tx
+                    .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
+                    .ok();
+            }
         }
     }
     let scope_ctx = CurrentContext {
@@ -1933,16 +1891,10 @@ async fn run() -> Result<i32> {
             // Don't `?`-propagate here: an error must still fall through to the
             // telemetry.shutdown() below, otherwise this session's un-drained
             // mpsc events are lost. Capture the Result and let it bubble up only
-            // *after* the flush. Engine v2 routes through the bridged handle
-            // (engine_loop = None); the legacy engine still spawns its AgentLoop.
+            // *after* the flush. The run routes through the bridged handle.
             let notifications_cfg = config.notifications.clone();
-            let (engine_loop, engine_handle) = if engine_v2 {
-                (None, v2_handle.take().expect("v2 handle built above"))
-            } else {
-                (Some(agent_loop), agent_handle)
-            };
+            let engine_handle = v2_handle.take().expect("v2 handle built above");
             match run_headless(
-                engine_loop,
                 notifications_cfg,
                 engine_handle,
                 prompt,
@@ -2028,23 +1980,14 @@ async fn run() -> Result<i32> {
             // actual errors in their shell/CI output.
             redirect_stderr_to_log_file();
 
-            let tui_handle = if let Some(h) = v2_handle.take() {
-                // engine v2: the bridge task already runs the engine; the legacy
-                // loop is never started. (/session and /resume inside the TUI go
-                // through runtime_factory and thus still spawn v1 runtimes — the
-                // factory seam is the next strangler step.)
-                h
-            } else {
-                let ctx = atomcode_telemetry::CurrentContext::current();
-                tokio::spawn(async move {
-                    atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-                });
-                agent_handle
-            };
+            // The bridge task already runs the engine behind this handle; the TUI
+            // just drives it. In-TUI /session and /resume spawn via
+            // runtime_spawn_override.
+            let tui_handle = v2_handle.take().expect("v2 handle built above");
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            match atomcode_tuix::run(config, model_name, tui_handle, runtime_factory, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+            match atomcode_tuix::run(config, model_name, tui_handle, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
             }
@@ -2184,9 +2127,6 @@ fn bridge_config_from(
 /// `verbose=true`: also emit tool calls, token usage, [done] summary, working
 /// dir changes, and sub-agent progress on stderr.
 async fn run_headless(
-    // `None` = engine v2: the bridged engine task is ALREADY running behind the
-    // handle's channels (atomcode-bridge); only the legacy engine needs spawning.
-    agent_loop: Option<AgentLoop>,
     notifications_cfg: atomcode_core::config::NotificationConfig,
     agent_handle: atomcode_core::agent::AgentHandle,
     prompt: String,
@@ -2226,12 +2166,6 @@ async fn run_headless(
         (handle.client.cmd_tx, handle.event_rx)
     };
 
-    if let Some(agent_loop) = agent_loop {
-        let ctx = atomcode_telemetry::CurrentContext::current();
-        tokio::spawn(async move {
-            atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
-        });
-    }
     let mut exit_code: i32 = 0;
 
     // NON-FATAL on a closed channel: with engine v2 the bridged task may have
