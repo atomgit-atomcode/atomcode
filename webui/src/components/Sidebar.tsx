@@ -338,6 +338,8 @@ export function Sidebar({
   // MCP menu: server list fetched lazily; the count badge shows once loaded.
   const [mcpStatus, setMcpStatus] = useState<McpStatusInfo | null>(null);
   const [mcpLoading, setMcpLoading] = useState(false);
+  // Bounds the connecting-state poll loop (see the poll effect below).
+  const mcpPollAttemptsRef = useRef(0);
   const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
   const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const mcpMenuRef = useRef<HTMLDivElement | null>(null);
@@ -608,19 +610,42 @@ export function Sidebar({
     onPickSkill?.(name);
   }
 
-  // Fetch MCP status once (for the count badge + menu list).
-  function ensureMcpStatus() {
-    if (mcpStatus !== null || mcpLoading) return;
+  // Fetch MCP status (for the count badge + menu list). Unlike a one-shot cache,
+  // this can re-run: remote servers (especially HTTP) connect asynchronously, so
+  // an early snapshot can show them as `connecting` and must be refreshed until
+  // they settle. Only the in-flight fetch is deduped (mcpLoading), not the result.
+  function refreshMcpStatus() {
+    if (mcpLoading) return;
     setMcpLoading(true);
     getMcpStatus()
       .then(setMcpStatus)
-      .catch(() => setMcpStatus({ servers: [] }))
+      // On a transient error keep whatever we had; only fall back to empty if we
+      // never got a result, so a blip doesn't wipe a populated panel.
+      .catch(() => setMcpStatus((cur) => cur ?? { servers: [] }))
       .finally(() => setMcpLoading(false));
   }
   useEffect(() => {
-    ensureMcpStatus();
+    refreshMcpStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Poll while any server is still `connecting` so the panel converges to the
+  // settled state (connected / error) without the user reopening it. Servers
+  // resolve to connected/failed within their timeout, so this stops on its own;
+  // an attempt cap guards against a server that never settles.
+  useEffect(() => {
+    const anyConnecting = (mcpStatus?.servers ?? []).some((s) => s.status === 'connecting');
+    if (!anyConnecting) {
+      mcpPollAttemptsRef.current = 0;
+      return;
+    }
+    if (mcpPollAttemptsRef.current >= 20) return; // ~30s ceiling
+    const id = window.setTimeout(() => {
+      mcpPollAttemptsRef.current += 1;
+      refreshMcpStatus();
+    }, 1500);
+    return () => window.clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mcpStatus]);
 
   // MCP menu is fixed-positioned; close on outside click / scroll / resize.
   // Scroll events originating inside the menu itself are ignored so the user
@@ -655,7 +680,10 @@ export function Sidebar({
       setMcpMenuOpen(false);
       return;
     }
-    ensureMcpStatus();
+    // Reopening forces a fresh fetch (and restarts the connecting poll) so a
+    // panel that was empty during the connect window picks up newly-ready servers.
+    mcpPollAttemptsRef.current = 0;
+    refreshMcpStatus();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setMcpMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
     setMcpMenuOpen(true);

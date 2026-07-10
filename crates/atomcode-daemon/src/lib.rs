@@ -3733,9 +3733,60 @@ struct McpStatusResponse {
     servers: Vec<McpServerStatus>,
 }
 
+/// Merge a registry's known server statuses with the full set of *configured*
+/// server names. A configured server the registry hasn't recorded yet (still
+/// mid-`initialize()` — common for remote HTTP during the connect window) is
+/// surfaced as `Connecting`, so the panel shows it immediately instead of an
+/// empty list. A status the registry already knows (Connected / Failed /
+/// Disconnected) always wins over the synthetic `Connecting`.
+fn merge_configured_mcp_statuses(
+    statuses: Vec<(String, atomcode_core::mcp::ServerStatus)>,
+    configured_names: &[String],
+) -> Vec<(String, atomcode_core::mcp::ServerStatus)> {
+    let mut by_name: std::collections::BTreeMap<String, atomcode_core::mcp::ServerStatus> =
+        statuses.into_iter().collect();
+    for name in configured_names {
+        by_name
+            .entry(name.clone())
+            .or_insert(atomcode_core::mcp::ServerStatus::Connecting);
+    }
+    by_name.into_iter().collect()
+}
+
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
-    let registry = state.mcp_registry.read().await.clone();
+    // Report status from the registry that actually SERVES this session's tools,
+    // so the panel reflects reality instead of the daemon's separate startup
+    // registry (which reconnects on the side and can diverge). Preference:
+    //   1. the live session's registry (sync mode / TUI `/webui`),
+    //   2. the per-project chat cache (daemon `/chat`),
+    //   3. the startup registry as a last resort.
+    let working_dir = state.project.read().await.working_dir.clone();
+    let registry = if let Some(reg) = live_api::live_serving_mcp_registry().await {
+        reg
+    } else if let Some(reg) = state
+        .mcp_cache
+        .read()
+        .await
+        .get(&working_dir)
+        .map(|c| c.registry.clone())
+    {
+        reg
+    } else {
+        state.mcp_registry.read().await.clone()
+    };
+
     let statuses = registry.server_statuses().await;
+
+    // Surface configured-but-not-yet-connected servers as `connecting` so a slow
+    // handshake (especially remote HTTP) renders as "connecting", not an empty
+    // panel. Names come from the same user + project mcp.json the registry loads.
+    let configured_names: Vec<String> = atomcode_core::mcp::load_mcp_config(&working_dir)
+        .map(|cfgs| cfgs.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default();
+    let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
+
+    // Fetch the tool list once (was previously re-fetched per connected server).
+    let tools = registry.list_all_tools().await;
     let mut servers = Vec::new();
     for (name, status) in statuses {
         let (status_str, error) = match &status {
@@ -3745,7 +3796,6 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
             atomcode_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
         };
         let tool_count = if matches!(status, atomcode_core::mcp::ServerStatus::Connected) {
-            let tools = registry.list_all_tools().await;
             Some(tools.iter().filter(|t| t.server_name == name).count())
         } else {
             None
@@ -4984,6 +5034,57 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 回归：远程 HTTP MCP 服务器在 `/mcp/status` 面板显示为空。根因之一是 in-flight
+    // （仍在 initialize() 途中）的服务器既不在 servers、也不在 failed_servers → 被
+    // server_statuses() 略过 → 面板空。修复：把配置里有、但 registry 尚未记录的服务器
+    // 补成 connecting，让面板在连接窗口里就有东西显示，而不是空列表。
+    #[test]
+    fn merge_surfaces_configured_servers_as_connecting() {
+        use atomcode_core::mcp::ServerStatus;
+        let statuses = vec![
+            ("connected-srv".to_string(), ServerStatus::Connected),
+            ("failed-srv".to_string(), ServerStatus::Failed("boom".to_string())),
+        ];
+        let configured = vec![
+            "connected-srv".to_string(),
+            "failed-srv".to_string(),
+            "pending-srv".to_string(),
+        ];
+        let merged: std::collections::HashMap<_, _> =
+            merge_configured_mcp_statuses(statuses, &configured)
+                .into_iter()
+                .collect();
+        assert_eq!(merged.len(), 3);
+        assert!(matches!(merged.get("connected-srv"), Some(ServerStatus::Connected)));
+        assert!(matches!(merged.get("failed-srv"), Some(ServerStatus::Failed(_))));
+        // The not-yet-connected configured server is visible as connecting, not dropped.
+        assert!(matches!(merged.get("pending-srv"), Some(ServerStatus::Connecting)));
+    }
+
+    #[test]
+    fn merge_keeps_registry_status_over_synthetic_connecting() {
+        use atomcode_core::mcp::ServerStatus;
+        // A server already known as Failed/Connected must NOT be downgraded to the
+        // synthetic Connecting just because it's also in the config file.
+        let merged = merge_configured_mcp_statuses(
+            vec![("s".to_string(), ServerStatus::Failed("x".to_string()))],
+            &["s".to_string()],
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].1, ServerStatus::Failed(_)));
+    }
+
+    #[test]
+    fn merge_no_config_is_identity() {
+        use atomcode_core::mcp::ServerStatus;
+        let merged = merge_configured_mcp_statuses(
+            vec![("s".to_string(), ServerStatus::Connected)],
+            &[],
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].1, ServerStatus::Connected));
+    }
 
     // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 core 会话存储命名目录
     // 用的 hash 完全一致。曾经 daemon 自持一份用 `str::hash`（而非 `Path::hash`）的

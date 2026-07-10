@@ -228,6 +228,22 @@ pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Return the MCP registry that serves the *current live session's* tools, if a
+/// live session exists. In sync mode (TUI `/webui`) this is the registry the AI
+/// actually uses — kept in the process-global MCP cache, keyed by the live
+/// session's working_dir — which is distinct from the daemon's startup
+/// `state.mcp_registry`. Lets `/mcp/status` report what's really connected
+/// instead of a separate registry that reconnects on the side.
+pub(crate) async fn live_serving_mcp_registry() -> Option<Arc<McpRegistry>> {
+    let working_dir = LIVE_WORKING_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let cache = live_mcp_cache();
+    let guard = cache.read().await;
+    guard.get(&working_dir).map(|entry| entry.registry.clone())
+}
+
 /// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
 /// 不需要传入 AppState — 使用进程级共享 MCP 缓存。
 ///
