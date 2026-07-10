@@ -262,13 +262,7 @@ fn build_i18n_command() -> clap::Command {
             a.help(t(Msg::CliHelpPromptFile).into_owned())
         })
         .mut_arg("verbose", |a| a.help(t(Msg::CliHelpVerbose).into_owned()))
-        .mut_arg("max_turns", |a| {
-            a.help(t(Msg::CliHelpMaxTurns).into_owned())
-        })
         .mut_arg("dev", |a| a.help(t(Msg::CliHelpDev).into_owned()))
-        .mut_arg("disable_tools", |a| {
-            a.help(t(Msg::CliHelpDisableTools).into_owned())
-        })
         .mut_arg("no_telemetry", |a| {
             a.help(t(Msg::CliHelpNoTelemetry).into_owned())
         })
@@ -599,13 +593,6 @@ struct Cli {
     #[arg(short = 'v', long)]
     verbose: bool,
 
-    /// Maximum number of LLM turns before the agent loop is force-stopped.
-    /// Bounds context accumulation on long-running tasks (e.g. SWE-bench eval).
-    /// Default: unbounded — the agent stops naturally when the model returns
-    /// no tool calls or when the step budget (tool-call cap) is reached.
-    #[arg(long)]
-    max_turns: Option<usize>,
-
     /// Disable auto-update for this launch. Skips applying any staged
     /// upgrade, skips the sync stage+apply on startup, and skips the
     /// detached background stager. Use during local development so a
@@ -613,16 +600,6 @@ struct Cli {
     /// released binary.
     #[arg(long)]
     dev: bool,
-
-    /// Comma-separated list of tool names to exclude from the registry.
-    /// Use this to disable tools that are useless or harmful in a particular
-    /// environment — e.g. `--disable-tools bash,web_fetch` for SWE-bench eval
-    /// where the sandbox can't run commands and offline mode is required.
-    /// Tools the LLM tries to call after disabling will be invisible to it
-    /// (they won't appear in the schemas list at all), so the model will not
-    /// retry against a permanently-blocked tool.
-    #[arg(long, value_delimiter = ',', value_name = "NAMES")]
-    disable_tools: Vec<String>,
 
     /// Disable telemetry for this invocation.
     #[arg(long = "no-telemetry", default_value_t = false, global = true)]
@@ -1607,8 +1584,7 @@ async fn run() -> Result<i32> {
     // The engine-v2 bridge builds the agent's own tool registry from config; here
     // we only build the shared `McpRegistry` the TUI uses (status panel / mgmt)
     // and, for TUI mode, an event channel so connection status surfaces in
-    // scrollback. (`--disable-tools` / $ATOMCODE_DISABLE_TOOLS only gated the
-    // retired v1 registry and is not consulted by the v2 engine.)
+    // scrollback.
     let (mcp_registry, mcp_connect_rx) = if is_headless {
         // Headless: wait for connections so the registry is populated up front.
         let registry = McpRegistry::from_config(&working_dir).await;

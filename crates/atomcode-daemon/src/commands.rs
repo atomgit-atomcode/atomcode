@@ -881,16 +881,11 @@ mod tests {
     /// writing to a project-hash bucket and reading it back returns the same session.
     #[test]
     fn save_session_to_hash_roundtrip() {
-        use std::sync::Mutex as TestMutex;
-        use std::sync::OnceLock;
-
-        // Process-global env lock so ATOMCODE_HOME mutations don't race other tests.
-        fn env_lock() -> &'static TestMutex<()> {
-            static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-            LOCK.get_or_init(|| TestMutex::new(()))
-        }
-
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Shared process-global env lock so ATOMCODE_HOME mutations don't race
+        // the other daemon test modules in the same test binary.
+        let _guard = crate::atomcode_home_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var("ATOMCODE_HOME").ok();
         std::env::set_var("ATOMCODE_HOME", dir.path());

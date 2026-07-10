@@ -19,16 +19,6 @@ pub(crate) fn approval_mode_wire(mode: ApprovalMode) -> &'static str {
     }
 }
 
-/// Plan mode suffix appended to the per-turn system prompt. It is never
-/// persisted and is shared by `/live` and `/chat` so all clients get identical
-/// read-only guidance.
-pub(crate) const PLAN_MODE_SYSTEM_SUFFIX: &str = "\n\n# Plan mode (read-only)\n\
-You are in PLAN MODE. Explore the codebase read-only and PRESENT A PLAN for the \
-user to approve. Do NOT edit files, do NOT run mutating shell commands — any such \
-tool call will be denied. Use read/search tools freely, then summarize the concrete \
-steps you would take. 你正处于「Plan 只读模式」：只读探索并给出方案，不要改文件、不要跑\
-改动类命令（会被拒绝），最后给出你打算执行的具体步骤。";
-
 #[cfg(test)]
 mod tests {
     use super::*;

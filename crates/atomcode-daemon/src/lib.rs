@@ -66,19 +66,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use atomcode_core::auth;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
+use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::telemetry_bootstrap::detect_repo_origin;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::TurnEvent;
-use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider, PlanPermissionDecider,
-};
-use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
@@ -287,6 +279,17 @@ pub struct SessionDetail {
 }
 
 /// Global project state store (current working directory)
+/// Process-global lock serialising `$ATOMCODE_HOME` mutations across ALL daemon
+/// tests. `commands.rs` and `live_api.rs` compile into the same test binary and
+/// both point `ATOMCODE_HOME` at a tempdir; without a shared lock their separate
+/// per-module locks don't mutually exclude, so they race and read each other's
+/// sessions root. One lock here fixes that.
+#[cfg(test)]
+pub(crate) fn atomcode_home_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 type ProjectStateStore = Arc<RwLock<ProjectState>>;
 
 /// Active chat tasks (session_id -> cancellation token)
@@ -2737,16 +2740,13 @@ async fn process_chat_request(
     cancel_token: CancellationToken,
     cancellation_key: String,
     stopped_sessions: StoppedSessionsStore,
-    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    // The engine-v2 bridge builds its own MCP; this per-project cache is warmed by
+    // the /context, /compact and /live paths, not the chat turn.
+    _mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
     interactive_permission: bool,
 ) -> anyhow::Result<()> {
-    use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
-        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
-    };
     let approval_mode = effective_chat_approval_mode(req.approval_mode);
     // Load config
     let config_path = Config::default_path();
@@ -2762,8 +2762,10 @@ async fn process_chat_request(
         .get(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
 
-    // Create provider instance
-    let provider = provider::create_provider(provider_config)?;
+    // Pre-flight: validate the selected provider config up front so a bad
+    // provider surfaces a clean error here rather than deep in the bridge. The
+    // engine-v2 bridge builds its own provider for the actual turn.
+    let _provider = provider::create_provider(provider_config)?;
 
     // Get working directory
     let working_dir = req
@@ -2839,227 +2841,13 @@ async fn process_chat_request(
             conv.turn_tracker.on_user_message(idx);
         }
     }
-    // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
-    let mut tool_context = ToolContext::with_telemetry(
-        working_dir.clone(),
-        req.session_id.as_deref().unwrap_or("default"),
-        telemetry.clone(),
-    );
-    let mut tool_registry = ToolRegistry::new();
-    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
-    // the CLI's --disable-tools behaviour. Comma-separated tool names.
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
-
-    // Load skills and register use_skill tool
-    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-    skill_registry.reload(&working_dir);
-    let has_skills = !skill_registry.is_empty();
-    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
-        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
-            registry: skill_registry.clone(),
-        }));
-    }
-
-    // Register MCP tools using per-project cache.
-    // Each project directory gets its own MCP registry (loaded from its .mcp.json + global).
-    let mcp_registry: Arc<McpRegistry> = {
-        let cache = mcp_cache.read().await;
-        if let Some(cached) = cache.get(&working_dir) {
-            cached.registry.clone()
-        } else {
-            drop(cache);
-            // Cache miss — create new registry for this project
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            new_registry
-                .wait_for_initial_connections(Duration::from_secs(5))
-                .await;
-            // Store in cache
-            let mut cache = mcp_cache.write().await;
-            // Evict LRU if cache is full
-            if cache.len() >= MCP_CACHE_MAX {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-            cache.insert(
-                working_dir.clone(),
-                CachedMcpRegistry {
-                    registry: new_registry.clone(),
-                    last_used: std::time::Instant::now(),
-                },
-            );
-            new_registry
-        }
-    };
-    // Update last_used timestamp
-    {
-        let mut cache = mcp_cache.write().await;
-        if let Some(entry) = cache.get_mut(&working_dir) {
-            entry.last_used = std::time::Instant::now();
-        }
-    }
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-    }
-
-    // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-    tool_context.lsp = lsp_manager;
-
-    let shared_tools = Arc::new(tool_registry);
-
-    // webui/daemon mode: interactive approval bridged over HTTP. The decider
-    // sends an `ApprovalRequest` on `perm_req_tx` (we keep the receiver alive so
-    // `send` succeeds — if it were dropped, EVERY tool would auto-deny) and
-    // blocks on `perm_resp_rx` until the browser POSTs a decision to
-    // `/chat/permission`, which is routed back here via `pending_permissions`.
-    // The user-facing notification is the `TurnEvent::ApprovalRequested` event
-    // forwarded as a `permission_request` SSE event below.
-    // Interactive local clients (WebUI, channel, VSCode, JetBrains) can answer
-    // approval prompts, so Build uses InteractivePermissionDecider plus the
-    // register/keep-alive/unregister plumbing. Clients without a permission
-    // response channel keep the compatibility BypassAll fallback in Build mode;
-    // Plan and Bypass are explicit modes and never depend on an approver.
+    // Interactive approval bridged over HTTP: interactive local clients (WebUI,
+    // channel, VSCode, JetBrains) in Build mode route `/chat/permission`
+    // decisions back to the engine-v2 producer via `pending_permissions` (see
+    // the registration in the turn task below). Plan and Bypass are explicit
+    // modes and never depend on an approver.
     let registered_permission_responder =
         interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
-    let (permission, _perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = match approval_mode {
-        crate::approval_mode::ApprovalMode::Bypass => (
-            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-            None,
-        ),
-        crate::approval_mode::ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
-        crate::approval_mode::ApprovalMode::Build if interactive_permission => {
-            let (perm_req_tx, perm_req_rx) =
-                tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-            let (perm_resp_tx, perm_resp_rx) =
-                tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-            let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                atomcode_core::tool::PermissionStore::new(),
-            ));
-            pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-            (
-                Box::new(InteractivePermissionDecider::new(
-                    perm_req_tx,
-                    perm_resp_rx,
-                    perm_store,
-                )),
-                Some(perm_req_rx),
-            )
-        }
-        crate::approval_mode::ApprovalMode::Build => {
-            // Compatibility for clients without a permission response channel.
-            // Known local IDE/webui clients are classified interactive above.
-            (
-                Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-                None,
-            )
-        }
-    };
-    // Same ctx selection as interactive AgentLoop: walk config.providers
-    // for the active provider (the one actually selected for this turn,
-    // not config.default_provider), fallback to synthetic 128K config if absent.
-    let daemon_ctx = match config.providers.get(&provider_name) {
-        Some(pc) => atomcode_core::ctx::for_provider(pc),
-        None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
-                provider_type: String::new(),
-                api_key: None,
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: 128_000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: true,
-                capable_model: None,
-            })
-        }
-    };
-    // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
-    // mirroring the TUI agent so daemon/WebUI turns stay hook-aware.
-    let mut hook_engine = atomcode_core::hook::HookEngine::new();
-    hook_engine.load_all(&working_dir);
-    let _turn_runner = TurnRunner {
-        provider: provider.into(),
-        tools: shared_tools,
-        context: tool_context,
-        config: config.clone(),
-        ctx: daemon_ctx,
-        permission,
-        recently_edited_files: Vec::new(),
-        hook_engine: std::sync::Arc::new(hook_engine),
-        loop_guard: Default::default(),
-        current_turn_number: 0,
-    };
-
-    // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let mut system_prompt =
-        build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
-    // Plan mode: append the read-only plan instruction so the model explores
-    // and plans instead of firing edits that PlanPermissionDecider will deny.
-    // Mirrors the live path for every client that selects Plan.
-    if approval_mode == crate::approval_mode::ApprovalMode::Plan {
-        system_prompt.push_str(crate::approval_mode::PLAN_MODE_SYSTEM_SUFFIX);
-    }
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -3089,16 +2877,13 @@ async fn process_chat_request(
             tool_calls: 0,
             session_id: session.id.to_string(),
         });
-        // Turn never ran — drop the permission registration and the request
-        // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too). Only registered in interactive Build mode.
+        // Turn never ran — the turn task (which registers the responder) never
+        // spawned, so this is a defensive no-op cleanup for interactive Build mode.
         if registered_permission_responder {
             pending_permissions.unregister(&perm_session_key);
         }
         return Ok(());
     }
-
-    let _conversation_clone = conversation.clone();
 
     // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
     let tel_ctx = CurrentContext::current();

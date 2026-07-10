@@ -406,58 +406,24 @@ pub(crate) async fn build_turn_parts(
 
     let mut tool_registry = ToolRegistry::new();
 
-    // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
+    tool_registry.register_sync(Box::new(ReadFileTool));
+    tool_registry.register_sync(Box::new(WriteFileTool));
+    tool_registry.register_sync(Box::new(EditFileTool));
+    tool_registry.register_sync(Box::new(BashTool));
+    tool_registry.register_sync(Box::new(GrepTool));
+    tool_registry.register_sync(Box::new(GlobTool));
+    tool_registry.register_sync(Box::new(ListDirTool));
+    tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
+    tool_registry.register_sync(Box::new(WebFetchTool));
+    tool_registry.register_sync(Box::new(SearchReplaceTool));
+    tool_registry.register_sync(Box::new(TodoTool::new()));
 
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
     skill_registry.reload(working_dir);
     let has_skills = !skill_registry.is_empty();
     let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
+    if has_skills {
         tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone(),
         }));
@@ -512,7 +478,7 @@ pub(crate) async fn build_turn_parts(
 
     // Build LSP manager from config and inject into ToolContext.
     let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
+    if lsp_manager.is_some() {
         tool_registry.register_sync(Box::new(DiagnosticsTool));
     }
     tool_context.lsp = lsp_manager;
@@ -2718,12 +2684,10 @@ mod tests {
     // is the helper the executor now also calls at turn start (user message durable) and
     // throttled mid-turn (partial assistant text durable).
 
-    use std::sync::Mutex as TestMutex;
-
-    /// Process-global env lock so ATOMCODE_HOME-mutating tests in THIS binary never race.
-    fn env_lock() -> &'static TestMutex<()> {
-        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TestMutex::new(()))
+    /// Shared process-global env lock so ATOMCODE_HOME-mutating tests across ALL
+    /// daemon test modules in this binary never race.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::atomcode_home_test_lock()
     }
 
     /// Point ATOMCODE_HOME (→ sessions root) at a tempdir for the duration of a test,
