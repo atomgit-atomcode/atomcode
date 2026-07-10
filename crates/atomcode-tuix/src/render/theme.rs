@@ -71,6 +71,14 @@ impl Palette {
     pub const ERROR: Color = Color::Red; // bright red (91)
     pub const DIFF_ADD: Color = Color::Green; // bright green (92)
     pub const DIFF_REMOVE: Color = Color::Red; // bright red (91) — paired with Error
+    /// Diff add on **light** backgrounds. `DarkGreen` (SGR 32) is more readable on white.
+    pub const DIFF_ADD_LIGHT: Color = Color::DarkGreen; // SGR 32
+    /// Diff add on **dark** backgrounds — keep bright green for contrast.
+    pub const DIFF_ADD_DARK: Color = Color::Green; // SGR 92
+    /// Diff remove on **light** backgrounds. `DarkRed` (SGR 31) is more readable on white.
+    pub const DIFF_REMOVE_LIGHT: Color = Color::DarkRed; // SGR 31
+    /// Diff remove on **dark** backgrounds — keep bright red for contrast.
+    pub const DIFF_REMOVE_DARK: Color = Color::Red; // SGR 91
     pub const CODE: Color = Color::Cyan; // bright cyan (96)
 }
 
@@ -105,6 +113,36 @@ pub fn warning_for_current_theme() -> Color {
     }
 }
 
+/// Resolve the diff add shade for the active palette.
+///
+/// Light theme → `DIFF_ADD_LIGHT` (SGR 32 dark green, readable on white).
+/// Dark theme  → `DIFF_ADD_DARK`  (SGR 92 bright green, pops on dark).
+///
+/// Bright green on light backgrounds lacks contrast; this split matches the
+/// light/dark strategy used by `warning_for_current_theme` and `muted_for_current_theme`.
+pub fn diff_add_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::DIFF_ADD_LIGHT
+    } else {
+        Palette::DIFF_ADD_DARK
+    }
+}
+
+/// Resolve the diff remove shade for the active palette.
+///
+/// Light theme → `DIFF_REMOVE_LIGHT` (SGR 31 dark red, readable on white).
+/// Dark theme  → `DIFF_REMOVE_DARK`  (SGR 91 bright red, pops on dark).
+///
+/// Bright red on light backgrounds lacks contrast; this split matches the
+/// light/dark strategy used by `warning_for_current_theme` and `muted_for_current_theme`.
+pub fn diff_remove_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::DIFF_REMOVE_LIGHT
+    } else {
+        Palette::DIFF_REMOVE_DARK
+    }
+}
+
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
 /// Returns None when colours are disabled OR when the role intentionally
 /// uses the terminal's default foreground (so strong/tool-name text just
@@ -126,8 +164,8 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::Warning => Some(warning_for_current_theme()),
         Role::Error => Some(Palette::ERROR),
         Role::Success => Some(Palette::DIFF_ADD),
-        Role::DiffAdd => Some(Palette::DIFF_ADD),
-        Role::DiffRemove => Some(Palette::DIFF_REMOVE),
+        Role::DiffAdd => Some(diff_add_for_current_theme()),
+        Role::DiffRemove => Some(diff_remove_for_current_theme()),
         // Tool names: emphasise with bold only; the caller adds `\x1b[1m`.
         // No colour means the name picks up the terminal's default fg,
         // which guarantees readability on any theme.
@@ -244,5 +282,15 @@ mod tests {
         // foreground — they should return None even when colours are on.
         assert!(role(caps(true), Role::Secondary).is_none());
         assert!(role(caps(true), Role::ToolName).is_none());
+    }
+
+    #[test]
+    fn diff_colors_soften_on_light_theme() {
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(diff_add_for_current_theme(), Color::DarkGreen);
+        assert_eq!(diff_remove_for_current_theme(), Color::DarkRed);
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(diff_add_for_current_theme(), Color::Green);
+        assert_eq!(diff_remove_for_current_theme(), Color::Red);
     }
 }
