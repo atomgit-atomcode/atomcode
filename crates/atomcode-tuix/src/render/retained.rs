@@ -4026,10 +4026,22 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
+                // Capture BEFORE the arm mutates `last_mark_was_assistant`.
+                // We need the entry-time value to decide whether to insert a
+                // leading blank row for breathing room.
+                let prev_was_assistant = self.last_mark_was_assistant;
                 self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
+                // Insert one blank body row between assistant text and the
+                // tool-call header so the block has visual breathing room.
+                // Only fires when the previous rendered mark was assistant
+                // text — consecutive tool calls in a chain stay compact
+                // (no blank between them).
+                if prev_was_assistant {
+                    self.push_body_row(Vec::new());
+                }
                 let bullet_style = self.tool_bullet_style();
                 let tool_name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
@@ -13670,6 +13682,80 @@ mod tests {
         assert!(
             vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
             "wrapped bash segment must survive approval pop\ndump:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// A ToolCall that follows assistant text must have at least one blank row
+    /// between the last assistant-text row and the `● Bash` header row.
+    #[test]
+    fn tool_block_has_leading_blank_after_assistant_text() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        r.render(UiLine::AssistantText("refine spacing further now".into()));
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let rows: Vec<String> = (0..vterm.height() as usize)
+            .map(|i| vterm.row_text(i))
+            .collect();
+        let text_idx = rows
+            .iter()
+            .position(|r| r.contains("refine spacing further"))
+            .unwrap_or_else(|| panic!("assistant text row not found\nvterm dump:\n{}", vterm.dump()));
+        let bash_idx = rows
+            .iter()
+            .position(|r| r.contains("● Bash"))
+            .expect("bash header row");
+        assert!(
+            bash_idx > text_idx + 1,
+            "≥1 blank line between text and tool block: text@{text_idx} bash@{bash_idx}\n{}",
+            vterm.dump()
+        );
+        assert!(
+            rows[text_idx + 1..bash_idx].iter().any(|r| r.trim().is_empty()),
+            "a blank row exists between them\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Two consecutive ToolCall blocks (separated only by a ToolResult) must
+    /// NOT have a blank row between them — tool chains stay compact.
+    #[test]
+    fn tool_block_no_blank_between_consecutive_tool_calls() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        // First tool call + result (no assistant text in between)
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
+        r.render(UiLine::ToolResult { success: true, summary: "file.txt".into() });
+        // Second tool call — previous mark was a ToolResult, NOT assistant text
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "pwd".into() });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let rows: Vec<String> = (0..vterm.height() as usize)
+            .map(|i| vterm.row_text(i))
+            .collect();
+        // Find the two `● Bash` header rows
+        let bash_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains("● Bash"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(bash_positions.len(), 2, "expected two ● Bash rows\n{}", vterm.dump());
+        let first_bash = bash_positions[0];
+        let second_bash = bash_positions[1];
+        // The rows between first_bash and second_bash (exclusive) should have
+        // no entirely-blank row — they should all contain the result text or
+        // be adjacent (i.e. second_bash == first_bash + 1 or +2 for result).
+        let blank_between = rows[first_bash + 1..second_bash]
+            .iter()
+            .any(|r| r.trim().is_empty());
+        assert!(
+            !blank_between,
+            "consecutive tool calls must NOT have a blank row between them: \
+             first_bash@{first_bash} second_bash@{second_bash}\n{}",
             vterm.dump()
         );
     }
