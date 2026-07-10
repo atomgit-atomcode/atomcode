@@ -160,8 +160,10 @@ impl Tool for OpenFileTool {
 
         // URL support: http:// / https:// URLs are opened directly in the browser,
         // skipping path resolution and file existence checks.
+        // Scheme is case-insensitive per RFC 3986, so we check the lowercased form.
         let fp = a.file_path.trim();
-        if fp.starts_with("http://") || fp.starts_with("https://") {
+        let lower = fp.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             return open_url(fp).await;
         }
 
@@ -239,13 +241,12 @@ async fn open_url(url: &str) -> ToolResult {
             c
         }
         OpenStrategy::WindowsStart => {
-            // Quote the URL to protect cmd.exe shell metacharacters (&, |, %, ^).
-            // cmd /c start "" "url" — the empty "" is the required window title.
-            // Without quotes, & in query strings (e.g. ?a=1&b=2) would be treated
-            // as command separators, truncating the URL.
-            let quoted = format!("\"{}\"", url.replace('"', "\"\""));
-            let mut c = Command::new("cmd");
-            c.args(["/c", "start", "", &quoted]);
+            // Use explorer.exe directly to avoid cmd.exe shell metacharacter issues.
+            // cmd /c start would interpret &, |, %, ^ in URLs as shell operators,
+            // causing truncation of query strings or potential command injection.
+            // explorer.exe uses ShellExecute internally and handles URLs safely.
+            let mut c = Command::new("explorer");
+            c.arg(url);
             c
         }
         OpenStrategy::Wslview => {
@@ -320,6 +321,12 @@ impl OpenFileWorkspaceGate {
         let Ok(parsed) = serde_json::from_str::<Args>(args) else {
             return false;
         };
+        // URLs are always treated as "in workspace" so they get auto-approved
+        // (opening a URL is no more dangerous than opening an in-workspace file).
+        let fp = parsed.file_path.trim();
+        if fp.to_ascii_lowercase().starts_with("http://") || fp.to_ascii_lowercase().starts_with("https://") {
+            return true;
+        }
         let Ok(root) = std::fs::canonicalize(working_dir) else {
             return false;
         };

@@ -248,7 +248,7 @@ impl Tool for OpenFileTool {
         // URLs don't need path-based approval — they're opened in the browser
         // and are as safe as any in-workspace file.
         let fp = parsed.file_path.trim();
-        if fp.starts_with("http://") || fp.starts_with("https://") {
+        if fp.to_ascii_lowercase().starts_with("http://") || fp.to_ascii_lowercase().starts_with("https://") {
             return ApprovalRequirement::AutoApprove;
         }
         let wd = match ctx.working_dir.try_read() {
@@ -270,8 +270,10 @@ impl Tool for OpenFileTool {
         let path = parsed.file_path.as_str().trim();
 
         // URL support: http:// / https:// URLs are opened directly in the browser,
-        // skipping file-path resolution and existence checks.
-        if path.starts_with("http://") || path.starts_with("https://") {
+        // skipping file-path resolution and existence checks. Scheme is
+        // case-insensitive per RFC 3986, so we check the lowercased form.
+        let lower = path.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             return open_url(path).await;
         }
 
@@ -379,13 +381,12 @@ async fn open_url(url: &str) -> Result<ToolResult> {
             c
         }
         OpenStrategy::WindowsStart => {
-            // Quote the URL to protect cmd.exe shell metacharacters (&, |, %, ^).
-            // cmd /c start "" "url" — the empty "" is the required window title.
-            // Without quotes, & in query strings (e.g. ?a=1&b=2) would be treated
-            // as command separators, truncating the URL.
-            let quoted = format!("\"{}\"", url.replace('"', "\"\""));
-            let mut c = Command::new("cmd");
-            c.args(["/c", "start", "", &quoted]);
+            // Use explorer.exe directly to avoid cmd.exe shell metacharacter issues.
+            // cmd /c start would interpret &, |, %, ^ in URLs as shell operators,
+            // causing truncation of query strings or potential command injection.
+            // explorer.exe uses ShellExecute internally and handles URLs safely.
+            let mut c = Command::new("explorer");
+            c.arg(url);
             c
         }
         OpenStrategy::Wslview => {
