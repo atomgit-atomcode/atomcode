@@ -1085,6 +1085,29 @@ fn response_project_hash(path: &std::path::Path) -> String {
     hash_path(path)
 }
 
+/// System temp directory prefixes to exclude from the project list.
+/// These are directories that are not meaningful as user projects.
+fn is_system_temp_dir(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+    // Unix/Linux/macOS temp dirs
+    if path_str.starts_with("/tmp/") || path_str == "/tmp" {
+        return true;
+    }
+    if path_str.starts_with("/var/tmp/") || path_str == "/var/tmp" {
+        return true;
+    }
+    // Windows temp dirs
+    if path_str.contains("\\Temp\\") || path_str.contains("\\TEMP\\") || path_str.ends_with("\\Temp") || path_str.ends_with("\\TEMP")
+    {
+        return true;
+    }
+    // /private/tmp (macOS symlink target for /tmp)
+    if path_str.starts_with("/private/tmp/") || path_str == "/private/tmp" {
+        return true;
+    }
+    false
+}
+
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     let sessions_root = SessionManager::sessions_root_dir();
@@ -1126,8 +1149,13 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
                 }
             }
 
-            // Only include projects with at least one session
+            // Only include projects with at least one session and not in system temp dirs
             if session_count > 0 {
+                // Filter out system temp directories (e.g. /tmp/.tmpXXX, C:\Windows\Temp\...)
+                if !working_dir.to_string_lossy().is_empty() && is_system_temp_dir(&working_dir) {
+                    continue;
+                }
+
                 let name = working_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
