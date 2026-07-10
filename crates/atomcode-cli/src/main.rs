@@ -1948,10 +1948,10 @@ fn redirect_stderr_to_log_file() {
 /// both resolve the provider identically.
 ///
 /// `provider_override` is the `--provider` flag: it must flow through the SAME
-/// `active_provider` resolution the legacy engine uses (honor the override, fall
-/// back when the default points to a deleted section). Reading
-/// `default_provider` directly silently ignored `--provider`, so a headless
-/// `--engine v2 --provider X` run picked the config default instead of X.
+/// `active_provider` resolution (honor the override, fall back when the default
+/// points to a deleted section). Reading `default_provider` directly silently
+/// ignored `--provider`, so a headless `--provider X` run picked the config
+/// default instead of X.
 fn bridge_config_from(
     config: &atomcode_core::config::Config,
     working_dir: &std::path::Path,
