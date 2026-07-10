@@ -11618,24 +11618,20 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (seg_idx, seg) in segments.iter().enumerate() {
         let lead = if seg_idx == 0 { "" } else { indent };
-        let avail = width.saturating_sub(lead.len()).max(8);
         let mut line = String::from(lead);
         let mut line_len = lead.len();
         for word in seg.split(' ') {
             let wlen = word.chars().count();
             let need = if line_len == lead.len() { wlen } else { wlen + 1 };
-            if line_len > lead.len() && line_len + need > width && line_len > lead.len() {
+            if line_len > lead.len() && line_len + need > width {
                 out.push(std::mem::take(&mut line));
                 line.push_str(indent);
                 line_len = indent.len();
             }
-            if line_len > lead.len() && !line.ends_with(' ') && line_len != lead.len() {
+            if line_len > lead.len() && !line.ends_with(' ') {
                 line.push(' ');
                 line_len += 1;
-            } else if line_len == lead.len() && !lead.is_empty() {
-                // 已含 indent,不额外加空格
             }
-            let _ = avail;
             line.push_str(word);
             line_len += wlen;
         }
