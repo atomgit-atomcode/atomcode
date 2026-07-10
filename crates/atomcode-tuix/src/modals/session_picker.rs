@@ -745,6 +745,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message::new(Role::Assistant, "The answer is X."),
         ];
@@ -919,6 +920,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Text("go".into()),
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Assistant,
@@ -940,6 +942,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -949,6 +952,7 @@ mod tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -958,6 +962,7 @@ mod tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
             // A FAILED todowrite: its block still renders, but its error result must
             // NOT be suppressed (parity with live's `… && success` suppression).
@@ -974,6 +979,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -983,6 +989,7 @@ mod tests {
                     success: false,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
         ];
 

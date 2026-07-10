@@ -51,6 +51,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -64,6 +65,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -359,6 +361,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -368,6 +371,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -377,6 +381,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
         Message::new(Role::Assistant, "Here's what I found..."),
         Message::new(Role::User, "now edit it"),
@@ -393,6 +398,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -402,6 +408,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
     ];
 

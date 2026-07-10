@@ -6493,6 +6493,7 @@ mod todo_command_tests {
                 thinking_blocks: vec![],
             },
             synthetic: false,
+            internal_origin: None,
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
