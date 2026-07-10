@@ -645,6 +645,18 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// breaks the "inflight strip = body tail" invariant and orphans the
     /// spinner glyph next to the committed `●` (bash-only, since the hint is).
     inflight_hint: Option<String>,
+    /// Number of body rows pushed by the most-recent `UiLine::ApprovalPrompt`
+    /// render, or `Some(0)` after `pop_approval_prompt` has consumed them.
+    /// `None` means no ApprovalPrompt has been rendered yet (or the renderer
+    /// was reset), which triggers the legacy heuristic walk-back in
+    /// `pop_approval_prompt` as a defensive fallback.
+    ///
+    /// This count is set at the END of the `UiLine::ApprovalPrompt` arm
+    /// (after all `push_body_row` calls), so it self-corrects on resize:
+    /// the reflow replay re-runs the arm at the new terminal width and
+    /// re-records the fresh count, making it always consistent with
+    /// `body_lines`.
+    approval_block_rows: Option<usize>,
 
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -813,6 +825,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             inflight_hint: None,
+            approval_block_rows: None,
             live_group: None,
             modal_overlay: None,
             body_log: Vec::new(),
@@ -4300,6 +4313,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
+                // Capture row count BEFORE any push so we know exactly how
+                // many rows this approval block occupies. Set at the END of
+                // the arm after all push_body_row calls. Used by
+                // pop_approval_prompt to avoid the fragile col-0 heuristic.
+                let n0 = self.body_lines.len();
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 // Truecolor so the chips read as vivid green / blue / red on
@@ -4408,6 +4426,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     chips_row.extend(chips_cells);
                     self.push_body_row(chips_row);
                 }
+                // Record the exact number of rows pushed by this approval block.
+                // pop_approval_prompt reads this to avoid the fragile col-0 walk.
+                // Must be set AFTER all push_body_row calls so the count is final.
+                self.approval_block_rows = Some(self.body_lines.len().saturating_sub(n0));
             }
             UiLine::Error(msg) => {
                 // Defense in depth (mirror TurnComplete / TurnCancelled): a turn
@@ -4582,45 +4604,77 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         //   - When the label is long: 1+ label rows (first starts
         //     with '▶', continuation rows start with spaces) plus
         //     1 chips row (also starting with spaces).
-        // We need to pop all of them. Strategy: walk backwards
-        // from the tail, popping every row until we find the ▶
-        // header row (which we also pop). Other symbol rows hold
-        // '●' (tool call) or '❯' (user turn) at col 0 — distinct
-        // glyphs — so the first ▶ we encounter must be ours.
-        // Safe because the agent doesn't append further body rows
-        // between `ApprovalNeeded` and the user's Y/A/N reply.
+        // We need to pop all of them.
         //
-        // CRITICAL: capture `bottom` BEFORE the pop loop runs. In the
-        // top-anchored body model, `body_bottom_row()` returns
-        // `min(body_lines.len(), cap)` — calling it AFTER popping
-        // would point at the LAST `popped_count` rows of REMAINING
-        // body content (the rows just above the approval strip), so
-        // the erase would wipe real markers instead of the formerly-
-        // approval rows. Capture once, before mutating body_lines.
+        // PRIMARY PATH (count-based): `approval_block_rows` is set at the
+        // end of the `UiLine::ApprovalPrompt` render arm to the exact number
+        // of rows pushed. Using the explicit count avoids any heuristic and
+        // makes double-pop a clean noop:
+        //   Some(n>0)  → pop exactly n rows, then set Some(0).
+        //   Some(0)    → already consumed; return immediately (noop).
+        //   None       → defensive fallback: use the legacy walk-back heuristic
+        //                (covers any code path that didn't go through the
+        //                ApprovalPrompt render arm).
+        //
+        // CRITICAL: capture `bottom` BEFORE any pop. In the top-anchored body
+        // model, `body_bottom_row()` returns `min(body_lines.len(), cap)` —
+        // calling it AFTER popping would point at the LAST `popped_count` rows
+        // of REMAINING body content (the rows just above the approval strip),
+        // so the erase would wipe real markers instead of the formerly-approval
+        // rows. Capture once, before mutating body_lines.
         let bottom_before_pop = self.body_bottom_row();
-        let mut popped_count: u16 = 0;
-        loop {
-            let action = match self.body_lines.last() {
-                None => break,
-                Some(last) => last.get(0).map(|c| c.ch),
-            };
-            match action {
-                // ▶ header: pop it and stop (we've found the start).
-                Some('▶') => {
-                    self.body_lines.pop();
-                    popped_count = popped_count.saturating_add(1);
-                    break;
-                }
-                // Space-padded continuation / chips row: pop and keep going.
-                Some(' ') => {
-                    self.body_lines.pop();
-                    popped_count = popped_count.saturating_add(1);
-                }
-                // Any other glyph (● tool-call, ❯ user turn, etc.):
-                // not part of the approval block — stop without popping.
-                _ => break,
+
+        let popped_count: u16 = match self.approval_block_rows {
+            Some(0) => {
+                // Already consumed — double-pop is a clean noop.
+                return;
             }
-        }
+            Some(n) => {
+                // Count-based path: pop exactly n rows (clamped to what's
+                // available to be safe against any edge case).
+                let to_pop = n.min(self.body_lines.len());
+                for _ in 0..to_pop {
+                    self.body_lines.pop();
+                }
+                // Mark as consumed so the next call is a noop.
+                self.approval_block_rows = Some(0);
+                to_pop as u16
+            }
+            None => {
+                // Fallback: legacy walk-back heuristic.
+                //
+                // Walk backwards from the tail, popping every row until we
+                // find the ▶ header row (which we also pop). Other symbol rows
+                // hold '●' (tool call) or '❯' (user turn) at col 0 — distinct
+                // glyphs — so the first ▶ we encounter must be ours. Safe
+                // because the agent doesn't append further body rows between
+                // `ApprovalNeeded` and the user's Y/A/N reply.
+                let mut count: u16 = 0;
+                loop {
+                    let action = match self.body_lines.last() {
+                        None => break,
+                        Some(last) => last.get(0).map(|c| c.ch),
+                    };
+                    match action {
+                        // ▶ header: pop it and stop (we've found the start).
+                        Some('▶') => {
+                            self.body_lines.pop();
+                            count = count.saturating_add(1);
+                            break;
+                        }
+                        // Space-padded continuation / chips row: pop and keep going.
+                        Some(' ') => {
+                            self.body_lines.pop();
+                            count = count.saturating_add(1);
+                        }
+                        // Any other glyph (● tool-call, ❯ user turn, etc.):
+                        // not part of the approval block — stop without popping.
+                        _ => break,
+                    }
+                }
+                count
+            }
+        };
         if popped_count == 0 {
             return;
         }
@@ -8757,6 +8811,80 @@ mod tests {
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
         );
+    }
+
+    /// Validate that `approval_block_rows` is set to Some(n>0) after rendering
+    /// an ApprovalPrompt, that pop_approval_prompt consumes exactly n rows and
+    /// sets the count to Some(0), and that a second pop is a clean noop.
+    #[test]
+    fn approval_block_rows_count_semantics() {
+        // Wide terminal: label + chips fit on one line → exactly 1 approval row.
+        {
+            let (mut r, _buf) = new_capturing(80, 24);
+            r.render(UiLine::ApprovalPrompt {
+                tool: "bash".into(),
+                detail: "ls".into(),
+            });
+            // After rendering, approval_block_rows must be Some(n) with n > 0.
+            let n = r.approval_block_rows.expect("approval_block_rows should be set");
+            assert!(n > 0, "approval_block_rows must be > 0 after render, got {n}");
+
+            let body_before = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after = r.body_lines.len();
+            assert_eq!(
+                body_before - body_after,
+                n,
+                "pop should drop exactly n={n} rows, dropped {}",
+                body_before - body_after
+            );
+            assert_eq!(
+                r.approval_block_rows,
+                Some(0),
+                "approval_block_rows must be Some(0) after pop"
+            );
+
+            // Second pop: count is Some(0) → must be a noop.
+            let body_before2 = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after2 = r.body_lines.len();
+            assert_eq!(
+                body_before2, body_after2,
+                "second pop must be a noop (approval_block_rows == Some(0))"
+            );
+            assert_eq!(
+                r.approval_block_rows,
+                Some(0),
+                "approval_block_rows must remain Some(0) after noop second pop"
+            );
+        }
+
+        // Narrow terminal: label wraps → 2+ approval rows (chips on separate line).
+        {
+            let (mut r, _buf) = new_capturing(30, 24);
+            r.render(UiLine::ApprovalPrompt {
+                tool: "bash".into(),
+                detail: "a very long command indeed".into(),
+            });
+            let n = r.approval_block_rows.expect("approval_block_rows should be set");
+            assert!(n >= 2, "narrow terminal should produce >= 2 rows, got {n}");
+
+            let body_before = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after = r.body_lines.len();
+            assert_eq!(
+                body_before - body_after,
+                n,
+                "pop should drop exactly n={n} rows, dropped {}",
+                body_before - body_after
+            );
+            assert_eq!(r.approval_block_rows, Some(0));
+
+            // Second pop is noop.
+            let body_before2 = r.body_lines.len();
+            r.pop_approval_prompt();
+            assert_eq!(r.body_lines.len(), body_before2, "second pop must be noop");
+        }
     }
 
     /// Regression: when the user approves a tool (presses Y/A/N),
