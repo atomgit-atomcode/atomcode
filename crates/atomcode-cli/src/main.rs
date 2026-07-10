@@ -31,25 +31,11 @@ use atomcode_core::config::Config;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpHttpAuthConfig,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig,
     McpOAuthLoginOptions, McpRegistry, McpTokenStore, McpTransportConfig,
 };
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
-use atomcode_core::tool::bash::BashTool;
-use atomcode_core::tool::cd::CdTool;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
-use atomcode_core::tool::edit::EditFileTool;
-use atomcode_core::tool::glob::GlobTool;
-use atomcode_core::tool::grep::GrepTool;
-use atomcode_core::tool::list_dir::ListDirTool;
-use atomcode_core::tool::open_file::OpenFileTool;
-use atomcode_core::tool::read::ReadFileTool;
-use atomcode_core::tool::search_replace::SearchReplaceTool;
-use atomcode_core::tool::web_fetch::WebFetchTool;
-use atomcode_core::tool::web_search::WebSearchTool;
-use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
 
 use atomcode_core::auth;
 use atomcode_telemetry::{
@@ -1612,123 +1598,42 @@ async fn run() -> Result<i32> {
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
-    // Build the disabled-tool set from --disable-tools (CLI) merged with the
-    // ATOMCODE_DISABLE_TOOLS env var. The env var allows the SWE-bench
-    // harness to opt-out of bash without rebuilding atomcode or threading a
-    // CLI flag through every shell wrapper.
-    let mut disabled_tools: std::collections::HashSet<String> = cli
-        .disable_tools
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if let Ok(env_list) = std::env::var("ATOMCODE_DISABLE_TOOLS") {
-        for name in env_list
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            disabled_tools.insert(name.to_string());
-        }
-    }
-    if !disabled_tools.is_empty() {
-        let mut sorted: Vec<&String> = disabled_tools.iter().collect();
-        sorted.sort();
-        eprintln!(
-            "[atomcode] tools disabled: {}",
-            sorted
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    let mut tool_registry = ToolRegistry::new();
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    // change_dir is opt-in: weak models (e.g. deepseek-v4-flash) repeatedly
-    // emit empty `arguments: {}` for it, looping the same broken call until
-    // the identical-args guard blocks it. Bash with `cd` already covers the
-    // legitimate use case (atomcode tracks `cd` in bash and mutates
-    // `working_dir` accordingly), and `/cd` lets the user switch manually.
-    // Set ATOMCODE_ENABLE_CD=1 to re-expose the tool to the LLM.
-    if enabled("change_dir") && std::env::var("ATOMCODE_ENABLE_CD").is_ok() {
-        tool_registry.register_sync(Box::new(CdTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("open_file") {
-        tool_registry.register_sync(Box::new(OpenFileTool));
-    }
-
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
     let is_headless =
         cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
 
-    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user).
-    // For TUI mode, start connections in background to avoid blocking startup.
-    // For headless mode (-p/--prompt-file/fixissue), wait for connections since tools
-    // are needed immediately.
+    // Load MCP servers from .mcp.json (project) and ~/.atomcode/mcp.json (user).
+    // The engine-v2 bridge builds the agent's own tool registry from config; here
+    // we only build the shared `McpRegistry` the TUI uses (status panel / mgmt)
+    // and, for TUI mode, an event channel so connection status surfaces in
+    // scrollback. (`--disable-tools` / $ATOMCODE_DISABLE_TOOLS only gated the
+    // retired v1 registry and is not consulted by the v2 engine.)
     let (mcp_registry, mcp_connect_rx) = if is_headless {
-        // Headless: need tools right now, wait for connections
+        // Headless: wait for connections so the registry is populated up front.
         let registry = McpRegistry::from_config(&working_dir).await;
         let mcp_tools = registry.list_all_tools().await;
         let mcp_registry = if !mcp_tools.is_empty() {
-            let mcp_registry = std::sync::Arc::new(registry);
-            register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-            Some(mcp_registry)
+            Some(std::sync::Arc::new(registry))
         } else {
             None
         };
         (mcp_registry, None)
     } else {
-        // TUI: start in background, tools populate as servers connect
-        // Create event channel so TUI can display connection status in scrollback
+        // TUI: start in background; the event channel lets the TUI display
+        // connection status in scrollback as servers connect.
         use atomcode_core::mcp::McpConnectEvent;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
         let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
         let mcp_registry = std::sync::Arc::new(registry);
-        // Don't wait for tools - they'll be registered dynamically as servers connect
         (Some(mcp_registry), Some(rx))
     };
 
-    // Build LSP manager from config and inject into ToolContext.
-    // TUI mode uses the event-channel constructor so server start /
-    // failure surfaces in scrollback (✓/✗ lines) instead of being
-    // eprintln!'d directly to stderr — which would land inside the
-    // input box while the renderer owns the terminal. Headless keeps
-    // the no-channel path: stderr leakage doesn't matter when no TUI
-    // is active and CI logs benefit from raw error visibility.
-    let (lsp_manager, lsp_connect_rx) = if is_headless {
+    // Build the core LSP manager. The engine-v2 agent uses the separate
+    // capabilities LSP; this manager exists only to drive `lsp_connect_rx`, whose
+    // events the TUI renders as ✓/✗ status lines. `_lsp_manager` is bound (not
+    // dropped) so its event channel keeps receiving until the TUI exits.
+    let (_lsp_manager, lsp_connect_rx) = if is_headless {
         (build_lsp_manager(&config.lsp, &working_dir), None)
     } else {
         match atomcode_core::lsp::build_lsp_manager_with_events(&config.lsp, &working_dir) {
@@ -1736,14 +1641,6 @@ async fn run() -> Result<i32> {
             None => (None, None),
         }
     };
-    if lsp_manager.is_some() && enabled("diagnostics") {
-        tool_registry.register_sync(Box::new(DiagnosticsTool));
-    }
-
-    // Pass the already-initialized telemetry handle into ToolContext.
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.clone(), "default", telemetry.clone());
-    tool_context.lsp = lsp_manager;
 
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
