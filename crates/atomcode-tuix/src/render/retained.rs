@@ -4086,14 +4086,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // bash rows survive the approval pop without any NBSP sentinel.
                     let dollar_style = self.style_for(Role::Brand);
                     let cmd_style = self.style_for(Role::Secondary);
-                    // Muted style for the `└` gutter — mirrors ToolResult arm's prefix_style.
+                    // Muted style for the `└` gutter — same `  └ ` col-2 muted gutter as the
+                    // attachment-preview row (`  └ [Image #N]`, ~line 1858); the muted/faint
+                    // style follows ToolResult's `muted_hint` pattern. Note: ToolResult uses
+                    // `⎿` (U+23BF), not `└` (U+2514), so this is NOT a mirror of that arm.
                     let gutter_style = if crate::highlight::theme::is_light_for_render() {
                         self.style_for(Role::Muted)
                     } else {
                         self.style_faint(Role::Muted)
                     };
                     // `└` gutter glyph, gated for non-unicode terminals (→ ASCII backtick),
-                    // mirroring the ToolResult arm convention exactly.
+                    // matching the attachment-preview row convention.
                     let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
                     // Width budget: command text starts at col 6 (`  └ $ `), so subtract 6.
                     let width = (self.screen.width() as usize)
@@ -8104,6 +8107,9 @@ mod tests {
         // No NBSP sentinel should appear anywhere.
         assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
             "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
+        // `$` must be indented (not at col 0) — the layout is `  └ $ <cmd>`.
+        assert!(!vterm.any_row(|row| row.starts_with("$ ")),
+            "$ must be indented (not col 0)\ndump:\n{}", vterm.dump());
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure

@@ -11621,7 +11621,7 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
         let mut line = String::from(lead);
         let mut line_len = lead.len();
         for word in seg.split(' ') {
-            let wlen = word.chars().count();
+            let wlen = crate::width::display_width(word);
             let need = if line_len == lead.len() { wlen } else { wlen + 1 };
             if line_len > lead.len() && line_len + need > width {
                 out.push(std::mem::take(&mut line));
@@ -12135,5 +12135,26 @@ mod format_shell_command_tests {
         let out = format_shell_command("echo hello && echo world", 80).join("\n");
         assert!(!out.contains('…'), "no ellipsis: {}", out);
         assert!(!out.contains("truncated"), "no truncated marker: {}", out);
+    }
+
+    #[test]
+    fn cjk_chars_use_display_width_no_mid_token_split() {
+        // 每个 CJK 字符占 2 列; "你好世界" = 8 列。宽度 16 时第一段
+        // "echo 你好世界" = 14 列,可容纳;宽度缩到 12 时不够容纳同段
+        // 后续词,但绝不拆断 "你好世界" token 本身。
+        let cmd = "echo 你好世界 && echo done";
+        let out = format_shell_command(cmd, 12);
+        // 无论怎样折行,token "你好世界" 必须整体保留在某行中。
+        assert!(
+            out.iter().any(|l| l.contains("你好世界")),
+            "CJK token must not be split: {:?}",
+            out
+        );
+        // 必须不含截断标记。
+        assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
+        // 每行至少有一个非空字符(无鬼空行)。
+        for line in &out {
+            assert!(!line.trim().is_empty(), "no empty line in output: {:?}", out);
+        }
     }
 }
