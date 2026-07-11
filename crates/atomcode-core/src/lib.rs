@@ -12,7 +12,11 @@ pub mod atomgit;
 pub mod auth;
 pub mod process_utils;
 pub mod coding_plan;
-pub mod config;
+/// Re-export shim: the config system moved to the leaf `atomcode-config` crate so it
+/// no longer lives in the retiring `atomcode-core`. Kept as a re-export so existing
+/// `atomcode_core::config::*` paths keep resolving during the migration (Phase B
+/// repoints consumers off this shim).
+pub use atomcode_config::config;
 pub mod conversation;
 pub mod ctx;
 pub mod graph;

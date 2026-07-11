@@ -86,7 +86,7 @@ impl ProviderConfig {
     /// recognised, extend the heuristic rather than threading a
     /// per-provider config flag (no user-facing knob to discover).
     pub fn accepts_images(&self) -> bool {
-        crate::provider::model_name_suggests_vision(&self.model)
+        crate::util::model_name_suggests_vision(&self.model)
     }
 }
 

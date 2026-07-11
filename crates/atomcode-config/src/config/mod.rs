@@ -470,7 +470,7 @@ pub struct LspConfig {
     pub auto_detect: bool,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
-    pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+    pub servers: std::collections::HashMap<String, crate::lsp_registry::LspServerConfig>,
     /// Time in milliseconds to wait after file sync before reading diagnostics.
     /// LSP servers need time to process notifications and publish diagnostics.
     /// Larger files or slower servers may need higher values.
@@ -843,7 +843,7 @@ impl Config {
             std::env::var("ATOMCODE_HOME")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            crate::tool::real_home_dir(),
+            crate::util::real_home_dir(),
         )
     }
 
@@ -1146,7 +1146,7 @@ mod tests {
         let mut servers = std::collections::HashMap::new();
         servers.insert(
             "rs".to_string(),
-            crate::lsp::registry::LspServerConfig {
+            crate::lsp_registry::LspServerConfig {
                 command: "my-custom-rust-ls".to_string(),
                 args: vec![],
                 root_markers: vec![],

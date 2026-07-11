@@ -20,3 +20,9 @@ pub mod proxy;
 /// The `LspServerConfig` config type (`Config.lsp.servers`). The LSP runtime
 /// (`LspServerRegistry`, client, manager) stays in `atomcode-core::lsp` and re-exports it.
 pub mod lsp_registry;
+
+/// The disk/TOML config system: [`Config`](config::Config) + all sub-configs +
+/// load/save/paths. `atomcode_core::config` re-exports this during the transition.
+pub mod config;
+
+pub use config::{provider::ProviderConfig, Config};

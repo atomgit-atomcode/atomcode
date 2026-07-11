@@ -52,3 +52,30 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
 fn get_user_home(_username: &str) -> Option<PathBuf> {
     None
 }
+
+/// Heuristic: does this model name look vision-capable? Verbatim copy of
+/// `atomcode_core::provider::model_name_suggests_vision` (and
+/// `atomcode_capabilities::provider::model_suggests_vision`). Used by
+/// `ProviderConfig::accepts_images`. MUST stay in sync with those copies.
+pub fn model_name_suggests_vision(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("vision")
+        || n.contains("-vl")
+        || n.contains("vl-")
+        || n.contains("ocr")
+        || n.contains("-4v")
+        || n.contains("-4.1v")
+        || n.starts_with("gpt-4o")
+        || n.starts_with("claude-3")
+        || n.starts_with("claude-4")
+        || n.starts_with("claude-5")
+        || n.starts_with("claude-6")
+        || n.starts_with("claude-7")
+        || n.starts_with("claude-sonnet")
+        || n.starts_with("claude-opus")
+        || n.starts_with("claude-haiku")
+        || n.starts_with("gemini")
+        || n.starts_with("pixtral")
+        || n.contains("llava")
+        || n.contains("qvq")
+}
