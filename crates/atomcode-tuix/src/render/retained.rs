@@ -264,6 +264,98 @@ fn format_todo_row(
     format!("{marker}{title}{meta}")
 }
 
+/// Max rows the footer todo panel may occupy, INCLUDING the header. The panel
+/// is additionally clamped against screen height by the caller.
+const MAX_TODO_PANEL_ROWS: usize = 6;
+
+/// One logical row of the collapsed todo panel. Pure structure — glyphs,
+/// i18n words, styling and width-fitting are applied in `build_todo_rows`.
+#[derive(Debug, Clone, PartialEq)]
+enum TodoPanelRow {
+    Header { completed: usize, total: usize },
+    CompletedFold { count: usize },
+    Item {
+        status: atomcode_capabilities::tools::todo::TodoStatus,
+        content: String,
+    },
+    More { hidden: usize },
+}
+
+/// Collapse a todo list into at most `max_rows` panel rows (incl. header).
+///
+/// Selection priority under a tight budget: the in-progress task always shows
+/// when present, then the completed fold, then pending items. Pending overflow
+/// collapses into a single `More` row (which itself costs a row). Display order
+/// is: Header, CompletedFold?, InProgress?, Pending…, More?.
+fn todo_panel_rows(
+    items: &[(atomcode_capabilities::tools::todo::TodoStatus, String)],
+    completed: usize,
+    total: usize,
+    max_rows: usize,
+) -> Vec<TodoPanelRow> {
+    use atomcode_capabilities::tools::todo::TodoStatus;
+    let mut rows = vec![TodoPanelRow::Header { completed, total }];
+    let body_budget = max_rows.saturating_sub(1);
+    if body_budget == 0 {
+        return rows;
+    }
+
+    let in_progress: Option<&String> = items
+        .iter()
+        .find(|(s, _)| *s == TodoStatus::InProgress)
+        .map(|(_, c)| c);
+    let pendings: Vec<&String> = items
+        .iter()
+        .filter(|(s, _)| *s == TodoStatus::Pending)
+        .map(|(_, c)| c)
+        .collect();
+
+    // Reserve high-priority slots first (in-progress, then completed fold).
+    let mut used = 0usize;
+    let show_ip = in_progress.is_some() && used < body_budget;
+    if show_ip {
+        used += 1;
+    }
+    let show_fold = completed > 0 && used < body_budget;
+    if show_fold {
+        used += 1;
+    }
+
+    // Remaining budget for pending rows (+ possible More row).
+    let pend_budget = body_budget.saturating_sub(used);
+    let (shown_pending, hidden) = if pend_budget == 0 {
+        (0usize, 0usize) // header N/M still reflects them
+    } else if pendings.len() <= pend_budget {
+        (pendings.len(), 0)
+    } else {
+        let shown = pend_budget - 1; // reserve 1 row for the More marker
+        (shown, pendings.len() - shown)
+    };
+
+    // Emit in display order.
+    if show_fold {
+        rows.push(TodoPanelRow::CompletedFold { count: completed });
+    }
+    if show_ip {
+        if let Some(c) = in_progress {
+            rows.push(TodoPanelRow::Item {
+                status: TodoStatus::InProgress,
+                content: c.clone(),
+            });
+        }
+    }
+    for c in pendings.iter().take(shown_pending) {
+        rows.push(TodoPanelRow::Item {
+            status: TodoStatus::Pending,
+            content: (*c).clone(),
+        });
+    }
+    if hidden > 0 {
+        rows.push(TodoPanelRow::More { hidden });
+    }
+    rows
+}
+
 /// Format a token count using k/m units. `round_clean=true` drops the
 /// decimal when the value is an exact multiple of the unit (used for
 /// the model's advertised window — `128_000` → `128k`, `1_000_000` →
@@ -14248,5 +14340,69 @@ mod tests {
              first_bash@{first_bash} second_bash@{second_bash}\n{}",
             vterm.dump()
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_panel_rows_tests {
+    use super::*;
+    use atomcode_capabilities::tools::todo::TodoStatus;
+
+    fn items(spec: &[(TodoStatus, &str)]) -> Vec<(TodoStatus, String)> {
+        spec.iter().map(|(s, c)| (*s, c.to_string())).collect()
+    }
+
+    #[test]
+    fn header_plus_all_when_fits() {
+        let it = items(&[
+            (TodoStatus::Completed, "a"),
+            (TodoStatus::InProgress, "b"),
+            (TodoStatus::Pending, "c"),
+        ]);
+        let rows = todo_panel_rows(&it, 1, 3, MAX_TODO_PANEL_ROWS);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0], TodoPanelRow::Header { completed: 1, total: 3 }));
+        assert!(matches!(rows[1], TodoPanelRow::CompletedFold { count: 1 }));
+        assert!(matches!(&rows[2], TodoPanelRow::Item { status: TodoStatus::InProgress, content } if content == "b"));
+        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::Pending, content } if content == "c"));
+    }
+
+    #[test]
+    fn no_fold_when_none_completed() {
+        let it = items(&[(TodoStatus::InProgress, "b"), (TodoStatus::Pending, "c")]);
+        let rows = todo_panel_rows(&it, 0, 2, MAX_TODO_PANEL_ROWS);
+        assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::CompletedFold { .. })));
+    }
+
+    #[test]
+    fn pending_overflow_becomes_more() {
+        let it = items(&[
+            (TodoStatus::InProgress, "ip"),
+            (TodoStatus::Pending, "p1"),
+            (TodoStatus::Pending, "p2"),
+            (TodoStatus::Pending, "p3"),
+            (TodoStatus::Pending, "p4"),
+        ]);
+        // max_rows=4 → header + ip + 1 pending + More{3}
+        let rows = todo_panel_rows(&it, 0, 5, 4);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows.last().unwrap(), TodoPanelRow::More { hidden: 3 }));
+    }
+
+    #[test]
+    fn in_progress_survives_tight_budget() {
+        // body budget = 1: in-progress wins the single slot over the completed fold.
+        let it = items(&[(TodoStatus::Completed, "done"), (TodoStatus::InProgress, "ip")]);
+        let rows = todo_panel_rows(&it, 1, 2, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[1], TodoPanelRow::Item { status: TodoStatus::InProgress, .. }));
+    }
+
+    #[test]
+    fn never_exceeds_max_rows() {
+        let mut it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Completed, "c")]);
+        for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
+        let rows = todo_panel_rows(&it, 1, 22, MAX_TODO_PANEL_ROWS);
+        assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
     }
 }
