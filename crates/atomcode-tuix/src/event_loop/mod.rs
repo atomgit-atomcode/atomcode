@@ -11759,51 +11759,6 @@ pub(crate) fn install_password_modal(
     )));
 }
 
-/// Split a todowrite call's args into per-item display lines (`<glyph> <content>`).
-/// Returns an empty Vec on parse failure — the caller then falls back to the normal
-/// tool row. Each returned string is already fully formatted: `<glyph> <content>`.
-/// Parse a todowrite call's args into `(status, "<glyph> <content>")` pairs. Empty
-/// on parse failure / empty list (caller falls back to the normal tool row). Returns
-/// the TYPED status so the renderer styles by status instead of re-sniffing glyph
-/// prefixes (which would silently misclassify a future new status/glyph).
-pub(crate) fn todo_block_lines(
-    args: &str,
-    unicode: bool,
-) -> Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)> {
-    use atomcode_capabilities::tools::todo::{parse_todos, todo_glyph};
-    match parse_todos(args) {
-        Ok(todos) if !todos.is_empty() => todos
-            .into_iter()
-            .map(|t| {
-                (
-                    t.status,
-                    format!("{} {}", todo_glyph(t.status, unicode), t.content),
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// A todowrite call's args → the compact todo block as ready-to-render body
-/// lines, each SGR-styled by status (in-progress bold, completed faint, pending
-/// plain — weight-based so it's theme-safe). SHARED by the LIVE tool-render path
-/// and the `/resume` replay so the two never drift (each renders these as
-/// `UiLine::CommandOutput`). Empty on parse failure (caller falls back to the
-/// normal tool row). Emphasis is deliberately NOT `UiLine::Warning` (it prefixes
-/// a `!` and uses an un-theme-aware bright yellow).
-pub(crate) fn todo_block_styled_lines(args: &str, unicode: bool) -> Vec<String> {
-    use atomcode_capabilities::tools::todo::TodoStatus;
-    todo_block_lines(args, unicode)
-        .into_iter()
-        .map(|(status, line)| match status {
-            TodoStatus::InProgress => format!("\x1b[1m  {line}\x1b[0m"),
-            TodoStatus::Completed => format!("\x1b[2m  {line}\x1b[0m"),
-            TodoStatus::Pending => format!("  {line}"),
-        })
-        .collect()
-}
-
 /// Build footer todo progress (current task + completed/total) from a parsed
 /// list. An empty list yields `total == 0`, which `build_status` filters out.
 pub(crate) fn todo_progress_from_items(
@@ -11869,20 +11824,6 @@ mod todo_block_tests {
     use super::*;
 
     #[test]
-    fn todo_block_renders_glyph_lines() {
-        use atomcode_capabilities::tools::todo::TodoStatus;
-        let lines = todo_block_lines(
-            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
-            false,
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].0, TodoStatus::Completed);
-        assert_eq!(lines[0].1, "[x] a");
-        assert_eq!(lines[1].0, TodoStatus::InProgress);
-        assert_eq!(lines[1].1, "[~] b");
-    }
-
-    #[test]
     fn todo_progress_from_args_carries_current_and_distinguishes_clear() {
         let p = todo_progress_from_args(
             r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"},{"content":"c","status":"pending"}]}"#,
@@ -11902,37 +11843,6 @@ mod todo_block_tests {
         );
         // Unparseable ⇒ None ⇒ keep whatever the footer already shows.
         assert!(todo_progress_from_args("not json").is_none());
-    }
-
-    #[test]
-    fn todo_block_bad_args_empty() {
-        assert!(todo_block_lines(r#"{"nope":1}"#, false).is_empty());
-    }
-
-    #[test]
-    fn todo_block_styled_lines_weights_by_status() {
-        let out = todo_block_styled_lines(
-            r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"completed"},{"content":"c","status":"pending"}]}"#,
-            false,
-        );
-        assert_eq!(out.len(), 3);
-        assert!(
-            out[0].starts_with("\x1b[1m") && out[0].contains('a'),
-            "in-progress bold: {:?}",
-            out[0]
-        );
-        assert!(
-            out[1].starts_with("\x1b[2m") && out[1].contains('b'),
-            "completed faint: {:?}",
-            out[1]
-        );
-        assert!(
-            !out[2].contains("\x1b[") && out[2].contains('c'),
-            "pending plain: {:?}",
-            out[2]
-        );
-        // Empty on parse failure (caller falls back to the normal tool row).
-        assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
     }
 
     #[test]
