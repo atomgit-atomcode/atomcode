@@ -332,13 +332,12 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
-    /// Live todo progress (current task + completed/total) for the footer todo
-    /// row, captured from the in-flight turn's `todowrite` calls. This is the
-    /// row's SOLE source: cleared on TurnComplete / TurnCancelled / Error so the
-    /// row is a live execution indicator that DISAPPEARS when the turn ends
-    /// (mirroring the goal/loop row). `None` ⇒ no row. At-rest progress is seen
-    /// via the `/todo` command or the inline todowrite block, not this row.
-    pub live_turn_todo: Option<crate::render::TodoProgress>,
+    /// Active todo list for the persistent footer todo PANEL. Written from the
+    /// turn's `todowrite` calls, seeded from the transcript on resume/switch
+    /// (`replay_session`), reset on `/clear`/`/new` (`reset_to_new_session`).
+    /// Unlike the old live-only row, this PERSISTS across turn boundaries — the
+    /// panel is a standing view, hidden only when the list is empty or all done.
+    pub active_todos: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -472,7 +471,7 @@ impl UiState {
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
-            live_turn_todo: None,
+            active_todos: None,
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
@@ -717,11 +716,6 @@ impl UiState {
         // reaches here, so the cancelled path naturally leaves this
         // None too.)
         self.last_submitted_message = None;
-        // The footer's live todo snapshot belongs to the turn that produced it;
-        // hand the segment back to the transcript-derived source now that the
-        // turn (or peer turn / session switch — all funnel through here) is over.
-        // Single source of truth so no turn-end path can pin a stale count.
-        self.live_turn_todo = None;
         // Same discipline for the subagent fan-out activity: no turn-end path may
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
@@ -739,7 +733,6 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.live_turn_todo = None;
         self.subagent_activity = None;
     }
 
@@ -750,7 +743,6 @@ impl UiState {
         self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
-        self.live_turn_todo = None;
         self.subagent_activity = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
         // flags so an errored turn can't leak a stale notice into a reused turn.
@@ -1615,5 +1607,18 @@ mod tests {
         // Compacting but fresh activity → not stalled.
         s.last_stream_activity = Some(std::time::Instant::now());
         assert!(!s.compaction_stalled());
+    }
+
+    #[test]
+    fn active_todos_persists_across_turn_end() {
+        let mut s = UiState::new();
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("x".into()),
+            completed: 0,
+            total: 2,
+            items: vec![],
+        });
+        s.on_turn_complete();
+        assert!(s.active_todos.is_some(), "panel must survive turn end");
     }
 }

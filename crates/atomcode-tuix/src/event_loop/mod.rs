@@ -8747,26 +8747,14 @@ fn handle_agent_event(
                 return;
             }
 
-            // todowrite: render a compact glyph list block instead of the animated
-            // ToolCallInFlight spinner row. Each item line is styled by status:
-            // completed → Muted (dim), in_progress → Warning (yellow), pending → Muted.
-            // Falls through to the normal ToolCallInFlight path when parse fails.
+            // todowrite: the persistent footer PANEL is the sole view. Capture the
+            // full list into `active_todos` (the transcript won't carry it until
+            // turn end), and suppress the tool CALL + RESULT rows. On a parse
+            // failure fall through to the normal tool row so the error surfaces.
             if name == "todowrite" {
-                // Capture live footer progress from this in-flight call — the
-                // transcript won't carry it until turn end (persist_current_session),
-                // so the footer would otherwise not move mid-turn.
-                state.live_turn_todo = todo_progress_from_args(&arguments);
-                // SHARED with the /resume replay (session_picker) via
-                // `todo_block_styled_lines` so live and replay stay identical.
-                let block = todo_block_styled_lines(&arguments, ctx.caps.unicode_symbols);
-                if !block.is_empty() {
-                    renderer.render(UiLine::AssistantLineBreak);
-                    for styled in block {
-                        renderer.render(UiLine::CommandOutput(styled));
-                    }
-                    renderer.flush();
-                    // Mark as rendered (call_rendered=true) so ToolCallResult
-                    // suppresses the normal ToolCall + ToolResult lines.
+                if let Some(progress) = todo_progress_from_args(&arguments) {
+                    state.active_todos = Some(progress);
+                    // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                     pending_tools.insert(id, (display.clone(), detail, true));
                     state.on_tool_call_started(&display);
                     return;
@@ -10758,13 +10746,13 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo progress for the dedicated footer todo row. Driven PURELY by the live
-    // in-flight snapshot (set from the turn's todowrite calls, cleared at turn end
-    // in on_turn_complete/cancelled/error) so the row is a live execution
-    // indicator: it appears when the agent starts tracking todos and DISAPPEARS
-    // when the turn finishes — mirroring how the goal/loop row only shows while
-    // active. `total == 0` (a live clear) ⇒ omit the row.
-    let todo = state.live_turn_todo.clone().filter(|p| p.total > 0);
+    // Todo panel source: the persistent `active_todos` cache. Hidden when the
+    // list is empty (`total == 0`) or fully done (`completed == total`) so a
+    // finished panel disappears — otherwise it stands across turns and resume.
+    let todo = state
+        .active_todos
+        .clone()
+        .filter(|p| p.total > 0 && p.completed < p.total);
     crate::render::StatusLine {
         model,
         cwd,

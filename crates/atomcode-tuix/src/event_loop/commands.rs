@@ -4293,6 +4293,7 @@ pub(crate) fn reset_to_new_session(
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
+    state.active_todos = None;
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.
