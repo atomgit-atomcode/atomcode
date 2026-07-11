@@ -1156,7 +1156,7 @@ async fn run() -> Result<i32> {
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
+                let repo = atomcode_telemetry::detect_repo_origin(
                     &std::env::current_dir().unwrap_or_default(),
                 );
                 telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
@@ -1708,7 +1708,7 @@ async fn run() -> Result<i32> {
     // login action this run; login()/logout() update it later as needed.
     // mode: Headless when a prompt is supplied (-p / --prompt-file / fixissue);
     //       Tui when the user launches the interactive terminal UI.
-    let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
+    let repo = atomcode_telemetry::detect_repo_origin(
         &std::env::current_dir().unwrap_or_else(|_| working_dir.clone()),
     );
     telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));

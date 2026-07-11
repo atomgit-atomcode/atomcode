@@ -1,15 +1,33 @@
-//! Helpers for constructing telemetry envelope context at process start.
+//! Helpers for constructing telemetry envelope context at process start:
+//! detect the repository host from `git remote origin`.
+//!
+//! Lives here (not in a driver) because the [`RepoOrigin`]/[`RepoHost`] it produces
+//! are telemetry envelope types; the CLI and daemon both call [`detect_repo_origin`]
+//! at startup. Ported out of `atomcode-core` (v1 engine) as part of retiring it.
 
-use atomcode_telemetry::{RepoHost, RepoOrigin};
+use crate::{RepoHost, RepoOrigin};
 use std::path::Path;
 use std::process::Command;
+
+/// Suppress the Windows console-window flash for a short-lived child process.
+/// `detect_repo_origin` runs from the console-less daemon on every `/chat` turn,
+/// so a bare `git` spawn would pop and flicker a window. Uses only safe std
+/// (`CREATE_NO_WINDOW` creation flag) so it holds under this crate's
+/// `#![forbid(unsafe_code)]`. No-op off Windows.
+#[cfg(target_os = "windows")]
+fn suppress_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn suppress_console_window(_cmd: &mut Command) {}
 
 pub fn detect_repo_origin(cwd: &Path) -> RepoOrigin {
     let mut cmd = Command::new("git");
     cmd.args(["-C"]).arg(cwd).args(["remote", "get-url", "origin"]);
-    // Suppress the console-window flash: this runs from the console-less daemon on
-    // every /chat turn, so a bare git spawn pops (and flickers) a window. No-op off Windows.
-    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    suppress_console_window(&mut cmd);
     let output = cmd.output();
     match output {
         Ok(o) if o.status.success() => {

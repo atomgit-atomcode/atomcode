@@ -69,7 +69,7 @@ use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
-use atomcode_core::telemetry_bootstrap::detect_repo_origin;
+use atomcode_telemetry::detect_repo_origin;
 use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
