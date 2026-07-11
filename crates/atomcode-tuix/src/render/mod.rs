@@ -510,9 +510,10 @@ pub struct StatusLine {
     pub loop_status: Option<LoopStatus>,
 }
 
-/// Progress of the active todo list, rendered on the dedicated footer todo row.
-/// The renderer width-truncates `current` to fit; the `completed`/`total` count
-/// always survives (see `todo_row_parts`).
+/// Progress of the active todo list, rendered as the multi-line footer todo
+/// panel. The renderer collapses the list to fit (`todo_panel_rows`) and
+/// width-truncates item content; the `completed`/`total` count shows in the
+/// panel header.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TodoProgress {
     /// The description of the task currently `in_progress` (todowrite enforces

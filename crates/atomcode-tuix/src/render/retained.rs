@@ -212,59 +212,6 @@ fn todo_marker(unicode: bool) -> &'static str {
     }
 }
 
-/// The three display segments of the dedicated footer todo row, width-fitted:
-/// `(marker, current_task, meta)`. Mirrors `goal_row_parts` — marker in Brand,
-/// the running task in normal text, the ` · N/M` count muted. The count is
-/// RESERVED and always survives; the task title fills the rest and is truncated
-/// with `…`. With no task in progress the title is empty and the count renders
-/// bare (no leading separator). CJK/width-safe via `crate::width`.
-#[cfg(test)]
-fn todo_row_parts(
-    current: Option<&str>,
-    completed: usize,
-    total: usize,
-    max_cols: usize,
-    unicode: bool,
-) -> (&'static str, String, String) {
-    let marker = todo_marker(unicode);
-    let icon_w = crate::width::display_width(marker);
-    let count = format!("{completed}/{total}");
-    match current {
-        Some(task) if !task.is_empty() => {
-            let meta = format!(" · {count}");
-            let title_budget = max_cols
-                .saturating_sub(icon_w)
-                .saturating_sub(crate::width::display_width(&meta));
-            if title_budget == 0 {
-                // Too narrow for the task — keep marker + count only.
-                let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
-                (marker, String::new(), bare)
-            } else {
-                let title = crate::width::truncate_with_ellipsis(task, title_budget);
-                (marker, title, meta)
-            }
-        }
-        // No task in progress → just the bare count (no leading " · ").
-        _ => {
-            let bare = crate::width::truncate_to_width(&count, max_cols.saturating_sub(icon_w));
-            (marker, String::new(), bare)
-        }
-    }
-}
-
-/// Full todo-row text joined. Thin wrapper over [`todo_row_parts`] for tests.
-#[cfg(test)]
-fn format_todo_row(
-    current: Option<&str>,
-    completed: usize,
-    total: usize,
-    max_cols: usize,
-    unicode: bool,
-) -> String {
-    let (marker, title, meta) = todo_row_parts(current, completed, total, max_cols, unicode);
-    format!("{marker}{title}{meta}")
-}
-
 /// Max rows the footer todo panel may occupy, INCLUDING the header. The panel
 /// is additionally clamped against screen height by the caller.
 const MAX_TODO_PANEL_ROWS: usize = 6;
@@ -6106,27 +6053,6 @@ mod tests {
             "no mode indicator should produce no PLAN badge; got: {:?}",
             visible
         );
-    }
-
-    /// Dedicated todo row: shows the running task + reserved `N/M` count; the
-    /// count always survives, the title truncates, and with no in-progress task
-    /// the count renders bare (no leading separator).
-    #[test]
-    fn todo_row_parts_shows_task_and_reserved_count() {
-        // Running task + count.
-        let s = format_todo_row(Some("write the parser"), 3, 7, 60, true);
-        assert!(s.contains("write the parser"), "task title present; got {s:?}");
-        assert!(s.contains("3/7"), "count present; got {s:?}");
-        assert!(s.contains(" · 3/7"), "count separated from title; got {s:?}");
-        // No in-progress task → bare count, no leading ' · '.
-        let none = format_todo_row(None, 2, 5, 60, true);
-        assert!(none.contains("2/5"), "count present; got {none:?}");
-        assert!(!none.contains(" · "), "no leading separator when no task; got {none:?}");
-        // Narrow terminal → title dropped, count still survives.
-        let narrow = format_todo_row(Some("a very long task description here"), 4, 9, 10, true);
-        assert!(narrow.contains("4/9"), "count survives narrow width; got {narrow:?}");
-        // ASCII marker fallback for legacy terminals — distinct from goal/loop's `*`.
-        assert!(format_todo_row(Some("x"), 1, 2, 60, false).starts_with("+ "));
     }
 
     /// Bypass indicator (--dangerously-skip-permissions) renders on the
