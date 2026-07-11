@@ -3541,6 +3541,73 @@ mod tool_format_tests {
         assert!(out.starts_with("Error: foo"));
         assert!(out.contains("(3 lines)"));
     }
+
+    /// Batch child text: bash children get `  └ $ <cmd>` (codex style);
+    /// non-bash children keep `  └ Name(args)`.
+    ///
+    /// This is a unit test on the text-format logic that event_loop emits —
+    /// mirrors what ToolBatchStarted builds for children.
+    #[test]
+    fn batch_child_bash_uses_dollar_prefix_non_bash_keeps_name_args() {
+        let child_glyph = "\u{2514}";
+
+        // Bash child: name == "bash" (raw snake name)
+        let bash_name = "bash";
+        let bash_detail = "cd /tmp && ls";
+        let bash_text = if bash_name.eq_ignore_ascii_case("bash") {
+            format!("  {} $ {}", child_glyph, bash_detail)
+        } else {
+            format!("  {} {}({})", child_glyph, display_tool_name_short(bash_name), bash_detail)
+        };
+        assert!(
+            bash_text.contains("$ cd /tmp"),
+            "bash child text must contain `$ cd /tmp`, got: {}",
+            bash_text
+        );
+        assert!(
+            !bash_text.contains("Bash("),
+            "bash child must NOT use Bash(...) wrapper, got: {}",
+            bash_text
+        );
+
+        // Non-bash child: name == "grep"
+        let grep_name = "grep";
+        let grep_detail = "foo";
+        let grep_text = if grep_name.eq_ignore_ascii_case("bash") {
+            format!("  {} $ {}", child_glyph, grep_detail)
+        } else {
+            format!("  {} {}({})", child_glyph, display_tool_name_short(grep_name), grep_detail)
+        };
+        assert!(
+            grep_text.contains("Grep(foo)"),
+            "non-bash child must keep Name(args), got: {}",
+            grep_text
+        );
+        assert!(
+            !grep_text.contains("$ "),
+            "non-bash child must NOT use $ prefix, got: {}",
+            grep_text
+        );
+
+        // Update path: bash update text also uses `$ ` prefix (no `Bash(` wrapper).
+        let update_base = if bash_name.eq_ignore_ascii_case("bash") {
+            format!("$ {}", bash_detail)
+        } else {
+            format!("{}({})", display_tool_name_short(bash_name), bash_detail)
+        };
+        let suffix = " \u{2192} 3 lines";
+        let update_text = format!("  {} {}{}", child_glyph, update_base, suffix);
+        assert!(
+            update_text.contains("$ cd /tmp"),
+            "update text must still have $ prefix, got: {}",
+            update_text
+        );
+        assert!(
+            !update_text.contains("Bash("),
+            "update text must NOT have Bash(, got: {}",
+            update_text
+        );
+    }
 }
 
 pub(crate) enum BufferResult {
@@ -8933,7 +9000,13 @@ fn handle_agent_event(
                 // visual consistency with the initial child row.
                 let prefix = pending_tools
                     .remove(&call_id)
-                    .map(|(_, det, _)| format!("{}({})", display_tool_name_short(&name), det))
+                    .map(|(_, det, _)| {
+                        if name.eq_ignore_ascii_case("bash") {
+                            format!("$ {}", det)
+                        } else {
+                            format!("{}({})", display_tool_name_short(&name), det)
+                        }
+                    })
                     .unwrap_or_else(|| display_tool_name_short(&name));
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
@@ -9866,12 +9939,16 @@ fn handle_agent_event(
                 .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
-                    text: format!(
-                        "  {} {}({})",
-                        child_glyph,
-                        display_tool_name_short(&c.name),
-                        detail
-                    ),
+                    text: if c.name.eq_ignore_ascii_case("bash") {
+                        format!("  {} $ {}", child_glyph, detail)
+                    } else {
+                        format!(
+                            "  {} {}({})",
+                            child_glyph,
+                            display_tool_name_short(&c.name),
+                            detail
+                        )
+                    },
                 })
                 .collect();
             renderer.render(UiLine::AssistantLineBreak);

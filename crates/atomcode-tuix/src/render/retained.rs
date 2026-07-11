@@ -3652,6 +3652,84 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.md_state.reset();
     }
 
+    /// Build a single child row for a live tool-group, applying the
+    /// codex-style `$ <cmd>` format (magenta `$`) for bash children.
+    ///
+    /// Detection: if `text` (after the `"  └ "` / `"  ` "`" ASCII-downgraded
+    /// prefix) starts with `"$ "`, render `"  └ "` in `muted`, `"$ "` in
+    /// `Role::Brand` (magenta), and the remainder in `muted`, then clip to
+    /// screen width exactly like `build_one_row`. For all other children,
+    /// delegates to `build_one_row` unchanged.
+    ///
+    /// Called from both the initial `ToolGroupRender` child loop and the
+    /// `ToolGroupChildUpdate` in-place rewrite path so both share identical
+    /// width and styling behaviour.
+    fn build_group_child_row(&self, text: &str, muted: &CellStyle) -> Vec<Cell> {
+        let unicode = self.caps.unicode_symbols;
+        let screen_w = self.screen.width();
+        // Downgrade decorative glyphs first — same as build_one_row.
+        let downgr = crate::glyph::downgrade_glyphs(text, unicode);
+        let safe = scrub_controls(&downgr);
+
+        // Detect bash child: after leading "  " (2) + glyph (1 char) + " " (1) = 4 cols,
+        // the content starts with "$ ".  Both unicode `└ ` (U+2514, 1 col wide) and
+        // ASCII `` ` `` fallback produce a single character here, so we split
+        // off everything up to and including the first space after the glyph,
+        // then check what follows.
+        //
+        // Pattern: "  {glyph} $ {cmd}" — split at the THIRD ' ' (two leading
+        // spaces + one after glyph), then check if the remainder starts with "$ ".
+        let bash_prefix = if safe.starts_with("  ") {
+            // The two leading spaces are guaranteed; find the glyph char and the
+            // space that follows it.
+            let after_two = &safe[2..]; // past "  "
+            if let Some(rest) = after_two.splitn(2, ' ').nth(1) {
+                // `rest` is everything after "  {glyph} ".
+                rest.starts_with("$ ")
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if bash_prefix {
+            // Split into: prefix ("  {glyph} "), dollar_part ("$ "), remainder.
+            let avail = (screen_w as usize).saturating_sub(PAD_COL);
+            // Find the split point by consuming "  " then to first space.
+            let glyph_end = safe[2..]
+                .find(' ')
+                .map(|i| 2 + i + 1) // index just after "  {glyph} "
+                .unwrap_or(safe.len());
+            let prefix_str = &safe[..glyph_end]; // "  {glyph} "
+            let after_glyph = &safe[glyph_end..]; // "$ {cmd}"
+            // "$ " is always 2 bytes.
+            let (dollar_str, cmd_str) = if after_glyph.len() >= 2 {
+                (&after_glyph[..2], &after_glyph[2..])
+            } else {
+                (after_glyph, "")
+            };
+
+            // Width budget accounting (all ASCII except possibly the glyph).
+            let prefix_w = crate::width::display_width(prefix_str);
+            let dollar_w = crate::width::display_width(dollar_str);
+            let cmd_budget = avail
+                .saturating_sub(prefix_w)
+                .saturating_sub(dollar_w)
+                .max(1);
+            let cmd_truncated = crate::width::truncate_with_ellipsis(cmd_str, cmd_budget);
+
+            let dollar_style = self.style_for(crate::render::theme::Role::Brand);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, prefix_str, muted);
+            push_str_cells(&mut row, dollar_str, &dollar_style);
+            push_str_cells(&mut row, &cmd_truncated, muted);
+            row
+        } else {
+            build_one_row(&safe, muted, screen_w, unicode)
+        }
+    }
+
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3985,7 +4063,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
-                    let row = build_one_row(&c.text, &muted, screen_w, self.caps.unicode_symbols);
+                    let row = self.build_group_child_row(&c.text, &muted);
                     self.push_body_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
@@ -4041,7 +4119,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     self.style_faint(Role::Muted)
                 };
-                let new_row = build_one_row(&new_text, &muted, self.screen.width(), self.caps.unicode_symbols);
+                let new_row = self.build_group_child_row(&new_text, &muted);
 
                 // Update in-memory.
                 if let Some(slot) = self.body_lines.get_mut(row_idx) {
@@ -10559,6 +10637,144 @@ mod tests {
         assert!(
             !dump.contains("✓ child one"),
             "no ✓ should appear on the child after freeze:\n{}",
+            dump
+        );
+    }
+
+    /// Parallel batch: bash children render as `  └ $ <cmd>` (codex style,
+    /// magenta `$`); non-bash children stay as `  └ Name(args)`.
+    /// Asserts both the vterm text AND the magenta cell style on the `$`.
+    #[test]
+    fn batch_bash_child_shows_dollar_accent() {
+        use crate::render::ToolGroupChild;
+        use crate::render::theme::Palette;
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b1".into(),
+            header: "● Running 2 tools in parallel".into(),
+            children: vec![
+                ToolGroupChild {
+                    call_id: "bash1".into(),
+                    // event_loop new format for bash children
+                    text: "  \u{2514} $ cd /tmp && ls".into(),
+                },
+                ToolGroupChild {
+                    call_id: "grep1".into(),
+                    text: "  \u{2514} Grep(foo)".into(),
+                },
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump = vterm.dump();
+        // Bash child shows `$ cd /tmp` without `Bash(` wrapper.
+        assert!(
+            vterm.any_row(|row| row.contains("$ cd /tmp")),
+            "bash child must show `$ cd /tmp`\ndump:\n{}",
+            dump
+        );
+        assert!(
+            !dump.contains("Bash("),
+            "bash child must NOT wrap in Bash(...):\n{}",
+            dump
+        );
+        // Non-bash child unchanged.
+        assert!(
+            vterm.any_row(|row| row.contains("Grep(foo)")),
+            "non-bash child must keep Name(args) format\ndump:\n{}",
+            dump
+        );
+
+        // The `$` cell in the bash row must be magenta (Role::Brand).
+        let dollar_cells: Vec<_> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == '$')
+            .collect();
+        assert!(
+            !dollar_cells.is_empty(),
+            "no `$` cell found in body_lines\ndump:\n{}",
+            dump
+        );
+        assert!(
+            dollar_cells.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
+            "the `$` cell must be magenta (Role::Brand); fgs: {:?}\ndump:\n{}",
+            dollar_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
+            dump
+        );
+    }
+
+    /// After initial bash child render, a ToolGroupChildUpdate with `→ N lines`
+    /// must preserve the magenta `$` accent through the in-place CUP rewrite.
+    #[test]
+    fn batch_bash_child_update_preserves_dollar() {
+        use crate::render::ToolGroupChild;
+        use crate::render::theme::Palette;
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b2".into(),
+            header: "● Running 1 tool in parallel".into(),
+            children: vec![ToolGroupChild {
+                call_id: "bash2".into(),
+                text: "  \u{2514} $ cd /tmp && ls".into(),
+            }],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Now send in-place update with `→ 3 lines` suffix.
+        r.render(UiLine::ToolGroupChildUpdate {
+            batch_id: "b2".into(),
+            call_id: "bash2".into(),
+            new_text: "  \u{2514} $ cd /tmp && ls \u{2192} 3 lines".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump = vterm.dump();
+        // Updated row shows the arrow and line count.
+        assert!(
+            vterm.any_row(|row| row.contains("$ cd /tmp") && row.contains("3 lines")),
+            "updated bash row must contain `$ cd /tmp` and `3 lines`\ndump:\n{}",
+            dump
+        );
+
+        // `$` still magenta after update.
+        let dollar_cells: Vec<_> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == '$')
+            .collect();
+        assert!(
+            !dollar_cells.is_empty(),
+            "no `$` cell found after update\ndump:\n{}",
+            dump
+        );
+        assert!(
+            dollar_cells.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
+            "`$` must still be magenta after update; fgs: {:?}\ndump:\n{}",
+            dollar_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
             dump
         );
     }
