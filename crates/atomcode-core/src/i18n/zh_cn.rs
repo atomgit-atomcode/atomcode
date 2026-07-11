@@ -298,6 +298,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("加载会话失败：{error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("已恢复：{name}").into(),
+
+        // ── 待办面板 ──
+        Msg::TodoPanelTitle => "待办".into(),
+        Msg::TodoPanelCompleted { n } => format!("{n} 已完成").into(),
+        Msg::TodoPanelMore { n } => format!("+{n} 更多…").into(),
+
         Msg::SessionTimeJustNow => "刚刚".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}小时前").into(),

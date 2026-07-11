@@ -308,6 +308,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("load session failed: {error}").into(),
         Msg::SessionResumedLabel { name } =>
             format!("resumed: {name}").into(),
+
+        // ── Todo panel ──
+        Msg::TodoPanelTitle => "Todos".into(),
+        Msg::TodoPanelCompleted { n } => format!("{n} completed").into(),
+        Msg::TodoPanelMore { n } => format!("+{n} more…").into(),
+
         Msg::SessionTimeJustNow => "just now".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}h ago").into(),

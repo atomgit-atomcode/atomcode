@@ -226,6 +226,12 @@ pub enum Msg<'a> {
     // ── Session picker ──
     SessionLoadFailed { error: &'a str },
     SessionResumedLabel { name: &'a str },
+
+    // ── Todo panel ──
+    TodoPanelTitle,
+    TodoPanelCompleted { n: usize },
+    TodoPanelMore { n: usize },
+
     SessionTimeJustNow,
     SessionTimeMinAgo { n: u64 },
     SessionTimeHourAgo { n: u64 },

@@ -430,4 +430,12 @@ mod tests {
             Locale::En
         );
     }
+
+    #[test]
+    fn todo_panel_labels_render() {
+        // Default locale (En); exact copy is locale-dependent, assert non-empty + digit.
+        assert!(!t(Msg::TodoPanelTitle).is_empty());
+        assert!(t(Msg::TodoPanelCompleted { n: 3 }).contains('3'));
+        assert!(t(Msg::TodoPanelMore { n: 2 }).contains('2'));
+    }
 }
