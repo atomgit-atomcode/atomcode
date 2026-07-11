@@ -547,6 +547,7 @@ dependencies = [
  "async-trait",
  "atomcode-bridge",
  "atomcode-capabilities",
+ "atomcode-config",
  "atomcode-core",
  "atomcode-kernel",
  "atomcode-telemetry",

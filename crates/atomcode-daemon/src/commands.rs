@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::AppState;
 use atomcode_core::agent::compression;
-use atomcode_core::config::memory::MemoryStore;
+use atomcode_config::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
@@ -382,8 +382,8 @@ fn exec_whoami() -> anyhow::Result<CommandResult> {
 }
 
 fn exec_config() -> anyhow::Result<CommandResult> {
-    let path = atomcode_core::config::Config::default_path();
-    let provider = atomcode_core::config::Config::load(&path)
+    let path = atomcode_config::config::Config::default_path();
+    let provider = atomcode_config::config::Config::load(&path)
         .map(|c| c.default_provider)
         .unwrap_or_default();
     Ok(CommandResult::Config {
@@ -409,8 +409,8 @@ fn exec_status(
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
-    let config_path = atomcode_core::config::Config::default_path();
-    let config = atomcode_core::config::Config::load(&config_path).ok();
+    let config_path = atomcode_config::config::Config::default_path();
+    let config = atomcode_config::config::Config::load(&config_path).ok();
     let provider_name = provider
         .map(|s| s.to_string())
         .or_else(|| config.as_ref().map(|c| c.default_provider.clone()))
@@ -574,7 +574,7 @@ pub(crate) async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::config::memory::MemoryStore;
+    use atomcode_config::config::memory::MemoryStore;
     use atomcode_core::conversation::message::{Message, Role};
     use atomcode_core::session::{DisplayMessage, TurnStat};
 

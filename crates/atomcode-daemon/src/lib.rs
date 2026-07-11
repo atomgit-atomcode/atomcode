@@ -64,7 +64,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_core::auth;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
@@ -2751,7 +2751,7 @@ async fn process_chat_request(
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
-    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
+    atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // Determine provider
     let provider_name = req
@@ -3158,14 +3158,14 @@ async fn process_chat_request(
 pub(crate) fn build_api_system_prompt(
     working_dir: &PathBuf,
     _config: &Config,
-    provider_config: &atomcode_core::config::provider::ProviderConfig,
+    provider_config: &atomcode_config::config::provider::ProviderConfig,
     skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
 ) -> String {
     // Respect user's custom system_prompt override (same as TUI).
     let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
         custom.to_string()
     } else {
-        atomcode_core::config::prompt_sections::build_rules().to_string()
+        atomcode_config::config::prompt_sections::build_rules().to_string()
     };
 
     // Environment metadata
@@ -3209,7 +3209,7 @@ pub(crate) fn build_api_system_prompt(
 
     // Layered instructions (global → project → user).
     // Pure file reads, no side effects, < 1ms.
-    let instructions = atomcode_core::config::instructions::LayeredInstructions::load(working_dir);
+    let instructions = atomcode_config::config::instructions::LayeredInstructions::load(working_dir);
     let merged_instructions = instructions.merged();
     if !merged_instructions.is_empty() {
         prompt.push_str(&format!("\n{}\n", merged_instructions));
@@ -3218,7 +3218,7 @@ pub(crate) fn build_api_system_prompt(
     // Persistent memory (global + project).
     // Pure file reads, no side effects.
     {
-        use atomcode_core::config::memory::MemoryStore;
+        use atomcode_config::config::memory::MemoryStore;
         let project_name = working_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3266,7 +3266,7 @@ pub(crate) fn build_api_system_prompt(
     ));
 
     // Platform-specific rules (Windows path conventions, etc.)
-    let platform = atomcode_core::config::platform_rules();
+    let platform = atomcode_config::config::platform_rules();
     if !platform.is_empty() {
         prompt.push_str(platform);
         prompt.push('\n');

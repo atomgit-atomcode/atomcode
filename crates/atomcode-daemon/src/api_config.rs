@@ -1,5 +1,5 @@
-use atomcode_core::config::provider::ProviderConfig;
-use atomcode_core::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
 use axum::{response::IntoResponse, Json};
 
 use crate::{json_error, ConfigResponse, ProviderInfo};

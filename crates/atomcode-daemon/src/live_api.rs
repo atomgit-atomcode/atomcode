@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
@@ -490,7 +490,7 @@ pub(crate) async fn build_turn_parts(
     let ctx = match config.providers.get(&resolved_provider_name) {
         Some(pc) => atomcode_core::ctx::for_provider(pc),
         None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            atomcode_core::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),
