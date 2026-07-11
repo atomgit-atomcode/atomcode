@@ -218,6 +218,7 @@ fn todo_marker(unicode: bool) -> &'static str {
 /// RESERVED and always survives; the task title fills the rest and is truncated
 /// with `…`. With no task in progress the title is empty and the count renders
 /// bare (no leading separator). CJK/width-safe via `crate::width`.
+#[cfg(test)]
 fn todo_row_parts(
     current: Option<&str>,
     completed: usize,
@@ -1793,19 +1794,76 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.build_marker_row(marker, &label, &meta)
     }
 
-    /// Build the dedicated todo row (one full-width line, shown while a todo list
-    /// is active). Sits directly above the status line — and above the goal/loop
-    /// row when one is present. `☑` marker, the running task, ` · N/M` count.
-    fn build_todo_row(&self, todo: &crate::render::TodoProgress, rule_width: usize) -> Vec<Cell> {
-        let current = todo.current.as_deref().map(scrub_controls);
-        let (marker, title, meta) = todo_row_parts(
-            current.as_deref(),
-            todo.completed,
-            todo.total,
-            rule_width.max(1),
-            self.caps.unicode_symbols,
-        );
-        self.build_marker_row(marker, &title, &meta)
+    /// Effective panel height cap: `MAX_TODO_PANEL_ROWS`, clamped so the panel
+    /// never claims more than the screen can spare (rules + one input + status).
+    fn todo_panel_cap(&self) -> usize {
+        let h = self.screen.height() as usize;
+        MAX_TODO_PANEL_ROWS.min(h.saturating_sub(4)).max(1)
+    }
+
+    /// Number of rows the todo panel will occupy — mirrors `build_todo_rows`'
+    /// row count without building cells (used by the footer height math).
+    fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress) -> usize {
+        todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap()).len()
+    }
+
+    /// Build the multi-line todo panel: a header marker row (`☑ Todos · N/M`)
+    /// followed by collapsed item rows. Sits directly above the status line (and
+    /// above the goal/loop row when present). Theme-safe: Brand marker, bold
+    /// in-progress, faint completed/fold, Muted pending/more. ASCII fallback via
+    /// `todo_marker`/`todo_glyph`.
+    fn build_todo_rows(
+        &self,
+        todo: &crate::render::TodoProgress,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        use atomcode_capabilities::tools::todo::{todo_glyph, TodoStatus};
+        let unicode = self.caps.unicode_symbols;
+        let rows = todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap());
+
+        // An indented item line: `  <glyph> <content>` (content width-fitted).
+        let item_line = |glyph: &str, body: &str, style: &CellStyle| -> Vec<Cell> {
+            let mut row = Vec::new();
+            let gw = crate::width::display_width(glyph);
+            let budget = rule_width.saturating_sub(2 + gw + 1); // indent + glyph + space
+            let fitted = crate::width::truncate_with_ellipsis(&scrub_controls(body), budget);
+            push_str_cells(&mut row, &format!("  {glyph} {fitted}"), style);
+            row
+        };
+
+        rows.into_iter()
+            .map(|r| match r {
+                TodoPanelRow::Header { completed, total } => self.build_marker_row(
+                    todo_marker(unicode),
+                    &crate::i18n::t(crate::i18n::Msg::TodoPanelTitle).into_owned(),
+                    &format!(" \u{b7} {completed}/{total}"),
+                ),
+                TodoPanelRow::CompletedFold { count } => {
+                    let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
+                    let label = crate::i18n::t(crate::i18n::Msg::TodoPanelCompleted { n: count })
+                        .into_owned();
+                    item_line(todo_glyph(TodoStatus::Completed, unicode), &label, &style)
+                }
+                TodoPanelRow::Item { status, content } => {
+                    let style = match status {
+                        TodoStatus::InProgress => {
+                            CellStyle { bold: true, ..self.style_for(Role::Brand) }
+                        }
+                        TodoStatus::Completed => {
+                            CellStyle { faint: true, ..self.style_for(Role::Muted) }
+                        }
+                        TodoStatus::Pending => self.style_for(Role::Muted),
+                    };
+                    item_line(todo_glyph(status, unicode), &content, &style)
+                }
+                TodoPanelRow::More { hidden } => {
+                    let style = self.style_for(Role::Muted);
+                    let label =
+                        crate::i18n::t(crate::i18n::Msg::TodoPanelMore { n: hidden }).into_owned();
+                    item_line(todo_glyph(TodoStatus::Pending, unicode), &label, &style)
+                }
+            })
+            .collect()
     }
 
     /// Paint the full footer into `self.screen`. Layout mirrors
@@ -1905,7 +1963,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         // Dedicated todo row: one full-width line above the status row (and above
         // the goal/loop row when present), shown while a todo list is active.
-        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
+        let todo_rows = self
+            .status
+            .todo
+            .as_ref()
+            .map(|t| self.todo_panel_row_count(t))
+            .unwrap_or(0);
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
@@ -1967,10 +2030,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let todo_cells: Option<Vec<Cell>> = status_clone
+        let todo_cells: Vec<Vec<Cell>> = status_clone
             .todo
             .as_ref()
-            .map(|t| self.build_todo_row(t, rule_width));
+            .map(|t| self.build_todo_rows(t, rule_width))
+            .unwrap_or_default();
         let menu_kind = self
             .menu
             .as_ref()
@@ -2054,10 +2118,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.draw_row(goal_top, 0, &padded);
         }
         let todo_top = goal_top + goal_rows;
-        if let Some(tr) = todo_cells {
+        for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(todo_top, 0, &padded);
+            self.screen.draw_row(todo_top + i, 0, &padded);
         }
         if let Some(st) = status_cells {
             let mut padded = st;
@@ -2123,7 +2187,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        let todo_rows = if self.status.todo.is_some() { 1 } else { 0 };
+        let todo_rows = self
+            .status
+            .todo
+            .as_ref()
+            .map(|t| self.todo_panel_row_count(t))
+            .unwrap_or(0);
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
@@ -14404,5 +14473,36 @@ mod todo_panel_rows_tests {
         for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
         let rows = todo_panel_rows(&it, 1, 22, MAX_TODO_PANEL_ROWS);
         assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
+    }
+
+    #[test]
+    fn build_todo_rows_header_and_inprogress() {
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        use crate::terminal::{EnvView, TerminalCaps};
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm-256color".into()),
+            colorterm: Some("truecolor".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        });
+        let r = RetainedRenderer::with_writer(Vec::<u8>::new(), caps, 80, 24);
+        let todo = crate::render::TodoProgress {
+            current: Some("wire it".into()),
+            completed: 1,
+            total: 3,
+            items: vec![
+                (TodoStatus::Completed, "done a".into()),
+                (TodoStatus::InProgress, "wire it".into()),
+                (TodoStatus::Pending, "later".into()),
+            ],
+        };
+        let rows = r.build_todo_rows(&todo, 40);
+        let text = |cells: &Vec<Cell>| cells.iter().map(|c| c.ch).collect::<String>();
+        // header shows the i18n title + N/M
+        assert!(text(&rows[0]).contains("Todos") && text(&rows[0]).contains("1/3"));
+        // the in-progress row is bold
+        let ip = rows.iter().find(|row| text(row).contains("wire it")).unwrap();
+        assert!(ip.iter().any(|c| c.style.bold));
     }
 }
