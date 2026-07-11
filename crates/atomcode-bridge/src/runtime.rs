@@ -943,7 +943,7 @@ impl Bridge {
                         // the TUI stores into `ctx.working_dir` (otherwise it re-verbatims the
                         // value the TUI's own `/cd` just stripped, and the status row / any
                         // cwd display leaks `\\?\C:\…`). Mirrors the daemon's `change_dir`.
-                        let d = atomcode_core::tool::strip_verbatim_prefix_path(&d);
+                        let d = atomcode_capabilities::pathnorm::strip_verbatim_path(&d);
                         // `/cd` = a NEW SESSION in the new project: re-prepare the engine
                         // rooted at the new dir so persona/context/instructions/MCP/skills
                         // all rebind. An in-place `shared_cwd` write would only move the
@@ -2885,6 +2885,28 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod cd_pathnorm_tests {
+    use std::path::Path;
+
+    #[test]
+    fn cd_target_strips_windows_verbatim_prefix() {
+        // The `/cd` handler (runtime.rs) canonicalizes the target and must strip the
+        // Windows `\\?\` verbatim prefix before it reaches `working_dir` / the
+        // `WorkingDirChanged` event, or the status row leaks `\\?\C:\…`. This locks
+        // that behavior against the capabilities helper the handler now calls
+        // (replacing the former `atomcode_core::tool::strip_verbatim_prefix_path`).
+        let got = atomcode_capabilities::pathnorm::strip_verbatim_path(Path::new(r"\\?\C:\Users\x"));
+        assert_eq!(got, Path::new(r"C:\Users\x"));
+        // Verbatim-UNC form collapses to a normal UNC path.
+        let unc = atomcode_capabilities::pathnorm::strip_verbatim_path(Path::new(r"\\?\UNC\server\share"));
+        assert_eq!(unc, Path::new(r"\\server\share"));
+        // No prefix → unchanged (covers every POSIX path).
+        let plain = atomcode_capabilities::pathnorm::strip_verbatim_path(Path::new("/home/x"));
+        assert_eq!(plain, Path::new("/home/x"));
     }
 }
 
