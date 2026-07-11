@@ -1,0 +1,13 @@
+[package]
+name = "atomcode-config"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "atomcode disk/TOML config system (Config + sub-configs + loader). Leaf crate: depends only on atomcode-telemetry + serde/toml/anyhow, so every stack layer can read config without an atomcode-core dependency."
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+atomcode-telemetry = { path = "../atomcode-telemetry" }
