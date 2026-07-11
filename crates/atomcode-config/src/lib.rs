@@ -16,3 +16,7 @@ mod util;
 /// `[network.proxy]` config types + process-env proxy policy. The reqwest-applying
 /// runtime stays in `atomcode-core::proxy` (needs the HTTP stack) and re-exports these.
 pub mod proxy;
+
+/// The `LspServerConfig` config type (`Config.lsp.servers`). The LSP runtime
+/// (`LspServerRegistry`, client, manager) stays in `atomcode-core::lsp` and re-exports it.
+pub mod lsp_registry;
