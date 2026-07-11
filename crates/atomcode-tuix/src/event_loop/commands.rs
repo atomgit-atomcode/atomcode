@@ -2134,6 +2134,10 @@ fn execute_slash_command_impl(
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // The todo panel is per-session and is NOT cleared at turn end;
+                    // this fresh foreground session has no todos, so drop the prior
+                    // session's list (mirrors reset_to_new_session / SessionSwitched).
+                    state.active_todos = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
                     // (same anti-flicker as `/resume`). Self-contained: the
