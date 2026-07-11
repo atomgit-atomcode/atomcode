@@ -8,7 +8,7 @@ use super::state::InstallScope;
 /// to `./.atomcode` when `$HOME` cannot be resolved, so callers no longer
 /// need to handle a `None`.
 pub fn plugins_root() -> Option<PathBuf> {
-    Some(crate::config::Config::config_dir().join("plugins"))
+    Some(atomcode_config::config::Config::config_dir().join("plugins"))
 }
 
 pub fn marketplaces_root() -> Option<PathBuf> {

@@ -6,7 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use atomcode_core::{auth, config::Config};
+use atomcode_config::config::Config;
+use atomcode_core::auth;
 use atomcode_telemetry::Event;
 
 use crate::{api_config::cleanup_expired_sessions, json_error, AppState, LoginSessionEntry};

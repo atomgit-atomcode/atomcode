@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, ToolErrorKind};
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 use crate::conversation::Conversation;
 use crate::hook::{HookCtx, HookEngine, ToolResultContext};
 use crate::provider::LlmProvider;

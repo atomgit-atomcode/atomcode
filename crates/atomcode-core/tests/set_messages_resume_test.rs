@@ -146,7 +146,7 @@ fn rebuild_correctly_tracks_message_indices_per_turn() {
 
 #[test]
 fn context_builds_with_turn_tracking_after_set_messages() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -234,7 +234,7 @@ fn context_builds_with_turn_tracking_after_set_messages() {
 
 #[test]
 fn context_uses_fallback_when_turn_tracker_is_empty() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -456,7 +456,7 @@ fn set_messages_with_single_user_message_produces_one_active_turn() {
 
 #[test]
 fn restored_context_contains_same_user_messages_as_original() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -529,7 +529,7 @@ fn restored_context_contains_same_user_messages_as_original() {
 
 #[test]
 fn empty_turn_tracker_loses_windowing_precision() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 

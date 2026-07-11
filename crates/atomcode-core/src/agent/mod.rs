@@ -46,7 +46,7 @@ pub enum AgentCommand {
     DenyTool,
     /// Reload config from TUI (the single source of truth for in-memory config,
     /// including ephemeral OAuth providers). Switches to the new default provider.
-    ReloadConfig(crate::config::Config),
+    ReloadConfig(atomcode_config::config::Config),
     /// Change working directory.
     ChangeDir(String),
     /// Append input during streaming — queued and injected before next LLM call.
@@ -571,7 +571,7 @@ mod compute_rich_context_stats_tests {
             Message::new(Role::User, "hello world"),
         ];
         let tools = ToolRegistry::new();
-        let ctx = crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+        let ctx = crate::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
             provider_type: String::new(),
             api_key: None,
             model: String::new(),

@@ -181,7 +181,7 @@ impl Conversation {
 
     /// Path to history file.
     pub fn history_path() -> std::path::PathBuf {
-        crate::config::Config::config_dir().join("history.json")
+        atomcode_config::config::Config::config_dir().join("history.json")
     }
 
     pub fn add_user_message(&mut self, content: &str) {

@@ -33,7 +33,7 @@ impl ToolResultStore {
 
     /// Default cache directory: `$ATOMCODE_HOME/tool_cache/`
     pub fn default_dir() -> PathBuf {
-        crate::config::Config::config_dir().join("tool_cache")
+        atomcode_config::config::Config::config_dir().join("tool_cache")
     }
 
     /// Store a tool result on disk and return a lightweight reference.

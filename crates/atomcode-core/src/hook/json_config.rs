@@ -45,7 +45,7 @@ fn default_timeout() -> u64 {
 /// Project hooks override global hooks with the same name. Disabled hooks
 /// are filtered out.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
-    let global_path = crate::config::Config::config_dir().join("hooks.json");
+    let global_path = atomcode_config::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
     let mut merged: BTreeMap<String, HookConfig> = BTreeMap::new();

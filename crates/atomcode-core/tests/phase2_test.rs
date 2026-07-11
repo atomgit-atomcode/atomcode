@@ -1,6 +1,6 @@
 //! Unified prompt tests.
 
-use atomcode_core::config::prompt_sections::build_rules;
+use atomcode_config::config::prompt_sections::build_rules;
 
 // ═══════════════════════════════════════════════════════════════
 // 1. Unified prompt — minimal but complete

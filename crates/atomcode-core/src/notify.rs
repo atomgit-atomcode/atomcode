@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::agent::TurnStopReason;
-use crate::config::NotificationConfig;
+use atomcode_config::config::NotificationConfig;
 
 #[derive(Debug, Clone)]
 pub struct TurnNotification<'a> {

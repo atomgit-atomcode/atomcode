@@ -26,7 +26,7 @@
 //! atomcode must remain usable on offline machines, in air-gapped
 //! corporate environments, on systems without git, etc.
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 
 use super::installer::{install, list_installed};
 use super::marketplace::{add_marketplace, list_marketplaces, update_marketplace};

@@ -10,8 +10,8 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::provider::ProviderConfig;
-use crate::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
@@ -309,7 +309,7 @@ fn make_runner(
 ) -> TurnRunner {
     // Tests don't set up real ProviderConfig, so construct a DefaultCtx
     // directly with a generous window (matches test_config's implicit budget).
-    let test_provider = crate::config::provider::ProviderConfig {
+    let test_provider = atomcode_config::config::provider::ProviderConfig {
         provider_type: "test".into(),
         api_key: None,
         model: "test-model".into(),
@@ -1255,7 +1255,7 @@ async fn test_tool_registry_stable_order() {
 /// (those belong in tool definitions, not system prompt).
 #[test]
 fn test_rules_no_tool_descriptions() {
-    let rules = crate::config::prompt_sections::build_rules();
+    let rules = atomcode_config::config::prompt_sections::build_rules();
 
     // Should NOT contain tool usage descriptions (removed for token savings)
     assert!(
@@ -1294,7 +1294,7 @@ fn test_rules_no_tool_descriptions() {
 /// that would break prompt caching.
 #[test]
 fn test_rules_no_dynamic_content() {
-    let rules = crate::config::prompt_sections::build_rules();
+    let rules = atomcode_config::config::prompt_sections::build_rules();
 
     assert!(!rules.contains("Date:"), "Rules should not contain date");
     assert!(
@@ -1463,7 +1463,7 @@ mod telemetry_tests {
         let (tel, captured) = Telemetry::in_memory("test".into());
         let ctx = ToolContext::with_telemetry(PathBuf::from("/tmp/test"), "session-1", tel);
 
-        let test_provider_cfg = crate::config::provider::ProviderConfig {
+        let test_provider_cfg = atomcode_config::config::provider::ProviderConfig {
             provider_type: "test".into(),
             api_key: None,
             model: "test-model".into(),

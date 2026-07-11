@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_telemetry::{Event, Telemetry};
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 
 /// Default Platform server base URL (client_secret is kept on the broker).
 /// Override with the `ATOMCODE_PLATFORM_SERVER` environment variable.
@@ -1111,7 +1111,7 @@ pub fn save_auth(auth: &AuthInfo) -> Result<()> {
 
 /// Get path to auth file
 pub fn auth_file_path() -> std::path::PathBuf {
-    crate::config::Config::config_dir().join("auth.toml")
+    atomcode_config::config::Config::config_dir().join("auth.toml")
 }
 
 /// Check if user is logged in

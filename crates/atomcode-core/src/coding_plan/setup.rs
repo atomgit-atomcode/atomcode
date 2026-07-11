@@ -37,8 +37,8 @@ use super::types::{ModelEntry, PlanType, StatusResponse};
 #[cfg(test)]
 use super::types::RateLimitWindow;
 use crate::auth;
-use crate::config::provider::ProviderConfig;
-use crate::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
 
 /// Default LLM gateway base URL for CodingPlan-managed providers when
 /// the `models-v2` payload doesn't carry a per-model `base_url`. Used

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
@@ -417,7 +417,7 @@ impl SubAgentTask {
         max_turns: usize,
     ) -> SubAgentResult {
         // 1. Build minimal system prompt
-        let rules = crate::config::prompt_sections::build_rules();
+        let rules = atomcode_config::config::prompt_sections::build_rules();
         let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte")
         {
             "\nCRITICAL: This is a Vue SFC. Edit <script> and <template> in SEPARATE edit_file calls. \
@@ -459,7 +459,7 @@ impl SubAgentTask {
         // isn't in the config — matches AgentLoop::new's fallback.
         let build_ctx = match config.providers.get(&config.default_provider) {
             Some(pc) => crate::ctx::for_provider(pc),
-            None => crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+            None => crate::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),

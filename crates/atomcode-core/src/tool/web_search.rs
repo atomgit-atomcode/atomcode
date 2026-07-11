@@ -77,7 +77,7 @@ impl Default for WebSearchTool {
 impl WebSearchTool {
     /// Build from the `[web_search]` config block. `EXA_API_KEY` env var
     /// takes precedence over a configured `api_key`.
-    pub fn from_config(cfg: &crate::config::WebSearchConfig) -> Self {
+    pub fn from_config(cfg: &atomcode_config::config::WebSearchConfig) -> Self {
         let exa_api_key =
             env_exa_key().or_else(|| cfg.api_key.clone().filter(|s| !s.trim().is_empty()));
         Self {

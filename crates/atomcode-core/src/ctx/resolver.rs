@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use super::{CtxBuilder, DefaultCtx};
-use crate::config::provider::ProviderConfig;
+use atomcode_config::config::provider::ProviderConfig;
 
 /// 给定 provider config 返回对应的 [`CtxBuilder`]。
 ///

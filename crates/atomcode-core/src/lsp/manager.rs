@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, RwLock};
 use super::client::LspClient;
 use super::registry::LspServerRegistry;
 use super::types::Diagnostic;
-use crate::config::LspConfig;
+use atomcode_config::config::LspConfig;
 
 /// Status events emitted by `LspManager` when servers start, fail, or
 /// hit non-fatal trouble. Mirrors `mcp::McpConnectEvent` so the TUI
