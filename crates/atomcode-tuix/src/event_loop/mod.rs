@@ -11838,6 +11838,32 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
         .map(|todos| todo_progress_from_items(&todos))
 }
 
+/// Todo panel state derived from a full transcript — the last VALID `todowrite`
+/// call wins (mirrors capabilities::derive_current_todos, but over the core
+/// conversation message type held by `Session.messages`; tool calls live inside
+/// `AssistantWithToolCalls`). `None` when the session never used todowrite, or
+/// when the last valid call cleared the list. Used to seed the panel on
+/// `/resume` / session switch with zero extra storage.
+pub(crate) fn todo_progress_from_messages(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> Option<crate::render::TodoProgress> {
+    use atomcode_core::conversation::message::MessageContent;
+    for m in messages.iter().rev() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+            for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
+                if let Ok(todos) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
+                    if todos.is_empty() {
+                        return None; // last valid call cleared the list → hide panel
+                    }
+                    return Some(todo_progress_from_items(&todos));
+                }
+                // invalid args: skip, keep scanning for an earlier valid call
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
@@ -11925,6 +11951,32 @@ mod todo_block_tests {
         assert_eq!(p.items[1], (TodoStatus::InProgress, "b".to_string()));
         assert_eq!(p.items[2], (TodoStatus::Pending, "c".to_string()));
         assert_eq!((p.completed, p.total), (1, 3));
+    }
+
+    #[test]
+    fn todo_progress_from_messages_last_valid_wins() {
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_core::tool::ToolCall;
+        let mk = |id: &str, args: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall { id: id.into(), name: "todowrite".into(), arguments: args.into() }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let msgs = vec![
+            mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
+            mk("2", r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#),
+        ];
+        let p = todo_progress_from_messages(&msgs).expect("last valid todowrite → Some");
+        assert_eq!((p.completed, p.total), (1, 2)); // LAST call wins
+        assert_eq!(p.current.as_deref(), Some("b"));
+        assert_eq!(p.items.len(), 2);
+        assert!(todo_progress_from_messages(&[]).is_none()); // no todowrite → None
     }
 }
 
