@@ -85,10 +85,11 @@ pub struct OpenAiCompatConfig {
 /// `atomcode_core::provider::model_name_suggests_vision` — this L0 crate cannot
 /// depend on core, so it is duplicated (like `session::hash_path` is in the
 /// daemon). MUST stay in sync: it also gates the live VL-preprocess and the
-/// `read_file` vision path (both via core's copy); a drift silently drops (or
-/// wrongly forwards) images. Used only as the DEFAULT for `supports_vision`;
-/// core-aware callers (bridge / coding assemble) override it with core's copy.
-fn model_suggests_vision(name: &str) -> bool {
+/// `read_file` vision path; a drift silently drops (or wrongly forwards) images.
+/// `pub` so the v2 `bridge` reuses THIS copy for its resumed-image vision gate
+/// (dropping its former `atomcode_core::provider::model_name_suggests_vision`
+/// dependency) — one authority as the v1 stack is retired.
+pub fn model_suggests_vision(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("vision")
         || n.contains("-vl")
@@ -1059,6 +1060,38 @@ struct PromptTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Parity lock: `model_suggests_vision` MUST classify identically to
+    // `atomcode_core::provider::model_name_suggests_vision` (verbatim copy). The
+    // v2 `bridge` now depends on THIS copy, so a drift would silently change the
+    // resumed-image vision gate. Covers every match rule (in core's list order)
+    // plus a representative text-only negative.
+    #[test]
+    fn model_suggests_vision_matches_core_classifications() {
+        for m in [
+            "gpt-4-vision-preview",
+            "glm-4v",
+            "qwen2-vl-7b",
+            "vl-max",
+            "got-ocr2",
+            "grok-4v",
+            "step-4.1v",
+            "gpt-4o-mini",
+            "claude-3-5-sonnet",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+            "gemini-2.0-flash",
+            "pixtral-12b",
+            "llava-1.6",
+            "qvq-72b",
+        ] {
+            assert!(model_suggests_vision(m), "should be vision: {m}");
+        }
+        for m in ["glm-5.2", "deepseek-v4", "gpt-4-turbo", "claude-2.1", "o3-mini"] {
+            assert!(!model_suggests_vision(m), "should be text-only: {m}");
+        }
+    }
 
     fn line(v: Value) -> String {
         format!("data: {}\n", v)

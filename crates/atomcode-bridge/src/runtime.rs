@@ -2614,9 +2614,11 @@ fn build_provider(
             // a FRESH image into text (see `maybe_preprocess` above), but a RESUMED
             // conversation's historical image message would still serialize as multimodal and
             // 400 the whole request every turn (`glm-5.2 is not a multimodal model`). Gate it
-            // with the SAME detector `maybe_preprocess` uses so the two stay consistent.
+            // with the vision detector that is a byte-for-byte parity copy of the one
+            // `maybe_preprocess` uses, so the two stay consistent (parity test in
+            // capabilities/src/provider/openai_compat.rs).
             pc.supports_vision =
-                atomcode_core::provider::model_name_suggests_vision(&cfg.model);
+                atomcode_capabilities::provider::model_suggests_vision(&cfg.model);
             // Fallback `max_tokens` (the per-call `chat_options.max_tokens` still wins). Without
             // this v2 sent NO max_tokens and the gateway's hidden default truncated long replies.
             pc.max_tokens = Some(default_max_tokens(cfg.context_window));
