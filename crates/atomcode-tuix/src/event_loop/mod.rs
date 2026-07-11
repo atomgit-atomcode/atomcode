@@ -10212,6 +10212,7 @@ fn handle_agent_event(
             state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
+            state.active_todos = None;
 
             // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
             let target_session = match loaded {
