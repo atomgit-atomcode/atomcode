@@ -319,6 +319,7 @@ dependencies = [
  "atomcode-bridge",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-config",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-kernel",

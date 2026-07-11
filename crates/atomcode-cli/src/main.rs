@@ -26,8 +26,8 @@ fn _isolate_atomcode_home() {
 }
 
 use atomcode_core::agent::{AgentCommand, AgentEvent};
-use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
-use atomcode_core::config::Config;
+use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
+use atomcode_config::config::Config;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
@@ -220,7 +220,7 @@ fn scan_argv_for_lang() -> Option<String> {
 /// has no `language` key. This is a lightweight pre-parse -- the full config
 /// is loaded later in `run()` after clap has parsed CLI flags.
 fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
-    let path = atomcode_core::config::Config::default_path();
+    let path = atomcode_config::config::Config::default_path();
     if !path.exists() {
         return None;
     }
@@ -228,7 +228,7 @@ fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
         Ok(c) => c,
         Err(_) => return None,
     };
-    let cfg: atomcode_core::config::Config = match toml::from_str(&content) {
+    let cfg: atomcode_config::config::Config = match toml::from_str(&content) {
         Ok(c) => c,
         Err(_) => return None,
     };
@@ -352,9 +352,9 @@ fn should_try_sync_upgrade() -> bool {
 
     // Load just enough of the config to honor `auto_update = false`.
     // Failure to load = assume default (true) — fresh installs benefit.
-    let path = atomcode_core::config::Config::default_path();
+    let path = atomcode_config::config::Config::default_path();
     if path.exists() {
-        if let Ok(cfg) = atomcode_core::config::Config::load(&path) {
+        if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
             if !cfg.auto_update {
                 return false;
             }
@@ -1408,8 +1408,8 @@ async fn run() -> Result<i32> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
     });
-    match atomcode_core::config::Config::seed_user_config(&config_path, seed_source.as_deref()) {
-        atomcode_core::config::SeedOutcome::Seeded => {
+    match atomcode_config::config::Config::seed_user_config(&config_path, seed_source.as_deref()) {
+        atomcode_config::config::SeedOutcome::Seeded => {
             if let Some(src) = seed_source.as_deref() {
                 eprintln!(
                     "[seed] initialized {} from {}",
@@ -1418,10 +1418,10 @@ async fn run() -> Result<i32> {
                 );
             }
         }
-        atomcode_core::config::SeedOutcome::Invalid(e) => {
+        atomcode_config::config::SeedOutcome::Invalid(e) => {
             eprintln!("Warning: --seed-config ignored (not a valid config): {e}");
         }
-        atomcode_core::config::SeedOutcome::IoError(e) => {
+        atomcode_config::config::SeedOutcome::IoError(e) => {
             eprintln!("Warning: --seed-config could not be applied: {e}");
         }
         // AlreadyConfigured / NoSource → nothing to do, stay quiet.
@@ -1437,7 +1437,7 @@ async fn run() -> Result<i32> {
         // No config yet — TUI Welcome screen will guide first-run setup
         Config::default()
     };
-    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
+    atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // ── i18n locale ──
     // Locale was already pre-resolved above (before clap parse) so --help
@@ -1662,7 +1662,7 @@ async fn run() -> Result<i32> {
         // --dangerously-skip-permissions — not just the launch handle.
         let skip_perms = cli.dangerously_skip_permissions;
         std::sync::Arc::new(
-            move |config: &atomcode_core::config::Config, working_dir: &std::path::Path| {
+            move |config: &atomcode_config::config::Config, working_dir: &std::path::Path| {
                 atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
                     config,
                     working_dir,
@@ -1953,7 +1953,7 @@ fn redirect_stderr_to_log_file() {
 /// ignored `--provider`, so a headless `--provider X` run picked the config
 /// default instead of X.
 fn bridge_config_from(
-    config: &atomcode_core::config::Config,
+    config: &atomcode_config::config::Config,
     working_dir: &std::path::Path,
     provider_override: Option<&str>,
     telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
@@ -2000,7 +2000,7 @@ fn bridge_config_from(
 /// `verbose=true`: also emit tool calls, token usage, [done] summary, working
 /// dir changes, and sub-agent progress on stderr.
 async fn run_headless(
-    notifications_cfg: atomcode_core::config::NotificationConfig,
+    notifications_cfg: atomcode_config::config::NotificationConfig,
     agent_handle: atomcode_core::agent::AgentHandle,
     prompt: String,
     _provider_name: Option<&str>,
@@ -3126,7 +3126,7 @@ fn run_codingplan_core(
         Ok(c) => c,
         Err(_) => Config::default(),
     };
-    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
+    atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // If the stored token is locally valid (file present, expires_in
     // not yet past) but the server rejects it (revoked, refresh-token
@@ -3355,7 +3355,7 @@ mod tests {
             base_url = "https://api.deepseek.com"
             reasoning_history = "exclude"
         "#;
-        let config: atomcode_core::config::Config = toml::from_str(toml_str).unwrap();
+        let config: atomcode_config::config::Config = toml::from_str(toml_str).unwrap();
         let wd = PathBuf::from("/tmp/x");
 
         // No override → the config default (gateway), no reasoning_history set.
