@@ -645,6 +645,18 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// breaks the "inflight strip = body tail" invariant and orphans the
     /// spinner glyph next to the committed `●` (bash-only, since the hint is).
     inflight_hint: Option<String>,
+    /// Number of body rows pushed by the most-recent `UiLine::ApprovalPrompt`
+    /// render, or `Some(0)` after `pop_approval_prompt` has consumed them.
+    /// `None` means no ApprovalPrompt has been rendered yet (or the renderer
+    /// was reset), which triggers the legacy heuristic walk-back in
+    /// `pop_approval_prompt` as a defensive fallback.
+    ///
+    /// This count is set at the END of the `UiLine::ApprovalPrompt` arm
+    /// (after all `push_body_row` calls), so it self-corrects on resize:
+    /// the reflow replay re-runs the arm at the new terminal width and
+    /// re-records the fresh count, making it always consistent with
+    /// `body_lines`.
+    approval_block_rows: Option<usize>,
 
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -813,6 +825,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             inflight_hint: None,
+            approval_block_rows: None,
             live_group: None,
             modal_overlay: None,
             body_log: Vec::new(),
@@ -3532,6 +3545,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
+        // After a resize the approval prompt rows are NOT in body_log, so
+        // the reflow above does not rebuild them.  Setting Some(0) marks the
+        // block as "already consumed", making the next pop_approval_prompt a
+        // clean noop instead of falling through to the legacy heuristic
+        // (which could mistake space-padded body rows for approval chips).
+        // None would re-enable the heuristic, which is unsafe here.
+        if self.approval_block_rows.is_some() {
+            self.approval_block_rows = Some(0);
+        }
         self.live_spinner_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
@@ -4026,52 +4048,120 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
+                // Capture BEFORE the arm mutates `last_mark_was_assistant`.
+                // We need the entry-time value to decide whether to insert a
+                // leading blank row for breathing room.
+                let prev_was_assistant = self.last_mark_was_assistant;
                 self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
+                // Insert one blank body row between assistant text and the
+                // tool-call header so the block has visual breathing room.
+                // Only fires when the previous rendered mark was assistant
+                // text — consecutive tool calls in a chain stay compact
+                // (no blank between them).
+                if prev_was_assistant {
+                    self.push_body_row(Vec::new());
+                }
                 let bullet_style = self.tool_bullet_style();
                 let tool_name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
-                let body_str = if safe_detail.is_empty() {
-                    safe_name.clone()
-                } else {
-                    format!("{}({})", safe_name, safe_detail)
-                };
-                // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
-                // commands) from producing hundreds of terminal lines.
-                let body_str = truncate_body_str(&body_str, 500);
-                // ● (U+25CF, Geometric Shapes block) replaces the
-                // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
-                // Mono but is missing from Consolas / NSimSun /
-                // legacy conhost defaults — Windows users saw the
-                // tool-call row prefixed by `□` tofu (screenshot
-                // bug report). ● has near-universal monospace
-                // coverage, same reason state.tick_spinner picked
-                // half-moons over Braille (state.rs:528-544). Bonus:
-                // unifies the visual anchor with the parallel-batch
-                // header (also ●), matching Claude Code's single-glyph
-                // model for tool-call entries.
-                if safe_detail.is_empty() {
-                    self.push_body_prefixed(
-                        "● ",
-                        &bullet_style,
-                        &body_str,
-                        &tool_name_style,
+
+                // Bash command: render `● bash` header then command lines
+                // via `format_shell_command` (shell-boundary wrapping, no
+                // truncation). The magenta `$ ` prefix (Role::Brand) signals
+                // "this is a shell command" at a glance, matching the codex
+                // visual convention.
+                let is_bash = safe_name.eq_ignore_ascii_case("bash");
+                if is_bash && !safe_detail.is_empty() {
+                    // Header: `● Bash`
+                    self.push_body_prefixed("● ", &bullet_style, &safe_name, &tool_name_style);
+                    // Command lines: Claude Code style — `  └ $ <cmd>` (dim `└` gutter,
+                    // magenta `$`). Layout: PAD_COL (2 sp) + `└ ` (2) + `$ ` (2) = 6 cols
+                    // before command text.  Safe because Task 5 made pop_approval_prompt
+                    // count-based — it no longer keys on col-0 space, so space-prefixed
+                    // bash rows survive the approval pop without any NBSP sentinel.
+                    let dollar_style = self.style_for(Role::Brand);
+                    let cmd_style = self.style_for(Role::Secondary);
+                    // Muted style for the `└` gutter — same `  └ ` col-2 muted gutter as the
+                    // attachment-preview row (`  └ [Image #N]`, ~line 1858); the muted/faint
+                    // style follows ToolResult's `muted_hint` pattern. Note: ToolResult uses
+                    // `⎿` (U+23BF), not `└` (U+2514), so this is NOT a mirror of that arm.
+                    let gutter_style = if crate::highlight::theme::is_light_for_render() {
+                        self.style_for(Role::Muted)
+                    } else {
+                        self.style_faint(Role::Muted)
+                    };
+                    // `└` gutter glyph, gated for non-unicode terminals (→ ASCII backtick),
+                    // matching the attachment-preview row convention.
+                    let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
+                    // Width budget: command text starts at col 6 (`  └ $ `), so subtract 6.
+                    let width = (self.screen.width() as usize)
+                        .saturating_sub(6)
+                        .max(8);
+                    let safe_cmd = crate::glyph::downgrade_glyphs(
+                        &safe_detail,
+                        self.caps.unicode_symbols,
                     );
-                } else {
-                    let detail_str = format!("({})", safe_detail);
-                    let rows = self.build_mixed_style_rows(
-                        "● ", &bullet_style,
-                        &safe_name, &tool_name_style,
-                        &detail_str, &detail_style,
-                        "", &tool_name_style,
-                        &body_str,
-                    );
-                    for row in rows {
+                    let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
+                    for (idx, line) in lines.iter().enumerate() {
+                        let mut row = Vec::new();
+                        if idx == 0 {
+                            // `  └ $ <cmd>`: PAD_COL + gutter + dollar + command text.
+                            push_str_cells(&mut row, leaf, &gutter_style);
+                            push_str_cells(&mut row, "$ ", &dollar_style);
+                            push_str_cells(&mut row, line, &cmd_style);
+                        } else {
+                            // Continuation: format_shell_command prepends 4 spaces to its
+                            // continuation segments; we add 2 more (PAD_COL) so text lands
+                            // at col 6, aligned under the command text of line 0.
+                            push_str_cells(&mut row, "  ", &gutter_style);
+                            push_str_cells(&mut row, line, &cmd_style);
+                        }
                         self.push_body_row(row);
+                    }
+                } else {
+                    let body_str = if safe_detail.is_empty() {
+                        safe_name.clone()
+                    } else {
+                        format!("{}({})", safe_name, safe_detail)
+                    };
+                    // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+                    // commands) from producing hundreds of terminal lines.
+                    let body_str = truncate_body_str(&body_str, 500);
+                    // ● (U+25CF, Geometric Shapes block) replaces the
+                    // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
+                    // Mono but is missing from Consolas / NSimSun /
+                    // legacy conhost defaults — Windows users saw the
+                    // tool-call row prefixed by `□` tofu (screenshot
+                    // bug report). ● has near-universal monospace
+                    // coverage, same reason state.tick_spinner picked
+                    // half-moons over Braille (state.rs:528-544). Bonus:
+                    // unifies the visual anchor with the parallel-batch
+                    // header (also ●), matching Claude Code's single-glyph
+                    // model for tool-call entries.
+                    if safe_detail.is_empty() {
+                        self.push_body_prefixed(
+                            "● ",
+                            &bullet_style,
+                            &body_str,
+                            &tool_name_style,
+                        );
+                    } else {
+                        let detail_str = format!("({})", safe_detail);
+                        let rows = self.build_mixed_style_rows(
+                            "● ", &bullet_style,
+                            &safe_name, &tool_name_style,
+                            &detail_str, &detail_style,
+                            "", &tool_name_style,
+                            &body_str,
+                        );
+                        for row in rows {
+                            self.push_body_row(row);
+                        }
                     }
                 }
             }
@@ -4234,6 +4324,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
+                // Capture row count BEFORE any push so we know exactly how
+                // many rows this approval block occupies. Set at the END of
+                // the arm after all push_body_row calls. Used by
+                // pop_approval_prompt to avoid the fragile col-0 heuristic.
+                let n0 = self.body_lines.len();
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 // Truecolor so the chips read as vivid green / blue / red on
@@ -4342,6 +4437,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     chips_row.extend(chips_cells);
                     self.push_body_row(chips_row);
                 }
+                // Record the exact number of rows pushed by this approval block.
+                // pop_approval_prompt reads this to avoid the fragile col-0 walk.
+                // Must be set AFTER all push_body_row calls so the count is final.
+                self.approval_block_rows = Some(self.body_lines.len().saturating_sub(n0));
             }
             UiLine::Error(msg) => {
                 // Defense in depth (mirror TurnComplete / TurnCancelled): a turn
@@ -4516,45 +4615,77 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         //   - When the label is long: 1+ label rows (first starts
         //     with '▶', continuation rows start with spaces) plus
         //     1 chips row (also starting with spaces).
-        // We need to pop all of them. Strategy: walk backwards
-        // from the tail, popping every row until we find the ▶
-        // header row (which we also pop). Other symbol rows hold
-        // '●' (tool call) or '❯' (user turn) at col 0 — distinct
-        // glyphs — so the first ▶ we encounter must be ours.
-        // Safe because the agent doesn't append further body rows
-        // between `ApprovalNeeded` and the user's Y/A/N reply.
+        // We need to pop all of them.
         //
-        // CRITICAL: capture `bottom` BEFORE the pop loop runs. In the
-        // top-anchored body model, `body_bottom_row()` returns
-        // `min(body_lines.len(), cap)` — calling it AFTER popping
-        // would point at the LAST `popped_count` rows of REMAINING
-        // body content (the rows just above the approval strip), so
-        // the erase would wipe real markers instead of the formerly-
-        // approval rows. Capture once, before mutating body_lines.
+        // PRIMARY PATH (count-based): `approval_block_rows` is set at the
+        // end of the `UiLine::ApprovalPrompt` render arm to the exact number
+        // of rows pushed. Using the explicit count avoids any heuristic and
+        // makes double-pop a clean noop:
+        //   Some(n>0)  → pop exactly n rows, then set Some(0).
+        //   Some(0)    → already consumed; return immediately (noop).
+        //   None       → defensive fallback: use the legacy walk-back heuristic
+        //                (covers any code path that didn't go through the
+        //                ApprovalPrompt render arm).
+        //
+        // CRITICAL: capture `bottom` BEFORE any pop. In the top-anchored body
+        // model, `body_bottom_row()` returns `min(body_lines.len(), cap)` —
+        // calling it AFTER popping would point at the LAST `popped_count` rows
+        // of REMAINING body content (the rows just above the approval strip),
+        // so the erase would wipe real markers instead of the formerly-approval
+        // rows. Capture once, before mutating body_lines.
         let bottom_before_pop = self.body_bottom_row();
-        let mut popped_count: u16 = 0;
-        loop {
-            let action = match self.body_lines.last() {
-                None => break,
-                Some(last) => last.get(0).map(|c| c.ch),
-            };
-            match action {
-                // ▶ header: pop it and stop (we've found the start).
-                Some('▶') => {
-                    self.body_lines.pop();
-                    popped_count = popped_count.saturating_add(1);
-                    break;
-                }
-                // Space-padded continuation / chips row: pop and keep going.
-                Some(' ') => {
-                    self.body_lines.pop();
-                    popped_count = popped_count.saturating_add(1);
-                }
-                // Any other glyph (● tool-call, ❯ user turn, etc.):
-                // not part of the approval block — stop without popping.
-                _ => break,
+
+        let popped_count: u16 = match self.approval_block_rows {
+            Some(0) => {
+                // Already consumed — double-pop is a clean noop.
+                return;
             }
-        }
+            Some(n) => {
+                // Count-based path: pop exactly n rows (clamped to what's
+                // available to be safe against any edge case).
+                let to_pop = n.min(self.body_lines.len());
+                for _ in 0..to_pop {
+                    self.body_lines.pop();
+                }
+                // Mark as consumed so the next call is a noop.
+                self.approval_block_rows = Some(0);
+                to_pop.min(u16::MAX as usize) as u16
+            }
+            None => {
+                // Fallback: legacy walk-back heuristic.
+                //
+                // Walk backwards from the tail, popping every row until we
+                // find the ▶ header row (which we also pop). Other symbol rows
+                // hold '●' (tool call) or '❯' (user turn) at col 0 — distinct
+                // glyphs — so the first ▶ we encounter must be ours. Safe
+                // because the agent doesn't append further body rows between
+                // `ApprovalNeeded` and the user's Y/A/N reply.
+                let mut count: u16 = 0;
+                loop {
+                    let action = match self.body_lines.last() {
+                        None => break,
+                        Some(last) => last.get(0).map(|c| c.ch),
+                    };
+                    match action {
+                        // ▶ header: pop it and stop (we've found the start).
+                        Some('▶') => {
+                            self.body_lines.pop();
+                            count = count.saturating_add(1);
+                            break;
+                        }
+                        // Space-padded continuation / chips row: pop and keep going.
+                        Some(' ') => {
+                            self.body_lines.pop();
+                            count = count.saturating_add(1);
+                        }
+                        // Any other glyph (● tool-call, ❯ user turn, etc.):
+                        // not part of the approval block — stop without popping.
+                        _ => break,
+                    }
+                }
+                count
+            }
+        };
         if popped_count == 0 {
             return;
         }
@@ -7632,10 +7763,14 @@ mod tests {
     fn retained_resize_clips_wide_body_rows_to_new_width() {
         let (mut r, buf) = new_capturing(120, 24);
 
-        // Seed body with a long tool call: a `▸ Name(payload)` row whose
+        // Seed body with a long tool call: a `● Name(payload)` row whose
         // display width far exceeds any sane "shrink-to" target.
+        // Use "EditFile" (not "Bash") so the generic inline render path is
+        // exercised — bash now wraps at shell boundaries (format_shell_command),
+        // and a 100-char single-token command intentionally stays one line even
+        // at narrow widths (never splits mid-token by design).
         r.render(UiLine::ToolCall {
-            name: "Bash".into(),
+            name: "EditFile".into(),
             detail: "X".repeat(100),
         });
         r.render(UiLine::InputPrompt {
@@ -7828,8 +7963,8 @@ mod tests {
         );
     }
 
-    /// ToolCall: `● name(detail)` formatted. Grid-verifies the
-    /// marker + name + parens appear together on one row.
+    /// ToolCall bash: renders `● bash` header + `$ ls -la` command row
+    /// (new two-part shape instead of old inline `● bash(ls -la)`).
     #[test]
     fn retained_tool_call_renders_via_vterm() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -7848,13 +7983,21 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm
-            .any_row(|row| row.contains("●") && row.contains("bash") && row.contains("ls -la"));
-        assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
+        // Header row: `● bash` (no inline paren command).
+        assert!(
+            vterm.any_row(|row| row.contains("●") && row.contains("bash") && !row.contains("bash(")),
+            "bash header row missing\ndump:\n{}", vterm.dump()
+        );
+        // Command row: `$ ls -la`.
+        assert!(
+            vterm.any_row(|row| row.contains("$ ls -la")),
+            "bash command row with $ prefix missing\ndump:\n{}", vterm.dump()
+        );
     }
 
     /// ToolCall glyph `●` must sit at col 0, same baseline as user
-    /// echo and input chevron.
+    /// echo and input chevron. With bash two-part rendering, the header
+    /// row (`● bash`) carries the glyph.
     #[test]
     fn retained_tool_call_arrow_at_col_0() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -7874,9 +8017,10 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
+        // The header row is `● bash` (no inline command) — glyph at col 0.
         let row_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains("bash"))
-            .unwrap_or_else(|| panic!("tool call row missing\ndump:\n{}", vterm.dump()));
+            .unwrap_or_else(|| panic!("tool call header row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 0).ch,
             '●',
@@ -7934,6 +8078,38 @@ mod tests {
             !static_detail.style.bold,
             "tool-call detail must use normal foreground, not highlighted text"
         );
+    }
+
+    /// Bash ToolCall renders `● Bash` header + `  └ $ command` lines (Claude Code style:
+    /// dim `└` gutter at col 2, magenta `$` at col 4, command text at col 6), wrapping
+    /// along shell boundaries (not mid-token), with no truncation and no NBSP sentinel.
+    #[test]
+    fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "cd /tmp && sed -i '' \\ -e 's/mb-2.5/mb-[10px]/g' \\ -e 's/mb-3.5/mb-[14px]/g'".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
+            "header is `● Bash` without inline paren command\ndump:\n{}", vterm.dump());
+        // Line 0 must contain both `└` (or `` ` ``) gutter and `$ cd /tmp`.
+        assert!(
+            vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("$ cd /tmp")),
+            "first command row must have └ gutter + $ prefix\ndump:\n{}", vterm.dump()
+        );
+        assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
+            "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
+        assert!(!vterm.any_row(|row| row.contains("truncated")),
+            "no truncation\ndump:\n{}", vterm.dump());
+        // No NBSP sentinel should appear anywhere.
+        assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
+            "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
+        // `$` must be indented (not at col 0) — the layout is `  └ $ <cmd>`.
+        assert!(!vterm.any_row(|row| row.starts_with("$ ")),
+            "$ must be indented (not col 0)\ndump:\n{}", vterm.dump());
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure
@@ -8620,6 +8796,60 @@ mod tests {
         );
     }
 
+    /// Regression: resize-during-approval must reset `approval_block_rows` to
+    /// `None` so that a subsequent `pop_approval_prompt` falls back to the
+    /// legacy heuristic (safe noop) rather than popping stale-count rows of
+    /// real body content.
+    ///
+    /// Scenario:
+    ///   1. Render real body content (ToolCall + AssistantText).
+    ///   2. Render an ApprovalPrompt → sets `approval_block_rows = Some(n)`.
+    ///   3. Simulate a window resize via `on_resize`.
+    ///   4. Call `pop_approval_prompt` — must NOT eat real body rows.
+    #[test]
+    fn approval_resize_resets_stale_count() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        // Render real body content so body_lines is non-empty.
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        r.render(UiLine::AssistantText("some important output".into()));
+        r.render(UiLine::AssistantLineBreak);
+
+        // Render approval prompt — this sets approval_block_rows = Some(n).
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        // Confirm approval_block_rows is set (Some(n > 0)).
+        assert!(
+            matches!(r.approval_block_rows, Some(n) if n > 0),
+            "approval_block_rows should be Some(n>0) after render, got {:?}",
+            r.approval_block_rows
+        );
+
+        // Simulate a resize — this triggers reflow_body_to_current_width which
+        // clears body_lines and replays body_log (ApprovalPrompt is NOT in
+        // body_log so it won't be rebuilt).
+        r.on_resize(60, 24);
+
+        // After resize: body_lines does NOT include the approval rows anymore.
+        // Record how many body rows exist now (all real content).
+        let body_after_resize = r.body_lines.len();
+
+        // pop_approval_prompt: must be a safe noop — must NOT pop real content.
+        r.pop_approval_prompt();
+        let body_after_pop = r.body_lines.len();
+
+        assert_eq!(
+            body_after_pop, body_after_resize,
+            "pop_approval_prompt after resize must not eat real body rows \
+             (stale count data-loss bug): before={body_after_resize} after={body_after_pop}"
+        );
+    }
+
     /// When the approval label wraps across multiple lines (narrow
     /// terminal), pop_approval_prompt must remove ALL of them: the
     /// wrapped label rows + the chips row.
@@ -8656,6 +8886,80 @@ mod tests {
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
         );
+    }
+
+    /// Validate that `approval_block_rows` is set to Some(n>0) after rendering
+    /// an ApprovalPrompt, that pop_approval_prompt consumes exactly n rows and
+    /// sets the count to Some(0), and that a second pop is a clean noop.
+    #[test]
+    fn approval_block_rows_count_semantics() {
+        // Wide terminal: label + chips fit on one line → exactly 1 approval row.
+        {
+            let (mut r, _buf) = new_capturing(80, 24);
+            r.render(UiLine::ApprovalPrompt {
+                tool: "bash".into(),
+                detail: "ls".into(),
+            });
+            // After rendering, approval_block_rows must be Some(n) with n > 0.
+            let n = r.approval_block_rows.expect("approval_block_rows should be set");
+            assert!(n > 0, "approval_block_rows must be > 0 after render, got {n}");
+
+            let body_before = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after = r.body_lines.len();
+            assert_eq!(
+                body_before - body_after,
+                n,
+                "pop should drop exactly n={n} rows, dropped {}",
+                body_before - body_after
+            );
+            assert_eq!(
+                r.approval_block_rows,
+                Some(0),
+                "approval_block_rows must be Some(0) after pop"
+            );
+
+            // Second pop: count is Some(0) → must be a noop.
+            let body_before2 = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after2 = r.body_lines.len();
+            assert_eq!(
+                body_before2, body_after2,
+                "second pop must be a noop (approval_block_rows == Some(0))"
+            );
+            assert_eq!(
+                r.approval_block_rows,
+                Some(0),
+                "approval_block_rows must remain Some(0) after noop second pop"
+            );
+        }
+
+        // Narrow terminal: label wraps → 2+ approval rows (chips on separate line).
+        {
+            let (mut r, _buf) = new_capturing(30, 24);
+            r.render(UiLine::ApprovalPrompt {
+                tool: "bash".into(),
+                detail: "a very long command indeed".into(),
+            });
+            let n = r.approval_block_rows.expect("approval_block_rows should be set");
+            assert!(n >= 2, "narrow terminal should produce >= 2 rows, got {n}");
+
+            let body_before = r.body_lines.len();
+            r.pop_approval_prompt();
+            let body_after = r.body_lines.len();
+            assert_eq!(
+                body_before - body_after,
+                n,
+                "pop should drop exactly n={n} rows, dropped {}",
+                body_before - body_after
+            );
+            assert_eq!(r.approval_block_rows, Some(0));
+
+            // Second pop is noop.
+            let body_before2 = r.body_lines.len();
+            r.pop_approval_prompt();
+            assert_eq!(r.body_lines.len(), body_before2, "second pop must be noop");
+        }
     }
 
     /// Regression: when the user approves a tool (presses Y/A/N),
@@ -13509,5 +13813,153 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    /// Regression: bash command rows rendered above an approval block must
+    /// SURVIVE `pop_approval_prompt`. The pop walks backwards from the tail
+    /// popping space-prefixed and `▶`-prefixed rows; it stops as soon as it
+    /// hits the `▶` header, so bash rows above the approval strip are never
+    /// reached — regardless of whether the `$` sits at col 0 or col 2.
+    #[test]
+    fn bash_command_rows_survive_approval_pop() {
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+
+        // Render input prompt first (mirrors real usage).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Render a bash ToolCall with a long multi-segment command that WILL
+        // wrap at width 40 (the screen width minus prefix overhead).
+        let long_cmd = "cd /tmp && sed -i '' \\ -e 's/aaaa/bbbb/g' \\ -e 's/cccc/dddd/g' \\ -e 's/eeee/ffff/g'";
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: long_cmd.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The command should wrap to multiple rows — verify at least one
+        // wrapped segment is present before the pop.
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
+            "wrapped segment must be visible before pop\ndump:\n{}",
+            vterm.dump()
+        );
+
+        // Now render an approval prompt on top.
+        r.render(UiLine::ApprovalPrompt {
+            tool: "Bash".into(),
+            detail: long_cmd.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Pop the approval block.
+        r.pop_approval_prompt();
+        // Force a repaint cycle (mirrors real Y/A/N handling).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // CRITICAL: bash command rows MUST survive the pop.
+        assert!(
+            vterm.any_row(|row| row.contains("$ cd /tmp")),
+            "bash $ command line must survive approval pop\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
+            "wrapped bash segment must survive approval pop\ndump:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// A ToolCall that follows assistant text must have at least one blank row
+    /// between the last assistant-text row and the `● Bash` header row.
+    #[test]
+    fn tool_block_has_leading_blank_after_assistant_text() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        r.render(UiLine::AssistantText("refine spacing further now".into()));
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let rows: Vec<String> = (0..vterm.height() as usize)
+            .map(|i| vterm.row_text(i))
+            .collect();
+        let text_idx = rows
+            .iter()
+            .position(|r| r.contains("refine spacing further"))
+            .unwrap_or_else(|| panic!("assistant text row not found\nvterm dump:\n{}", vterm.dump()));
+        let bash_idx = rows
+            .iter()
+            .position(|r| r.contains("● Bash"))
+            .expect("bash header row");
+        assert!(
+            bash_idx > text_idx + 1,
+            "≥1 blank line between text and tool block: text@{text_idx} bash@{bash_idx}\n{}",
+            vterm.dump()
+        );
+        assert!(
+            rows[text_idx + 1..bash_idx].iter().any(|r| r.trim().is_empty()),
+            "a blank row exists between them\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Two consecutive ToolCall blocks (separated only by a ToolResult) must
+    /// NOT have a blank row between them — tool chains stay compact.
+    #[test]
+    fn tool_block_no_blank_between_consecutive_tool_calls() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        // First tool call + result (no assistant text in between)
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "ls".into() });
+        r.render(UiLine::ToolResult { success: true, summary: "file.txt".into() });
+        // Second tool call — previous mark was a ToolResult, NOT assistant text
+        r.render(UiLine::ToolCall { name: "Bash".into(), detail: "pwd".into() });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let rows: Vec<String> = (0..vterm.height() as usize)
+            .map(|i| vterm.row_text(i))
+            .collect();
+        // Find the two `● Bash` header rows
+        let bash_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains("● Bash"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(bash_positions.len(), 2, "expected two ● Bash rows\n{}", vterm.dump());
+        let first_bash = bash_positions[0];
+        let second_bash = bash_positions[1];
+        // The rows between first_bash and second_bash (exclusive) should have
+        // no entirely-blank row — they should all contain the result text or
+        // be adjacent (i.e. second_bash == first_bash + 1 or +2 for result).
+        let blank_between = rows[first_bash + 1..second_bash]
+            .iter()
+            .any(|r| r.trim().is_empty());
+        assert!(
+            !blank_between,
+            "consecutive tool calls must NOT have a blank row between them: \
+             first_bash@{first_bash} second_bash@{second_bash}\n{}",
+            vterm.dump()
+        );
     }
 }

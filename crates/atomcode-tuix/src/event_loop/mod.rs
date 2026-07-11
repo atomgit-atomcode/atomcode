@@ -11565,6 +11565,77 @@ pub(crate) fn summarise(output: &str) -> String {
     }
 }
 
+/// 把一条 shell 命令软折成多行,按续行边界优先断行,续行缩进 4 空格。
+/// 绝不从非空白 token 中间硬断,绝不加省略/截断标记——命令必须可读、看得全。
+pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
+    let cmd = cmd.trim_end();
+    if cmd.is_empty() {
+        return vec![String::new()];
+    }
+    // 1) 先在语义边界切成逻辑段:` \` 续行、` && `、` || `、` | `、` -e `。
+    //    保留分隔符在段首(除了 `\` 始终段尾),让读者看清结构。
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let tokens: Vec<&str> = cmd.split(' ').collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok == "\\" {
+            // 反斜杠续行留在段尾,断段。
+            if !cur.is_empty() { cur.push(' '); }
+            cur.push_str(tok);
+            segments.push(std::mem::take(&mut cur));
+        } else if tok == "&&" || tok == "||" || tok == "|" {
+            // 这些分隔符留在段首(下一个逻辑段开头)。
+            if !cur.is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(tok);
+        } else if tok == "-e" && !cur.is_empty() {
+            // `-e` 起新段(sed 常见),留在段首。
+            segments.push(std::mem::take(&mut cur));
+            cur.push_str(tok);
+        } else {
+            if !cur.is_empty() { cur.push(' '); }
+            cur.push_str(tok);
+        }
+        i += 1;
+    }
+    if !cur.is_empty() { segments.push(cur); }
+
+    // 2) 每段再按 width 软折(只在空格处断,绝不切 token);续行缩进 4 空格。
+    let indent = "    ";
+    let mut out: Vec<String> = Vec::new();
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let lead = if seg_idx == 0 { "" } else { indent };
+        let mut line = String::from(lead);
+        let mut line_len = lead.len();
+        for word in seg.split(' ') {
+            let wlen = crate::width::display_width(word);
+            let need = if line_len == lead.len() { wlen } else { wlen + 1 };
+            if line_len > lead.len() && line_len + need > width {
+                out.push(std::mem::take(&mut line));
+                line.push_str(indent);
+                line_len = indent.len();
+            }
+            if line_len > lead.len() && !line.ends_with(' ') {
+                line.push(' ');
+                line_len += 1;
+            }
+            line.push_str(word);
+            line_len += wlen;
+        }
+        // 跳过纯空白段(连续分隔符可能产生),不产出空行。
+        if !line.trim().is_empty() {
+            out.push(line);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Render the `task` tool's `<task ...>` result blocks into clean per-subtask lines:
 /// `id · model · ✓ done` (or `✗ failed (reason)`), one per subtask. A single subtask
 /// drops its `#1` suffix and appends the result's line count. Falls back to the generic
@@ -12013,5 +12084,67 @@ mod install_password_modal_tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         install_password_modal(&mut app, "[sudo] password:".into(), tx);
         assert!(app.active_modal.is_some(), "modal installed");
+    }
+}
+
+#[cfg(test)]
+mod format_shell_command_tests {
+    use super::format_shell_command;
+
+    #[test]
+    fn short_command_stays_one_line() {
+        assert_eq!(format_shell_command("ls -la", 80), vec!["ls -la".to_string()]);
+    }
+
+    #[test]
+    fn breaks_on_backslash_continuation() {
+        let out = format_shell_command("sed -i '' \\ -e 's/a/b/' \\ -e 's/c/d/'", 80);
+        // 每个 `\` 续行段独立成行,续行缩进 4 空格
+        assert!(out.len() >= 3, "got {:?}", out);
+        assert!(out[0].ends_with('\\'), "first line keeps its trailing backslash: {:?}", out);
+        assert!(out[1].starts_with("    "), "continuation is indented: {:?}", out);
+    }
+
+    #[test]
+    fn breaks_on_and_and() {
+        let out = format_shell_command("cd /tmp && make build && make test", 80);
+        assert!(out.len() >= 2, "got {:?}", out);
+        assert!(out.iter().any(|l| l.contains("&& make build")), "got {:?}", out);
+    }
+
+    #[test]
+    fn never_splits_mid_token() {
+        // 一个超宽无空格的 token 必须整体留在一行(不硬断)
+        let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
+        let out = format_shell_command(long, 20);
+        assert!(out.iter().any(|l| l.contains(long)), "token stays intact: {:?}", out);
+    }
+
+    #[test]
+    fn never_appends_truncation_marker() {
+        let out = format_shell_command("echo hello && echo world", 80).join("\n");
+        assert!(!out.contains('…'), "no ellipsis: {}", out);
+        assert!(!out.contains("truncated"), "no truncated marker: {}", out);
+    }
+
+    #[test]
+    fn cjk_chars_use_display_width_no_mid_token_split() {
+        // 每个 CJK 字符占 2 列; "你好世界" = 8 列。宽度 16 时第一段
+        // "echo 你好世界" = 14 列,可容纳;宽度缩到 12 时不够容纳同段
+        // 后续词,但绝不拆断 "你好世界" token 本身。
+        let cmd = "echo 你好世界 && echo done";
+        let out = format_shell_command(cmd, 12);
+        // 无论怎样折行,token "你好世界" 必须整体保留在某行中。
+        assert!(
+            out.iter().any(|l| l.contains("你好世界")),
+            "CJK token must not be split: {:?}",
+            out
+        );
+        // 必须不含截断标记。
+        assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
+        // 每行至少有一个非空字符(无鬼空行)。
+        for line in &out {
+            assert!(!line.trim().is_empty(), "no empty line in output: {:?}", out);
+        }
     }
 }
