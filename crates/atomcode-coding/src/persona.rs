@@ -176,10 +176,11 @@ tools live under `Scripts\\` (not `bin/`).";
 /// on small edits. Only injected when the `todowrite` tool is actually mounted
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
-For a task that clearly spans several distinct steps (roughly three or more), touches \
-multiple files, or bundles several user requests, start by calling `todowrite` to lay out \
-the steps, then keep it updated as you work — exactly one item in_progress at a time, and \
-mark an item done only after that step is actually verified (never on intent). It keeps you \
+When a task spans three or more distinct steps (count steps, not tool calls), touches \
+multiple files, or bundles several user requests, call `todowrite` FIRST to lay out the \
+steps, then keep it current as you work — exactly one item in_progress at a time, and \
+mark an item done only after that step is actually verified (never on intent). Keep each \
+item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
 and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
 quick edit, a one-off command, or a purely informational / conversational reply.";
 
@@ -283,6 +284,12 @@ mod tests {
         let on = coding_persona("glm-5.2", true);
         assert!(on.contains("## TASK TRACKING"), "enabled → guidance present");
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
+        // Threshold disambiguation: count steps, not tool calls (fixes weak-model
+        // miscounting that made GLM under-trigger).
+        assert!(
+            on.contains("count steps, not tool calls"),
+            "guidance must disambiguate steps from tool calls: {on}"
+        );
 
         let off = coding_persona("glm-5.2", false);
         assert!(!off.contains("## TASK TRACKING"), "disabled → no guidance");

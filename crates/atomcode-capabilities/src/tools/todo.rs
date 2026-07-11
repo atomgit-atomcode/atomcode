@@ -132,11 +132,16 @@ impl TodoTool {
 }
 
 const TODOWRITE_DESCRIPTION: &str = "Create and maintain a structured task list for the current coding session. \
-Send the ENTIRE updated list every call (full replace). Use it proactively for multi-step work (3+ distinct steps), \
-when the user gives multiple tasks, or to plan a non-trivial refactor. Do NOT use it for a single trivial edit or a \
-purely informational/conversational reply. Rules: update statuses in real time; keep EXACTLY ONE task in_progress at \
-a time; mark a task completed ONLY after the work is actually done (including any required verification), never on \
-intent; keep tasks specific and actionable.";
+Send the ENTIRE updated list every call (full replace). \
+When to use: the work spans three or more DISTINCT steps (count real steps, not tool calls — several edits for one \
+conceptual change is still one step), the user gives multiple tasks, or you are planning a non-trivial refactor. \
+USE it for e.g. `add a --retry flag and cover it with a test`, or `rename resolve_path across the crate` (grep shows \
+many hits). SKIP it for e.g. `add a doc comment to parse_args` (single edit), `what does this function do?` \
+(informational), or `run cargo test and show the output` (one command). \
+Each task is ONE specific, verifiable action — write `add error handling to load_config`, not `handle errors` or \
+`make it work`; break large work into small steps, no filler. \
+Rules: update statuses in real time; keep EXACTLY ONE task in_progress at a time; mark a task completed ONLY after the \
+work is actually done (including any required verification), never on intent.";
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -326,5 +331,17 @@ mod tests {
     #[test]
     fn tool_name_is_todowrite() {
         assert_eq!(TodoTool::new().name(), "todowrite");
+    }
+
+    #[test]
+    fn description_calibrates_when_to_use() {
+        let t = TodoTool::new();
+        let d = t.description();
+        // Disambiguates steps from tool calls (the key precision fix).
+        assert!(d.contains("not tool calls"), "must clarify steps ≠ tool calls: {d}");
+        // Shows both use and skip examples, not just tells.
+        assert!(d.contains("USE it for") && d.contains("SKIP it for"), "must give use/skip examples: {d}");
+        // Sets an item-quality bar with a good/bad contrast.
+        assert!(d.contains("specific, verifiable action"), "must set item quality bar: {d}");
     }
 }
