@@ -922,17 +922,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
-    /// Render `● Bash` header + `  └ $ <cmd>` block lines (Claude Code style).
-    /// Used by both the static `UiLine::ToolCall` arm and `commit_inflight_tool`
-    /// so the live and static paths produce identical output.
+    /// Render `● Bash` header + `  └ <cmd>` block lines. Used by both the static
+    /// `UiLine::ToolCall` arm and `commit_inflight_tool` so the live and static
+    /// paths produce identical output.
     fn push_bash_command_block(&mut self, safe_name: &str, safe_detail: &str) {
         let bullet_style = self.tool_bullet_style();
         let tool_name_style = self.style_bold(Role::ToolName);
         // Header: `● Bash`
         self.push_body_prefixed("● ", &bullet_style, safe_name, &tool_name_style);
-        // Command lines: `  └ $ <cmd>` (dim `└` gutter, magenta `$`).
-        // Layout: PAD_COL (2 sp) + `└ ` (2) + `$ ` (2) = 6 cols before command text.
-        let dollar_style = self.style_for(Role::Brand);
+        // Command lines: `  └ <cmd>` (dim `└` gutter, command in Secondary).
+        // Layout: PAD_COL (2 sp) + `└ ` (2) = 4 cols before command text.
         let cmd_style = self.style_for(Role::Secondary);
         let gutter_style = if crate::highlight::theme::is_light_for_render() {
             self.style_for(Role::Muted)
@@ -940,19 +939,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.style_faint(Role::Muted)
         };
         let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
-        let width = (self.screen.width() as usize).saturating_sub(6).max(8);
+        let width = (self.screen.width() as usize).saturating_sub(4).max(8);
         let safe_cmd = crate::glyph::downgrade_glyphs(safe_detail, self.caps.unicode_symbols);
         let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
         for (idx, line) in lines.iter().enumerate() {
             let mut row = Vec::new();
             if idx == 0 {
                 push_str_cells(&mut row, leaf, &gutter_style);
-                push_str_cells(&mut row, "$ ", &dollar_style);
                 push_str_cells(&mut row, line, &cmd_style);
             } else {
-                // Continuation: format_shell_command prepends 4 spaces; add 2 more
-                // (PAD_COL) so text lands at col 6, aligned under command text of line 0.
-                push_str_cells(&mut row, "  ", &gutter_style);
+                // Continuation: format_shell_command already prepends 4 spaces, so the
+                // text lands at col 4, aligned under line 0's command text.
                 push_str_cells(&mut row, line, &cmd_style);
             }
             self.push_body_row(row);
@@ -2931,7 +2928,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // so multi-row inflight spinners are fully covered.
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
             if safe_name.eq_ignore_ascii_case("bash") && !safe_detail.is_empty() {
-                // Live bash commit: produce the same `● Bash` + `  └ $ <cmd>` block as
+                // Live bash commit: produce the same `● Bash` + `  └ <cmd>` block as
                 // the static `UiLine::ToolCall` arm, via the shared helper.
                 self.push_bash_command_block(&safe_name, &safe_detail);
             } else if safe_detail.is_empty() {
@@ -3760,97 +3757,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.md_state.reset();
     }
 
-    /// Build a single child row for a live tool-group, applying the
-    /// codex-style `$ <cmd>` format (magenta `$`) for bash children.
-    ///
-    /// Detection: if `text` (after the `"  └ "` / `"  ` "`" ASCII-downgraded
-    /// prefix) starts with `"$ "`, render `"  └ "` in `muted`, `"$ "` in
-    /// `Role::Brand` (magenta), and the remainder in `muted`, then clip to
-    /// screen width exactly like `build_one_row`. For all other children,
-    /// delegates to `build_one_row` unchanged.
-    ///
-    /// Called from both the initial `ToolGroupRender` child loop and the
-    /// `ToolGroupChildUpdate` in-place rewrite path so both share identical
-    /// width and styling behaviour.
+    /// Build a single child row for a live tool-group. Downgrades decorative
+    /// glyphs, scrubs controls, and renders muted + width-clipped via
+    /// `build_one_row` — bash children now read `  └ Bash <cmd>` like any other
+    /// child (no `$` prefix / accent). Called from both the initial
+    /// `ToolGroupRender` child loop and the `ToolGroupChildUpdate` in-place
+    /// rewrite path so both share identical width and styling behaviour.
     fn build_group_child_row(&self, text: &str, muted: &CellStyle) -> Vec<Cell> {
         let unicode = self.caps.unicode_symbols;
         let screen_w = self.screen.width();
-        // Downgrade decorative glyphs first — same as build_one_row.
         let downgr = crate::glyph::downgrade_glyphs(text, unicode);
         let safe = scrub_controls(&downgr);
-
-        // Detect bash child: after leading "  " (2) + glyph (1 char) + " " (1) = 4 cols,
-        // the content is "Bash $ {cmd}".  Both unicode `└ ` (U+2514, 1 col wide) and
-        // ASCII `` ` `` fallback produce a single character here, so we split
-        // off everything up to and including the first space after the glyph,
-        // then check what follows.
-        //
-        // Pattern: "  {glyph} Bash $ {cmd}" — split at the space after glyph,
-        // then check if the remainder starts with "Bash $ ".
-        let bash_prefix = if safe.starts_with("  ") {
-            // The two leading spaces are guaranteed; find the glyph char and the
-            // space that follows it.
-            let after_two = &safe[2..]; // past "  "
-            if let Some(rest) = after_two.splitn(2, ' ').nth(1) {
-                // `rest` is everything after "  {glyph} ".
-                rest.starts_with("Bash $ ")
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if bash_prefix {
-            // Split into: glyph_prefix ("  {glyph} "), name_str ("Bash "), dollar_part ("$ "), remainder.
-            let avail = (screen_w as usize).saturating_sub(PAD_COL);
-            // Find the split point by consuming "  " then to first space.
-            let glyph_end = safe[2..]
-                .find(' ')
-                .map(|i| 2 + i + 1) // index just after "  {glyph} "
-                .unwrap_or(safe.len());
-            let glyph_prefix_str = &safe[..glyph_end]; // "  {glyph} "
-            let after_glyph = &safe[glyph_end..]; // "Bash $ {cmd}"
-            // "Bash " is 5 bytes; "$ " is 2 bytes.
-            let (name_str, dollar_and_cmd) = if after_glyph.len() >= 5 {
-                (&after_glyph[..5], &after_glyph[5..])
-            } else {
-                (after_glyph, "")
-            };
-            let (dollar_str, cmd_str) = if dollar_and_cmd.len() >= 2 {
-                (&dollar_and_cmd[..2], &dollar_and_cmd[2..])
-            } else {
-                (dollar_and_cmd, "")
-            };
-
-            // Width budget accounting.
-            let prefix_w = crate::width::display_width(glyph_prefix_str)
-                + crate::width::display_width(name_str);
-            let dollar_w = crate::width::display_width(dollar_str);
-
-            // Degenerate-width guard: if the terminal is too narrow to fit
-            // even the prefix + "$ ", fall back to plain muted rendering
-            // so we never exceed avail or misalign the CUP rewrite.
-            if avail < prefix_w + dollar_w {
-                return build_one_row(&safe, muted, screen_w, unicode);
-            }
-
-            let cmd_budget = avail
-                .saturating_sub(prefix_w)
-                .saturating_sub(dollar_w)
-                .max(1);
-            let cmd_truncated = crate::width::truncate_with_ellipsis(cmd_str, cmd_budget);
-
-            let dollar_style = self.style_for(crate::render::theme::Role::Brand);
-            let mut row = Vec::new();
-            push_str_cells(&mut row, glyph_prefix_str, muted);
-            push_str_cells(&mut row, name_str, muted);
-            push_str_cells(&mut row, dollar_str, &dollar_style);
-            push_str_cells(&mut row, &cmd_truncated, muted);
-            row
-        } else {
-            build_one_row(&safe, muted, screen_w, unicode)
-        }
+        build_one_row(&safe, muted, screen_w, unicode)
     }
 
 }
@@ -4314,9 +4232,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
                 // Bash command: render `● bash` header then command lines
                 // via `format_shell_command` (shell-boundary wrapping, no
-                // truncation). The magenta `$ ` prefix (Role::Brand) signals
-                // "this is a shell command" at a glance, matching the codex
-                // visual convention.
+                // truncation). The `● Bash` header + `└` gutter already mark it
+                // as a shell command, so the command text renders plainly.
                 let is_bash = safe_name.eq_ignore_ascii_case("bash");
                 if is_bash && !safe_detail.is_empty() {
                     self.push_bash_command_block(&safe_name, &safe_detail);
@@ -8139,7 +8056,7 @@ mod tests {
         );
     }
 
-    /// ToolCall bash: renders `● bash` header + `$ ls -la` command row
+    /// ToolCall bash: renders `● bash` header + `ls -la` command row
     /// (new two-part shape instead of old inline `● bash(ls -la)`).
     #[test]
     fn retained_tool_call_renders_via_vterm() {
@@ -8164,10 +8081,10 @@ mod tests {
             vterm.any_row(|row| row.contains("●") && row.contains("bash") && !row.contains("bash(")),
             "bash header row missing\ndump:\n{}", vterm.dump()
         );
-        // Command row: `$ ls -la`.
+        // Command row: `ls -la` (no `$` prefix).
         assert!(
-            vterm.any_row(|row| row.contains("$ ls -la")),
-            "bash command row with $ prefix missing\ndump:\n{}", vterm.dump()
+            vterm.any_row(|row| row.contains("ls -la")),
+            "bash command row missing\ndump:\n{}", vterm.dump()
         );
     }
 
@@ -8256,9 +8173,9 @@ mod tests {
         );
     }
 
-    /// Bash ToolCall renders `● Bash` header + `  └ $ command` lines (Claude Code style:
-    /// dim `└` gutter at col 2, magenta `$` at col 4, command text at col 6), wrapping
-    /// along shell boundaries (not mid-token), with no truncation and no NBSP sentinel.
+    /// Bash ToolCall renders `● Bash` header + `  └ command` lines (dim `└`
+    /// gutter at col 2, command text at col 4), wrapping along shell boundaries
+    /// (not mid-token), with no truncation and no NBSP sentinel.
     #[test]
     fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
         let (mut r, buf) = new_capturing(60, 24);
@@ -8271,10 +8188,10 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
             "header is `● Bash` without inline paren command\ndump:\n{}", vterm.dump());
-        // Line 0 must contain both `└` (or `` ` ``) gutter and `$ cd /tmp`.
+        // Line 0 must contain both `└` (or `` ` ``) gutter and `cd /tmp`.
         assert!(
-            vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("$ cd /tmp")),
-            "first command row must have └ gutter + $ prefix\ndump:\n{}", vterm.dump()
+            vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("cd /tmp")),
+            "first command row must have └ gutter + command\ndump:\n{}", vterm.dump()
         );
         assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
             "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
@@ -8283,16 +8200,16 @@ mod tests {
         // No NBSP sentinel should appear anywhere.
         assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
             "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
-        // `$` must be indented (not at col 0) — the layout is `  └ $ <cmd>`.
-        assert!(!vterm.any_row(|row| row.starts_with("$ ")),
-            "$ must be indented (not col 0)\ndump:\n{}", vterm.dump());
+        // The command must be indented under the gutter, never flush at col 0.
+        assert!(!vterm.any_row(|row| row.starts_with("cd /tmp")),
+            "command must be indented (not col 0)\ndump:\n{}", vterm.dump());
     }
 
     /// Live bash committed via ToolCallInFlight → ToolCallCommit must produce
-    /// the same `● Bash` + `  └ $ <cmd>` block as the static `UiLine::ToolCall`
+    /// the same `● Bash` + `  └ <cmd>` block as the static `UiLine::ToolCall`
     /// arm — NOT the old `● Bash(cmd)` inline format.
     #[test]
-    fn live_bash_commits_to_dollar_block() {
+    fn live_bash_commits_to_command_block() {
         let (mut r, buf) = new_capturing(60, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
         // Live inflight strip (as ToolCallStarted would push):
@@ -8310,8 +8227,8 @@ mod tests {
         // Committed form is the block, NOT `● Bash(cmd)` inline:
         assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
             "committed header is `● Bash` (no inline paren)\ndump:\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("$ cd /tmp")),
-            "committed command line `  └ $ cd /tmp`\ndump:\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("cd /tmp")),
+            "committed command line `  └ cd /tmp`\ndump:\n{}", vterm.dump());
         assert!(vterm.any_row(|row| row.contains("-e 's/cc/dd/g'")),
             "wrapped segment survives\ndump:\n{}", vterm.dump());
         assert!(!vterm.any_row(|row| row.contains("truncated")), "no (truncated)\ndump:\n{}", vterm.dump());
@@ -10743,13 +10660,11 @@ mod tests {
         );
     }
 
-    /// Parallel batch: bash children render as `  └ $ <cmd>` (codex style,
-    /// magenta `$`); non-bash children stay as `  └ Name(args)`.
-    /// Asserts both the vterm text AND the magenta cell style on the `$`.
+    /// Parallel batch: bash children render as plain `  └ Bash <cmd>` (no `$`
+    /// prefix or magenta accent); non-bash children stay as `  └ Name(args)`.
     #[test]
-    fn batch_bash_child_shows_dollar_accent() {
+    fn batch_bash_child_renders_plain() {
         use crate::render::ToolGroupChild;
-        use crate::render::theme::Palette;
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
 
@@ -10759,8 +10674,8 @@ mod tests {
             children: vec![
                 ToolGroupChild {
                     call_id: "bash1".into(),
-                    // event_loop new format for bash children: name + $ + cmd
-                    text: "  \u{2514} Bash $ cd /tmp && ls".into(),
+                    // event_loop format for bash children: name + cmd (no `$`).
+                    text: "  \u{2514} Bash cd /tmp && ls".into(),
                 },
                 ToolGroupChild {
                     call_id: "grep1".into(),
@@ -10779,12 +10694,13 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let dump = vterm.dump();
-        // Bash child shows `Bash $ cd /tmp` (name + magenta $ + cmd).
+        // Bash child shows `Bash cd /tmp` (name + cmd, no `$` prefix/accent).
         assert!(
-            vterm.any_row(|row| row.contains("Bash $ cd /tmp")),
-            "bash child must show `Bash $ cd /tmp`\ndump:\n{}",
+            vterm.any_row(|row| row.contains("Bash cd /tmp")),
+            "bash child must show `Bash cd /tmp`\ndump:\n{}",
             dump
         );
+        assert!(!dump.contains('$'), "no `$` prefix expected\ndump:\n{}", dump);
         assert!(
             !dump.contains("Bash("),
             "bash child must NOT wrap in Bash(...):\n{}",
@@ -10794,102 +10710,6 @@ mod tests {
         assert!(
             vterm.any_row(|row| row.contains("Grep(foo)")),
             "non-bash child must keep Name(args) format\ndump:\n{}",
-            dump
-        );
-
-        // The `$` cell in the bash row must be magenta (Role::Brand).
-        let dollar_cells: Vec<_> = r
-            .body_lines
-            .iter()
-            .flatten()
-            .filter(|c| c.ch == '$')
-            .collect();
-        assert!(
-            !dollar_cells.is_empty(),
-            "no `$` cell found in body_lines\ndump:\n{}",
-            dump
-        );
-        assert!(
-            dollar_cells.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
-            "the `$` cell must be magenta (Role::Brand); fgs: {:?}\ndump:\n{}",
-            dollar_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
-            dump
-        );
-        // The `Bash ` name cells must be muted (not Brand).
-        let bash_name_cells: Vec<_> = r
-            .body_lines
-            .iter()
-            .flatten()
-            .filter(|c| c.ch == 'B' || c.ch == 'a' || c.ch == 's' || c.ch == 'h')
-            .collect();
-        assert!(
-            bash_name_cells.iter().all(|c| c.style.fg != Some(Palette::BRAND)),
-            "the `Bash` name cells must be muted (not Brand); fgs: {:?}\ndump:\n{}",
-            bash_name_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
-            dump
-        );
-    }
-
-    /// After initial bash child render, a ToolGroupChildUpdate with `→ N lines`
-    /// must preserve the magenta `$` accent through the in-place CUP rewrite.
-    #[test]
-    fn batch_bash_child_update_preserves_dollar() {
-        use crate::render::ToolGroupChild;
-        use crate::render::theme::Palette;
-        let (mut r, buf) = new_capturing(80, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
-
-        r.render(UiLine::ToolGroupRender {
-            batch_id: "b2".into(),
-            header: "● Running 1 tool in parallel".into(),
-            children: vec![ToolGroupChild {
-                call_id: "bash2".into(),
-                text: "  \u{2514} Bash $ cd /tmp && ls".into(),
-            }],
-        });
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status_basic(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Now send in-place update with `→ 3 lines` suffix.
-        r.render(UiLine::ToolGroupChildUpdate {
-            batch_id: "b2".into(),
-            call_id: "bash2".into(),
-            new_text: "  \u{2514} Bash $ cd /tmp && ls \u{2192} 3 lines".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        let dump = vterm.dump();
-        // Updated row shows the arrow and line count.
-        assert!(
-            vterm.any_row(|row| row.contains("Bash $ cd /tmp") && row.contains("3 lines")),
-            "updated bash row must contain `Bash $ cd /tmp` and `3 lines`\ndump:\n{}",
-            dump
-        );
-
-        // `$` still magenta after update.
-        let dollar_cells: Vec<_> = r
-            .body_lines
-            .iter()
-            .flatten()
-            .filter(|c| c.ch == '$')
-            .collect();
-        assert!(
-            !dollar_cells.is_empty(),
-            "no `$` cell found after update\ndump:\n{}",
-            dump
-        );
-        assert!(
-            dollar_cells.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
-            "`$` must still be magenta after update; fgs: {:?}\ndump:\n{}",
-            dollar_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
             dump
         );
     }
@@ -11175,7 +10995,7 @@ mod tests {
         assert!(saw_bar, "expected a continuation row");
     }
 
-    /// Regression: after approving a bash tool call, the `● Bash` header + `  └ $ cmd`
+    /// Regression: after approving a bash tool call, the `● Bash` header + `  └ cmd`
     /// block and the `└ [elapsed: …]` result row should be adjacent with no blank
     /// line between them. User reported a visible blank gap after pressing Y on the
     /// approval prompt.
@@ -11248,7 +11068,7 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // The committed bash block is now TWO rows: `● Bash` header + `  └ $ rm -f ...` cmd.
+        // The committed bash block is now TWO rows: `● Bash` header + `  └ rm -f ...` cmd.
         // Debug: print body_lines around the tool and result rows.
         let bash_header_idx = r.body_lines.iter().rposition(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
@@ -11286,7 +11106,7 @@ mod tests {
             r.body_lines.get(bash_cmd_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
         );
 
-        // Also check the virtual terminal: the `● Bash` header, `  └ $ cmd`, and
+        // Also check the virtual terminal: the `● Bash` header, `  └ cmd`, and
         // `└ result` rows should appear on consecutive terminal rows with no blanks.
         eprintln!("vterm dump:\n{}", vterm.dump());
         let bash_header_term = (0..vterm.height() as usize)
@@ -14252,8 +14072,8 @@ mod tests {
 
         // CRITICAL: bash command rows MUST survive the pop.
         assert!(
-            vterm.any_row(|row| row.contains("$ cd /tmp")),
-            "bash $ command line must survive approval pop\ndump:\n{}",
+            vterm.any_row(|row| row.contains("cd /tmp")),
+            "bash command line must survive approval pop\ndump:\n{}",
             vterm.dump()
         );
         assert!(

@@ -3523,26 +3523,26 @@ mod tool_format_tests {
         assert!(out.contains("(3 lines)"));
     }
 
-    /// Batch child text: bash children get `  └ Bash $ <cmd>` (name + codex style);
+    /// Batch child text: bash children get `  └ Bash <cmd>` (name + command);
     /// non-bash children keep `  └ Name(args)`.
     ///
     /// This is a unit test on the text-format logic that event_loop emits —
     /// mirrors what ToolBatchStarted builds for children.
     #[test]
-    fn batch_child_bash_uses_dollar_prefix_non_bash_keeps_name_args() {
+    fn batch_child_bash_uses_name_prefix_non_bash_keeps_name_args() {
         let child_glyph = "\u{2514}";
 
         // Bash child: name == "bash" (raw snake name)
         let bash_name = "bash";
         let bash_detail = "cd /tmp && ls";
         let bash_text = if bash_name.eq_ignore_ascii_case("bash") {
-            format!("  {} {} $ {}", child_glyph, display_tool_name_short(bash_name), bash_detail)
+            format!("  {} {} {}", child_glyph, display_tool_name_short(bash_name), bash_detail)
         } else {
             format!("  {} {}({})", child_glyph, display_tool_name_short(bash_name), bash_detail)
         };
         assert!(
-            bash_text.contains("Bash $ cd /tmp"),
-            "bash child text must contain `Bash $ cd /tmp`, got: {}",
+            bash_text.contains("Bash cd /tmp"),
+            "bash child text must contain `Bash cd /tmp`, got: {}",
             bash_text
         );
         assert!(
@@ -3555,7 +3555,7 @@ mod tool_format_tests {
         let grep_name = "grep";
         let grep_detail = "foo";
         let grep_text = if grep_name.eq_ignore_ascii_case("bash") {
-            format!("  {} {} $ {}", child_glyph, display_tool_name_short(grep_name), grep_detail)
+            format!("  {} {} {}", child_glyph, display_tool_name_short(grep_name), grep_detail)
         } else {
             format!("  {} {}({})", child_glyph, display_tool_name_short(grep_name), grep_detail)
         };
@@ -3570,17 +3570,17 @@ mod tool_format_tests {
             grep_text
         );
 
-        // Update path: bash update text uses `Bash $ ` prefix (no `Bash(` wrapper).
+        // Update path: bash update text uses `Bash ` prefix (no `Bash(` wrapper).
         let update_base = if bash_name.eq_ignore_ascii_case("bash") {
-            format!("{} $ {}", display_tool_name_short(bash_name), bash_detail)
+            format!("{} {}", display_tool_name_short(bash_name), bash_detail)
         } else {
             format!("{}({})", display_tool_name_short(bash_name), bash_detail)
         };
         let suffix = " \u{2192} 3 lines";
         let update_text = format!("  {} {}{}", child_glyph, update_base, suffix);
         assert!(
-            update_text.contains("Bash $ cd /tmp"),
-            "update text must have `Bash $ ` prefix, got: {}",
+            update_text.contains("Bash cd /tmp"),
+            "update text must have `Bash ` prefix, got: {}",
             update_text
         );
         assert!(
@@ -8898,7 +8898,7 @@ fn handle_agent_event(
                     .remove(&call_id)
                     .map(|(_, det, _)| {
                         if name.eq_ignore_ascii_case("bash") {
-                            format!("{} $ {}", display_tool_name_short(&name), det)
+                            format!("{} {}", display_tool_name_short(&name), det)
                         } else {
                             format!("{}({})", display_tool_name_short(&name), det)
                         }
@@ -9805,7 +9805,7 @@ fn handle_agent_event(
                     call_id: c.id.clone(),
                     text: if c.name.eq_ignore_ascii_case("bash") {
                         format!(
-                            "  {} {} $ {}",
+                            "  {} {} {}",
                             child_glyph,
                             display_tool_name_short(&c.name),
                             detail
