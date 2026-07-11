@@ -493,9 +493,10 @@ enabled = true
 
         let mut engine = HookEngine::new();
         engine.load_all(&dir);
-        // built-ins are always registered, so has_any() may be true
-        // This test just verifies load_all doesn't panic on empty dir
-        assert!(engine.has_any());
+        // An empty dir registers NO hooks, and `HookEngine::new()` has none either
+        // (see `has_any_returns_false_for_empty_engine`) — the point of this test is
+        // that `load_all` doesn't panic on an empty dir and leaves the engine empty.
+        assert!(!engine.has_any(), "empty dir must register no hooks");
 
         let _ = fs::remove_dir_all(&dir);
     }
