@@ -4079,20 +4079,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 if is_bash && !safe_detail.is_empty() {
                     // Header: `● Bash`
                     self.push_body_prefixed("● ", &bullet_style, &safe_name, &tool_name_style);
-                    // Command lines via `format_shell_command` (shell-boundary wrapping).
-                    // Line 0: `$ ` prefix (magenta, Role::Brand) at col 0 — the `$`
-                    // sentinel at col 0 ensures `pop_approval_prompt` stops here and
-                    // never eats bash command rows (it pops only `▶`-or-space col-0 rows).
-                    // Continuation lines (idx > 0): format_shell_command adds 4-space indent;
-                    // we prepend a non-breaking-space (U+00A0) sentinel at col 0 so they
-                    // are equally safe from the pop (which only stops on U+0020 space and
-                    // `▶`; any other char — including NBSP — hits the `_ => break` arm).
+                    // Command lines: Claude Code style — `  └ $ <cmd>` (dim `└` gutter,
+                    // magenta `$`). Layout: PAD_COL (2 sp) + `└ ` (2) + `$ ` (2) = 6 cols
+                    // before command text.  Safe because Task 5 made pop_approval_prompt
+                    // count-based — it no longer keys on col-0 space, so space-prefixed
+                    // bash rows survive the approval pop without any NBSP sentinel.
                     let dollar_style = self.style_for(Role::Brand);
                     let cmd_style = self.style_for(Role::Secondary);
-                    // Width budget: `$ ` = 2 cols consumed, so reserve PAD_COL from
-                    // available (PAD_COL = 2, matching the `$ ` prefix width).
+                    // Muted style for the `└` gutter — mirrors ToolResult arm's prefix_style.
+                    let gutter_style = if crate::highlight::theme::is_light_for_render() {
+                        self.style_for(Role::Muted)
+                    } else {
+                        self.style_faint(Role::Muted)
+                    };
+                    // `└` gutter glyph, gated for non-unicode terminals (→ ASCII backtick),
+                    // mirroring the ToolResult arm convention exactly.
+                    let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
+                    // Width budget: command text starts at col 6 (`  └ $ `), so subtract 6.
                     let width = (self.screen.width() as usize)
-                        .saturating_sub(PAD_COL)
+                        .saturating_sub(6)
                         .max(8);
                     let safe_cmd = crate::glyph::downgrade_glyphs(
                         &safe_detail,
@@ -4102,23 +4107,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     for (idx, line) in lines.iter().enumerate() {
                         let mut row = Vec::new();
                         if idx == 0 {
+                            // `  └ $ <cmd>`: PAD_COL + gutter + dollar + command text.
+                            push_str_cells(&mut row, leaf, &gutter_style);
                             push_str_cells(&mut row, "$ ", &dollar_style);
+                            push_str_cells(&mut row, line, &cmd_style);
                         } else {
-                            // NBSP sentinel at col 0 so this row is safe from
-                            // `pop_approval_prompt` (which only pops U+0020 rows).
-                            // The rest of the indent comes from format_shell_command's
-                            // own 4-space lead (trimmed here: col 1 is a regular space
-                            // for the visual gap after the sentinel).
-                            push_str_cells(&mut row, "\u{00A0} ", &cmd_style);
-                            // format_shell_command continuation lines start with "    "
-                            // (4 spaces). Skip those leading spaces so the text aligns
-                            // under the command (col 3 matches col 2 of `$ cmd`).
-                            let trimmed = line.trim_start_matches(' ');
-                            push_str_cells(&mut row, trimmed, &cmd_style);
-                            self.push_body_row(row);
-                            continue;
+                            // Continuation: format_shell_command prepends 4 spaces to its
+                            // continuation segments; we add 2 more (PAD_COL) so text lands
+                            // at col 6, aligned under the command text of line 0.
+                            push_str_cells(&mut row, "  ", &gutter_style);
+                            push_str_cells(&mut row, line, &cmd_style);
                         }
-                        push_str_cells(&mut row, line, &cmd_style);
                         self.push_body_row(row);
                     }
                 } else {
@@ -8078,8 +8077,9 @@ mod tests {
         );
     }
 
-    /// Bash ToolCall renders `● bash` header + `$ command` lines,
-    /// wrapping along shell boundaries (not mid-token), with no truncation.
+    /// Bash ToolCall renders `● Bash` header + `  └ $ command` lines (Claude Code style:
+    /// dim `└` gutter at col 2, magenta `$` at col 4, command text at col 6), wrapping
+    /// along shell boundaries (not mid-token), with no truncation and no NBSP sentinel.
     #[test]
     fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
         let (mut r, buf) = new_capturing(60, 24);
@@ -8092,12 +8092,18 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
             "header is `● Bash` without inline paren command\ndump:\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| row.contains("$ cd /tmp")),
-            "command line with $ prefix\ndump:\n{}", vterm.dump());
+        // Line 0 must contain both `└` (or `` ` ``) gutter and `$ cd /tmp`.
+        assert!(
+            vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("$ cd /tmp")),
+            "first command row must have └ gutter + $ prefix\ndump:\n{}", vterm.dump()
+        );
         assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
             "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
         assert!(!vterm.any_row(|row| row.contains("truncated")),
             "no truncation\ndump:\n{}", vterm.dump());
+        // No NBSP sentinel should appear anywhere.
+        assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
+            "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure
