@@ -65,7 +65,8 @@
       "url": "https://api.githubcopilot.com/mcp/",
       "auth": {
         "type": "oauth",
-        "provider": "github"
+        "provider": "github",
+        "client_secret_env": "GITHUB_MCP_CLIENT_SECRET"
       },
       "disabled": true
     }
