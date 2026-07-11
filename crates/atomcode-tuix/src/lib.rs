@@ -40,7 +40,7 @@ pub mod width;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -388,9 +388,9 @@ pub async fn run(
     //   into the input box. Terminals that answer neither query default to
     //   dark after the internal cap.
     let theme_light = match config.ui.theme {
-        atomcode_core::config::UiTheme::Light => true,
-        atomcode_core::config::UiTheme::Dark => false,
-        atomcode_core::config::UiTheme::Auto => {
+        atomcode_config::config::UiTheme::Light => true,
+        atomcode_config::config::UiTheme::Dark => false,
+        atomcode_config::config::UiTheme::Auto => {
             if caps.colors && !force_plain {
                 crate::terminal_bg::detect_light(
                     std::time::Duration::from_millis(60),

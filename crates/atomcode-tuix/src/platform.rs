@@ -98,14 +98,14 @@ fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
 /// Path for the per-user input history file.
 /// Uses ATOMCODE_HOME if set, otherwise falls back to home directory.
 pub fn history_path() -> PathBuf {
-    atomcode_core::config::Config::config_dir().join("history")
+    atomcode_config::config::Config::config_dir().join("history")
 }
 
 /// Path for the per-user image attachment cache. Sibling to `history_path()`.
 /// Used by the History image-attachment feature to persist pasted bytes so
 /// up-arrow recall can rehydrate them on a future submit.
 pub fn image_cache_dir() -> PathBuf {
-    atomcode_core::config::Config::config_dir().join("image-cache")
+    atomcode_config::config::Config::config_dir().join("image-cache")
 }
 
 #[cfg(test)]
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn image_cache_dir_lives_under_config_dir() {
         let p = image_cache_dir();
-        let cfg = atomcode_core::config::Config::config_dir();
+        let cfg = atomcode_config::config::Config::config_dir();
         assert!(p.starts_with(&cfg), "{:?} should be under {:?}", p, cfg);
         assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("image-cache"));
     }

@@ -8,7 +8,7 @@
 // Renders as a MenuPayload above the input box.
 
 use anyhow::Result;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -274,8 +274,8 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::config::provider::ProviderConfig;
-    use atomcode_core::config::Config;
+    use atomcode_config::config::provider::ProviderConfig;
+    use atomcode_config::config::Config;
     fn make_config(providers: Vec<(&str, &str, &str)>, default: &str) -> Config {
         use std::collections::HashMap;
         let mut map: HashMap<String, ProviderConfig> = HashMap::new();

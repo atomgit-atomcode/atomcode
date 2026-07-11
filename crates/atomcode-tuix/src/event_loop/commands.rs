@@ -31,7 +31,7 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 use crate::markdown::{fence_start, is_closing_fence};
@@ -248,7 +248,7 @@ pub fn perform_session_rename(
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
 fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_core::config::instructions::LayeredInstructions;
+    use atomcode_config::config::instructions::LayeredInstructions;
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
     for (level, path) in instructions.status_lines() {
@@ -1463,11 +1463,11 @@ fn execute_slash_command_impl(
             if arg.is_empty() {
                 *active_modal = Some(Box::new(LanguagePicker::open()));
             } else {
-                match arg.parse::<atomcode_core::locale::Locale>() {
+                match arg.parse::<atomcode_config::locale::Locale>() {
                     Ok(locale) => {
                         crate::i18n::set_locale(locale);
                         ctx.config.language = Some(locale);
-                        let config_path = atomcode_core::config::Config::default_path();
+                        let config_path = atomcode_config::config::Config::default_path();
                         if let Err(e) = ctx.config.save(&config_path) {
                             // TODO: surface via renderer once a non-modal error display is available
                             eprintln!("[language] failed to save config: {e}");
@@ -1476,8 +1476,8 @@ fn execute_slash_command_impl(
                         // so /language en and /language zh both echo a
                         // human-readable name, not just the locale code.
                         let label = match locale {
-                            atomcode_core::locale::Locale::En => "English",
-                            atomcode_core::locale::Locale::ZhCn => "简体中文",
+                            atomcode_config::locale::Locale::En => "English",
+                            atomcode_config::locale::Locale::ZhCn => "简体中文",
                         };
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::LanguageSwitched {
@@ -4506,7 +4506,7 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
 /// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
 /// so stale entries from a deleted project don't linger in the picker.
 pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| {
@@ -4523,7 +4523,7 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
 /// failure (read-only HOME, permission denied) is swallowed so it can
 /// never break an interactive `/cd`.
 pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     let content = dirs
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -5455,9 +5455,9 @@ fn run_oauth_with_renderer(
 /// inside an existing runtime panics with "Cannot drop a runtime in a
 /// context where blocking is not allowed".
 fn run_coding_plan_blocking(
-    config: &atomcode_core::config::Config,
+    config: &atomcode_config::config::Config,
     tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
-) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+) -> Result<(atomcode_config::config::Config, atomcode_core::coding_plan::SetupReport)> {
     let mut cfg = config.clone();
     let tel = tel.clone();
     // Run on a dedicated OS thread so `reqwest::blocking::Client`'s

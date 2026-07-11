@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn render_empty_bg_list_mentions_no_background_sessions() {
         let _g = crate::i18n::test_lock();
-        crate::i18n::set_locale(atomcode_core::locale::Locale::En);
+        crate::i18n::set_locale(atomcode_config::locale::Locale::En);
         let slots = BackgroundSlots::new(16);
         assert_eq!(render_bg_list(&slots), "  No background sessions.\n");
     }

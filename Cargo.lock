@@ -628,6 +628,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "atomcode-capabilities",
+ "atomcode-config",
  "atomcode-core",
  "atomcode-daemon",
  "atomcode-kernel",

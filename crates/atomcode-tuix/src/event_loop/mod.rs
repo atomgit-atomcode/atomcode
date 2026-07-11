@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
@@ -5133,8 +5133,8 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     // Hot-reload the config file. Fail silently: if the other process
     // wrote a malformed config (shouldn't happen — it would have
     // rejected its own reload), leave our in-memory snapshot alone.
-    let path = atomcode_core::config::Config::default_path();
-    if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
+    let path = atomcode_config::config::Config::default_path();
+    if let Ok(fresh) = atomcode_config::config::Config::load(&path) {
         ctx.config = fresh;
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
@@ -7219,7 +7219,7 @@ fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
     // setup-state.json exists but the skill may have been deleted manually.
     // Path must match SkillRegistry::reload's scan path: the unified
     // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
-    let skill_dir = atomcode_core::config::Config::config_dir()
+    let skill_dir = atomcode_config::config::Config::config_dir()
         .join("skills")
         .join("atomcode-automation-recommender");
     !skill_dir.exists()
