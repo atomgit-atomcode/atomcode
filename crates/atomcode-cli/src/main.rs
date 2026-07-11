@@ -279,9 +279,6 @@ fn build_i18n_command() -> clap::Command {
         .mut_subcommand("rollback", |s| {
             s.about(t(Msg::CliAboutRollback).into_owned())
         })
-        .mut_subcommand("fixissue", |s| {
-            s.about(t(Msg::CliAboutFixissue).into_owned())
-        })
         .mut_subcommand("mcp", |s| s.about(t(Msg::CliAboutMcp).into_owned()))
         .mut_subcommand("daemon", |s| s.about(t(Msg::CliAboutDaemon).into_owned()))
         .mut_subcommand("webui", |s| s.about(t(Msg::CliAboutWebui).into_owned()))
@@ -636,12 +633,6 @@ enum Commands {
     },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
-    /// Fetch an AtomGit issue assigned to you and let the agent fix it
-    /// in the current project (no commit, no push — edits local files only).
-    Fixissue {
-        /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
-        url: String,
-    },
     /// Hidden alias for `atomcode login` — kept so existing scripts /
     /// muscle memory don't break after `/codingplan` and `atomcode
     /// codingplan` were folded into the unified `/login` flow.
@@ -1130,19 +1121,9 @@ async fn run() -> Result<i32> {
     // Handle subcommands. Most are self-contained (`handle_command` runs
     // and exits); `Login` (and its hidden alias `Codingplan`) run the
     // full OAuth + CodingPlan setup flow and then fall through to the
-    // TUI. `Fixissue` is like headless `-p` but with the prompt
-    // synthesised from a remote issue payload — so we resolve it here
-    // and hand it to the agent loop via `fixissue_prompt` below.
-    let mut fixissue_prompt: Option<String> = None;
-    // Saved when fixissue is parsed, so after the agent finishes we can
-    // POST the summary back to AtomGit as a comment + add the `fixed`
-    // label. `None` = not a fixissue run, skip the post-back step.
-    let mut fixissue_ref: Option<atomcode_core::atomgit::IssueRef> = None;
-    // `fixissue` is an interactive-feeling structured workflow (the user
-    // is watching progress, not piping output). Force verbose so they see
-    // tool calls / edits instead of long silences while the agent works.
+    // TUI.
 
-    let mut force_verbose = false;
+    let force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::Login | Commands::Codingplan => {
@@ -1183,41 +1164,6 @@ async fn run() -> Result<i32> {
                 println!("\n  Starting AtomCode...\n");
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
-            }
-            Commands::Fixissue { url } => {
-                HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let cwd = cli.dir.clone().unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                });
-                match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
-                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
-                        prompt,
-                        issue_title,
-                        issue_number,
-                        issue_ref,
-                    }) => {
-                        eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
-                        fixissue_prompt = Some(prompt);
-                        fixissue_ref = Some(issue_ref);
-                        force_verbose = true;
-                        // Fall through: agent loop will run this as a headless prompt.
-                    }
-                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
-                        eprintln!("{}", reason);
-                        // Flush telemetry before exiting, otherwise events are lost.
-                        telemetry
-                            .shutdown(std::time::Duration::from_millis(500))
-                            .await;
-                        return Ok(0);
-                    }
-                    Err(e) => {
-                        eprintln!("fixissue failed: {:#}", e);
-                        telemetry
-                            .shutdown(std::time::Duration::from_millis(500))
-                            .await;
-                        return Ok(1);
-                    }
-                }
             }
             Commands::Daemon {
                 port,
@@ -1577,8 +1523,7 @@ async fn run() -> Result<i32> {
 
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
-    let is_headless =
-        cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
+    let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some();
 
     // Load MCP servers from .mcp.json (project) and ~/.atomcode/mcp.json (user).
     // The engine-v2 bridge builds the agent's own tool registry from config; here
@@ -1676,29 +1621,23 @@ async fn run() -> Result<i32> {
         )
     };
 
-    // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
-    // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
-    // precedence — when it's set we've already committed to headless mode.
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
     // clap's conflicts_with ensures `-p` and `--prompt-file` can't both be given.
-    let effective_prompt: Option<String> = if let Some(p) = fixissue_prompt.take() {
-        Some(p)
-    } else {
-        match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
-            (Some(p), None) => Some(p.clone()),
-            (None, Some(path)) => match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!(
-                        "error: failed to read --prompt-file {}: {}",
-                        path.display(),
-                        e
-                    );
-                    std::process::exit(2);
-                }
-            },
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
-        }
+    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "error: failed to read --prompt-file {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(2);
+            }
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Build the session-scope context: repo_origin, mode.
@@ -1706,7 +1645,7 @@ async fn run() -> Result<i32> {
     // set_session_id() / set_account_id(). Seed account_id from stored auth so
     // events from this session correlate to the user even before any explicit
     // login action this run; login()/logout() update it later as needed.
-    // mode: Headless when a prompt is supplied (-p / --prompt-file / fixissue);
+    // mode: Headless when a prompt is supplied (-p / --prompt-file);
     //       Tui when the user launches the interactive terminal UI.
     let repo = atomcode_telemetry::detect_repo_origin(
         &std::env::current_dir().unwrap_or_else(|_| working_dir.clone()),
@@ -1754,13 +1693,9 @@ async fn run() -> Result<i32> {
         telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: cli.dangerously_skip_permissions });
 
         // Headless mode: -p / --prompt-file triggers non-interactive execution.
-        // `fixissue` also sets `force_verbose` so tool activity is visible — the
-        // user is watching a single long-running task, not feeding a pipe.
         let exit_code = if let Some(prompt) = effective_prompt {
             let verbose = cli.verbose || force_verbose;
-            // Capture the assistant's streamed text only when we need to post
-            // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
-            let capture = fixissue_ref.is_some();
+            let capture = false;
             // Don't `?`-propagate here: an error must still fall through to the
             // telemetry.shutdown() below, otherwise this session's un-drained
             // mpsc events are lost. Capture the Result and let it bubble up only
@@ -1781,47 +1716,7 @@ async fn run() -> Result<i32> {
             .await
             {
                 Err(e) => Err(e),
-                Ok((ec, captured)) => {
-                    // Post-run side effects for fixissue: only on clean completion
-                    // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
-                    // On non-zero we leave the issue alone — the user can retry.
-                    if let Some(issue_ref) = fixissue_ref {
-                        let mut final_exit = ec;
-                        if ec == 0 {
-                            if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
-                                match atomcode_core::atomgit::fixissue::post_completion(
-                                    &issue_ref, &summary,
-                                ) {
-                                    Ok(()) => eprintln!(
-                                        "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
-                                        issue_ref.number
-                                    ),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
-                                            e
-                                        );
-                                        // Signal partial failure so CI/scripts can detect it.
-                                        final_exit = 3;
-                                    }
-                                }
-                            } else {
-                                eprintln!(
-                                    "[fixissue] agent produced no text; skipping comment + label on issue #{}",
-                                    issue_ref.number
-                                );
-                            }
-                        } else {
-                            eprintln!(
-                                "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
-                                ec, issue_ref.number
-                            );
-                        }
-                        Ok::<i32, anyhow::Error>(final_exit)
-                    } else {
-                        Ok::<i32, anyhow::Error>(ec)
-                    }
-                }
+                Ok((ec, _captured)) => Ok::<i32, anyhow::Error>(ec),
             }
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
@@ -2066,9 +1961,7 @@ async fn run_headless(
     // next non-reasoning event must close the line with a `\n` so subsequent
     // log lines don't glue onto the tail of the thinking text.
     let mut thinking_line_open = false;
-    // When `capture` is set, we also buffer every TextDelta the agent
-    // emits so the caller (e.g. the fixissue workflow) can post the
-    // full assistant output back to AtomGit as an issue comment.
+    // When `capture` is set, we also buffer every TextDelta the agent emits.
     let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
     // Helper: close any in-flight `[thinking]` line before emitting a new log
@@ -2540,9 +2433,6 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             keep_data,
             dry_run,
         }),
-        Commands::Fixissue { .. } => {
-            unreachable!("Fixissue is handled inline in run() before handle_command")
-        }
         Commands::Codingplan => {
             // Hidden alias for Login — `run()` intercepts both before
             // handle_command is called, so this arm is unreachable.

@@ -249,16 +249,6 @@ pub enum Msg<'a> {
     DirChanged { path: &'a str },
     DirNotADirectory { path: &'a str },
 
-    // ── Issue wizard ──
-    IssueCancelled,
-    IssueNewOn { owner: &'a str, repo: &'a str },
-    IssueStep1,
-    IssueStep2,
-    IssueTitleConfirmed { title: &'a str },
-    IssueRequiredField { field: &'a str },
-    IssueCreated { number: u64, title: &'a str, url: &'a str },
-    IssueCreateFailed { error: &'a str },
-
     // ── Language ──
     /// Confirmation rendered to scrollback after the user picks a
     /// locale via `/language` (modal or arg). Already includes the
@@ -597,7 +587,6 @@ pub enum Msg<'a> {
     CmdDescUndo,
     CmdDescWorktree,
     CmdDescUpgrade,
-    CmdDescIssue,
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,
@@ -1002,7 +991,6 @@ pub enum Msg<'a> {
     CliAboutStatus,
     CliAboutUpgrade,
     CliAboutRollback,
-    CliAboutFixissue,
     CliAboutMcp,
     CliAboutDaemon,
     CliAboutWebui,
@@ -1049,7 +1037,6 @@ pub enum Msg<'a> {
     CliHelpIdleTimeout,
     CliHelpPortWebui,
     CliHelpHost,
-    CliHelpFixissueUrl,
     CliHelpUninstallYes,
     CliHelpUninstallPurge,
     CliHelpUninstallKeepData,

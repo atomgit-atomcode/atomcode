@@ -836,19 +836,11 @@ pub struct LoopCtx {
     /// `select!` arm. Unbounded — events are tiny terminal results.
     pub plugin_job_tx: mpsc::UnboundedSender<atomcode_core::plugin::PluginJobEvent>,
     pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_core::plugin::PluginJobEvent>,
-    /// Signal channel from the `/issue` wizard modal back to the event
-    /// loop. The wizard's Enter handler can't touch `App` directly
-    /// (modals only see `LoopCtx`), so it stores the collected title +
-    /// body here, returns `Close`, and the event loop's post-close
-    /// branch POSTs the issue to AtomGit and echoes the URL of the
-    /// newly-created issue back into the conversation.
-    pub pending_new_issue: Option<NewIssueDraft>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
     /// modal close and runs the full `/login` flow (OAuth if needed →
     /// claim → fetch models → register providers). Needs raw-mode
-    /// suspend/resume, something modals can't drive themselves. Same
-    /// pattern as `pending_new_issue`.
+    /// suspend/resume, something modals can't drive themselves.
     pub pending_run_login_setup: bool,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 1 (Configure manually). The event loop drains this on
@@ -984,17 +976,6 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     let tail_start = bytes.len().saturating_sub(1024);
     bytes[tail_start..].hash(&mut hasher);
     hasher.finish()
-}
-
-/// What the `/issue` wizard hands back to the event loop after the user
-/// finishes step 2. The event loop turns this into a `POST /repos/.../issues`
-/// API call and echoes the resulting issue URL into scrollback.
-#[derive(Debug, Clone)]
-pub struct NewIssueDraft {
-    pub owner: String,
-    pub repo: String,
-    pub title: String,
-    pub body: String,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -3679,16 +3660,6 @@ pub struct App {
     /// of this, a bare Esc neither arms nor triggers undo — so a rapid Esc mash
     /// undoes at most once per burst.
     pub esc_undo_last_at: Option<std::time::Instant>,
-    /// Set by `/fixissue <url>` while the agent is resolving that issue.
-    /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
-    /// back as an issue comment + the `fixed` label is applied. Cleared
-    /// on TurnComplete / TurnCancelled / Error so a subsequent normal
-    /// message doesn't accidentally trigger a post-back.
-    pub fixissue_pending: Option<atomcode_core::atomgit::IssueRef>,
-    /// Accumulates every visible `AssistantText` delta produced during a
-    /// fixissue turn, verbatim. Sent as the AtomGit comment body on
-    /// successful completion.
-    pub fixissue_buffer: String,
     /// True while a setup skill turn is in flight. On `TurnComplete`,
     /// skill/command registries are reloaded so newly-created skills
     /// become visible to the LLM immediately. Cleared on
@@ -3761,8 +3732,6 @@ impl App {
             exit_pending: None,
             esc_undo_pending: None,
             esc_undo_last_at: None,
-            fixissue_pending: None,
-            fixissue_buffer: String::new(),
             setup_pending: false,
             reasoning_buffer: String::new(),
             setup_hint_shown: false,
@@ -3806,14 +3775,11 @@ pub enum ExitReason {
 ///
 /// `idle` is derived from `UiPhase::Idle` so "the agent finished its turn"
 /// and "safe to fire" are the same gate.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_loop_decision(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let idle = matches!(state.phase, UiPhase::Idle);
@@ -3827,8 +3793,6 @@ pub(crate) fn handle_loop_decision(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         ),
         crate::event_loop::loop_ctrl::LoopAction::Skip => {}
@@ -4535,7 +4499,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -4992,7 +4956,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -5050,8 +5014,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &mut ctx,
                 renderer,
                 &mut app.active_modal,
-                &mut app.fixissue_pending,
-                &mut app.fixissue_buffer,
                 &mut app.setup_pending,
             );
         }
@@ -5615,43 +5577,6 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
-                        // IssueWizard signals a staged title+body via
-                        // `ctx.pending_new_issue`. Drain + POST to the
-                        // AtomGit API here and echo the created-issue
-                        // URL into scrollback. Blocking call — the
-                        // wizard is modal so UI freezing briefly is
-                        // expected / acceptable.
-                        if let Some(draft) = ctx.pending_new_issue.take() {
-                            match atomcode_core::atomgit::Client::from_stored_auth().and_then(|c| {
-                                c.create_issue(&draft.owner, &draft.repo, &draft.title, &draft.body)
-                            }) {
-                                Ok(created) => {
-                                    let shown_url = created.html_url.clone().unwrap_or_else(|| {
-                                        format!(
-                                            "https://atomgit.com/{}/{}/issues/{}",
-                                            draft.owner, draft.repo, created.number
-                                        )
-                                    });
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::IssueCreated {
-                                            number: created.number,
-                                            title: &created.title,
-                                            url: &shown_url,
-                                        })
-                                        .into_owned(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
-                                            error: &format!("{:#}", e),
-                                        })
-                                        .into_owned(),
-                                    ));
-                                }
-                            }
-                            renderer.flush();
-                        }
                         // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
@@ -6260,8 +6185,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                     if matches!(app.state.phase, UiPhase::Idle) {
@@ -6389,8 +6312,6 @@ fn handle_idle_key(
                             ctx,
                             renderer,
                             &mut app.active_modal,
-                            &mut app.fixissue_pending,
-                            &mut app.fixissue_buffer,
                             &mut app.setup_pending,
                         )?;
                         if matches!(app.state.phase, UiPhase::Idle) {
@@ -6459,8 +6380,6 @@ fn handle_idle_key(
                             ctx,
                             renderer,
                             &mut app.active_modal,
-                            &mut app.fixissue_pending,
-                            &mut app.fixissue_buffer,
                             &mut app.setup_pending,
                         )?;
                     }
@@ -6736,8 +6655,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                     if matches!(app.state.phase, UiPhase::Idle) {
@@ -6835,8 +6752,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                 }
@@ -7706,8 +7621,6 @@ fn handle_streaming_key(
                     ctx,
                     renderer,
                     &mut app.active_modal,
-                    &mut app.fixissue_pending,
-                    &mut app.fixissue_buffer,
                     &mut app.setup_pending,
                 )?;
                 app.message_queue.clear();
@@ -8713,8 +8626,6 @@ fn handle_agent_event(
     renderer: &mut dyn Renderer,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     ctx: &mut LoopCtx,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
     buf: &mut Buffer,
@@ -8773,9 +8684,6 @@ fn handle_agent_event(
                     state.response_finalized = false;
                 }
                 state.last_assistant_response.push_str(&visible);
-                if fixissue_pending.is_some() {
-                    fixissue_buffer.push_str(&visible);
-                }
                 renderer.render(UiLine::AssistantText(visible));
                 renderer.flush();
             }
@@ -9413,32 +9321,6 @@ fn handle_agent_event(
                 }
             }
 
-            // fixissue post-run side effects — only on successful TurnComplete
-            // (TurnCancelled / Error arms below clear `fixissue_pending`
-            // without posting). Takes the IssueRef out so only this turn's
-            // completion triggers the post-back.
-            if let Some(issue_ref) = fixissue_pending.take() {
-                let body = std::mem::take(fixissue_buffer);
-                if body.trim().is_empty() {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  [fixissue] agent produced no text; skipping comment + label on issue #{}\n",
-                        issue_ref.number
-                    )));
-                } else {
-                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
-                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
-                            issue_ref.number
-                        ))),
-                        Err(e) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✗ post-back failed (local fix still saved): {:#}\n",
-                            e
-                        ))),
-                    }
-                }
-                renderer.flush();
-            }
-
             // setup post-run side effects — only on successful TurnComplete.
             // Reload skills/commands so newly-created skills become visible
             // to the LLM immediately.
@@ -9498,10 +9380,6 @@ fn handle_agent_event(
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
             state.on_turn_cancelled();
-            // Cancellation = agent didn't finish; don't post a comment
-            // against an incomplete "fix".
-            fixissue_pending.take();
-            fixissue_buffer.clear();
             *setup_pending = false;
             // Same reset rationale as TurnComplete: a cancelled turn is the
             // single most common way for `<think>` to go unclosed, so this
@@ -9587,8 +9465,6 @@ fn handle_agent_event(
             state.response_finalized = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
-            fixissue_pending.take();
-            fixissue_buffer.clear();
             *setup_pending = false;
             state.on_error();
             // Same reset rationale as TurnComplete / TurnCancelled — an

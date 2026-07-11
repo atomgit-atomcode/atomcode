@@ -336,23 +336,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::DirNotADirectory { path } =>
             format!("不是目录：{path}").into(),
 
-        // ── Issue 向导 ──
-        Msg::IssueCancelled => "（已取消）".into(),
-        Msg::IssueNewOn { owner, repo } =>
-            format!("在 atomgit.com/{owner}/{repo} 创建 Issue").into(),
-        Msg::IssueStep1 =>
-            "步骤 1/2 — 输入标题（必填，按 Esc 取消）：".into(),
-        Msg::IssueStep2 =>
-            "步骤 2/2 — 输入描述（Shift+Enter 换行，Enter 提交，Esc 取消）：".into(),
-        Msg::IssueTitleConfirmed { title } =>
-            format!("✓ 标题：{title}").into(),
-        Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
-        Msg::IssueCreateFailed { error } =>
-            format!("  [issue] × 创建失败：{error}\n").into(),
-        Msg::IssueRequiredField { field } =>
-            format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
-
         // ── 语言 ──
         Msg::LanguageSwitched { label, locale } =>
             format!("  ✓ 已切换语言为 {label}（{locale}）。\n").into(),
@@ -801,7 +784,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
-        Msg::CmdDescIssue => "为 AtomCode 报告 Bug / 提出功能建议（交互式向导）".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
@@ -1067,7 +1049,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliAboutStatus => "查看当前登录状态".into(),
         Msg::CliAboutUpgrade => "就地升级 atomcode 到最新发布版本".into(),
         Msg::CliAboutRollback => "回退到上一个版本（与 .bak 交换）".into(),
-        Msg::CliAboutFixissue => "获取分配给你的 AtomGit issue 并让 agent 修复".into(),
         Msg::CliAboutMcp => "管理 .mcp.json 中的 MCP 服务器配置".into(),
         Msg::CliAboutDaemon => "启动用于 IDE 集成的 HTTP 守护进程".into(),
         Msg::CliAboutWebui => "启动本地浏览器 webui".into(),
@@ -1114,7 +1095,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliHelpIdleTimeout => "空闲关闭超时（秒）；0 禁用".into(),
         Msg::CliHelpPortWebui => "端口（默认：13457）".into(),
         Msg::CliHelpHost => "绑定地址（默认：127.0.0.1）".into(),
-        Msg::CliHelpFixissueUrl => "完整的 issue URL".into(),
         Msg::CliHelpUninstallYes => "跳过提示；使用每组的默认决定".into(),
         Msg::CliHelpUninstallPurge => "完全清除 ~/.atomcode/".into(),
         Msg::CliHelpUninstallKeepData => "完全保留 ~/.atomcode/".into(),

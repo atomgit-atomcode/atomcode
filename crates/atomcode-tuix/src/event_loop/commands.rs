@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
     ProxyPicker, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
@@ -485,16 +485,13 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
 ///   returns `Stop`).
 ///
 /// Callers must thread `execute_slash_command`'s extra params through so a
-/// slash payload can open modals / drive the fixissue + setup side-channels
-/// exactly as a typed command would.
-#[allow(clippy::too_many_arguments)]
+/// slash payload can open modals / drive setup side-channels exactly as a
+/// typed command would.
 pub(crate) fn fire_interval_payload(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let payload = match ctx.loop_ctrl.as_mut() {
@@ -535,8 +532,6 @@ pub(crate) fn fire_interval_payload(
                 ctx,
                 renderer,
                 active_modal,
-                fixissue_pending,
-                fixissue_buffer,
                 setup_pending,
             );
             if let Some(c) = ctx.loop_ctrl.as_mut() {
@@ -570,7 +565,6 @@ pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
 ///
 /// A payload starting with `/` is a slash command (split into cmd + arg on
 /// the first whitespace); anything else is a free-text prompt.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_interval_loop(
     state: &mut UiState,
     ctx: &mut LoopCtx,
@@ -578,8 +572,6 @@ pub(crate) fn start_interval_loop(
     secs: u64,
     payload: String,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let p = if payload.starts_with('/') {
@@ -606,8 +598,6 @@ pub(crate) fn start_interval_loop(
         ctx,
         renderer,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
 }
@@ -619,8 +609,6 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
     // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
@@ -637,8 +625,6 @@ pub(super) fn execute_slash_command(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         );
     };
@@ -653,8 +639,6 @@ pub(super) fn execute_slash_command(
         ctx,
         &mut cap,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
     if !cap.captured.is_empty() {
@@ -1075,19 +1059,8 @@ fn execute_slash_command_impl(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
-    // entry that consumes them (the `/fixissue` arm was removed; the
-    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
-    // event_loop/mod.rs's AgentEvent handler still drains them on
-    // TurnComplete). They stay in the signature so callers don't have to
-    // change, and so a future restoration of the slash command is a
-    // one-arm-add rather than a refactor.
-    let _ = (&fixissue_pending, &fixissue_buffer);
-
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
@@ -2078,28 +2051,6 @@ fn execute_slash_command_impl(
                 });
             }
         }
-        "issue" => {
-            // Two-step wizard to file a NEW issue against the **atomcode
-            // upstream repo** (atomgit_atomcode/atomcode), NOT against
-            // the user's current working project. Use case is in-tool
-            // bug reports / feature requests for atomcode itself; using
-            // cwd would be confusing (a user reporting an atomcode bug
-            // while in some unrelated repo would land their issue in
-            // the wrong place, or get blocked by cwd validation).
-            //
-            // Step 1 collects a title (required), step 2 collects a
-            // description (required, Shift+Enter for newlines). On
-            // submit the event loop's post-close branch POSTs
-            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
-            // new issue URL into scrollback.
-            let _ = arg; // reserved for future options (e.g. --template)
-            let mut wiz = IssueWizard::open(
-                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
-                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
-            );
-            wiz.emit_prompt(renderer);
-            *active_modal = Some(Box::new(wiz));
-        }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
             // TUI behaviour). The picker's Enter-handler invokes `apply_cd`
@@ -2991,8 +2942,6 @@ fn execute_slash_command_impl(
                         secs,
                         payload,
                         active_modal,
-                        fixissue_pending,
-                        fixissue_buffer,
                         setup_pending,
                     );
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
@@ -4191,67 +4140,6 @@ fn format_context_report(
     }
 
     out
-}
-
-/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
-/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
-/// the event loop's post-close hook when `IssueWizard` has stashed a
-/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
-/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
-/// Run it arms the post-completion hook (`fixissue_pending` +
-/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
-/// UiState to Streaming via `state.on_submit()`.
-/// Currently unused — the `/fixissue` slash command was removed from
-/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
-/// a future restoration of the slash command can re-add a one-line
-/// dispatcher arm without re-implementing this whole flow. The
-/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
-/// directly and does not depend on this function.
-#[allow(dead_code)]
-pub(crate) fn launch_fixissue(
-    url: &str,
-    state: &mut UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
-) {
-    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
-            prompt,
-            issue_title,
-            issue_number,
-            issue_ref,
-        }) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
-                issue_number, issue_title,
-            )));
-            renderer.flush();
-            *fixissue_pending = Some(issue_ref);
-            fixissue_buffer.clear();
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: prompt,
-                    images: vec![],
-                    image_markers: vec![],
-                })
-                .ok();
-            state.on_submit();
-        }
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
-            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
-            renderer.flush();
-        }
-        Err(e) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  fixissue failed: {:#}\n",
-                e
-            )));
-            renderer.flush();
-        }
-    }
 }
 
 /// Assemble the `/status` body in canonical display order: the login line FIRST

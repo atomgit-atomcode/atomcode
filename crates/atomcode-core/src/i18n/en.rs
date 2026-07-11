@@ -346,23 +346,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::DirNotADirectory { path } =>
             format!("Not a directory: {path}").into(),
 
-        // ── Issue wizard ──
-        Msg::IssueCancelled => "(cancelled)".into(),
-        Msg::IssueNewOn { owner, repo } =>
-            format!("New issue on atomgit.com/{owner}/{repo}").into(),
-        Msg::IssueStep1 =>
-            "Step 1/2 — enter title (required, Esc to cancel):".into(),
-        Msg::IssueStep2 =>
-            "Step 2/2 — enter description (Shift+Enter = newline, Enter to submit, Esc to cancel):".into(),
-        Msg::IssueTitleConfirmed { title } =>
-            format!("✓ title: {title}").into(),
-        Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
-        Msg::IssueCreateFailed { error } =>
-            format!("  [issue] × create failed: {error}\n").into(),
-        Msg::IssueRequiredField { field } =>
-            format!("(required — type a {field} or Esc to cancel)").into(),
-
         // ── Language ──
         Msg::LanguageSwitched { label, locale } =>
             format!("  ✓ Language switched to {label} ({locale}).\n").into(),
@@ -814,7 +797,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
-        Msg::CmdDescIssue => "Report a bug / request a feature for AtomCode itself (interactive wizard)".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
@@ -1086,7 +1068,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliAboutStatus => "Show current login status".into(),
         Msg::CliAboutUpgrade => "Upgrade atomcode in-place to the latest released version".into(),
         Msg::CliAboutRollback => "Roll back to the previous version (swap with .bak on disk)".into(),
-        Msg::CliAboutFixissue => "Fetch an AtomGit issue and let the agent fix it in the current project".into(),
         Msg::CliAboutMcp => "Manage MCP server entries in .mcp.json".into(),
         Msg::CliAboutDaemon => "Start the HTTP daemon for IDE integration".into(),
         Msg::CliAboutWebui => "Start the local browser webui".into(),
@@ -1133,7 +1114,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliHelpIdleTimeout => "Idle-shutdown timeout in seconds; 0 disables".into(),
         Msg::CliHelpPortWebui => "Port (default: 13457)".into(),
         Msg::CliHelpHost => "Bind address (default: 127.0.0.1)".into(),
-        Msg::CliHelpFixissueUrl => "Full issue URL".into(),
         Msg::CliHelpUninstallYes => "Skip prompts; use per-group default decisions".into(),
         Msg::CliHelpUninstallPurge => "Wipe ~/.atomcode/ entirely".into(),
         Msg::CliHelpUninstallKeepData => "Keep ~/.atomcode/ entirely".into(),

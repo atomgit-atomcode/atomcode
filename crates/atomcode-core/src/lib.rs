@@ -8,7 +8,6 @@ fn _isolate_atomcode_home() {
 }
 
 pub mod agent;
-pub mod atomgit;
 pub mod auth;
 pub mod process_utils;
 pub mod coding_plan;
