@@ -9,7 +9,9 @@
 //!    the official `atomcode-plugins-official` marketplace and touch the
 //!    marker.
 //!    Failure (no network, no git on PATH, upstream down) is logged
-//!    and swallowed — startup proceeds without skills.
+//!    to `$ATOMCODE_HOME/stderr.log` and swallowed — startup proceeds
+//!    without skills. Direct file writes avoid stderr-fd leakage into
+//!    the TUI input box on Windows (raw-mode cursor sits at the prompt).
 //!
 //! 2. **Every startup** — we `git pull --ff-only` every installed
 //!    marketplace so the plugins stay in sync with the remote.
@@ -31,6 +33,34 @@ use crate::config::Config;
 use super::installer::{install, list_installed};
 use super::marketplace::{add_marketplace, list_marketplaces, update_marketplace};
 use super::PluginJobEvent;
+use std::io::Write;
+
+/// Append a diagnostic line to `$ATOMCODE_HOME/stderr.log`.
+///
+/// This replaces the previous `eprintln!` approach, which leaked into
+/// the TUI input box on Windows when the terminal was already in raw
+/// mode (the cursor sits at the prompt footer, so stderr-fd writes
+/// rendered "inside" the input area). Direct file I/O is cross-platform
+/// and avoids the fd-sharing problem entirely.
+///
+/// Best-effort: if the home dir can't be resolved or the file can't
+/// be opened, silently drop the line — bootstrap failures are already
+/// reported through `PluginJobEvent` channels.
+fn log_to_file(msg: &str) {
+    let home = Config::config_dir();
+    if std::fs::create_dir_all(&home).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("stderr.log"))
+    else {
+        return;
+    };
+    let _ = std::io::Write::write_all(&mut file, msg.as_bytes());
+    let _ = file.write_all(b"\n");
+}
 
 /// Public git URLs for the default marketplaces — the official AtomCode
 /// plugin registry and the legacy AtomCode skills bag. The plugin
@@ -67,8 +97,8 @@ const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v2";
 ///
 /// Returns the list of `PluginJobEvent`s the caller should forward to
 /// the TUI event loop so the user sees a toast (e.g. "marketplace
-/// `atomcode` added at abc1234 (3 plugins)"). The same lines
-/// are still `eprintln!`'d for `stderr.log` posterity. No-op cases
+/// `atomcode` added at abc1234 (3 plugins)"). Diagnostic lines are
+/// written to `$ATOMCODE_HOME/stderr.log` for posterity. No-op cases
 /// (marker already present, no marketplaces to refresh, nothing
 /// changed under HEAD) return an empty vec.
 pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
@@ -80,11 +110,11 @@ pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     // git on PATH (common on macOS GUI-launched processes that don't inherit
     // the user's shell profile).
     if super::marketplace::find_git().is_err() {
-        eprintln!(
+        log_to_file(
             "⚠ git is not installed or not on PATH. \
              Plugin marketplace auto-install and auto-update are disabled. \
              Install git (e.g. `xcode-select --install` on macOS, \
-             `sudo apt install git` on Ubuntu) and restart AtomCode."
+             `sudo apt install git` on Ubuntu) and restart AtomCode.",
         );
         events.push(PluginJobEvent::GitNotFound);
         return events;
@@ -168,11 +198,11 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
             Ok(info) => {
                 let mp_name = info.name.clone();
                 let plugins = info.plugins.clone();
-                eprintln!(
+                log_to_file(&format!(
                     "✓ Auto-installed plugin marketplace `{}` (commit {}).",
                     mp_name,
                     short_commit(&info.git_commit)
-                );
+                ));
                 events.push(PluginJobEvent::MarketplaceAdded(info));
                 if should_auto_install(url) {
                     install_plugins_from_marketplace(&mut events, &mp_name, &plugins);
@@ -183,7 +213,7 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
                     "auto-install of marketplace `{url}` failed: {e:#}. \
                      Run `/plugin marketplace add {url}` manually when ready."
                 );
-                eprintln!("⚠ {msg}");
+                log_to_file(&format!("⚠ {msg}"));
                 events.push(PluginJobEvent::Failed {
                     op: "auto-install".into(),
                     msg,
@@ -210,10 +240,10 @@ fn install_plugins_from_marketplace(
     for plugin in plugins {
         match install(plugin, mp_name, super::state::InstallScope::User) {
             Ok(pi) => {
-                eprintln!(
+                log_to_file(&format!(
                     "  ✓ Installed plugin `{}@{}` from marketplace `{mp_name}`.",
                     pi.plugin, pi.marketplace
-                );
+                ));
                 events.push(PluginJobEvent::PluginInstalled(pi));
             }
             Err(e) => {
@@ -222,7 +252,7 @@ fn install_plugins_from_marketplace(
                 // re-run after deleting the marker).
                 let msg =
                     format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e:#}");
-                eprintln!("  ⚠ {msg}");
+                log_to_file(&format!("  ⚠ {msg}"));
                 events.push(PluginJobEvent::Failed {
                     op: "auto-install-plugin".into(),
                     msg,
@@ -247,7 +277,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
         Ok(l) => l,
         Err(e) => {
             let msg = format!("could not enumerate marketplaces for auto-update: {e:#}");
-            eprintln!("⚠ {msg}");
+            log_to_file(&format!("⚠ {msg}"));
             events.push(PluginJobEvent::Failed {
                 op: "auto-update".into(),
                 msg,
@@ -265,12 +295,12 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                     let is_auto = should_auto_install(&entry.source);
                     let name = info.name.clone();
                     let plugins = info.plugins.clone();
-                    eprintln!(
+                    log_to_file(&format!(
                         "✓ Updated marketplace `{}` ({} → {}).",
                         entry.name,
                         short_commit(&entry.git_commit),
                         short_commit(&info.git_commit)
-                    );
+                    ));
                     events.push(PluginJobEvent::MarketplaceUpdated(info));
                     if is_auto {
                         // Only install plugins not already present — avoids
@@ -293,7 +323,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
             }
             Err(e) => {
                 let msg = format!("auto-update of marketplace `{}` failed: {e:#}", entry.name);
-                eprintln!("⚠ {msg}");
+                log_to_file(&format!("⚠ {msg}"));
                 events.push(PluginJobEvent::Failed {
                     op: "auto-update".into(),
                     msg,
