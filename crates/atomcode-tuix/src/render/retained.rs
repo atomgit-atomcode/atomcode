@@ -882,6 +882,43 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
+    /// Render `● Bash` header + `  └ $ <cmd>` block lines (Claude Code style).
+    /// Used by both the static `UiLine::ToolCall` arm and `commit_inflight_tool`
+    /// so the live and static paths produce identical output.
+    fn push_bash_command_block(&mut self, safe_name: &str, safe_detail: &str) {
+        let bullet_style = self.tool_bullet_style();
+        let tool_name_style = self.style_bold(Role::ToolName);
+        // Header: `● Bash`
+        self.push_body_prefixed("● ", &bullet_style, safe_name, &tool_name_style);
+        // Command lines: `  └ $ <cmd>` (dim `└` gutter, magenta `$`).
+        // Layout: PAD_COL (2 sp) + `└ ` (2) + `$ ` (2) = 6 cols before command text.
+        let dollar_style = self.style_for(Role::Brand);
+        let cmd_style = self.style_for(Role::Secondary);
+        let gutter_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
+        let width = (self.screen.width() as usize).saturating_sub(6).max(8);
+        let safe_cmd = crate::glyph::downgrade_glyphs(safe_detail, self.caps.unicode_symbols);
+        let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
+        for (idx, line) in lines.iter().enumerate() {
+            let mut row = Vec::new();
+            if idx == 0 {
+                push_str_cells(&mut row, leaf, &gutter_style);
+                push_str_cells(&mut row, "$ ", &dollar_style);
+                push_str_cells(&mut row, line, &cmd_style);
+            } else {
+                // Continuation: format_shell_command prepends 4 spaces; add 2 more
+                // (PAD_COL) so text lands at col 6, aligned under command text of line 0.
+                push_str_cells(&mut row, "  ", &gutter_style);
+                push_str_cells(&mut row, line, &cmd_style);
+            }
+            self.push_body_row(row);
+        }
+    }
+
     /// Build the cells for a spinner body row: `<frame> <label>`,
     /// flush-left at col 0 (no PAD_COL indent) so the frame glyph
     /// aligns with `❯` user echoes and `▸` tool calls in the same
@@ -2785,7 +2822,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // double-gap in screenshots). Use `remove` (not just 1)
             // so multi-row inflight spinners are fully covered.
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
-            if safe_detail.is_empty() {
+            if safe_name.eq_ignore_ascii_case("bash") && !safe_detail.is_empty() {
+                // Live bash commit: produce the same `● Bash` + `  └ $ <cmd>` block as
+                // the static `UiLine::ToolCall` arm, via the shared helper.
+                self.push_bash_command_block(&safe_name, &safe_detail);
+            } else if safe_detail.is_empty() {
                 self.push_body_prefixed(
                     "\u{25cf} ",
                     &self.tool_bullet_style(),
@@ -4077,52 +4118,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // visual convention.
                 let is_bash = safe_name.eq_ignore_ascii_case("bash");
                 if is_bash && !safe_detail.is_empty() {
-                    // Header: `● Bash`
-                    self.push_body_prefixed("● ", &bullet_style, &safe_name, &tool_name_style);
-                    // Command lines: Claude Code style — `  └ $ <cmd>` (dim `└` gutter,
-                    // magenta `$`). Layout: PAD_COL (2 sp) + `└ ` (2) + `$ ` (2) = 6 cols
-                    // before command text.  Safe because Task 5 made pop_approval_prompt
-                    // count-based — it no longer keys on col-0 space, so space-prefixed
-                    // bash rows survive the approval pop without any NBSP sentinel.
-                    let dollar_style = self.style_for(Role::Brand);
-                    let cmd_style = self.style_for(Role::Secondary);
-                    // Muted style for the `└` gutter — same `  └ ` col-2 muted gutter as the
-                    // attachment-preview row (`  └ [Image #N]`, ~line 1858); the muted/faint
-                    // style follows ToolResult's `muted_hint` pattern. Note: ToolResult uses
-                    // `⎿` (U+23BF), not `└` (U+2514), so this is NOT a mirror of that arm.
-                    let gutter_style = if crate::highlight::theme::is_light_for_render() {
-                        self.style_for(Role::Muted)
-                    } else {
-                        self.style_faint(Role::Muted)
-                    };
-                    // `└` gutter glyph, gated for non-unicode terminals (→ ASCII backtick),
-                    // matching the attachment-preview row convention.
-                    let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
-                    // Width budget: command text starts at col 6 (`  └ $ `), so subtract 6.
-                    let width = (self.screen.width() as usize)
-                        .saturating_sub(6)
-                        .max(8);
-                    let safe_cmd = crate::glyph::downgrade_glyphs(
-                        &safe_detail,
-                        self.caps.unicode_symbols,
-                    );
-                    let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
-                    for (idx, line) in lines.iter().enumerate() {
-                        let mut row = Vec::new();
-                        if idx == 0 {
-                            // `  └ $ <cmd>`: PAD_COL + gutter + dollar + command text.
-                            push_str_cells(&mut row, leaf, &gutter_style);
-                            push_str_cells(&mut row, "$ ", &dollar_style);
-                            push_str_cells(&mut row, line, &cmd_style);
-                        } else {
-                            // Continuation: format_shell_command prepends 4 spaces to its
-                            // continuation segments; we add 2 more (PAD_COL) so text lands
-                            // at col 6, aligned under the command text of line 0.
-                            push_str_cells(&mut row, "  ", &gutter_style);
-                            push_str_cells(&mut row, line, &cmd_style);
-                        }
-                        self.push_body_row(row);
-                    }
+                    self.push_bash_command_block(&safe_name, &safe_detail);
                 } else {
                     let body_str = if safe_detail.is_empty() {
                         safe_name.clone()
@@ -8112,6 +8108,38 @@ mod tests {
             "$ must be indented (not col 0)\ndump:\n{}", vterm.dump());
     }
 
+    /// Live bash committed via ToolCallInFlight → ToolCallCommit must produce
+    /// the same `● Bash` + `  └ $ <cmd>` block as the static `UiLine::ToolCall`
+    /// arm — NOT the old `● Bash(cmd)` inline format.
+    #[test]
+    fn live_bash_commits_to_dollar_block() {
+        let (mut r, buf) = new_capturing(60, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
+        // Live inflight strip (as ToolCallStarted would push):
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "cd /tmp && sed -i '' \\ -e 's/aa/bb/g' \\ -e 's/cc/dd/g'".into(),
+            hint: None,
+        });
+        r.flush_deferred();
+        // Commit (as ToolCallCommit would):
+        r.render(UiLine::ToolCallCommit { call_id: Some("call-1".into()) });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // Committed form is the block, NOT `● Bash(cmd)` inline:
+        assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
+            "committed header is `● Bash` (no inline paren)\ndump:\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("$ cd /tmp")),
+            "committed command line `  └ $ cd /tmp`\ndump:\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| row.contains("-e 's/cc/dd/g'")),
+            "wrapped segment survives\ndump:\n{}", vterm.dump());
+        assert!(!vterm.any_row(|row| row.contains("truncated")), "no (truncated)\ndump:\n{}", vterm.dump());
+        // No ghost/duplicate strip row lingering:
+        let bash_headers = (0..vterm.height() as usize).filter(|&i| vterm.row_text(i).contains("● Bash")).count();
+        assert_eq!(bash_headers, 1, "exactly one ● Bash header (no ghost)\ndump:\n{}", vterm.dump());
+    }
+
     /// ToolResult success: `⎿ summary` + blank spacer; failure
     /// prepends `✗ `. We test success path here; the error styling
     /// (Role::Error red) is a cell-style detail not asserted in
@@ -10816,10 +10844,10 @@ mod tests {
         assert!(saw_bar, "expected a continuation row");
     }
 
-    /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
-    /// and the `└ [elapsed: …]` result row should be adjacent with no
-    /// blank line between them. User reported a visible blank gap after
-    /// pressing Y on the approval prompt.
+    /// Regression: after approving a bash tool call, the `● Bash` header + `  └ $ cmd`
+    /// block and the `└ [elapsed: …]` result row should be adjacent with no blank
+    /// line between them. User reported a visible blank gap after pressing Y on the
+    /// approval prompt.
     #[test]
     fn retained_approval_pop_then_result_no_blank_gap() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -10889,58 +10917,73 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
+        // The committed bash block is now TWO rows: `● Bash` header + `  └ $ rm -f ...` cmd.
         // Debug: print body_lines around the tool and result rows.
-        let tool_idx = r.body_lines.iter().rposition(|row| {
+        let bash_header_idx = r.body_lines.iter().rposition(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("Bash") && text.contains("rm -f")
-        }).expect("● Bash row should exist in body_lines");
+            text.contains('●') && text.contains("Bash")
+        }).expect("● Bash header row should exist in body_lines");
+
+        let bash_cmd_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("rm -f")
+        }).expect("bash cmd row should exist in body_lines");
 
         let result_idx = r.body_lines.iter().rposition(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
             text.contains("elapsed")
         }).expect("└ result row should exist in body_lines");
 
-        eprintln!("body_lines around tool row:");
-        for i in tool_idx.saturating_sub(2)..=result_idx+2 {
+        eprintln!("body_lines around tool block:");
+        let start = bash_header_idx.saturating_sub(2);
+        let end = (result_idx + 2).min(r.body_lines.len() - 1);
+        for i in start..=end {
             if let Some(row) = r.body_lines.get(i) {
                 let text: String = row.iter().map(|c| c.ch).collect();
                 eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
             }
         }
 
-        // Check body_lines: there should be no blank row between the
-        // ● Bash row and the └ result row.
-        assert_eq!(
-            result_idx,
-            tool_idx + 1,
-            "result row should be immediately after tool row, but found gap.\n\
-             body_lines around tool row:\n  {:?}\n  {:?}\n  {:?}",
-            r.body_lines.get(tool_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(tool_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(tool_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+        // Check body_lines: header immediately precedes cmd, cmd immediately precedes result.
+        assert_eq!(bash_cmd_idx, bash_header_idx + 1,
+            "cmd row should be immediately after header row (no blank gap)");
+        assert_eq!(result_idx, bash_cmd_idx + 1,
+            "result row should be immediately after cmd row, but found gap.\n\
+             body_lines:\n  {:?}\n  {:?}\n  {:?}",
+            r.body_lines.get(bash_cmd_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(bash_cmd_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(bash_cmd_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
         );
 
-        // Also check the virtual terminal: the ● Bash row and └ result row
-        // should be on adjacent terminal rows with no blank row between them.
+        // Also check the virtual terminal: the `● Bash` header, `  └ $ cmd`, and
+        // `└ result` rows should appear on consecutive terminal rows with no blanks.
         eprintln!("vterm dump:\n{}", vterm.dump());
-        let bash_term_row = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains("Bash") && vterm.row_text(i).contains("rm"))
-            .expect("Bash row should be on terminal");
+        let bash_header_term = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains('●') && vterm.row_text(i).contains("Bash") && !vterm.row_text(i).contains("Bash("))
+            .expect("● Bash header row should be on terminal");
+        let bash_cmd_term = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("rm -f"))
+            .expect("bash cmd row should be on terminal");
         let result_term_row = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("elapsed"))
             .expect("result row should be on terminal");
 
+        assert_eq!(bash_cmd_term, bash_header_term + 1,
+            "cmd row should be immediately below header on terminal.\ndump:\n{}", vterm.dump());
         assert_eq!(
             result_term_row,
-            bash_term_row + 1,
-            "result should be on terminal row immediately below Bash row.\n\
-             Bash row {}: {:?}\n\
-             Row below: {:?}\n\
+            bash_cmd_term + 1,
+            "result should be on terminal row immediately below cmd row.\n\
+             Bash header row {}: {:?}\n\
+             Bash cmd row {}: {:?}\n\
+             Row below cmd: {:?}\n\
              Result row {}: {:?}\n\
              dump:\n{}",
-            bash_term_row,
-            vterm.row_text(bash_term_row),
-            vterm.row_text(bash_term_row + 1),
+            bash_header_term,
+            vterm.row_text(bash_header_term),
+            bash_cmd_term,
+            vterm.row_text(bash_cmd_term),
+            vterm.row_text(bash_cmd_term + 1),
             result_term_row,
             vterm.row_text(result_term_row),
             vterm.dump(),
