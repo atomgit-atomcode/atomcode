@@ -3672,20 +3672,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let safe = scrub_controls(&downgr);
 
         // Detect bash child: after leading "  " (2) + glyph (1 char) + " " (1) = 4 cols,
-        // the content starts with "$ ".  Both unicode `└ ` (U+2514, 1 col wide) and
+        // the content is "Bash $ {cmd}".  Both unicode `└ ` (U+2514, 1 col wide) and
         // ASCII `` ` `` fallback produce a single character here, so we split
         // off everything up to and including the first space after the glyph,
         // then check what follows.
         //
-        // Pattern: "  {glyph} $ {cmd}" — split at the THIRD ' ' (two leading
-        // spaces + one after glyph), then check if the remainder starts with "$ ".
+        // Pattern: "  {glyph} Bash $ {cmd}" — split at the space after glyph,
+        // then check if the remainder starts with "Bash $ ".
         let bash_prefix = if safe.starts_with("  ") {
             // The two leading spaces are guaranteed; find the glyph char and the
             // space that follows it.
             let after_two = &safe[2..]; // past "  "
             if let Some(rest) = after_two.splitn(2, ' ').nth(1) {
                 // `rest` is everything after "  {glyph} ".
-                rest.starts_with("$ ")
+                rest.starts_with("Bash $ ")
             } else {
                 false
             }
@@ -3694,25 +3694,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
 
         if bash_prefix {
-            // Split into: prefix ("  {glyph} "), dollar_part ("$ "), remainder.
+            // Split into: glyph_prefix ("  {glyph} "), name_str ("Bash "), dollar_part ("$ "), remainder.
             let avail = (screen_w as usize).saturating_sub(PAD_COL);
             // Find the split point by consuming "  " then to first space.
             let glyph_end = safe[2..]
                 .find(' ')
                 .map(|i| 2 + i + 1) // index just after "  {glyph} "
                 .unwrap_or(safe.len());
-            let prefix_str = &safe[..glyph_end]; // "  {glyph} "
-            let after_glyph = &safe[glyph_end..]; // "$ {cmd}"
-            // "$ " is always 2 bytes.
-            let (dollar_str, cmd_str) = if after_glyph.len() >= 2 {
-                (&after_glyph[..2], &after_glyph[2..])
+            let glyph_prefix_str = &safe[..glyph_end]; // "  {glyph} "
+            let after_glyph = &safe[glyph_end..]; // "Bash $ {cmd}"
+            // "Bash " is 5 bytes; "$ " is 2 bytes.
+            let (name_str, dollar_and_cmd) = if after_glyph.len() >= 5 {
+                (&after_glyph[..5], &after_glyph[5..])
             } else {
                 (after_glyph, "")
             };
+            let (dollar_str, cmd_str) = if dollar_and_cmd.len() >= 2 {
+                (&dollar_and_cmd[..2], &dollar_and_cmd[2..])
+            } else {
+                (dollar_and_cmd, "")
+            };
 
-            // Width budget accounting (all ASCII except possibly the glyph).
-            let prefix_w = crate::width::display_width(prefix_str);
+            // Width budget accounting.
+            let prefix_w = crate::width::display_width(glyph_prefix_str)
+                + crate::width::display_width(name_str);
             let dollar_w = crate::width::display_width(dollar_str);
+
+            // Degenerate-width guard: if the terminal is too narrow to fit
+            // even the prefix + "$ ", fall back to plain muted rendering
+            // so we never exceed avail or misalign the CUP rewrite.
+            if avail < prefix_w + dollar_w {
+                return build_one_row(&safe, muted, screen_w, unicode);
+            }
+
             let cmd_budget = avail
                 .saturating_sub(prefix_w)
                 .saturating_sub(dollar_w)
@@ -3721,7 +3735,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
             let dollar_style = self.style_for(crate::render::theme::Role::Brand);
             let mut row = Vec::new();
-            push_str_cells(&mut row, prefix_str, muted);
+            push_str_cells(&mut row, glyph_prefix_str, muted);
+            push_str_cells(&mut row, name_str, muted);
             push_str_cells(&mut row, dollar_str, &dollar_style);
             push_str_cells(&mut row, &cmd_truncated, muted);
             row
@@ -10657,8 +10672,8 @@ mod tests {
             children: vec![
                 ToolGroupChild {
                     call_id: "bash1".into(),
-                    // event_loop new format for bash children
-                    text: "  \u{2514} $ cd /tmp && ls".into(),
+                    // event_loop new format for bash children: name + $ + cmd
+                    text: "  \u{2514} Bash $ cd /tmp && ls".into(),
                 },
                 ToolGroupChild {
                     call_id: "grep1".into(),
@@ -10677,10 +10692,10 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let dump = vterm.dump();
-        // Bash child shows `$ cd /tmp` without `Bash(` wrapper.
+        // Bash child shows `Bash $ cd /tmp` (name + magenta $ + cmd).
         assert!(
-            vterm.any_row(|row| row.contains("$ cd /tmp")),
-            "bash child must show `$ cd /tmp`\ndump:\n{}",
+            vterm.any_row(|row| row.contains("Bash $ cd /tmp")),
+            "bash child must show `Bash $ cd /tmp`\ndump:\n{}",
             dump
         );
         assert!(
@@ -10713,6 +10728,19 @@ mod tests {
             dollar_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
             dump
         );
+        // The `Bash ` name cells must be muted (not Brand).
+        let bash_name_cells: Vec<_> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == 'B' || c.ch == 'a' || c.ch == 's' || c.ch == 'h')
+            .collect();
+        assert!(
+            bash_name_cells.iter().all(|c| c.style.fg != Some(Palette::BRAND)),
+            "the `Bash` name cells must be muted (not Brand); fgs: {:?}\ndump:\n{}",
+            bash_name_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
+            dump
+        );
     }
 
     /// After initial bash child render, a ToolGroupChildUpdate with `→ N lines`
@@ -10729,7 +10757,7 @@ mod tests {
             header: "● Running 1 tool in parallel".into(),
             children: vec![ToolGroupChild {
                 call_id: "bash2".into(),
-                text: "  \u{2514} $ cd /tmp && ls".into(),
+                text: "  \u{2514} Bash $ cd /tmp && ls".into(),
             }],
         });
         r.render(UiLine::InputPrompt {
@@ -10746,7 +10774,7 @@ mod tests {
         r.render(UiLine::ToolGroupChildUpdate {
             batch_id: "b2".into(),
             call_id: "bash2".into(),
-            new_text: "  \u{2514} $ cd /tmp && ls \u{2192} 3 lines".into(),
+            new_text: "  \u{2514} Bash $ cd /tmp && ls \u{2192} 3 lines".into(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -10754,8 +10782,8 @@ mod tests {
         let dump = vterm.dump();
         // Updated row shows the arrow and line count.
         assert!(
-            vterm.any_row(|row| row.contains("$ cd /tmp") && row.contains("3 lines")),
-            "updated bash row must contain `$ cd /tmp` and `3 lines`\ndump:\n{}",
+            vterm.any_row(|row| row.contains("Bash $ cd /tmp") && row.contains("3 lines")),
+            "updated bash row must contain `Bash $ cd /tmp` and `3 lines`\ndump:\n{}",
             dump
         );
 
