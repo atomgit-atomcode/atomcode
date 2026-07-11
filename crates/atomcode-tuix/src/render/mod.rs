@@ -522,6 +522,10 @@ pub struct TodoProgress {
     pub completed: usize,
     /// Total number of tasks in the list.
     pub total: usize,
+    /// The full ordered list (status + content) — drives the multi-line footer
+    /// todo panel. `current`/`completed`/`total` are retained as pre-computed
+    /// conveniences for the header + hide-when-all-done filter.
+    pub items: Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)>,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated

@@ -11827,10 +11827,15 @@ pub(crate) fn todo_progress_from_items(
         .iter()
         .find(|t| t.status == TodoStatus::InProgress)
         .map(|t| t.content.clone());
+    let items = todos
+        .iter()
+        .map(|t| (t.status, t.content.clone()))
+        .collect();
     crate::render::TodoProgress {
         current,
         completed,
         total,
+        items,
     }
 }
 
@@ -11914,6 +11919,24 @@ mod todo_block_tests {
         );
         // Empty on parse failure (caller falls back to the normal tool row).
         assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
+    }
+
+    #[test]
+    fn todo_progress_carries_full_items_in_order() {
+        let p = todo_progress_from_args(
+            r#"{"todos":[
+                {"content":"a","status":"completed"},
+                {"content":"b","status":"in_progress"},
+                {"content":"c","status":"pending"}
+            ]}"#,
+        )
+        .unwrap();
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        assert_eq!(p.items.len(), 3);
+        assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
+        assert_eq!(p.items[1], (TodoStatus::InProgress, "b".to_string()));
+        assert_eq!(p.items[2], (TodoStatus::Pending, "c".to_string()));
+        assert_eq!((p.completed, p.total), (1, 3));
     }
 }
 
