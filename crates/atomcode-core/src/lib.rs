@@ -19,7 +19,11 @@ pub mod graph;
 pub mod hook;
 pub mod i18n;
 pub mod live;
-pub mod locale;
+/// Re-export shim: `locale` moved to the leaf `atomcode-config` crate (config's
+/// `language` field needs it, and config must not depend on core). Kept as a
+/// re-export so existing `atomcode_core::locale::*` paths keep resolving during
+/// the config extraction.
+pub use atomcode_config::locale;
 pub mod lsp;
 pub mod mcp;
 pub mod notify;

@@ -463,12 +463,23 @@ name = "atomcode-codingplan-crypto"
 version = "0.1.0"
 
 [[package]]
+name = "atomcode-config"
+version = "4.26.0"
+dependencies = [
+ "anyhow",
+ "atomcode-telemetry",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "atomcode-core"
 version = "4.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-codingplan-crypto",
+ "atomcode-config",
  "atomcode-kernel",
  "atomcode-telemetry",
  "base64",
