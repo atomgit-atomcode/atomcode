@@ -329,7 +329,7 @@ impl Bridge {
         // place (see `refresh_subagent_tiers`) and routing re-resolves without a respawn.
         if atomcode_coding::subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
             if let Ok(full_cfg) =
-                atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+                atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
             {
                 let host_model = coding_cfg.model.clone();
                 let (fast_thunk, cap_thunk) =
@@ -778,8 +778,8 @@ impl Bridge {
                 let images = if !images.is_empty() {
                     use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
                     let core_images: Vec<atomcode_core::conversation::message::ImagePart> = images.clone();
-                    let config = atomcode_core::config::Config::load(
-                        &atomcode_core::config::Config::default_path(),
+                    let config = atomcode_config::config::Config::load(
+                        &atomcode_config::config::Config::default_path(),
                     );
                     match config {
                         Err(_) => {
@@ -1650,10 +1650,10 @@ impl Bridge {
                 // async loop's hot path once naming is done for this session.
                 if let Some(convo) = ai_convo_text {
                     if !self.ai_name_attempted {
-                        let feature_on = atomcode_core::config::Config::load(
-                            &atomcode_core::config::Config::default_path(),
+                        let feature_on = atomcode_config::config::Config::load(
+                            &atomcode_config::config::Config::default_path(),
                         )
-                        .map(|c| atomcode_core::config::ai_session_naming_enabled(&c))
+                        .map(|c| atomcode_config::config::ai_session_naming_enabled(&c))
                         .unwrap_or(false);
                         if should_attempt(feature_on, self.ai_name_attempted, true) {
                             self.ai_name_attempted = true;
@@ -2168,7 +2168,7 @@ fn loop_update_ev(l: &LoopState) -> CoreEv {
 // the current conversation in `spawn_goal_eval`, right before each evaluation.
 fn build_goal_provider() -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
-        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path()).ok()?;
     let try_key = |key: &str| -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
         let pcfg = config.providers.get(key)?;
         let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
@@ -2192,7 +2192,7 @@ fn build_naming_provider(
     session_id: &str,
 ) -> Option<Arc<dyn atomcode_core::provider::LlmProvider>> {
     let config =
-        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path()).ok()?;
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path()).ok()?;
     let pcfg = config.providers.get(&config.default_provider)?;
     let provider = atomcode_core::provider::create_provider(pcfg).ok()?;
     // Ride the conversation's `x-atomcode-session-id` so this background
@@ -2425,7 +2425,7 @@ fn compute_undo(
 
 fn apply_reload_provider(
     cfg: &mut CodingAgentConfig,
-    provider: &atomcode_core::config::provider::ProviderConfig,
+    provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
     cfg.model = provider.model.clone();
     if let Some(base_url) = &provider.base_url {
@@ -2667,7 +2667,7 @@ fn build_provider(
 /// (fresh reqwest client, slow OS cert load) happens lazily in [`tier_builder`]'s thunk.
 fn derive_tier_cfg(
     base: &CodingAgentConfig,
-    pc: &atomcode_core::config::provider::ProviderConfig,
+    pc: &atomcode_config::config::provider::ProviderConfig,
 ) -> CodingAgentConfig {
     let mut tier_cfg = base.clone();
     tier_cfg.model = pc.model.clone();
@@ -2702,7 +2702,7 @@ fn derive_tier_cfg(
 fn tier_builder(
     base: &CodingAgentConfig,
     host_model: &str,
-    pc: &atomcode_core::config::provider::ProviderConfig,
+    pc: &atomcode_config::config::provider::ProviderConfig,
 ) -> Option<atomcode_coding::SubagentProvider> {
     if pc.model == host_model {
         return None; // tier == host → reuse host slot
@@ -2718,7 +2718,7 @@ fn tier_builder(
 fn resolve_tier_thunks(
     base: &CodingAgentConfig,
     host_model: &str,
-    full_cfg: &atomcode_core::config::Config,
+    full_cfg: &atomcode_config::config::Config,
 ) -> (atomcode_coding::SubagentProvider, atomcode_coding::SubagentProvider) {
     let none_thunk = || -> atomcode_coding::SubagentProvider { std::sync::Arc::new(|| None) };
     // `None` ⇒ no routing (self-config host / <2 participants) ⇒ both tiers fall back to the
@@ -2749,7 +2749,7 @@ fn refresh_subagent_tiers(coding_cfg: &CodingAgentConfig) {
         return;
     }
     let Ok(full_cfg) =
-        atomcode_core::config::Config::load(&atomcode_core::config::Config::default_path())
+        atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
     else {
         return; // keep the existing tiers if config can't be read
     };
@@ -3003,7 +3003,7 @@ mod undo_tests {
         default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
         manual_noop_result,
     };
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
     use atomcode_kernel::message::Message;
     use atomcode_kernel::provider::ReasoningEffort;
@@ -3453,8 +3453,8 @@ mod undo_tests {
     }
 
     // Helper: build a minimal ProviderConfig for tier-provider tests.
-    fn tier_pc(model: &str, base_url: &str) -> atomcode_core::config::provider::ProviderConfig {
-        atomcode_core::config::provider::ProviderConfig {
+    fn tier_pc(model: &str, base_url: &str) -> atomcode_config::config::provider::ProviderConfig {
+        atomcode_config::config::provider::ProviderConfig {
             provider_type: "openai".into(),
             api_key: Some("sk-x".into()),
             model: model.into(),
