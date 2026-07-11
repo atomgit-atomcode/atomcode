@@ -530,7 +530,7 @@ pub async fn run(
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
     // waiting for the next poll to rediscover it.
-    if let Ok(Some(pending)) = atomcode_core::self_update::read_pending() {
+    if let Ok(Some(pending)) = atomcode_updater::read_pending() {
         if let Ok(mut g) = update_hint.lock() {
             *g = Some(pending.version);
         }
@@ -570,7 +570,7 @@ pub async fn run(
     // loop's select!. Unbounded because progress events are tiny and
     // we never want the upgrade task to block on UI backpressure.
     let (upgrade_tx, upgrade_rx) =
-        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+        tokio::sync::mpsc::unbounded_channel::<atomcode_updater::UpgradeEvent>();
     // Mirror channel for /plugin add|update|install so git latency never
     // stalls the input loop. See LoopCtx::plugin_job_tx for the rationale.
     let (plugin_job_tx, plugin_job_rx) =
@@ -801,7 +801,7 @@ pub async fn run(
         // Set env var so the new process can show a one-time "upgraded" banner
         // on the welcome screen.
         std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
-        match atomcode_core::self_update::re_exec_self(Some(exe)) {
+        match atomcode_updater::re_exec_self(Some(exe)) {
             Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
             Err(e) => {
                 // Re-exec failed. The upgrade is on disk, so the user just

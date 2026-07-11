@@ -6,7 +6,7 @@
 //! row. Any error (network, parse, non-matching format) silently returns
 //! `None` — this feature must never be noisy.
 
-use atomcode_core::self_update::{Manifest, MANIFEST_URL};
+use atomcode_updater::{Manifest, MANIFEST_URL};
 
 /// Compare a `latest.json` body against the current compiled-in version.
 ///

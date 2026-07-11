@@ -35,6 +35,27 @@ pub const MANIFEST_URL: &str =
     "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json";
 pub const DOWNLOAD_BASE: &str = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download";
 
+/// User-Agent for the update HTTP client. Lowercase `atomcode/<version>` is
+/// deliberate (the gateway UA filter hijacks capital-A `AtomCode`). Vendored here so
+/// this leaf crate doesn't depend on `atomcode-core` (mirrors its `ATOMCODE_USER_AGENT`;
+/// same value since the whole workspace shares one version).
+const ATOMCODE_USER_AGENT: &str = concat!("atomcode/", env!("CARGO_PKG_VERSION"));
+
+/// Apply the process proxy policy to the download client: honor `no_proxy` mode,
+/// otherwise leave reqwest's env-based proxy detection intact. Same behavior as the
+/// retiring `atomcode_core::proxy::apply_async_proxy_policy`, using the config crate's
+/// proxy env items so this crate needs no `atomcode-core` dependency.
+fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+        == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 /// Streamed progress events from the upgrade/rollback machinery.
 ///
 /// Sender is always async-owned (the upgrade task); receivers are the
@@ -226,9 +247,9 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
 /// fast at startup); here the user explicitly asked for an upgrade, so
 /// waiting 30s for a slow mirror is acceptable.
 pub async fn fetch_manifest() -> Result<Manifest> {
-    let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+    let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .user_agent(ATOMCODE_USER_AGENT)
         .build()?;
     let resp = client
         .get(MANIFEST_URL)
@@ -276,9 +297,9 @@ async fn download_and_verify(
         let _ = std::fs::remove_file(dest);
     }
 
-    let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+    let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(600))
-        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .user_agent(ATOMCODE_USER_AGENT)
         .build()?;
     let resp = client
         .get(url)

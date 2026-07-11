@@ -372,7 +372,7 @@ fn should_try_sync_upgrade() -> bool {
 /// Bounded by an overall 120 s timeout so a slow mirror / hung DNS can't
 /// wedge startup forever.
 async fn sync_stage_and_apply_if_newer() {
-    use atomcode_core::self_update::{self, UpgradeEvent};
+    use atomcode_updater::{self as self_update, UpgradeEvent};
 
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
@@ -470,10 +470,10 @@ async fn run_prepare_upgrade_worker() -> i32 {
     // UpgradeEvent stream is per-byte progress; we don't surface it here
     // (parent is gone), so drain to /dev/null.
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+        tokio::sync::mpsc::unbounded_channel::<atomcode_updater::UpgradeEvent>();
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-    match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
+    match atomcode_updater::prepare_deferred_upgrade(&current, tx).await {
         Ok(_) => 0,
         Err(_) => 1,
     }
@@ -951,13 +951,13 @@ async fn async_main() {
     if !is_backup && !dev_mode {
         // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-        match atomcode_core::self_update::apply_pending_upgrade() {
+        match atomcode_updater::apply_pending_upgrade() {
             Ok(Some(applied)) => {
                 eprintln!("✓ Upgrading to {}...", applied.version);
                 // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
                 // can surface a welcome-screen confirmation exactly once.
                 std::env::set_var(UPGRADED_FROM_ENV, &current_version);
-                match atomcode_core::self_update::re_exec_self(Some(&applied.exe)) {
+                match atomcode_updater::re_exec_self(Some(&applied.exe)) {
                     Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                     Err(e) => {
                         eprintln!(
@@ -1732,7 +1732,7 @@ async fn run() -> Result<i32> {
             if config.auto_update
                 && !is_running_as_backup()
                 && !cli.dev
-                && !atomcode_core::self_update::is_package_managed()
+                && !atomcode_updater::is_package_managed()
             {
                 spawn_detached_upgrade_prep();
             }
@@ -2880,7 +2880,7 @@ fn parse_plugin_spec(s: &str) -> Result<PluginSpec> {
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and
 /// success/error messages the same way `install.sh` does.
 async fn run_upgrade_cli(force: bool) -> Result<()> {
-    use atomcode_core::self_update::{self, UpgradeEvent, ALREADY_LATEST};
+    use atomcode_updater::{self as self_update, UpgradeEvent, ALREADY_LATEST};
 
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
@@ -2936,7 +2936,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             // (not a Failed event) — these arms exist only to keep the
             // match exhaustive if the TUI path ever reuses this code.
             UpgradeEvent::Failed(msg) => {
-                if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+                if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                     println!(
                         "\n{}",
                         atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
@@ -2959,7 +2959,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         Ok(Ok(_summary)) => Ok(()),
         Ok(Err(e)) => {
             let msg = format!("{:#}", e);
-            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+            if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 println!(
                     "{}",
                     atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
@@ -2978,11 +2978,11 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
 }
 
 fn run_rollback_cli() -> Result<()> {
-    let summary = match atomcode_core::self_update::run_rollback() {
+    let summary = match atomcode_updater::run_rollback() {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("{:#}", e);
-            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+            if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 println!(
                     "{}",
                     atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)

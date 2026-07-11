@@ -26,7 +26,6 @@ pub mod mcp;
 pub mod notify;
 pub mod proxy;
 pub mod provider;
-pub mod self_update;
 pub mod semantic;
 pub mod session;
 pub mod plugin;

@@ -825,10 +825,10 @@ pub struct LoopCtx {
     /// events from the detached upgrade task. Cloned into the task at
     /// spawn time; kept here so the receiver in the loop outlives any
     /// number of upgrades (no reconstructing on each invocation).
-    pub upgrade_tx: mpsc::UnboundedSender<atomcode_core::self_update::UpgradeEvent>,
+    pub upgrade_tx: mpsc::UnboundedSender<atomcode_updater::UpgradeEvent>,
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
-    pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_updater::UpgradeEvent>,
     /// Long-lived channel for /plugin marketplace add|update and /plugin
     /// install. Each invocation spawns a blocking task that does the git
     /// clone/pull and pushes a `PluginJobEvent` here when done. Mirrors the
@@ -8130,13 +8130,13 @@ pub(super) fn handle_plugin_job_event(
 }
 
 pub(super) fn handle_upgrade_event(
-    ev: atomcode_core::self_update::UpgradeEvent,
+    ev: atomcode_updater::UpgradeEvent,
     last_pct: &mut i32,
     done: &mut Option<std::path::PathBuf>,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
-    use atomcode_core::self_update::UpgradeEvent;
+    use atomcode_updater::UpgradeEvent;
     match ev {
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
@@ -8199,13 +8199,13 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+            if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 // HarmonyBrew-managed build: self-update is intentionally
                 // disabled. Not an error — render as command output.
                 renderer.render(UiLine::CommandOutput(
                     crate::i18n::t(crate::i18n::Msg::UpgradePackageManaged).into_owned(),
                 ));
-            } else if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+            } else if msg.contains(atomcode_updater::ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 // self_update.rs's anyhow!() error is fixed-format
                 // English: "already on {current} (latest is {latest}).
@@ -8214,7 +8214,7 @@ pub(super) fn handle_upgrade_event(
                 // itself instead of pasting English into a translated
                 // wrapper.
                 let friendly = msg.replace(
-                    &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
+                    &format!("{}: ", atomcode_updater::ALREADY_LATEST),
                     "",
                 );
                 let (current, latest) =
@@ -10651,7 +10651,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::render::HintSeverity::Info,
         ))
     } else if let Some(v) = ctx.update_hint.lock().ok().and_then(|g| g.clone()) {
-        let text = if atomcode_core::self_update::is_package_managed() {
+        let text = if atomcode_updater::is_package_managed() {
             crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v }).into_owned()
         } else {
             crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned()

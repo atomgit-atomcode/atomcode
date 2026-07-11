@@ -2001,12 +2001,12 @@ fn execute_slash_command_impl(
                 // Rollback is sync and fast (three renames). Run inline
                 // so the user sees the result immediately without waiting
                 // for an async task to schedule.
-                match atomcode_core::self_update::run_rollback() {
+                match atomcode_updater::run_rollback() {
                     Ok(sum) => {
                         // Route through the event channel so rendering
                         // and "set done → exit" logic stays in one place.
                         let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                            atomcode_updater::UpgradeEvent::RolledBack {
                                 exe: sum.exe,
                                 backup: sum.backup,
                             },
@@ -2015,7 +2015,7 @@ fn execute_slash_command_impl(
                     Err(e) => {
                         let _ =
                             ctx.upgrade_tx
-                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                .send(atomcode_updater::UpgradeEvent::Failed(format!(
                                     "{:#}",
                                     e
                                 )));
@@ -2041,9 +2041,9 @@ fn execute_slash_command_impl(
                     // we translate to a Failed event so the TUI layer
                     // only has to handle one event stream.
                     if let Err(e) =
-                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                        atomcode_updater::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                        let _ = tx.send(atomcode_updater::UpgradeEvent::Failed(format!(
                             "{:#}",
                             e
                         )));

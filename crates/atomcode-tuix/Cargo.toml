@@ -5,13 +5,15 @@ edition.workspace = true
 
 [features]
 default = []
-distro-pm = ["atomcode-core/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm"]
 
 [dependencies]
 # Config/locale systems (leaf crate, extracted from core) — used directly, not via
 # the transitional atomcode_core::{config,locale} re-export shims. (proxy stays on
 # atomcode-core: its module keeps the reqwest-applying policy fns.)
 atomcode-config = { path = "../atomcode-config" }
+# Self-update mechanics (leaf crate, extracted from core).
+atomcode-updater = { path = "../atomcode-updater" }
 # Askpass lives in atomcode-capabilities (`::askpass`, unix-only); the TUI drives the
 # server + password modal via that path.
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools"] }

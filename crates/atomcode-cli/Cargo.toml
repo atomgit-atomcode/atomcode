@@ -18,13 +18,15 @@ path = "src/lib.rs"
 
 [features]
 default = []
-distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 # Config system (leaf crate, extracted from core) — used directly, not via the
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
+# Self-update mechanics (leaf crate, extracted from core).
+atomcode-updater = { path = "../atomcode-updater" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-tuix = { path = "../atomcode-tuix" }
