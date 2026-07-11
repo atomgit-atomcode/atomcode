@@ -20,7 +20,7 @@
 /// default-on config. Keeping ALL call sites on this one helper guarantees the
 /// system-prompt guidance and the mounted tool never disagree.
 pub(crate) fn todo_switch_enabled() -> bool {
-    atomcode_core::config::todo_enabled_from_env(
+    atomcode_config::config::todo_enabled_from_env(
         std::env::var("ATOMCODE_TODO").ok().as_deref(),
         true,
     )

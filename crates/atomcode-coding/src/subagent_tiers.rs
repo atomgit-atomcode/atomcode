@@ -4,7 +4,7 @@
 //! there are ≥2 participants; otherwise both tiers collapse to the host's own key so the
 //! subagent runs on the current model (the self-configured / single-model case).
 
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 
 /// Resolve `Some((fast_key, capable_key))` for the subagent tiers, given the current
 /// `host_model`, or `None` when routing should NOT engage (⇒ the subagent uses the current
@@ -43,8 +43,8 @@ pub fn resolve_tier_keys(config: &Config, host_model: &str) -> Option<(String, S
 #[cfg(test)]
 mod tests {
     use super::resolve_tier_keys;
-    use atomcode_core::config::provider::ProviderConfig;
-    use atomcode_core::config::Config;
+    use atomcode_config::config::provider::ProviderConfig;
+    use atomcode_config::config::Config;
 
     fn pc(model: &str, capable: Option<i64>) -> ProviderConfig {
         ProviderConfig {
