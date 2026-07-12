@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use atomcode_bridge::BridgeConfig;
+use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::config::CodingAgentConfig;
 use atomcode_coding::parts::{assemble, prepare, PrepareOptions};
 use atomcode_kernel::agent::AgentHandle;
@@ -97,6 +98,11 @@ pub async fn spawn(
 #[allow(dead_code)]
 type CoreEv = atomcode_core::agent::AgentEvent;
 
+/// The core command shape the daemon's turn driver sends; the reverse-direction
+/// translator [`KernelToWebui::to_kernel_command`] maps these onto kernel commands.
+#[allow(dead_code)]
+type CoreCmd = atomcode_core::agent::AgentCommand;
+
 /// The kernel event shape the runtime produces.
 #[allow(dead_code)]
 type KEv = atomcode_kernel::event::AgentEvent;
@@ -173,6 +179,15 @@ pub struct KernelToWebui {
     /// (it has no kernel handle). `TurnComplete` pushes `KCmd::Snapshot` here;
     /// Task 6 drains after each `translate`, Task 5 reuses it for approvals.
     outbound: Vec<KCmd>,
+    /// The parked approval round-trip: `(kernel request id, tool name)`. Set when a
+    /// `KEv::Request{kind == APPROVAL_KIND}` arrives; consumed when the driver sends
+    /// `ApproveTool`/`ApproveToolAlways`/`DenyTool` (→ `KCmd::Respond`) or when a
+    /// `Cancel` releases it as a deny. Mirrors bridge's `pending_approval`.
+    pending_approval: Option<(atomcode_kernel::event::RequestId, String)>,
+    /// Plan-mode flag. `SetPlanMode(on)` sets it; Task 6's respawn reads it into
+    /// `PrepareOptions` (the flag is only APPLIED on the next respawn — there is no
+    /// live kernel command for it). Mirrors bridge's `parts.plan_mode`.
+    plan_mode: bool,
 }
 
 #[allow(dead_code)]
@@ -197,6 +212,99 @@ impl KernelToWebui {
     /// returns after each `translate`.
     pub fn drain_kernel_commands(&mut self) -> Vec<KCmd> {
         std::mem::take(&mut self.outbound)
+    }
+
+    /// The current plan-mode flag. Task 6's spawn reads it into `PrepareOptions`
+    /// when it (re)assembles the kernel agent — there is no live kernel command
+    /// for plan mode, so a `SetPlanMode` toggle only takes effect on the next
+    /// respawn. Mirrors bridge reading `parts.plan_mode`.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// Translate one core command into a direct kernel command.
+    ///
+    /// Returns `Some(KCmd)` for a command the caller should send straight to the
+    /// kernel. Returns `None` for two DISTINCT reasons:
+    ///
+    /// 1. **Out-of-band via `outbound`** — an approval `Cancel` pushes the
+    ///    displaced-approval deny onto `self.outbound` (drained separately) and
+    ///    then returns `Some(KCmd::Cancel)`; an `ApproveTool`/`DenyTool` with
+    ///    nothing parked returns `None` (nothing to answer).
+    /// 2. **Respawn / no-op** — `SetConversation`/`ClearConversation`/`ReloadConfig`/
+    ///    `ChangeDir`/`SetSessionId` have NO kernel command equivalent (the kernel
+    ///    `AgentCommand` has only 6 variants; there is no `SetMessages`). Task 6
+    ///    owns respawn and PEELS the respawn-triggering commands off BEFORE calling
+    ///    this — here they simply fall through to `None`.
+    ///
+    /// Ported from `atomcode_bridge::runtime::Bridge::on_core_command` (the
+    /// approval + plan + compact arms); goal/loop/memory/undo/etc. are the daemon's
+    /// deferred variants (it does not send them today).
+    pub fn to_kernel_command(&mut self, cmd: CoreCmd) -> Option<KCmd> {
+        match cmd {
+            CoreCmd::SendMessage { text, images, .. } => {
+                // Robust whether or not the kernel emits `TurnStarted`: reset the
+                // per-turn stats here as well (bridge resets in `start_turn_stats`
+                // gated on `!turn_running`; the daemon path resets on send).
+                self.start_turn_stats();
+                Some(KCmd::SendMessage {
+                    text,
+                    images: images
+                        .iter()
+                        .map(atomcode_bridge::convert::image_to_kernel)
+                        .collect(),
+                })
+            }
+            CoreCmd::Cancel => {
+                // Release + clear any parked approval as a DENY before forwarding
+                // Cancel (bridge parity ~903): the kernel then backfills the
+                // cancelled tool's result, and clearing our mirror means a later
+                // re-read of the snapshot can't re-trigger a lingering approval.
+                if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
+                    self.outbound.push(cmd);
+                }
+                Some(KCmd::Cancel)
+            }
+            CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
+            CoreCmd::ApproveToolAlways => self.answer_approval(ApprovalResponse::allow_always()),
+            CoreCmd::DenyTool => self.answer_approval(ApprovalResponse::deny()),
+            CoreCmd::SetPlanMode(on) => {
+                // Applied on the next respawn by Task 6 (no live kernel command).
+                // deferred (daemon kernel path): bridge's `pending_plan_note` text
+                // prefix (delivered with the next user message) is SCOPED OUT.
+                self.plan_mode = on;
+                None
+            }
+            CoreCmd::Compact { prompt } => Some(KCmd::Compact { focus: prompt }),
+            CoreCmd::Shutdown => Some(KCmd::Shutdown),
+            // Out-of-band respawn / no-op: Task 6 owns respawn and peels these off
+            // BEFORE calling this translator (`ChangeDir`/`ReloadConfig`/
+            // `SetConversation`/`ClearConversation` re-prepare + re-spawn the agent
+            // against fresh state; the kernel has no in-place `SetMessages`).
+            // `SetSessionId` is a header-binding no-op on this path.
+            CoreCmd::SetConversation(_)
+            | CoreCmd::ClearConversation
+            | CoreCmd::ReloadConfig(_)
+            | CoreCmd::ChangeDir(_)
+            | CoreCmd::SetSessionId(_) => None,
+            // deferred (daemon kernel path): the daemon does not send any of these
+            // today, so they have no kernel translation here yet.
+            // AppendInput / SyncMessages / RefreshContextStats / Background /
+            // Remember / Forget / ShowMemory / ReloadHooks / UndoToPrompt /
+            // LocalShell / SetGoal / ClearGoal / SetLoop / ClearLoop.
+            _ => None,
+        }
+    }
+
+    /// Answer the parked approval (allow / allow_always / deny). Returns the
+    /// `KCmd::Respond` to send, or `None` when nothing is parked. Ported from
+    /// bridge's `answer_approval` (~1329) minus the `PhaseChange` emit (the daemon
+    /// SSE layer does not consume `PhaseChange`).
+    fn answer_approval(&mut self, resp: ApprovalResponse) -> Option<KCmd> {
+        self.pending_approval.take().map(|(id, _tool)| {
+            let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
+            KCmd::Respond { id, value }
+        })
     }
 
     /// Reset the per-turn stats. Mirrors bridge's `start_turn_stats` — the bridge
@@ -446,8 +554,49 @@ impl KernelToWebui {
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                 }]
             }
-            // Task 5 owns the `Request`/approval arms (it will reuse `outbound`).
-            KEv::Request { .. } => vec![], // Task 5:
+            // ---- approval round-trip (Task 5) ----
+            KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
+                // deferred (daemon kernel path): bridge's
+                // `bypass_auto_approval`/`--dangerously-skip-permissions` path is
+                // SCOPED OUT — the daemon's approval MODE handles Bypass at the
+                // decider level, so every Risky tool round-trips here.
+                let req: ApprovalRequest = match serde_json::from_value(payload) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Malformed → fail closed (deny via null Respond, no prompt).
+                        self.outbound
+                            .push(KCmd::Respond { id, value: serde_json::Value::Null });
+                        return vec![];
+                    }
+                };
+                // The legacy protocol has exactly one bare Approve/Deny in flight.
+                // A SECOND approval while one is parked would be un-answerable, so
+                // deny the DISPLACED one CLOSED rather than leave the kernel hanging.
+                if let Some((old_id, _)) = self.pending_approval.take() {
+                    self.outbound.push(KCmd::Respond {
+                        id: old_id,
+                        value: serde_json::to_value(ApprovalResponse::deny())
+                            .unwrap_or(serde_json::Value::Null),
+                    });
+                }
+                self.pending_approval = Some((id, req.tool.clone()));
+                vec![CoreEv::ApprovalNeeded {
+                    tool_name: req.tool.clone(),
+                    reason: "Requires approval".to_string(),
+                    call: atomcode_core::tool::ToolCall {
+                        id: req.call_id,
+                        name: req.tool,
+                        arguments: req.args,
+                    },
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                }]
+            }
+            KEv::Request { id, .. } => {
+                // Unknown request kind: fail closed.
+                self.outbound
+                    .push(KCmd::Respond { id, value: serde_json::Value::Null });
+                vec![]
+            }
             KEv::Cancelled => vec![],
             // `#[non_exhaustive]` kernel enum: any future variant is silently
             // dropped until a task maps it.
@@ -459,6 +608,20 @@ impl KernelToWebui {
 // ---------------- private helpers (copied VERBATIM from bridge) ----------------
 // These are NOT `pub` in `atomcode_bridge::runtime`, so they are copied here (pure
 // fns). Keep in sync with runtime.rs:2809-2882.
+
+/// Build a DENY `KCmd::Respond` for a parked approval, taking (clearing) it.
+/// Ported verbatim from `atomcode_bridge::runtime::take_deny_cmd`. Used by the
+/// `Cancel` arm to release a parked approval closed before cancelling the turn.
+#[allow(dead_code)]
+fn take_deny_cmd(
+    pending: &mut Option<(atomcode_kernel::event::RequestId, String)>,
+) -> Option<KCmd> {
+    pending.take().map(|(id, _tool)| {
+        let value =
+            serde_json::to_value(ApprovalResponse::deny()).unwrap_or(serde_json::Value::Null);
+        KCmd::Respond { id, value }
+    })
+}
 
 /// Map a raw provider error into the localized message drivers show. The only
 /// substitution is the AtomGit gateway 401 → "login expired"; everything else is
@@ -1013,5 +1176,262 @@ mod kernel_runtime_translate_tests {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         assert!(t.translate(KEv::TurnStarted).is_empty());
         assert!(t.translate(KEv::Cancelled).is_empty());
+    }
+
+    // ---- Task 5: command translator + approval round-trip ----
+
+    use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+    use atomcode_core::agent::AgentCommand as CoreCmd;
+    use atomcode_core::conversation::message::ImagePart;
+
+    fn approval_payload(call_id: &str, tool: &str, args: &str) -> serde_json::Value {
+        serde_json::to_value(ApprovalRequest {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            args: args.into(),
+        })
+        .unwrap()
+    }
+
+    fn decision(cmd: &KCmd) -> String {
+        match cmd {
+            KCmd::Respond { value, .. } => value
+                .get("decision")
+                .and_then(|d| d.as_str())
+                .unwrap_or("<none>")
+                .to_string(),
+            _ => panic!("expected Respond, got {cmd:?}"),
+        }
+    }
+
+    fn respond_id(cmd: &KCmd) -> u64 {
+        match cmd {
+            KCmd::Respond { id, .. } => *id,
+            _ => panic!("expected Respond, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_maps_text_and_images_and_resets_stats() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.tool_calls = 5;
+        t.rounds = 3;
+        t.total_tokens = 42;
+        let out = t.to_kernel_command(CoreCmd::SendMessage {
+            text: "hi".into(),
+            images: vec![ImagePart { data: "AAAA".into(), media_type: "image/png".into() }],
+            image_markers: vec![],
+        });
+        match out {
+            Some(KCmd::SendMessage { text, images }) => {
+                assert_eq!(text, "hi");
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+        // start_turn_stats ran.
+        assert_eq!(t.tool_calls, 0);
+        assert_eq!(t.rounds, 0);
+        assert_eq!(t.total_tokens, 0);
+        assert!(t.started.is_some());
+    }
+
+    #[test]
+    fn cancel_maps_to_kernel_cancel() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.to_kernel_command(CoreCmd::Cancel);
+        assert!(matches!(out, Some(KCmd::Cancel)));
+        // Nothing parked → no deny pushed.
+        assert!(t.drain_kernel_commands().is_empty());
+    }
+
+    #[test]
+    fn cancel_releases_parked_approval_as_deny() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 7,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("call-1", "bash", "{}"),
+        });
+        let out = t.to_kernel_command(CoreCmd::Cancel);
+        assert!(matches!(out, Some(KCmd::Cancel)));
+        let cmds = t.drain_kernel_commands();
+        assert_eq!(cmds.len(), 1, "expected a deny Respond, got {cmds:?}");
+        assert_eq!(respond_id(&cmds[0]), 7);
+        assert_eq!(decision(&cmds[0]), "deny");
+        // Parked approval cleared.
+        assert!(t.pending_approval.is_none());
+    }
+
+    #[test]
+    fn approval_request_parks_and_emits_approval_needed() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Request {
+            id: 11,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("call-9", "edit_file", "{\"path\":\"x\"}"),
+        });
+        match &out[..] {
+            [CoreEv::ApprovalNeeded { tool_name, reason, call, .. }] => {
+                assert_eq!(tool_name, "edit_file");
+                assert_eq!(reason, "Requires approval");
+                assert_eq!(call.id, "call-9");
+                assert_eq!(call.name, "edit_file");
+                assert_eq!(call.arguments, "{\"path\":\"x\"}");
+            }
+            _ => panic!("expected ApprovalNeeded, got {out:?}"),
+        }
+        assert!(matches!(&t.pending_approval, Some((11, tool)) if tool == "edit_file"));
+    }
+
+    #[test]
+    fn approve_tool_after_park_responds_allow_with_parked_id() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 11,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c", "bash", "{}"),
+        });
+        let out = t.to_kernel_command(CoreCmd::ApproveTool);
+        let cmd = out.expect("expected a Respond");
+        assert_eq!(respond_id(&cmd), 11);
+        assert_eq!(decision(&cmd), "allow");
+        assert!(t.pending_approval.is_none());
+    }
+
+    #[test]
+    fn approve_tool_always_after_park_responds_allow_always() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 3,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c", "bash", "{}"),
+        });
+        let cmd = t.to_kernel_command(CoreCmd::ApproveToolAlways).expect("Respond");
+        assert_eq!(respond_id(&cmd), 3);
+        assert_eq!(decision(&cmd), "allow_always");
+    }
+
+    #[test]
+    fn deny_tool_after_park_responds_deny() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 5,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c", "bash", "{}"),
+        });
+        let cmd = t.to_kernel_command(CoreCmd::DenyTool).expect("Respond");
+        assert_eq!(respond_id(&cmd), 5);
+        assert_eq!(decision(&cmd), "deny");
+    }
+
+    #[test]
+    fn approve_with_nothing_parked_is_none() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(t.to_kernel_command(CoreCmd::ApproveTool).is_none());
+        assert!(t.to_kernel_command(CoreCmd::DenyTool).is_none());
+    }
+
+    #[test]
+    fn second_request_while_parked_denies_displaced_old_id() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 1,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c1", "bash", "{}"),
+        });
+        // Second request while the first is still parked.
+        let out = t.translate(KEv::Request {
+            id: 2,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c2", "edit_file", "{}"),
+        });
+        // New one is surfaced.
+        assert!(matches!(&out[..], [CoreEv::ApprovalNeeded { .. }]));
+        assert!(matches!(&t.pending_approval, Some((2, _))));
+        // Displaced old id (1) denied via outbound.
+        let cmds = t.drain_kernel_commands();
+        assert_eq!(cmds.len(), 1, "expected one displaced deny, got {cmds:?}");
+        assert_eq!(respond_id(&cmds[0]), 1);
+        assert_eq!(decision(&cmds[0]), "deny");
+    }
+
+    #[test]
+    fn malformed_approval_payload_fails_closed_with_null_respond() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Request {
+            id: 8,
+            kind: APPROVAL_KIND.into(),
+            payload: serde_json::json!({ "not": "an approval" }),
+        });
+        assert!(out.is_empty(), "malformed request must emit no core events");
+        let cmds = t.drain_kernel_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(respond_id(&cmds[0]), 8);
+        match &cmds[0] {
+            KCmd::Respond { value, .. } => assert!(value.is_null()),
+            other => panic!("expected null Respond, got {other:?}"),
+        }
+        assert!(t.pending_approval.is_none());
+    }
+
+    #[test]
+    fn unknown_request_kind_fails_closed_with_null_respond() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Request {
+            id: 9,
+            kind: "not-approval".into(),
+            payload: serde_json::json!({}),
+        });
+        assert!(out.is_empty());
+        let cmds = t.drain_kernel_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(respond_id(&cmds[0]), 9);
+        assert!(matches!(&cmds[0], KCmd::Respond { value, .. } if value.is_null()));
+    }
+
+    #[test]
+    fn set_plan_mode_sets_flag_and_returns_none() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(!t.plan_mode());
+        assert!(t.to_kernel_command(CoreCmd::SetPlanMode(true)).is_none());
+        assert!(t.plan_mode());
+        assert!(t.to_kernel_command(CoreCmd::SetPlanMode(false)).is_none());
+        assert!(!t.plan_mode());
+    }
+
+    #[test]
+    fn compact_and_shutdown_map_directly() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(matches!(
+            t.to_kernel_command(CoreCmd::Compact { prompt: Some("focus".into()) }),
+            Some(KCmd::Compact { focus: Some(f) }) if f == "focus"
+        ));
+        assert!(matches!(t.to_kernel_command(CoreCmd::Shutdown), Some(KCmd::Shutdown)));
+    }
+
+    #[test]
+    fn respawn_and_noop_commands_return_none() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(t
+            .to_kernel_command(CoreCmd::SetConversation(
+                atomcode_core::conversation::ConversationSnapshot::default()
+            ))
+            .is_none());
+        assert!(t.to_kernel_command(CoreCmd::ClearConversation).is_none());
+        assert!(t.to_kernel_command(CoreCmd::ChangeDir("/tmp".into())).is_none());
+        assert!(t.to_kernel_command(CoreCmd::SetSessionId("s1".into())).is_none());
+    }
+
+    #[test]
+    fn deferred_commands_return_none() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(t.to_kernel_command(CoreCmd::AppendInput("x".into())).is_none());
+        assert!(t.to_kernel_command(CoreCmd::SyncMessages).is_none());
+        assert!(t.to_kernel_command(CoreCmd::RefreshContextStats).is_none());
+        assert!(t.to_kernel_command(CoreCmd::ShowMemory).is_none());
+        assert!(t.to_kernel_command(CoreCmd::ReloadHooks).is_none());
+        assert!(t.to_kernel_command(CoreCmd::ClearGoal).is_none());
+        assert!(t.to_kernel_command(CoreCmd::ClearLoop).is_none());
     }
 }
