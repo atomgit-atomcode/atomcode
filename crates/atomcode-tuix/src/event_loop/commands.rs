@@ -4883,9 +4883,9 @@ fn resolve_save_in(
         working_dir.join(path)
     };
 
-    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
-    // so a typo can't silently scatter directories. An empty parent (writing
-    // to the cwd, the common relative-name case) always "exists".
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir,
+    // so a typo can't silently scatter directories. Relative paths are already
+    // rooted at `working_dir`; absolute paths are checked as provided.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
