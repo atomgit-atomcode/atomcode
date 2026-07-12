@@ -286,22 +286,20 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::DiffBlock(entries) => {
                 self.drop_transient();
-                for entry in entries {
-                    let sign = if entry.added { "+" } else { "-" };
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
+                for entry in &entries {
                     let color = if self.caps.colors {
-                        if entry.added { SGR_GREEN } else { SGR_RED }
+                        match entry.kind {
+                            crate::render::DiffKind::Add => SGR_GREEN,
+                            crate::render::DiffKind::Del => SGR_RED,
+                            crate::render::DiffKind::Context => "",
+                        }
                     } else {
                         ""
                     };
-                    let reset = if self.caps.colors { SGR_RESET } else { "" };
-                    let _ = writeln!(
-                        self.out,
-                        "  {}{} {}{}",
-                        color,
-                        sign,
-                        scrub_controls(&entry.text),
-                        reset
-                    );
+                    let reset = if self.caps.colors && !color.is_empty() { SGR_RESET } else { "" };
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
                 }
             }
             UiLine::ApprovalPrompt { tool, detail } => {

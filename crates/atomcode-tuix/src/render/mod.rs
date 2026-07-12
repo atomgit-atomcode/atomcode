@@ -1,5 +1,6 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod cell;
+pub(crate) mod diff;
 pub mod plain;
 pub mod qr;
 pub mod retained;
@@ -557,10 +558,22 @@ pub struct LoopStatus {
     pub elapsed_secs: u64,
 }
 
-/// One line in a diff batch. `added = true` renders as `+`, false as `-`.
+/// The role of a diff line: an addition (`+`), a deletion (`-`), or unchanged
+/// context (` `). Drives the sign + color in the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Add,
+    Del,
+    Context,
+}
+
+/// One line of a rendered diff, with the file line number for its side.
+/// `old_lineno` is set for Del + Context, `new_lineno` for Add + Context.
 #[derive(Debug, Clone)]
 pub struct DiffEntry {
-    pub added: bool,
+    pub kind: DiffKind,
+    pub old_lineno: Option<usize>,
+    pub new_lineno: Option<usize>,
     pub text: String,
 }
 

@@ -4446,15 +4446,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &style);
             }
             UiLine::DiffBlock(entries) => {
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
                 for entry in &entries {
-                    let style = self.style_for(if entry.added {
-                        Role::DiffAdd
-                    } else {
-                        Role::DiffRemove
-                    });
-                    let sign = if entry.added { '+' } else { '-' };
-                    let body = format!("       {} {}", sign, scrub_controls(&entry.text));
-                    self.push_body_text(&body, &style);
+                    let role = match entry.kind {
+                        crate::render::DiffKind::Add => Role::DiffAdd,
+                        crate::render::DiffKind::Del => Role::DiffRemove,
+                        crate::render::DiffKind::Context => Role::Muted,
+                    };
+                    let style = self.style_for(role);
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    self.push_body_text(&scrub_controls(&body), &style);
                 }
             }
 
@@ -8632,16 +8633,21 @@ mod tests {
     /// respective rows at the correct indent (7-space prefix).
     #[test]
     fn retained_diff_block_renders_via_vterm() {
+        use crate::render::{DiffEntry, DiffKind};
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
         r.render(UiLine::DiffBlock(vec![
-            super::super::DiffEntry {
-                added: true,
+            DiffEntry {
+                kind: DiffKind::Add,
+                old_lineno: None,
+                new_lineno: Some(1),
                 text: "new line".into(),
             },
-            super::super::DiffEntry {
-                added: false,
+            DiffEntry {
+                kind: DiffKind::Del,
+                old_lineno: Some(1),
+                new_lineno: None,
                 text: "old line".into(),
             },
         ]));
@@ -8658,6 +8664,28 @@ mod tests {
         let has_removed = vterm.any_row(|r| r.contains("-") && r.contains("old line"));
         assert!(has_added, "added row missing\ndump:\n{}", vterm.dump());
         assert!(has_removed, "removed row missing\ndump:\n{}", vterm.dump());
+    }
+
+    #[test]
+    fn diff_block_renders_line_number_gutter() {
+        use crate::render::{DiffEntry, DiffKind};
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        r.render(UiLine::DiffBlock(vec![
+            DiffEntry { kind: DiffKind::Context, old_lineno: Some(9), new_lineno: Some(9), text: "keep".into() },
+            DiffEntry { kind: DiffKind::Del, old_lineno: Some(10), new_lineno: None, text: "old line".into() },
+            DiffEntry { kind: DiffKind::Add, old_lineno: None, new_lineno: Some(10), text: "new line".into() },
+        ]));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(), cursor_byte: 0, menu: None,
+            status: status_basic(), attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(vterm.any_row(|row| row.contains("10 - old line")), "removed row w/ gutter\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| row.contains("10 + new line")), "added row w/ gutter\n{}", vterm.dump());
+        assert!(vterm.any_row(|row| row.contains("9   keep")), "context row w/ gutter\n{}", vterm.dump());
     }
 
     /// TurnSeparator: blank + `──── Label ────` + blank. The rule

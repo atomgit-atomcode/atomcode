@@ -9015,25 +9015,7 @@ fn handle_agent_event(
                 "edit_file" | "write_file" | "create_file" | "search_replace"
             );
             if emits_diff {
-                let diff_entries: Vec<crate::render::DiffEntry> = output
-                    .lines()
-                    .take(120)
-                    .filter_map(|line| {
-                        if let Some(rest) = line.strip_prefix("+ ") {
-                            Some(crate::render::DiffEntry {
-                                added: true,
-                                text: rest.to_string(),
-                            })
-                        } else if let Some(rest) = line.strip_prefix("- ") {
-                            Some(crate::render::DiffEntry {
-                                added: false,
-                                text: rest.to_string(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let diff_entries = crate::render::diff::parse_unified_diff(&output, 120);
                 if !diff_entries.is_empty() {
                     renderer.render(UiLine::DiffBlock(diff_entries));
                 }
