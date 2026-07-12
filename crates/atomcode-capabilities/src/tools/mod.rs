@@ -55,6 +55,11 @@ pub mod web_search;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
+/// Model-facing memory tool (remember / forget / list). Opt-in `memory` feature.
+#[cfg(feature = "memory")]
+mod memory;
+#[cfg(feature = "memory")]
+pub use memory::MemoryTool;
 
 pub use approval::{
     ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
