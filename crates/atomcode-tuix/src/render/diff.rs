@@ -5,8 +5,9 @@
 use crate::render::{DiffEntry, DiffKind};
 
 /// Parse a git unified diff (`@@ -a,b +c,d @@` hunks + ` `/`+`/`-` lines) into
-/// line-numbered entries. Lines before the first `@@`, and `---`/`+++` file
-/// headers, are ignored. Stops after `max_lines` entries.
+/// line-numbered entries. Everything before the first `@@` hunk — the `Edited …`
+/// preamble and any `--- `/`+++ ` file headers — is ignored. Stops after
+/// `max_lines` entries.
 pub(crate) fn parse_unified_diff(diff: &str, max_lines: usize) -> Vec<DiffEntry> {
     let mut out: Vec<DiffEntry> = Vec::new();
     let mut old_ln = 0usize;
@@ -22,11 +23,12 @@ pub(crate) fn parse_unified_diff(diff: &str, max_lines: usize) -> Vec<DiffEntry>
             }
             continue;
         }
-        if line.starts_with("---") || line.starts_with("+++") {
-            continue; // unified-diff file headers
-        }
         if old_ln == 0 && new_ln == 0 {
-            continue; // preamble before the first hunk
+            // Preamble before the first hunk: the `Edited …` line and the
+            // `--- `/`+++ ` file headers (which always precede the first `@@`).
+            // Do NOT skip `---`/`+++`-shaped lines INSIDE a hunk — those are
+            // deleted/added content (e.g. a `-- ` line diffs to `--- `).
+            continue;
         }
         match line.as_bytes().first() {
             Some(b'+') => {
@@ -151,6 +153,24 @@ Edited a.rs (1 replacement)
         assert_eq!(e[0].text, "old");
         assert_eq!(e[1].kind, DiffKind::Add);
         assert_eq!(e[1].text, "new");
+    }
+
+    #[test]
+    fn del_line_starting_with_dashes_is_not_dropped_as_a_header() {
+        // A deleted line whose content starts with `--` becomes `---…` in the
+        // diff (sign `-` + content `--…`). It must render as a DELETION, not be
+        // mistaken for a `---` file header and silently dropped (which would also
+        // throw off every following line number). Same idea for added `++` lines.
+        let diff = "\
+@@ -1,3 +1,2 @@
+ keep
+---
++++new";
+        let e = parse_unified_diff(diff, 100);
+        assert_eq!(e.len(), 3, "context + del + add, none dropped: {e:?}");
+        assert_eq!(e[0].kind, DiffKind::Context);
+        assert_eq!((e[1].kind, e[1].text.as_str(), e[1].old_lineno), (DiffKind::Del, "--", Some(2)));
+        assert_eq!((e[2].kind, e[2].text.as_str(), e[2].new_lineno), (DiffKind::Add, "++new", Some(2)));
     }
 
     #[test]
