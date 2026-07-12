@@ -262,10 +262,10 @@ impl KernelToWebui {
     /// Returns `Some(KCmd)` for a command the caller should send straight to the
     /// kernel. Returns `None` for two DISTINCT reasons:
     ///
-    /// 1. **Out-of-band via `outbound`** — an approval `Cancel` pushes the
-    ///    displaced-approval deny onto `self.outbound` (drained separately) and
-    ///    then returns `Some(KCmd::Cancel)`; an `ApproveTool`/`DenyTool` with
-    ///    nothing parked returns `None` (nothing to answer).
+    /// 1. **Out-of-band via `outbound`** — `Cancel` pushes the parked-approval deny
+    ///    (if any) then `KCmd::Cancel` onto `self.outbound` (drained separately, deny
+    ///    first) and returns `None`; an `ApproveTool`/`DenyTool` with nothing parked
+    ///    returns `None` (nothing to answer).
     /// 2. **Respawn / no-op** — `SetConversation`/`ClearConversation`/`ReloadConfig`/
     ///    `ChangeDir`/`SetSessionId` have NO kernel command equivalent (the kernel
     ///    `AgentCommand` has only 6 variants; there is no `SetMessages`). Task 6
@@ -291,14 +291,18 @@ impl KernelToWebui {
                 })
             }
             CoreCmd::Cancel => {
-                // Release + clear any parked approval as a DENY before forwarding
-                // Cancel (bridge parity ~903): the kernel then backfills the
-                // cancelled tool's result, and clearing our mirror means a later
-                // re-read of the snapshot can't re-trigger a lingering approval.
+                // Release + clear any parked approval as a DENY, queued BEFORE Cancel
+                // (bridge parity ~903): the kernel backfills the cancelled tool's
+                // result cleanly, and clearing our mirror means a later re-read of the
+                // snapshot can't re-trigger a lingering approval. Both go through
+                // `outbound` (returning None) so the deny is sent first, then Cancel —
+                // returning `Some(KCmd::Cancel)` would invert the order (the caller
+                // sends the returned command before draining `outbound`).
                 if let Some(cmd) = take_deny_cmd(&mut self.pending_approval) {
                     self.outbound.push(cmd);
                 }
-                Some(KCmd::Cancel)
+                self.outbound.push(KCmd::Cancel);
+                None
             }
             CoreCmd::ApproveTool => self.answer_approval(ApprovalResponse::allow()),
             CoreCmd::ApproveToolAlways => self.answer_approval(ApprovalResponse::allow_always()),
@@ -510,8 +514,11 @@ impl KernelToWebui {
                 // sending `KCmd::Snapshot` it parks the reason and asks the caller
                 // to send the command (via `drain_kernel_commands`). The matching
                 // `Snapshot` reply runs `finish_turn`.
-                // deferred (daemon kernel path): the `pending_approval` clear bridge
-                // does here belongs to Task 5 (it owns approval state).
+                // Clear any still-parked approval on turn end (bridge parity ~2064):
+                // a turn can end with a request unanswered (e.g. the kernel's own
+                // approval `request()` timed out on the non-interactive `/chat` path),
+                // and a stale id must not leak into the next turn's Request handling.
+                self.pending_approval = None;
                 self.pending_finish = Some(reason);
                 self.outbound.push(KCmd::Snapshot);
                 vec![]
@@ -1030,7 +1037,16 @@ impl KernelDriver {
     /// non-dir / canonicalize error, emit a `Warning` and do NOT respawn.
     async fn change_dir(&mut self, dir: String) {
         let target = {
-            let base = self.coding_cfg.working_dir.clone();
+            // Resolve a RELATIVE `/cd` against the LIVE cwd (a bash `cd` inside a tool
+            // mutates `parts.shared_cwd`), falling back to the pinned config value —
+            // bridge parity (~929). Using `coding_cfg.working_dir` would resolve
+            // against a stale base after an in-tool `cd`.
+            let base = self
+                .parts
+                .shared_cwd
+                .read()
+                .map(|p| p.clone())
+                .unwrap_or_else(|_| self.coding_cfg.working_dir.clone());
             let p = std::path::Path::new(&dir);
             if p.is_absolute() {
                 p.to_path_buf()
@@ -1819,14 +1835,16 @@ mod kernel_runtime_translate_tests {
     #[test]
     fn cancel_maps_to_kernel_cancel() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        // Cancel returns None and queues KCmd::Cancel on `outbound` (so a parked-
+        // approval deny can be sent BEFORE it — see the parked variant below).
         let out = t.to_kernel_command(CoreCmd::Cancel);
-        assert!(matches!(out, Some(KCmd::Cancel)));
-        // Nothing parked → no deny pushed.
-        assert!(t.drain_kernel_commands().is_empty());
+        assert!(out.is_none());
+        let cmds = t.drain_kernel_commands();
+        assert!(matches!(&cmds[..], [KCmd::Cancel]), "expected [Cancel], got {cmds:?}");
     }
 
     #[test]
-    fn cancel_releases_parked_approval_as_deny() {
+    fn cancel_releases_parked_approval_as_deny_before_cancel() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         t.translate(KEv::Request {
             id: 7,
@@ -1834,11 +1852,14 @@ mod kernel_runtime_translate_tests {
             payload: approval_payload("call-1", "bash", "{}"),
         });
         let out = t.to_kernel_command(CoreCmd::Cancel);
-        assert!(matches!(out, Some(KCmd::Cancel)));
+        assert!(out.is_none());
+        // The deny Respond MUST precede Cancel so the kernel backfills the cancelled
+        // tool's result cleanly (bridge parity).
         let cmds = t.drain_kernel_commands();
-        assert_eq!(cmds.len(), 1, "expected a deny Respond, got {cmds:?}");
+        assert_eq!(cmds.len(), 2, "expected [deny Respond, Cancel], got {cmds:?}");
         assert_eq!(respond_id(&cmds[0]), 7);
         assert_eq!(decision(&cmds[0]), "deny");
+        assert!(matches!(cmds[1], KCmd::Cancel));
         // Parked approval cleared.
         assert!(t.pending_approval.is_none());
     }
@@ -1862,6 +1883,25 @@ mod kernel_runtime_translate_tests {
             _ => panic!("expected ApprovalNeeded, got {out:?}"),
         }
         assert!(matches!(&t.pending_approval, Some((11, tool)) if tool == "edit_file"));
+    }
+
+    #[test]
+    fn turn_complete_clears_stale_parked_approval() {
+        // A turn can end with an approval still parked (e.g. the kernel's own
+        // approval request timed out on the non-interactive path). TurnComplete must
+        // clear it so the stale id can't leak into the next turn's Request handling.
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::Request {
+            id: 3,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("c", "bash", "{}"),
+        });
+        assert!(t.pending_approval.is_some());
+        let out = t.translate(KEv::TurnComplete { reason: StopReason::Stopped });
+        assert!(out.is_empty());
+        assert!(t.pending_approval.is_none(), "TurnComplete must clear the parked approval");
+        // It still requests the finishing snapshot.
+        assert!(matches!(&t.drain_kernel_commands()[..], [KCmd::Snapshot]));
     }
 
     #[test]
