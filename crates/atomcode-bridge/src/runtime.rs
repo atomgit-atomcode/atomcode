@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atomcode_capabilities::memory::MemoryStore;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
     assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
@@ -956,54 +955,6 @@ impl Bridge {
                     }
                     _ => self.emit(CoreEv::Warning(format!("no such directory: {dir}"))),
                 }
-            }
-            CoreCmd::Remember { content, global } => {
-                let store = if global {
-                    MemoryStore::global()
-                } else {
-                    MemoryStore::project(&self.coding_cfg.working_dir)
-                };
-                let msg = match store.append(&content) {
-                    Ok(()) => format!(
-                        "Remembered ({}): {content}",
-                        if global { "global" } else { "project" }
-                    ),
-                    Err(e) => format!("Failed to remember: {e}"),
-                };
-                // System result, NOT a user message → Warning (info line on both
-                // ends). UserEcho would render a fake user bubble in tuix and be
-                // dropped entirely in headless.
-                self.emit(CoreEv::Warning(msg));
-            }
-            CoreCmd::Forget { keyword } => {
-                let project = MemoryStore::project(&self.coding_cfg.working_dir);
-                let global = MemoryStore::global();
-                let mut removed = project.remove_matching(&keyword).unwrap_or_default();
-                removed.extend(global.remove_matching(&keyword).unwrap_or_default());
-                let msg = if removed.is_empty() {
-                    format!("Nothing matched '{keyword}'")
-                } else {
-                    format!("Forgot {} entr(y/ies)", removed.len())
-                };
-                self.emit(CoreEv::Warning(msg));
-            }
-            CoreCmd::ShowMemory => {
-                let name = self
-                    .coding_cfg
-                    .working_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "project".into());
-                let merged = MemoryStore::merged_for_prompt(
-                    &MemoryStore::global(),
-                    &MemoryStore::project(&self.coding_cfg.working_dir),
-                    &name,
-                );
-                self.emit(CoreEv::Warning(if merged.is_empty() {
-                    "(memory is empty)".into()
-                } else {
-                    merged
-                }));
             }
             CoreCmd::SetConversation(snap) => {
                 // The driver resumes a (legacy-format) session: convert, persist

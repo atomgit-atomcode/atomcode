@@ -70,14 +70,6 @@ pub enum AgentCommand {
     Compact {
         prompt: Option<String>,
     },
-    Remember {
-        content: String,
-        global: bool,
-    },
-    Forget {
-        keyword: String,
-    },
-    ShowMemory,
     /// Run a one-shot task in an isolated background context (read-only-ish
     /// tool subset, independent conversation, capped turns + timeout).
     /// Result is returned via `AgentEvent::BackgroundComplete`.

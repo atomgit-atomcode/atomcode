@@ -2049,7 +2049,6 @@ mod kernel_runtime_translate_tests {
         assert!(t.to_kernel_command(CoreCmd::AppendInput("x".into())).is_none());
         assert!(t.to_kernel_command(CoreCmd::SyncMessages).is_none());
         assert!(t.to_kernel_command(CoreCmd::RefreshContextStats).is_none());
-        assert!(t.to_kernel_command(CoreCmd::ShowMemory).is_none());
         assert!(t.to_kernel_command(CoreCmd::ReloadHooks).is_none());
         assert!(t.to_kernel_command(CoreCmd::ClearGoal).is_none());
         assert!(t.to_kernel_command(CoreCmd::ClearLoop).is_none());
