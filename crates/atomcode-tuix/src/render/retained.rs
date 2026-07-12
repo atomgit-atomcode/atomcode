@@ -1751,11 +1751,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap()).len()
     }
 
-    /// Build the multi-line todo panel: a header marker row (`☑ Todos · N/M`)
-    /// followed by collapsed item rows. Sits directly above the status line (and
-    /// above the goal/loop row when present). Theme-safe: Brand marker, bold
-    /// in-progress, faint completed/fold, Muted pending/more. ASCII fallback via
-    /// `todo_marker`/`todo_glyph`.
+    /// Build the multi-line todo panel: a header row (`☑ Todos · N/M`) followed
+    /// by collapsed item rows. Pinned at the top of the footer. Theme-safe and
+    /// COLORLESS — hierarchy is by weight, matching the footer's minimal grey
+    /// palette: bold `☑ Todos` header + bold in-progress, faint completed/fold,
+    /// Muted pending/more/count. ASCII fallback via `todo_marker`/`todo_glyph`.
     fn build_todo_rows(
         &self,
         todo: &crate::render::TodoProgress,
@@ -1777,11 +1777,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         rows.into_iter()
             .map(|r| match r {
-                TodoPanelRow::Header { completed, total } => self.build_marker_row(
-                    todo_marker(unicode),
-                    &crate::i18n::t(crate::i18n::Msg::TodoPanelTitle).into_owned(),
-                    &format!(" \u{b7} {completed}/{total}"),
-                ),
+                TodoPanelRow::Header { completed, total } => {
+                    // Colorless: the `☑ Todos` marker + title anchor the panel by
+                    // weight (bold), the ` · N/M` count stays muted. No accent —
+                    // matches the footer's minimal grey palette.
+                    let bold = CellStyle { bold: true, ..CellStyle::default() };
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, todo_marker(unicode), &bold);
+                    push_str_cells(
+                        &mut row,
+                        &crate::i18n::t(crate::i18n::Msg::TodoPanelTitle).into_owned(),
+                        &bold,
+                    );
+                    push_str_cells(
+                        &mut row,
+                        &format!(" \u{b7} {completed}/{total}"),
+                        &self.style_for(Role::Muted),
+                    );
+                    row
+                }
                 TodoPanelRow::CompletedFold { count } => {
                     let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
                     let label = crate::i18n::t(crate::i18n::Msg::TodoPanelCompleted { n: count })
@@ -1791,7 +1805,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 TodoPanelRow::Item { status, content } => {
                     let style = match status {
                         TodoStatus::InProgress => {
-                            CellStyle { bold: true, ..self.style_for(Role::Brand) }
+                            // Bold for emphasis, but NO color — the pink read as
+                            // jarring; the accent is reserved for the header.
+                            CellStyle { bold: true, ..CellStyle::default() }
                         }
                         TodoStatus::Completed => {
                             CellStyle { faint: true, ..self.style_for(Role::Muted) }
@@ -14290,10 +14306,20 @@ mod todo_panel_rows_tests {
         };
         let rows = r.build_todo_rows(&todo, 40);
         let text = |cells: &Vec<Cell>| cells.iter().map(|c| c.ch).collect::<String>();
-        // header shows the i18n title + N/M
+        use crate::render::theme::Palette;
+        // header shows the i18n title + N/M, is bold, and carries NO color.
         assert!(text(&rows[0]).contains("Todos") && text(&rows[0]).contains("1/3"));
-        // the in-progress row is bold
+        assert!(rows[0].iter().any(|c| c.style.bold), "header title is bold");
+        assert!(
+            rows[0].iter().all(|c| c.style.fg != Some(Palette::BRAND)),
+            "header must carry no Brand (pink) color"
+        );
+        // the in-progress row is bold but NOT pink — the panel is colorless.
         let ip = rows.iter().find(|row| text(row).contains("wire it")).unwrap();
         assert!(ip.iter().any(|c| c.style.bold));
+        assert!(
+            ip.iter().all(|c| c.style.fg != Some(Palette::BRAND)),
+            "in-progress task must not be Brand-colored"
+        );
     }
 }
