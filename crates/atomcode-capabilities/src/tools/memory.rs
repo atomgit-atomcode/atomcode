@@ -107,10 +107,15 @@ impl Tool for MemoryTool {
                     Some(k) => k,
                     None => return err("memory: action=forget requires a non-empty `keyword`."),
                 };
-                match Self::store(scope, &ctx.working_dir).remove_matching(keyword) {
-                    Ok(removed) if removed.is_empty() => ok(format!("no memory entries matched '{keyword}' in {scope}.")),
-                    Ok(removed) => ok(format!("forgot {} entr{} in {scope}.", removed.len(), if removed.len() == 1 { "y" } else { "ies" })),
-                    Err(e) => err(format!("memory: failed to update: {e}")),
+                // Scan BOTH stores regardless of `scope` (parity with the `/forget`
+                // command): a forget-by-keyword should remove the entry wherever it
+                // lives, so a global entry can be dropped without an explicit scope.
+                let mut removed = MemoryStore::project(&ctx.working_dir).remove_matching(keyword).unwrap_or_default();
+                removed.extend(MemoryStore::global().remove_matching(keyword).unwrap_or_default());
+                if removed.is_empty() {
+                    ok(format!("no memory entries matched '{keyword}'."))
+                } else {
+                    ok(format!("forgot {} entr{}.", removed.len(), if removed.len() == 1 { "y" } else { "ies" }))
                 }
             }
             "list" => {
@@ -174,6 +179,20 @@ mod tests {
         let r = MemoryTool.execute(r#"{"action":"forget","keyword":"delete me"}"#, &ctx(tmp.path())).await;
         assert!(!r.is_error);
         assert!(crate::memory::MemoryStore::project(tmp.path()).load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_without_scope_reaches_global_store() {
+        // A global entry must be forgettable via a bare `forget` (no scope) — parity
+        // with the `/forget` command, which scans both stores. Unique keywords avoid
+        // colliding with the process-shared (isolated-home) global store.
+        let tmp = tempfile::tempdir().unwrap();
+        MemoryTool.execute(r#"{"action":"remember","content":"projq7x1 marker"}"#, &ctx(tmp.path())).await;
+        MemoryTool.execute(r#"{"action":"remember","content":"globq7x2 marker","scope":"global"}"#, &ctx(tmp.path())).await;
+        let r = MemoryTool.execute(r#"{"action":"forget","keyword":"q7x"}"#, &ctx(tmp.path())).await;
+        assert!(!r.is_error);
+        assert!(crate::memory::MemoryStore::project(tmp.path()).find_matching("q7x").is_empty());
+        assert!(crate::memory::MemoryStore::global().find_matching("globq7x2").is_empty(), "global entry must be forgotten");
     }
 
     #[test]

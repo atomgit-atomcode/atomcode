@@ -1608,10 +1608,12 @@ fn execute_slash_command_impl(
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
                 } else {
                     let store = if global { MemoryStore::global() } else { MemoryStore::project(&ctx.working_dir) };
-                    match store.append(&content) {
-                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "Remembered ({}): {content}", if global { "global" } else { "project" }
-                        ))),
+                    let scope = if global { "global" } else { "project" };
+                    // Dedup on write (parity with the model-facing `memory` tool) so a
+                    // repeated /remember of the same line doesn't double-write.
+                    match store.append_deduped(&content) {
+                        Ok(true) => renderer.render(UiLine::CommandOutput(format!("Remembered ({scope}): {content}"))),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(format!("Already remembered ({scope}): {content}"))),
                         Err(e) => renderer.render(UiLine::Error(format!("Failed to remember: {e}"))),
                     }
                 }

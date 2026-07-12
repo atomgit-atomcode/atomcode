@@ -11,12 +11,16 @@ Explore first: identify the build system, the exact build / test / lint / format
 the top-level directory layout and architecture, key conventions, and any NON-OBVIOUS \
 gotchas a newcomer would trip on.
 
-Then write `AGENTS.md` at the project root with `write_file`. Keep it concise (~200-400 \
-words), actionable, and focused on non-obvious, project-specific information — do NOT \
-include generic advice like \"follow existing patterns\" or \"write tests\".
+Write the result with `write_file`, keeping it concise (~200-400 words), actionable, and \
+focused on non-obvious, project-specific information — do NOT include generic advice like \
+\"follow existing patterns\" or \"write tests\".
 
-If `AGENTS.md` already EXISTS, first read it, then improve it in place: preserve the useful \
-content, fill gaps, and fix anything stale — do NOT wipe and rewrite it from scratch.";
+IMPORTANT — pick the RIGHT file: check for an existing project instruction file in this \
+precedence order — `.atomcode.md`, `AGENTS.md`, `CLAUDE.md`. If ONE already EXISTS, read it \
+and improve THAT SAME file in place (it is the file the agent actually loads — writing a \
+different filename would be shadowed and never take effect): preserve the useful content, \
+fill gaps, and fix anything stale; do NOT wipe and rewrite it from scratch. Only if NONE of \
+those files exists, create a new `AGENTS.md` at the project root.";
 
 #[cfg(test)]
 mod tests {
