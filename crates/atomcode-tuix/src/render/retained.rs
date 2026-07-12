@@ -1810,19 +1810,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .collect()
     }
 
-    /// Paint the full footer into `self.screen`. Layout mirrors
-    /// `AnsiRenderer::draw_footer_here_with_prev_cursor`:
+    /// Paint the full footer into `self.screen`. Layout (top to bottom):
     ///
-    ///   row 0: spinner (or blank margin)
-    ///   row 1: top rule
-    ///   rows 2..2+N: middle input lines (N = wrap_with_cursor line count)
-    ///   row 2+N: bottom rule
-    ///   rows 3+N..3+N+M: menu items (M = up to half screen height)
-    ///   row 3+N+M: status line (if any chrome)
+    ///   rows 0..T:   todo panel (T = todo_rows, a standing view above input)
+    ///   row T:       top rule
+    ///   rows T+1..:  middle input lines (N = wrap_with_cursor line count)
+    ///   row T+1+N:   bottom rule
+    ///   attachments / menu (M = up to half screen height)
+    ///   goal|loop row / status line (if any chrome)
     ///
-    /// Total rows = 1 + 1 + N + 1 + M + status_rows (where status is
-    /// 0 or 1). `footer_top = screen.height - total_rows`. Cursor
-    /// parks at `(footer_top + 2 + cursor_row_in_middle,
+    /// `footer_top = screen.height - total_rows`; `rules_top = footer_top +
+    /// todo_rows`. Cursor parks at `(rules_top + 2 + cursor_row_in_middle,
     /// PAD_COL + 2 + cursor_col_in_row)` — 1-indexed at emit.
     fn paint_footer(&mut self) {
         let w = self.screen.width() as usize;
@@ -2014,17 +2012,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // screen width before emit so blank cells overwrite any stale
         // body content still showing from earlier frames (see
         // `pad_row_to_width` for full rationale).
+        //
+        // The todo panel sits at the TOP of the footer block — a standing view
+        // pinned above the input box, directly under the scrollback. Everything
+        // else (rules, input, attachments, menu, goal/loop, status) shifts down
+        // by todo_rows.
+        let todo_top = footer_top;
+        for (i, tr) in todo_cells.into_iter().enumerate() {
+            let mut padded = tr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(todo_top + i, 0, &padded);
+        }
+        let rules_top = footer_top + todo_rows;
+
         let mut top_rule = top_rule;
         Self::pad_row_to_width(&mut top_rule, w);
-        self.screen.draw_row(footer_top, 0, &top_rule);
+        self.screen.draw_row(rules_top, 0, &top_rule);
 
         for (i, r) in middle_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(footer_top + 1 + i, 0, &padded);
+            self.screen.draw_row(rules_top + 1 + i, 0, &padded);
         }
 
-        let bot_rule_row = footer_top + 1 + middle_rows;
+        let bot_rule_row = rules_top + 1 + middle_rows;
         let mut bot_rule = bot_rule;
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
@@ -2054,23 +2065,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
-        // Stack above the status line: `· menu / goal|loop / todo / status ·`.
+        // Stack below the input box: `· menu / goal|loop / status ·`
+        // (the todo panel is drawn at the TOP of the footer, above the rules).
         let goal_top = menu_top + menu_rows;
         if let Some(gr) = goal_cells {
             let mut padded = gr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(goal_top, 0, &padded);
         }
-        let todo_top = goal_top + goal_rows;
-        for (i, tr) in todo_cells.into_iter().enumerate() {
-            let mut padded = tr;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(todo_top + i, 0, &padded);
-        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(todo_top + todo_rows, 0, &padded);
+            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -2079,7 +2085,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Middle row lives at `footer_top + 1 + cursor_row_in_middle`
         // (0-indexed); +1 more to convert to the 1-indexed form the
         // cursor-set helper expects.
-        let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
+        let cursor_abs_row = (rules_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
         // Hide the terminal cursor ONLY while an inflight-tool row is
@@ -10711,6 +10717,45 @@ mod tests {
             vterm.any_row(|row| row.contains("Grep(foo)")),
             "non-bash child must keep Name(args) format\ndump:\n{}",
             dump
+        );
+    }
+
+    /// The todo panel is pinned at the TOP of the footer — it must render ABOVE
+    /// the input box (lower row index), not below it.
+    #[test]
+    fn todo_panel_renders_above_the_input_box() {
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.todo = Some(crate::render::TodoProgress {
+            current: Some("wire it".into()),
+            completed: 1,
+            total: 3,
+            items: vec![
+                (TodoStatus::Completed, "done a".into()),
+                (TodoStatus::InProgress, "wire it".into()),
+                (TodoStatus::Pending, "later".into()),
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: "TYPEDHERE".into(),
+            cursor_byte: 9,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let h = vterm.height() as usize;
+        let row_of = |needle: &str| (0..h).find(|&i| vterm.row_text(i).contains(needle));
+        let panel = row_of("Todos").expect("panel header rendered");
+        let input = row_of("TYPEDHERE").expect("input text rendered");
+        assert!(
+            panel < input,
+            "todo panel must render ABOVE the input box (panel row {panel} vs input row {input})\n{}",
+            vterm.dump()
         );
     }
 
