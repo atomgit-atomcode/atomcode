@@ -26,6 +26,15 @@ pub(crate) fn todo_switch_enabled() -> bool {
     )
 }
 
+/// Whether the `memory` tool is mounted (mirrors the registration gate in
+/// `register_coding_tools_with_vision`): env `ATOMCODE_MEMORY_TOOL` != 0/false/off.
+pub(crate) fn memory_tool_enabled() -> bool {
+    std::env::var("ATOMCODE_MEMORY_TOOL")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
 pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
@@ -67,6 +76,9 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // phantom tool call. `todo_enabled` is that switch, resolved by the caller.
     if todo_enabled {
         p.push_str(TODO_USAGE);
+    }
+    if memory_tool_enabled() {
+        p.push_str(MEMORY_USAGE);
     }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
@@ -189,6 +201,18 @@ mark an item done only after that step is actually verified (never on intent). K
 item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
 and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
 quick edit, a one-off command, or a purely informational / conversational reply.";
+
+/// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
+/// learnings — not standard facts or session one-offs. Only injected when the
+/// `memory` tool is actually mounted (see the `memory_tool_enabled()` gate in
+/// `coding_persona`).
+const MEMORY_USAGE: &str = "\n\n## MEMORY:\n\
+When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting \
+preference, a correction that should stick, a non-obvious convention or gotcha — persist it \
+with the `memory` tool (`action:\"remember\"`). Do NOT record obvious facts, standard \
+tool/language behavior, anything already in AGENTS.md, or session-specific one-offs. Keep \
+each entry to one concise line. This is a judgment call, not a requirement — only record \
+what a future session would genuinely benefit from.";
 
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
@@ -706,5 +730,22 @@ mod tests {
         assert!(model_needs_firm_tool_steering("deepseek-chat"));
         assert!(!model_needs_firm_tool_steering("claude-opus-4-8"));
         assert!(!model_needs_firm_tool_steering("gpt-5"));
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_memory_tool_env)]
+    fn persona_includes_memory_guidance_when_enabled() {
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+        let p = coding_persona("glm-5.2", true);
+        assert!(p.contains("## MEMORY"), "memory guidance present when tool enabled");
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_memory_tool_env)]
+    fn persona_omits_memory_guidance_when_env_off() {
+        std::env::set_var("ATOMCODE_MEMORY_TOOL", "0");
+        let p = coding_persona("glm-5.2", true);
+        assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
     }
 }
