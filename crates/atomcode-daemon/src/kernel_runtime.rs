@@ -222,6 +222,28 @@ impl KernelToWebui {
         self.plan_mode
     }
 
+    /// Clear all PER-TURN state so a respawn (or a ReloadConfig handle-swap)
+    /// can't strand stale bookkeeping onto the fresh kernel agent: a parked
+    /// approval (`pending_approval`) whose id belongs to the torn-down kernel, a
+    /// deferred `pending_finish` whose Snapshot will never arrive, the running
+    /// `stats` (`started`/`rounds`/`tool_calls`/`total_tokens`), the in-flight
+    /// tool timers (`live_tools`), and any queued outbound kernel commands
+    /// (`outbound`).
+    ///
+    /// PRESERVES `last_usage` — a model swap keeps the SAME conversation, so the
+    /// context size drives the footer / `/context` gauge until the next real turn
+    /// overwrites it. Mirrors bridge clearing `pending_*` after a swap/respawn.
+    pub fn reset_turn_state(&mut self) {
+        self.pending_finish = None;
+        self.pending_approval = None;
+        self.started = None;
+        self.rounds = 0;
+        self.tool_calls = 0;
+        self.total_tokens = 0;
+        self.live_tools.clear();
+        self.outbound.clear();
+    }
+
     /// The kernel task ended: if a turn was awaiting its deferred `Snapshot` to
     /// finalize, no Snapshot will ever arrive — synthesize the terminal from an
     /// EMPTY snapshot so the driver isn't stranded busy. Mirrors bridge's
@@ -700,7 +722,7 @@ impl KernelDriver {
                 biased;
                 cmd = cmd_rx.recv() => match cmd {
                     Some(c) => {
-                        if self.on_command(c) {
+                        if self.on_command(c).await {
                             break; // Shutdown
                         }
                     }
@@ -750,16 +772,48 @@ impl KernelDriver {
     }
 
     /// One core command in. Returns `true` iff the driver should stop (`Shutdown`).
-    fn on_command(&mut self, c: CoreCmd) -> bool {
+    async fn on_command(&mut self, c: CoreCmd) -> bool {
         match c {
             CoreCmd::Shutdown => true,
-            // Task 6b: seeding an EXISTING conversation needs a respawn-Resume (there
-            // is no in-place `SetMessages` on the kernel). A brand-new (empty)
-            // conversation is a no-op — the fresh-spawned agent already starts empty.
-            CoreCmd::SetConversation(_) => false,
-            // Task 6b: model-switch (ReloadConfig) and ChangeDir re-prepare + respawn
-            // the agent against fresh config/cwd; ClearConversation respawns Fresh.
-            CoreCmd::ReloadConfig(_) | CoreCmd::ChangeDir(_) | CoreCmd::ClearConversation => false,
+            // Seed an EXISTING conversation: there is no in-place `SetMessages` on the
+            // kernel, so convert the (legacy) snapshot → kernel messages, persist under
+            // the bridge id, and respawn-Resume. An EMPTY snapshot is a no-op — the
+            // fresh-spawned agent already starts empty (a needless respawn would just
+            // burn a prepare). Ported from bridge's `SetConversation` handler (~1008),
+            // minus the optional `MessagesSync` echo (the daemon ignores it).
+            CoreCmd::SetConversation(snap) => {
+                if snap.messages.is_empty() {
+                    return false;
+                }
+                let kmsgs: Vec<_> = snap
+                    .messages
+                    .iter()
+                    .map(atomcode_bridge::convert::message_to_kernel)
+                    .collect();
+                let ksnap = atomcode_kernel::message::SessionSnapshot::new(kmsgs);
+                if let Some(b) = self.parts.session.as_ref() {
+                    let _ = b.manager.save_snapshot(&self.bridge_session, &ksnap);
+                }
+                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+                false
+            }
+            // Model switch: assemble a NEW provider on the SAME `parts` (conversation +
+            // approval grants survive) and swap the kernel handle — NOT a respawn.
+            // Ported from bridge's `ReloadConfig` handler (~1031), minus
+            // `refresh_subagent_tiers` and all loop cleanup (deferred). ChangeDir and
+            // ClearConversation DO respawn (fresh cwd / fresh conversation).
+            CoreCmd::ReloadConfig(config) => {
+                self.reload_config(config).await;
+                false
+            }
+            CoreCmd::ChangeDir(dir) => {
+                self.change_dir(dir).await;
+                false
+            }
+            CoreCmd::ClearConversation => {
+                self.respawn(SessionMode::Fresh).await;
+                false
+            }
             // Degraded guard (mirrors bridge): the kernel agent isn't running, so a
             // SendMessage can't be answered — surface an actionable error instead of
             // silently dropping it.
@@ -784,6 +838,219 @@ impl KernelDriver {
                     let _ = self.handle.commands.send(kc);
                 }
                 false
+            }
+        }
+    }
+
+    /// Bounded teardown of the OLD kernel task: send `Shutdown`, then await it up to
+    /// `grace`, aborting on a wedge so a stuck SessionEnd hook can't hang the driver.
+    /// Inlined from bridge's private `await_kernel_or_abort` (runtime.rs:135) — a
+    /// respawn/swap tears the old handle down before installing the new one.
+    async fn shutdown_old_handle(&mut self, grace: std::time::Duration) {
+        let _ = self.handle.commands.send(KCmd::Shutdown);
+        let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
+        if tokio::time::timeout(grace, &mut task).await.is_err() {
+            task.abort();
+        }
+    }
+
+    /// Re-`prepare` + re-`assemble` the kernel agent against the CURRENT
+    /// `coding_cfg` under the given `session` mode, then swap in the new handle.
+    ///
+    /// Ported from bridge's `Bridge::respawn` (runtime.rs:1382), MINUS the deferred
+    /// goal/loop/undo/AI-naming lines (see SCOPE OUT). Used by `/clear` (Fresh),
+    /// `/cd` (Fresh, new project root), and resume-seeding (`Resume`).
+    ///
+    /// A `Resume` that can't load its snapshot falls back to `Fresh` before giving up
+    /// (a broken snapshot must not wedge the whole driver). On total failure it emits
+    /// a `CoreEv::Error`, installs a `noop_handle`, and marks `degraded` so the event
+    /// loop stays alive and `SendMessage` is answered with an actionable error.
+    async fn respawn(&mut self, session: SessionMode) {
+        // A live turn / parked approval would be stranded when the kernel is torn
+        // down: clear the translator's per-turn state and synthesize a Cancelled
+        // terminal so the daemon returns to Idle (mirrors bridge closing the
+        // lifecycle FIRST). PRESERVES `last_usage` (context size survives).
+        // deferred (daemon kernel path): the loop_pending_finish hold-open branch
+        // bridge also settles here is scoped out (no loop on this path).
+        for ce in self.tx.terminate_pending() {
+            let _ = self.ev_tx.send(ce);
+        }
+        self.tx.reset_turn_state();
+
+        self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
+
+        let mut opts = self.opts_template.clone();
+        // Plan mode is a respawn-applied toolset (there is no live kernel command):
+        // carry the translator's current flag into the fresh prepare so a prior
+        // /plan survives /cd, /clear, /resume. Mirrors bridge preserving plan_mode.
+        let plan_mode = self.tx.plan_mode();
+        opts.session = session;
+
+        // Try the requested mode; if Resume fails (missing/broken snapshot), fall
+        // back to Fresh before giving up entirely (bridge parity).
+        let mut parts = match prepare_with_plugin_hooks(
+            &self.coding_cfg,
+            opts.clone(),
+            self.plugin_cc_hooks.clone(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(opts.session, SessionMode::Fresh) {
+                    let _ = self.ev_tx.send(CoreEv::Error {
+                        error: format!("engine v2 respawn failed: {e}"),
+                        snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                    });
+                    self.handle = noop_handle();
+                    self.degraded = true;
+                    return;
+                }
+                opts.session = SessionMode::Fresh;
+                match prepare_with_plugin_hooks(
+                    &self.coding_cfg,
+                    opts,
+                    self.plugin_cc_hooks.clone(),
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e2) => {
+                        let _ = self.ev_tx.send(CoreEv::Error {
+                            error: format!(
+                                "engine v2 respawn failed (fresh fallback also failed): {e2}"
+                            ),
+                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                        });
+                        self.handle = noop_handle();
+                        self.degraded = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Approval grants + plan mode survive the respawn (same contract as bridge).
+        parts.approval = self.parts.approval.clone();
+        parts.plan_mode = self.parts.plan_mode.clone();
+        parts
+            .plan_mode
+            .store(plan_mode, std::sync::atomic::Ordering::Relaxed);
+        // deferred (daemon kernel path): bridge re-mounts the schedule_wakeup tool on
+        // the fresh parts here (for /loop). The daemon kernel path has no loop, so it
+        // is scoped out.
+
+        match atomcode_bridge::build_provider(&self.coding_cfg)
+            .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
+        {
+            Ok(a) => {
+                self.handle = a.spawn();
+                // A Fresh respawn gives a NEW session id; refresh so later Resume
+                // seeding + snapshot persistence target the right session.
+                self.bridge_session = parts
+                    .session
+                    .as_ref()
+                    .map(|b| b.id.clone())
+                    .unwrap_or_default();
+                self.parts = parts;
+                self.degraded = false;
+                // deferred (daemon kernel path): bridge's AI-naming re-arm and loop
+                // cancellation on a fresh respawn are scoped out.
+            }
+            Err(e) => {
+                let _ = self.ev_tx.send(CoreEv::Error {
+                    error: format!("engine v2 respawn failed: {e}"),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+                // Install a live handle so the event loop's recv() never returns None.
+                self.handle = noop_handle();
+                self.degraded = true;
+            }
+        }
+    }
+
+    /// Model switch (`/model`, `/effort`, `/think`): apply the new default provider
+    /// onto the CURRENT `coding_cfg`, rebuild the provider, and re-`assemble` on the
+    /// SAME `parts` so the conversation + approval grants survive — then swap the
+    /// kernel handle. NOT a respawn (no re-prepare). Ported from bridge's
+    /// `ReloadConfig` handler (runtime.rs:1031), MINUS `refresh_subagent_tiers` and
+    /// all loop cleanup (deferred). If assemble fails, the OLD handle is KEPT so the
+    /// driver stays alive for another retry.
+    async fn reload_config(&mut self, config: atomcode_config::config::Config) {
+        // A swap tears down the running kernel; settle the translator's per-turn
+        // state so a parked approval / deferred finish isn't stranded on the new
+        // handle. deferred (daemon kernel path): bridge also settles an in-flight
+        // turn snapshot + a sleeping loop here — scoped out (no goal/loop).
+        let Some(p) = config.providers.get(&config.default_provider) else {
+            return;
+        };
+        atomcode_bridge::apply_reload_provider(&mut self.coding_cfg, p);
+        // deferred (daemon kernel path): `refresh_subagent_tiers` (strong/weak
+        // routing re-resolve on a /model swap) is scoped out.
+        match atomcode_bridge::build_provider(&self.coding_cfg) {
+            Ok(provider) => {
+                // Assemble BEFORE tearing down the old handle: if assemble fails, the
+                // old (possibly noop) handle stays intact and the driver keeps running.
+                match assemble(&mut self.parts, &self.coding_cfg, provider) {
+                    Ok(a) => {
+                        let new_handle = a.spawn();
+                        // Close the lifecycle + clear stale translator state, then swap.
+                        for ce in self.tx.terminate_pending() {
+                            let _ = self.ev_tx.send(ce);
+                        }
+                        self.tx.reset_turn_state();
+                        self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
+                        self.handle = new_handle;
+                        self.degraded = false;
+                    }
+                    Err(e) => {
+                        // KEEP the old handle (may be noop) so the driver stays alive.
+                        let _ = self.ev_tx.send(CoreEv::Error {
+                            error: format!("provider switch failed: {e}"),
+                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = self.ev_tx.send(CoreEv::Error {
+                    error: format!("engine v2 provider init failed: {e}"),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+            }
+        }
+    }
+
+    /// `/cd`: resolve `dir` (absolute as-is, else joined onto `coding_cfg.working_dir`),
+    /// canonicalize, and — on Windows — strip the `\\?\` verbatim prefix
+    /// `canonicalize` re-adds (a prior bug leaked `\\?\C:\…` into the UI status row).
+    /// Set `working_dir`, emit `WorkingDirChanged`, then respawn Fresh so
+    /// persona/context/instructions/MCP/skills all rebind to the new project root.
+    /// Ported from bridge's `ChangeDir` handler (runtime.rs:927). On a
+    /// non-dir / canonicalize error, emit a `Warning` and do NOT respawn.
+    async fn change_dir(&mut self, dir: String) {
+        let target = {
+            let base = self.coding_cfg.working_dir.clone();
+            let p = std::path::Path::new(&dir);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            }
+        };
+        match target.canonicalize() {
+            Ok(d) if d.is_dir() => {
+                // Windows `canonicalize` re-adds the `\\?\` verbatim prefix; strip it
+                // before it reaches `working_dir` OR the `WorkingDirChanged` event the
+                // UI stores (otherwise the status row / cwd display leaks `\\?\C:\…`).
+                // Ported EXACTLY from bridge (known footgun).
+                let d = atomcode_capabilities::pathnorm::strip_verbatim_path(&d);
+                self.coding_cfg.working_dir = d.clone();
+                let _ = self.ev_tx.send(CoreEv::WorkingDirChanged(d));
+                self.respawn(SessionMode::Fresh).await;
+            }
+            _ => {
+                let _ = self.ev_tx.send(CoreEv::Warning(format!("no such directory: {dir}")));
             }
         }
     }

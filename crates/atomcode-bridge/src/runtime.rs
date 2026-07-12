@@ -2423,7 +2423,13 @@ fn compute_undo(
     }
 }
 
-fn apply_reload_provider(
+/// Mutate a [`CodingAgentConfig`] in place from a [`ProviderConfig`] on a
+/// `/model` (ReloadConfig) swap: model, base_url/api_key, context window, per-call
+/// output cap, reasoning effort, adapter kind + thinking knobs, and UA/TLS. Kept
+/// `pub` so the daemon's kernel path can reuse it (do not replicate this mapping).
+///
+/// [`ProviderConfig`]: atomcode_config::config::provider::ProviderConfig
+pub fn apply_reload_provider(
     cfg: &mut CodingAgentConfig,
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
