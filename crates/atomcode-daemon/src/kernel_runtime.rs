@@ -101,6 +101,12 @@ type CoreEv = atomcode_core::agent::AgentEvent;
 #[allow(dead_code)]
 type KEv = atomcode_kernel::event::AgentEvent;
 
+/// The kernel command shape the translator emits into `outbound`.
+#[allow(dead_code)]
+type KCmd = atomcode_kernel::event::AgentCommand;
+
+use atomcode_kernel::event::StopReason;
+
 /// Truncates `s` to at most `max` *chars*, appending an ellipsis when clipped.
 ///
 /// Ported verbatim from `atomcode_bridge::runtime::truncate` (the `ToolCallStreaming`
@@ -148,12 +154,128 @@ pub struct KernelToWebui {
     tool_calls: usize,
     rounds: usize,
     total_tokens: usize,
+    /// Wall-clock start of the current turn (`TurnStarted` → `finish_turn`
+    /// duration). Mirrors `TurnStats::started`. `None` before the first turn or
+    /// after a reset.
+    started: Option<Instant>,
+    /// Deferred terminal reason: set on `TurnComplete`, consumed on the matching
+    /// `Snapshot` reply to run `finish_turn`. Mirrors bridge's `pending_finish`.
+    pending_finish: Option<StopReason>,
+    /// The provider context window (tokens), the `ContextStats.ctx_window`
+    /// fallback when the last usage carried none. Mirrors bridge's
+    /// `coding_cfg.context_window`.
+    context_window: u32,
+    /// The provider base URL, needed by `friendly_provider_error` to recognize
+    /// the AtomGit gateway 401 → "login expired" localization. Mirrors bridge's
+    /// `coding_cfg.base_url`.
+    base_url: String,
+    /// Outbound kernel commands the STATELESS translator asks its caller to send
+    /// (it has no kernel handle). `TurnComplete` pushes `KCmd::Snapshot` here;
+    /// Task 6 drains after each `translate`, Task 5 reuses it for approvals.
+    outbound: Vec<KCmd>,
 }
 
 #[allow(dead_code)]
 impl KernelToWebui {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a translator.
+    ///
+    /// * `context_window` — provider window (tokens); the `ContextStats.ctx_window`
+    ///   fallback when a usage report carries no window (`ctx_window == 0`).
+    /// * `base_url` — provider base URL; lets `friendly_provider_error` recognize
+    ///   the AtomGit gateway 401 and localize it to "login expired".
+    pub fn new(context_window: u32, base_url: String) -> Self {
+        Self {
+            context_window,
+            base_url,
+            ..Self::default()
+        }
+    }
+
+    /// Drain (returns + clears) the outbound kernel commands the translator
+    /// accumulated. The translator is stateless w.r.t. the kernel handle, so it
+    /// cannot send commands itself — the caller (Task 6) sends whatever this
+    /// returns after each `translate`.
+    pub fn drain_kernel_commands(&mut self) -> Vec<KCmd> {
+        std::mem::take(&mut self.outbound)
+    }
+
+    /// Reset the per-turn stats. Mirrors bridge's `start_turn_stats` — the bridge
+    /// gates on `!turn_running`; the daemon path resets unconditionally on
+    /// `TurnStarted` (the kernel emits exactly one per turn).
+    fn start_turn_stats(&mut self) {
+        self.started = Some(Instant::now());
+        self.rounds = 0;
+        self.tool_calls = 0;
+        self.total_tokens = 0;
+    }
+
+    /// Synthesize a `ContextStats` from the last usage report. Ported verbatim
+    /// from `Bridge::emit_context_stats` (field values, zeros, `ctx_name`, and
+    /// the `ctx_window` fallback to `self.context_window`).
+    fn context_stats(&self) -> CoreEv {
+        let sent = self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+        let ctx_window = self
+            .last_usage
+            .as_ref()
+            .map(|m| m.ctx_window as usize)
+            .filter(|w| *w > 0)
+            .unwrap_or(self.context_window as usize);
+        CoreEv::ContextStats {
+            system_tokens: 0,
+            sent_tokens: sent,
+            dropped_tokens: 0,
+            working_set_tokens: sent,
+            total_messages: 0,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            ctx_window,
+            ctx_name: "engine-v2".into(),
+            system_prompt: String::new(),
+        }
+    }
+
+    /// Synthesize the terminal event(s) for a completed turn from the kernel
+    /// snapshot. Ported from `Bridge::finish_turn` (@1607). SCOPE OUT (deferred on
+    /// the daemon kernel path): the goal hook, the loop hook, `pending_undo`/undo,
+    /// and AI-session-naming (`SessionRenamed`) — the webui daemon does not wire
+    /// goals/loops/undo, and AI-naming is a follow-up parity gap.
+    fn finish_turn(
+        &mut self,
+        reason: StopReason,
+        messages: Vec<atomcode_core::conversation::message::Message>,
+    ) -> Vec<CoreEv> {
+        use atomcode_core::conversation::ConversationSnapshot;
+        let duration = self
+            .started
+            .map(|s| s.elapsed())
+            .unwrap_or(std::time::Duration::ZERO);
+        match reason {
+            StopReason::Cancelled => vec![CoreEv::TurnCancelled {
+                snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+            }],
+            other => {
+                let stop_reason = match other {
+                    StopReason::Stopped => atomcode_core::agent::TurnStopReason::Natural,
+                    StopReason::MaxRounds => atomcode_core::agent::TurnStopReason::TurnLimit,
+                    StopReason::MaxContinuations => atomcode_core::agent::TurnStopReason::StepLimit,
+                    StopReason::Cancelled => atomcode_core::agent::TurnStopReason::Cancelled,
+                    _ => atomcode_core::agent::TurnStopReason::Error,
+                };
+                // NOTE (bridge parity): a provider/stream error already surfaced as
+                // a `CoreEv::Error` from `KEv::Error`; we do NOT re-emit a synthetic
+                // "turn ended" error here. `stop_reason` carries the classification.
+                // deferred (daemon kernel path): AI-session-naming (SessionRenamed)
+                // is a follow-up parity gap and is intentionally not fired here.
+                vec![CoreEv::TurnComplete {
+                    duration,
+                    total_tokens: self.total_tokens,
+                    turn_count: self.rounds,
+                    tool_call_count: self.tool_calls,
+                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                    stop_reason,
+                }]
+            }
+        }
     }
 
     /// Translate one kernel event into `0..n` core events.
@@ -229,26 +351,184 @@ impl KernelToWebui {
             KEv::Usage(meta) => {
                 self.rounds += 1;
                 self.total_tokens += (meta.tokens.prompt + meta.tokens.completion) as usize;
-                let ev = CoreEv::TokenUsage(atomcode_bridge::convert::usage_to_core(&meta.tokens));
+                let token_usage =
+                    CoreEv::TokenUsage(atomcode_bridge::convert::usage_to_core(&meta.tokens));
                 self.last_usage = Some(meta);
-                // Task 4: emit ContextStats synthesized from `last_usage` here.
-                vec![ev]
+                // Order matches bridge: TokenUsage THEN the synthesized ContextStats.
+                vec![token_usage, self.context_stats()]
             }
-            // ---- Task 4: synthesis arms (Snapshot / TurnComplete / compaction /
-            // Error / Request / TurnStarted). Return no events for now; a later
-            // task fills these in. Do NOT panic here. ----
-            KEv::TurnStarted => vec![], // Task 4:
-            KEv::Snapshot { .. } => vec![], // Task 4:
-            KEv::TurnComplete { .. } => vec![], // Task 4:
-            KEv::CompactionStarted { .. } => vec![], // Task 4:
-            KEv::Compacted { .. } => vec![], // Task 4:
-            KEv::Error { .. } => vec![], // Task 4:
-            KEv::Request { .. } => vec![], // Task 4:
-            KEv::Cancelled => vec![], // Task 4:
+            // ---- Task 4: synthesis arms ----
+            KEv::TurnStarted => {
+                self.start_turn_stats();
+                vec![]
+            }
+            KEv::TurnComplete { reason } => {
+                // Stateless translator: it has no kernel handle, so instead of
+                // sending `KCmd::Snapshot` it parks the reason and asks the caller
+                // to send the command (via `drain_kernel_commands`). The matching
+                // `Snapshot` reply runs `finish_turn`.
+                // deferred (daemon kernel path): the `pending_approval` clear bridge
+                // does here belongs to Task 5 (it owns approval state).
+                self.pending_finish = Some(reason);
+                self.outbound.push(KCmd::Snapshot);
+                vec![]
+            }
+            KEv::Snapshot { snapshot } => {
+                if let Some(reason) = self.pending_finish.take() {
+                    let messages: Vec<atomcode_core::conversation::message::Message> = snapshot
+                        .messages
+                        .iter()
+                        .map(atomcode_bridge::convert::message_to_core)
+                        .collect();
+                    // deferred (daemon kernel path): bridge's Snapshot arm also runs
+                    // the goal hook, the loop hook, and `pending_undo`/undo before
+                    // finishing. The webui daemon does not wire goals/loops/undo, so
+                    // we go straight to finish_turn.
+                    self.finish_turn(reason, messages)
+                } else {
+                    // deferred (daemon kernel path): bridge emits `MessagesSync` for a
+                    // bare snapshot (a `/sync` reply). The daemon does not consume
+                    // MessagesSync, so bare snapshots are ignored on this path.
+                    vec![]
+                }
+            }
+            KEv::CompactionStarted { .. } => {
+                vec![CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin)]
+            }
+            KEv::Compacted {
+                committed,
+                trigger,
+                removed,
+                bytes_before,
+                bytes_after,
+                ..
+            } => {
+                use atomcode_core::agent::CompactionUiKind;
+                // The kernel measures BYTES; token figures derive from the last
+                // provider usage. Capture it BEFORE mutating `last_usage` below.
+                let before_tokens =
+                    self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+                let mut out = Vec::new();
+                if committed {
+                    // Unified marker for auto + manual. Drain (removed>0) shows
+                    // before→after; stub fold (removed==0) shows tokens saved.
+                    let label =
+                        compaction_mark_label(removed, bytes_before, bytes_after, before_tokens);
+                    out.push(CoreEv::CompactionUi(CompactionUiKind::Mark(label)));
+                    // Refresh the cached context size so footer / `/context` reflect
+                    // the shrink IMMEDIATELY (estimate post-shrink tokens from the
+                    // byte ratio — the next real turn overwrites it with the exact
+                    // count).
+                    if let Some(meta) = self.last_usage.as_mut() {
+                        meta.used_tokens =
+                            estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
+                    }
+                    out.push(self.context_stats());
+                } else {
+                    // No-op / refused: release the spinner, draw no marker. A manual
+                    // /compact also gets an inline "nothing to compact" note; the auto
+                    // path stays silent (nothing to acknowledge).
+                    out.push(CoreEv::CompactionUi(CompactionUiKind::End));
+                    if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
+                        out.push(CoreEv::TextDelta(manual_noop_result(
+                            bytes_before,
+                            bytes_after,
+                            before_tokens,
+                        )));
+                    }
+                }
+                out
+            }
+            KEv::Error { message, http_status, .. } => {
+                let error = friendly_provider_error(message, http_status, &self.base_url);
+                vec![CoreEv::Error {
+                    error,
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                }]
+            }
+            // Task 5 owns the `Request`/approval arms (it will reuse `outbound`).
+            KEv::Request { .. } => vec![], // Task 5:
+            KEv::Cancelled => vec![],
             // `#[non_exhaustive]` kernel enum: any future variant is silently
             // dropped until a task maps it.
             _ => vec![],
         }
+    }
+}
+
+// ---------------- private helpers (copied VERBATIM from bridge) ----------------
+// These are NOT `pub` in `atomcode_bridge::runtime`, so they are copied here (pure
+// fns). Keep in sync with runtime.rs:2809-2882.
+
+/// Map a raw provider error into the localized message drivers show. The only
+/// substitution is the AtomGit gateway 401 → "login expired"; everything else is
+/// passed through verbatim.
+#[allow(dead_code)]
+fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: &str) -> String {
+    if http_status == Some(401)
+        && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
+    {
+        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+    }
+    message
+}
+
+/// Localized completion marker for a COMMITTED compaction, unified across auto +
+/// manual. A drain (`removed > 0`) reports the messages summarized and the token
+/// before→after; an in-place stub fold (`removed == 0`) reports the tokens saved.
+#[allow(dead_code)]
+fn compaction_mark_label(
+    removed: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    before_tokens: usize,
+) -> String {
+    use atomcode_core::i18n::{t, Msg};
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    if removed > 0 {
+        let before = fmt_k_tokens(before_tokens);
+        let after = fmt_k_tokens(after_tokens);
+        t(Msg::CompactMarkDrain { messages: removed, before: &before, after: &after }).into_owned()
+    } else {
+        let saved = fmt_k_tokens(before_tokens.saturating_sub(after_tokens));
+        t(Msg::CompactMarkStub { saved: &saved }).into_owned()
+    }
+}
+
+/// Inline note for a manual `/compact` that did NOT commit (nothing to drop).
+#[allow(dead_code)]
+fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
+    use atomcode_core::i18n::{t, Msg};
+    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
+    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
+    let before = fmt_k_tokens(before_tokens);
+    let after = fmt_k_tokens(after_tokens);
+    if bytes_after > bytes_before {
+        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
+    } else {
+        t(Msg::CompactNothingShort).into_owned()
+    }
+}
+
+/// Estimate the post-compaction token count by scaling the pre-compaction count by
+/// the kernel's byte-reduction ratio. `bytes_before == 0` ⇒ unchanged.
+#[allow(dead_code)]
+fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
+    if bytes_before > 0 {
+        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
+    } else {
+        before_tokens
+    }
+}
+
+/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
+#[allow(dead_code)]
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        t.to_string()
     }
 }
 
@@ -262,21 +542,21 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn text_delta_maps_1to1() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::TextDelta("hello".into()));
         assert!(matches!(&out[..], [CoreEv::TextDelta(s)] if s == "hello"));
     }
 
     #[test]
     fn reasoning_maps_to_reasoning_delta() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::Reasoning("thinking…".into()));
         assert!(matches!(&out[..], [CoreEv::ReasoningDelta(s)] if s == "thinking…"));
     }
 
     #[test]
     fn tool_call_streaming_maps_name_and_truncated_hint() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let long_args = "x".repeat(200);
         let out = t.translate(KEv::ToolCallStreaming {
             index: 0,
@@ -297,7 +577,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_call_streaming_missing_name_defaults_empty() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::ToolCallStreaming {
             index: 0,
             id: None,
@@ -315,7 +595,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_started_maps_and_records_timer() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::ToolStarted {
             call: ToolCall {
                 id: "c1".into(),
@@ -337,7 +617,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_progress_maps_to_output_chunk() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::ToolProgress {
             call_id: "c1".into(),
             message: "working…".into(),
@@ -353,7 +633,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_result_fills_duration_from_timer() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         // Start the timer first.
         t.translate(KEv::ToolStarted {
             call: ToolCall {
@@ -388,7 +668,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_result_without_timer_defaults_name_and_zero_duration() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::ToolResult {
             result: ToolResult {
                 call_id: "orphan".into(),
@@ -412,7 +692,7 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn tool_batch_started_and_completed_map_1to1() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let started = t.translate(KEv::ToolBatchStarted {
             batch_id: "b1".into(),
             calls: vec![atomcode_kernel::event::ToolBatchCall {
@@ -444,14 +724,14 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn warning_maps_1to1() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::Warning("truncated".into()));
         assert!(matches!(&out[..], [CoreEv::Warning(w)] if w == "truncated"));
     }
 
     #[test]
     fn rate_limited_maps_fields_verbatim() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let out = t.translate(KEv::RateLimited {
             reset_at_display: "12:00".into(),
             reset_label: "resets".into(),
@@ -471,20 +751,21 @@ mod kernel_runtime_translate_tests {
 
     #[test]
     fn usage_maps_to_token_usage_and_stashes_last_usage() {
-        let mut t = KernelToWebui::new();
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         let meta = MessageMeta {
             tokens: KTokenUsage { prompt: 100, completion: 20, cached: 5, ..Default::default() },
             used_tokens: 120,
             ..Default::default()
         };
         let out = t.translate(KEv::Usage(meta));
+        // Task 4 appends a synthesized ContextStats after the TokenUsage.
         match &out[..] {
-            [CoreEv::TokenUsage(u)] => {
+            [CoreEv::TokenUsage(u), CoreEv::ContextStats { .. }] => {
                 assert_eq!(u.prompt_tokens, 100);
                 assert_eq!(u.completion_tokens, 20);
                 assert_eq!(u.cached_tokens, 5);
             }
-            _ => panic!("expected TokenUsage, got {out:?}"),
+            _ => panic!("expected [TokenUsage, ContextStats], got {out:?}"),
         }
         // last_usage stashed for Task 4; counters accumulated.
         assert!(t.last_usage.is_some());
@@ -492,16 +773,245 @@ mod kernel_runtime_translate_tests {
         assert_eq!(t.total_tokens, 120);
     }
 
+    // ---- Task 4 synthesis arms ----
+
+    use atomcode_kernel::event::{AgentCommand as KCmd, StopReason};
+    use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
+
     #[test]
-    fn task4_synthesis_arms_return_empty() {
-        let mut t = KernelToWebui::new();
+    fn turn_started_resets_stats() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.tool_calls = 3;
+        t.rounds = 2;
+        t.total_tokens = 999;
+        let out = t.translate(KEv::TurnStarted);
+        assert!(out.is_empty());
+        assert_eq!(t.tool_calls, 0);
+        assert_eq!(t.rounds, 0);
+        assert_eq!(t.total_tokens, 0);
+        assert!(t.started.is_some());
+    }
+
+    #[test]
+    fn usage_also_emits_context_stats_with_used_tokens_and_ctx_window() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let meta = MessageMeta {
+            tokens: KTokenUsage { prompt: 100, completion: 20, cached: 5, ..Default::default() },
+            used_tokens: 120,
+            ctx_window: 0, // zero → falls back to the constructor context_window
+            ..Default::default()
+        };
+        let out = t.translate(KEv::Usage(meta));
+        // Order: TokenUsage THEN ContextStats (matches bridge).
+        match &out[..] {
+            [CoreEv::TokenUsage(_), CoreEv::ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens,
+                working_set_tokens,
+                total_messages,
+                tool_defs_tokens,
+                cold_zone_tokens,
+                ctx_window,
+                ctx_name,
+                system_prompt,
+            }] => {
+                assert_eq!(*system_tokens, 0);
+                assert_eq!(*sent_tokens, 120);
+                assert_eq!(*dropped_tokens, 0);
+                assert_eq!(*working_set_tokens, 120);
+                assert_eq!(*total_messages, 0);
+                assert_eq!(*tool_defs_tokens, 0);
+                assert_eq!(*cold_zone_tokens, 0);
+                assert_eq!(*ctx_window, 64_000);
+                assert_eq!(ctx_name, "engine-v2");
+                assert!(system_prompt.is_empty());
+            }
+            _ => panic!("expected [TokenUsage, ContextStats], got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_context_stats_prefers_meta_ctx_window() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let meta = MessageMeta {
+            tokens: KTokenUsage { prompt: 10, completion: 2, ..Default::default() },
+            used_tokens: 12,
+            ctx_window: 128_000,
+            ..Default::default()
+        };
+        let out = t.translate(KEv::Usage(meta));
+        match &out[..] {
+            [CoreEv::TokenUsage(_), CoreEv::ContextStats { ctx_window, .. }] => {
+                assert_eq!(*ctx_window, 128_000);
+            }
+            _ => panic!("expected [TokenUsage, ContextStats], got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_started_maps_to_begin() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::CompactionStarted {
+            trigger: CompactTrigger::Manual { focus: None },
+        });
+        assert!(matches!(
+            &out[..],
+            [CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin)]
+        ));
+    }
+
+    #[test]
+    fn compacted_committed_emits_mark_and_context_stats() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        // Seed last_usage so before_tokens is non-zero.
+        t.translate(KEv::Usage(MessageMeta {
+            tokens: KTokenUsage { prompt: 1000, completion: 0, ..Default::default() },
+            used_tokens: 1000,
+            ctx_window: 64_000,
+            ..Default::default()
+        }));
+        let out = t.translate(KEv::Compacted {
+            trigger: CompactTrigger::Auto { utilization: 0.8 },
+            epoch: 1,
+            removed: 5,
+            bytes_before: 4000,
+            bytes_after: 1000,
+            committed: true,
+        });
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(_))
+            )),
+            "expected a Mark, got {out:?}"
+        );
+        assert!(
+            out.iter().any(|e| matches!(e, CoreEv::ContextStats { .. })),
+            "expected a ContextStats refresh, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn compacted_noop_manual_emits_end_and_text() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Compacted {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed: 0,
+            bytes_before: 100,
+            bytes_after: 100,
+            committed: false,
+        });
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::End))));
+        assert!(out.iter().any(|e| matches!(e, CoreEv::TextDelta(_))));
+    }
+
+    #[test]
+    fn compacted_noop_auto_stays_silent() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Compacted {
+            trigger: CompactTrigger::Auto { utilization: 0.8 },
+            epoch: 1,
+            removed: 0,
+            bytes_before: 100,
+            bytes_after: 100,
+            committed: false,
+        });
+        // End only — no TextDelta note on the auto path.
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::End))));
+        assert!(!out.iter().any(|e| matches!(e, CoreEv::TextDelta(_))));
+    }
+
+    #[test]
+    fn error_maps_to_friendly_error_with_default_snapshot() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate(KEv::Error {
+            message: "boom".into(),
+            http_status: Some(500),
+            code: None,
+        });
+        match &out[..] {
+            [CoreEv::Error { error, snapshot }] => {
+                assert_eq!(error, "boom");
+                assert!(snapshot.messages.is_empty());
+            }
+            _ => panic!("expected Error, got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_complete_pushes_snapshot_command_and_snapshot_finishes_turn() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        // Simulate a round of usage so counters are non-zero.
+        t.translate(KEv::TurnStarted);
+        t.translate(KEv::Usage(MessageMeta {
+            tokens: KTokenUsage { prompt: 100, completion: 20, ..Default::default() },
+            used_tokens: 120,
+            ctx_window: 64_000,
+            ..Default::default()
+        }));
+        t.translate(KEv::ToolStarted {
+            call: ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
+        });
+
+        // TurnComplete: returns nothing, pushes a Snapshot command.
+        let out = t.translate(KEv::TurnComplete { reason: StopReason::Stopped });
+        assert!(out.is_empty());
+        let cmds = t.drain_kernel_commands();
+        assert!(matches!(&cmds[..], [KCmd::Snapshot]), "expected Snapshot cmd, got {cmds:?}");
+        // Drained: a second drain is empty.
+        assert!(t.drain_kernel_commands().is_empty());
+
+        // Now the kernel replies with the snapshot → finish_turn synthesis.
+        let snap = SessionSnapshot::new(vec![Message::user("hi")]);
+        let out = t.translate(KEv::Snapshot { snapshot: snap });
+        match &out[..] {
+            [CoreEv::TurnComplete {
+                total_tokens,
+                turn_count,
+                tool_call_count,
+                snapshot,
+                stop_reason,
+                ..
+            }] => {
+                assert_eq!(*total_tokens, 120);
+                assert_eq!(*turn_count, 1);
+                assert_eq!(*tool_call_count, 1);
+                assert_eq!(snapshot.messages.len(), 1);
+                assert_eq!(snapshot.messages[0].text(), Some("hi"));
+                assert_eq!(*stop_reason, atomcode_core::agent::TurnStopReason::Natural);
+            }
+            _ => panic!("expected TurnComplete, got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_cancelled_yields_turn_cancelled() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        t.translate(KEv::TurnComplete { reason: StopReason::Cancelled });
+        let _ = t.drain_kernel_commands();
+        let snap = SessionSnapshot::new(vec![]);
+        let out = t.translate(KEv::Snapshot { snapshot: snap });
+        assert!(matches!(&out[..], [CoreEv::TurnCancelled { .. }]));
+    }
+
+    #[test]
+    fn bare_snapshot_without_pending_finish_is_ignored() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let snap = SessionSnapshot::new(vec![Message::user("hi")]);
+        let out = t.translate(KEv::Snapshot { snapshot: snap });
+        assert!(out.is_empty(), "bare snapshot should be ignored on the kernel path, got {out:?}");
+    }
+
+    #[test]
+    fn task4_turn_started_and_cancelled_do_not_panic() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         assert!(t.translate(KEv::TurnStarted).is_empty());
-        assert!(t
-            .translate(KEv::TurnComplete { reason: Default::default() })
-            .is_empty());
         assert!(t.translate(KEv::Cancelled).is_empty());
-        assert!(t
-            .translate(KEv::Error { message: "x".into(), http_status: None, code: None })
-            .is_empty());
     }
 }
