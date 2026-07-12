@@ -222,6 +222,19 @@ impl KernelToWebui {
         self.plan_mode
     }
 
+    /// The kernel task ended: if a turn was awaiting its deferred `Snapshot` to
+    /// finalize, no Snapshot will ever arrive — synthesize the terminal from an
+    /// EMPTY snapshot so the driver isn't stranded busy. Mirrors bridge's
+    /// kernel-ended `pending_finish` branch (runtime.rs:489). Returns `vec![]` when
+    /// nothing was pending. (The goal/loop/undo/turn_running hold-open branches
+    /// bridge also handles here are deferred on the daemon kernel path.)
+    pub fn terminate_pending(&mut self) -> Vec<CoreEv> {
+        match self.pending_finish.take() {
+            Some(reason) => self.finish_turn(reason, Vec::new()),
+            None => vec![],
+        }
+    }
+
     /// Translate one core command into a direct kernel command.
     ///
     /// Returns `Some(KCmd)` for a command the caller should send straight to the
@@ -601,6 +614,306 @@ impl KernelToWebui {
             // `#[non_exhaustive]` kernel enum: any future variant is silently
             // dropped until a task maps it.
             _ => vec![],
+        }
+    }
+}
+
+// ---------------- kernel-native driver (Task 6a) ----------------
+//
+// The DRIVER wires the `KernelToWebui` translator into a live kernel agent and
+// presents it through the LEGACY (`atomcode_core`) channel protocol, so
+// `spawn_kernel_runtime` is a byte-identical drop-in for
+// `atomcode_bridge::spawn_bridged_runtime` (see runtime.rs:101). The construction
+// (opts_template / prepare / provider / assemble / degraded fallback) and the lean
+// select loop are ported from `atomcode_bridge::runtime::Bridge::run` MINUS all
+// goal / loop / wakeup wiring (deferred on the daemon kernel path).
+
+use atomcode_coding::cc_hooks::HookConfig;
+use atomcode_coding::config::CodingAgentConfig as CodingCfg;
+use atomcode_coding::parts::{prepare_with_plugin_hooks, CodingParts, SessionMode};
+use atomcode_core::agent::AgentClient;
+use tokio::sync::mpsc;
+
+/// A no-op kernel handle: its task drains commands until `Shutdown`, holding the
+/// event sender open so the driver's `handle.events.recv()` never returns `None`
+/// while degraded. Inlined from `Bridge::noop_handle` (runtime.rs:1528) — a
+/// one-line pub there would leak an implementation detail, and the body is trivial.
+fn noop_handle() -> AgentHandle {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<KCmd>();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<KEv>();
+    AgentHandle {
+        commands: cmd_tx,
+        events: ev_rx,
+        task: tokio::spawn(async move {
+            let _keep_alive = ev_tx;
+            loop {
+                match cmd_rx.recv().await {
+                    Some(KCmd::Shutdown) | None => break,
+                    _ => {}
+                }
+            }
+        }),
+    }
+}
+
+/// The kernel-native driver: owns the translator + live kernel handle and pumps
+/// core commands in / core events out. Private — only `spawn_kernel_runtime`
+/// constructs it. Field parity with `Bridge` minus the goal/loop/undo/background
+/// state (deferred on this path).
+struct KernelDriver {
+    /// The resolved coding config (kept for Task 6b respawn: model-switch /
+    /// ChangeDir / SetConversation(non-empty) seeding all re-prepare from it).
+    #[allow(dead_code)]
+    coding_cfg: CodingCfg,
+    /// The prepare template (session Fresh / mcp / memory / web / review). Kept for
+    /// Task 6b respawn (plan-mode toolset applies by re-preparing with this).
+    #[allow(dead_code)]
+    opts_template: PrepareOptions,
+    /// Plugin-contributed inline CC hooks, resolved once and reused across respawns
+    /// (Task 6b). Threaded into `prepare_with_plugin_hooks`.
+    #[allow(dead_code)]
+    plugin_cc_hooks: Vec<HookConfig>,
+    /// The assembled coding parts. Kept for Task 6b respawn (re-mount tools etc.).
+    #[allow(dead_code)]
+    parts: CodingParts,
+    handle: AgentHandle,
+    ev_tx: mpsc::UnboundedSender<CoreEv>,
+    /// The kernel session id this agent persists under. Kept for Task 6b respawn.
+    #[allow(dead_code)]
+    bridge_session: String,
+    /// The kernel-event ↔ core-event / core-command ↔ kernel-command translator.
+    tx: KernelToWebui,
+    /// `true` when provider/assemble failed at construction: the kernel agent is a
+    /// `noop_handle`, so `SendMessage` is answered with a degraded error instead of
+    /// being forwarded (mirrors bridge's degraded SendMessage arm).
+    degraded: bool,
+}
+
+impl KernelDriver {
+    /// The select-loop shell. Biased so `cmd_rx` (Cancel/Shutdown) wins ties.
+    /// Ported from `Bridge::run`'s loop @451 MINUS the goal_eval / wakeup / loop_fire
+    /// arms (deferred). On `Shutdown` (or the driver's command channel closing) it
+    /// sends `KCmd::Shutdown` and bounded-awaits the kernel task (5s, abort on hang).
+    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>) {
+        loop {
+            tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => {
+                        if self.on_command(c) {
+                            break; // Shutdown
+                        }
+                    }
+                    None => break, // driver gone
+                },
+                ev = self.handle.events.recv() => match ev {
+                    Some(e) => self.on_kernel_event(e),
+                    None => {
+                        // Kernel task ended. If a turn was awaiting its deferred
+                        // Snapshot to finalize, synthesize a terminal from an empty
+                        // snapshot so the daemon isn't stranded busy (mirrors bridge's
+                        // pending_finish branch; the goal/loop/undo hold-open branches
+                        // are deferred on this path).
+                        for ce in self.tx.terminate_pending() {
+                            let _ = self.ev_tx.send(ce);
+                        }
+                        let _ = self.ev_tx.send(CoreEv::Error {
+                            error: "engine v2 agent terminated".into(),
+                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                        });
+                        break;
+                    }
+                },
+            }
+        }
+        let _ = self.handle.commands.send(KCmd::Shutdown);
+        // Bounded teardown: a wedged SessionEnd hook must not hang the driver task
+        // forever (mirrors bridge's `await_kernel_or_abort`).
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.handle.task)
+            .await
+            .is_err()
+        {
+            self.handle.task.abort();
+        }
+    }
+
+    /// One kernel event → translate to `0..n` core events, then drain any outbound
+    /// kernel commands the (stateless) translator queued (e.g. the `Snapshot`
+    /// request `TurnComplete` pushes, or a displaced-approval deny).
+    fn on_kernel_event(&mut self, e: KEv) {
+        for ce in self.tx.translate(e) {
+            let _ = self.ev_tx.send(ce);
+        }
+        for kc in self.tx.drain_kernel_commands() {
+            let _ = self.handle.commands.send(kc);
+        }
+    }
+
+    /// One core command in. Returns `true` iff the driver should stop (`Shutdown`).
+    fn on_command(&mut self, c: CoreCmd) -> bool {
+        match c {
+            CoreCmd::Shutdown => true,
+            // Task 6b: seeding an EXISTING conversation needs a respawn-Resume (there
+            // is no in-place `SetMessages` on the kernel). A brand-new (empty)
+            // conversation is a no-op — the fresh-spawned agent already starts empty.
+            CoreCmd::SetConversation(_) => false,
+            // Task 6b: model-switch (ReloadConfig) and ChangeDir re-prepare + respawn
+            // the agent against fresh config/cwd; ClearConversation respawns Fresh.
+            CoreCmd::ReloadConfig(_) | CoreCmd::ChangeDir(_) | CoreCmd::ClearConversation => false,
+            // Degraded guard (mirrors bridge): the kernel agent isn't running, so a
+            // SendMessage can't be answered — surface an actionable error instead of
+            // silently dropping it.
+            CoreCmd::SendMessage { .. } if self.degraded => {
+                let _ = self.ev_tx.send(CoreEv::Error {
+                    error: "engine v2 failed to initialise — the kernel agent is not \
+                            running. Use /model to switch to a working provider, or \
+                            restart atomcode."
+                        .into(),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+                false
+            }
+            // Everything else: translate → forward. `SetPlanMode` sets the translator
+            // flag and returns None (Task 6b: plan toolset applies on the next
+            // respawn); approval decisions become `KCmd::Respond`; etc.
+            other => {
+                if let Some(kc) = self.tx.to_kernel_command(other) {
+                    let _ = self.handle.commands.send(kc);
+                }
+                for kc in self.tx.drain_kernel_commands() {
+                    let _ = self.handle.commands.send(kc);
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Spawn a kernel-native agent presented through the LEGACY channel protocol.
+///
+/// Byte-identical drop-in for [`atomcode_bridge::spawn_bridged_runtime`]
+/// (runtime.rs:101): same signature, same `(AgentClient, ev_rx)` return, same
+/// "returns immediately; prepares asynchronously; the command channel buffers
+/// anything sent meanwhile" contract. Opt-in via `ATOMCODE_DAEMON_ENGINE=kernel`
+/// (see [`engine_is_kernel`]); the daemon defaults to the bridge path.
+///
+/// New-conversations-only in Task 6a: respawn / existing-conversation seeding /
+/// model-switch / ChangeDir are `// Task 6b:` no-ops in `on_command`.
+pub fn spawn_kernel_runtime(
+    cfg: BridgeConfig,
+) -> (AgentClient, mpsc::UnboundedReceiver<CoreEv>) {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CoreCmd>();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<CoreEv>();
+
+    // Mirror bridge's shared registries the (legacy) client carries for the slash
+    // palette / dynamic MCP tools.
+    let tool_registry = Arc::new(atomcode_core::tool::ToolRegistry::new());
+    let skill_registry = Arc::new(std::sync::RwLock::new(
+        atomcode_core::skill::SkillRegistry::new(),
+    ));
+    let client = AgentClient {
+        cmd_tx,
+        tool_registry,
+        skill_registry,
+    };
+
+    tokio::spawn(async move {
+        // ---- CONSTRUCTION (ported from Bridge::run @286-409, minus subagent tiers +
+        //      the schedule_wakeup tool mount, which are deferred here). ----
+        let coding_cfg = coding_config_from_bridge(&cfg);
+        let opts_template = PrepareOptions {
+            session: SessionMode::Fresh,
+            skill_dirs: None,
+            mcp: cfg.mcp,
+            memory: true,
+            web: true,
+            review: true,
+        };
+        let plugin_cc_hooks = atomcode_bridge::gather_plugin_cc_hooks();
+
+        let mut parts = match prepare_with_plugin_hooks(
+            &coding_cfg,
+            opts_template.clone(),
+            plugin_cc_hooks.clone(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // prepare() failed — no parts, so no agent can be built. Report and
+                // keep the event channel alive by draining commands until Shutdown
+                // (inlined, minimal: the daemon just needs the turn to fail cleanly).
+                let _ = ev_tx.send(CoreEv::Error {
+                    error: format!("engine v2 prepare failed: {e}"),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+                keep_alive_until_shutdown(ev_tx, cmd_rx).await;
+                return;
+            }
+        };
+        let bridge_session = parts
+            .session
+            .as_ref()
+            .map(|b| b.id.clone())
+            .unwrap_or_default();
+
+        let provider = match atomcode_bridge::build_provider(&coding_cfg) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let _ = ev_tx.send(CoreEv::Error {
+                    error: format!("engine v2 provider init failed: {e}"),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+                None
+            }
+        };
+        let (handle, degraded) = match provider {
+            Some(provider) => match assemble(&mut parts, &coding_cfg, provider) {
+                Ok(a) => (a.spawn(), false),
+                Err(e) => {
+                    let _ = ev_tx.send(CoreEv::Error {
+                        error: format!("engine v2 assemble failed: {e}"),
+                        snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                    });
+                    (noop_handle(), true)
+                }
+            },
+            None => (noop_handle(), true),
+        };
+
+        let tx = KernelToWebui::new(coding_cfg.context_window, coding_cfg.base_url.clone());
+        let driver = KernelDriver {
+            coding_cfg,
+            opts_template,
+            plugin_cc_hooks,
+            parts,
+            handle,
+            ev_tx,
+            bridge_session,
+            tx,
+            degraded,
+        };
+        driver.run(cmd_rx).await;
+    });
+
+    (client, ev_rx)
+}
+
+/// Drain driver commands until `Shutdown` (or the channel closes) after a failed
+/// `prepare`, holding `ev_tx` open so the daemon's forwarder doesn't see the
+/// channel close prematurely. The initial Error was already sent before entering.
+/// Inlined + minimal parity with `Bridge::keep_alive_loop` (runtime.rs:1554) — the
+/// daemon path does not need the ReloadConfig/SendMessage feedback branches (those
+/// are Task 6b), only a clean drain.
+async fn keep_alive_until_shutdown(
+    ev_tx: mpsc::UnboundedSender<CoreEv>,
+    mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+) {
+    let _hold = ev_tx; // keep the event channel open until the driver is torn down
+    loop {
+        match cmd_rx.recv().await {
+            Some(CoreCmd::Shutdown) | None => break,
+            _ => {}
         }
     }
 }
@@ -1433,5 +1746,67 @@ mod kernel_runtime_translate_tests {
         assert!(t.to_kernel_command(CoreCmd::ReloadHooks).is_none());
         assert!(t.to_kernel_command(CoreCmd::ClearGoal).is_none());
         assert!(t.to_kernel_command(CoreCmd::ClearLoop).is_none());
+    }
+}
+
+#[cfg(test)]
+mod kernel_runtime_driver_tests {
+    use super::*;
+    use atomcode_core::agent::AgentCommand as CoreCmd;
+    use std::path::PathBuf;
+
+    /// A non-gateway OpenAI-compat config so `build_provider` needs no request
+    /// signer (a `localhost` base_url is not the AtomGit gateway) — construction
+    /// succeeds without network or auth. A full turn needs a live provider (Task 7
+    /// manual verification); here we assert construction + Shutdown teardown only.
+    fn local_openai_cfg() -> BridgeConfig {
+        BridgeConfig {
+            api_key: "sk-test".into(),
+            base_url: "http://localhost:9/v1".into(),
+            model: "gpt-4o-mini".into(),
+            working_dir: PathBuf::from("."),
+            context_window: 128_000,
+            max_tokens: None,
+            mcp: false,
+            telemetry: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            provider_type: "openai".into(),
+            thinking_enabled: None,
+            thinking_type: None,
+            thinking_keep: None,
+            dangerously_skip_permissions: false,
+            interactive: true,
+            keep_interrupted_context: false,
+            user_agent: None,
+            skip_tls_verify: false,
+            loop_max_rounds: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_client_and_rx_then_shutdown_closes_it() {
+        let (client, mut rx) = spawn_kernel_runtime(local_openai_cfg());
+
+        // Send Shutdown → the driver's `on_command` returns true, breaks the select
+        // loop, tears down the kernel agent, and the driver task ends → `ev_tx` drops
+        // → `rx` closes. Bound the wait so a wedge fails loudly instead of hanging.
+        client
+            .cmd_tx
+            .send(CoreCmd::Shutdown)
+            .expect("command channel open");
+
+        // Drain any construction events (e.g. a provider/assemble Error is fine — the
+        // point of THIS test is teardown, not a successful provider) until the channel
+        // closes. `recv()` returns `None` once the driver task drops `ev_tx`.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if rx.recv().await.is_none() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "driver did not tear down within 5s after Shutdown");
     }
 }

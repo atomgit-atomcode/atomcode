@@ -735,7 +735,11 @@ impl TurnExecutor for KernelTurnExecutor {
             };
             let provider_name = self.resolve_provider_name();
             let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
+            let (client, rx) = if crate::kernel_runtime::engine_is_kernel() {
+                crate::kernel_runtime::spawn_kernel_runtime(cfg)
+            } else {
+                atomcode_bridge::spawn_bridged_runtime(cfg)
+            };
             *guard = Some(BridgeState {
                 client,
                 events: rx,
@@ -1393,7 +1397,11 @@ pub(crate) async fn run_chat_turn_v2(
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+    let (client, mut events) = if crate::kernel_runtime::engine_is_kernel() {
+        crate::kernel_runtime::spawn_kernel_runtime(bridge_cfg)
+    } else {
+        atomcode_bridge::spawn_bridged_runtime(bridge_cfg)
+    };
 
     // Seed the bridge from conv (which already has the just-sent user message), then
     // send that message to actually run the turn.

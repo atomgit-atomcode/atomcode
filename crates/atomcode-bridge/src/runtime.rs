@@ -153,7 +153,7 @@ struct TurnStats {
 /// [`PluginCcHook`](atomcode_core::plugin::loader::PluginCcHook) specs and we lift each into
 /// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
 /// plugin manifests from disk) and reused across respawns.
-fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+pub fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
     atomcode_core::plugin::loader::installed_plugin_cc_hooks()
         .into_iter()
         .filter_map(|h| {
@@ -2558,7 +2558,7 @@ fn provider_init_event(e: &anyhow::Error) -> CoreEv {
     provider_init_event_for(atomcode_core::auth::is_logged_in(), e)
 }
 
-fn build_provider(
+pub fn build_provider(
     cfg: &CodingAgentConfig,
 ) -> anyhow::Result<Arc<dyn atomcode_kernel::provider::LlmProvider>> {
     use atomcode_capabilities::provider::{
