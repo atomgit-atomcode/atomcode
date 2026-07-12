@@ -34,6 +34,8 @@ regex = { version = "1", optional = true }
 # on a large file); skips binary; pairs with the `ignore` walker above.
 grep = { version = "0.3", optional = true }
 globset = { version = "0.4", optional = true }
+# Real line diff for edit_file's compact diff (git-style unified hunks + line numbers).
+similar = { workspace = true, optional = true }
 # Decode subprocess (bash) output that isn't UTF-8: CJK Windows consoles emit OEM
 # codepage bytes (GBK/CP936, Big5, …), which otherwise render as `◇◇◇` mojibake.
 encoding_rs = { version = "0.8", optional = true }
@@ -78,7 +80,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.

@@ -38,3 +38,4 @@ description = "Open-source terminal AI coding agent"
 [workspace.dependencies]
 agent-client-protocol = "=1.0.1"
 anyhow = "1"
+similar = "2"

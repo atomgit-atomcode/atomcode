@@ -120,7 +120,7 @@ impl Tool for EditFileTool {
                 if let Err(e) = tokio::fs::write(&path, &fuzzy_result).await {
                     return err(format!("edit_file: failed to write {}: {e}", crate::pathnorm::to_display(&path)));
                 }
-                let diff = build_compact_diff(&a.old_string, &a.new_string);
+                let diff = build_compact_diff(&content, &fuzzy_result);
                 return ok(format!(
                     "Edited {} (fuzzy whitespace match, {fuzzy_count} replacement{})\n{}",
                     crate::pathnorm::to_display(&path),
@@ -164,7 +164,7 @@ impl Tool for EditFileTool {
             ));
         }
         let replaced = if a.replace_all { count } else { 1 };
-        let diff = build_compact_diff(&a.old_string, &a.new_string);
+        let diff = build_compact_diff(&content, &updated);
         ok(format!(
             "Edited {} ({replaced} replacement{})\n{}",
             crate::pathnorm::to_display(&path),
@@ -174,33 +174,27 @@ impl Tool for EditFileTool {
     }
 }
 
-fn build_compact_diff(old: &str, new: &str) -> String {
-    let mut diff = String::new();
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-    let max_show = 4;
-
-    for (i, line) in old_lines.iter().take(max_show).enumerate() {
-        diff.push_str(&format!("- {}\n", line));
-        if i == max_show - 1 && old_lines.len() > max_show {
-            diff.push_str(&format!(
-                "  ... ({} more removed)\n",
-                old_lines.len() - max_show
-            ));
-        }
+/// A compact GIT UNIFIED DIFF (`@@` hunks, 3 lines of context) between the OLD
+/// and NEW whole-file contents, capped so a large edit can't flood the model
+/// context / transcript. The TUI re-parses this into a line-numbered, color-
+/// coded diff block; the model reads it as a normal unified diff.
+fn build_compact_diff(old_file: &str, new_file: &str) -> String {
+    const MAX_DIFF_LINES: usize = 60;
+    let full = similar::TextDiff::from_lines(old_file, new_file)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
+    let full = full.trim_end();
+    let lines: Vec<&str> = full.lines().collect();
+    if lines.len() <= MAX_DIFF_LINES {
+        return full.to_string();
     }
-
-    for (i, line) in new_lines.iter().take(max_show).enumerate() {
-        diff.push_str(&format!("+ {}\n", line));
-        if i == max_show - 1 && new_lines.len() > max_show {
-            diff.push_str(&format!(
-                "  ... ({} more added)\n",
-                new_lines.len() - max_show
-            ));
-        }
-    }
-
-    diff.trim_end().to_string()
+    let mut out = lines[..MAX_DIFF_LINES].join("\n");
+    out.push_str(&format!(
+        "\n… ({} more diff lines)",
+        lines.len() - MAX_DIFF_LINES
+    ));
+    out
 }
 
 /// Number of leading whitespace **characters** in `s`. Counts Unicode
@@ -353,21 +347,33 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("- let x = 1;"), "{}", r.content);
-        assert!(r.content.contains("+ let x = 2;"), "{}", r.content);
+        assert!(r.content.contains("-    let x = 1;"), "{}", r.content);
+        assert!(r.content.contains("+    let x = 2;"), "{}", r.content);
         let on_disk = std::fs::read_to_string(d.path().join("a.rs")).unwrap();
         assert!(on_disk.contains("let x = 2;"), "{on_disk}");
     }
 
     #[test]
-    fn compact_diff_truncates_each_side() {
-        let old = "1\n2\n3\n4\n5";
-        let new = "a\nb\nc\nd\ne";
+    fn compact_diff_is_unified_with_line_numbers() {
+        // Whole-file old vs new; a real diff must produce a `@@` hunk header whose
+        // new-side start reflects the changed line's position in the file.
+        let old = "fn main() {\n    let x = 1;\n}\n";
+        let new = "fn main() {\n    let x = 2;\n}\n";
         let diff = build_compact_diff(old, new);
-        assert!(diff.contains("- 1"), "{diff}");
-        assert!(diff.contains("... (1 more removed)"), "{diff}");
-        assert!(diff.contains("+ a"), "{diff}");
-        assert!(diff.contains("... (1 more added)"), "{diff}");
+        assert!(diff.contains("@@"), "must be a unified diff with a hunk header: {diff}");
+        assert!(diff.contains("-    let x = 1;"), "removed line present: {diff}");
+        assert!(diff.contains("+    let x = 2;"), "added line present: {diff}");
+        // The change is on file line 2, which falls within lines 1-3 shown in the hunk header.
+        assert!(diff.contains("@@ -1,3 +1,3 @@"), "hunk header shows lines 1-3: {diff}");
+    }
+
+    #[test]
+    fn compact_diff_caps_huge_diffs() {
+        let old = String::new();
+        let new: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let diff = build_compact_diff(&old, &new);
+        assert!(diff.lines().count() <= 61, "capped: {} lines", diff.lines().count());
+        assert!(diff.contains("more diff lines"), "shows a truncation note: {diff}");
     }
 
     #[tokio::test]
