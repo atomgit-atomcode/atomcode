@@ -4022,10 +4022,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: tools & diffs ──
             UiLine::ToolCallInFlight { id, name, detail, hint } => {
+                // Capture BEFORE the mark mutates the flag (mirrors the static
+                // ToolCall arm) so we can add one blank row of breathing room
+                // between assistant text and this tool.
+                let prev_was_assistant = self.last_mark_was_assistant;
                 self.clear_live_spinner();
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
+                // `prev_was_assistant` implies no in-flight tool to preempt (a
+                // preempt means the previous mark was a tool, not assistant), so
+                // this blank never lands between the strip and a preempted commit.
+                if prev_was_assistant {
+                    self.push_body_row(Vec::new());
+                }
                 // Parallel tool calls are rare but not impossible. If
                 // one is already animating, freeze it before starting
                 // a new one — single-at-a-time animation is a deliberate
@@ -4074,6 +4084,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 header,
                 children,
             } => {
+                // Capture BEFORE the mark mutates the flag (mirrors the static
+                // ToolCall arm) so we can add one blank row of breathing room
+                // between assistant text and this tool batch.
+                let prev_was_assistant = self.last_mark_was_assistant;
                 self.clear_live_spinner();
                 // Mark the batch header as a ToolCall anchor — Alt+↑/↓
                 // (message-jump) walks `message_marks`; without this
@@ -4083,6 +4097,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
+                if prev_was_assistant {
+                    self.push_body_row(Vec::new());
+                }
                 // Push header + N child rows as single-line rows so
                 // body_lines indices map 1:1 with terminal positions.
                 // push_body_row clears any prior live_group, including
@@ -9691,18 +9708,17 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: bold + bright cyan (SGR 96). The markdown crate
-        // now colours inline code the same as headings and code-block
-        // chrome, using the 16-colour SGR palette so the terminal theme
-        // remaps the actual shade. In CellStyle this arrives as
+        // Inline code: bright cyan (SGR 96) but NOT bold (bold made it flare in
+        // dense prose — weight is reserved for **bold**). The 16-colour SGR lets
+        // the terminal theme remap the shade; in CellStyle this arrives as
         // `Color::Cyan` (crossterm's name for SGR 96 / bright cyan).
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
         assert!(
-            code_cell.bold,
-            "inline code cell should be bold: {:?}",
+            !code_cell.bold,
+            "inline code cell must NOT be bold (de-flare): {:?}",
             code_cell
         );
         assert_eq!(
