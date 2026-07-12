@@ -52,11 +52,18 @@ impl StatusReminderHook {
                 ctx.used_tokens, ctx.context_window, pct
             ));
         }
-        // Round budget within the current turn.
-        match ctx.max_rounds {
-            Some(max) => lines.push(format!("Turn round: {} of {} (max)", ctx.round, max)),
-            None => lines.push(format!("Turn round: {}", ctx.round)),
-        }
+        // Turn round counter — the CURRENT round only, deliberately WITHOUT the
+        // `of {max} (max)` ceiling. Surfacing the ceiling ("48 of 50 (max)")
+        // reads as a countdown that pressures weaker models (deepseek-v4-flash)
+        // into rushing to declare the task "done" before running out of rounds
+        // — a FALSE completion that unravels on the next question. A bare
+        // progress counter keeps pacing awareness without the countdown.
+        // (codex exposes remaining budget as an on-demand tool, not a per-turn
+        // push; opencode injects no countdown at all. The anti-false-completion
+        // guardrail lives in the persona's EXECUTION DISCIPLINE section.)
+        // (`ctx.max_rounds` stays available to other hooks — e.g. cc-hooks in
+        // hooks.rs — it is simply no longer surfaced to the model here.)
+        lines.push(format!("Turn round: {}", ctx.round));
         crate::reminder::system_reminder(&lines.join("\n"))
     }
 }
@@ -109,7 +116,12 @@ mod tests {
         assert!(!s.contains("local time"), "must not carry wall-clock time: {s}");
         assert!(!s.contains("17:34"), "must not carry wall-clock time: {s}");
         assert!(s.contains("Context window: 40000 / 128000 tokens used (31%)"), "usage: {s}");
-        assert!(s.contains("Turn round: 3 of 50 (max)"), "round budget: {s}");
+        // Round counter shows the CURRENT round only — the `of N (max)` ceiling
+        // is deliberately NOT surfaced (countdown pressures weak models into
+        // false completions; see render() + persona EXECUTION DISCIPLINE).
+        assert!(s.contains("Turn round: 3"), "round counter: {s}");
+        assert!(!s.contains("(max)"), "no countdown ceiling: {s}");
+        assert!(!s.contains("of 50"), "no `of N` countdown framing: {s}");
     }
 
     #[test]
@@ -117,7 +129,8 @@ mod tests {
         let dt = Local.with_ymd_and_hms(2026, 6, 15, 9, 0, 0).single().unwrap();
         let s = StatusReminderHook::render(dt, &ctx(2, 0, 0));
         assert!(!s.contains("Context window"), "no context line when window=0: {s}");
-        assert!(s.contains("Turn round: 2 of 50"), "{s}");
+        assert!(s.contains("Turn round: 2"), "{s}");
+        assert!(!s.contains("(max)"), "no countdown ceiling even when window unknown: {s}");
     }
 
     #[tokio::test]
