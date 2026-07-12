@@ -31,6 +31,7 @@ mod api_config;
 mod api_provider;
 pub mod approval_mode;
 mod commands;
+pub(crate) mod kernel_runtime;
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
