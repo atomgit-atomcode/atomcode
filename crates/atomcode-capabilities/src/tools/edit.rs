@@ -180,7 +180,15 @@ impl Tool for EditFileTool {
 /// coded diff block; the model reads it as a normal unified diff.
 fn build_compact_diff(old_file: &str, new_file: &str) -> String {
     const MAX_DIFF_LINES: usize = 60;
-    let full = similar::TextDiff::from_lines(old_file, new_file)
+    // Bound the Myers diff with a deadline: this runs synchronously on the async
+    // executor thread over the WHOLE file, and two large, mostly-different files
+    // (e.g. replacing a minified blob) can otherwise spin for a long time and
+    // stall the event loop. On timeout `similar` returns a coarser-but-valid
+    // diff instead of hanging (same guard codex uses).
+    let mut config = similar::TextDiff::configure();
+    config.timeout(std::time::Duration::from_millis(200));
+    let full = config
+        .diff_lines(old_file, new_file)
         .unified_diff()
         .context_radius(3)
         .to_string();
