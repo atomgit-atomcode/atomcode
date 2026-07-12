@@ -18,6 +18,9 @@ atomcode-updater = { path = "../atomcode-updater" }
 # server + password modal via that path.
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory"] }
 atomcode-core = { path = "../atomcode-core" }
+# INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
+# coding agent explores the repo and writes AGENTS.md via its tools.
+atomcode-coding = { path = "../atomcode-coding" }
 zeroize = "1"
 atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }

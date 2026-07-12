@@ -17,7 +17,6 @@ pub mod git;
 pub mod glyph;
 pub mod highlight;
 pub mod i18n;
-pub mod init;
 pub mod input;
 pub mod pricing;
 pub mod version_check;

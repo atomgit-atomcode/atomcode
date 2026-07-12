@@ -520,12 +520,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /background <task description>\n".into(),
 
         // ── /init ──
-        Msg::InitAlreadyExists { path } =>
-            format!("  {} already exists. Use `/init --force` to overwrite.\n", path).into(),
-        Msg::InitWrote { path, bytes } =>
-            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next message.\n", path, bytes).into(),
-        Msg::InitFailed { error } =>
-            format!("  /init failed: {}\n", error).into(),
+        Msg::InitKickoff =>
+            "  Analyzing the project and generating AGENTS.md…\n".into(),
 
         // ── /cd ──
         Msg::CdWorkingDir { cwd } =>
@@ -787,7 +783,7 @@ Msg::CmdDescSetup =>
         Msg::CmdDescConfig => "Show config path".into(),
         Msg::CmdDescReload => "Reload $ATOMCODE_HOME/config.toml from disk".into(),
         Msg::CmdDescCd => "Change working directory".into(),
-Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
+Msg::CmdDescInit => "Analyze the project and generate AGENTS.md".into(),
 Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),
 Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
         Msg::CmdDescDiff => "Show git diff".into(),

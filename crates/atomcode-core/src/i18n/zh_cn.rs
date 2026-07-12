@@ -508,12 +508,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/background <任务描述>\n".into(),
 
         // ── /init ──
-        Msg::InitAlreadyExists { path } =>
-            format!("  {} 已存在。使用 `/init --force` 覆盖。\n", path).into(),
-        Msg::InitWrote { path, bytes } =>
-            format!("  已写入 {}（{} 字节）。编辑以自定义；下一条消息生效。\n", path, bytes).into(),
-        Msg::InitFailed { error } =>
-            format!("  /init 失败：{}\n", error).into(),
+        Msg::InitKickoff =>
+            "  正在分析项目并生成 AGENTS.md…\n".into(),
 
         // ── /cd ──
         Msg::CdWorkingDir { cwd } =>
@@ -774,7 +770,7 @@ Msg::CmdDescSetup =>
         Msg::CmdDescConfig => "显示配置文件路径".into(),
         Msg::CmdDescReload => "从磁盘重新加载 $ATOMCODE_HOME/config.toml".into(),
         Msg::CmdDescCd => "切换工作目录".into(),
-Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
+Msg::CmdDescInit => "分析项目并生成 AGENTS.md".into(),
 Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),
 Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
         Msg::CmdDescDiff => "显示 git diff".into(),

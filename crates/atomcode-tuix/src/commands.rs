@@ -90,7 +90,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "config",  desc: "Show config path", needs_args: false },
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
     Command { name: "cd",      desc: "Change working directory", needs_args: false },
-    Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
+    Command { name: "init",    desc: "Analyze the project and generate AGENTS.md", needs_args: false },
     Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
     Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },

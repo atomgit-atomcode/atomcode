@@ -2339,50 +2339,11 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "init" => {
-            // Generate .atomcode.md from project structure. Refuses to
-            // overwrite by default — `/init --force` opts in. The file is
-            // picked up by agent::prompt next time the system prompt is
-            // built; in-flight turns finish on the old prompt.
-            let target = ctx.working_dir.join(".atomcode.md");
-            let force = matches!(arg.trim(), "--force" | "force");
-            if target.exists() && !force {
-                let path_str = target.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::InitAlreadyExists { path: &path_str }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-            let content = crate::init::generate_project_instructions(&ctx.working_dir);
-            match std::fs::write(&target, &content) {
-                Ok(()) => {
-                    let path_str = target.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote {
-                            path: &path_str,
-                            bytes: content.len(),
-                        })
-                        .into_owned(),
-                    ));
-                    // Confirm the file is reachable for the prompt-builder by
-                    // re-running the same load that `/status` uses. If the
-                    // freshly written file does NOT appear under PROJECT here,
-                    // the user knows immediately — instead of asking the AI
-                    // a question and trying to infer load state from its
-                    // answer.
-                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
-                        &ctx.working_dir,
-                    )));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::InitFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
-            }
+            // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
+            // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
+            // static .atomcode.md generator.
+            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
         "mcp" => {
@@ -6415,5 +6376,11 @@ mod todo_command_tests {
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
+    }
+
+    #[test]
+    fn init_submits_the_coding_init_prompt() {
+        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
+        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
     }
 }

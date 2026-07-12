@@ -376,9 +376,7 @@ pub enum Msg<'a> {
     BackgroundUsage,
 
     // ── /init ──
-    InitAlreadyExists { path: &'a str },
-    InitWrote { path: &'a str, bytes: usize },
-    InitFailed { error: &'a str },
+    InitKickoff,
 
     // ── /cd ──
     CdWorkingDir { cwd: &'a str },
