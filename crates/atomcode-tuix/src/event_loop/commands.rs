@@ -30,6 +30,7 @@ use crate::modals::{
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
+use atomcode_capabilities::memory::MemoryStore;
 use atomcode_core::agent::AgentCommand;
 use atomcode_config::config::Config;
 use atomcode_core::session::{Session, SessionId, SessionManager};
@@ -1596,42 +1597,51 @@ fn execute_slash_command_impl(
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
                 renderer.flush();
             } else {
-                let (content, global) = if text.starts_with("--global ") {
-                    (text[9..].trim().to_string(), true)
+                let (content, global) = if let Some(rest) = text.strip_prefix("--global ") {
+                    (rest.trim().to_string(), true)
                 } else {
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
-                    renderer.flush();
                 } else {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::Remember { content, global })
-                        .ok();
+                    let store = if global { MemoryStore::global() } else { MemoryStore::project(&ctx.working_dir) };
+                    match store.append(&content) {
+                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
+                            "Remembered ({}): {content}", if global { "global" } else { "project" }
+                        ))),
+                        Err(e) => renderer.render(UiLine::Error(format!("Failed to remember: {e}"))),
+                    }
                 }
+                renderer.flush();
             }
         }
         "forget" => {
             let keyword = arg.trim();
             if keyword.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
-                renderer.flush();
             } else {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::Forget {
-                        keyword: keyword.to_string(),
-                    })
-                    .ok();
+                let mut removed = MemoryStore::project(&ctx.working_dir).remove_matching(keyword).unwrap_or_default();
+                removed.extend(MemoryStore::global().remove_matching(keyword).unwrap_or_default());
+                let msg = if removed.is_empty() {
+                    format!("No memory entries matched '{keyword}'.")
+                } else {
+                    format!("Forgot {} entr{}.", removed.len(), if removed.len() == 1 { "y" } else { "ies" })
+                };
+                renderer.render(UiLine::CommandOutput(msg));
             }
+            renderer.flush();
         }
         "memory" => {
-            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&ctx.working_dir);
+            let name = ctx.working_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+            let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
+            let out = if merged.trim().is_empty() { "(memory is empty)".to_string() } else { merged };
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
         }
         "webui" => {
             let a = arg.trim();
@@ -6352,6 +6362,21 @@ mod tests {
             CopyResolve::Text(s, _) => assert_eq!(s, "b()"),
             other => panic!("expected last block, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_command_tests {
+    #[test]
+    fn remember_project_writes_directly_to_store() {
+        use atomcode_capabilities::memory::MemoryStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::project(tmp.path());
+        // 迁移后 /remember 走 MemoryStore::project(cwd).append —— 这里直接验证 store 语义,
+        // 命令臂在 Step 4 改为调用它。
+        store.append("uses tabs not spaces").unwrap();
+        let entries = MemoryStore::project(tmp.path()).load();
+        assert!(entries.iter().any(|e| e == "uses tabs not spaces"));
     }
 }
 
