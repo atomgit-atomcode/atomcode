@@ -53,6 +53,25 @@ impl Mode {
     }
     pub fn is_plan(self) -> bool { matches!(self, Mode::Plan) }
     pub fn is_auto(self) -> bool { matches!(self, Mode::Auto) }
+    /// The `(plan_mode, bypass_mode)` enforcement flags this mode maps to — the
+    /// authoritative decomposition the bridge applies to its two atomics.
+    /// Exhaustive so a new variant forces an update here.
+    pub fn to_flags(self) -> (bool, bool) {
+        match self {
+            Mode::Build => (false, false),
+            Mode::Auto => (false, true),
+            Mode::Plan => (true, false),
+        }
+    }
+    /// Canonical wire string (`build`/`plan`/`bypass`). Must match the serde
+    /// rename on the enum above; the `mode_wire_matches_serde` test locks that.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Mode::Build => "build",
+            Mode::Auto => "bypass",
+            Mode::Plan => "plan",
+        }
+    }
     /// Stable ASCII label (status/telemetry). UI display uses i18n glyphs.
     pub fn label(self) -> &'static str {
         match self {
@@ -82,6 +101,21 @@ mod mode_tests {
         assert_eq!(serde_json::to_string(&Mode::Auto).unwrap(), "\"bypass\"");
         assert_eq!(serde_json::to_string(&Mode::Plan).unwrap(), "\"plan\"");
         assert_eq!(serde_json::from_str::<Mode>("\"bypass\"").unwrap(), Mode::Auto);
+    }
+    #[test]
+    fn mode_flags_and_predicates() {
+        assert_eq!(Mode::Build.to_flags(), (false, false));
+        assert_eq!(Mode::Auto.to_flags(), (false, true));
+        assert_eq!(Mode::Plan.to_flags(), (true, false));
+        assert!(Mode::Auto.is_auto() && !Mode::Auto.is_plan());
+        assert!(Mode::Plan.is_plan() && !Mode::Plan.is_auto());
+        assert!(!Mode::Build.is_auto() && !Mode::Build.is_plan());
+    }
+    #[test]
+    fn mode_wire_matches_serde() {
+        for m in [Mode::Build, Mode::Auto, Mode::Plan] {
+            assert_eq!(format!("\"{}\"", m.wire()), serde_json::to_string(&m).unwrap());
+        }
     }
 }
 

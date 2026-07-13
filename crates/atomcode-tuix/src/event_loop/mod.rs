@@ -7894,11 +7894,6 @@ pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> Agen
     }
 }
 
-/// True iff the current mode auto-approves tool calls without a panel.
-pub(crate) fn approval_should_auto_bypass(mode: crate::state::AgentMode) -> bool {
-    matches!(mode, crate::state::AgentMode::Auto)
-}
-
 /// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
 /// auto-resolves. A named function so the `handle_agent_event` short-circuit
 /// and its test share one source of truth.
@@ -7962,14 +7957,6 @@ mod bypass_approval_tests {
         assert!(matches!(super::approval_kind_to_command(ApprovalKind::AllowOnce), AgentCommand::ApproveTool));
         assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
         assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
-    }
-
-    #[test]
-    fn auto_mode_bypasses_approval() {
-        use crate::state::AgentMode;
-        assert!(super::approval_should_auto_bypass(AgentMode::Auto));
-        assert!(!super::approval_should_auto_bypass(AgentMode::Build));
-        assert!(!super::approval_should_auto_bypass(AgentMode::Plan));
     }
 }
 
@@ -9106,7 +9093,7 @@ fn handle_agent_event(
             // bypass to webui peers attached to the same LiveSession).
             // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
             // and to the local agent otherwise.
-            if approval_should_auto_bypass(state.agent_mode) {
+            if state.agent_mode.is_auto() {
                 deliver_approval(ctx, bypass_approval_command());
                 return;
             }

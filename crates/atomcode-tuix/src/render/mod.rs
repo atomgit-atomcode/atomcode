@@ -463,12 +463,13 @@ pub struct StatusLine {
     /// run, so the user wants this prominent.
     pub mode_indicator: Option<String>,
     /// Right-aligned bypass indicator, appended after `hint` on the
-    /// right side of the status row. Shown when
-    /// `--dangerously-skip-permissions / -y` is active, rendering a
-    /// yellow warning badge so the user is always aware that all tool
-    /// calls are auto-approved. Kept separate from `mode_indicator`
-    /// (left-aligned PLAN/Build badge) so BYPASS does not displace
-    /// the mode indicator.
+    /// right side of the status row. Shown whenever the execution mode is
+    /// `Auto` (auto-approve all tools) — whether entered via
+    /// `--dangerously-skip-permissions / -y` at startup or the `/auto` /
+    /// Tab cycle at runtime — rendering a yellow warning badge so the user
+    /// is always aware that all tool calls are auto-approved. Kept separate
+    /// from `mode_indicator` (left-aligned PLAN badge) so it does not
+    /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after

@@ -1071,7 +1071,7 @@ impl Bridge {
                 }
             }
             CoreCmd::SetMode(mode) => {
-                let (plan_on, bypass_on) = mode_to_flags(mode);
+                let (plan_on, bypass_on) = mode.to_flags();
                 let was_plan = self
                     .parts
                     .plan_mode
@@ -2061,17 +2061,6 @@ impl Bridge {
 /// path does.
 fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
     skip_permissions.then(ApprovalResponse::allow)
-}
-
-/// Translate a Mode into the (plan_mode, bypass_mode) atomic pair the bridge
-/// enforces. Pure seam so the mapping is unit-testable.
-pub(crate) fn mode_to_flags(mode: atomcode_core::agent::Mode) -> (bool, bool) {
-    use atomcode_core::agent::Mode;
-    match mode {
-        Mode::Build => (false, false),
-        Mode::Auto => (false, true),
-        Mode::Plan => (true, false),
-    }
 }
 
 /// TAKE a parked approval out of the bridge's mirror and return the kernel command
@@ -3591,13 +3580,3 @@ mod ai_name_tests {
     }
 }
 
-#[cfg(test)]
-mod mode_flag_tests {
-    #[test]
-    fn mode_to_flags_maps_all_three() {
-        use atomcode_core::agent::Mode;
-        assert_eq!(super::mode_to_flags(Mode::Build), (false, false));
-        assert_eq!(super::mode_to_flags(Mode::Auto), (false, true));
-        assert_eq!(super::mode_to_flags(Mode::Plan), (true, false));
-    }
-}

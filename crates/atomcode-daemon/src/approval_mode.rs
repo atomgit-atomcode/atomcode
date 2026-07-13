@@ -3,13 +3,8 @@
 /// where the old `Bypass` is `Mode::Auto`).
 pub use atomcode_core::agent::Mode as ApprovalMode;
 
-pub(crate) fn approval_mode_wire(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Build => "build",
-        ApprovalMode::Auto => "bypass",
-        ApprovalMode::Plan => "plan",
-    }
-}
+// Wire strings come from `ApprovalMode::wire()` (core), which the core
+// `mode_wire_matches_serde` test locks against the serde rename.
 
 #[cfg(test)]
 mod tests {
@@ -26,7 +21,7 @@ mod tests {
             let back: ApprovalMode =
                 serde_json::from_str(&format!("\"{wire}\"")).expect("deserialize mode");
             assert_eq!(back, mode);
-            assert_eq!(approval_mode_wire(mode), wire);
+            assert_eq!(mode.wire(), wire);
         }
 
         assert_eq!(ApprovalMode::default(), ApprovalMode::Build);

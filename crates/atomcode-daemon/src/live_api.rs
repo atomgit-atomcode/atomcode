@@ -30,7 +30,7 @@ use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use crate::approval_mode::{approval_mode_wire, ApprovalMode};
+pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
@@ -69,7 +69,7 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 
 /// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
 fn live_current_mode_wire() -> String {
-    approval_mode_wire(live_current_approval_mode()).to_string()
+    live_current_approval_mode().wire().to_string()
 }
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
@@ -130,7 +130,7 @@ pub fn live_set_provider(provider: String) {
 pub fn live_set_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     if let Some(s) = current_live_session() {
-        s.notify_mode_changed(approval_mode_wire(mode).to_string());
+        s.notify_mode_changed(mode.wire().to_string());
     }
 }
 
