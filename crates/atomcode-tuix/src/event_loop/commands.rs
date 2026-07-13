@@ -4971,10 +4971,10 @@ mod status_login_tests {
     #[test]
     fn status_body_no_longer_shows_a_token_line() {
         // /status is a quick-glance state view; per-session token count is /cost's job.
-        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
+        let en = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::En, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
-        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
+        let zh = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::ZhCn, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
         assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
@@ -6326,7 +6326,7 @@ mod memory_command_tests {
 mod todo_command_tests {
     use super::format_todo_command;
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
 
     #[test]

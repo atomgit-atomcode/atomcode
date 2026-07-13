@@ -1851,8 +1851,8 @@ mod tests {
     /// step 3 render must come out ASCII-only.
     #[test]
     fn draw_setup_lines_ascii_fallback_produces_pure_ascii_box() {
-        let _g = atomcode_core::i18n::test_lock();
-        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let _g = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
         let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
         for bad in ['┌', '┐', '└', '┘', '─', '│', '●', '○', '·', '←', '•'] {
@@ -1874,8 +1874,8 @@ mod tests {
     /// border zig-zagging).
     #[test]
     fn draw_panel_ascii_fallback_right_border_column_aligned() {
-        let _g = atomcode_core::i18n::test_lock();
-        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let _g = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
         // Drop the step header row that sits ABOVE the panel — it's
         // not bordered.

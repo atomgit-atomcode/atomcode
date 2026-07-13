@@ -2373,7 +2373,7 @@ impl std::fmt::Display for SourceBuildGatewayUnsupported {
         write!(
             f,
             "{}",
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::GatewayAuthUnavailable {
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::GatewayAuthUnavailable {
                 base_url: &self.base_url,
             })
         )
@@ -2400,12 +2400,12 @@ impl std::error::Error for SourceBuildGatewayUnsupported {}
 fn provider_init_event_for(logged_in: bool, e: &anyhow::Error) -> CoreEv {
     if e.downcast_ref::<SourceBuildGatewayUnsupported>().is_some() {
         return CoreEv::Warning(
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitSourceBuild).into_owned(),
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ProviderInitSourceBuild).into_owned(),
         );
     }
     if logged_in {
         CoreEv::Error {
-            error: atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitFailed {
+            error: atomcode_config::i18n::t(atomcode_config::i18n::Msg::ProviderInitFailed {
                 detail: &e.to_string(),
             })
             .into_owned(),
@@ -2413,7 +2413,7 @@ fn provider_init_event_for(logged_in: bool, e: &anyhow::Error) -> CoreEv {
         }
     } else {
         CoreEv::Warning(
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::ProviderInitNeedsLogin).into_owned(),
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ProviderInitNeedsLogin).into_owned(),
         )
     }
 }
@@ -2675,7 +2675,7 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
     if http_status == Some(401)
         && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
     {
-        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+        return atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatAuthExpired).to_string();
     }
     message
 }
@@ -2692,7 +2692,7 @@ fn compaction_mark_label(
     bytes_after: usize,
     before_tokens: usize,
 ) -> String {
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
     let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
     if removed > 0 {
@@ -2710,7 +2710,7 @@ fn compaction_mark_label(
 /// "(… would not save tokens: X → Y)" when a summary was built but didn't
 /// shrink. The auto path stays silent on a no-op (no user action to ack).
 fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
     let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
     let before = fmt_k_tokens(before_tokens);

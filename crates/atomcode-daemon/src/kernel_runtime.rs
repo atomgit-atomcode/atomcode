@@ -1226,7 +1226,7 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
     if http_status == Some(401)
         && atomcode_core::coding_plan::crypto::is_atomgit_gateway(base_url)
     {
-        return atomcode_core::i18n::t(atomcode_core::i18n::Msg::ChatAuthExpired).to_string();
+        return atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatAuthExpired).to_string();
     }
     message
 }
@@ -1241,7 +1241,7 @@ fn compaction_mark_label(
     bytes_after: usize,
     before_tokens: usize,
 ) -> String {
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
     let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
     if removed > 0 {
@@ -1257,7 +1257,7 @@ fn compaction_mark_label(
 /// Inline note for a manual `/compact` that did NOT commit (nothing to drop).
 #[allow(dead_code)]
 fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
     let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
     let before = fmt_k_tokens(before_tokens);

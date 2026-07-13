@@ -1,5 +1,5 @@
 use atomcode_core::agent::{AgentClient, AgentEvent};
-use atomcode_core::i18n::{t, Msg};
+use atomcode_config::i18n::{t, Msg};
 use atomcode_core::session::{Session, SessionManager};
 
 pub const MAX_BACKGROUND_SLOTS: usize = 16;

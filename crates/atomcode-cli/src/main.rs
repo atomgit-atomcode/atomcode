@@ -1918,13 +1918,13 @@ async fn run_headless(
     if skip_permissions {
         eprintln!(
             "{}",
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::BypassWarningHeadless)
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::BypassWarningHeadless)
         );
     }
     if is_admin {
         eprintln!(
             "{}",
-            atomcode_core::i18n::t(atomcode_core::i18n::Msg::AdminWarningHeadless)
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::AdminWarningHeadless)
         );
     }
 
@@ -2145,7 +2145,7 @@ async fn run_headless(
                     eprintln!(
                         "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
                         duration.as_secs_f64(),
-                        atomcode_core::i18n::fmt_tokens(total_tokens),
+                        atomcode_config::i18n::fmt_tokens(total_tokens),
                         turn_count,
                         tool_call_count,
                         suffix
@@ -2927,7 +2927,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
                 if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                     println!(
                         "\n{}",
-                        atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                        atomcode_config::i18n::t(atomcode_config::i18n::Msg::UpgradePackageManaged)
                     );
                 } else {
                     eprintln!("\nupgrade failed: {}", msg);
@@ -2950,7 +2950,7 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 println!(
                     "{}",
-                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::UpgradePackageManaged)
                 );
                 Ok(())
             } else if msg.contains(ALREADY_LATEST) {
@@ -2973,7 +2973,7 @@ fn run_rollback_cli() -> Result<()> {
             if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 println!(
                     "{}",
-                    atomcode_core::i18n::t(atomcode_core::i18n::Msg::UpgradePackageManaged)
+                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::UpgradePackageManaged)
                 );
                 return Ok(());
             }
@@ -3016,7 +3016,7 @@ fn run_codingplan_core(
     // do itself.
     let mut report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
     if report.auth_expired {
-        use atomcode_core::i18n::{t, Msg};
+        use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
         match atomcode_core::auth::login(telemetry)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
