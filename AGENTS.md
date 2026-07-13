@@ -1,16 +1,28 @@
 # 项目全局开发约束
 
-## core/bridge 相关改动的强制前置
+## 适用范围与约束来源
 
-当任务涉及以下任一范围时，开始设计或修改代码前必须先阅读：
+本文件已经内化 core/bridge 退役盘点的长期有效结论，是项目级、自包含的开发约束；不得依赖未纳入仓库的本地文件。
 
-- `.plan_docs/2026-07-13-core-bridge-retirement-inventory.md`
+当任务涉及以下任一范围时，开始设计或修改代码前必须先检查相关当前代码：
+
 - `crates/atomcode-core/src/agent/`
 - `crates/atomcode-bridge/`
 - `crates/atomcode-kernel/`
 - CLI、TUI、daemon 的 runtime、session、command/event 协议或 engine v1/v2 切换
 
-阅读规划文档后仍必须以当前代码为准复核。该文档是原始盘点和目标背景，不保证所有“现状”“前置任务”和行号仍然有效。
+约束中的基线结论仍必须以当前代码复核，不保证所有现状、前置任务、分支和行号长期不变。
+
+## 总体方向与修改意图
+
+- 最终目标是让 CLI、TUI、daemon 的目标 driver 使用 kernel 原生命令、事件和生命周期边界，并实际删除对应的 core legacy variant、bridge handler、旧依赖与 fallback；只把逻辑移到新栈不算完成退役。
+- 不需要运行中引擎的本地查询或副作用能力，可以优先下沉到 driver/local service；迁移时必须同时清除旧发送点、协议变体和 handler，避免长期双路径。
+- compact、undo、plan、background、context、model/provider、session/resume/cd 等能力即使已有 kernel/capabilities 实现，只要仍通过 bridge `AgentClient` 投递，就属于“逻辑已实现但协议尚未退役”。体验增强不得冒充退役进度。
+- goal/loop 与运行中的 conversation、Snapshot、continuation 和回合结束控制耦合，必须作为完整生命周期问题处理；不能只复制 handler 或再增加一个普通回合末 hook。
+- 真正解除高频引擎命令对 bridge 的依赖，需要推进原生 driver 协议：先验证 daemon kernel 路径及 parity，再处理 goal/loop 生命周期，随后切换 CLI/TUI，最后删除 bridge/core legacy surface。
+- 会话生命周期相关修改必须把 resume、session、clear、rename、working directory、snapshot、provider、审批和 gateway affinity 作为同一架构簇检查，不能针对单个可见 bug 做局部补丁。
+- 版本号、发布配置和版本策略不属于默认迁移范围；除非任务明确要求，不得顺带修改。
+- 任何问题修复都必须检查同一状态所有权、协议边界和各 driver 消费方，优先修复共同根因，并补齐跨路径测试，不能只覆盖被点名的表面症状。
 
 ## 已知基线校正点
 
@@ -63,7 +75,7 @@
 4. 写明本次达到上述四种状态中的哪一种；
 5. 写明本次预计删除的 legacy surface，而不只是要新增的代码。
 
-如果发现规划文档与当前代码冲突，不得按旧规划盲目实现；应保留规划文档原文作为背景，在交付说明中报告冲突，并依据当前代码选择实现方向。
+如果发现本文件中的历史基线与当前代码冲突，不得按旧基线盲目实现；应在交付说明中报告差异，并依据当前代码选择实现方向。
 
 ## 验证与交付
 
