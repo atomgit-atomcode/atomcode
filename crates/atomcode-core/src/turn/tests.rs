@@ -17,7 +17,7 @@ use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{
-    ApprovalRequirement, PermissionDecision, Tool, ToolCall, ToolContext, ToolDef, ToolRegistry,
+    ApprovalRequirement, Tool, ToolCall, ToolContext, ToolDef, ToolRegistry,
     ToolResult,
 };
 
