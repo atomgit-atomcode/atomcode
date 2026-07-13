@@ -33,6 +33,7 @@ pub enum PluginJobEvent {
     MarketplaceAdded(marketplace::MarketplaceInfo),
     MarketplaceUpdated(marketplace::MarketplaceInfo),
     PluginInstalled(installer::InstalledPluginInfo),
+    PluginUpdated(installer::InstalledPluginInfo),
     /// The plugin is already installed; carries the canonical id so the
     /// renderer can show a friendly reinstall hint with the right commands.
     PluginAlreadyInstalled { id: String },

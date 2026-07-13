@@ -721,18 +721,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrInstalledStatus => "installed".into(),
         Msg::PluginMgrInstallableStatus => "can be installed".into(),
         Msg::PluginMgrInstallingStatus => "installing".into(),
+        Msg::PluginMgrUpdatingStatus => "updating".into(),
         Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
         Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
         Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
         Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
         Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
 Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
+Msg::PluginMgrHintUpdating => "Updating, please wait… · esc back".into(),
 Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…” · esc back".into(),
         Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace · esc back".into(),
         Msg::PluginMgrEmptyInstalled => "No plugins installed · esc back".into(),
         Msg::PluginMgrCloning => "Cloning marketplace…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
+        Msg::PluginMgrUpdating { plugin } => format!("Updating {plugin}…").into(),
         Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
         Msg::PluginScopeUser => "Install for you (user scope)".into(),
         Msg::PluginScopeUserDesc => "~/.atomcode/plugins — all projects".into(),
@@ -771,6 +774,9 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             format!("✓ marketplace `{name}` updated to {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
             format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        }
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),

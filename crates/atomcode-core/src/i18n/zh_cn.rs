@@ -710,18 +710,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrInstalledStatus => "已安装".into(),
         Msg::PluginMgrInstallableStatus => "可以安装".into(),
         Msg::PluginMgrInstallingStatus => "安装中".into(),
+        Msg::PluginMgrUpdatingStatus => "更新中".into(),
         Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
         Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
         Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
         Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
         Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
 Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
+Msg::PluginMgrHintUpdating => "更新中，请稍候… · esc 返回".into(),
 Msg::PluginMgrInstallingLabel => "安装中…".into(),
         Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」 · esc 返回".into(),
         Msg::PluginMgrEmptyPlugins => "该市场暂无插件 · esc 返回".into(),
         Msg::PluginMgrEmptyInstalled => "暂无已安装插件 · esc 返回".into(),
         Msg::PluginMgrCloning => "正在克隆市场…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
+        Msg::PluginMgrUpdating { plugin } => format!("正在更新 {plugin}…").into(),
 Msg::PluginMgrEscToCancel => "Esc 取消".into(),
 Msg::PluginScopeUser => "为你安装（用户级）".into(),
 Msg::PluginScopeUserDesc => "~/.atomcode/plugins — 所有项目可见".into(),
@@ -760,6 +763,9 @@ Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
         Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
             format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        }
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),

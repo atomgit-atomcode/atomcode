@@ -81,6 +81,7 @@ pub struct PluginManager {
     search_query: String,
     /// The install scope selected for the plugin currently being installed.
     installing_scope: Option<InstallScope>,
+    is_updating: bool,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -109,6 +110,7 @@ impl PluginManager {
             close_requested: false,
             search_query: String::new(),
             installing_scope: None,
+            is_updating: false,
         };
         m.reload();
         m
@@ -316,15 +318,26 @@ impl PluginManager {
 
     // ─── Async dispatch (clone-heavy ops) ───
 
-    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, ctx: &LoopCtx) {
+    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, is_update: bool, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
         self.installing_plugin = Some(plugin.clone());
         self.installing_scope = Some(scope.clone());
-        self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
+        self.is_updating = is_update;
+        if is_update {
+            self.pending = Some(t(Msg::PluginMgrUpdating { plugin: &plugin }).into_owned());
+        } else {
+            self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
+        }
         tokio::task::spawn_blocking(move || {
             let _ = atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope.clone());
             let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
-                Ok(info) => PluginJobEvent::PluginInstalled(info),
+                Ok(info) => {
+                    if is_update {
+                        PluginJobEvent::PluginUpdated(info)
+                    } else {
+                        PluginJobEvent::PluginInstalled(info)
+                    }
+                }
                 Err(e) => {
                     if let Some(aie) = e
                         .downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>(
@@ -397,7 +410,7 @@ impl PluginManager {
             2 => InstallScope::Local,
             _ => return,
         };
-        self.dispatch_install(plugin, mp, scope, ctx);
+        self.dispatch_install(plugin, mp, scope, false, ctx);
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -430,7 +443,7 @@ impl PluginManager {
         match self.selected {
             0 => {
                 // Update
-                self.dispatch_install(plugin, mp, scope, ctx);
+                self.dispatch_install(plugin, mp, scope, true, ctx);
             }
             1 => {
                 // Uninstall
@@ -600,7 +613,7 @@ impl PluginManager {
             Screen::InstalledDetails { plugin, .. } => {
                 let installing = self.installing_plugin.as_deref() == Some(plugin.as_str());
                 let (update_label, update_desc) = if installing {
-                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                    (format!("⏳ {}...", t(Msg::PluginMgrUpdatingStatus)), "".to_string())
                 } else {
                     (t(Msg::PluginActionUpdate).into_owned(), t(Msg::PluginActionUpdateDesc).into_owned())
                 };
@@ -610,7 +623,12 @@ impl PluginManager {
                     (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
                     (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
                 ];
-                (rows, "↑↓ Select action · Enter confirm · Esc back".to_string())
+                let hint = if installing {
+                    t(Msg::PluginMgrHintUpdating).into_owned()
+                } else {
+                    "↑↓ Select action · Enter confirm · Esc back".to_string()
+                };
+                (rows, hint)
             }
         }
     }
@@ -893,6 +911,7 @@ impl Modal for PluginManager {
         self.pending = None;
         self.installing_plugin = None;
         self.installing_scope = None;
+        self.is_updating = false;
 
         // If a cancelled install completed successfully, roll it back
         // (uninstall) so the filesystem is not left in an inconsistent
@@ -900,7 +919,7 @@ impl Modal for PluginManager {
         // a git clone is still in flight: the clone finishes and updates
         // installed_plugins.json, but the user already expressed intent to
         // cancel.
-        if let PluginJobEvent::PluginInstalled(info) = ev {
+        if let PluginJobEvent::PluginInstalled(info) | PluginJobEvent::PluginUpdated(info) = ev {
             let id = format!("{}@{}", info.plugin, info.marketplace);
             if self.cancelled_installs.take(&id).is_some() {
                 // Best-effort rollback — if this fails the stale dir
@@ -996,6 +1015,7 @@ mod tests {
             close_requested: false,
             search_query: String::new(),
             installing_scope: None,
+            is_updating: false,
         }
     }
 

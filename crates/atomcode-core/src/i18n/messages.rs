@@ -513,18 +513,21 @@ pub enum Msg<'a> {
     PluginMgrInstalledStatus,
     PluginMgrInstallableStatus,
     PluginMgrInstallingStatus,
+    PluginMgrUpdatingStatus,
     PluginMgrHintNav,
     PluginMgrHintToggle,
     PluginMgrHintRemove,
     PluginMgrHintUninstall,
     PluginMgrHintUrl,
     PluginMgrHintPending,
+    PluginMgrHintUpdating,
     PluginMgrInstallingLabel,
     PluginMgrEmptyMarketplaces,
     PluginMgrEmptyPlugins,
     PluginMgrEmptyInstalled,
     PluginMgrCloning,
     PluginMgrInstalling { plugin: &'a str },
+    PluginMgrUpdating { plugin: &'a str },
     PluginMgrEscToCancel,
     // Scope selection screen.
     PluginScopeUser,
@@ -566,6 +569,13 @@ pub enum Msg<'a> {
     /// `show_details_hint` flips on the trailing "(Ctrl+O for details)"
     /// nudge when warnings exist and verbose mode is off.
     PluginInstallDone {
+        plugin: &'a str,
+        marketplace: &'a str,
+        loaded: usize,
+        skipped: usize,
+        show_details_hint: bool,
+    },
+    PluginUpdateDone {
         plugin: &'a str,
         marketplace: &'a str,
         loaded: usize,

@@ -8178,6 +8178,25 @@ pub(super) fn handle_plugin_job_event(
                 }
             }
         }
+        PluginJobEvent::PluginUpdated(info) => {
+            let (loaded, warnings) = reload_plugins(ctx);
+            if state.show_tool_output {
+                for w in &warnings {
+                    renderer.render(UiLine::CommandOutput(format!("  {}", w)));
+                }
+            }
+            let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginUpdateDone {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                    loaded,
+                    skipped: warnings.len(),
+                    show_details_hint,
+                })
+                .into_owned(),
+            ));
+        }
         PluginJobEvent::Failed { op, msg } => {
             // Clean up pending guide topic so future /guide commands work.
             if ctx.pending_guide_topic.take().is_some() {
