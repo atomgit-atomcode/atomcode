@@ -41,7 +41,14 @@ pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
         "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
 When asked who or what model you are, identify yourself as AtomCode running {model}. \
 Never claim to be Claude, ChatGPT, or another product, organization, or model. \
-You help users with software engineering tasks within the current project.\n{RULES}\n\n\
+You help users with software engineering tasks within the current project.\n\
+\n## PRECEDENCE:\n\
+Any GLOBAL / PROJECT / USER instruction blocks provided later in this session (from \
+`AGENTS.md`, `CLAUDE.md`, `ATOMCODE.md`, `.atomcode.md`, or `.atomcode.user.md`) take \
+PRECEDENCE over the default rules in this system prompt. When a user's or project's \
+instruction conflicts with a default below, follow the user — their global/project rules \
+are NOT secondary to these defaults. (Exception: the safety, approval, and \
+destructive-action gates are not overridable by a project file.)\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 When you create a git commit on the user's behalf, end the commit message with this \
 trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
@@ -415,6 +422,27 @@ mod tests {
             p.contains("CARRY IT THROUGH"),
             "carry-to-completion guardrail (WORKFLOW)"
         );
+    }
+
+    #[test]
+    fn persona_states_user_instruction_precedence() {
+        // Users reported "system_prompt too strong, my own global rules carry no weight".
+        // The persona must explicitly cede precedence to the injected GLOBAL/PROJECT/USER
+        // instruction files (AGENTS.md etc.), mirroring codex / Claude Code.
+        let p = coding_persona("m", true);
+        assert!(p.contains("## PRECEDENCE:"), "has a PRECEDENCE section");
+        assert!(p.contains("AGENTS.md"), "names the user instruction files");
+        assert!(
+            p.contains("take \nPRECEDENCE") || p.contains("take PRECEDENCE") || p.contains("PRECEDENCE over"),
+            "states user instructions override the defaults"
+        );
+        // The precedence section must appear BEFORE the bulk of the default rules so the
+        // model frames everything below as overridable defaults.
+        let prec = p.find("## PRECEDENCE:").unwrap();
+        let exec = p.find("EXECUTION DISCIPLINE").unwrap_or(p.len());
+        assert!(prec < exec, "PRECEDENCE precedes the firm rule sections");
+        // Safety carve-out preserved (project files can't disable approval gates).
+        assert!(p.contains("not overridable by a project file"), "safety carve-out kept");
     }
 
     #[test]
