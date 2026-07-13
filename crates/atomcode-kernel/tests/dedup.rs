@@ -20,7 +20,9 @@
 //! The dedup KEY is computed from the ORIGINAL `call.name`/`call.arguments` at the
 //! top of the loop — BEFORE any ToolMiddleware `before` chain may rewrite
 //! `call.arguments`. Two calls the MODEL emitted identically are duplicates
-//! regardless of what middleware would later do to them.
+//! regardless of what middleware would later do to them. JSON arguments are
+//! canonicalised recursively first, so whitespace and object-key ordering do not
+//! create distinct logical calls; array order and malformed input remain distinct.
 
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
@@ -227,6 +229,56 @@ async fn same_name_args_different_id_is_not_re_executed_but_still_paired() {
         let n = history.iter().filter(|m| m.tool_call_id.as_deref() == Some(id)).count();
         assert_eq!(n, 1, "history must carry exactly one result for {id}; got {n}");
     }
+}
+
+#[tokio::test]
+async fn reordered_nested_json_is_not_re_executed_or_counted_as_a_batch() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CountingTool::new(counter.clone())));
+
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call(
+                "c1",
+                "count",
+                r#"{"a":1,"nested":{"x":1,"y":2}}"#,
+            )),
+            StreamEvent::ToolCall(tool_call(
+                "c2",
+                "count",
+                r#"{"nested":{"y":2,"x":1},"a":1}"#,
+            )),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["count"]))
+        .build()
+        .spawn();
+
+    let events = drive_collect(&mut handle, "count twice with reordered json").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "semantically identical JSON arguments must execute once"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolBatchStarted { .. })),
+        "two duplicate calls are one logical call, not a multi-call batch"
+    );
+    assert_eq!(tool_results_for(&events, "c2").len(), 1);
 }
 
 // CLAIM 21c — the gate does NOT over-suppress: two calls with DIFFERENT

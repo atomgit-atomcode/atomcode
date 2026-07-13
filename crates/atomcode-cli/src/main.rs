@@ -2285,18 +2285,6 @@ async fn run_headless(
                     );
                 }
             }
-            AgentEvent::BackgroundComplete {
-                summary,
-                files_edited,
-                turns,
-                success,
-            } => {
-                let status = if success { "ok" } else { "fail" };
-                eprintln!("[background {} turns={}] {}", status, turns, summary);
-                if verbose && !files_edited.is_empty() {
-                    eprintln!("[background files={}]", files_edited.join(","));
-                }
-            }
             // VL preprocessor failure restores pending image bytes for the
             // TUI to re-attach. CLI has no interactive input buffer to put
             // them in, so just ignore — the failure itself was already

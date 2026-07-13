@@ -109,4 +109,10 @@ pub trait Modal: Send {
     /// interactive `/plugin` manager overrides this. The event loop calls it
     /// before rendering the job result and before redrawing the modal.
     fn on_plugin_event(&mut self, _ev: &atomcode_core::plugin::PluginJobEvent) {}
+
+    /// Whether this modal has requested to close. The event loop checks this
+    /// to clean up the modal asynchronously.
+    fn close_requested(&self) -> bool {
+        false
+    }
 }

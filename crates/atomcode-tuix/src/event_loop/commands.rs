@@ -3113,40 +3113,12 @@ fn execute_slash_command_impl(
                 submit_agent_turn(ctx, state, rendered);
             } else {
                 // Unknown command — emit failure telemetry
-                let available_commands: Vec<&str> = vec![
-                    "help",
-                    "quit",
-                    "exit",
-                    "clear",
-                    "compact",
-                    "reload",
-                    "config",
-                    "plan",
-                    "build",
-                    "auto",
-                    "session",
-                    "model",
-                    "language",
-                    "resume",
-                    "rename",
-                    "provider",
-                    "status",
-                    "diff",
-                    "undo",
-                    "cost",
-                    "context",
-                    "remember",
-                    "forget",
-                    "memory",
-                    "login",
-                    "logout",
-                    "whoami",
-                    "upgrade",
-                    "issue",
-                    "cd",
-                    "bg",
-                    "codingplan",
-                ];
+                let available_commands: Vec<&str> =
+                    crate::commands::CommandRegistry::builtin()
+                        .all()
+                        .iter()
+                        .map(|command| command.name)
+                        .collect();
                 ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
                     type_: other.to_string(),
                     success: Some(false),

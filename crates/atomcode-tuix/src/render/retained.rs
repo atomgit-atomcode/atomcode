@@ -25,7 +25,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
+use super::cell::{push_str_cells, push_str_cells_sgr, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
@@ -1487,9 +1487,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                 }
             }
+            super::MenuKind::Plugin => {
+                let name_width = unicode_width::UnicodeWidthStr::width(name);
+                let pad = 12usize.saturating_sub(name_width);
+                let padded = format!("{}{}", name, " ".repeat(pad));
+                if selected {
+                    format!("▸ {}  {}", padded, desc)
+                } else {
+                    format!("  {}  {}", padded, desc)
+                }
+            }
         };
 
-        let style = if selected {
+        let mut style = if selected {
             CellStyle {
                 fg: None,
                 bold: true,
@@ -1505,7 +1515,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // selected row, not from a colour-contrast distinction.
             self.style_for(Role::Secondary)
         };
-        push_str_cells(&mut row, &content, &style);
+        let is_uninstall = name == "Uninstall" || name == "卸载";
+        if is_uninstall {
+            style.fg = Some(crossterm::style::Color::Red);
+        }
+        push_str_cells_sgr(&mut row, &content, style.clone());
 
         if selected {
             let content_w = crate::width::display_width(&content);
@@ -1519,6 +1533,100 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         row
+    }
+
+    fn build_plugin_menu_rows(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let (status, description) = if let Some(idx) = desc.find("  ·  ") {
+            (&desc[..idx], &desc[idx + 5..])
+        } else {
+            (desc, "")
+        };
+
+        let name_style = if selected {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: true,
+                faint: false,
+            }
+        } else {
+            CellStyle::default()
+        };
+
+        let status_style = if selected {
+            CellStyle {
+                fg: None,
+                bold: false,
+                reverse: true,
+                faint: true,
+            }
+        } else {
+            let mut s = self.style_for(Role::Secondary);
+            s.faint = true;
+            s
+        };
+
+        let name_width = unicode_width::UnicodeWidthStr::width(name);
+        let pad = 24usize.saturating_sub(name_width);
+        let padded = format!("{}{}", name, " ".repeat(pad));
+        let part_a = if selected {
+            format!("▸ {}", padded)
+        } else {
+            format!("  {}", padded)
+        };
+        let part_b = format!("  {}", status);
+
+        let mut row1 = Vec::new();
+        push_str_cells_sgr(&mut row1, &part_a, name_style.clone());
+        push_str_cells_sgr(&mut row1, &part_b, status_style);
+        let content_w1 = crate::width::display_width(&part_a) + crate::width::display_width(&part_b);
+        let right_pad1 = rule_width.saturating_sub(content_w1);
+        for _ in 0..right_pad1 {
+            row1.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected { name_style.clone() } else { CellStyle::default() },
+            });
+        }
+
+        let mut style2 = self.style_for(Role::Secondary);
+        style2.faint = true;
+        let style2 = if selected {
+            CellStyle {
+                fg: None,
+                bold: false,
+                reverse: true,
+                faint: true,
+            }
+        } else {
+            style2
+        };
+
+        let line2_str = if description.is_empty() {
+            String::new()
+        } else {
+            format!("    {}", description)
+        };
+
+        let mut row2 = Vec::new();
+        push_str_cells_sgr(&mut row2, &line2_str, style2.clone());
+        let content_w2 = crate::width::display_width(&line2_str);
+        let right_pad2 = rule_width.saturating_sub(content_w2);
+        for _ in 0..right_pad2 {
+            row2.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected { style2.clone() } else { CellStyle::default() },
+            });
+        }
+
+        vec![row1, row2]
     }
 
     fn build_status_row(&self, status: &StatusLine, rule_width: usize) -> Vec<Cell> {
@@ -1929,37 +2037,79 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|m| m.kind.max_visible_rows(h, m.items.len()))
             .unwrap_or(4);
-        let (menu_items, selected_in_view) = if let Some(m) = self.menu.as_ref() {
+        let menu_kind = self
+            .menu
+            .as_ref()
+            .map(|m| m.kind)
+            .unwrap_or_default();
+        let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
-                (Vec::<(String, String)>::new(), None)
+                (Vec::<(String, String)>::new(), None, 0)
             } else {
-                let offset = if len <= max_menu {
-                    0
-                } else if m.selected < max_menu {
-                    0
-                } else {
-                    (m.selected + 1)
-                        .saturating_sub(max_menu)
-                        .min(len.saturating_sub(max_menu))
-                };
-                let end = (offset + max_menu).min(len);
+                let mut offset = 0;
+                let mut height_sum = 0;
+                let mut end = 0;
+                while end < len {
+                    let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len.saturating_sub(1) {
+                        2
+                    } else {
+                        1
+                    };
+                    if height_sum + item_h > max_menu {
+                        break;
+                    }
+                    height_sum += item_h;
+                    end += 1;
+                }
+
+                if m.selected >= end {
+                    while offset < len && m.selected >= end {
+                        offset += 1;
+                        let mut h_sum = 0;
+                        end = offset;
+                        while end < len {
+                            let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len.saturating_sub(1) {
+                                2
+                            } else {
+                                1
+                            };
+                            if h_sum + item_h > max_menu {
+                                break;
+                            }
+                            h_sum += item_h;
+                            end += 1;
+                        }
+                    }
+                }
+
                 let items: Vec<(String, String)> = m.items[offset..end].to_vec();
                 let sel = if m.selected >= offset && m.selected < end {
                     Some(m.selected - offset)
                 } else {
                     None
                 };
-                (items, sel)
+                (items, sel, offset)
             }
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, 0)
         };
 
         // Spinner moved to body as a live paragraph row — footer no
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
-        let menu_rows = menu_items.len().min(max_menu);
+        let menu_rows = if let Some(m) = self.menu.as_ref() {
+            menu_items.iter().enumerate().map(|(i, _)| {
+                let orig_idx = actual_offset + i;
+                if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < m.items.len().saturating_sub(1) {
+                    2
+                } else {
+                    1
+                }
+            }).sum::<usize>()
+        } else {
+            0
+        };
         // Attachment-preview rows: one `└ [Image #N]` per kept marker,
         // sitting between bot_rule and the menu. The list arrives
         // pre-filtered by `compute_input_attachments` (only markers
@@ -2079,14 +2229,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|m| m.kind)
             .unwrap_or_default();
-        let menu_cells: Vec<Vec<Cell>> = menu_items
-            .iter()
-            .enumerate()
-            .map(|(i, (name, desc))| {
-                let selected = selected_in_view == Some(i);
-                self.build_menu_row(name, desc, selected, rule_width, menu_kind)
-            })
-            .collect();
+        let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
+        let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
+        for (i, (name, desc)) in menu_items.iter().enumerate() {
+            let orig_idx = actual_offset + i;
+            let selected = selected_in_view == Some(i);
+            if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < final_len.saturating_sub(1) {
+                menu_cells.extend(self.build_plugin_menu_rows(name, desc, selected, rule_width));
+            } else {
+                menu_cells.push(self.build_menu_row(name, desc, selected, rule_width, menu_kind));
+            }
+        }
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
         // echo. PAD_COL is the leading 2-space indent every body /
@@ -4677,6 +4830,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &style);
             }
             UiLine::CommandOutput(text) => {
+                // If it's a subordinate command output (starts with "  ⎿" or "  └" or "  `" or "  \\"),
+                // pop the empty blank separator so it sits flush under the command!
+                let is_subordinate = text.starts_with("  ⎿") || text.starts_with("  └") || text.starts_with("  `") || text.starts_with("  \\");
+                if is_subordinate && self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    crate::tuix_trace!(
+                        "BPOP",
+                        "site=command_blank len_before={} n=1 scrolled_off={}",
+                        self.body_lines.len(),
+                        self.scrolled_off
+                    );
+                    self.body_lines.pop();
+                    let bottom = self.body_bottom_row();
+                    if bottom > 0 {
+                        let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                        let _ = self.out.write_all(seq.as_bytes());
+                    }
+                    self.skip_body_scroll_count =
+                        self.skip_body_scroll_count.saturating_add(1);
+                }
+
                 // CommandOutput is trusted internal text — let SGR
                 // through the sanitizer so colour / bold / faint
                 // attributes survive (e.g. the `/codingplan` red
@@ -5650,6 +5823,32 @@ mod tests {
         let row = format_goal_row("some long condition", 2, 9, 14, true);
         assert!(crate::width::display_width(&row) <= 14, "row fits narrow width: {row}");
         assert!(row.contains("round 2"), "round survives even when condition dropped: {row}");
+    }
+
+    #[test]
+    fn loop_row_shows_label_round_and_elapsed() {
+        let row = format_loop_row("检查构建状态", 3, 133, 80, true);
+
+        assert!(row.starts_with("⚡ "), "lightning marker present: {row}");
+        assert!(row.contains("检查构建状态"), "full label kept: {row}");
+        assert!(row.contains("· round 3 · 2m13s"), "round/elapsed shown: {row}");
+    }
+
+    #[test]
+    fn loop_row_uses_ascii_marker_when_unicode_is_disabled() {
+        let row = format_loop_row("check", 2, 9, 80, false);
+
+        assert!(row.starts_with("* "), "ascii marker present: {row}");
+        assert!(!row.contains('⚡'), "unicode marker omitted: {row}");
+    }
+
+    #[test]
+    fn loop_row_truncates_label_without_dropping_metadata() {
+        let row = format_loop_row(&"x".repeat(200), 7, 5, 40, true);
+
+        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(row.contains("· round 7 · 5s"), "metadata survives: {row}");
+        assert!(row.contains('…'), "label uses an ellipsis: {row}");
     }
 
     #[test]

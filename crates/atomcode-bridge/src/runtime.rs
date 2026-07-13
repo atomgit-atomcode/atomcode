@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::{
-    assemble, prepare, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+    assemble, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
 };
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
@@ -200,8 +200,6 @@ struct Bridge {
     /// `/undo` in flight: the requested prompt index (None = the last turn). Awaits a
     /// Snapshot to truncate against.
     pending_undo: Option<Option<usize>>,
-    /// One `/background` task at a time (set while a background worker runs).
-    background_running: Arc<std::sync::atomic::AtomicBool>,
     /// `!cmd` local-shell outputs accumulated since the last user message: each is a
     /// `<bash-*>` block injected ahead of the next message so the model sees it (the
     /// `!` path runs the shell + shows output but starts NO turn of its own).
@@ -429,7 +427,6 @@ impl Bridge {
             pending_sync: false,
             pending_plan_note: None,
             pending_undo: None,
-            background_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
             degraded,
@@ -1093,27 +1090,6 @@ impl Bridge {
                         }
                         .to_string(),
                     );
-                }
-            }
-            CoreCmd::Background { task } => {
-                use std::sync::atomic::Ordering;
-                if self.background_running.swap(true, Ordering::AcqRel) {
-                    self.emit(CoreEv::Error {
-                        error: "A background task is already running. Wait for it to finish."
-                            .into(),
-                        snapshot: ConversationSnapshot::default(),
-                    });
-                } else {
-                    // A SEPARATE one-shot agent runs the task off to the side; its
-                    // intermediate events stay internal (no interleaving with the
-                    // foreground turn) — only the final BackgroundComplete surfaces.
-                    // NOTE: unlike v1 this does NOT auto-commit the edited files.
-                    tokio::spawn(run_background_task(
-                        self.coding_cfg.clone(),
-                        self.ev_tx.clone(),
-                        self.background_running.clone(),
-                        task,
-                    ));
                 }
             }
             CoreCmd::RefreshContextStats => self.emit_context_stats(),
@@ -2270,103 +2246,6 @@ fn format_local_shell(
     (display, ctx, success)
 }
 
-/// Run a `/background` task on a SEPARATE one-shot agent (no persistence/MCP/memory —
-/// a fast isolated worker). Approvals are auto-granted (the user explicitly launched
-/// it). Intermediate events stay internal; only the final `BackgroundComplete`
-/// surfaces. Clears `flag` on exit. Minimal vs v1: no git auto-commit.
-async fn run_background_task(
-    coding_cfg: CodingAgentConfig,
-    ev_tx: mpsc::UnboundedSender<CoreEv>,
-    flag: Arc<std::sync::atomic::AtomicBool>,
-    task: String,
-) {
-    use std::sync::atomic::Ordering;
-
-    let finish = |summary: String, files: Vec<String>, turns: usize, success: bool| {
-        let _ = ev_tx.send(CoreEv::BackgroundComplete {
-            summary,
-            files_edited: files,
-            turns,
-            success,
-        });
-        flag.store(false, Ordering::Release);
-    };
-
-    let opts = PrepareOptions {
-        session: SessionMode::Disabled,
-        skill_dirs: None,
-        mcp: false,
-        memory: false,
-        web: true,
-        // A background one-shot stays lean — no nested review sub-agent.
-        review: false,
-    };
-    let built = async {
-        let mut parts = prepare(&coding_cfg, opts).await.map_err(|e| e.to_string())?;
-        let provider = build_provider(&coding_cfg).map_err(|e| e.to_string())?;
-        assemble(&mut parts, &coding_cfg, provider)
-            .map(|a| a.spawn())
-            .map_err(|e| e.to_string())
-    }
-    .await;
-    let mut handle = match built {
-        Ok(h) => h,
-        Err(e) => return finish(format!("background setup failed: {e}"), vec![], 0, false),
-    };
-
-    let _ = handle.commands.send(KCmd::SendMessage { text: task, images: vec![] });
-    let mut summary = String::new();
-    let mut files: Vec<String> = Vec::new();
-    let mut turns = 0usize;
-    let mut success = true;
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            KEv::TextDelta(t) => summary.push_str(&t),
-            KEv::Request { id, kind, .. } if kind == APPROVAL_KIND => {
-                let value = serde_json::to_value(ApprovalResponse::allow())
-                    .unwrap_or(serde_json::Value::Null);
-                let _ = handle.commands.send(KCmd::Respond { id, value });
-            }
-            KEv::Request { id, .. } => {
-                let _ = handle.commands.send(KCmd::Respond { id, value: serde_json::Value::Null });
-            }
-            KEv::ToolStarted { call } => {
-                if matches!(call.name.as_str(), "write_file" | "edit_file" | "parallel_edit") {
-                    if let Some(p) = extract_path(&call.arguments) {
-                        if !files.contains(&p) {
-                            files.push(p);
-                        }
-                    }
-                }
-            }
-            KEv::Usage(_) => turns += 1,
-            KEv::Error { .. } => success = false,
-            KEv::TurnComplete { reason } => {
-                success = success && matches!(reason, StopReason::Stopped);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let _ = handle.commands.send(KCmd::Shutdown);
-    await_kernel_or_abort(&mut handle.task, Duration::from_secs(5)).await;
-    let summary = if summary.trim().is_empty() {
-        "(background task finished with no text output)".to_string()
-    } else {
-        summary
-    };
-    finish(summary, files, turns, success);
-}
-
-/// Pull the `path` out of a write/edit tool's JSON arguments, if present.
-fn extract_path(args: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()?
-        .get("path")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 /// Result of a successful `/undo` truncation.
 struct UndoPlan {
     truncated: Vec<atomcode_kernel::message::Message>,
@@ -3226,16 +3105,6 @@ mod undo_tests {
         assert_eq!(compute_undo(&convo(), Some(3)).err(), Some((3, 2)));
         assert_eq!(compute_undo(&convo(), Some(0)).err(), Some((0, 2)));
         assert_eq!(compute_undo(&[], None).err(), Some((0, 0)));
-    }
-
-    #[test]
-    fn extract_path_pulls_path_from_write_args() {
-        assert_eq!(
-            super::extract_path(r#"{"path":"src/x.rs","content":"hi"}"#),
-            Some("src/x.rs".to_string())
-        );
-        assert_eq!(super::extract_path(r#"{"no_path":1}"#), None);
-        assert_eq!(super::extract_path("not json"), None);
     }
 
     #[tokio::test]

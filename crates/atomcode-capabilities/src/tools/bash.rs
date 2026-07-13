@@ -1524,7 +1524,7 @@ mod tests {
     // rewrite `sudo` command words to `sudo -A` so a plain `sudo` pops our password modal.
     #[cfg(unix)]
     #[test]
-    fn rewrite_sudo_inserts_dash_A_only_when_appropriate() {
+    fn rewrite_sudo_inserts_dash_a_only_when_appropriate() {
         // bare sudo in command position → gets -A
         assert_eq!(rewrite_sudo_for_askpass("sudo find / -name x"), "sudo -A find / -name x");
         // already has -A → unchanged

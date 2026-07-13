@@ -468,14 +468,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::KbdHintOther =>
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
 
-        // ── 后台任务 ──
-        Msg::BackgroundComplete { turns } =>
-            format!("  后台任务完成（{} 轮）：\n", turns).into(),
-        Msg::BackgroundFailed { turns } =>
-            format!("  后台任务失败，共 {} 轮：\n", turns).into(),
-        Msg::BackgroundFilesEdited =>
-            "  已编辑的文件：\n".into(),
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider：{}\n  配置文件：{}\n\n", provider, path).into(),
@@ -720,18 +712,24 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrRemove => "移除市场…".into(),
         Msg::PluginMgrInstalled { count } => format!("已安装 ({count})").into(),
         Msg::PluginMgrInstalledMark => "✓ 已安装".into(),
+        Msg::PluginMgrInstalledStatus => "已安装".into(),
+        Msg::PluginMgrInstallableStatus => "可以安装".into(),
+        Msg::PluginMgrInstallingStatus => "安装中".into(),
+        Msg::PluginMgrUpdatingStatus => "更新中".into(),
         Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
         Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
         Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
         Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
         Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
 Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
+Msg::PluginMgrHintUpdating => "更新中，请稍候… · esc 返回".into(),
 Msg::PluginMgrInstallingLabel => "安装中…".into(),
         Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」 · esc 返回".into(),
         Msg::PluginMgrEmptyPlugins => "该市场暂无插件 · esc 返回".into(),
         Msg::PluginMgrEmptyInstalled => "暂无已安装插件 · esc 返回".into(),
         Msg::PluginMgrCloning => "正在克隆市场…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
+        Msg::PluginMgrUpdating { plugin } => format!("正在更新 {plugin}…").into(),
 Msg::PluginMgrEscToCancel => "Esc 取消".into(),
 Msg::PluginScopeUser => "为你安装（用户级）".into(),
 Msg::PluginScopeUserDesc => "~/.atomcode/plugins — 所有项目可见".into(),
@@ -740,6 +738,17 @@ Msg::PluginScopeProjectDesc => ".atomcode/plugins — 通过 git 共享".into(),
 Msg::PluginScopeLocal => "仅在本仓库为你安装（本地级）".into(),
 Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — 不提交到 git".into(),
 Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into(),
+Msg::PluginScopeUserShort => "用户级".into(),
+Msg::PluginScopeProjectShort => "项目级".into(),
+Msg::PluginScopeLocalShort => "本地级".into(),
+Msg::PluginActionUninstall => "卸载".into(),
+Msg::PluginActionUninstallDesc => "卸载该插件所有的组件与配置".into(),
+Msg::PluginActionUpdate => "更新".into(),
+Msg::PluginActionUpdateDesc => "重新拉取并安装最新版本".into(),
+Msg::PluginActionDisable => "禁用".into(),
+Msg::PluginActionDisableDesc => "临时禁用该插件".into(),
+Msg::PluginActionBack => "返回到上一级".into(),
+Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -757,9 +766,11 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
-            let hint = if show_details_hint { "  （按 Ctrl+O 查看详情）" } else { "" };
-            format!("✓ 已安装 `{plugin}@{marketplace}` —— 加载 {loaded} 个 skill，跳过 {skipped} 个{hint}").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        }
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),

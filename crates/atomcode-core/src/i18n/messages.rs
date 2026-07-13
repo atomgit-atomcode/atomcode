@@ -351,11 +351,6 @@ pub enum Msg<'a> {
     KbdHintMacos,
     KbdHintOther,
 
-    // ── Background task ──
-    BackgroundComplete { turns: usize },
-    BackgroundFailed { turns: usize },
-    BackgroundFilesEdited,
-
     // ── /config command ──
     ConfigProviderLabel { provider: &'a str, path: &'a str },
 
@@ -521,18 +516,24 @@ pub enum Msg<'a> {
     PluginMgrRemove,
     PluginMgrInstalled { count: usize },
     PluginMgrInstalledMark,
+    PluginMgrInstalledStatus,
+    PluginMgrInstallableStatus,
+    PluginMgrInstallingStatus,
+    PluginMgrUpdatingStatus,
     PluginMgrHintNav,
     PluginMgrHintToggle,
     PluginMgrHintRemove,
     PluginMgrHintUninstall,
     PluginMgrHintUrl,
     PluginMgrHintPending,
+    PluginMgrHintUpdating,
     PluginMgrInstallingLabel,
     PluginMgrEmptyMarketplaces,
     PluginMgrEmptyPlugins,
     PluginMgrEmptyInstalled,
     PluginMgrCloning,
     PluginMgrInstalling { plugin: &'a str },
+    PluginMgrUpdating { plugin: &'a str },
     PluginMgrEscToCancel,
     // Scope selection screen.
     PluginScopeUser,
@@ -542,6 +543,17 @@ pub enum Msg<'a> {
     PluginScopeLocal,
     PluginScopeLocalDesc,
     PluginScopeHint,
+    PluginScopeUserShort,
+    PluginScopeProjectShort,
+    PluginScopeLocalShort,
+    PluginActionUninstall,
+    PluginActionUninstallDesc,
+    PluginActionUpdate,
+    PluginActionUpdateDesc,
+    PluginActionDisable,
+    PluginActionDisableDesc,
+    PluginActionBack,
+    PluginActionBackDesc,
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
@@ -563,6 +575,13 @@ pub enum Msg<'a> {
     /// `show_details_hint` flips on the trailing "(Ctrl+O for details)"
     /// nudge when warnings exist and verbose mode is off.
     PluginInstallDone {
+        plugin: &'a str,
+        marketplace: &'a str,
+        loaded: usize,
+        skipped: usize,
+        show_details_hint: bool,
+    },
+    PluginUpdateDone {
         plugin: &'a str,
         marketplace: &'a str,
         loaded: usize,

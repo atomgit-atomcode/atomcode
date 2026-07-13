@@ -478,16 +478,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::KbdHintOther =>
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
 
-        // ── Background task ──
-        Msg::BackgroundComplete { turns } =>
-            format!("  Background task complete ({} turn{}):\n",
-                    turns, if turns == 1 { "" } else { "s" }).into(),
-        Msg::BackgroundFailed { turns } =>
-            format!("  Background task failed after {} turn{}:\n",
-                    turns, if turns == 1 { "" } else { "s" }).into(),
-        Msg::BackgroundFilesEdited =>
-            "  Files edited:\n".into(),
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),
@@ -733,18 +723,24 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrRemove => "Remove marketplace…".into(),
         Msg::PluginMgrInstalled { count } => format!("Installed ({count})").into(),
         Msg::PluginMgrInstalledMark => "✓ installed".into(),
+        Msg::PluginMgrInstalledStatus => "installed".into(),
+        Msg::PluginMgrInstallableStatus => "can be installed".into(),
+        Msg::PluginMgrInstallingStatus => "installing".into(),
+        Msg::PluginMgrUpdatingStatus => "updating".into(),
         Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
         Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
         Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
         Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
         Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
 Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
+Msg::PluginMgrHintUpdating => "Updating, please wait… · esc back".into(),
 Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…” · esc back".into(),
         Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace · esc back".into(),
         Msg::PluginMgrEmptyInstalled => "No plugins installed · esc back".into(),
         Msg::PluginMgrCloning => "Cloning marketplace…".into(),
         Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
+        Msg::PluginMgrUpdating { plugin } => format!("Updating {plugin}…").into(),
         Msg::PluginMgrEscToCancel => "Esc to cancel".into(),
         Msg::PluginScopeUser => "Install for you (user scope)".into(),
         Msg::PluginScopeUserDesc => "~/.atomcode/plugins — all projects".into(),
@@ -753,6 +749,17 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginScopeLocal => "Install for you, in this repo only (local scope)".into(),
         Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — not committed".into(),
         Msg::PluginScopeHint => "↑↓ Select scope · Enter confirm · Esc back".into(),
+        Msg::PluginScopeUserShort => "user".into(),
+        Msg::PluginScopeProjectShort => "project".into(),
+        Msg::PluginScopeLocalShort => "local".into(),
+        Msg::PluginActionUninstall => "Uninstall".into(),
+        Msg::PluginActionUninstallDesc => "Uninstall all components and settings".into(),
+        Msg::PluginActionUpdate => "Update".into(),
+        Msg::PluginActionUpdateDesc => "Reinstall / Upgrade to latest version".into(),
+        Msg::PluginActionDisable => "Disable".into(),
+        Msg::PluginActionDisableDesc => "Temporarily disable this plugin".into(),
+        Msg::PluginActionBack => "Back to parent".into(),
+        Msg::PluginActionBackDesc => "Return to the installed list".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -770,9 +777,11 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
-            let hint = if show_details_hint { "  (Ctrl+O for details)" } else { "" };
-            format!("✓ installed `{plugin}@{marketplace}` — {loaded} skills loaded, {skipped} skipped{hint}").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        }
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),

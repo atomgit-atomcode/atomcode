@@ -4476,17 +4476,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                        closed = true;
+                    }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -4933,17 +4943,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                        closed = true;
+                    }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -8150,6 +8170,25 @@ pub(super) fn handle_plugin_job_event(
                 }
             }
         }
+        PluginJobEvent::PluginUpdated(info) => {
+            let (loaded, warnings) = reload_plugins(ctx);
+            if state.show_tool_output {
+                for w in &warnings {
+                    renderer.render(UiLine::CommandOutput(format!("  {}", w)));
+                }
+            }
+            let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginUpdateDone {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                    loaded,
+                    skipped: warnings.len(),
+                    show_details_hint,
+                })
+                .into_owned(),
+            ));
+        }
         PluginJobEvent::Failed { op, msg } => {
             // Clean up pending guide topic so future /guide commands work.
             if ctx.pending_guide_topic.take().is_some() {
@@ -10085,36 +10124,6 @@ fn handle_agent_event(
                 renderer.flush();
             }
             state.on_sub_agent_dispatch_end();
-        }
-        AgentEvent::BackgroundComplete {
-            summary,
-            files_edited,
-            turns,
-            success,
-        } => {
-            let header = if success {
-                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
-            } else {
-                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
-            };
-            let mut body = String::from(&header);
-            body.push_str("  ");
-            body.push_str(&summary);
-            if !body.ends_with('\n') {
-                body.push('\n');
-            }
-            if !files_edited.is_empty() {
-                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
-                for f in &files_edited {
-                    body.push_str(&format!("    - {}\n", f));
-                }
-            }
-            if success {
-                renderer.render(UiLine::CommandOutput(body));
-            } else {
-                renderer.render(UiLine::Error(body));
-            }
-            renderer.flush();
         }
         AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
