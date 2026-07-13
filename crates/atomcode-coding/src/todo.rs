@@ -24,7 +24,7 @@ impl LifecycleHooks for TodoHook {
             "Current task list — keep it accurate and finish it:\n\
 - The MOMENT you finish an item, call `todowrite` to mark it `completed` (do not leave a done item showing incomplete).\n\
 - Mark an item `in_progress` when you start it.\n\
-- Do NOT stop, summarize, or hand back to the user while ANY item is still pending or in_progress — keep working through them until EVERY item is completed.\n\
+- Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.\n\
 {}",
             render_todos_text(&todos, false)
         );

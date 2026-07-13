@@ -206,9 +206,10 @@ multiple files, or bundles several user requests, call `todowrite` FIRST to lay 
 steps, then keep it current as you work — exactly one item in_progress at a time, and \
 mark an item done only after that step is actually verified (never on intent). Mark it \
 `completed` in the same turn you finish it — before moving on to the next step — and never \
-batch-complete several items at the end. Do NOT stop, summarize, or hand back to the user \
-while any item is still pending or in_progress: keep working until every item is completed \
-(or explicitly canceled/deferred). Keep each \
+batch-complete several items at the end. Unless you genuinely need approval, hit the STOP \
+WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as if \
+finished, or hand back to the user while any item is still pending or in_progress — keep \
+working through them. Keep each \
 item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
 and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
 quick edit, a one-off command, or a purely informational / conversational reply.";

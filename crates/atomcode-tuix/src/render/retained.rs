@@ -245,11 +245,17 @@ fn todo_panel_rows(
     max_rows: usize,
 ) -> Vec<TodoPanelRow> {
     use atomcode_capabilities::tools::todo::TodoStatus;
-    // Spacer is always first — it adds one blank line between the transcript
-    // body above and the `☑ Todos` header, so the panel doesn't feel cramped.
-    let mut rows = vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, total }];
-    // body_budget accounts for the Spacer + Header already in `rows` (2 slots).
-    let body_budget = max_rows.saturating_sub(2);
+    // Spacer goes first — one blank line between the transcript body above and
+    // the `☑ Todos` header, so the panel doesn't feel cramped. But on a terminal
+    // too short to afford the cosmetic row (max_rows < 2) we drop it, so the
+    // panel never emits more rows than max_rows.
+    let mut rows = if max_rows >= 2 {
+        vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, total }]
+    } else {
+        vec![TodoPanelRow::Header { completed, total }]
+    };
+    // body_budget = whatever's left after the header (+ spacer when present).
+    let body_budget = max_rows.saturating_sub(rows.len());
     if body_budget == 0 {
         return rows;
     }
@@ -14189,6 +14195,22 @@ mod todo_panel_rows_tests {
         for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
         let rows = todo_panel_rows(&it, 1, 22, MAX_TODO_PANEL_ROWS);
         assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
+    }
+
+    #[test]
+    fn tight_budget_drops_spacer_and_respects_cap() {
+        // On a very short terminal (todo_panel_cap can return 1), the cosmetic
+        // Spacer must be dropped so we never emit more rows than max_rows.
+        let it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Pending, "p")]);
+        // max_rows=1: header only, no spacer, no body.
+        let rows = todo_panel_rows(&it, 0, 2, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], TodoPanelRow::Header { .. }));
+        // max_rows=2: spacer + header, no body budget left.
+        let rows = todo_panel_rows(&it, 0, 2, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], TodoPanelRow::Spacer));
+        assert!(matches!(rows[1], TodoPanelRow::Header { .. }));
     }
 
     #[test]
