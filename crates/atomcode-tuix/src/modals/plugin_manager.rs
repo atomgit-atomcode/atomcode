@@ -145,11 +145,16 @@ impl PluginManager {
 
     fn filtered_browse_plugins(&self) -> Vec<BrowsePluginItem> {
         let all = self.all_browse_plugins();
+        let uninstalled: Vec<BrowsePluginItem> = all
+            .into_iter()
+            .filter(|item| !self.is_installed(&item.name, &item.marketplace))
+            .collect();
+
         if self.search_query.is_empty() {
-            all
+            uninstalled
         } else {
             let q = self.search_query.to_lowercase();
-            all.into_iter()
+            uninstalled.into_iter()
                 .filter(|item| {
                     item.name.to_lowercase().contains(&q)
                         || item.marketplace.to_lowercase().contains(&q)
@@ -1003,5 +1008,22 @@ mod tests {
             .collect();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "git-lens");
+    }
+
+    #[test]
+    fn browse_filters_out_installed_plugins() {
+        let m = manager(
+            vec![
+                mk_mp("official", &["git-lens", "rust-analyzer"]),
+                mk_mp("community", &["go-pls"]),
+            ],
+            vec![
+                mk_installed("git-lens", "official"),
+            ],
+        );
+        let browse = m.filtered_browse_plugins();
+        assert_eq!(browse.len(), 2);
+        assert_eq!(browse[0].name, "go-pls");
+        assert_eq!(browse[1].name, "rust-analyzer");
     }
 }
