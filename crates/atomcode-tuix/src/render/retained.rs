@@ -1813,38 +1813,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         panel.options.len()
     }
 
-    /// Build the compact footer approval panel: just the selectable options
-    /// (selected row = `▸ ` + reverse), each with a left `▌` warning accent bar
-    /// (ASCII `|`). The header / command / hint are intentionally omitted — the
-    /// command is already shown in the `▸ Tool(detail)` body row above, and the
-    /// option labels are self-describing (e.g. "Always allow Bash" carries the
-    /// tool name). Colorless besides the bar + reverse selection.
+    /// Build the compact footer approval panel: just the selectable options,
+    /// aligned to col 0 so the `▸` on the selected row lines up with the
+    /// `▸ Tool(detail)` body row above and the input's `❯` prompt, and the
+    /// labels line up with the input text (col 2). Selected row = `▸ ` + reverse;
+    /// the others indent 2 cols. No accent bar / header / hint — the approval
+    /// context is set by the body row above, and the option labels are
+    /// self-describing (e.g. "Always allow Bash" carries the tool name).
     fn build_approval_rows(
         &self,
         panel: &crate::render::ApprovalPanelView,
         rule_width: usize,
     ) -> Vec<Vec<Cell>> {
         let unicode = self.caps.unicode_symbols;
-        let bar = if unicode { "\u{258c} " } else { "| " }; // ▌
-        let bar_style = self.style_for(Role::Warning);
         let mut out: Vec<Vec<Cell>> = Vec::new();
 
-        // option rows: `▌  ▸ <label>` (selected: ▸ + reverse) / `▌    <label>`
+        // option rows: `▸ <label>` (selected: ▸ + reverse) / `  <label>`
         for (i, label) in panel.options.iter().enumerate() {
             let mut row = Vec::new();
-            push_str_cells(&mut row, bar, &bar_style);
             let selected = i == panel.selected;
             let marker = if selected {
-                if unicode { "  \u{25b8} " } else { "  > " } // ▸
+                if unicode { "\u{25b8} " } else { "> " } // ▸
             } else {
-                "    "
+                "  "
             };
             let style = if selected {
                 CellStyle { reverse: true, ..CellStyle::default() }
             } else {
                 self.style_for(Role::Secondary)
             };
-            let budget = rule_width.saturating_sub(6);
+            let budget = rule_width.saturating_sub(2);
             let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
             push_str_cells(&mut row, marker, &style);
             push_str_cells(&mut row, &lbl, &style);
