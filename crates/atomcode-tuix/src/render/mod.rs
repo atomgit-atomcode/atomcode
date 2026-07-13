@@ -381,16 +381,14 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
-    /// Two-column list: name left-aligned, desc right-aligned,
-    /// selected row uses reverse-video (no prefix, no arrow).
-    /// Used by session picker.
-    /// `row_prefix` is prepended before the name (e.g. `/`).
-    /// `selected_marker` is shown before the prefix for the selected row;
-    /// unselected rows get `display_width(marker)` spaces.
     TwoColumn {
         row_prefix: &'static str,
         selected_marker: &'static str,
     },
+    /// Plugin manager list: 2-line rendering per item.
+    /// Row 1: Plugin Name + Marketplace + Installation Status
+    /// Row 2: Description
+    Plugin,
 }
 
 impl MenuKind {
@@ -399,14 +397,14 @@ impl MenuKind {
     /// rendering.
     pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
         match self {
-            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
-            // Window cap is `max(h/2, 4)`, but never reserve more rows than
-            // there are items — `paint_footer` only paints `item_count`
-            // rows when there are fewer than the cap, so `.max(4)` MUST
-            // apply to the cap, not the final value, or `current_footer_rows`
-            // over-estimates the footer height for short lists (< 4 items)
-            // and desyncs from the actual paint.
-            MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+            MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
+            MenuKind::Skill | MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+            MenuKind::Plugin => {
+                let plugin_count = item_count.saturating_sub(3);
+                let max_plugins = (screen_height / 4).max(2);
+                let visible_plugins = plugin_count.min(max_plugins);
+                3 + visible_plugins * 2
+            }
         }
     }
 }
@@ -695,7 +693,7 @@ mod tests {
 
     #[test]
     fn fixed_kinds_cap_at_four() {
-        for k in [MenuKind::SlashCommand, MenuKind::AtMention, MenuKind::Skill] {
+        for k in [MenuKind::SlashCommand, MenuKind::AtMention] {
             assert_eq!(k.max_visible_rows(40, 2), 2);
             assert_eq!(k.max_visible_rows(40, 10), 4);
         }

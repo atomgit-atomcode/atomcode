@@ -18,6 +18,8 @@ pub(crate) mod url;
 
 // Re-export types needed by downstream crates (TUI, CLI).
 pub use state::InstallScope;
+pub use manifest::{load_marketplace_manifest, load_plugin_manifest, MarketplaceManifest, PluginEntry, PluginManifest};
+pub use paths::{marketplaces_root, plugins_root, project_plugins_root};
 
 #[cfg(test)]
 pub(crate) mod test_support;
