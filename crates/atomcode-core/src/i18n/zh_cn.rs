@@ -309,6 +309,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalDeny => "拒绝".into(),
 
+        Msg::ModeAutoLabel => "自动模式".into(),
+        Msg::ModePlanLabel => "计划模式".into(),
+        Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
+
         Msg::SessionTimeJustNow => "刚刚".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}小时前").into(),

@@ -319,6 +319,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
         Msg::ApprovalDeny => "Deny".into(),
 
+        Msg::ModeAutoLabel => "auto mode on".into(),
+        Msg::ModePlanLabel => "plan mode on".into(),
+        Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
+
         Msg::SessionTimeJustNow => "just now".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}h ago").into(),

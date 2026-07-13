@@ -18,6 +18,73 @@ use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::skill::SkillRegistry;
 use crate::tool::{ToolCall, ToolRegistry};
 
+/// The unified execution mode. Single source of truth across TUI, daemon,
+/// webui. `Build` = interactive approval; `Auto` = auto-approve all tools
+/// (bypass); `Plan` = read-only (PlanModeGate blocks writes/commands).
+///
+/// Wire format stays `build`/`plan`/`bypass` (Auto ↔ "bypass") so the daemon
+/// `/live/mode` + `/approval_mode` endpoints and the webui stay compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Build,
+    #[serde(rename = "bypass")]
+    Auto,
+    Plan,
+}
+
+impl Mode {
+    /// Forward cycle: Build → Auto → Plan → Build.
+    pub fn next(self) -> Self {
+        match self {
+            Mode::Build => Mode::Auto,
+            Mode::Auto => Mode::Plan,
+            Mode::Plan => Mode::Build,
+        }
+    }
+    /// Reverse cycle: Build → Plan → Auto → Build.
+    pub fn prev(self) -> Self {
+        match self {
+            Mode::Build => Mode::Plan,
+            Mode::Plan => Mode::Auto,
+            Mode::Auto => Mode::Build,
+        }
+    }
+    pub fn is_plan(self) -> bool { matches!(self, Mode::Plan) }
+    pub fn is_auto(self) -> bool { matches!(self, Mode::Auto) }
+    /// Stable ASCII label (status/telemetry). UI display uses i18n glyphs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Build => "Build",
+            Mode::Auto => "Auto",
+            Mode::Plan => "Plan",
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::Mode;
+    #[test]
+    fn mode_cycles_forward_and_back() {
+        assert_eq!(Mode::Build.next(), Mode::Auto);
+        assert_eq!(Mode::Auto.next(), Mode::Plan);
+        assert_eq!(Mode::Plan.next(), Mode::Build);
+        assert_eq!(Mode::Build.prev(), Mode::Plan);
+        assert_eq!(Mode::Plan.prev(), Mode::Auto);
+        assert_eq!(Mode::Auto.prev(), Mode::Build);
+        assert_eq!(Mode::default(), Mode::Build);
+    }
+    #[test]
+    fn mode_wire_is_build_plan_bypass() {
+        assert_eq!(serde_json::to_string(&Mode::Build).unwrap(), "\"build\"");
+        assert_eq!(serde_json::to_string(&Mode::Auto).unwrap(), "\"bypass\"");
+        assert_eq!(serde_json::to_string(&Mode::Plan).unwrap(), "\"plan\"");
+        assert_eq!(serde_json::from_str::<Mode>("\"bypass\"").unwrap(), Mode::Auto);
+    }
+}
+
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
 pub enum AgentCommand {

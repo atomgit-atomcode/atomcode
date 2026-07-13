@@ -237,6 +237,11 @@ pub enum Msg<'a> {
     ApprovalAlwaysAllow { tool: &'a str },
     ApprovalDeny,
 
+    // ── Execution mode pill ──
+    ModeAutoLabel,
+    ModePlanLabel,
+    CmdSwitchedAutoMode,
+
     SessionTimeJustNow,
     SessionTimeMinAgo { n: u64 },
     SessionTimeHourAgo { n: u64 },
