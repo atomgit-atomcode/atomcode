@@ -319,9 +319,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
+        Msg::ToolDenied => "denied".into(),
 
-        Msg::ModeAutoLabel => "auto mode on".into(),
-        Msg::ModePlanLabel => "plan mode on".into(),
         Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
 
         Msg::SessionTimeJustNow => "just now".into(),
@@ -1028,8 +1027,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),
         Msg::BypassWarningHeadless =>
             "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
-        Msg::BypassBadge =>
-            "\u{26a0} BYPASS".into(),
 
         Msg::AdminWarningBanner =>
             "\x1b[33m\u{26a0} Warning: Running with Administrator privileges.\n   The model may have access to system files.\n   Consider running without elevation, inside a scoped working directory.\x1b[39m\n".into(),

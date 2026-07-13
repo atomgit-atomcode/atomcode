@@ -902,36 +902,79 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
-    /// Render `● Bash` header + `  └ <cmd>` block lines. Used by both the static
+    /// Build `<prefix><Name>(<cmd>)<meta>` rows for a bash tool call. The
+    /// command sits in parens on the header line to match other tools
+    /// (`● Read(arg)`), while `format_shell_command` keeps the shell-boundary
+    /// wrapping (`&&`, `||`, `|`, `\`) so multi-part commands break onto their
+    /// own lines. Shared by the static/committed path (`prefix = "● "`, empty
+    /// `meta`) and the live spinner (`prefix` = animated glyph, `meta` = elapsed
+    /// timer) so both render identically apart from the glyph and timer.
+    #[allow(clippy::too_many_arguments)]
+    fn build_bash_command_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        safe_name: &str,
+        name_style: &CellStyle,
+        detail_style: &CellStyle,
+        safe_detail: &str,
+        meta: &str,
+        meta_style: &CellStyle,
+    ) -> Vec<Vec<Cell>> {
+        // Row 0 carries the `<prefix><Name>(` header. Budget the wrap width for
+        // it; continuation lines only carry format_shell_command's 4-space
+        // indent, so `cont_pad` re-aligns them under the command text on row 0.
+        let header_cols = crate::width::display_width(prefix)
+            + crate::width::display_width(safe_name)
+            + 1;
+        let cont_pad = " ".repeat(header_cols.saturating_sub(4));
+        let width = (self.screen.width() as usize).saturating_sub(header_cols).max(8);
+        let safe_cmd = crate::glyph::downgrade_glyphs(safe_detail, self.caps.unicode_symbols);
+        let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
+        let last = lines.len().saturating_sub(1);
+        let mut rows = Vec::with_capacity(lines.len());
+        for (idx, line) in lines.iter().enumerate() {
+            let mut row = Vec::new();
+            if idx == 0 {
+                push_str_cells(&mut row, prefix, prefix_style);
+                push_str_cells(&mut row, safe_name, name_style);
+                push_str_cells(&mut row, "(", detail_style);
+            } else if !cont_pad.is_empty() {
+                push_str_cells(&mut row, &cont_pad, detail_style);
+            }
+            push_str_cells(&mut row, line, detail_style);
+            if idx == last {
+                push_str_cells(&mut row, ")", detail_style);
+                if !meta.is_empty() {
+                    push_str_cells(&mut row, meta, meta_style);
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Render `● Bash(<cmd>)` header block (static / committed path). Thin
+    /// wrapper over `build_bash_command_rows`. Used by both the static
     /// `UiLine::ToolCall` arm and `commit_inflight_tool` so the live and static
     /// paths produce identical output.
     fn push_bash_command_block(&mut self, safe_name: &str, safe_detail: &str) {
         let bullet_style = self.tool_bullet_style();
         let tool_name_style = self.style_bold(Role::ToolName);
-        // Header: `● Bash`
-        self.push_body_prefixed("● ", &bullet_style, safe_name, &tool_name_style);
-        // Command lines: `  └ <cmd>` (dim `└` gutter, command in Secondary).
-        // Layout: PAD_COL (2 sp) + `└ ` (2) = 4 cols before command text.
-        let cmd_style = self.style_for(Role::Secondary);
-        let gutter_style = if crate::highlight::theme::is_light_for_render() {
-            self.style_for(Role::Muted)
-        } else {
-            self.style_faint(Role::Muted)
-        };
-        let leaf = if self.caps.unicode_symbols { "  \u{2514} " } else { "  ` " };
-        let width = (self.screen.width() as usize).saturating_sub(4).max(8);
-        let safe_cmd = crate::glyph::downgrade_glyphs(safe_detail, self.caps.unicode_symbols);
-        let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
-        for (idx, line) in lines.iter().enumerate() {
-            let mut row = Vec::new();
-            if idx == 0 {
-                push_str_cells(&mut row, leaf, &gutter_style);
-                push_str_cells(&mut row, line, &cmd_style);
-            } else {
-                // Continuation: format_shell_command already prepends 4 spaces, so the
-                // text lands at col 4, aligned under line 0's command text.
-                push_str_cells(&mut row, line, &cmd_style);
-            }
+        // Parens + command render in Secondary, same as the `(detail)` other
+        // tools show.
+        let detail_style = self.style_for(Role::Secondary);
+        let rows = self.build_bash_command_rows(
+            "● ",
+            &bullet_style,
+            safe_name,
+            &tool_name_style,
+            &detail_style,
+            safe_detail,
+            "",
+            &detail_style,
+        );
+        for row in rows {
             self.push_body_row(row);
         }
     }
@@ -991,6 +1034,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let detail_style = self.style_for(Role::Secondary);
         let meta_style = self.style_bold(Role::ToolName);
 
+        let is_bash = safe_name.eq_ignore_ascii_case("bash");
         let mut new_rows = if safe_detail.is_empty() {
             // No detail: simple path — name + meta, all bold
             self.build_mixed_style_rows(
@@ -999,6 +1043,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 "", &detail_style,
                 meta, &meta_style,
                 &safe_name,
+            )
+        } else if is_bash {
+            // Bash: same shell-boundary wrapping as the static/committed path
+            // (`build_bash_command_rows`) so the live spinner and the final
+            // committed block look identical — `● Bash(cmd)` breaking at
+            // `&&`/`|`/`\` rather than mid-token width-wrapping. `meta` (the
+            // elapsed timer) rides the last line.
+            self.build_bash_command_rows(
+                &prefix, &prefix_style,
+                &safe_name, &name_style,
+                &detail_style,
+                &safe_detail,
+                meta, &meta_style,
             )
         } else {
             // Note: full_body intentionally excludes `meta` —
@@ -1644,37 +1701,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let error = self.style_for(Role::Error);
         let brand = self.style_for(Role::Brand);
 
-        // Mode indicator first — non-default modes (Plan today) prepend
-        // a brand-colored badge so the user sees at a glance that file
-        // edits / shell are gated. Build (default) is None and adds
-        // nothing.
-        let mode_badge: Option<String> = status
-            .mode_indicator
-            .as_ref()
-            .map(|s| scrub_controls(s));
-        let mode_badge_w = mode_badge
+        // Left mode badge — a single left-aligned badge covers all non-default
+        // modes: Plan → brand-colored "PLAN"; Auto → warning-colored "⏵⏵ auto"
+        // (auto-approve-all is a caution state the user must always see).
+        // `mode_indicator` (Plan) and `bypass_indicator` (Auto) are mutually
+        // exclusive, so one slot serves both — there is no separate right badge.
+        let (left_badge, left_badge_style): (Option<String>, CellStyle) =
+            if let Some(m) = status.mode_indicator.as_ref() {
+                (Some(scrub_controls(m)), brand.clone())
+            } else if let Some(b) = status.bypass_indicator.as_ref() {
+                (Some(scrub_controls(b)), self.style_for(Role::Warning))
+            } else {
+                (None, brand.clone())
+            };
+        let mode_badge_w = left_badge
             .as_ref()
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
             .unwrap_or(0);
 
-        // Bypass indicator — right-aligned warning badge when
-        // --dangerously-skip-permissions / -y is active. Rendered in
-        // red (Role::Error) after the hint on the right side so
-        // it does not displace the PLAN mode indicator on the left.
-        let bypass_badge: Option<String> = status
-            .bypass_indicator
-            .as_ref()
-            .map(|s| scrub_controls(s));
-        let bypass_badge_w = bypass_badge
-            .as_ref()
-            .map(|s| crate::width::display_width(s) + 1) // +1 for the leading space separator
-            .unwrap_or(0);
-
         // Hint right-alignment math must reserve space for the mode badge
-        // and bypass badge so they never collide with the right-aligned
-        // hint when the status row is wide.
+        // so it never collides with the right-aligned hint when wide.
         let max = rule_width.max(1);
-        let right_reserved = mode_badge_w + bypass_badge_w;
+        let right_reserved = mode_badge_w;
         let left_max = max.saturating_sub(right_reserved);
 
         // Pre-truncate the cwd so that model + ctx_usage still get space
@@ -1736,20 +1784,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the mode indicator is always at column 0 (after PAD_COL) and
         // both hint / no-hint branches share the same prefix.
         let push_badge = |row: &mut Vec<Cell>| {
-            if let Some(badge) = &mode_badge {
-                push_str_cells(row, badge, &brand);
+            if let Some(badge) = &left_badge {
+                push_str_cells(row, badge, &left_badge_style);
                 push_str_cells(row, " ", &pad);
-            }
-        };
-
-        // Helper: emit the bypass badge at the right edge of the row.
-        // Rendered in red (Role::Error) to draw the eye — the user
-        // must always see when tool calls are auto-approved.
-        let bypass_style = self.style_for(Role::Error);
-        let push_bypass = |row: &mut Vec<Cell>| {
-            if let Some(badge) = &bypass_badge {
-                push_str_cells(row, " ", &pad);
-                push_str_cells(row, badge, &bypass_style);
             }
         };
 
@@ -1760,7 +1797,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 crate::render::HintSeverity::Warning => error,
                 crate::render::HintSeverity::Info => secondary.clone(),
             };
-            let right_w = hint_w + bypass_badge_w;
+            let right_w = hint_w;
             if right_w + 1 < left_max {
                 let left_budget = left_max - right_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
@@ -1770,18 +1807,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
-                push_bypass(&mut row);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, left_max);
                 push_badge(&mut row);
                 push_str_cells(&mut row, &truncated, &secondary);
-                push_bypass(&mut row);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, left_max);
             push_badge(&mut row);
             push_str_cells(&mut row, &truncated, &secondary);
-            push_bypass(&mut row);
         }
         row
     }
@@ -6101,11 +6135,11 @@ mod tests {
         );
     }
 
-    /// Bypass indicator (--dangerously-skip-permissions) renders on the
-    /// RIGHT side of the status row, after the model · cwd run. It must
-    /// NOT displace the left-aligned PLAN mode indicator.
+    /// `mode_indicator` (Plan) and `bypass_indicator` (Auto) are mutually
+    /// exclusive — they share ONE left badge slot. If both are somehow set,
+    /// the mode indicator wins and the bypass badge does not also render.
     #[test]
-    fn build_status_row_bypass_badge_on_right_side() {
+    fn build_status_row_mode_indicator_wins_over_bypass() {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
@@ -6126,27 +6160,16 @@ mod tests {
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
-        let trimmed = visible.trim_start();
-        // PLAN badge still on the left.
+        // PLAN badge on the left.
         assert!(
-            trimmed.starts_with("PLAN "),
-            "PLAN badge must still appear first on the left; got: {:?}",
+            visible.trim_start().starts_with("PLAN "),
+            "PLAN badge must appear first on the left; got: {:?}",
             visible
         );
-        // BYPASS badge appears somewhere in the row (right side).
+        // Single left slot: BYPASS does NOT also render.
         assert!(
-            visible.contains("BYPASS"),
-            "BYPASS badge must appear in the row; got: {:?}",
-            visible
-        );
-        // PLAN comes before BYPASS in the rendered row.
-        let plan_pos = visible.find("PLAN").expect("PLAN must be present");
-        let bypass_pos = visible.find("BYPASS").expect("BYPASS must be present");
-        assert!(
-            plan_pos < bypass_pos,
-            "PLAN ({}) must precede BYPASS ({}); got: {:?}",
-            plan_pos,
-            bypass_pos,
+            !visible.contains("BYPASS"),
+            "bypass must not render when a mode indicator is present; got: {:?}",
             visible
         );
     }
@@ -6928,8 +6951,10 @@ mod tests {
         assert_eq!(r.inflight_tool_rows, 1);
 
         // A detail that WRAPS to multiple rows ⇒ prev_rows(1) != n(>1) ⇒ fallback re-push.
-        let long = "x".repeat(200);
-        r.render_inflight_tool("\u{25cf}", "Bash", &long, "");
+        // Bash wraps at shell boundaries (format_shell_command breaks at each `&&`),
+        // so use a multi-segment command rather than one long unbreakable token.
+        let long = "cd /tmp && echo one && echo two && echo three && echo four";
+        r.render_inflight_tool("\u{25cf}", "Bash", long, "");
         assert!(r.inflight_tool_rows >= 2, "wrapped strip should be multi-row: {}", r.inflight_tool_rows);
 
         // Both real lines must survive — the fallback re-push must not have popped them.
@@ -8207,15 +8232,11 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        // Header row: `● bash` (no inline paren command).
+        // Header row: `● bash(ls -la)` — command inline in parens, matching
+        // other tools (`● Read(arg)`).
         assert!(
-            vterm.any_row(|row| row.contains("●") && row.contains("bash") && !row.contains("bash(")),
+            vterm.any_row(|row| row.contains("●") && row.contains("bash(") && row.contains("ls -la")),
             "bash header row missing\ndump:\n{}", vterm.dump()
-        );
-        // Command row: `ls -la` (no `$` prefix).
-        assert!(
-            vterm.any_row(|row| row.contains("ls -la")),
-            "bash command row missing\ndump:\n{}", vterm.dump()
         );
     }
 
@@ -8304,9 +8325,9 @@ mod tests {
         );
     }
 
-    /// Bash ToolCall renders `● Bash` header + `  └ command` lines (dim `└`
-    /// gutter at col 2, command text at col 4), wrapping along shell boundaries
-    /// (not mid-token), with no truncation and no NBSP sentinel.
+    /// Bash ToolCall renders `● Bash(<cmd>)` — command inline in parens on the
+    /// header line (matching other tools) — while still wrapping along shell
+    /// boundaries (not mid-token), with no truncation and no NBSP sentinel.
     #[test]
     fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
         let (mut r, buf) = new_capturing(60, 24);
@@ -8317,30 +8338,32 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
-            "header is `● Bash` without inline paren command\ndump:\n{}", vterm.dump());
-        // Line 0 must contain both `└` (or `` ` ``) gutter and `cd /tmp`.
-        assert!(
-            vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("cd /tmp")),
-            "first command row must have └ gutter + command\ndump:\n{}", vterm.dump()
-        );
+        // Header row carries `● Bash(` plus the first command segment inline.
+        assert!(vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
+            "header is `● Bash(cd /tmp …` with inline paren command\ndump:\n{}", vterm.dump());
         assert!(vterm.any_row(|row| row.contains("-e 's/mb-2.5/mb-[10px]/g'")),
             "the -e segment stays intact on one row\ndump:\n{}", vterm.dump());
+        // Wrapping still breaks at `&&` (the second segment lands on its own row).
+        assert!(vterm.any_row(|row| row.trim_start().starts_with("&& sed")),
+            "shell boundary wrap at `&&` preserved\ndump:\n{}", vterm.dump());
+        // Closing paren terminates the command block.
+        assert!(vterm.any_row(|row| row.trim_end().ends_with(')')),
+            "command block closed with `)`\ndump:\n{}", vterm.dump());
         assert!(!vterm.any_row(|row| row.contains("truncated")),
             "no truncation\ndump:\n{}", vterm.dump());
         // No NBSP sentinel should appear anywhere.
         assert!(!vterm.any_row(|row| row.contains('\u{00A0}')),
             "no NBSP sentinel expected in new layout\ndump:\n{}", vterm.dump());
-        // The command must be indented under the gutter, never flush at col 0.
+        // The command follows `● Bash(`, never flush at col 0.
         assert!(!vterm.any_row(|row| row.starts_with("cd /tmp")),
-            "command must be indented (not col 0)\ndump:\n{}", vterm.dump());
+            "command must sit after the `● Bash(` prefix (not col 0)\ndump:\n{}", vterm.dump());
     }
 
     /// Live bash committed via ToolCallInFlight → ToolCallCommit must produce
-    /// the same `● Bash` + `  └ <cmd>` block as the static `UiLine::ToolCall`
-    /// arm — NOT the old `● Bash(cmd)` inline format.
+    /// the same `● Bash(<cmd>)` inline-paren block as the static
+    /// `UiLine::ToolCall` arm, still wrapping at shell boundaries.
     #[test]
-    fn live_bash_commits_to_command_block() {
+    fn live_bash_commits_to_inline_paren_command() {
         let (mut r, buf) = new_capturing(60, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(60, 24);
         // Live inflight strip (as ToolCallStarted would push):
@@ -8355,17 +8378,15 @@ mod tests {
         r.render(UiLine::ToolCallCommit { call_id: Some("call-1".into()) });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        // Committed form is the block, NOT `● Bash(cmd)` inline:
-        assert!(vterm.any_row(|row| row.contains("● Bash") && !row.contains("Bash(")),
-            "committed header is `● Bash` (no inline paren)\ndump:\n{}", vterm.dump());
-        assert!(vterm.any_row(|row| (row.contains('\u{2514}') || row.contains('`')) && row.contains("cd /tmp")),
-            "committed command line `  └ cd /tmp`\ndump:\n{}", vterm.dump());
+        // Committed form is `● Bash(cmd)` inline, matching the static arm:
+        assert!(vterm.any_row(|row| row.contains("● Bash(") && row.contains("cd /tmp")),
+            "committed header is `● Bash(cd /tmp …`\ndump:\n{}", vterm.dump());
         assert!(vterm.any_row(|row| row.contains("-e 's/cc/dd/g'")),
             "wrapped segment survives\ndump:\n{}", vterm.dump());
         assert!(!vterm.any_row(|row| row.contains("truncated")), "no (truncated)\ndump:\n{}", vterm.dump());
         // No ghost/duplicate strip row lingering:
-        let bash_headers = (0..vterm.height() as usize).filter(|&i| vterm.row_text(i).contains("● Bash")).count();
-        assert_eq!(bash_headers, 1, "exactly one ● Bash header (no ghost)\ndump:\n{}", vterm.dump());
+        let bash_headers = (0..vterm.height() as usize).filter(|&i| vterm.row_text(i).contains("● Bash(")).count();
+        assert_eq!(bash_headers, 1, "exactly one ● Bash( header (no ghost)\ndump:\n{}", vterm.dump());
     }
 
     /// ToolResult success: `⎿ summary` + blank spacer; failure

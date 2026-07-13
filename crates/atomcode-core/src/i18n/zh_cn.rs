@@ -309,9 +309,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalDeny => "拒绝".into(),
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
+        Msg::ToolDenied => "已拒绝".into(),
 
-        Msg::ModeAutoLabel => "自动模式".into(),
-        Msg::ModePlanLabel => "计划模式".into(),
         Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
 
         Msg::SessionTimeJustNow => "刚刚".into(),
@@ -1011,8 +1010,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),
         Msg::BypassWarningHeadless =>
             "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
-        Msg::BypassBadge =>
-            "\u{26a0} BYPASS".into(),
 
         Msg::AdminWarningBanner =>
             "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   建议改用普通权限、并在受限的工作目录中运行 AtomCode。\x1b[39m\n".into(),

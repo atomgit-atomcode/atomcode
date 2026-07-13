@@ -238,9 +238,10 @@ pub enum Msg<'a> {
     ApprovalDeny,
     ApprovalHint,
 
-    // ── Execution mode pill ──
-    ModeAutoLabel,
-    ModePlanLabel,
+    // ── Tool result markers ──
+    ToolDenied,
+
+    // ── Execution mode ──
     CmdSwitchedAutoMode,
 
     SessionTimeJustNow,
@@ -923,9 +924,6 @@ pub enum Msg<'a> {
     BypassWarningBanner,
     /// Headless-mode stderr warning when --dangerously-skip-permissions is active.
     BypassWarningHeadless,
-    /// Status-bar badge text shown when --dangerously-skip-permissions is
-    /// active. Typically "⚠ BYPASS" — kept short for the status row.
-    BypassBadge,
 
     // ── admin / root privilege warning ──
     /// TUI scrollback warning when AtomCode is running as admin/root.

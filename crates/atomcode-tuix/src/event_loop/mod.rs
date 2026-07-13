@@ -3460,6 +3460,28 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn approval_denial_label_detects_denials() {
+        // Policy denial → calm label (non-empty).
+        let label = approval_denial_label(
+            "blocked: denied by approval policy: mcp__x__y {\"a\":1}",
+            false,
+        );
+        assert!(label.is_some());
+        assert!(!label.unwrap().is_empty());
+
+        // User-interactive denial → calm label.
+        let label2 = approval_denial_label("Tool 'bash' was denied by the user.", false);
+        assert!(label2.is_some());
+        assert!(!label2.unwrap().is_empty());
+
+        // Success → None.
+        assert_eq!(approval_denial_label("ok", true), None);
+
+        // Non-denial failure → None (keeps normal ✗ render).
+        assert_eq!(approval_denial_label("Error: file not found", false), None);
+    }
+
+    #[test]
     fn summarise_multi_line_adds_line_count() {
         let out = summarise("first line\nsecond line\nthird line");
         assert!(out.starts_with("first line"));
@@ -9066,6 +9088,10 @@ fn handle_agent_event(
                 // sees WHY the tool didn't run and that they should review the plan.
                 if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
+                } else if let Some(label) = approval_denial_label(&output, success) {
+                    // A denial is the user's choice, not an error — render a calm `○ denied`
+                    // (muted, like plan-mode blocks), dropping the verbose tool+args repeat.
+                    renderer.render(UiLine::CommandOutput(format!("  ○ {label}\n")));
                 } else {
                     // A single web_search call gets the same source-domain
                     // summary as the parallel child rows (`sources: eol.cn,
@@ -10715,19 +10741,27 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // against the user being confused why the agent refuses to write
     // files. Default Build = None, no visual noise.
     let mode_indicator = match state.agent_mode {
-        crate::state::AgentMode::Plan => Some("PLAN".to_string()),
+        crate::state::AgentMode::Plan => {
+            // `⏸ plan` — glyph downgrades to `||` on non-unicode terminals.
+            let pause = if ctx.caps.unicode_symbols { "\u{23f8}" } else { "||" };
+            Some(format!("{pause} plan"))
+        }
         crate::state::AgentMode::Build => None,
-        // Auto's visual is the right-aligned warning badge below (Auto = bypass).
+        // Auto's visual is the warning-colored left badge below (via bypass_indicator).
         crate::state::AgentMode::Auto => None,
     };
-    // Bypass indicator: right-aligned warning badge while the execution mode is
-    // Auto (auto-approve all tools). `--dangerously-skip-permissions` seeds
-    // `agent_mode = Auto` at startup, so keying off the mode covers both the
-    // startup flag AND the runtime Tab/`/auto` toggle — the badge no longer
-    // silently disappears when Auto is entered at runtime. Kept on the right so
-    // it doesn't displace the PLAN mode indicator on the left.
+    // Auto mode badge: a single warning-colored LEFT badge `⏵⏵ auto` (rendered
+    // in place of the PLAN badge, since Plan and Auto are mutually exclusive).
+    // `--dangerously-skip-permissions` seeds `agent_mode = Auto` at startup, so
+    // keying off the mode covers both the startup flag AND the runtime Tab /
+    // `/auto` toggle. The `⏵⏵` glyph downgrades to `>>` on non-unicode terminals.
     let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
-        Some(crate::i18n::t(crate::i18n::Msg::BypassBadge).into_owned())
+        let arrows = if ctx.caps.unicode_symbols {
+            "\u{23f5}\u{23f5}"
+        } else {
+            ">>"
+        };
+        Some(format!("{arrows} auto"))
     } else {
         None
     };
@@ -11747,6 +11781,24 @@ pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str
     }
     let reason = output.strip_prefix("blocked: ")?;
     reason.starts_with("plan mode").then_some(reason)
+}
+
+/// A tool result that is an approval/user DENIAL → a calm compact label
+/// (localized "denied"), NOT the red ✗ error. Detects the deny messages from
+/// approval.rs / write_approval.rs ("denied by approval policy: ...") and
+/// runner.rs ("Tool 'X' was denied by the user."). Returns None for successes
+/// and non-denial failures (those keep the normal ✗ result). The tool name +
+/// args in the raw message are intentionally dropped — the `● Tool(...)` header
+/// above already shows them (the redundancy the user complained about).
+pub(crate) fn approval_denial_label(output: &str, success: bool) -> Option<String> {
+    if success {
+        return None;
+    }
+    if output.contains("denied by approval policy") || output.contains("was denied by the user") {
+        Some(crate::i18n::t(crate::i18n::Msg::ToolDenied).into_owned())
+    } else {
+        None
+    }
 }
 
 // SessionPicker tests moved alongside the struct in
