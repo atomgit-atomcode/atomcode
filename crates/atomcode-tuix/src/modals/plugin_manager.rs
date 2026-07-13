@@ -250,7 +250,7 @@ impl PluginManager {
             Screen::AddUrl => 0,
             Screen::ScopeSelect { .. } => 3, // user / project / local
             Screen::Installing { .. } => 0, // No selectable rows — just status text
-            Screen::InstalledDetails { .. } => 4, // Uninstall, Update, Disable, Back
+            Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
         }
     }
 
@@ -432,14 +432,6 @@ impl PluginManager {
                 self.dispatch_install(plugin, mp, scope, ctx);
             }
             1 => {
-                // Disable (mock it, close the modal and print a success line)
-                renderer.render(UiLine::CommandOutput(
-                    format!("  ⎿  ✓ Disabled {}. Run /reload-plugins to apply.", plugin)
-                ));
-                self.close_requested = true;
-                renderer.flush();
-            }
-            2 => {
                 // Uninstall
                 match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
                     Ok(()) => {
@@ -456,7 +448,7 @@ impl PluginManager {
                 }
                 renderer.flush();
             }
-            3 => {
+            2 => {
                 // Back to parent
                 self.goto(Screen::Installed);
             }
@@ -614,7 +606,6 @@ impl PluginManager {
 
                 let rows = vec![
                     (update_label, update_desc),
-                    (t(Msg::PluginActionDisable).into_owned(), t(Msg::PluginActionDisableDesc).into_owned()),
                     (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
                     (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
                 ];
@@ -1222,13 +1213,12 @@ mod tests {
             mp: "official".to_string(),
             scope: InstallScope::Project,
         });
-        assert_eq!(m.current_len(), 4);
+        assert_eq!(m.current_len(), 3);
         let (rows, _) = m.rows();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 3);
         // Action options
         assert!(rows[0].0.contains("Update") || rows[0].0.contains("更新"));
-        assert!(rows[1].0.contains("Disable") || rows[1].0.contains("禁用"));
-        assert!(rows[2].0.contains("Uninstall") || rows[2].0.contains("卸载"));
-        assert!(rows[3].0.contains("Back") || rows[3].0.contains("返回"));
+        assert!(rows[1].0.contains("Uninstall") || rows[1].0.contains("卸载"));
+        assert!(rows[2].0.contains("Back") || rows[2].0.contains("返回"));
     }
 }
