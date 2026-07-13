@@ -4714,6 +4714,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &style);
             }
             UiLine::CommandOutput(text) => {
+                // If it's a subordinate command output (starts with "  ⎿" or "  └" or "  `" or "  \\"),
+                // pop the empty blank separator so it sits flush under the command!
+                let is_subordinate = text.starts_with("  ⎿") || text.starts_with("  └") || text.starts_with("  `") || text.starts_with("  \\");
+                if is_subordinate && self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    crate::tuix_trace!(
+                        "BPOP",
+                        "site=command_blank len_before={} n=1 scrolled_off={}",
+                        self.body_lines.len(),
+                        self.scrolled_off
+                    );
+                    self.body_lines.pop();
+                    let bottom = self.body_bottom_row();
+                    if bottom > 0 {
+                        let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                        let _ = self.out.write_all(seq.as_bytes());
+                    }
+                    self.skip_body_scroll_count =
+                        self.skip_body_scroll_count.saturating_add(1);
+                }
+
                 // CommandOutput is trusted internal text — let SGR
                 // through the sanitizer so colour / bold / faint
                 // attributes survive (e.g. the `/codingplan` red
