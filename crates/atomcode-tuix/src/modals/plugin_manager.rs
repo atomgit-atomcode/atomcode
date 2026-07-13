@@ -322,6 +322,7 @@ impl PluginManager {
         self.installing_scope = Some(scope.clone());
         self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         tokio::task::spawn_blocking(move || {
+            let _ = atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope.clone());
             let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
                 Ok(info) => PluginJobEvent::PluginInstalled(info),
                 Err(e) => {
