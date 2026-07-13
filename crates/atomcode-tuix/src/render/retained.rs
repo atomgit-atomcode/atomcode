@@ -2013,12 +2013,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
-        let approval_active = approval_rows > 0;
-        let eff_middle   = if approval_active { 0 } else { middle_rows };
-        let eff_bot_rule = if approval_active { 0 } else { 1 };
-        let eff_status   = if approval_active { 0 } else { status_rows };
-        let total_rows =
-            1 + eff_middle + eff_bot_rule + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + eff_status;
+        let approval_active = self.approval_active();
+        let total_rows = self.footer_total_rows(
+            middle_rows,
+            attachment_rows,
+            menu_rows,
+            goal_rows,
+            todo_rows,
+            approval_rows,
+            status_rows,
+        );
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -2122,7 +2126,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self::pad_row_to_width(&mut top_rule, w);
         self.screen.draw_row(rules_top, 0, &top_rule);
 
-        if approval_active {
+        // `post_approval` is the row index immediately after whatever occupies the
+        // slot between the top rule and the attachment rows — either the approval
+        // panel (when active) or the input box + bot_rule (normal case).
+        let post_approval = if approval_active {
             // Approval replaces input box: draw approval rows directly after the
             // top rule (skip middle rows, skip bot_rule, skip status).
             let approval_top = rules_top + 1;
@@ -2131,31 +2138,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 Self::pad_row_to_width(&mut padded, w);
                 self.screen.draw_row(approval_top + i, 0, &padded);
             }
-            let post_approval = approval_top + approval_rows;
-            let attach_top = post_approval;
-            for (i, r) in attachment_cells.into_iter().enumerate() {
-                let mut padded = r;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(attach_top + i, 0, &padded);
-            }
-            let menu_top = attach_top + attachment_rows;
-            self.screen.invalidate_rows_from(menu_top);
-            for (i, r) in menu_cells.into_iter().enumerate() {
-                let mut padded = r;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(menu_top + i, 0, &padded);
-            }
-            let goal_top = menu_top + menu_rows;
-            if let Some(gr) = goal_cells {
-                let mut padded = gr;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(goal_top, 0, &padded);
-            }
-            // Status row hidden when approval is active — no draw.
             // Cursor visibility handled by the common suppress_cursor block below.
+            rules_top + 1 + approval_rows
         } else {
-            // Normal (no approval): draw middle rows, bot_rule, optional approval
-            // (no-op), attachments, menu, goal/loop, status — original layout.
+            // Normal (no approval): draw middle rows then bot_rule.
             for (i, r) in middle_cells.into_iter().enumerate() {
                 let mut padded = r;
                 Self::pad_row_to_width(&mut padded, w);
@@ -2167,54 +2153,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Self::pad_row_to_width(&mut bot_rule, w);
             self.screen.draw_row(bot_rule_row, 0, &bot_rule);
 
-            // approval_rows == 0 in this branch (no-op).
-            let approval_top = bot_rule_row + 1;
-            for (i, ar) in approval_cells.into_iter().enumerate() {
-                let mut padded = ar;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(approval_top + i, 0, &padded);
-            }
-
-            let attach_top = bot_rule_row + 1 + approval_rows;
-            for (i, r) in attachment_cells.into_iter().enumerate() {
-                let mut padded = r;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(attach_top + i, 0, &padded);
-            }
-
-            let menu_top = attach_top + attachment_rows;
-            // Invalidate prev_cells for the menu rows so the next render_diff
-            // emits explicit patches for EVERY cell (including blank padding at
-            // the right edge). Without this, a CJK character from a prior frame's
-            // skill description whose display cells transition to ASCII spaces can
-            // leave the right-half of its glyph visible on some terminals (iTerm2
-            // per-cell patch coalescing). `pad_row_to_width` on the individual row
-            // already fills the buffer with blanks from content-end to screen edge,
-            // but the diff/serialize mechanism may not fully overwrite the right
-            // half of a 2-cell-wide glyph because the continuation cell at (c+1)
-            // is compared against the new (non-continuation) blank cell — the patch
-            // IS generated, yet the physical glyph remnant survives on iTerm2.
-            // Sentinel prev forces every column through the diff, blanks included.
-            self.screen.invalidate_rows_from(menu_top);
-            for (i, r) in menu_cells.into_iter().enumerate() {
-                let mut padded = r;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(menu_top + i, 0, &padded);
-            }
-            // Stack below the input box: `· menu / goal|loop / status ·`
-            // (the todo panel is drawn at the TOP of the footer, above the rules).
-            let goal_top = menu_top + menu_rows;
-            if let Some(gr) = goal_cells {
-                let mut padded = gr;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(goal_top, 0, &padded);
-            }
-            if let Some(st) = status_cells {
-                let mut padded = st;
-                Self::pad_row_to_width(&mut padded, w);
-                self.screen.draw_row(goal_top + goal_rows, 0, &padded);
-            }
-
             // Cursor park — 1-indexed, inside middle row at the input cell.
             // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
             // Symbol-bearing body rows share this col-0 baseline.
@@ -2224,6 +2162,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let cursor_abs_row = (rules_top + 1 + cursor_row_in_middle + 1) as u16;
             let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
             self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+
+            bot_rule_row + 1
+        };
+
+        // Shared drawing: attachments → menu → goal|loop row → status row.
+        // (Status row is suppressed when approval is active since eff_status == 0.)
+        let attach_top = post_approval;
+        for (i, r) in attachment_cells.into_iter().enumerate() {
+            let mut padded = r;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(attach_top + i, 0, &padded);
+        }
+
+        let menu_top = attach_top + attachment_rows;
+        // Invalidate prev_cells for the menu rows so the next render_diff
+        // emits explicit patches for EVERY cell (including blank padding at
+        // the right edge). Without this, a CJK character from a prior frame's
+        // skill description whose display cells transition to ASCII spaces can
+        // leave the right-half of its glyph visible on some terminals (iTerm2
+        // per-cell patch coalescing). `pad_row_to_width` on the individual row
+        // already fills the buffer with blanks from content-end to screen edge,
+        // but the diff/serialize mechanism may not fully overwrite the right
+        // half of a 2-cell-wide glyph because the continuation cell at (c+1)
+        // is compared against the new (non-continuation) blank cell — the patch
+        // IS generated, yet the physical glyph remnant survives on iTerm2.
+        // Sentinel prev forces every column through the diff, blanks included.
+        self.screen.invalidate_rows_from(menu_top);
+        for (i, r) in menu_cells.into_iter().enumerate() {
+            let mut padded = r;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(menu_top + i, 0, &padded);
+        }
+        // Stack below the input box: `· menu / goal|loop / status ·`
+        // (the todo panel is drawn at the TOP of the footer, above the rules).
+        let goal_top = menu_top + menu_rows;
+        if let Some(gr) = goal_cells {
+            let mut padded = gr;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(goal_top, 0, &padded);
+        }
+        // Status row hidden when approval is active (eff_status == 0, no draw).
+        if !approval_active {
+            if let Some(st) = status_cells {
+                let mut padded = st;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(goal_top + goal_rows, 0, &padded);
+            }
         }
         // Hide the terminal cursor ONLY while an inflight-tool row is
         // animating. `render_inflight_tool`'s in-place path writes raw
@@ -2246,6 +2231,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // regardless of inflight_tool state (user navigates with ↑↓/Enter).
         let suppress_cursor = self.inflight_tool.is_some() || approval_active;
         self.screen.set_cursor_visible(!suppress_cursor);
+    }
+
+    /// Returns `true` when an approval panel is currently active (replaces
+    /// the input box and hides the status row in the footer).
+    #[inline]
+    fn approval_active(&self) -> bool {
+        self.status.approval.is_some()
+    }
+
+    /// Single source of truth for the footer height formula so
+    /// `paint_footer`'s `total_rows` and `current_footer_rows` can never
+    /// drift.  Applies the approval-active suppression (input middle line +
+    /// bottom rule + status row are hidden while an approval panel is up)
+    /// then sums all the components.
+    fn footer_total_rows(
+        &self,
+        middle: usize,
+        attachment: usize,
+        menu: usize,
+        goal: usize,
+        todo: usize,
+        approval: usize,
+        status: usize,
+    ) -> usize {
+        let approval_active = approval > 0;
+        let eff_middle   = if approval_active { 0 } else { middle };
+        let eff_bot_rule = if approval_active { 0 } else { 1 };
+        let eff_status   = if approval_active { 0 } else { status };
+        1 /* top rule */ + eff_middle + eff_bot_rule + attachment + menu + goal + todo + approval + eff_status
     }
 
     /// Footer total height — mirrors the computation inside
@@ -2301,12 +2315,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        // When approval is active, mirror paint_footer: hide input middle + bot_rule + status.
-        let approval_active = approval_rows > 0;
-        let eff_middle   = if approval_active { 0 } else { capped_middle };
-        let eff_bot_rule = if approval_active { 0 } else { 1 };
-        let eff_status   = if approval_active { 0 } else { status_rows };
-        1 + eff_middle + eff_bot_rule + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + eff_status
+        // Delegates to footer_total_rows so both functions share one formula.
+        self.footer_total_rows(
+            capped_middle,
+            attachment_rows,
+            menu_rows,
+            goal_rows,
+            todo_rows,
+            approval_rows,
+            status_rows,
+        )
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
