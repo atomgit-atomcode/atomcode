@@ -9885,21 +9885,12 @@ fn handle_agent_event(
                 .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
-                    text: if c.name.eq_ignore_ascii_case("bash") {
-                        format!(
-                            "  {} {} {}",
-                            child_glyph,
-                            display_tool_name_short(&c.name),
-                            detail
-                        )
-                    } else {
-                        format!(
-                            "  {} {}({})",
-                            child_glyph,
-                            display_tool_name_short(&c.name),
-                            detail
-                        )
-                    },
+                    text: format!(
+                        "  {} {}({})",
+                        child_glyph,
+                        display_tool_name_short(&c.name),
+                        detail
+                    ),
                 })
                 .collect();
             renderer.render(UiLine::AssistantLineBreak);
