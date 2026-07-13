@@ -2011,8 +2011,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
+        // When an approval panel is active, we replace the input box with the
+        // approval panel (saves 2+ rows) and hide the status row.
+        let approval_active = approval_rows > 0;
+        let eff_middle   = if approval_active { 0 } else { middle_rows };
+        let eff_bot_rule = if approval_active { 0 } else { 1 };
+        let eff_status   = if approval_active { 0 } else { status_rows };
         let total_rows =
-            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + status_rows;
+            1 + eff_middle + eff_bot_rule + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + eff_status;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -2116,77 +2122,109 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self::pad_row_to_width(&mut top_rule, w);
         self.screen.draw_row(rules_top, 0, &top_rule);
 
-        for (i, r) in middle_cells.into_iter().enumerate() {
-            let mut padded = r;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(rules_top + 1 + i, 0, &padded);
-        }
+        if approval_active {
+            // Approval replaces input box: draw approval rows directly after the
+            // top rule (skip middle rows, skip bot_rule, skip status).
+            let approval_top = rules_top + 1;
+            for (i, ar) in approval_cells.into_iter().enumerate() {
+                let mut padded = ar;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(approval_top + i, 0, &padded);
+            }
+            let post_approval = approval_top + approval_rows;
+            let attach_top = post_approval;
+            for (i, r) in attachment_cells.into_iter().enumerate() {
+                let mut padded = r;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(attach_top + i, 0, &padded);
+            }
+            let menu_top = attach_top + attachment_rows;
+            self.screen.invalidate_rows_from(menu_top);
+            for (i, r) in menu_cells.into_iter().enumerate() {
+                let mut padded = r;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(menu_top + i, 0, &padded);
+            }
+            let goal_top = menu_top + menu_rows;
+            if let Some(gr) = goal_cells {
+                let mut padded = gr;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(goal_top, 0, &padded);
+            }
+            // Status row hidden when approval is active — no draw.
+            // Cursor visibility handled by the common suppress_cursor block below.
+        } else {
+            // Normal (no approval): draw middle rows, bot_rule, optional approval
+            // (no-op), attachments, menu, goal/loop, status — original layout.
+            for (i, r) in middle_cells.into_iter().enumerate() {
+                let mut padded = r;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(rules_top + 1 + i, 0, &padded);
+            }
 
-        let bot_rule_row = rules_top + 1 + middle_rows;
-        let mut bot_rule = bot_rule;
-        Self::pad_row_to_width(&mut bot_rule, w);
-        self.screen.draw_row(bot_rule_row, 0, &bot_rule);
+            let bot_rule_row = rules_top + 1 + middle_rows;
+            let mut bot_rule = bot_rule;
+            Self::pad_row_to_width(&mut bot_rule, w);
+            self.screen.draw_row(bot_rule_row, 0, &bot_rule);
 
-        // Approval panel: a compact action bar directly BELOW the input box
-        // (below the bottom rule), above the attachments/menu/goal/status chrome.
-        // `approval_rows == 0` when no approval is pending, so this is a no-op on
-        // the normal path and the layout below collapses back to the old offsets.
-        let approval_top = bot_rule_row + 1;
-        for (i, ar) in approval_cells.into_iter().enumerate() {
-            let mut padded = ar;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(approval_top + i, 0, &padded);
-        }
+            // approval_rows == 0 in this branch (no-op).
+            let approval_top = bot_rule_row + 1;
+            for (i, ar) in approval_cells.into_iter().enumerate() {
+                let mut padded = ar;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(approval_top + i, 0, &padded);
+            }
 
-        let attach_top = bot_rule_row + 1 + approval_rows;
-        for (i, r) in attachment_cells.into_iter().enumerate() {
-            let mut padded = r;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(attach_top + i, 0, &padded);
-        }
+            let attach_top = bot_rule_row + 1 + approval_rows;
+            for (i, r) in attachment_cells.into_iter().enumerate() {
+                let mut padded = r;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(attach_top + i, 0, &padded);
+            }
 
-        let menu_top = attach_top + attachment_rows;
-        // Invalidate prev_cells for the menu rows so the next render_diff
-        // emits explicit patches for EVERY cell (including blank padding at
-        // the right edge). Without this, a CJK character from a prior frame's
-        // skill description whose display cells transition to ASCII spaces can
-        // leave the right-half of its glyph visible on some terminals (iTerm2
-        // per-cell patch coalescing). `pad_row_to_width` on the individual row
-        // already fills the buffer with blanks from content-end to screen edge,
-        // but the diff/serialize mechanism may not fully overwrite the right
-        // half of a 2-cell-wide glyph because the continuation cell at (c+1)
-        // is compared against the new (non-continuation) blank cell — the patch
-        // IS generated, yet the physical glyph remnant survives on iTerm2.
-        // Sentinel prev forces every column through the diff, blanks included.
-        self.screen.invalidate_rows_from(menu_top);
-        for (i, r) in menu_cells.into_iter().enumerate() {
-            let mut padded = r;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(menu_top + i, 0, &padded);
-        }
-        // Stack below the input box: `· menu / goal|loop / status ·`
-        // (the todo panel is drawn at the TOP of the footer, above the rules).
-        let goal_top = menu_top + menu_rows;
-        if let Some(gr) = goal_cells {
-            let mut padded = gr;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(goal_top, 0, &padded);
-        }
-        if let Some(st) = status_cells {
-            let mut padded = st;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(goal_top + goal_rows, 0, &padded);
-        }
+            let menu_top = attach_top + attachment_rows;
+            // Invalidate prev_cells for the menu rows so the next render_diff
+            // emits explicit patches for EVERY cell (including blank padding at
+            // the right edge). Without this, a CJK character from a prior frame's
+            // skill description whose display cells transition to ASCII spaces can
+            // leave the right-half of its glyph visible on some terminals (iTerm2
+            // per-cell patch coalescing). `pad_row_to_width` on the individual row
+            // already fills the buffer with blanks from content-end to screen edge,
+            // but the diff/serialize mechanism may not fully overwrite the right
+            // half of a 2-cell-wide glyph because the continuation cell at (c+1)
+            // is compared against the new (non-continuation) blank cell — the patch
+            // IS generated, yet the physical glyph remnant survives on iTerm2.
+            // Sentinel prev forces every column through the diff, blanks included.
+            self.screen.invalidate_rows_from(menu_top);
+            for (i, r) in menu_cells.into_iter().enumerate() {
+                let mut padded = r;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(menu_top + i, 0, &padded);
+            }
+            // Stack below the input box: `· menu / goal|loop / status ·`
+            // (the todo panel is drawn at the TOP of the footer, above the rules).
+            let goal_top = menu_top + menu_rows;
+            if let Some(gr) = goal_cells {
+                let mut padded = gr;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(goal_top, 0, &padded);
+            }
+            if let Some(st) = status_cells {
+                let mut padded = st;
+                Self::pad_row_to_width(&mut padded, w);
+                self.screen.draw_row(goal_top + goal_rows, 0, &padded);
+            }
 
-        // Cursor park — 1-indexed, inside middle row at the input cell.
-        // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
-        // Symbol-bearing body rows share this col-0 baseline.
-        // Middle row lives at `footer_top + 1 + cursor_row_in_middle`
-        // (0-indexed); +1 more to convert to the 1-indexed form the
-        // cursor-set helper expects.
-        let cursor_abs_row = (rules_top + 1 + cursor_row_in_middle + 1) as u16;
-        let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
-        self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+            // Cursor park — 1-indexed, inside middle row at the input cell.
+            // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
+            // Symbol-bearing body rows share this col-0 baseline.
+            // Middle row lives at `footer_top + 1 + cursor_row_in_middle`
+            // (0-indexed); +1 more to convert to the 1-indexed form the
+            // cursor-set helper expects.
+            let cursor_abs_row = (rules_top + 1 + cursor_row_in_middle + 1) as u16;
+            let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
+            self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+        }
         // Hide the terminal cursor ONLY while an inflight-tool row is
         // animating. `render_inflight_tool`'s in-place path writes raw
         // cursor-position bytes via `self.out.write_all` to overwrite each
@@ -2203,7 +2241,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // box stays editable during streaming (type-ahead message queue),
         // so hiding the caret would leave the user typing blind — the
         // "no cursor while replying" bug.
-        let suppress_cursor = self.inflight_tool.is_some();
+        //
+        // When approval is active there is no input box — hide the caret
+        // regardless of inflight_tool state (user navigates with ↑↓/Enter).
+        let suppress_cursor = self.inflight_tool.is_some() || approval_active;
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 
@@ -2260,7 +2301,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + status_rows
+        // When approval is active, mirror paint_footer: hide input middle + bot_rule + status.
+        let approval_active = approval_rows > 0;
+        let eff_middle   = if approval_active { 0 } else { capped_middle };
+        let eff_bot_rule = if approval_active { 0 } else { 1 };
+        let eff_status   = if approval_active { 0 } else { status_rows };
+        1 + eff_middle + eff_bot_rule + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + eff_status
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -13613,6 +13659,201 @@ mod tests {
              first_bash@{first_bash} second_bash@{second_bash}\n{}",
             vterm.dump()
         );
+    }
+
+    // ── Step 2: approval replaces input box + hides status row ──────────────
+
+    /// When an approval panel is pending:
+    ///  - the input box (middle "❯ " / "> " line) must NOT appear
+    ///  - the status row (model name) must NOT appear
+    ///  - the approval option rows (1. / 2. / 3.) MUST appear
+    ///  - the hint row MUST appear
+    ///  - exactly ONE horizontal rule is above the first option row
+    #[test]
+    fn approval_active_hides_input_box_and_status() {
+        const W: u16 = 80;
+        let (mut r, buf) = new_capturing(W, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, 24);
+
+        let mut status = status_basic(); // sets model = "glm-5", cwd = "~/project/atomcode"
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "rm -rf /tmp/x".into(),
+            options: vec!["Allow once".into(), "Always allow Bash (this session)".into(), "Deny".into()],
+            selected: 0,
+        });
+
+        r.render(UiLine::InputPrompt {
+            buf: "some typed text that would normally show in input box".into(),
+            cursor_byte: 4,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        let h = vterm.height() as usize;
+
+        // Input box middle row must NOT be present:
+        // The input middle row contains "> " or "❯ " followed by input text.
+        // We look for the typed text in the middle row specifically.
+        let input_text_visible = vterm.any_row(|row| row.contains("some typed text"));
+        assert!(!input_text_visible, "input box middle row must be hidden during approval\n{dump}");
+
+        // Status row (model name) must NOT appear.
+        let status_visible = vterm.any_row(|row| row.contains("glm-5"));
+        assert!(!status_visible, "status row (model name 'glm-5') must be hidden during approval\n{dump}");
+
+        // Approval options MUST appear.
+        assert!(vterm.any_row(|row| row.contains("1. ")), "option 1 prefix must be on screen\n{dump}");
+        assert!(vterm.any_row(|row| row.contains("2. ")), "option 2 prefix must be on screen\n{dump}");
+        assert!(vterm.any_row(|row| row.contains("3. ")), "option 3 prefix must be on screen\n{dump}");
+        assert!(vterm.any_row(|row| row.contains("Allow once")), "Allow once must be on screen\n{dump}");
+        assert!(vterm.any_row(|row| row.contains("Deny")), "Deny must be on screen\n{dump}");
+
+        // Hint row MUST appear.
+        let hint_visible = vterm.any_row(|row| row.contains("select") || row.contains("选择") || row.contains("Enter"));
+        assert!(hint_visible, "hint row with keyboard hint text must appear\n{dump}");
+
+        // Exactly ONE horizontal rule above the first option row.
+        // A rule row is a row where every non-space char is the rule char (─ or -).
+        let row_of = |needle: &str| -> Option<usize> {
+            (0..h).find(|&i| vterm.row_text(i).contains(needle))
+        };
+        let option1_row = row_of("1. ").expect("option 1 row must exist");
+        // There should be a rule row at option1_row - 1.
+        let row_above = option1_row.checked_sub(1).expect("option 1 must not be at row 0");
+        let rule_text = vterm.row_text(row_above);
+        let is_rule = !rule_text.trim().is_empty() && rule_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
+        assert!(is_rule, "row above first option must be a horizontal rule; got: {:?}\n{dump}", rule_text);
+
+        // No second rule immediately above the rule row (no bot_rule).
+        if let Some(two_above) = row_above.checked_sub(1) {
+            let two_above_text = vterm.row_text(two_above);
+            let is_also_rule = !two_above_text.trim().is_empty()
+                && two_above_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
+            // two_above should NOT be a rule (would mean bot_rule still drawn)
+            assert!(!is_also_rule,
+                "bot_rule must not appear during approval; row {} looks like a second rule: {:?}\n{dump}",
+                two_above, two_above_text);
+        }
+    }
+
+    /// Without an approval panel, the input box and status row are still present
+    /// (regression guard — normal mode must not be disturbed).
+    #[test]
+    fn no_approval_keeps_input_box_and_status() {
+        const W: u16 = 80;
+        let (mut r, buf) = new_capturing(W, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, 24);
+
+        let status = status_basic(); // model="glm-5", no approval
+
+        r.render(UiLine::InputPrompt {
+            buf: "hello world".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+
+        // Input box must be visible (the text we typed).
+        assert!(vterm.any_row(|row| row.contains("hello world")), "input text must appear without approval\n{dump}");
+
+        // Status row (model name) must be visible.
+        assert!(vterm.any_row(|row| row.contains("glm-5")), "status row (model='glm-5') must appear without approval\n{dump}");
+
+        // No approval options.
+        assert!(!vterm.any_row(|row| row.contains("1. ")), "no option prefix without approval\n{dump}");
+    }
+
+    /// The footer height reported by `current_footer_rows()` must equal the
+    /// height that `paint_footer` actually uses — the critical mirror invariant.
+    ///
+    /// Strategy: for a known minimal setup (todo=0, menu=0, goal=0,
+    /// attachment=0, 3 options + hint → approval_rows=4) with approval active,
+    /// the approval-active formula yields:
+    ///   1 (top_rule) + 0 (middle) + 0 (bot_rule) + 0+0+0+0 + 4 (approval) + 0 (status)
+    ///   = 5
+    /// We assert `current_footer_rows()` returns 5 and that after painting,
+    /// the body row above the footer is NOT overwritten by footer content.
+    #[test]
+    fn footer_height_mirrors_match_during_approval() {
+        const W: u16 = 80;
+        const H: u16 = 24;
+        let (mut r, buf) = new_capturing(W, H);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+
+        // 3 options + 1 hint = approval_rows=4.
+        let mut status = StatusLine {
+            model: String::new(), // no status row (has_status=false → status_rows=0)
+            cwd: String::new(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: None,
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            approval: None,
+        };
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cmd".into(),
+            options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
+            selected: 0,
+        });
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // approval_rows = 3 opts + 1 hint = 4; formula = 1 + 4 = 5.
+        let expected_footer_rows = 5usize;
+        assert_eq!(
+            r.current_footer_rows(),
+            expected_footer_rows,
+            "current_footer_rows() must equal 1 (top_rule) + 4 (approval) = 5 during approval"
+        );
+
+        // Paint and confirm the layout: with no body lines, footer starts at row 0.
+        // The top rule is at row 0, approval options at rows 1-3, hint at row 4.
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, H);
+        drain_into_vterm(&buf, &mut vterm);
+        // Row 0 = top rule (─────…).
+        let top_rule_row_text = vterm.row_text(0);
+        let is_rule = !top_rule_row_text.trim().is_empty()
+            && top_rule_row_text.chars().all(|c| c == '─' || c == '-' || c == ' ');
+        assert!(is_rule,
+            "row 0 must be a top rule; got: {:?}",
+            top_rule_row_text);
+        // Row 1 = first approval option.
+        let option_row = vterm.row_text(1);
+        assert!(option_row.contains("1. ") || option_row.contains("Allow"),
+            "row 1 must be the first approval option; got: {:?}", option_row);
+        // Rows 4..H-1 should be blank (no status, no input, no second rule).
+        // Verify row expected_footer_rows (5) is blank — nothing leaked beyond the 5 footer rows.
+        let row_after_footer = vterm.row_text(expected_footer_rows);
+        assert!(row_after_footer.trim().is_empty(),
+            "row {} (just below footer) must be blank; got: {:?}",
+            expected_footer_rows, row_after_footer);
     }
 }
 
