@@ -345,11 +345,6 @@ pub enum Msg<'a> {
     KbdHintMacos,
     KbdHintOther,
 
-    // ── Background task ──
-    BackgroundComplete { turns: usize },
-    BackgroundFailed { turns: usize },
-    BackgroundFilesEdited,
-
     // ── /config command ──
     ConfigProviderLabel { provider: &'a str, path: &'a str },
 

@@ -328,9 +328,8 @@ impl KernelToWebui {
             | CoreCmd::SetSessionId(_) => None,
             // deferred (daemon kernel path): the daemon does not send any of these
             // today, so they have no kernel translation here yet.
-            // AppendInput / SyncMessages / RefreshContextStats / Background /
-            // Remember / Forget / ShowMemory / ReloadHooks / UndoToPrompt /
-            // LocalShell / SetGoal / ClearGoal / SetLoop / ClearLoop.
+            // AppendInput / SyncMessages / RefreshContextStats / ReloadHooks /
+            // UndoToPrompt / LocalShell / SetGoal / ClearGoal / SetLoop / ClearLoop.
             _ => None,
         }
     }
@@ -687,7 +686,7 @@ fn noop_handle() -> AgentHandle {
 
 /// The kernel-native driver: owns the translator + live kernel handle and pumps
 /// core commands in / core events out. Private — only `spawn_kernel_runtime`
-/// constructs it. Field parity with `Bridge` minus the goal/loop/undo/background
+/// constructs it. Field parity with `Bridge` minus the goal/loop/undo
 /// state (deferred on this path).
 struct KernelDriver {
     /// The resolved coding config (kept for Task 6b respawn: model-switch /

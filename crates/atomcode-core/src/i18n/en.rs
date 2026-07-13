@@ -473,16 +473,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::KbdHintOther =>
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
 
-        // ── Background task ──
-        Msg::BackgroundComplete { turns } =>
-            format!("  Background task complete ({} turn{}):\n",
-                    turns, if turns == 1 { "" } else { "s" }).into(),
-        Msg::BackgroundFailed { turns } =>
-            format!("  Background task failed after {} turn{}:\n",
-                    turns, if turns == 1 { "" } else { "s" }).into(),
-        Msg::BackgroundFilesEdited =>
-            "  Files edited:\n".into(),
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),

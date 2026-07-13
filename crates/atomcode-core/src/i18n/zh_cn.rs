@@ -463,14 +463,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::KbdHintOther =>
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
 
-        // ── 后台任务 ──
-        Msg::BackgroundComplete { turns } =>
-            format!("  后台任务完成（{} 轮）：\n", turns).into(),
-        Msg::BackgroundFailed { turns } =>
-            format!("  后台任务失败，共 {} 轮：\n", turns).into(),
-        Msg::BackgroundFilesEdited =>
-            "  已编辑的文件：\n".into(),
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider：{}\n  配置文件：{}\n\n", provider, path).into(),

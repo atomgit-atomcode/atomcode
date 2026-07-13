@@ -10103,36 +10103,6 @@ fn handle_agent_event(
             }
             state.on_sub_agent_dispatch_end();
         }
-        AgentEvent::BackgroundComplete {
-            summary,
-            files_edited,
-            turns,
-            success,
-        } => {
-            let header = if success {
-                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
-            } else {
-                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
-            };
-            let mut body = String::from(&header);
-            body.push_str("  ");
-            body.push_str(&summary);
-            if !body.ends_with('\n') {
-                body.push('\n');
-            }
-            if !files_edited.is_empty() {
-                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
-                for f in &files_edited {
-                    body.push_str(&format!("    - {}\n", f));
-                }
-            }
-            if success {
-                renderer.render(UiLine::CommandOutput(body));
-            } else {
-                renderer.render(UiLine::Error(body));
-            }
-            renderer.flush();
-        }
         AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover

@@ -70,12 +70,6 @@ pub enum AgentCommand {
     Compact {
         prompt: Option<String>,
     },
-    /// Run a one-shot task in an isolated background context (read-only-ish
-    /// tool subset, independent conversation, capped turns + timeout).
-    /// Result is returned via `AgentEvent::BackgroundComplete`.
-    Background {
-        task: String,
-    },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
     /// cache is only refreshed on LLM round-trips, so between turns (or
@@ -399,14 +393,6 @@ pub enum AgentEvent {
         elapsed_secs: u64,
         label: String,
         last_reason: Option<String>,
-    },
-    /// `/background` task finished. `summary` is the final assistant text
-    /// (truncated if long). `success` is false on error / timeout / cancel.
-    BackgroundComplete {
-        summary: String,
-        files_edited: Vec<String>,
-        turns: usize,
-        success: bool,
     },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
