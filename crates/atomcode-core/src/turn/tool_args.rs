@@ -1,5 +1,8 @@
 use serde_json::{Map, Value};
 
+// KEEP IN SYNC WITH atomcode-kernel/src/agent.rs `canonicalize_tool_args`.
+// Kernel intentionally cannot depend on the retiring core stack, but both
+// execution paths must agree on tool-call identity during migration.
 /// Canonicalise model-supplied tool arguments for equality and hash keys.
 ///
 /// Object keys are sorted recursively so the result is stable regardless of

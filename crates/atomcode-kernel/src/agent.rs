@@ -1968,8 +1968,8 @@ impl RunningAgent {
             }
             // ── Batch detection (pre-scan) ──
             // Count NON-DUPLICATE tool calls using the SAME dedup key as the
-            // execution loop below — `(name, raw_arguments)` — captured BEFORE
-            // any middleware rewrite, matching the loop's `dedup_key` (L1019).
+            // execution loop below — `(name, canonical_arguments)` — captured
+            // BEFORE any middleware rewrite, matching the loop's `dedup_key`.
             // If ≥ 2 non-dup calls, emit ToolBatchStarted so the UI can render
             // a single grouped block instead of N independent rows. The count
             // (`total_non_dup`) reflects the REAL calls that will actually

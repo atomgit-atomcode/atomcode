@@ -20,7 +20,9 @@
 //! The dedup KEY is computed from the ORIGINAL `call.name`/`call.arguments` at the
 //! top of the loop — BEFORE any ToolMiddleware `before` chain may rewrite
 //! `call.arguments`. Two calls the MODEL emitted identically are duplicates
-//! regardless of what middleware would later do to them.
+//! regardless of what middleware would later do to them. JSON arguments are
+//! canonicalised recursively first, so whitespace and object-key ordering do not
+//! create distinct logical calls; array order and malformed input remain distinct.
 
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
