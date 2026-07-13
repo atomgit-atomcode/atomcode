@@ -78,6 +78,8 @@ pub struct PluginManager {
     /// Search / filter query. Captures printable characters when typing
     /// on Browse, Plugins, and Installed screens.
     search_query: String,
+    /// The install scope selected for the plugin currently being installed.
+    installing_scope: Option<InstallScope>,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -105,6 +107,7 @@ impl PluginManager {
             cancelled_installs: HashSet::new(),
             close_requested: false,
             search_query: String::new(),
+            installing_scope: None,
         };
         m.reload();
         m
@@ -285,6 +288,7 @@ impl PluginManager {
     fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
         self.installing_plugin = Some(plugin.clone());
+        self.installing_scope = Some(scope.clone());
         self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
         tokio::task::spawn_blocking(move || {
             let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
@@ -507,12 +511,34 @@ impl PluginManager {
             }
             Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
             Screen::ScopeSelect { .. } => {
+                let installing = self.installing_plugin.is_some();
+                let user_desc = if installing && self.installing_scope == Some(InstallScope::User) {
+                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                } else {
+                    t(Msg::PluginScopeUserDesc).into_owned()
+                };
+                let project_desc = if installing && self.installing_scope == Some(InstallScope::Project) {
+                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                } else {
+                    t(Msg::PluginScopeProjectDesc).into_owned()
+                };
+                let local_desc = if installing && self.installing_scope == Some(InstallScope::Local) {
+                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                } else {
+                    t(Msg::PluginScopeLocalDesc).into_owned()
+                };
+
                 let rows = vec![
-                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned()),
-                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned()),
-                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned()),
+                    (t(Msg::PluginScopeUser).into_owned(), user_desc),
+                    (t(Msg::PluginScopeProject).into_owned(), project_desc),
+                    (t(Msg::PluginScopeLocal).into_owned(), local_desc),
                 ];
-                (rows, t(Msg::PluginScopeHint).into_owned())
+                let hint = if installing {
+                    t(Msg::PluginMgrHintPending).into_owned()
+                } else {
+                    t(Msg::PluginScopeHint).into_owned()
+                };
+                (rows, hint)
             }
             Screen::Installing { plugin, .. } => {
                 let hint = format!(
@@ -759,6 +785,7 @@ impl Modal for PluginManager {
     fn on_plugin_event(&mut self, ev: &PluginJobEvent) {
         self.pending = None;
         self.installing_plugin = None;
+        self.installing_scope = None;
 
         // If a cancelled install completed successfully, roll it back
         // (uninstall) so the filesystem is not left in an inconsistent
@@ -777,6 +804,8 @@ impl Modal for PluginManager {
                     &info.marketplace,
                     info.scope.clone(),
                 );
+            } else {
+                self.close_requested = true;
             }
         }
 
@@ -823,6 +852,7 @@ mod tests {
             cancelled_installs: HashSet::new(),
             close_requested: false,
             search_query: String::new(),
+            installing_scope: None,
         }
     }
 

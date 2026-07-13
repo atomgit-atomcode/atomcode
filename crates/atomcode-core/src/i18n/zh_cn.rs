@@ -747,9 +747,8 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
-            let hint = if show_details_hint { "  （按 Ctrl+O 查看详情）" } else { "" };
-            format!("✓ 已安装 `{plugin}@{marketplace}` —— 加载 {loaded} 个 skill，跳过 {skipped} 个{hint}").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),

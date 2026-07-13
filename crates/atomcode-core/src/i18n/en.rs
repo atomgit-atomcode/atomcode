@@ -758,9 +758,8 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
-            let hint = if show_details_hint { "  (Ctrl+O for details)" } else { "" };
-            format!("✓ installed `{plugin}@{marketplace}` — {loaded} skills loaded, {skipped} skipped{hint}").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
