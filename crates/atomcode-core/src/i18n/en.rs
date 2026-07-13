@@ -318,6 +318,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "Allow once".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
         Msg::ApprovalDeny => "Deny".into(),
+        Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
 
         Msg::ModeAutoLabel => "auto mode on".into(),
         Msg::ModePlanLabel => "plan mode on".into(),
@@ -809,6 +810,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
+        Msg::CmdDescAuto => "Switch to Auto mode (auto-approve all tools)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
         Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
         Msg::CmdDescHelp => "Show this help".into(),

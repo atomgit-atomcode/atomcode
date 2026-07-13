@@ -1,33 +1,9 @@
 // crates/atomcode-tuix/src/state.rs
 
-/// Plan vs Build execution mode. Plan is read-only exploration (no file
-/// writes, no shell commands); Build is full execution with all tools.
-/// Toggled by the Tab key (when the input buffer is empty) or the
-/// `/plan` and `/build` slash commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AgentMode {
-    #[default]
-    Build,
-    Plan,
-}
-
-impl AgentMode {
-    /// Human-readable label for status bar display.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Build => "Build",
-            Self::Plan => "Plan",
-        }
-    }
-
-    /// Return the opposite mode.
-    pub fn toggle(self) -> Self {
-        match self {
-            Self::Build => Self::Plan,
-            Self::Plan => Self::Build,
-        }
-    }
-}
+/// Execution mode (unified). Alias of the shared core enum so TUI, daemon,
+/// webui share one type. Build = interactive approval; Auto = auto-approve all
+/// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
+pub use atomcode_core::agent::Mode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
@@ -1622,18 +1598,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_build_toggles_to_plan() {
-        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    fn agent_mode_build_next_is_auto() {
+        assert_eq!(AgentMode::Build.next(), AgentMode::Auto);
     }
 
     #[test]
-    fn agent_mode_plan_toggles_to_build() {
-        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+    fn agent_mode_auto_next_is_plan() {
+        assert_eq!(AgentMode::Auto.next(), AgentMode::Plan);
     }
 
     #[test]
-    fn agent_mode_double_toggle_returns_to_original() {
-        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    fn agent_mode_plan_next_is_build() {
+        assert_eq!(AgentMode::Plan.next(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_cycle_forward_and_back() {
+        assert_eq!(AgentMode::Build.next().prev(), AgentMode::Build);
     }
 
     #[test]

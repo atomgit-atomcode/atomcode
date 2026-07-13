@@ -236,6 +236,7 @@ pub enum Msg<'a> {
     ApprovalAllowOnce,
     ApprovalAlwaysAllow { tool: &'a str },
     ApprovalDeny,
+    ApprovalHint,
 
     // ── Execution mode pill ──
     ModeAutoLabel,
@@ -602,6 +603,7 @@ pub enum Msg<'a> {
     CmdDescUpgrade,
     CmdDescPlan,
     CmdDescBuild,
+    CmdDescAuto,
     CmdDescThink,
     CmdDescEffort,
     CmdDescHelp,

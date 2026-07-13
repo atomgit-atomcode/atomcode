@@ -1297,18 +1297,23 @@ fn execute_slash_command_impl(
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedPlanMode).into_owned(),
-            ));
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Plan)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Plan);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedPlanMode).into_owned()));
             renderer.flush();
         }
         "build" => {
             state.agent_mode = AgentMode::Build;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedBuildMode).into_owned(),
-            ));
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Build)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Build);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedBuildMode).into_owned()));
+            renderer.flush();
+        }
+        "auto" => {
+            state.agent_mode = AgentMode::Auto;
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Auto)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Auto);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedAutoMode).into_owned()));
             renderer.flush();
         }
         "review" => {
@@ -3118,6 +3123,7 @@ fn execute_slash_command_impl(
                     "config",
                     "plan",
                     "build",
+                    "auto",
                     "session",
                     "model",
                     "language",

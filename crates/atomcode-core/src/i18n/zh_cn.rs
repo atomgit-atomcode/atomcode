@@ -308,6 +308,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "允许一次".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalDeny => "拒绝".into(),
+        Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
 
         Msg::ModeAutoLabel => "自动模式".into(),
         Msg::ModePlanLabel => "计划模式".into(),
@@ -796,6 +797,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
+        Msg::CmdDescAuto => "切换到 Auto 模式（所有工具自动批准）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
         Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),

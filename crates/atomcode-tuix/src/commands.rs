@@ -192,6 +192,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "upgrade" => Msg::CmdDescUpgrade,
         "plan" => Msg::CmdDescPlan,
         "build" => Msg::CmdDescBuild,
+        "auto" => Msg::CmdDescAuto,
         "think" => Msg::CmdDescThink,
         "effort" => Msg::CmdDescEffort,
         "help" => Msg::CmdDescHelp,

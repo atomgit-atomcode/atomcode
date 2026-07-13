@@ -3811,6 +3811,9 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
+    if ctx.dangerously_skip_permissions {
+        app.state.agent_mode = crate::state::AgentMode::Auto;
+    }
 
     crate::tuix_trace!(
         "SES",
@@ -6401,28 +6404,14 @@ fn handle_idle_key(
         }
     }
 
-    // Tab toggles Plan/Build mode when no completion menu is visible —
-    // there is nothing to complete, so the key is repurposed for mode
-    // switching instead.
-    if code == KeyCode::Tab && menu_items.is_none() {
-        app.state.agent_mode = app.state.agent_mode.toggle();
-        let is_plan = matches!(app.state.agent_mode, crate::state::AgentMode::Plan);
-        ctx.agent
-            .cmd_tx
-            .send(AgentCommand::SetPlanMode(is_plan))
-            .ok();
-        // 同步 daemon 的 LIVE_APPROVAL_MODE，使 App 端扫码/重连时拿到正确的模式。
-        if is_plan {
-            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Plan);
+    // Tab / Shift+Tab cycle execution mode when no completion menu is up.
+    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
+        let next = if code == KeyCode::BackTab {
+            app.state.agent_mode.prev()
         } else {
-            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Build);
-        }
-        renderer.render(UiLine::CommandOutput(format!(
-            "  Switched to {} mode.\n",
-            app.state.agent_mode.label()
-        )));
-        renderer.flush();
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            app.state.agent_mode.next()
+        };
+        set_agent_mode(app, ctx, renderer, next);
         return Ok(());
     }
 
@@ -7073,6 +7062,29 @@ mod bash_input_hint_tests {
         assert!(!bash_input_hint("ls"), "not a bang command");
         assert!(!bash_input_hint("echo !x"), "! not at line start");
     }
+}
+
+/// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
+/// /build /auto /plan commands. Sends the unified SetMode to the bridge, mirrors
+/// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
+/// repaints the footer.
+pub(crate) fn set_agent_mode(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    mode: crate::state::AgentMode,
+) {
+    app.state.agent_mode = mode;
+    ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode)).ok();
+    atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
+    let msg = match mode {
+        crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
+        crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
+        crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
+    };
+    renderer.render(UiLine::CommandOutput(msg));
+    renderer.flush();
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -7893,6 +7905,11 @@ fn approval_needed_is_auto_bypassed(dangerously_skip_permissions: bool) -> bool 
     dangerously_skip_permissions
 }
 
+/// True iff the current mode auto-approves tool calls without a panel.
+pub(crate) fn approval_should_auto_bypass(mode: crate::state::AgentMode) -> bool {
+    matches!(mode, crate::state::AgentMode::Auto)
+}
+
 /// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
 /// auto-resolves. A named function so the `handle_agent_event` short-circuit
 /// and its test share one source of truth.
@@ -7972,6 +7989,14 @@ mod bypass_approval_tests {
         assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
         assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
     }
+
+    #[test]
+    fn auto_mode_bypasses_approval() {
+        use crate::state::AgentMode;
+        assert!(super::approval_should_auto_bypass(AgentMode::Auto));
+        assert!(!super::approval_should_auto_bypass(AgentMode::Build));
+        assert!(!super::approval_should_auto_bypass(AgentMode::Plan));
+    }
 }
 
 fn handle_approval_key(
@@ -8036,11 +8061,17 @@ fn handle_approval_key(
             .as_ref()
             .and_then(|p| p.options.get(p.selected).map(|o| o.kind)),
         KeyCode::Esc => Some(crate::state::ApprovalKind::Deny),
-        KeyCode::Char(c) => app
-            .state
-            .approval_panel
-            .as_ref()
-            .and_then(|p| p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))),
+        KeyCode::Char(c) => app.state.approval_panel.as_ref().and_then(|p| {
+            // Digit shortcut: '1'..'9' selects by positional index.
+            if c.is_ascii_digit() && c != '0' {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < p.options.len() {
+                    return p.options.get(idx).map(|o| o.kind);
+                }
+            }
+            // Letter accelerator fallback (y/a/n).
+            p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))
+        }),
         _ => None,
     };
     let Some(kind) = kind else {
@@ -9101,7 +9132,7 @@ fn handle_agent_event(
             // bypass to webui peers attached to the same LiveSession).
             // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
             // and to the local agent otherwise.
-            if approval_needed_is_auto_bypassed(ctx.dangerously_skip_permissions) {
+            if approval_should_auto_bypass(state.agent_mode) {
                 deliver_approval(ctx, bypass_approval_command());
                 return;
             }
@@ -10200,20 +10231,18 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ModeChanged { plan, bypass } => {
-            state.agent_mode = if plan {
+            let mode = if bypass {
+                crate::state::AgentMode::Auto
+            } else if plan {
                 crate::state::AgentMode::Plan
             } else {
                 crate::state::AgentMode::Build
             };
-            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(plan));
-            let label = if bypass {
-                "Web UI Bypass"
-            } else {
-                state.agent_mode.label()
-            };
+            state.agent_mode = mode;
+            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode));
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} mode.\n",
-                label
+                mode.label()
             )));
             renderer.flush();
         }
@@ -10727,6 +10756,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let mode_indicator = match state.agent_mode {
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
+        // Auto visual handled by bypass_indicator (Task 5 will unify); keep None for now.
+        crate::state::AgentMode::Auto => None,
     };
     // Bypass indicator: right-aligned warning badge when
     // --dangerously-skip-permissions / -y is active. Placed on the
