@@ -1832,9 +1832,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, bar, &bar_style);
             push_str_cells(&mut row, warn, &self.style_for(Role::Warning));
+            // Prefix is `▌ ` (2 cols) + `⚠ ` (2 cols) = 4 cols before the name.
             let head = crate::width::truncate_with_ellipsis(
                 &scrub_controls(&panel.tool),
-                rule_width.saturating_sub(6),
+                rule_width.saturating_sub(4),
             );
             push_str_cells(&mut row, &head, &self.style_bold(Role::ToolName));
             out.push(row);

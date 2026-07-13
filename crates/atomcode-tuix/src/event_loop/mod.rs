@@ -8049,6 +8049,13 @@ fn handle_approval_key(
     let cmd = approval_kind_to_command(kind);
     deliver_approval(ctx, cmd);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
+    // Repaint the footer NOW so the approval panel disappears immediately, the
+    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+    // this, the retained renderer keeps painting its cached `self.status`
+    // (approval still `Some`) until the next event that carries a fresh
+    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+    // issue #455's "输入框没了" — here the panel lingers after a decision).
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
 
