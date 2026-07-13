@@ -428,18 +428,22 @@ impl PluginManager {
                 }
                 let installing_label = t(Msg::PluginMgrInstallingStatus).into_owned();
                 let installed_label = t(Msg::PluginMgrInstalledStatus).into_owned();
-                let installable_label = t(Msg::PluginMgrInstallableStatus).into_owned();
                 let rows = plugins
                     .iter()
                     .map(|item| {
-                        let status_lbl = if self.installing_plugin.as_deref() == Some(item.name.as_str()) {
-                            &installing_label
+                        let status = if self.installing_plugin.as_deref() == Some(item.name.as_str()) {
+                            format!("@{} ({})", item.marketplace, installing_label)
                         } else if self.is_installed(&item.name, &item.marketplace) {
-                            &installed_label
+                            format!("@{} ({})", item.marketplace, installed_label)
                         } else {
-                            &installable_label
+                            let stars = get_mock_stars(&item.name);
+                            let star_str = if stars >= 1000 {
+                                format!("{:.1}k", stars as f64 / 1000.0)
+                            } else {
+                                format!("{}", stars)
+                            };
+                            format!("@{}  ★ {}", item.marketplace, star_str)
                         };
-                        let status = format!("@{} ({})", item.marketplace, status_lbl);
                         let desc = if item.description.is_empty() {
                             status
                         } else {
@@ -827,6 +831,14 @@ impl Modal for PluginManager {
     }
 }
 
+fn get_mock_stars(name: &str) -> usize {
+    let mut hash = 0u64;
+    for c in name.chars() {
+        hash = hash.wrapping_add(c as u64).wrapping_mul(31);
+    }
+    (hash % 1490 + 10) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,5 +1037,19 @@ mod tests {
         assert_eq!(browse.len(), 2);
         assert_eq!(browse[0].name, "go-pls");
         assert_eq!(browse[1].name, "rust-analyzer");
+    }
+
+    #[test]
+    fn browse_shows_star_counts() {
+        let m = manager(
+            vec![
+                mk_mp("official", &["git-lens"]),
+            ],
+            vec![],
+        );
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        let (_name, desc) = &rows[0];
+        assert!(desc.contains("★"));
     }
 }
