@@ -667,47 +667,6 @@ pub(super) fn execute_slash_command(
     result
 }
 
-/// 解析 `/app` 要拉起的 relay-client 二进制路径。优先级：
-///
-/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 显式覆盖（联调/特殊布局）。
-/// 2. **与 atomcode 自身可执行文件同目录** —— 同一机制同时覆盖两件事：
-///    捆绑分发（安装包/zip 把两个二进制放一起，解压到任意目录都能找到）
-///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
-/// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
-///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
-/// 4. 以上都没有 → 自动从 GitCode Release 下载到 ~/.atomcode/bin/。
-fn resolve_relay_client_bin() -> String {
-    const BARE: &str = "atomcode-relay-client";
-
-    // 1) 显式环境变量覆盖（非空才采纳）。
-    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-
-    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
-    let exe_name = if cfg!(windows) {
-        "atomcode-relay-client.exe"
-    } else {
-        BARE
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
-            if sibling.is_file() {
-                return sibling.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    // 3) PATH 兜底。
-    if cfg!(windows) {
-        "atomcode-relay-client.exe".to_string()
-    } else {
-        BARE.to_string()
-    }
-}
-
 /// 中继客户端 oss 下载地址。
 /// 对应 gitcode.com/atomgit_atomcode/atomcode-relay-release 仓库的 Release。
 const RELAY_CLIENT_DOWNLOAD_BASE: &str =
@@ -832,49 +791,70 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
+/// 解析 relay-client 二进制路径。优先级：
+/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 开发者/特殊部署覆盖。
+/// 2. 与 atomcode 自身可执行文件同目录 —— 安装包捆绑分发。
+fn resolve_relay_client_bin() -> Option<String> {
+    // 1) 显式环境变量覆盖（非空才采纳）。
+    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
+        if !p.is_empty() && std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+
+    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
+    let exe_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
+            if sibling.is_file() {
+                return Some(sibling.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
 /// 确保 relay-client 二进制可用。
-/// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
+/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到 ~/.atomcode/bin/。
 fn ensure_relay_client_bin() -> Result<String, String> {
+    // 先尝试环境变量和同目录
+    if let Some(bin) = resolve_relay_client_bin() {
+        return Ok(bin);
+    }
+
     let bare_name = if cfg!(windows) {
         "atomcode-relay-client.exe"
     } else {
         "atomcode-relay-client"
     };
 
-    // 跳过下载标志
-    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        let local = resolve_relay_client_bin();
-        if local != bare_name || std::path::Path::new(&local).is_file() {
-            return Ok(local);
-        }
-        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-                    请手动将 relay-client 放入 PATH 或与 atomcode 同目录".to_string());
-    }
-
-    // 1-3: 先尝试本地查找
-    let local = resolve_relay_client_bin();
-
-    // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
-    if local != bare_name {
-        return Ok(local);
-    }
-    // 裸名也可能是 PATH 上的文件
-    if std::path::Path::new(&local).is_file() {
-        return Ok(local);
-    }
-
-    // 4) 检查缓存目录 ~/.atomcode/bin/
     let cache_dir = dirs::home_dir()
         .map(|h| h.join(".atomcode").join("bin"))
         .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
     let cache_path = cache_dir.join(bare_name);
     let version_path = cache_dir.join(".version");
 
-    // 5) 检测平台
+    // 缓存已存在 → 直接使用
+    if cache_path.is_file() {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
+
+    // 跳过下载标志
+    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
+        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+                    请手动将 relay-client 放入 ~/.atomcode/bin/ 目录".to_string());
+    }
+
+    // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
         return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 PATH 中",
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 ~/.atomcode/bin/ 中",
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
@@ -1937,9 +1917,8 @@ fn execute_slash_command_impl(
                                         match cmd.spawn() {
                                             Err(e) => format!(
                                                 "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                                 relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
-                                                 请确认它在 PATH 中或与 atomcode 同目录，\
-                                                 也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
+                                                 请确认 relay-client 在 ~/.atomcode/bin/ 目录下，\
+                                                 或删除该目录后重试 /app 自动下载。"
                                             ),
                                             Ok(child) => {
                                                 if let Some(mut old) = ctx.app_relay_child.take() {
