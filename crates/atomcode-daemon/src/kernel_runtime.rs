@@ -600,7 +600,7 @@ impl KernelToWebui {
             KEv::Request { id, kind, payload } if kind == APPROVAL_KIND => {
                 // deferred (daemon kernel path): bridge's
                 // `bypass_auto_approval`/`--dangerously-skip-permissions` path is
-                // SCOPED OUT — the daemon's approval MODE handles Bypass at the
+                // SCOPED OUT — the daemon's approval MODE handles Auto/bypass at the
                 // decider level, so every Risky tool round-trips here.
                 let req: ApprovalRequest = match serde_json::from_value(payload) {
                     Ok(r) => r,

@@ -2895,7 +2895,7 @@ async fn process_chat_request(
         let mut bridge_cfg =
             live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
         bridge_cfg.dangerously_skip_permissions = approval_mode
-            == crate::approval_mode::ApprovalMode::Bypass
+            == crate::approval_mode::ApprovalMode::Auto
             || (approval_mode == crate::approval_mode::ApprovalMode::Build
                 && !interactive_permission);
         // Interactive approval: route /chat/permission decisions to the v2 producer
@@ -5265,10 +5265,10 @@ mod channel_mode_tests {
             crate::approval_mode::ApprovalMode::Plan
         );
 
-        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Bypass);
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Auto);
         assert_eq!(
             effective_chat_approval_mode(None),
-            crate::approval_mode::ApprovalMode::Bypass
+            crate::approval_mode::ApprovalMode::Auto
         );
     }
 }

@@ -33,10 +33,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use crate::approval_mode::{approval_mode_wire, ApprovalMode};
 use crate::CachedMcpRegistry;
 
-fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
+pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
         ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Bypass => PermissionDecision::Allow,
+        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
     }
 }
 
@@ -811,7 +811,7 @@ impl TurnExecutor for KernelTurnExecutor {
             user_images
         };
         let effective_mode = if self.auto_approve {
-            ApprovalMode::Bypass
+            ApprovalMode::Auto
         } else {
             live_current_approval_mode()
         };
@@ -2262,7 +2262,7 @@ mod tests {
         let cases = [
             (ApprovalMode::Build, "build"),
             (ApprovalMode::Plan, "plan"),
-            (ApprovalMode::Bypass, "bypass"),
+            (ApprovalMode::Auto, "bypass"),
         ];
         for (mode, wire) in cases {
             // Serialize (used by Snapshot.mode + ModeChanged broadcast).
@@ -2286,7 +2286,7 @@ mod tests {
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            fallback_approval_decision(ApprovalMode::Bypass),
+            fallback_approval_decision(ApprovalMode::Auto),
             PermissionDecision::Allow
         ));
     }
@@ -2294,7 +2294,7 @@ mod tests {
     #[tokio::test]
     async fn approval_mode_get_returns_current_runtime_mode() {
         let _mode_guard = ScopedApprovalModeForTest::new();
-        live_set_mode(ApprovalMode::Bypass);
+        live_set_mode(ApprovalMode::Auto);
 
         let response = approval_mode_get().await.into_response();
         assert_eq!(response.status().as_u16(), 200);
