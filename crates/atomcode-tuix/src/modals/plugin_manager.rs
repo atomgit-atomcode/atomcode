@@ -428,6 +428,18 @@ impl PluginManager {
         let (plugin, mp, scope) = (plugin.clone(), mp.clone(), scope.clone());
         match self.selected {
             0 => {
+                // Update
+                self.dispatch_install(plugin, mp, scope, ctx);
+            }
+            1 => {
+                // Disable (mock it, close the modal and print a success line)
+                renderer.render(UiLine::CommandOutput(
+                    format!("  ⎿  ✓ Disabled {}. Run /reload-plugins to apply.", plugin)
+                ));
+                self.close_requested = true;
+                renderer.flush();
+            }
+            2 => {
                 // Uninstall
                 match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
                     Ok(()) => {
@@ -442,18 +454,6 @@ impl PluginManager {
                         t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
                     )),
                 }
-                renderer.flush();
-            }
-            1 => {
-                // Update
-                self.dispatch_install(plugin, mp, scope, ctx);
-            }
-            2 => {
-                // Disable (mock it, close the modal and print a success line)
-                renderer.render(UiLine::CommandOutput(
-                    format!("  ⎿  ✓ Disabled {}. Run /reload-plugins to apply.", plugin)
-                ));
-                self.close_requested = true;
                 renderer.flush();
             }
             3 => {
@@ -613,9 +613,9 @@ impl PluginManager {
                 };
 
                 let rows = vec![
-                    (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
                     (update_label, update_desc),
                     (t(Msg::PluginActionDisable).into_owned(), t(Msg::PluginActionDisableDesc).into_owned()),
+                    (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
                     (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
                 ];
                 (rows, "↑↓ Select action · Enter confirm · Esc back".to_string())
@@ -1226,9 +1226,9 @@ mod tests {
         let (rows, _) = m.rows();
         assert_eq!(rows.len(), 4);
         // Action options
-        assert!(rows[0].0.contains("Uninstall") || rows[0].0.contains("卸载"));
-        assert!(rows[1].0.contains("Update") || rows[1].0.contains("更新"));
-        assert!(rows[2].0.contains("Disable") || rows[2].0.contains("禁用"));
+        assert!(rows[0].0.contains("Update") || rows[0].0.contains("更新"));
+        assert!(rows[1].0.contains("Disable") || rows[1].0.contains("禁用"));
+        assert!(rows[2].0.contains("Uninstall") || rows[2].0.contains("卸载"));
         assert!(rows[3].0.contains("Back") || rows[3].0.contains("返回"));
     }
 }
