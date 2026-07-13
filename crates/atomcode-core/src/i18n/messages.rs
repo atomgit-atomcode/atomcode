@@ -236,7 +236,6 @@ pub enum Msg<'a> {
     ApprovalAllowOnce,
     ApprovalAlwaysAllow { tool: &'a str },
     ApprovalDeny,
-    ApprovalHint,
 
     SessionTimeJustNow,
     SessionTimeMinAgo { n: u64 },

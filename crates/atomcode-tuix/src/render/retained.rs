@@ -1806,16 +1806,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .collect()
     }
 
-    /// Rows the approval panel occupies (header + detail + one per option + hint),
-    /// for the footer height math.
+    /// Rows the approval panel occupies — one per option. The compact panel drops
+    /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
+    /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        2 + panel.options.len() + 1
+        panel.options.len()
     }
 
-    /// Build the footer approval panel: a warning `⚠ <tool>` header, the command
-    /// detail, the selectable options (selected row = `▸ ` + reverse), and a hint
-    /// line. Left `▌` accent bar per row (ASCII `|`). Colorless besides the warning
-    /// header + reverse selection.
+    /// Build the compact footer approval panel: just the selectable options
+    /// (selected row = `▸ ` + reverse), each with a left `▌` warning accent bar
+    /// (ASCII `|`). The header / command / hint are intentionally omitted — the
+    /// command is already shown in the `▸ Tool(detail)` body row above, and the
+    /// option labels are self-describing (e.g. "Always allow Bash" carries the
+    /// tool name). Colorless besides the bar + reverse selection.
     fn build_approval_rows(
         &self,
         panel: &crate::render::ApprovalPanelView,
@@ -1824,31 +1827,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let unicode = self.caps.unicode_symbols;
         let bar = if unicode { "\u{258c} " } else { "| " }; // ▌
         let bar_style = self.style_for(Role::Warning);
-        let warn = if unicode { "\u{26a0} " } else { "! " }; // ⚠
         let mut out: Vec<Vec<Cell>> = Vec::new();
 
-        // header row: `▌ ⚠ <tool>`
-        {
-            let mut row = Vec::new();
-            push_str_cells(&mut row, bar, &bar_style);
-            push_str_cells(&mut row, warn, &self.style_for(Role::Warning));
-            // Prefix is `▌ ` (2 cols) + `⚠ ` (2 cols) = 4 cols before the name.
-            let head = crate::width::truncate_with_ellipsis(
-                &scrub_controls(&panel.tool),
-                rule_width.saturating_sub(4),
-            );
-            push_str_cells(&mut row, &head, &self.style_bold(Role::ToolName));
-            out.push(row);
-        }
-        // detail row: `▌   <detail>`
-        {
-            let mut row = Vec::new();
-            push_str_cells(&mut row, bar, &bar_style);
-            let budget = rule_width.saturating_sub(4);
-            let det = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.detail), budget);
-            push_str_cells(&mut row, &format!("  {det}"), &self.style_for(Role::Secondary));
-            out.push(row);
-        }
         // option rows: `▌  ▸ <label>` (selected: ▸ + reverse) / `▌    <label>`
         for (i, label) in panel.options.iter().enumerate() {
             let mut row = Vec::new();
@@ -1870,16 +1850,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, &lbl, &style);
             out.push(row);
         }
-        // hint row: `▌  ↑↓ select · enter confirm · esc deny`
-        {
-            let mut row = Vec::new();
-            push_str_cells(&mut row, bar, &bar_style);
-            let hint = crate::i18n::t(crate::i18n::Msg::ApprovalHint).into_owned();
-            let budget = rule_width.saturating_sub(4);
-            let fitted = crate::width::truncate_with_ellipsis(&hint, budget);
-            push_str_cells(&mut row, &format!("  {fitted}"), &self.style_for(Role::Muted));
-            out.push(row);
-        }
         out
     }
 
@@ -1889,6 +1859,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///   row T:       top rule
     ///   rows T+1..:  middle input lines (N = wrap_with_cursor line count)
     ///   row T+1+N:   bottom rule
+    ///   approval panel (A = approval_rows, compact action bar below the input)
     ///   attachments / menu (M = up to half screen height)
     ///   goal|loop row / status line (if any chrome)
     ///
@@ -2098,23 +2069,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body content still showing from earlier frames (see
         // `pad_row_to_width` for full rationale).
         //
-        // The todo panel sits at the very TOP of the footer block. The approval
-        // panel is pinned directly BELOW the todo panel and ABOVE the top rule.
-        // Everything else (rules, input, attachments, menu, goal/loop, status)
-        // shifts down by todo_rows + approval_rows.
+        // The todo panel sits at the very TOP of the footer block, above the
+        // input box. The approval panel is drawn BELOW the input box (a compact
+        // bottom-anchored action bar — see further down). Everything from the top
+        // rule onward shifts down by todo_rows only.
         let todo_top = footer_top;
         for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(todo_top + i, 0, &padded);
         }
-        let approval_top = footer_top + todo_rows;
-        for (i, ar) in approval_cells.into_iter().enumerate() {
-            let mut padded = ar;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(approval_top + i, 0, &padded);
-        }
-        let rules_top = footer_top + todo_rows + approval_rows;
+        let rules_top = footer_top + todo_rows;
 
         let mut top_rule = top_rule;
         Self::pad_row_to_width(&mut top_rule, w);
@@ -2131,13 +2096,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
 
+        // Approval panel: a compact action bar directly BELOW the input box
+        // (below the bottom rule), above the attachments/menu/goal/status chrome.
+        // `approval_rows == 0` when no approval is pending, so this is a no-op on
+        // the normal path and the layout below collapses back to the old offsets.
+        let approval_top = bot_rule_row + 1;
+        for (i, ar) in approval_cells.into_iter().enumerate() {
+            let mut padded = ar;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(approval_top + i, 0, &padded);
+        }
+
+        let attach_top = bot_rule_row + 1 + approval_rows;
         for (i, r) in attachment_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(bot_rule_row + 1 + i, 0, &padded);
+            self.screen.draw_row(attach_top + i, 0, &padded);
         }
 
-        let menu_top = bot_rule_row + 1 + attachment_rows;
+        let menu_top = attach_top + attachment_rows;
         // Invalidate prev_cells for the menu rows so the next render_diff
         // emits explicit patches for EVERY cell (including blank padding at
         // the right edge). Without this, a CJK character from a prior frame's
@@ -10355,16 +10332,18 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let dump = vterm.dump();
-        assert!(vterm.any_row(|r| r.contains("Bash")), "header names the tool\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("rm -rf build/")), "detail shown\n{dump}");
+        // Compact panel: only the selectable options (no header/detail/hint row).
         assert!(vterm.any_row(|r| r.contains("Allow once")), "allow once row\n{dump}");
-        assert!(vterm.any_row(|r| r.contains("Always allow Bash")), "always row\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("Always allow Bash")), "always row (carries tool name)\n{dump}");
         assert!(vterm.any_row(|r| r.contains("Deny")), "deny row\n{dump}");
         assert!(vterm.any_row(|r| r.contains("▸") && r.contains("Allow once")), "selected marker on option 0\n{dump}");
-        // Panel renders ABOVE the input box (chevron ❯).
+        // The command detail is NOT duplicated in the panel — it lives in the
+        // `▸ Tool(detail)` body row above (not part of this InputPrompt render).
+        assert!(!vterm.any_row(|r| r.contains("rm -rf build/")), "detail must not be in the panel\n{dump}");
+        // Panel renders BELOW the input box (chevron ❯).
         let h = vterm.height() as usize;
         let row_of = |n: &str| (0..h).find(|&i| vterm.row_text(i).contains(n));
-        assert!(row_of("Allow once") < row_of("❯").or(Some(h)), "panel above input\n{dump}");
+        assert!(row_of("Allow once") > row_of("❯"), "panel below input\n{dump}");
     }
 
     /// `attachments` from `UiLine::InputPrompt` paints a `└ [Image #N]`

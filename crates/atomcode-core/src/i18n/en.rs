@@ -318,7 +318,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "Allow once".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
         Msg::ApprovalDeny => "Deny".into(),
-        Msg::ApprovalHint => "↑↓ select · enter confirm · esc deny".into(),
 
         Msg::SessionTimeJustNow => "just now".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),

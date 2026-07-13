@@ -308,7 +308,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "允许一次".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalDeny => "拒绝".into(),
-        Msg::ApprovalHint => "↑↓ 选 · enter 确认 · esc 拒绝".into(),
 
         Msg::SessionTimeJustNow => "刚刚".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),
