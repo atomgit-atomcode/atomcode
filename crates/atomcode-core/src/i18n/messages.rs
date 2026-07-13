@@ -557,6 +557,7 @@ pub enum Msg<'a> {
     PluginInstallDone {
         plugin: &'a str,
         marketplace: &'a str,
+        scope: &'a str,
         loaded: usize,
         skipped: usize,
         show_details_hint: bool,

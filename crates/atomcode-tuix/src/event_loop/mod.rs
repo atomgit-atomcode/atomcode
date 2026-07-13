@@ -8148,11 +8148,17 @@ pub(super) fn handle_plugin_job_event(
                     renderer.render(UiLine::CommandOutput(format!("  {}", w)));
                 }
             }
+            let scope_str = match info.scope {
+                atomcode_core::plugin::InstallScope::User => "user",
+                atomcode_core::plugin::InstallScope::Project => "project",
+                atomcode_core::plugin::InstallScope::Local => "local",
+            };
             let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginInstallDone {
                     plugin: &info.plugin,
                     marketplace: &info.marketplace,
+                    scope: scope_str,
                     loaded,
                     skipped: warnings.len(),
                     show_details_hint,

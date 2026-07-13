@@ -747,8 +747,14 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, scope, loaded: _, skipped: _, show_details_hint: _ } => {
+            let scope_cn = match scope {
+                "user" => "用户级",
+                "project" => "项目级",
+                "local" => "本地级",
+                _ => scope,
+            };
+            format!("  ⎿  ✓ Installed {plugin} ({scope_cn}). Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
