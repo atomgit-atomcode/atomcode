@@ -302,17 +302,6 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
                 }
             }
-            UiLine::ApprovalPrompt { tool, detail } => {
-                self.drop_transient();
-                let _ = writeln!(
-                    self.out,
-                    "{}",
-                    crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
-                        tool: &scrub_controls(&tool),
-                        detail: &scrub_controls(&detail),
-                    })
-                );
-            }
             UiLine::Error(msg) => {
                 self.drop_transient();
                 let color = if self.caps.colors { SGR_RED } else { "" };

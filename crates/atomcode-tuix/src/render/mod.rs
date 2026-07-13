@@ -126,10 +126,6 @@ pub enum UiLine {
     /// event loop long enough to freeze the spinner. `DiffBlock` does
     /// one erase + N writes + one redraw.
     DiffBlock(Vec<DiffEntry>),
-    ApprovalPrompt {
-        tool: String,
-        detail: String,
-    },
     Error(String),
     /// Non-fatal advisory line (yellow). Visually distinct from `Error`
     /// so the user can tell "we saw something fishy and want you to
@@ -330,13 +326,6 @@ pub trait Renderer: Send {
     fn take_pending_scroll_flush(&mut self) -> bool {
         false
     }
-
-    /// Remove the most recent `ApprovalPrompt` body row, if the tail
-    /// row is one. Called by the event loop after the user responds
-    /// Y/A/N so the prompt stops sitting in the body above the footer.
-    /// Default: no-op — implementations that stream body lines to
-    /// stdout (plain/pipe mode) can't retract them.
-    fn pop_approval_prompt(&mut self) {}
 
     /// Terminal window was resized to `(cols, rows)`. The retained
     /// backend uses this to re-flow body width and reposition the

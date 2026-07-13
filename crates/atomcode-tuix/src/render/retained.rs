@@ -599,15 +599,9 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// full-frame, guaranteeing the terminal re-processes the
     /// rule regardless of diff skip.
     last_painted_footer_rows: usize,
-    /// Set by `pop_approval_prompt` so the immediately-following
-    /// body-line emit overwrites the approval row in place instead of
-    /// scrolling the region up one row. Without this, the ToolResult
-    /// that follows Y/A/N would push the ▸ ToolCall row off to make
-    /// space for itself, leaving a blank gap between `▸ Tool(detail)`
-    /// and `⎿ result`.
     /// Number of upcoming `push_body_row` calls that should overwrite in
     /// place instead of scrolling the body region. Set by
-    /// `pop_approval_prompt` when the popped approval block occupied
+    /// `commit_inflight_tool` when the committed inflight strip occupied
     /// more than one terminal row — each skipped scroll closes one row
     /// of the gap between the last content row and body_bottom.
     /// Decremented on every `emit_body_line_inner` call.
@@ -685,19 +679,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// breaks the "inflight strip = body tail" invariant and orphans the
     /// spinner glyph next to the committed `●` (bash-only, since the hint is).
     inflight_hint: Option<String>,
-    /// Number of body rows pushed by the most-recent `UiLine::ApprovalPrompt`
-    /// render, or `Some(0)` after `pop_approval_prompt` has consumed them.
-    /// `None` means no ApprovalPrompt has been rendered yet (or the renderer
-    /// was reset), which triggers the legacy heuristic walk-back in
-    /// `pop_approval_prompt` as a defensive fallback.
-    ///
-    /// This count is set at the END of the `UiLine::ApprovalPrompt` arm
-    /// (after all `push_body_row` calls), so it self-corrects on resize:
-    /// the reflow replay re-runs the arm at the new terminal width and
-    /// re-records the fresh count, making it always consistent with
-    /// `body_lines`.
-    approval_block_rows: Option<usize>,
-
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
     /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
@@ -720,8 +701,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// re-wrap. Replaying this log through `render()` at the new
     /// geometry rebuilds every row correctly wrapped (same mechanism
     /// as the `/resume` replay). Transient / footer / modal variants
-    /// (InputPrompt, Spinner, ApprovalPrompt, ModalOverlay…) are NOT
-    /// logged — they are re-derived from live state by `paint_frame`.
+    /// (InputPrompt, Spinner, ModalOverlay…) are NOT logged — they are
+    /// re-derived from live state by `paint_frame`.
     /// Consecutive AssistantText / ReasoningText deltas are coalesced
     /// so per-token streaming doesn't bloat the log.
     body_log: Vec<UiLine>,
@@ -865,7 +846,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             inflight_hint: None,
-            approval_block_rows: None,
             live_group: None,
             modal_overlay: None,
             body_log: Vec::new(),
@@ -2583,9 +2563,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// that set it stay backwards-compatible, but the value no
     /// longer changes behaviour: in append-only mode, popping rows
     /// from `body_lines` (the trigger that arms `skip_body_scroll_count`
-    /// in `pop_approval_prompt` / `commit_inflight_tool`) naturally
-    /// shrinks the body region, and subsequent pushes naturally
-    /// fill the freed slots via the next `paint_frame` cell-diff.
+    /// in `commit_inflight_tool`) naturally shrinks the body region,
+    /// and subsequent pushes naturally fill the freed slots via the
+    /// next `paint_frame` cell-diff.
     /// The field will be deleted in a follow-up cleanup commit.
     fn emit_body_line_inner(&mut self, row: &[Cell], _bottom: u16) {
         if self.skip_body_scroll_count > 0 {
@@ -2711,7 +2691,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // 在闪动" report). Erasing just the target line keeps the new
         // body row's slot clean (no ghost tail) while leaving the footer
         // pixels untouched until the diff atomically repaints them. Same
-        // lesson as `pop_approval_prompt` (per-row EL, never ED, so the
+        // lesson as `commit_inflight_tool` (per-row EL, never ED, so the
         // input box never vanishes). Pre-format into one buffer so the
         // write hits stdout as one call — the chunk-counting test
         // harness asserts on chunk boundaries.
@@ -3754,11 +3734,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             | UiLine::Spinner { .. }
             | UiLine::ClearTransient
             | UiLine::InputCommit
-            // ApprovalPrompt is a live prompt that gets popped once the
-            // user answers (no UiLine marks the pop), so replaying it
-            // would resurrect an already-answered prompt. Re-derived
-            // from app state after a resize instead.
-            | UiLine::ApprovalPrompt { .. }
             | UiLine::ModalOverlay { .. }
             | UiLine::ModalOverlayClear => return,
             _ => {}
@@ -3813,15 +3788,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
-        // After a resize the approval prompt rows are NOT in body_log, so
-        // the reflow above does not rebuild them.  Setting Some(0) marks the
-        // block as "already consumed", making the next pop_approval_prompt a
-        // clean noop instead of falling through to the legacy heuristic
-        // (which could mistake space-padded body rows for approval chips).
-        // None would re-enable the heuristic, which is unsafe here.
-        if self.approval_block_rows.is_some() {
-            self.approval_block_rows = Some(0);
-        }
         self.live_spinner_active = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
@@ -4576,126 +4542,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
 
-            // ── body: approval / errors / command output ──
-            UiLine::ApprovalPrompt { tool, detail } => {
-                // Capture row count BEFORE any push so we know exactly how
-                // many rows this approval block occupies. Set at the END of
-                // the arm after all push_body_row calls. Used by
-                // pop_approval_prompt to avoid the fragile col-0 heuristic.
-                let n0 = self.body_lines.len();
-                let warn = self.style_bold(Role::Warning);
-                let plain = CellStyle::default();
-                // Truecolor so the chips read as vivid green / blue / red on
-                // EVERY terminal theme. The 16-colour bright variants the rest
-                // of the UI uses (Color::Green/Cyan/Red) render muddy and
-                // near-indistinguishable on some dark palettes — user report:
-                // allow+always both looked grey, deny orange. These chips are
-                // safety-critical (allow vs deny must be unmistakable), so pin
-                // exact RGB. Same approach markdown highlighting already takes;
-                // `caps.colors` still gates all colour output.
-                let approve_green = Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 };
-                let always_blue = Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 };
-                let deny_red = Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A };
-                let chip = |c: Color| CellStyle {
-                    fg: Some(c),
-                    bold: true,
-                    reverse: true,
-                    faint: false,
-                };
-                let chip_y = chip(approve_green);
-                let chip_a = chip(always_blue);
-                let chip_n = chip(deny_red);
-
-                let waiting = t(Msg::ApprovalWaitingLabel);
-                let prefix_w = crate::width::display_width(&waiting);
-                let cont_pad: String = " ".repeat(prefix_w);
-
-                let allow = t(Msg::ApprovalAllow);
-                let always = t(Msg::ApprovalAlways);
-                let deny = t(Msg::ApprovalDeny);
-
-                // Build the Y/A/N chips cells once — reused whether
-                // we place them inline or on a separate line. The `↵` marker
-                // after the Y chip flags Allow(once) as the DEFAULT: pressing
-                // Enter triggers it (see `handle_approval_key`), so the user
-                // doesn't have to reach for an explicit key/chord. ASCII
-                // terminals (no `unicode_symbols`) fall back to "Enter".
-                let enter_marker = if self.caps.unicode_symbols { " ↵" } else { " Enter" };
-                let enter_style = CellStyle {
-                    fg: Some(approve_green), // match the Allow chip
-                    bold: true,
-                    reverse: false,
-                    faint: false,
-                };
-                let mut chips_cells: Vec<Cell> = Vec::new();
-                push_str_cells(&mut chips_cells, " Y ", &chip_y);
-                push_str_cells(&mut chips_cells, enter_marker, &enter_style);
-                push_str_cells(&mut chips_cells, &allow, &plain);
-                push_str_cells(&mut chips_cells, " A ", &chip_a);
-                push_str_cells(&mut chips_cells, &always, &plain);
-                push_str_cells(&mut chips_cells, " N ", &chip_n);
-                push_str_cells(&mut chips_cells, &deny, &plain);
-                let chips_width: usize = chips_cells.iter().map(|c| c.width as usize).sum();
-
-                // Build the label rows, then decide: if the last label
-                // row + chips fit within the screen width, append chips
-                // inline (issue #454). Otherwise, emit chips on a
-                // separate line so they remain visible.
-                // "Waiting for approval:" prefix stays yellow (Warning bold);
-                // tool name is bold ToolName; (detail): uses default fg.
-                let safe_tool = crate::sanitize::scrub_controls(&tool);
-                let safe_detail = crate::sanitize::scrub_controls(&detail);
-                let tool_name_style = self.style_bold(Role::ToolName);
-                let detail_style = self.style_for(Role::Secondary);
-                let mut prefixed_rows = if detail.is_empty() {
-                    // No detail: "▶ Waiting for approval: tool:"
-                    let body = format!("{}: ", safe_tool);
-                    self.build_prefixed_rows(&waiting, &warn, &body, &tool_name_style, None)
-                } else {
-                    // Build rows with mixed styling: yellow prefix, bold tool, fg detail
-                    let detail_suffix = format!("({}): ", safe_detail);
-                    let full_body = format!("{}{}", safe_tool, detail_suffix);
-                    self.build_mixed_style_rows(
-                        &waiting, &warn,
-                        &safe_tool, &tool_name_style,
-                        &detail_suffix, &detail_style,
-                        "", &detail_style,
-                        &full_body,
-                    )
-                };
-                let screen_w = self.screen.width() as usize;
-                let last_row_w: usize = prefixed_rows
-                    .last()
-                    .map(|r| r.iter().map(|c| c.width as usize).sum())
-                    .unwrap_or(0);
-
-                if last_row_w + chips_width <= screen_w {
-                    // Everything fits on one line — append chips directly
-                    // after the label.  issue #454: users reported that
-                    // splitting into two lines was unnecessary when the
-                    // terminal is wide enough.
-                    if let Some(last_row) = prefixed_rows.last_mut() {
-                        last_row.extend(chips_cells);
-                    }
-                    for row in prefixed_rows {
-                        self.push_body_row(row);
-                    }
-                } else {
-                    // Label too long — keep chips on a separate line so
-                    // they remain visible even when the label wraps.
-                    for row in prefixed_rows {
-                        self.push_body_row(row);
-                    }
-                    let mut chips_row = Vec::new();
-                    push_str_cells(&mut chips_row, &cont_pad, &plain);
-                    chips_row.extend(chips_cells);
-                    self.push_body_row(chips_row);
-                }
-                // Record the exact number of rows pushed by this approval block.
-                // pop_approval_prompt reads this to avoid the fragile col-0 walk.
-                // Must be set AFTER all push_body_row calls so the count is final.
-                self.approval_block_rows = Some(self.body_lines.len().saturating_sub(n0));
-            }
+            // ── body: errors / command output ──
             UiLine::Error(msg) => {
                 // Defense in depth (mirror TurnComplete / TurnCancelled): a turn
                 // that errors while a tool is still in flight — gateway 5xx,
@@ -4859,138 +4706,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn flush(&mut self) {
         let _ = self.out.flush();
-    }
-
-    fn pop_approval_prompt(&mut self) {
-        // The approval prompt spans one or more body rows:
-        //   - When label + chips fit on one line: a single row
-        //     starting with '▶' containing both the label and
-        //     the Y/A/N chips.
-        //   - When the label is long: 1+ label rows (first starts
-        //     with '▶', continuation rows start with spaces) plus
-        //     1 chips row (also starting with spaces).
-        // We need to pop all of them.
-        //
-        // PRIMARY PATH (count-based): `approval_block_rows` is set at the
-        // end of the `UiLine::ApprovalPrompt` render arm to the exact number
-        // of rows pushed. Using the explicit count avoids any heuristic and
-        // makes double-pop a clean noop:
-        //   Some(n>0)  → pop exactly n rows, then set Some(0).
-        //   Some(0)    → already consumed; return immediately (noop).
-        //   None       → defensive fallback: use the legacy walk-back heuristic
-        //                (covers any code path that didn't go through the
-        //                ApprovalPrompt render arm).
-        //
-        // CRITICAL: capture `bottom` BEFORE any pop. In the top-anchored body
-        // model, `body_bottom_row()` returns `min(body_lines.len(), cap)` —
-        // calling it AFTER popping would point at the LAST `popped_count` rows
-        // of REMAINING body content (the rows just above the approval strip),
-        // so the erase would wipe real markers instead of the formerly-approval
-        // rows. Capture once, before mutating body_lines.
-        let bottom_before_pop = self.body_bottom_row();
-
-        let popped_count: u16 = match self.approval_block_rows {
-            Some(0) => {
-                // Already consumed — double-pop is a clean noop.
-                return;
-            }
-            Some(n) => {
-                // Count-based path: pop exactly n rows (clamped to what's
-                // available to be safe against any edge case).
-                let to_pop = n.min(self.body_lines.len());
-                for _ in 0..to_pop {
-                    self.body_lines.pop();
-                }
-                // Mark as consumed so the next call is a noop.
-                self.approval_block_rows = Some(0);
-                to_pop.min(u16::MAX as usize) as u16
-            }
-            None => {
-                // Fallback: legacy walk-back heuristic.
-                //
-                // Walk backwards from the tail, popping every row until we
-                // find the ▶ header row (which we also pop). Other symbol rows
-                // hold '●' (tool call) or '❯' (user turn) at col 0 — distinct
-                // glyphs — so the first ▶ we encounter must be ours. Safe
-                // because the agent doesn't append further body rows between
-                // `ApprovalNeeded` and the user's Y/A/N reply.
-                let mut count: u16 = 0;
-                loop {
-                    let action = match self.body_lines.last() {
-                        None => break,
-                        Some(last) => last.get(0).map(|c| c.ch),
-                    };
-                    match action {
-                        // ▶ header: pop it and stop (we've found the start).
-                        Some('▶') => {
-                            self.body_lines.pop();
-                            count = count.saturating_add(1);
-                            break;
-                        }
-                        // Space-padded continuation / chips row: pop and keep going.
-                        Some(' ') => {
-                            self.body_lines.pop();
-                            count = count.saturating_add(1);
-                        }
-                        // Any other glyph (● tool-call, ❯ user turn, etc.):
-                        // not part of the approval block — stop without popping.
-                        _ => break,
-                    }
-                }
-                count
-            }
-        };
-        if popped_count == 0 {
-            return;
-        }
-        crate::tuix_trace!(
-            "BPOP",
-            "site=approval len_after={} n={} scrolled_off={}",
-            self.body_lines.len(),
-            popped_count,
-            self.scrolled_off
-        );
-        // Physically wipe the popped rows for instant visual feedback
-        // on Y/A/N. The popped rows occupied terminal rows
-        // `bottom_before_pop - popped_count + 1 ..= bottom_before_pop`
-        // (1-indexed). Erase them row-by-row with `\x1b[K` (EL).
-        //
-        // Why per-row EL and not `\x1b[J` (ED from cursor): the cursor
-        // sits at `bottom` (the LAST popped row), and `\x1b[J` erases
-        // FROM cursor TO end-of-screen — i.e. that one body row plus
-        // every footer row below it. That wipes the input box / top
-        // rule / status bar from the terminal. The cell-diff cache
-        // (`self.screen.prev_cells`) still holds the prior footer
-        // content, so the next `paint_footer` → `render_diff` produces
-        // an empty patch (cells == prev_cells, no diff) and the
-        // footer never gets redrawn — user sees "input box vanished
-        // after approving a tool". EL is row-local, never touches the
-        // footer area, and leaves prev_cells consistent. Then flag the
-        // next body emit to overwrite in place (no scroll) so
-        // `⎿ result` lands directly below the `● Tool` row with no
-        // gap.
-        if bottom_before_pop > 0 {
-            // Erase the popped body rows (may span multiple terminal
-            // lines). Use per-row \x1b[K instead of \x1b[J to avoid
-            // erasing the footer rows below the body strip.
-            // screen.prev_cells still holds the old footer content,
-            // so without invalidation the next render_diff() would
-            // see identical prev/current footer cells and skip the
-            // repaint — leaving the footer permanently blank.
-            // invalidate() below ensures the next flush_deferred()
-            // emits a full repaint of every non-blank cell.
-            let start_row = bottom_before_pop.saturating_sub(popped_count - 1).max(1);
-            let mut seq = String::with_capacity((bottom_before_pop - start_row + 1) as usize * 8);
-            use std::fmt::Write as _;
-            for row in start_row..=bottom_before_pop {
-                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
-            }
-            let _ = self.out.write_all(seq.as_bytes());
-            let _ = self.out.flush();
-            self.skip_body_scroll_count = popped_count;
-            self.screen.invalidate();
-        }
-        self.dirty = true;
     }
 
     fn refresh_welcome_banner(&mut self, model: &str, working_dir: &str) {
@@ -9023,308 +8738,6 @@ mod tests {
         assert!(found, "command output missing\ndump:\n{}", vterm.dump());
     }
 
-    /// After moving ▶ to col 0, `pop_approval_prompt` must still
-    /// detect the approval rows via col 0 and must NOT be fooled by
-    /// an adjacent ● tool-call row (also at col 0, different glyph).
-    /// In an 80-col terminal the label + chips fit on one line, so
-    /// pop_approval_prompt removes a single row.
-    #[test]
-    fn retained_approval_pop_still_detects_glyph() {
-        let (mut r, _buf) = new_capturing(80, 24);
-
-        r.render(UiLine::ToolCall {
-            name: "bash".into(),
-            detail: "ls".into(),
-        });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "ls".into(),
-        });
-        let before = r.body_lines.len();
-        r.pop_approval_prompt();
-        let after = r.body_lines.len();
-        assert_eq!(
-            before - after,
-            1,
-            "pop_approval_prompt should drop the single label+chips row"
-        );
-
-        // Second call: last row is now the tool-call `●`, not `▶`.
-        // Must be a no-op.
-        let before2 = r.body_lines.len();
-        r.pop_approval_prompt();
-        let after2 = r.body_lines.len();
-        assert_eq!(
-            before2, after2,
-            "pop_approval_prompt must not drop non-approval rows"
-        );
-    }
-
-    /// The Allow/Always/Deny chips must be unmistakable green/blue/red on EVERY
-    /// theme. The 16-colour bright variants (Color::Green/Cyan/Red) render muddy
-    /// / near-identical on some dark palettes (user report), so the chips pin
-    /// exact truecolor RGB. Inspect the cell model so a regression back to
-    /// 16-colour is caught.
-    #[test]
-    fn approval_chips_use_vivid_truecolor() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "ls".into(),
-        });
-        let fgs: Vec<Color> = r
-            .body_lines
-            .iter()
-            .flatten()
-            .filter_map(|c| c.style.fg)
-            .collect();
-        assert!(
-            fgs.contains(&Color::Rgb { r: 0x30, g: 0xD1, b: 0x58 }),
-            "Allow chip must be truecolor green, got fgs: {fgs:?}",
-        );
-        assert!(
-            fgs.contains(&Color::Rgb { r: 0x2B, g: 0xB8, b: 0xE0 }),
-            "Always chip must be truecolor blue, got fgs: {fgs:?}",
-        );
-        assert!(
-            fgs.contains(&Color::Rgb { r: 0xFF, g: 0x45, b: 0x3A }),
-            "Deny chip must be truecolor red, got fgs: {fgs:?}",
-        );
-    }
-
-    /// Regression: resize-during-approval must reset `approval_block_rows` to
-    /// `None` so that a subsequent `pop_approval_prompt` falls back to the
-    /// legacy heuristic (safe noop) rather than popping stale-count rows of
-    /// real body content.
-    ///
-    /// Scenario:
-    ///   1. Render real body content (ToolCall + AssistantText).
-    ///   2. Render an ApprovalPrompt → sets `approval_block_rows = Some(n)`.
-    ///   3. Simulate a window resize via `on_resize`.
-    ///   4. Call `pop_approval_prompt` — must NOT eat real body rows.
-    #[test]
-    fn approval_resize_resets_stale_count() {
-        let (mut r, _buf) = new_capturing(80, 24);
-
-        // Render real body content so body_lines is non-empty.
-        r.render(UiLine::ToolCall {
-            name: "bash".into(),
-            detail: "echo hello".into(),
-        });
-        r.render(UiLine::AssistantText("some important output".into()));
-        r.render(UiLine::AssistantLineBreak);
-
-        // Render approval prompt — this sets approval_block_rows = Some(n).
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "echo hello".into(),
-        });
-        // Confirm approval_block_rows is set (Some(n > 0)).
-        assert!(
-            matches!(r.approval_block_rows, Some(n) if n > 0),
-            "approval_block_rows should be Some(n>0) after render, got {:?}",
-            r.approval_block_rows
-        );
-
-        // Simulate a resize — this triggers reflow_body_to_current_width which
-        // clears body_lines and replays body_log (ApprovalPrompt is NOT in
-        // body_log so it won't be rebuilt).
-        r.on_resize(60, 24);
-
-        // After resize: body_lines does NOT include the approval rows anymore.
-        // Record how many body rows exist now (all real content).
-        let body_after_resize = r.body_lines.len();
-
-        // pop_approval_prompt: must be a safe noop — must NOT pop real content.
-        r.pop_approval_prompt();
-        let body_after_pop = r.body_lines.len();
-
-        assert_eq!(
-            body_after_pop, body_after_resize,
-            "pop_approval_prompt after resize must not eat real body rows \
-             (stale count data-loss bug): before={body_after_resize} after={body_after_pop}"
-        );
-    }
-
-    /// When the approval label wraps across multiple lines (narrow
-    /// terminal), pop_approval_prompt must remove ALL of them: the
-    /// wrapped label rows + the chips row.
-    #[test]
-    fn retained_approval_pop_multiline() {
-        // 30-col terminal: "▶ 等待审批：Bash(a very long command)"
-        // should wrap the label, producing 2+ label rows + 1 chips row.
-        let (mut r, _buf) = new_capturing(30, 24);
-
-        r.render(UiLine::ToolCall {
-            name: "bash".into(),
-            detail: "a very long command".into(),
-        });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "a very long command".into(),
-        });
-        let before = r.body_lines.len();
-        r.pop_approval_prompt();
-        let after = r.body_lines.len();
-        // Should pop at least the chips row + the ▶ header row.
-        // If the label wrapped, it pops even more.
-        assert!(
-            before - after >= 2,
-            "pop_approval_prompt should drop at least 2 rows (label + chips), got {}",
-            before - after
-        );
-
-        // Second call: no more approval rows — must be a no-op.
-        let before2 = r.body_lines.len();
-        r.pop_approval_prompt();
-        let after2 = r.body_lines.len();
-        assert_eq!(
-            before2, after2,
-            "pop_approval_prompt must not drop non-approval rows"
-        );
-    }
-
-    /// Validate that `approval_block_rows` is set to Some(n>0) after rendering
-    /// an ApprovalPrompt, that pop_approval_prompt consumes exactly n rows and
-    /// sets the count to Some(0), and that a second pop is a clean noop.
-    #[test]
-    fn approval_block_rows_count_semantics() {
-        // Wide terminal: label + chips fit on one line → exactly 1 approval row.
-        {
-            let (mut r, _buf) = new_capturing(80, 24);
-            r.render(UiLine::ApprovalPrompt {
-                tool: "bash".into(),
-                detail: "ls".into(),
-            });
-            // After rendering, approval_block_rows must be Some(n) with n > 0.
-            let n = r.approval_block_rows.expect("approval_block_rows should be set");
-            assert!(n > 0, "approval_block_rows must be > 0 after render, got {n}");
-
-            let body_before = r.body_lines.len();
-            r.pop_approval_prompt();
-            let body_after = r.body_lines.len();
-            assert_eq!(
-                body_before - body_after,
-                n,
-                "pop should drop exactly n={n} rows, dropped {}",
-                body_before - body_after
-            );
-            assert_eq!(
-                r.approval_block_rows,
-                Some(0),
-                "approval_block_rows must be Some(0) after pop"
-            );
-
-            // Second pop: count is Some(0) → must be a noop.
-            let body_before2 = r.body_lines.len();
-            r.pop_approval_prompt();
-            let body_after2 = r.body_lines.len();
-            assert_eq!(
-                body_before2, body_after2,
-                "second pop must be a noop (approval_block_rows == Some(0))"
-            );
-            assert_eq!(
-                r.approval_block_rows,
-                Some(0),
-                "approval_block_rows must remain Some(0) after noop second pop"
-            );
-        }
-
-        // Narrow terminal: label wraps → 2+ approval rows (chips on separate line).
-        {
-            let (mut r, _buf) = new_capturing(30, 24);
-            r.render(UiLine::ApprovalPrompt {
-                tool: "bash".into(),
-                detail: "a very long command indeed".into(),
-            });
-            let n = r.approval_block_rows.expect("approval_block_rows should be set");
-            assert!(n >= 2, "narrow terminal should produce >= 2 rows, got {n}");
-
-            let body_before = r.body_lines.len();
-            r.pop_approval_prompt();
-            let body_after = r.body_lines.len();
-            assert_eq!(
-                body_before - body_after,
-                n,
-                "pop should drop exactly n={n} rows, dropped {}",
-                body_before - body_after
-            );
-            assert_eq!(r.approval_block_rows, Some(0));
-
-            // Second pop is noop.
-            let body_before2 = r.body_lines.len();
-            r.pop_approval_prompt();
-            assert_eq!(r.body_lines.len(), body_before2, "second pop must be noop");
-        }
-    }
-
-    /// Regression: when the user approves a tool (presses Y/A/N),
-    /// `pop_approval_prompt` must NOT erase the footer (input box,
-    /// top/bot rules, status bar) from the terminal. Earlier versions
-    /// used `\x1b[J` from `body_bottom;1` which erased to end-of-screen
-    /// — i.e. through the footer — and the cell-diff cache then prevented
-    /// the footer from being redrawn (cells unchanged → no diff →
-    /// no emit), leaving the user with no visible input prompt.
-    #[test]
-    fn retained_pop_approval_preserves_footer() {
-        let (mut r, buf) = new_capturing(80, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
-        let status = status_basic();
-
-        // Paint a full frame with an active footer (status bar visible).
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-        // Confirm baseline: status row visible.
-        assert!(
-            vterm.any_row(|row| row.contains("glm-5")),
-            "baseline: status row should be on screen\ndump:\n{}",
-            vterm.dump()
-        );
-
-        // Now render an approval prompt and pop it.
-        r.render(UiLine::ToolCall {
-            name: "bash".into(),
-            detail: "ls".into(),
-        });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "ls".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        r.pop_approval_prompt();
-        // Trigger a new paint cycle (mirrors what happens after the
-        // user presses Y and the agent emits the next body event).
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Footer (status bar) must still be visible. Before the fix
-        // this assertion failed: pop_approval_prompt's `\x1b[J`
-        // erased the status row, and the diff cache stopped paint_footer
-        // from re-emitting it.
-        assert!(
-            vterm.any_row(|row| row.contains("glm-5")),
-            "input box / status row should still be on screen after \
-             approval pop\ndump:\n{}",
-            vterm.dump()
-        );
-    }
-
     /// StreamingBox / Spinner: the `frame + label` pair now lives in
     /// the BODY (not the footer) as an animated "live" row at
     /// body_bottom. The emoji/frame is flush-left at col 0 — same
@@ -11234,152 +10647,6 @@ mod tests {
         assert!(saw_bar, "expected a continuation row");
     }
 
-    /// Regression: after approving a bash tool call, the `● Bash` header + `  └ cmd`
-    /// block and the `└ [elapsed: …]` result row should be adjacent with no blank
-    /// line between them. User reported a visible blank gap after pressing Y on the
-    /// approval prompt.
-    #[test]
-    fn retained_approval_pop_then_result_no_blank_gap() {
-        let (mut r, buf) = new_capturing(80, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
-        let status = status_basic();
-
-        // Seed a full frame so footer is painted.
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Simulate: ToolCallStarted → inflight spinner for Bash
-        r.render(UiLine::ToolCallInFlight {
-            id: "call-1".into(),
-            name: "Bash".into(),
-            detail: "rm -f /tmp/test.txt".into(),
-            hint: None,
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Simulate: ApprovalNeeded → commit inflight to ● + show approval prompt
-        r.render(UiLine::ToolCallCommit {
-            call_id: Some("call-1".into()),
-        });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "Bash".into(),
-            detail: "rm -f /tmp/test.txt".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // User presses Y → pop approval prompt
-        r.pop_approval_prompt();
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Simulate: ToolCallResult arrives
-        r.render(UiLine::AssistantLineBreak);
-        r.render(UiLine::ToolCallCommit {
-            call_id: Some("call-1".into()),
-        });
-        r.render(UiLine::ToolResult {
-            success: true,
-            summary: "[elapsed: 0.0s, exit: 0] (2 lines)".into(),
-        });
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // The committed bash block is now TWO rows: `● Bash` header + `  └ rm -f ...` cmd.
-        // Debug: print body_lines around the tool and result rows.
-        let bash_header_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains('●') && text.contains("Bash")
-        }).expect("● Bash header row should exist in body_lines");
-
-        let bash_cmd_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("rm -f")
-        }).expect("bash cmd row should exist in body_lines");
-
-        let result_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("elapsed")
-        }).expect("└ result row should exist in body_lines");
-
-        eprintln!("body_lines around tool block:");
-        let start = bash_header_idx.saturating_sub(2);
-        let end = (result_idx + 2).min(r.body_lines.len() - 1);
-        for i in start..=end {
-            if let Some(row) = r.body_lines.get(i) {
-                let text: String = row.iter().map(|c| c.ch).collect();
-                eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
-            }
-        }
-
-        // Check body_lines: header immediately precedes cmd, cmd immediately precedes result.
-        assert_eq!(bash_cmd_idx, bash_header_idx + 1,
-            "cmd row should be immediately after header row (no blank gap)");
-        assert_eq!(result_idx, bash_cmd_idx + 1,
-            "result row should be immediately after cmd row, but found gap.\n\
-             body_lines:\n  {:?}\n  {:?}\n  {:?}",
-            r.body_lines.get(bash_cmd_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(bash_cmd_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(bash_cmd_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-        );
-
-        // Also check the virtual terminal: the `● Bash` header, `  └ cmd`, and
-        // `└ result` rows should appear on consecutive terminal rows with no blanks.
-        eprintln!("vterm dump:\n{}", vterm.dump());
-        let bash_header_term = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains('●') && vterm.row_text(i).contains("Bash") && !vterm.row_text(i).contains("Bash("))
-            .expect("● Bash header row should be on terminal");
-        let bash_cmd_term = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains("rm -f"))
-            .expect("bash cmd row should be on terminal");
-        let result_term_row = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains("elapsed"))
-            .expect("result row should be on terminal");
-
-        assert_eq!(bash_cmd_term, bash_header_term + 1,
-            "cmd row should be immediately below header on terminal.\ndump:\n{}", vterm.dump());
-        assert_eq!(
-            result_term_row,
-            bash_cmd_term + 1,
-            "result should be on terminal row immediately below cmd row.\n\
-             Bash header row {}: {:?}\n\
-             Bash cmd row {}: {:?}\n\
-             Row below cmd: {:?}\n\
-             Result row {}: {:?}\n\
-             dump:\n{}",
-            bash_header_term,
-            vterm.row_text(bash_header_term),
-            bash_cmd_term,
-            vterm.row_text(bash_cmd_term),
-            vterm.row_text(bash_cmd_term + 1),
-            result_term_row,
-            vterm.row_text(result_term_row),
-            vterm.dump(),
-        );
-    }
-
     /// Regression: when a long Bash command wraps to multiple terminal
     /// rows, the inflight spinner `⠙ Bash(...)` may occupy 2+ body rows.
     /// After `ToolCallCommit` freezes it to `● Bash(...)`, the old
@@ -12327,16 +11594,6 @@ mod tests {
         }
     }
 
-    /// Regression (top-anchored body model): `pop_approval_prompt`
-    /// has the same wrong-row-erase pattern as `commit_inflight_tool`,
-    /// but the bug is masked at the user level by the immediately
-    /// following `screen.invalidate()` that forces a full repaint.
-    /// This test still asserts the post-condition contract — that
-    /// prior body rows remain visible after popping — so a future
-    /// refactor that drops the `invalidate()` shield can't silently
-    /// regress this path. With the over-erase removed (or the math
-    /// corrected) the test passes for the right reason instead of
-    /// being saved by the invalidation hammer.
     /// Regression: the bash "Press Ctrl+o …" hint must ride INSIDE the
     /// inflight strip so the commit erase covers it. Previously the hint was a
     /// separate body row pushed AFTER the strip, breaking the "strip = body
@@ -12448,73 +11705,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retained_approval_pop_preserves_prior_body() {
-        let w: u16 = 80;
-        let h: u16 = 24;
-        let (mut r, buf) = new_capturing(w, h);
-        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
-        let status = status_basic();
-
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        const N: usize = 5;
-        for i in 0..N {
-            r.render(UiLine::AssistantText(format!("MARKER_R{}\n", i)));
-        }
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        r.render(UiLine::ApprovalPrompt {
-            tool: "bash".into(),
-            detail: "ls".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        r.pop_approval_prompt();
-        // Trigger a repaint cycle (mirrors what happens after Y/A/N).
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        for i in 0..N {
-            let label = format!("MARKER_R{}", i);
-            assert!(
-                vterm.any_row(|row| row.contains(&label)),
-                "MARKER_R{} should still be on terminal after pop_approval_prompt.\
-                 \ndump:\n{}",
-                i,
-                vterm.dump()
-            );
-        }
-    }
-
     /// Bug repro: user reports that assistant text rows duplicate in
-    /// the scrollback right before an approval-needed tool call,
+    /// the scrollback right before a tool call commit burst,
     /// visible on every terminal (macOS Terminal.app, iTerm2, VSCode
     /// pwsh xterm.js) by scrolling up. Wire-dump confirms the LLM
     /// only emits each line once. So the duplicate is in body_lines.
     ///
     /// This test simulates the most-likely event sequence under load
     /// — TextDelta chunks token-by-token interleaved with spinner
-    /// ticks, then a ToolCallStreaming → ToolCallStarted → ApprovalNeeded
+    /// ticks, then a ToolCallStreaming → ToolCallStarted → ToolCallCommit
     /// burst — and asserts that body_lines never contains two
     /// adjacent entries with the same content.
+    /// (Rewritten to use CommandOutput instead of the removed ApprovalPrompt.)
     #[test]
     fn retained_approval_pending_no_duplicate_body_rows() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -12570,14 +11772,13 @@ mod tests {
         }
         r.flush_deferred();
 
-        // Phase 3: ApprovalNeeded fires — commit inflight + prompt.
+        // Phase 3: tool executes — commit inflight + result output.
+        // (Previously used ApprovalPrompt here; replaced with CommandOutput
+        // since the body ApprovalPrompt variant has been removed.)
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-7".into()),
         });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "WriteFile".into(),
-            detail: "atomcode_smoke_replace.txt".into(),
-        });
+        r.render(UiLine::CommandOutput("wrote atomcode_smoke_replace.txt".into()));
         r.flush_deferred();
 
         // Assert no two adjacent rows have identical non-blank content.
@@ -12692,8 +11893,11 @@ mod tests {
         );
     }
 
-    /// Bug repro: approval flow — ApprovalNeeded commits inflight to ●,
-    /// THEN ToolCallResult arrives later. Must not produce a second ●.
+    /// Bug repro: when ToolCallCommit fires while inflight and then ToolCallResult
+    /// arrives later, must not produce a second ● row. (Originally tested the
+    /// approval flow; rewritten without the removed body ApprovalPrompt variant —
+    /// the double-● assertion applies equally to any two-phase ToolCallCommit
+    /// sequence: first commit (commit inflight), then result commit.)
     #[test]
     fn retained_approval_flow_does_not_double_editfile() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -12716,36 +11920,23 @@ mod tests {
         });
         r.flush_deferred();
 
-        // Phase 2: ApprovalNeeded → ToolCallCommit (commit inflight) + ApprovalPrompt
+        // Phase 2: ToolCallCommit commits the inflight to a permanent ● row.
+        // (Previously this was the ApprovalNeeded path; now it's just the
+        // first ToolCallCommit that freezes the spinner to ●.)
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
         });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "EditFile".into(),
-            detail: "numbers.txt ← \"5\"".into(),
-        });
         r.flush_deferred();
 
-        // Count ● rows AFTER approval commit (should be 1)
+        // Count ● rows AFTER first commit (should be 1)
         let mid = r.body_lines.iter().filter(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
             text.contains("EditFile") && text.contains("●")
         }).count();
-        eprintln!("● EditFile rows after ApprovalNeeded: {}", mid);
-        assert_eq!(mid, 1, "ApprovalNeeded must produce exactly ONE ● EditFile row");
+        eprintln!("● EditFile rows after first ToolCallCommit: {}", mid);
+        assert_eq!(mid, 1, "First ToolCallCommit must produce exactly ONE ● EditFile row");
 
-        // Phase 3: User approves → pop_approval_prompt
-        r.pop_approval_prompt();
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-
-        // Phase 4: ToolCallResult arrives
+        // Phase 3: ToolCallResult arrives
         // EXACT sequence from event loop: AssistantLineBreak + ToolCallCommit + ToolResult
         r.render(UiLine::AssistantLineBreak);
         r.render(UiLine::ToolCallCommit {
@@ -12773,7 +11964,7 @@ mod tests {
 
         assert_eq!(
             after, 1,
-            "Full approval flow must produce exactly ONE ● EditFile row, got {}.\n{:?}",
+            "Full flow must produce exactly ONE ● EditFile row, got {}.\n{:?}",
             after,
             r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
         );
@@ -13089,7 +12280,7 @@ mod tests {
             });
 
         // Frame 2: simulate the invalidate-then-shrink sequence the
-        // bug requires. `pop_approval_prompt` / `refresh_welcome_banner`
+        // bug requires. `commit_inflight_tool` / `refresh_welcome_banner`
         // both call `screen.invalidate()` to force a cold-start repaint
         // — verify the bug class by invoking invalidate directly so the
         // test isolates the rendering invariant (not the specific
@@ -13390,7 +12581,7 @@ mod tests {
     /// Unit-level regression for the `theme::RESET` under-clearing bug.
     ///
     /// Pre-fix `RESET` was `\x1b[23;39m` (italic-off + default-fg only).
-    /// When upstream UI chrome (ApprovalPrompt Y chip, top-rule session
+    /// When upstream UI chrome (footer approval chip, top-rule session
     /// pill, etc.) emitted `\x1b[7m` and never explicitly disabled it
     /// with SGR 27, the working `style` inside `parse_markdown_to_cells`
     /// carried `reverse=true` across token boundaries. The highlighter's
@@ -13411,7 +12602,7 @@ mod tests {
     fn markdown_stream_does_not_leak_reverse_across_tokens() {
         // Pattern: reverse-ON, "Y", theme::RESET, then a Number token
         // wrapped with truecolor open + theme::RESET close — mirrors how
-        // an ApprovalPrompt chip's reverse state could leak into a
+        // a footer approval chip's reverse state could leak into a
         // syntect-highlighted code block.
         let stream = format!(
             "\x1b[7mY{reset}\x1b[38;2;209;154;102m42{reset}",
@@ -14246,80 +13437,6 @@ mod tests {
                     .join("\n")
             );
         }
-    }
-
-    /// Regression: bash command rows rendered above an approval block must
-    /// SURVIVE `pop_approval_prompt`. The pop walks backwards from the tail
-    /// popping space-prefixed and `▶`-prefixed rows; it stops as soon as it
-    /// hits the `▶` header, so bash rows above the approval strip are never
-    /// reached — regardless of whether the `$` sits at col 0 or col 2.
-    #[test]
-    fn bash_command_rows_survive_approval_pop() {
-        let (mut r, buf) = new_capturing(40, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
-        let status = status_basic();
-
-        // Render input prompt first (mirrors real usage).
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Render a bash ToolCall with a long multi-segment command that WILL
-        // wrap at width 40 (the screen width minus prefix overhead).
-        let long_cmd = "cd /tmp && sed -i '' \\ -e 's/aaaa/bbbb/g' \\ -e 's/cccc/dddd/g' \\ -e 's/eeee/ffff/g'";
-        r.render(UiLine::ToolCall {
-            name: "Bash".into(),
-            detail: long_cmd.into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // The command should wrap to multiple rows — verify at least one
-        // wrapped segment is present before the pop.
-        assert!(
-            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
-            "wrapped segment must be visible before pop\ndump:\n{}",
-            vterm.dump()
-        );
-
-        // Now render an approval prompt on top.
-        r.render(UiLine::ApprovalPrompt {
-            tool: "Bash".into(),
-            detail: long_cmd.into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Pop the approval block.
-        r.pop_approval_prompt();
-        // Force a repaint cycle (mirrors real Y/A/N handling).
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // CRITICAL: bash command rows MUST survive the pop.
-        assert!(
-            vterm.any_row(|row| row.contains("cd /tmp")),
-            "bash command line must survive approval pop\ndump:\n{}",
-            vterm.dump()
-        );
-        assert!(
-            vterm.any_row(|row| row.contains("-e 's/cccc/dddd/g'")),
-            "wrapped bash segment must survive approval pop\ndump:\n{}",
-            vterm.dump()
-        );
     }
 
     /// A ToolCall that follows assistant text must have at least one blank row

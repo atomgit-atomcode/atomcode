@@ -393,9 +393,6 @@ impl Renderer for CaptureRenderer<'_> {
     fn flush_deferred(&mut self) {
         self.inner.flush_deferred();
     }
-    fn pop_approval_prompt(&mut self) {
-        self.inner.pop_approval_prompt();
-    }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
