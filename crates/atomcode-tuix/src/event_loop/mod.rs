@@ -7894,17 +7894,6 @@ pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> Agen
     }
 }
 
-/// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
-/// of surfaced as a prompt (false), given the TUI's bypass flag.
-///
-/// In LOCAL mode the core decider short-circuits and never emits the event, so
-/// this only bites in SYNC mode, where the daemon's LiveSession always asks.
-/// Honoring bypass here is what keeps `--dangerously-skip-permissions` working
-/// for daemon-backed turns (e.g. a `/skills` expansion that drives tool calls).
-fn approval_needed_is_auto_bypassed(dangerously_skip_permissions: bool) -> bool {
-    dangerously_skip_permissions
-}
-
 /// True iff the current mode auto-approves tool calls without a panel.
 pub(crate) fn approval_should_auto_bypass(mode: crate::state::AgentMode) -> bool {
     matches!(mode, crate::state::AgentMode::Auto)
