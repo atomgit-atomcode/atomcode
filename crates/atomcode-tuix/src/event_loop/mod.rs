@@ -10771,6 +10771,12 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .active_todos
         .clone()
         .filter(|p| p.total > 0 && p.completed < p.total);
+    let approval = state.approval_panel.as_ref().map(|p| crate::render::ApprovalPanelView {
+        tool: p.tool.clone(),
+        detail: p.detail.clone(),
+        options: p.options.iter().map(|o| o.label.clone()).collect(),
+        selected: p.selected,
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -10788,6 +10794,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        approval,
     }
 }
 

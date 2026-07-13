@@ -497,6 +497,11 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
+    /// When the approval panel is active (user must confirm/deny a tool call),
+    /// this carries its current state for the dedicated footer approval panel
+    /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
+    /// omitted. Mirrors `todo` — the renderer owns glyph/width/terminal-safety.
+    pub approval: Option<ApprovalPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -509,6 +514,16 @@ pub struct StatusLine {
     /// footer loop row (its own full-width line, shown instead of the goal row
     /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
     pub loop_status: Option<LoopStatus>,
+}
+
+/// Renderer-facing snapshot of the approval panel (mirrors how `TodoProgress`
+/// feeds the todo panel). Header + option labels + selected index.
+#[derive(Debug, Clone)]
+pub struct ApprovalPanelView {
+    pub tool: String,
+    pub detail: String,
+    pub options: Vec<String>,
+    pub selected: usize,
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo

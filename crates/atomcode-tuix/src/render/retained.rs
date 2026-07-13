@@ -1826,6 +1826,82 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .collect()
     }
 
+    /// Rows the approval panel occupies (header + detail + one per option + hint),
+    /// for the footer height math.
+    fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
+        2 + panel.options.len() + 1
+    }
+
+    /// Build the footer approval panel: a warning `⚠ <tool>` header, the command
+    /// detail, the selectable options (selected row = `▸ ` + reverse), and a hint
+    /// line. Left `▌` accent bar per row (ASCII `|`). Colorless besides the warning
+    /// header + reverse selection.
+    fn build_approval_rows(
+        &self,
+        panel: &crate::render::ApprovalPanelView,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let unicode = self.caps.unicode_symbols;
+        let bar = if unicode { "\u{258c} " } else { "| " }; // ▌
+        let bar_style = self.style_for(Role::Warning);
+        let warn = if unicode { "\u{26a0} " } else { "! " }; // ⚠
+        let mut out: Vec<Vec<Cell>> = Vec::new();
+
+        // header row: `▌ ⚠ <tool>`
+        {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, bar, &bar_style);
+            push_str_cells(&mut row, warn, &self.style_for(Role::Warning));
+            let head = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&panel.tool),
+                rule_width.saturating_sub(6),
+            );
+            push_str_cells(&mut row, &head, &self.style_bold(Role::ToolName));
+            out.push(row);
+        }
+        // detail row: `▌   <detail>`
+        {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, bar, &bar_style);
+            let budget = rule_width.saturating_sub(4);
+            let det = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.detail), budget);
+            push_str_cells(&mut row, &format!("  {det}"), &self.style_for(Role::Secondary));
+            out.push(row);
+        }
+        // option rows: `▌  ▸ <label>` (selected: ▸ + reverse) / `▌    <label>`
+        for (i, label) in panel.options.iter().enumerate() {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, bar, &bar_style);
+            let selected = i == panel.selected;
+            let marker = if selected {
+                if unicode { "  \u{25b8} " } else { "  > " } // ▸
+            } else {
+                "    "
+            };
+            let style = if selected {
+                CellStyle { reverse: true, ..CellStyle::default() }
+            } else {
+                self.style_for(Role::Secondary)
+            };
+            let budget = rule_width.saturating_sub(6);
+            let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
+            push_str_cells(&mut row, marker, &style);
+            push_str_cells(&mut row, &lbl, &style);
+            out.push(row);
+        }
+        // hint row: `▌  ↑↓ select · enter confirm · esc deny`
+        {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, bar, &bar_style);
+            let hint = crate::i18n::t(crate::i18n::Msg::ApprovalHint).into_owned();
+            let budget = rule_width.saturating_sub(4);
+            let fitted = crate::width::truncate_with_ellipsis(&hint, budget);
+            push_str_cells(&mut row, &format!("  {fitted}"), &self.style_for(Role::Muted));
+            out.push(row);
+        }
+        out
+    }
+
     /// Paint the full footer into `self.screen`. Layout (top to bottom):
     ///
     ///   rows 0..T:   todo panel (T = todo_rows, a standing view above input)
@@ -1927,6 +2003,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
+        // Approval panel: sits above the todo panel (top of footer block).
+        let approval_rows = self
+            .status
+            .approval
+            .as_ref()
+            .map(|p| self.approval_panel_row_count(p))
+            .unwrap_or(0);
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
@@ -1935,7 +2018,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
         // into the status-rows reservation so the input box height accounts for them.
         let max_input_rows =
-            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows + todo_rows);
+            Self::max_input_rows(h, attachment_rows, menu_rows, status_rows + goal_rows + todo_rows + approval_rows);
         let input_view_start = if lines.len() > max_input_rows {
             cursor_row_in_middle
                 .saturating_sub(max_input_rows.saturating_sub(1))
@@ -1946,7 +2029,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
         let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         let total_rows =
-            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows;
+            1 + middle_rows + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -1993,6 +2076,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
+        let approval_cells: Vec<Vec<Cell>> = status_clone
+            .approval
+            .as_ref()
+            .map(|p| self.build_approval_rows(p, rule_width))
+            .unwrap_or_default();
         let menu_kind = self
             .menu
             .as_ref()
@@ -2029,17 +2117,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body content still showing from earlier frames (see
         // `pad_row_to_width` for full rationale).
         //
-        // The todo panel sits at the TOP of the footer block — a standing view
-        // pinned above the input box, directly under the scrollback. Everything
-        // else (rules, input, attachments, menu, goal/loop, status) shifts down
-        // by todo_rows.
-        let todo_top = footer_top;
+        // The approval panel sits at the very TOP of the footer block, above
+        // the todo panel. The todo panel is pinned directly after the approval
+        // panel. Everything else (rules, input, attachments, menu, goal/loop,
+        // status) shifts down by approval_rows + todo_rows.
+        let approval_top = footer_top;
+        for (i, ar) in approval_cells.into_iter().enumerate() {
+            let mut padded = ar;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(approval_top + i, 0, &padded);
+        }
+        let todo_top = footer_top + approval_rows;
         for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(todo_top + i, 0, &padded);
         }
-        let rules_top = footer_top + todo_rows;
+        let rules_top = footer_top + todo_rows + approval_rows;
 
         let mut top_rule = top_rule;
         Self::pad_row_to_width(&mut top_rule, w);
@@ -2159,6 +2253,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
+        let approval_rows = self
+            .status
+            .approval
+            .as_ref()
+            .map(|p| self.approval_panel_row_count(p))
+            .unwrap_or(0);
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
@@ -2166,12 +2266,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             h,
             attachment_rows,
             menu_rows,
-            status_rows + goal_rows + todo_rows,
+            status_rows + goal_rows + todo_rows + approval_rows,
         ));
-        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + status.
+        // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + status_rows
+        1 + capped_middle + 1 + attachment_rows + menu_rows + goal_rows + todo_rows + approval_rows + status_rows
     }
 
     /// Max rows the input box may DISPLAY before scrolling internally. Bounds
@@ -5950,6 +6050,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            approval: None,
         }
     }
 
@@ -5977,6 +6078,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            approval: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -6033,6 +6135,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            approval: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -6081,6 +6184,7 @@ mod tests {
             goal: None,
             loop_status: None,
             todo: None,
+            approval: None,
         };
         let row = r.build_status_row(&status, 60);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -10817,6 +10921,36 @@ mod tests {
             "todo panel must render ABOVE the input box (panel row {panel} vs input row {input})\n{}",
             vterm.dump()
         );
+    }
+
+    #[test]
+    fn approval_panel_renders_selectable_options() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "rm -rf build/".into(),
+            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            selected: 0,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        assert!(vterm.any_row(|r| r.contains("Bash")), "header names the tool\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("rm -rf build/")), "detail shown\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("Allow once")), "allow once row\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("Always allow Bash")), "always row\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("Deny")), "deny row\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("▸") && r.contains("Allow once")), "selected marker on option 0\n{dump}");
+        // Panel renders ABOVE the input box (chevron ❯).
+        let h = vterm.height() as usize;
+        let row_of = |n: &str| (0..h).find(|&i| vterm.row_text(i).contains(n));
+        assert!(row_of("Allow once") < row_of("❯").or(Some(h)), "panel above input\n{dump}");
     }
 
     /// `attachments` from `UiLine::InputPrompt` paints a `└ [Image #N]`
