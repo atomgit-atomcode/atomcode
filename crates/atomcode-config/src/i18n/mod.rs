@@ -2,7 +2,7 @@ mod en;
 mod messages;
 mod zh_cn;
 
-pub use atomcode_config::locale::Locale;
+pub use crate::locale::Locale;
 pub use messages::Msg;
 
 use std::borrow::Cow;

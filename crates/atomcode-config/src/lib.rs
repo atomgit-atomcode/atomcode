@@ -10,6 +10,10 @@
 /// re-exports this during the transition.
 pub mod locale;
 
+/// Localization message tables + `t()`/`Msg` (moved out of `atomcode-core`; it only
+/// needs `locale::Locale`). `atomcode_core::i18n` re-exports this during the transition.
+pub mod i18n;
+
 /// Vendored leaf helpers (home-dir resolution, vision heuristic) config needs.
 mod util;
 
