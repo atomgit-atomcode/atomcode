@@ -7847,6 +7847,30 @@ fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::Perm
     }
 }
 
+/// The three approval options for `tool`, in display order (Allow once is the
+/// default selection). The "Always allow" label carries the tool name because
+/// `AgentEvent::ApprovalNeeded` does not carry the grant scope.
+pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
+    use crate::state::{ApprovalKind, ApprovalOption};
+    vec![
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
+            kind: ApprovalKind::AllowOnce,
+            accel: 'y',
+        },
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned(),
+            kind: ApprovalKind::AlwaysAllow,
+            accel: 'a',
+        },
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+            kind: ApprovalKind::Deny,
+            accel: 'n',
+        },
+    ]
+}
+
 /// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
 /// of surfaced as a prompt (false), given the TUI's bypass flag.
 ///
@@ -7917,6 +7941,17 @@ mod bypass_approval_tests {
             approval_command_to_decision(&AgentCommand::DenyTool),
             PermissionDecision::Deny
         ));
+    }
+
+    #[test]
+    fn build_approval_options_shape() {
+        use crate::state::ApprovalKind;
+        let opts = super::build_approval_options("bash");
+        assert_eq!(opts.len(), 3);
+        assert_eq!((opts[0].kind, opts[0].accel), (ApprovalKind::AllowOnce, 'y'));
+        assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
+        assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
+        assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
     }
 }
 

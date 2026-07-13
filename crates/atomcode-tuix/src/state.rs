@@ -37,6 +37,57 @@ pub enum UiPhase {
     Suspended,
 }
 
+/// A tool-approval decision offered in the footer approval panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    AllowOnce,
+    AlwaysAllow,
+    Deny,
+}
+
+/// One selectable row of the approval panel.
+#[derive(Debug, Clone)]
+pub struct ApprovalOption {
+    pub label: String,
+    pub kind: ApprovalKind,
+    /// Single-key accelerator (lower-case): 'y' / 'a' / 'n'.
+    pub accel: char,
+}
+
+/// The active tool-approval prompt, shown as a footer panel while
+/// `UiPhase::Approval`. `None` when no approval is pending.
+#[derive(Debug, Clone)]
+pub struct ApprovalPanel {
+    pub tool: String,
+    pub detail: String,
+    pub options: Vec<ApprovalOption>,
+    pub selected: usize,
+}
+
+impl ApprovalPanel {
+    pub fn move_up(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.options.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+    pub fn move_down(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.options.len();
+    }
+    /// Index of the option whose accelerator matches `c` (case-insensitive).
+    pub fn accel_index(&self, c: char) -> Option<usize> {
+        let c = c.to_ascii_lowercase();
+        self.options.iter().position(|o| o.accel == c)
+    }
+}
+
 /// How long the model may go silent before the spinner surfaces the "slow
 /// response · esc to cancel" hint. A mid-stream drop fails cleanly at the
 /// provider's idle watchdog (~120s), but that is silent dead-air; this reassures
@@ -206,6 +257,10 @@ pub struct UiState {
     /// on `permission.decide().await` — looked identical to a real tool
     /// hang.
     pub prior_spinner_label: Option<String>,
+    /// The active footer approval panel (arrow-key selectable). `None` when no
+    /// tool approval is pending. Set in the `ApprovalNeeded` handler, cleared on
+    /// resolve / turn-end / session reset.
+    pub approval_panel: Option<ApprovalPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -449,6 +504,7 @@ impl UiState {
             response_finalized: false,
             prior_phase: None,
             prior_spinner_label: None,
+            approval_panel: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -901,6 +957,7 @@ impl UiState {
     }
 
     pub fn on_approval_resolved(&mut self) {
+        self.approval_panel = None;
         self.phase = UiPhase::Streaming;
         if let Some(prior) = self.prior_spinner_label.take() {
             self.spinner_label = prior;
@@ -1620,5 +1677,29 @@ mod tests {
         });
         s.on_turn_complete();
         assert!(s.active_todos.is_some(), "panel must survive turn end");
+    }
+
+    #[test]
+    fn approval_panel_selection_wraps_and_accel_maps() {
+        use crate::state::{ApprovalKind, ApprovalOption, ApprovalPanel};
+        let mut p = ApprovalPanel {
+            tool: "bash".into(),
+            detail: "rm -rf build/".into(),
+            options: vec![
+                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
+                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
+                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+            ],
+            selected: 0,
+        };
+        p.move_up();
+        assert_eq!(p.selected, 2, "up from 0 wraps to last");
+        p.move_down();
+        assert_eq!(p.selected, 0, "down from last wraps to 0");
+        p.move_down();
+        assert_eq!(p.selected, 1);
+        assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
+        assert_eq!(p.accel_index('n'), Some(2));
+        assert_eq!(p.accel_index('z'), None);
     }
 }
