@@ -436,13 +436,7 @@ impl PluginManager {
                         } else if self.is_installed(&item.name, &item.marketplace) {
                             format!("@{} ({})", item.marketplace, installed_label)
                         } else {
-                            let stars = get_mock_stars(&item.name);
-                            let star_str = if stars >= 1000 {
-                                format!("{:.1}k", stars as f64 / 1000.0)
-                            } else {
-                                format!("{}", stars)
-                            };
-                            format!("@{}  ★ {}", item.marketplace, star_str)
+                            format!("@{}  {}", item.marketplace, get_mock_category(&item.name))
                         };
                         let desc = if item.description.is_empty() {
                             status
@@ -831,12 +825,36 @@ impl Modal for PluginManager {
     }
 }
 
-fn get_mock_stars(name: &str) -> usize {
-    let mut hash = 0u64;
-    for c in name.chars() {
-        hash = hash.wrapping_add(c as u64).wrapping_mul(31);
+fn get_mock_category(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("git") || lower.contains("commit") || lower.contains("lens") {
+        "Git"
+    } else if lower.contains("lint") || lower.contains("check") || lower.contains("eslint") {
+        "Linter"
+    } else if lower.contains("format") || lower.contains("prettier") || lower.contains("style") {
+        "Formatter"
+    } else if lower.contains("rust")
+        || lower.contains("go")
+        || lower.contains("python")
+        || lower.contains("lang")
+        || lower.contains("analyzer")
+    {
+        "Language"
+    } else if lower.contains("security") || lower.contains("auth") || lower.contains("guard") {
+        "Security"
+    } else if lower.contains("ai") || lower.contains("gpt") || lower.contains("copilot") || lower.contains("model") {
+        "AI"
+    } else {
+        let mut hash = 0u64;
+        for c in name.chars() {
+            hash = hash.wrapping_add(c as u64).wrapping_mul(31);
+        }
+        match hash % 3 {
+            0 => "Utility",
+            1 => "Tool",
+            _ => "Completion",
+        }
     }
-    (hash % 1490 + 10) as usize
 }
 
 #[cfg(test)]
@@ -1040,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_shows_star_counts() {
+    fn browse_shows_categories() {
         let m = manager(
             vec![
                 mk_mp("official", &["git-lens"]),
@@ -1050,6 +1068,6 @@ mod tests {
         let (rows, _) = m.rows();
         assert_eq!(rows.len(), 1);
         let (_name, desc) = &rows[0];
-        assert!(desc.contains("★"));
+        assert!(desc.contains("Git"));
     }
 }
