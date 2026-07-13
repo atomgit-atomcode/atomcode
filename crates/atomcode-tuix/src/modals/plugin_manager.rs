@@ -515,26 +515,26 @@ impl PluginManager {
             Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
             Screen::ScopeSelect { .. } => {
                 let installing = self.installing_plugin.is_some();
-                let user_desc = if installing && self.installing_scope == Some(InstallScope::User) {
-                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                let (user_lbl, user_desc) = if installing && self.installing_scope == Some(InstallScope::User) {
+                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
-                    t(Msg::PluginScopeUserDesc).into_owned()
+                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned())
                 };
-                let project_desc = if installing && self.installing_scope == Some(InstallScope::Project) {
-                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                let (project_lbl, project_desc) = if installing && self.installing_scope == Some(InstallScope::Project) {
+                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
-                    t(Msg::PluginScopeProjectDesc).into_owned()
+                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned())
                 };
-                let local_desc = if installing && self.installing_scope == Some(InstallScope::Local) {
-                    format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus))
+                let (local_lbl, local_desc) = if installing && self.installing_scope == Some(InstallScope::Local) {
+                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
-                    t(Msg::PluginScopeLocalDesc).into_owned()
+                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned())
                 };
 
                 let rows = vec![
-                    (t(Msg::PluginScopeUser).into_owned(), user_desc),
-                    (t(Msg::PluginScopeProject).into_owned(), project_desc),
-                    (t(Msg::PluginScopeLocal).into_owned(), local_desc),
+                    (user_lbl, user_desc),
+                    (project_lbl, project_desc),
+                    (local_lbl, local_desc),
                 ];
                 let hint = if installing {
                     t(Msg::PluginMgrHintPending).into_owned()
