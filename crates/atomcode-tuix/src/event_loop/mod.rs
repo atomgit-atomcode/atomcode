@@ -7908,27 +7908,12 @@ fn bypass_approval_command() -> AgentCommand {
 
 #[cfg(test)]
 mod bypass_approval_tests {
-    use super::{
-        approval_command_to_decision, approval_needed_is_auto_bypassed, bypass_approval_command,
-        AgentCommand,
-    };
+    use super::{approval_command_to_decision, bypass_approval_command, AgentCommand};
     use atomcode_core::tool::PermissionDecision;
 
-    // The fix's core invariant: with `--dangerously-skip-permissions` on, an
-    // incoming `ApprovalNeeded` is auto-approved rather than prompted. This is
-    // what was broken in SYNC mode — the daemon always asks, and the TUI used
-    // to show the prompt regardless of bypass (e.g. on `/skills` tool calls).
-    #[test]
-    fn bypass_on_auto_approves() {
-        assert!(approval_needed_is_auto_bypassed(true));
-    }
-
-    // Without bypass, the event must NOT be short-circuited — the normal
-    // prompt path runs. Guards against an accidental inversion of the flag.
-    #[test]
-    fn bypass_off_still_prompts() {
-        assert!(!approval_needed_is_auto_bypassed(false));
-    }
+    // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
+    // (see `auto_mode_bypasses_approval`); the old `dangerously_skip_permissions`
+    // predicate was removed when `--skip` was folded into `AgentMode::Auto`.
 
     // End-to-end on the pure seam: the command BYPASS issues must resolve to a
     // genuine `Allow`. If either the issued command or the mapping drifts so
@@ -10745,14 +10730,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let mode_indicator = match state.agent_mode {
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
-        // Auto visual handled by bypass_indicator (Task 5 will unify); keep None for now.
+        // Auto's visual is the right-aligned warning badge below (Auto = bypass).
         crate::state::AgentMode::Auto => None,
     };
-    // Bypass indicator: right-aligned warning badge when
-    // --dangerously-skip-permissions / -y is active. Placed on the
-    // right side of the status row so it does not displace the PLAN
-    // mode indicator on the left.
-    let bypass_indicator = if ctx.dangerously_skip_permissions {
+    // Bypass indicator: right-aligned warning badge while the execution mode is
+    // Auto (auto-approve all tools). `--dangerously-skip-permissions` seeds
+    // `agent_mode = Auto` at startup, so keying off the mode covers both the
+    // startup flag AND the runtime Tab/`/auto` toggle — the badge no longer
+    // silently disappears when Auto is entered at runtime. Kept on the right so
+    // it doesn't displace the PLAN mode indicator on the left.
+    let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
         Some(crate::i18n::t(crate::i18n::Msg::BypassBadge).into_owned())
     } else {
         None
