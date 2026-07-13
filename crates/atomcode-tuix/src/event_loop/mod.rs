@@ -4475,6 +4475,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 // its cached lists from this job's result first.
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                    }
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
@@ -4932,6 +4935,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 // its cached lists from this job's result first.
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                    }
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the

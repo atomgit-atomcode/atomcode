@@ -816,6 +816,10 @@ impl Modal for PluginManager {
             self.goto(Screen::Browse);
         }
     }
+
+    fn close_requested(&self) -> bool {
+        self.close_requested
+    }
 }
 
 #[cfg(test)]
