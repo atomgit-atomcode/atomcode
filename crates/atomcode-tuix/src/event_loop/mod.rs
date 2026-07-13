@@ -8061,17 +8061,11 @@ fn handle_approval_key(
             .as_ref()
             .and_then(|p| p.options.get(p.selected).map(|o| o.kind)),
         KeyCode::Esc => Some(crate::state::ApprovalKind::Deny),
-        KeyCode::Char(c) => app.state.approval_panel.as_ref().and_then(|p| {
-            // Digit shortcut: '1'..'9' selects by positional index.
-            if c.is_ascii_digit() && c != '0' {
-                let idx = (c as usize) - ('1' as usize);
-                if idx < p.options.len() {
-                    return p.options.get(idx).map(|o| o.kind);
-                }
-            }
-            // Letter accelerator fallback (y/a/n).
-            p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))
-        }),
+        KeyCode::Char(c) => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))),
         _ => None,
     };
     let Some(kind) = kind else {
