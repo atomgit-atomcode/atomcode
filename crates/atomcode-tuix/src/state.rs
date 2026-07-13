@@ -775,6 +775,9 @@ impl UiState {
         // Same discipline for the subagent fan-out activity: no turn-end path may
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
+        // Safety clear: if a turn ends without resolving an approval (e.g. error
+        // path or session switch), ensure the panel is not left stale.
+        self.approval_panel = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -790,6 +793,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
+        self.approval_panel = None;
     }
 
     pub fn on_error(&mut self) {
@@ -804,6 +808,7 @@ impl UiState {
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.approval_panel = None;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —

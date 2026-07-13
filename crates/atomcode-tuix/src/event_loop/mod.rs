@@ -7871,6 +7871,17 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
     ]
 }
 
+/// The `AgentCommand` for a chosen approval option kind. Pure seam so the
+/// key handler's decision mapping is unit-testable.
+pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> AgentCommand {
+    use crate::state::ApprovalKind;
+    match kind {
+        ApprovalKind::AllowOnce => AgentCommand::ApproveTool,
+        ApprovalKind::AlwaysAllow => AgentCommand::ApproveToolAlways,
+        ApprovalKind::Deny => AgentCommand::DenyTool,
+    }
+}
+
 /// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
 /// of surfaced as a prompt (false), given the TUI's bypass flag.
 ///
@@ -7953,6 +7964,14 @@ mod bypass_approval_tests {
         assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
         assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
     }
+
+    #[test]
+    fn approval_kind_command_mapping() {
+        use crate::state::ApprovalKind;
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AllowOnce), AgentCommand::ApproveTool));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
+    }
 }
 
 fn handle_approval_key(
@@ -7976,7 +7995,6 @@ fn handle_approval_key(
             // The goal (if any) continues; Claude Code's /goal works the same way.
             // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
-            renderer.pop_approval_prompt();
             deliver_approval(ctx, AgentCommand::DenyTool);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
@@ -7990,23 +8008,47 @@ fn handle_approval_key(
     // Any other key resets the exit confirmation
     app.exit_pending = None;
 
-    let cmd = match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
-        KeyCode::Char('a') | KeyCode::Char('A') => AgentCommand::ApproveToolAlways,
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => AgentCommand::DenyTool,
-        _ => return Ok(()),
+    // Navigation: move the selection and repaint the footer, no decision yet.
+    match code {
+        KeyCode::Up => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_up();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        KeyCode::Down => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_down();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Resolve to a decision: Enter = the selected option; y/a/n = accelerators;
+    // Esc = Deny (safe default). Any other key is ignored.
+    let kind = match code {
+        KeyCode::Enter => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.options.get(p.selected).map(|o| o.kind)),
+        KeyCode::Esc => Some(crate::state::ApprovalKind::Deny),
+        KeyCode::Char(c) => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))),
+        _ => None,
     };
-    // Retract the "Waiting for approval" body row now that the user
-    // responded — without this, the prompt stays in scrollback next to
-    // the tool result, creating visual noise.
-    renderer.pop_approval_prompt();
-    // Per Claude Code semantics, denying a tool does NOT stop the active
-    // /goal — the evaluator will see the user's refusal on the next round
-    // and either change tactics or judge the goal complete. The user can
-    // explicitly halt with `/goal clear` or by pressing Esc outside this
-    // approval prompt (inside the prompt, Esc denies the tool instead).
+    let Some(kind) = kind else {
+        return Ok(());
+    };
+    let cmd = approval_kind_to_command(kind);
     deliver_approval(ctx, cmd);
-    app.state.on_approval_resolved();
+    app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
     Ok(())
 }
 
@@ -9131,9 +9173,11 @@ fn handle_agent_event(
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
 
-            renderer.render(UiLine::ApprovalPrompt {
+            state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
+                options: build_approval_options(&display),
+                selected: 0,
             });
             renderer.flush();
             atomcode_core::notify::notify(
@@ -10230,6 +10274,7 @@ fn handle_agent_event(
             state.thinking_idx = 0;
             state.on_turn_complete();
             state.active_todos = None;
+            state.approval_panel = None;
 
             // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
             let target_session = match loaded {
