@@ -733,6 +733,14 @@ Msg::PluginScopeHint => "↑↓ 选择范围 · Enter 确认 · Esc 返回".into
 Msg::PluginScopeUserShort => "用户级".into(),
 Msg::PluginScopeProjectShort => "项目级".into(),
 Msg::PluginScopeLocalShort => "本地级".into(),
+Msg::PluginActionUninstall => "卸载".into(),
+Msg::PluginActionUninstallDesc => "卸载该插件所有的组件与配置".into(),
+Msg::PluginActionUpdate => "更新".into(),
+Msg::PluginActionUpdateDesc => "重新拉取并安装最新版本".into(),
+Msg::PluginActionDisable => "禁用".into(),
+Msg::PluginActionDisableDesc => "临时禁用该插件".into(),
+Msg::PluginActionBack => "返回到上一级".into(),
+Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>

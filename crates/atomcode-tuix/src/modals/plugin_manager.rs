@@ -41,6 +41,7 @@ enum Screen {
     /// Installing in progress — shown after scope is selected.
     /// Waits for async install to complete; Esc cancels.
     Installing { plugin: String, mp: String },
+    InstalledDetails { plugin: String, mp: String, scope: InstallScope },
 }
 
 #[derive(Clone)]
@@ -182,7 +183,7 @@ impl PluginManager {
             Screen::Browse
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
-            Screen::Installed => 1,
+            Screen::Installed | Screen::InstalledDetails { .. } => 1,
             Screen::AddUrl => 2,
         };
         let installed_count = self.installed.len();
@@ -209,7 +210,7 @@ impl PluginManager {
             Screen::Browse
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
-            Screen::Installed => 1,
+            Screen::Installed | Screen::InstalledDetails { .. } => 1,
             Screen::AddUrl => 2,
         };
         let next_tab = if forward {
@@ -249,6 +250,7 @@ impl PluginManager {
             Screen::AddUrl => 0,
             Screen::ScopeSelect { .. } => 3, // user / project / local
             Screen::Installing { .. } => 0, // No selectable rows — just status text
+            Screen::InstalledDetails { .. } => 4, // Uninstall, Update, Disable, Back
         }
     }
 
@@ -281,6 +283,30 @@ impl PluginManager {
             }
         }
         (version, description)
+    }
+
+    fn get_installed_plugin_details(&self, plugin: &str, mp: &str, scope: &InstallScope) -> (Option<String>, Option<String>) {
+        let root_opt = atomcode_core::plugin::plugins_root();
+        let cwd = std::env::current_dir().ok();
+        let dir_opt = match scope {
+            InstallScope::User => root_opt,
+            InstallScope::Project | InstallScope::Local => {
+                if let Some(ref wd) = cwd {
+                    atomcode_core::plugin::project_plugins_root(wd, scope)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(root) = dir_opt {
+            if let Some(info) = self.installed.iter().find(|i| i.plugin == plugin && i.marketplace == mp && i.scope == *scope) {
+                let plugin_dir = root.join(&info.plugin_dir);
+                if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                    return (manifest.version, manifest.description);
+                }
+            }
+        }
+        self.get_plugin_details(plugin, mp)
     }
 
     fn goto(&mut self, screen: Screen) {
@@ -390,23 +416,52 @@ impl PluginManager {
         renderer.flush();
     }
 
-    fn enter_installed(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    fn enter_installed(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
         let inst = self.filtered_installed();
         let Some(i) = inst.get(self.selected) else { return };
         let (plugin, mp, scope) = (i.plugin.clone(), i.marketplace.clone(), i.scope.clone());
-        match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
-            Ok(()) => {
-                reload_plugins(ctx);
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
-                ));
-                self.reload();
+        self.goto(Screen::InstalledDetails { plugin, mp, scope });
+    }
+
+    fn enter_installed_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        let Screen::InstalledDetails { plugin, mp, scope } = &self.screen else { return };
+        let (plugin, mp, scope) = (plugin.clone(), mp.clone(), scope.clone());
+        match self.selected {
+            0 => {
+                // Uninstall
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
+                    Ok(()) => {
+                        reload_plugins(ctx);
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
+                        ));
+                        self.reload();
+                        self.goto(Screen::Installed);
+                    }
+                    Err(e) => renderer.render(UiLine::Error(
+                        t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
+                    )),
+                }
+                renderer.flush();
             }
-            Err(e) => renderer.render(UiLine::Error(
-                t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
-            )),
+            1 => {
+                // Update
+                self.dispatch_install(plugin, mp, scope, ctx);
+            }
+            2 => {
+                // Disable (mock it, close the modal and print a success line)
+                renderer.render(UiLine::CommandOutput(
+                    format!("  ⎿  ✓ Disabled {}. Run /reload-plugins to apply.", plugin)
+                ));
+                self.close_requested = true;
+                renderer.flush();
+            }
+            3 => {
+                // Back to parent
+                self.goto(Screen::Installed);
+            }
+            _ => {}
         }
-        renderer.flush();
     }
 
     // ─── Rendering helpers ───
@@ -549,6 +604,22 @@ impl PluginManager {
                 );
                 (Vec::new(), hint)
             }
+            Screen::InstalledDetails { plugin, .. } => {
+                let installing = self.installing_plugin.as_deref() == Some(plugin.as_str());
+                let (update_label, update_desc) = if installing {
+                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                } else {
+                    (t(Msg::PluginActionUpdate).into_owned(), t(Msg::PluginActionUpdateDesc).into_owned())
+                };
+
+                let rows = vec![
+                    (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
+                    (update_label, update_desc),
+                    (t(Msg::PluginActionDisable).into_owned(), t(Msg::PluginActionDisableDesc).into_owned()),
+                    (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
+                ];
+                (rows, "↑↓ Select action · Enter confirm · Esc back".to_string())
+            }
         }
     }
 }
@@ -648,6 +719,16 @@ impl Modal for PluginManager {
                             self.installing_scope = None;
                             self.goto(Screen::Browse);
                         }
+                        Screen::InstalledDetails { plugin, mp, .. } => {
+                            if self.installing_plugin.is_some() {
+                                let id = format!("{}@{}", sanitize(plugin), mp);
+                                self.cancelled_installs.insert(id);
+                                self.pending = None;
+                                self.installing_plugin = None;
+                                self.installing_scope = None;
+                            }
+                            self.goto(Screen::Installed);
+                        }
                         _ => {
                             return Ok(ModalAction::Close);
                         }
@@ -667,6 +748,7 @@ impl Modal for PluginManager {
                             // No-op: already installing, Enter does nothing.
                         }
                         Screen::Installed => self.enter_installed(ctx, renderer),
+                        Screen::InstalledDetails { .. } => self.enter_installed_details(ctx, renderer),
                         Screen::AddUrl => {}
                     }
                 }
@@ -703,13 +785,33 @@ impl Modal for PluginManager {
 
         let mut selected_offset = 2;
 
-        if let Screen::ScopeSelect { plugin, mp } | Screen::Installing { plugin, mp } = &self.screen {
-            let (version, description) = self.get_plugin_details(plugin, mp);
+        let details_opt = match &self.screen {
+            Screen::ScopeSelect { plugin, mp } | Screen::Installing { plugin, mp } => {
+                let (version, description) = self.get_plugin_details(plugin, mp);
+                Some((plugin.clone(), mp.clone(), version, description, None))
+            }
+            Screen::InstalledDetails { plugin, mp, scope } => {
+                let (version, description) = self.get_installed_plugin_details(plugin, mp, scope);
+                Some((plugin.clone(), mp.clone(), version, description, Some(scope.clone())))
+            }
+            _ => None,
+        };
+
+        if let Some((plugin, mp, version, description, scope_opt)) = details_opt {
             final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
             final_items.push((format!("  Name:        {}", plugin), String::new()));
             final_items.push((format!("  Marketplace: @{}", mp), String::new()));
             final_items.push((format!("  Version:     {}", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
             selected_offset += 4;
+            if let Some(scope) = scope_opt {
+                let scope_label = match scope {
+                    InstallScope::User => t(Msg::PluginScopeUserShort).into_owned(),
+                    InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
+                    InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
+                };
+                final_items.push((format!("  Scope:       {}", scope_label), String::new()));
+                selected_offset += 1;
+            }
             if let Some(desc) = description {
                 let trimmed = desc.trim();
                 if !trimmed.is_empty() {
@@ -725,6 +827,10 @@ impl Modal for PluginManager {
             final_items.push((String::new(), String::new()));
             if matches!(self.screen, Screen::ScopeSelect { .. }) {
                 final_items.push(("  Select Install Scope:".to_string(), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            } else if matches!(self.screen, Screen::InstalledDetails { .. }) {
+                final_items.push(("  Manage Plugin:".to_string(), String::new()));
                 final_items.push((String::new(), String::new()));
                 selected_offset += 3;
             } else {
@@ -1096,5 +1202,33 @@ mod tests {
         let (name, desc) = &rows[0];
         assert_eq!(name, "git-lens");
         assert!(desc.contains("project") || desc.contains("项目级"));
+    }
+
+    #[test]
+    fn installed_details_actions() {
+        let mut m = manager(
+            vec![],
+            vec![
+                InstalledPluginInfo {
+                    plugin: "git-lens".to_string(),
+                    marketplace: "official".to_string(),
+                    plugin_dir: "installed/official/git-lens".to_string(),
+                    scope: InstallScope::Project,
+                },
+            ],
+        );
+        m.goto(Screen::InstalledDetails {
+            plugin: "git-lens".to_string(),
+            mp: "official".to_string(),
+            scope: InstallScope::Project,
+        });
+        assert_eq!(m.current_len(), 4);
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 4);
+        // Action options
+        assert!(rows[0].0.contains("Uninstall") || rows[0].0.contains("卸载"));
+        assert!(rows[1].0.contains("Update") || rows[1].0.contains("更新"));
+        assert!(rows[2].0.contains("Disable") || rows[2].0.contains("禁用"));
+        assert!(rows[3].0.contains("Back") || rows[3].0.contains("返回"));
     }
 }
