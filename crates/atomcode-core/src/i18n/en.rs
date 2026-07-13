@@ -314,6 +314,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TodoPanelCompleted { n } => format!("{n} completed").into(),
         Msg::TodoPanelMore { n } => format!("+{n} more…").into(),
 
+        // ── Approval panel ──
+        Msg::ApprovalAllowOnce => "Allow once".into(),
+        Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
+        Msg::ApprovalDeny => "Deny".into(),
+
         Msg::SessionTimeJustNow => "just now".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}h ago").into(),
@@ -433,7 +438,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "▶ Waiting for approval: ".into(),
         Msg::ApprovalAllow => " Allow  ".into(),
         Msg::ApprovalAlways => " Always  ".into(),
-        Msg::ApprovalDeny => " Deny".into(),
 
         // ── Cancelled / Error prefix ──
         Msg::Cancelled => "(cancelled)".into(),

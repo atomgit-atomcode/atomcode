@@ -304,6 +304,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TodoPanelCompleted { n } => format!("{n} 已完成").into(),
         Msg::TodoPanelMore { n } => format!("+{n} 更多…").into(),
 
+        // ── 审批面板 ──
+        Msg::ApprovalAllowOnce => "允许一次".into(),
+        Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
+        Msg::ApprovalDeny => "拒绝".into(),
+
         Msg::SessionTimeJustNow => "刚刚".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}小时前").into(),
@@ -423,7 +428,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "▶ 等待审批：".into(),
         Msg::ApprovalAllow => " 允许  ".into(),
         Msg::ApprovalAlways => " 总是  ".into(),
-        Msg::ApprovalDeny => " 拒绝".into(),
 
         // ── 取消 / 错误前缀 ──
         Msg::Cancelled => "（已取消）".into(),

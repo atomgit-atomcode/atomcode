@@ -35,7 +35,19 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
     if let Some(body) = read_tier(&user) {
         out.push(format!("=== USER INSTRUCTIONS ({}) ===\n{body}", user.display()));
     }
-    out.join("\n\n")
+    if out.is_empty() {
+        return String::new();
+    }
+    // Precedence preamble injected right next to the user's own instructions so it is
+    // hard to overlook: these GLOBAL/PROJECT/USER blocks OVERRIDE the assistant's default
+    // system-prompt rules on conflict. Reinforces the same precedence stated in the
+    // persona (`## PRECEDENCE`), mirroring codex ("user instructions i.e. AGENTS.md may
+    // override these guidelines") and Claude Code ("user instructions ... OVERRIDE any
+    // default behavior"). Safety/approval gates are excepted (stated in the persona).
+    const PREAMBLE: &str = "The following GLOBAL / PROJECT / USER instructions take \
+PRECEDENCE over the assistant's default system-prompt rules — when they conflict with a \
+default, follow these. (Safety, approval, and destructive-action gates are not overridable here.)";
+    format!("{PREAMBLE}\n\n{}", out.join("\n\n"))
 }
 
 /// The first existing project-tier file (precedence order), if any.
@@ -93,6 +105,23 @@ mod tests {
         let out = render_instructions(&home, &proj);
         assert!(out.contains("GLOBAL INSTRUCTIONS") && out.contains("global rules"));
         assert!(out.contains("USER INSTRUCTIONS") && out.contains("user rules"));
+        // Precedence preamble is present and sits BEFORE the instruction blocks (so the
+        // model reads "these override defaults" next to the user's own rules).
+        let prec = out.find("PRECEDENCE").expect("preamble present");
+        let global_idx = out.find("GLOBAL INSTRUCTIONS").unwrap();
+        assert!(prec < global_idx, "preamble precedes the blocks: {out}");
+        assert!(out.contains("OVERRIDE") || out.contains("take PRECEDENCE"), "states override: {out}");
+    }
+
+    #[test]
+    fn no_precedence_preamble_when_no_instructions() {
+        // Empty output (no tiers) must stay empty — the preamble must NOT leak when there
+        // are no user instructions to elevate (else the caller emits a dangling section).
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let out = render_instructions(&d.path().join("nohome"), &proj);
+        assert!(out.is_empty(), "no tiers → fully empty, no preamble: {out:?}");
     }
 
     #[test]

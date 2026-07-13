@@ -232,6 +232,11 @@ pub enum Msg<'a> {
     TodoPanelCompleted { n: usize },
     TodoPanelMore { n: usize },
 
+    // ── Approval panel ──
+    ApprovalAllowOnce,
+    ApprovalAlwaysAllow { tool: &'a str },
+    ApprovalDeny,
+
     SessionTimeJustNow,
     SessionTimeMinAgo { n: u64 },
     SessionTimeHourAgo { n: u64 },
@@ -320,7 +325,6 @@ pub enum Msg<'a> {
     ApprovalWaitingLabel,
     ApprovalAllow,
     ApprovalAlways,
-    ApprovalDeny,
 
     // ── Cancelled / Error prefix ──
     Cancelled,

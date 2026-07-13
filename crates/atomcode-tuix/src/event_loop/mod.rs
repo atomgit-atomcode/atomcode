@@ -7847,6 +7847,41 @@ fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::Perm
     }
 }
 
+/// The three approval options for `tool`, in display order (Allow once is the
+/// default selection). The "Always allow" label carries the tool name because
+/// `AgentEvent::ApprovalNeeded` does not carry the grant scope.
+pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
+    use crate::state::{ApprovalKind, ApprovalOption};
+    vec![
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
+            kind: ApprovalKind::AllowOnce,
+            accel: 'y',
+        },
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned(),
+            kind: ApprovalKind::AlwaysAllow,
+            accel: 'a',
+        },
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+            kind: ApprovalKind::Deny,
+            accel: 'n',
+        },
+    ]
+}
+
+/// The `AgentCommand` for a chosen approval option kind. Pure seam so the
+/// key handler's decision mapping is unit-testable.
+pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> AgentCommand {
+    use crate::state::ApprovalKind;
+    match kind {
+        ApprovalKind::AllowOnce => AgentCommand::ApproveTool,
+        ApprovalKind::AlwaysAllow => AgentCommand::ApproveToolAlways,
+        ApprovalKind::Deny => AgentCommand::DenyTool,
+    }
+}
+
 /// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
 /// of surfaced as a prompt (false), given the TUI's bypass flag.
 ///
@@ -7918,6 +7953,25 @@ mod bypass_approval_tests {
             PermissionDecision::Deny
         ));
     }
+
+    #[test]
+    fn build_approval_options_shape() {
+        use crate::state::ApprovalKind;
+        let opts = super::build_approval_options("bash");
+        assert_eq!(opts.len(), 3);
+        assert_eq!((opts[0].kind, opts[0].accel), (ApprovalKind::AllowOnce, 'y'));
+        assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
+        assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
+        assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+    }
+
+    #[test]
+    fn approval_kind_command_mapping() {
+        use crate::state::ApprovalKind;
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AllowOnce), AgentCommand::ApproveTool));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
+    }
 }
 
 fn handle_approval_key(
@@ -7941,7 +7995,6 @@ fn handle_approval_key(
             // The goal (if any) continues; Claude Code's /goal works the same way.
             // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
-            renderer.pop_approval_prompt();
             deliver_approval(ctx, AgentCommand::DenyTool);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
@@ -7955,23 +8008,54 @@ fn handle_approval_key(
     // Any other key resets the exit confirmation
     app.exit_pending = None;
 
-    let cmd = match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
-        KeyCode::Char('a') | KeyCode::Char('A') => AgentCommand::ApproveToolAlways,
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => AgentCommand::DenyTool,
-        _ => return Ok(()),
+    // Navigation: move the selection and repaint the footer, no decision yet.
+    match code {
+        KeyCode::Up => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_up();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        KeyCode::Down => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_down();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Resolve to a decision: Enter = the selected option; y/a/n = accelerators;
+    // Esc = Deny (safe default). Any other key is ignored.
+    let kind = match code {
+        KeyCode::Enter => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.options.get(p.selected).map(|o| o.kind)),
+        KeyCode::Esc => Some(crate::state::ApprovalKind::Deny),
+        KeyCode::Char(c) => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))),
+        _ => None,
     };
-    // Retract the "Waiting for approval" body row now that the user
-    // responded — without this, the prompt stays in scrollback next to
-    // the tool result, creating visual noise.
-    renderer.pop_approval_prompt();
-    // Per Claude Code semantics, denying a tool does NOT stop the active
-    // /goal — the evaluator will see the user's refusal on the next round
-    // and either change tactics or judge the goal complete. The user can
-    // explicitly halt with `/goal clear` or by pressing Esc outside this
-    // approval prompt (inside the prompt, Esc denies the tool instead).
+    let Some(kind) = kind else {
+        return Ok(());
+    };
+    let cmd = approval_kind_to_command(kind);
     deliver_approval(ctx, cmd);
-    app.state.on_approval_resolved();
+    app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
+    // Repaint the footer NOW so the approval panel disappears immediately, the
+    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+    // this, the retained renderer keeps painting its cached `self.status`
+    // (approval still `Some`) until the next event that carries a fresh
+    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+    // issue #455's "输入框没了" — here the panel lingers after a decision).
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
 
@@ -8349,13 +8433,14 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
 
 /// If an approval prompt is still showing when the agent moves on (a tool result arrives,
 /// the turn ends), the approval was resolved WITHOUT a user keypress — a headless timeout
-/// fail-close, a displaced second approval, or a cancel. Retract the orphaned "Waiting for
-/// approval" body row with the SAME cleanup the Y/A/N keypath does (`pop_approval_prompt` +
-/// `on_approval_resolved`), so it can't linger above the result. Returns false (no-op) when
-/// no approval is pending — the normal path, where the keypress already cleared it.
-fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> bool {
+/// fail-close, a displaced second approval, or a cancel. Call `on_approval_resolved` to
+/// clear the footer panel and leave the Approval phase, so the panel doesn't linger above
+/// the result. Returns false (no-op) when no approval is pending — the normal path, where
+/// the keypress already cleared it.
+fn retract_stale_approval(state: &mut UiState) -> bool {
     if matches!(state.phase, UiPhase::Approval) {
-        renderer.pop_approval_prompt();
+        // The footer approval panel clears via `on_approval_resolved` (which nulls
+        // `state.approval_panel`); there is no body row to erase anymore.
         state.on_approval_resolved();
         true
     } else {
@@ -8366,40 +8451,16 @@ fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> b
 #[cfg(test)]
 mod approval_retract_tests {
     use super::retract_stale_approval;
-    use crate::render::{Renderer, UiLine};
     use crate::state::{UiPhase, UiState};
-
-    #[derive(Default)]
-    struct CountingRenderer {
-        pops: usize,
-    }
-    impl Renderer for CountingRenderer {
-        fn render(&mut self, _line: UiLine) {}
-        fn flush(&mut self) {}
-        fn shutdown(&mut self) {}
-        fn reset(&mut self) {}
-        fn clear_screen(&mut self) {}
-        fn suspend_for_external(&mut self) {}
-        fn resume_from_external(&mut self) {}
-        fn flush_deferred(&mut self) {}
-        fn pop_approval_prompt(&mut self) {
-            self.pops += 1;
-        }
-    }
 
     #[test]
     fn retracts_orphaned_approval_when_resolved_without_keypress() {
         let mut state = UiState::new();
         state.on_approval_needed("EditFile");
         assert!(matches!(state.phase, UiPhase::Approval));
-        let mut r = CountingRenderer::default();
         // A result/cancel arriving while the prompt is still up = resolved without a keypress.
-        let retracted = retract_stale_approval(&mut state, &mut r);
+        let retracted = retract_stale_approval(&mut state);
         assert!(retracted, "a still-pending approval must be retracted");
-        assert_eq!(
-            r.pops, 1,
-            "the orphaned 'Waiting for approval' body row must be popped"
-        );
         assert!(
             !matches!(state.phase, UiPhase::Approval),
             "phase must leave Approval"
@@ -8409,10 +8470,8 @@ mod approval_retract_tests {
     #[test]
     fn noop_when_no_approval_pending() {
         let mut state = UiState::new(); // not in Approval phase
-        let mut r = CountingRenderer::default();
-        let retracted = retract_stale_approval(&mut state, &mut r);
+        let retracted = retract_stale_approval(&mut state);
         assert!(!retracted, "nothing to retract when no prompt is up");
-        assert_eq!(r.pops, 0, "must not pop when no approval prompt is showing");
     }
 }
 
@@ -8829,7 +8888,7 @@ fn handle_agent_event(
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
             // approval" row first so it doesn't linger above the result.
-            retract_stale_approval(state, renderer);
+            retract_stale_approval(state);
             // The `task` fan-out finished — drop its live spinner activity so a
             // completed subtask's last action doesn't linger while the parent
             // agent keeps working the rest of the turn.
@@ -9096,9 +9155,11 @@ fn handle_agent_event(
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
 
-            renderer.render(UiLine::ApprovalPrompt {
+            state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
+                options: build_approval_options(&display),
+                selected: 0,
             });
             renderer.flush();
             atomcode_core::notify::notify(
@@ -10195,6 +10256,7 @@ fn handle_agent_event(
             state.thinking_idx = 0;
             state.on_turn_complete();
             state.active_todos = None;
+            state.approval_panel = None;
 
             // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
             let target_session = match loaded {
@@ -10736,6 +10798,12 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .active_todos
         .clone()
         .filter(|p| p.total > 0 && p.completed < p.total);
+    let approval = state.approval_panel.as_ref().map(|p| crate::render::ApprovalPanelView {
+        tool: p.tool.clone(),
+        detail: p.detail.clone(),
+        options: p.options.iter().map(|o| o.label.clone()).collect(),
+        selected: p.selected,
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -10753,6 +10821,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        approval,
     }
 }
 

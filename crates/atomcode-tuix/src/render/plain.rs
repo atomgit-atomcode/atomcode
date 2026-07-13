@@ -302,17 +302,6 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
                 }
             }
-            UiLine::ApprovalPrompt { tool, detail } => {
-                self.drop_transient();
-                let _ = writeln!(
-                    self.out,
-                    "{}",
-                    crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
-                        tool: &scrub_controls(&tool),
-                        detail: &scrub_controls(&detail),
-                    })
-                );
-            }
             UiLine::Error(msg) => {
                 self.drop_transient();
                 let color = if self.caps.colors { SGR_RED } else { "" };
@@ -397,10 +386,27 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = writeln!(self.out, "--- {} ---", scrub_controls(&label));
             }
-            UiLine::InputPrompt { buf, .. } => {
+            UiLine::InputPrompt { buf, status, .. } => {
                 if !self.last_prompt_written {
                     self.drop_transient();
                     if self.interactive_terminal {
+                        // Plain approval fallback: the retained footer panel is
+                        // not drawn in this renderer, so we must print the
+                        // approval guidance text as a body line before the
+                        // chevron — reproducing the OLD UiLine::ApprovalPrompt
+                        // behaviour (deleted in the selectable-panel refactor).
+                        // Pipe mode is excluded: no human is watching, and the
+                        // bot-driving stdin does not need the hint.
+                        if let Some(panel) = &status.approval {
+                            let _ = writeln!(
+                                self.out,
+                                "{}",
+                                crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
+                                    tool: &scrub_controls(&panel.tool),
+                                    detail: &scrub_controls(&panel.detail),
+                                })
+                            );
+                        }
                         // Real TTY — write `❯ ` so the user can see we
                         // are ready and the kernel will overlay their
                         // typed input on top of this prefix.
@@ -811,5 +817,93 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "hello\n");
+    }
+
+    /// Interactive plain mode (JediTerm / conhost / ATOMCODE_PLAIN=1 on a
+    /// real TTY): when an approval panel is present in the status, the
+    /// renderer must print the ApprovalPromptAlt text BEFORE the chevron so
+    /// the user knows what they are approving — reproducing the old body
+    /// UiLine::ApprovalPrompt behaviour that was removed in the
+    /// selectable-panel refactor (Task 4).
+    #[test]
+    fn approval_panel_printed_before_chevron_in_interactive_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true, // interactive — a real TTY in plain mode
+        );
+        let status = crate::render::StatusLine {
+            approval: Some(crate::render::ApprovalPanelView {
+                tool: "bash".to_string(),
+                detail: "rm -rf /tmp/x".to_string(),
+                options: vec![],
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // The approval guidance line must appear.
+        assert!(
+            s.contains("bash"),
+            "approval text must contain the tool name. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("[Y]es"),
+            "approval text must contain [Y]es key hint. got: {:?}",
+            s
+        );
+        // The guidance line must come BEFORE the chevron.
+        let approval_pos = s.find("bash").expect("approval text must be present");
+        let chev_pos = s.find('\u{276f}').expect("❯ chevron must follow the approval line");
+        assert!(
+            approval_pos < chev_pos,
+            "approval guidance must precede the chevron. got: {:?}",
+            s
+        );
+    }
+
+    /// Pipe / CI mode: no human watching, so the approval panel text must NOT
+    /// be emitted (mirrors the original arm which only printed for humans).
+    #[test]
+    fn approval_panel_suppressed_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_dumb(),
+            false, // non-interactive (pipe)
+        );
+        let status = crate::render::StatusLine {
+            approval: Some(crate::render::ApprovalPanelView {
+                tool: "bash".to_string(),
+                detail: "rm -rf /tmp/x".to_string(),
+                options: vec![],
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.is_empty(),
+            "pipe mode must suppress all InputPrompt output including approval text. got: {:?}",
+            s
+        );
     }
 }

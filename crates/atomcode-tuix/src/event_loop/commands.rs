@@ -393,9 +393,6 @@ impl Renderer for CaptureRenderer<'_> {
     fn flush_deferred(&mut self) {
         self.inner.flush_deferred();
     }
-    fn pop_approval_prompt(&mut self) {
-        self.inner.pop_approval_prompt();
-    }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
@@ -2150,6 +2147,7 @@ fn execute_slash_command_impl(
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / SessionSwitched).
                     state.active_todos = None;
+                    state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
                     // (same anti-flicker as `/resume`). Self-contained: the
@@ -2225,7 +2223,9 @@ fn execute_slash_command_impl(
                     // lack corresponding ToolResult entries.
                     let pending_approval = find_pending_approval(&ctx.current_session);
                     if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt {
+                        state.approval_panel = Some(crate::state::ApprovalPanel {
+                            options: crate::event_loop::build_approval_options(&tool_name),
+                            selected: 0,
                             tool: tool_name,
                             detail,
                         });
@@ -4244,6 +4244,7 @@ pub(crate) fn reset_to_new_session(
     state.thinking_idx = 0;
     state.on_turn_complete();
     state.active_todos = None;
+    state.approval_panel = None;
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.

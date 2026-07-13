@@ -126,10 +126,6 @@ pub enum UiLine {
     /// event loop long enough to freeze the spinner. `DiffBlock` does
     /// one erase + N writes + one redraw.
     DiffBlock(Vec<DiffEntry>),
-    ApprovalPrompt {
-        tool: String,
-        detail: String,
-    },
     Error(String),
     /// Non-fatal advisory line (yellow). Visually distinct from `Error`
     /// so the user can tell "we saw something fishy and want you to
@@ -331,13 +327,6 @@ pub trait Renderer: Send {
         false
     }
 
-    /// Remove the most recent `ApprovalPrompt` body row, if the tail
-    /// row is one. Called by the event loop after the user responds
-    /// Y/A/N so the prompt stops sitting in the body above the footer.
-    /// Default: no-op — implementations that stream body lines to
-    /// stdout (plain/pipe mode) can't retract them.
-    fn pop_approval_prompt(&mut self) {}
-
     /// Terminal window was resized to `(cols, rows)`. The retained
     /// backend uses this to re-flow body width and reposition the
     /// pinned footer; non-geometry-sensitive backends (Plain, tests)
@@ -497,6 +486,11 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
+    /// When the approval panel is active (user must confirm/deny a tool call),
+    /// this carries its current state for the dedicated footer approval panel
+    /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
+    /// omitted. Mirrors `todo` — the renderer owns glyph/width/terminal-safety.
+    pub approval: Option<ApprovalPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -509,6 +503,16 @@ pub struct StatusLine {
     /// footer loop row (its own full-width line, shown instead of the goal row
     /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
     pub loop_status: Option<LoopStatus>,
+}
+
+/// Renderer-facing snapshot of the approval panel (mirrors how `TodoProgress`
+/// feeds the todo panel). Header + option labels + selected index.
+#[derive(Debug, Clone)]
+pub struct ApprovalPanelView {
+    pub tool: String,
+    pub detail: String,
+    pub options: Vec<String>,
+    pub selected: usize,
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo
