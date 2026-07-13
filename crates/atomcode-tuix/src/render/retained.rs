@@ -1544,7 +1544,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             (desc, "")
         };
 
-        let style1 = if selected {
+        let name_style = if selected {
             CellStyle {
                 fg: None,
                 bold: true,
@@ -1552,27 +1552,42 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 faint: false,
             }
         } else {
-            self.style_for(Role::Secondary)
+            CellStyle::default()
+        };
+
+        let status_style = if selected {
+            CellStyle {
+                fg: None,
+                bold: false,
+                reverse: true,
+                faint: true,
+            }
+        } else {
+            let mut s = self.style_for(Role::Secondary);
+            s.faint = true;
+            s
         };
 
         let name_width = unicode_width::UnicodeWidthStr::width(name);
         let pad = 24usize.saturating_sub(name_width);
         let padded = format!("{}{}", name, " ".repeat(pad));
-        let line1_str = if selected {
-            format!("▸ {}  {}", padded, status)
+        let part_a = if selected {
+            format!("▸ {}", padded)
         } else {
-            format!("  {}  {}", padded, status)
+            format!("  {}", padded)
         };
+        let part_b = format!("  {}", status);
 
         let mut row1 = Vec::new();
-        push_str_cells_sgr(&mut row1, &line1_str, style1.clone());
-        let content_w1 = crate::width::display_width(&line1_str);
+        push_str_cells_sgr(&mut row1, &part_a, name_style.clone());
+        push_str_cells_sgr(&mut row1, &part_b, status_style);
+        let content_w1 = crate::width::display_width(&part_a) + crate::width::display_width(&part_b);
         let right_pad1 = rule_width.saturating_sub(content_w1);
         for _ in 0..right_pad1 {
             row1.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected { style1.clone() } else { CellStyle::default() },
+                style: if selected { name_style.clone() } else { CellStyle::default() },
             });
         }
 
