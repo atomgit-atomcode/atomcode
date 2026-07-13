@@ -370,9 +370,7 @@ impl PluginManager {
             2 => InstallScope::Local,
             _ => return,
         };
-        self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
-        self.screen = Screen::Installing { plugin, mp };
-        self.selected = 0;
+        self.dispatch_install(plugin, mp, scope, ctx);
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -632,7 +630,14 @@ impl Modal for PluginManager {
                     self.selected = 0;
                 } else {
                     match &self.screen {
-                        Screen::ScopeSelect { .. } => {
+                        Screen::ScopeSelect { plugin, mp } => {
+                            if self.installing_plugin.is_some() {
+                                let id = format!("{}@{}", sanitize(plugin), mp);
+                                self.cancelled_installs.insert(id);
+                                self.pending = None;
+                                self.installing_plugin = None;
+                                self.installing_scope = None;
+                            }
                             self.goto(Screen::Browse);
                         }
                         Screen::Installing { plugin, mp } => {
@@ -640,6 +645,7 @@ impl Modal for PluginManager {
                             self.cancelled_installs.insert(id);
                             self.pending = None;
                             self.installing_plugin = None;
+                            self.installing_scope = None;
                             self.goto(Screen::Browse);
                         }
                         _ => {
