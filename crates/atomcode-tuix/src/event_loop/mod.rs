@@ -4473,20 +4473,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
                     if m.close_requested() {
                         app.active_modal = None;
+                        closed = true;
                     }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -4933,20 +4940,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
                     if m.close_requested() {
                         app.active_modal = None;
+                        closed = true;
                     }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
