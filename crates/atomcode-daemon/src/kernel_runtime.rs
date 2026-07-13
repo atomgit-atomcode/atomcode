@@ -1776,7 +1776,7 @@ mod kernel_runtime_translate_tests {
 
     // ---- Task 5: command translator + approval round-trip ----
 
-    use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+    use atomcode_capabilities::tools::{ApprovalRequest, APPROVAL_KIND};
     use atomcode_core::agent::AgentCommand as CoreCmd;
     use atomcode_core::conversation::message::ImagePart;
 

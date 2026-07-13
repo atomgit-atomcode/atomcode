@@ -229,6 +229,56 @@ async fn same_name_args_different_id_is_not_re_executed_but_still_paired() {
     }
 }
 
+#[tokio::test]
+async fn reordered_nested_json_is_not_re_executed_or_counted_as_a_batch() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CountingTool::new(counter.clone())));
+
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call(
+                "c1",
+                "count",
+                r#"{"a":1,"nested":{"x":1,"y":2}}"#,
+            )),
+            StreamEvent::ToolCall(tool_call(
+                "c2",
+                "count",
+                r#"{"nested":{"y":2,"x":1},"a":1}"#,
+            )),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["count"]))
+        .build()
+        .spawn();
+
+    let events = drive_collect(&mut handle, "count twice with reordered json").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "semantically identical JSON arguments must execute once"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolBatchStarted { .. })),
+        "two duplicate calls are one logical call, not a multi-call batch"
+    );
+    assert_eq!(tool_results_for(&events, "c2").len(), 1);
+}
+
 // CLAIM 21c — the gate does NOT over-suppress: two calls with DIFFERENT
 // (name,args) both execute normally and are each paired. (c1=count{}, c2=echo{}.)
 #[tokio::test]

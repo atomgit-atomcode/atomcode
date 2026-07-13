@@ -11,9 +11,9 @@ use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
-use crate::tool::{MountedTools, ProgressSink, ToolContext, ToolResult};
+use crate::tool::{MountedTools, ProgressSink, ToolCall, ToolContext, ToolResult};
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -291,6 +291,46 @@ fn auto_compact_trigger(
     }
     let utilization = used_tokens as f32 / ctx_window as f32;
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
+}
+
+/// Build the equality key for calls emitted by the model before middleware
+/// rewrites their arguments. Object-key order and insignificant whitespace do
+/// not change call identity; array order and malformed input still do.
+fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
+    (
+        call.name.clone(),
+        canonicalize_tool_args(&call.arguments),
+    )
+}
+
+// KEEP IN SYNC WITH atomcode-core/src/turn/tool_args.rs. The kernel deliberately
+// has no dependency on the retiring core stack, but both execution paths must
+// agree on tool-call identity while the migration is in progress.
+fn canonicalize_tool_args(arguments: &str) -> String {
+    match serde_json::from_str(arguments) {
+        Ok(value) => serde_json::to_string(&sort_json_object_keys(value))
+            .unwrap_or_else(|_| arguments.to_string()),
+        Err(_) => arguments.to_string(),
+    }
+}
+
+fn sort_json_object_keys(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries: Vec<_> = object.into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+            let mut sorted = Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, sort_json_object_keys(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(sort_json_object_keys).collect())
+        }
+        scalar => scalar,
+    }
 }
 
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
@@ -1940,7 +1980,7 @@ impl RunningAgent {
                     std::collections::HashSet::new();
                 let mut non_dup = 0usize;
                 for c in &pending_calls {
-                    let key = (c.name.clone(), c.arguments.clone());
+                    let key = tool_call_dedup_key(c);
                     if dedup_set.insert(key) {
                         non_dup += 1;
                     }
@@ -2016,7 +2056,7 @@ impl RunningAgent {
                 // post-middleware args could spuriously merge two model-distinct
                 // calls (if a rewrite collapses them) or fail to catch a true dup
                 // (if a rewrite is non-deterministic).
-                let dedup_key = (call.name.clone(), call.arguments.clone());
+                let dedup_key = tool_call_dedup_key(&call);
 
                 // (1) SAME call_id (mode A — the load-bearing API-validity fix):
                 // a second result for an already-resulted id would push TWO

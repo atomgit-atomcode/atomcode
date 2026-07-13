@@ -5765,6 +5765,32 @@ mod tests {
     }
 
     #[test]
+    fn loop_row_shows_label_round_and_elapsed() {
+        let row = format_loop_row("检查构建状态", 3, 133, 80, true);
+
+        assert!(row.starts_with("⚡ "), "lightning marker present: {row}");
+        assert!(row.contains("检查构建状态"), "full label kept: {row}");
+        assert!(row.contains("· round 3 · 2m13s"), "round/elapsed shown: {row}");
+    }
+
+    #[test]
+    fn loop_row_uses_ascii_marker_when_unicode_is_disabled() {
+        let row = format_loop_row("check", 2, 9, 80, false);
+
+        assert!(row.starts_with("* "), "ascii marker present: {row}");
+        assert!(!row.contains('⚡'), "unicode marker omitted: {row}");
+    }
+
+    #[test]
+    fn loop_row_truncates_label_without_dropping_metadata() {
+        let row = format_loop_row(&"x".repeat(200), 7, 5, 40, true);
+
+        assert!(crate::width::display_width(&row) <= 40, "row fits width: {row}");
+        assert!(row.contains("· round 7 · 5s"), "metadata survives: {row}");
+        assert!(row.contains('…'), "label uses an ellipsis: {row}");
+    }
+
+    #[test]
     fn ctx_usage_keeps_round_window_clean() {
         // 128k window is the common default — render as `128k`, not `128.0k`.
         assert_eq!(format_ctx_usage(50_000, 128_000), "50.0k/128k tok (39%)");
