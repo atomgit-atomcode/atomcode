@@ -1051,17 +1051,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 &safe_name,
             )
         } else if is_bash {
-            // Bash: same shell-boundary wrapping as the static/committed path
-            // (`build_bash_command_rows`) so the live spinner and the final
-            // committed block look identical — `● Bash(cmd)` breaking at
-            // `&&`/`|`/`\` rather than mid-token width-wrapping. `meta` (the
-            // elapsed timer) rides the last line.
+            // Bash: render the command as a STATIC block (`● Bash(cmd)`, no
+            // inline meta) — identical to the committed form, shell-boundary
+            // wrapped. The live `Running · <t>` animation rides its own
+            // spinner-styled row appended below (after the Ctrl+o hint), so the
+            // command stays visually stable while the timer updates.
             self.build_bash_command_rows(
-                &prefix, &prefix_style,
+                "● ", &prefix_style,
                 &safe_name, &name_style,
                 &detail_style,
                 &safe_detail,
-                meta, &meta_style,
+                "", &meta_style,
             )
         } else {
             // Note: full_body intentionally excludes `meta` —
@@ -1096,6 +1096,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let hint_text = format!("  {marker} {hint}");
             let screen_w = self.screen.width();
             new_rows.push(build_one_row(&hint_text, &muted, screen_w, self.caps.unicode_symbols));
+        }
+
+        // Bash carries its command as a static block above; the live liveness
+        // (animated frame + `Running · <t>` timer) rides its own row here,
+        // rendered in the SAME style as the ordinary thinking spinner
+        // (`build_spinner_body_row`: brand frame + bold label) so the two read
+        // consistently. `meta` already carries the ` · 10.9s` suffix.
+        if is_bash {
+            let label = format!("Running{meta}");
+            new_rows.push(self.build_spinner_body_row(icon, &label));
         }
 
         let prev_rows = self.inflight_tool_rows;
@@ -6954,16 +6964,17 @@ mod tests {
             2
         );
 
-        // 1-row strip (first render → fallback with prev_rows == 0).
+        // First render → fallback with prev_rows == 0. Bash renders one command
+        // row plus its `Running` spinner row = 2 rows.
         r.render_inflight_tool("\u{25cf}", "Bash", "short", "");
-        assert_eq!(r.inflight_tool_rows, 1);
+        assert_eq!(r.inflight_tool_rows, 2);
 
-        // A detail that WRAPS to multiple rows ⇒ prev_rows(1) != n(>1) ⇒ fallback re-push.
+        // A detail that WRAPS to more rows ⇒ prev_rows(2) != n(>2) ⇒ fallback re-push.
         // Bash wraps at shell boundaries (format_shell_command breaks at each `&&`),
         // so use a multi-segment command rather than one long unbreakable token.
         let long = "cd /tmp && echo one && echo two && echo three && echo four";
         r.render_inflight_tool("\u{25cf}", "Bash", long, "");
-        assert!(r.inflight_tool_rows >= 2, "wrapped strip should be multi-row: {}", r.inflight_tool_rows);
+        assert!(r.inflight_tool_rows > 2, "wrapped strip should grow past 2 rows: {}", r.inflight_tool_rows);
 
         // Both real lines must survive — the fallback re-push must not have popped them.
         assert_eq!(
@@ -7224,17 +7235,24 @@ mod tests {
             frame: "⠋".into(),
             label: "Running Bash… · 12s".into(),
         });
-        let last = r.body_lines.last().expect("inflight row expected");
-        let text: String = last.iter().map(|c| c.ch).collect();
+        // Bash renders the command as a static block; the elapsed meta now
+        // rides the `Running · <t>` spinner row appended below it.
+        let rows: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect())
+            .collect();
         assert!(
-            text.contains("· 12s"),
-            "inflight tool row missing elapsed meta suffix; got: {:?}",
-            text
+            rows.iter().any(|t| t.contains("Bash(cargo install")),
+            "command block row missing command detail; got: {:?}",
+            rows
         );
+        let last = r.body_lines.last().expect("Running spinner row expected");
+        let last_text: String = last.iter().map(|c| c.ch).collect();
         assert!(
-            text.contains("Bash(cargo install"),
-            "inflight tool row missing command detail; got: {:?}",
-            text
+            last_text.contains("Running") && last_text.contains("· 12s"),
+            "Running spinner row missing elapsed meta suffix; got: {:?}",
+            last_text
         );
     }
 
