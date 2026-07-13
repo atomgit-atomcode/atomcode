@@ -997,12 +997,15 @@ impl UiState {
 
     pub fn tick_spinner(&mut self) -> &'static str {
         // Two frame sets, picked once at construction:
-        //   Unicode → half-moon rotation; Braille was prettier but
-        //   Windows fonts often lack that block and fall back to ":".
-        //   ASCII   → classic `|/-\` for terminals whose font also
-        //   lacks the Geometric Shapes block (notably Windows legacy
-        //   conhost with NSimSun / Consolas variants).
-        const UNICODE_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+        //   Unicode → braille dot rotation: a true single-cell glyph. The old
+        //   half-moon set (◐◓◑◒, Geometric Shapes) is often given emoji
+        //   presentation and renders oversized/double-width on modern
+        //   terminals — braille avoids that and is the de-facto CLI spinner.
+        //   ASCII   → classic `|/-\` for legacy terminals whose font lacks
+        //   the Braille block (notably Windows legacy conhost); those already
+        //   run with unicode_symbols = false, so they take this path.
+        const UNICODE_FRAMES: &[&str] =
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
         let frames = if self.unicode_symbols {
             UNICODE_FRAMES
@@ -1216,15 +1219,24 @@ mod tests {
     }
 
     #[test]
-    fn unicode_spinner_uses_half_moons() {
+    fn unicode_spinner_uses_single_cell_braille() {
+        // Braille dots are true single-cell glyphs; the old half-moon set
+        // (◐◓◑◒) was often given emoji presentation and rendered oversized.
         let mut s = UiState::with_unicode(true);
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        // Walk a full cycle (frame count is an implementation detail).
+        for _ in 0..10 {
             seen.push(s.tick_spinner());
         }
-        let mut sorted = seen.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec!["◐", "◑", "◒", "◓"]);
+        // Every frame is a Braille Patterns glyph (U+2800..=U+28FF).
+        for f in &seen {
+            let ch = f.chars().next().unwrap();
+            assert_eq!(f.chars().count(), 1, "frame {f:?} must be a single char");
+            assert!(
+                ('\u{2800}'..='\u{28FF}').contains(&ch),
+                "frame {f:?} must be a Braille glyph"
+            );
+        }
     }
 
     #[test]
