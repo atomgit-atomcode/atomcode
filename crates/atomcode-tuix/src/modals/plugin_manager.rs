@@ -31,6 +31,7 @@ use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
 /// Which screen the manager is currently showing.
+#[allow(dead_code)]
 enum Screen {
     Browse,
     AddUrl,
@@ -361,11 +362,7 @@ impl PluginManager {
             _ => return,
         };
         self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
-        // Stay on an Installing screen so the user sees the progress state,
-        // mirroring Claude Code's UX.  on_plugin_event will navigate back
-        // to the Plugins list once the job completes.
-        self.screen = Screen::Installing { plugin, mp };
-        self.selected = 0;
+        self.goto(Screen::Browse);
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
