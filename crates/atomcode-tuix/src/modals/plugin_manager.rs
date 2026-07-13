@@ -362,7 +362,8 @@ impl PluginManager {
             _ => return,
         };
         self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
-        self.goto(Screen::Browse);
+        self.screen = Screen::Installing { plugin, mp };
+        self.selected = 0;
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -667,7 +668,7 @@ impl Modal for PluginManager {
 
         let mut selected_offset = 2;
 
-        if let Screen::ScopeSelect { plugin, mp } = &self.screen {
+        if let Screen::ScopeSelect { plugin, mp } | Screen::Installing { plugin, mp } = &self.screen {
             let (version, description) = self.get_plugin_details(plugin, mp);
             final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
             final_items.push((format!("  Name:        {}", plugin), String::new()));
@@ -687,9 +688,16 @@ impl Modal for PluginManager {
                 }
             }
             final_items.push((String::new(), String::new()));
-            final_items.push(("  Select Install Scope:".to_string(), String::new()));
-            final_items.push((String::new(), String::new()));
-            selected_offset += 3;
+            if matches!(self.screen, Screen::ScopeSelect { .. }) {
+                final_items.push(("  Select Install Scope:".to_string(), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            } else {
+                let installing_label = t(Msg::PluginMgrInstallingStatus).into_owned();
+                final_items.push((format!("  Status:      ⏳ {}...", installing_label), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            }
         }
 
         for item in items {
