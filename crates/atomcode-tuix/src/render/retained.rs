@@ -1810,25 +1810,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        panel.options.len()
+        panel.options.len() + 1
     }
 
-    /// Build the compact footer approval panel: just the selectable options,
-    /// aligned to col 0 so the `▸` on the selected row lines up with the
-    /// `▸ Tool(detail)` body row above and the input's `❯` prompt, and the
-    /// labels line up with the input text (col 2). Selected row = `▸ ` + reverse;
-    /// the others indent 2 cols. No accent bar / header / hint — the approval
-    /// context is set by the body row above, and the option labels are
-    /// self-describing (e.g. "Always allow Bash" carries the tool name).
+    /// Build the compact footer approval panel: numbered selectable options
+    /// followed by a muted hint row.
+    ///
+    /// Layout per option row: `<marker><n>. <label>` padded to `rule_width`.
+    ///   - Selected row: `▸ ` + `{n}. ` + label, reverse-highlighted and padded
+    ///     with reverse-styled spaces to `rule_width` (full-width, no jump).
+    ///   - Unselected: `  ` + `{n}. ` + label in `Role::Secondary`.
+    ///
+    /// After the option rows: a muted hint row `  ↑↓ select · Enter confirm · Esc cancel`
+    /// (localized + glyph-downgraded on non-unicode terminals).
     fn build_approval_rows(
         &self,
         panel: &crate::render::ApprovalPanelView,
         rule_width: usize,
+        screen_width: usize,
     ) -> Vec<Vec<Cell>> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
 
-        // option rows: `▸ <label>` (selected: ▸ + reverse) / `  <label>`
+        // option rows: `<marker><n>. <label>` (selected: ▸ + reverse padded to screen_width)
         for (i, label) in panel.options.iter().enumerate() {
             let mut row = Vec::new();
             let selected = i == panel.selected;
@@ -1837,17 +1841,46 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 "  "
             };
+            // marker is 2 cols; number prefix `{n}. ` is up to 3 cols (e.g. "1. ")
+            let num_prefix = format!("{}. ", i + 1);
+            let num_prefix_width = crate::width::display_width(&num_prefix);
             let style = if selected {
                 CellStyle { reverse: true, ..CellStyle::default() }
             } else {
                 self.style_for(Role::Secondary)
             };
-            let budget = rule_width.saturating_sub(2);
+            let budget = rule_width.saturating_sub(2 + num_prefix_width);
             let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
             push_str_cells(&mut row, marker, &style);
+            push_str_cells(&mut row, &num_prefix, &style);
             push_str_cells(&mut row, &lbl, &style);
+            // Full-width selected highlight: pad with reverse spaces to screen_width so
+            // the entire terminal row is highlighted (no bare-background gap on the right).
+            if selected {
+                let current_width: usize = row.iter().map(|c| c.width as usize).sum();
+                let pad = screen_width.saturating_sub(current_width);
+                if pad > 0 {
+                    push_str_cells(&mut row, &" ".repeat(pad), &style);
+                }
+            }
             out.push(row);
         }
+
+        // Hint row: `  <localized hint>` in muted style, glyph-downgraded, truncated.
+        let hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint);
+        let hint = crate::glyph::downgrade_glyphs(&hint_raw, unicode);
+        let hint_budget = rule_width.saturating_sub(2);
+        let hint_truncated = crate::width::truncate_with_ellipsis(&hint, hint_budget);
+        let hint_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        let mut hint_row = Vec::new();
+        push_str_cells(&mut hint_row, "  ", &hint_style);
+        push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
+        out.push(hint_row);
+
         out
     }
 
@@ -2029,7 +2062,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_cells: Vec<Vec<Cell>> = status_clone
             .approval
             .as_ref()
-            .map(|p| self.build_approval_rows(p, rule_width))
+            .map(|p| self.build_approval_rows(p, rule_width, w))
             .unwrap_or_default();
         let menu_kind = self
             .menu
@@ -10342,6 +10375,97 @@ mod tests {
         let h = vterm.height() as usize;
         let row_of = |n: &str| (0..h).find(|&i| vterm.row_text(i).contains(n));
         assert!(row_of("Allow once") > row_of("❯"), "panel below input\n{dump}");
+    }
+
+    /// Step 1: option rows carry `1. ` / `2. ` / `3. ` numeric prefixes, the
+    /// selected row (`selected=0`) spans the full terminal width with reverse
+    /// highlight, and a hint row appears after the last option.
+    ///
+    /// `approval_panel_row_count` must equal `options.len() + 1` (hint row).
+    #[test]
+    fn approval_panel_numbered_prefixes_fullwidth_hint() {
+        const W: u16 = 80;
+        let (mut r, buf) = new_capturing(W, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, 24);
+
+        let mut status = status_basic();
+        let panel = crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "echo hi".into(),
+            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            selected: 0,
+        };
+        status.approval = Some(panel.clone());
+        r.render(UiLine::InputPrompt {
+            buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+
+        // 1. Numbered prefixes appear.
+        assert!(vterm.any_row(|r| r.contains("1. ")), "option 0 prefix '1. '\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("2. ")), "option 1 prefix '2. '\n{dump}");
+        assert!(vterm.any_row(|r| r.contains("3. ")), "option 2 prefix '3. '\n{dump}");
+
+        // 2. Selected row (option 0 / Allow once) spans full terminal width with
+        //    reverse highlight. Find the row, then check every cell is reverse.
+        let h = vterm.height() as usize;
+        let selected_row = (0..h).find(|&i| vterm.row_text(i).contains("1. ") && vterm.row_text(i).contains("Allow once"))
+            .expect("selected row with '1. Allow once' not found");
+        for col in 0..W as usize {
+            let cell = vterm.cell_at(selected_row, col);
+            assert!(
+                cell.reverse,
+                "selected row col {col} must be reverse-highlighted (full-width)\n{dump}"
+            );
+        }
+
+        // 3. Hint row present somewhere below the options.
+        // The hint contains "select" (en locale) or "选择" (zh) or ASCII-downgraded equivalent.
+        let hint_present = vterm.any_row(|r| r.contains("select") || r.contains("选择") || r.contains("Enter"));
+        assert!(hint_present, "hint row with keyboard hint text not found\n{dump}");
+
+        // 4. approval_panel_row_count == options.len() + 1.
+        assert_eq!(
+            r.approval_panel_row_count(&panel),
+            panel.options.len() + 1,
+            "row count must be options.len()+1"
+        );
+    }
+
+    /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
+    /// tested via the pure `ApprovalPanel.accel_index` + index-based resolution
+    /// in `handle_approval_key`. This test confirms the option ordering contract
+    /// so digit→index mapping is meaningful.
+    #[test]
+    fn approval_panel_option_order_for_digit_keys() {
+        use crate::state::{ApprovalKind, ApprovalOption, ApprovalPanel};
+        let p = ApprovalPanel {
+            tool: "bash".into(),
+            detail: "cmd".into(),
+            options: vec![
+                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
+                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
+                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+            ],
+            selected: 0,
+        };
+        // Digit routing: index = (c as usize) - ('1' as usize).
+        // '1' → idx 0 → AllowOnce
+        assert_eq!(p.options.get(('1' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::AllowOnce));
+        // '2' → idx 1 → AlwaysAllow
+        assert_eq!(p.options.get(('2' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::AlwaysAllow));
+        // '3' → idx 2 → Deny
+        assert_eq!(p.options.get(('3' as usize) - ('1' as usize)).map(|o| o.kind), Some(ApprovalKind::Deny));
+        // '9' → idx 8 → out of bounds → None (no panic)
+        assert_eq!(p.options.get(('9' as usize) - ('1' as usize)).map(|o| o.kind), None);
+        // Letter accelerator still works (y/a/n).
+        assert_eq!(p.accel_index('y').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::AllowOnce));
+        assert_eq!(p.accel_index('a').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::AlwaysAllow));
+        assert_eq!(p.accel_index('n').and_then(|i| p.options.get(i).map(|o| o.kind)), Some(ApprovalKind::Deny));
     }
 
     /// `attachments` from `UiLine::InputPrompt` paints a `└ [Image #N]`
