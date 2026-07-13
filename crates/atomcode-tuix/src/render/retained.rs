@@ -1499,7 +1499,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
-        let style = if selected {
+        let mut style = if selected {
             CellStyle {
                 fg: None,
                 bold: true,
@@ -1515,6 +1515,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // selected row, not from a colour-contrast distinction.
             self.style_for(Role::Secondary)
         };
+        let is_uninstall = name == "Uninstall" || name == "卸载";
+        if is_uninstall {
+            style.fg = Some(crossterm::style::Color::Red);
+        }
         push_str_cells_sgr(&mut row, &content, style.clone());
 
         if selected {
