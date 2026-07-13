@@ -251,6 +251,29 @@ impl PluginManager {
             .any(|i| i.marketplace == mp && (i.plugin == plugin || i.plugin == key))
     }
 
+    fn get_plugin_details(&self, plugin: &str, mp: &str) -> (Option<String>, Option<String>) {
+        let mut version = None;
+        let mut description = None;
+
+        if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+            let mp_dir = root.join(mp);
+
+            // Try loading from mp_dir/plugin first
+            let mut manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir.join(plugin)).ok();
+
+            // Fall back to mp_dir root
+            if manifest_opt.is_none() {
+                manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir).ok();
+            }
+
+            if let Some(manifest) = manifest_opt {
+                version = manifest.version;
+                description = manifest.description;
+            }
+        }
+        (version, description)
+    }
+
     fn goto(&mut self, screen: Screen) {
         self.screen = screen;
         self.selected = 0;
@@ -645,6 +668,33 @@ impl Modal for PluginManager {
         final_items.push((self.tab_bar(), String::new()));
         final_items.push((String::new(), String::new()));
 
+        let mut selected_offset = 2;
+
+        if let Screen::ScopeSelect { plugin, mp } = &self.screen {
+            let (version, description) = self.get_plugin_details(plugin, mp);
+            final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
+            final_items.push((format!("  Name:        {}", plugin), String::new()));
+            final_items.push((format!("  Marketplace: @{}", mp), String::new()));
+            final_items.push((format!("  Version:     {}", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
+            selected_offset += 4;
+            if let Some(desc) = description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    let truncated = if trimmed.len() > 60 {
+                        format!("{}...", &trimmed[..57])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    final_items.push((format!("  Description: {}", truncated), String::new()));
+                    selected_offset += 1;
+                }
+            }
+            final_items.push((String::new(), String::new()));
+            final_items.push(("  Select Install Scope:".to_string(), String::new()));
+            final_items.push((String::new(), String::new()));
+            selected_offset += 3;
+        }
+
         for item in items {
             final_items.push(item);
         }
@@ -655,12 +705,16 @@ impl Modal for PluginManager {
             // No items are selectable, so nothing should be highlighted.
             final_items.len()
         } else {
-            (self.selected + 2).min(final_items.len().saturating_sub(2))
+            (self.selected + selected_offset).min(final_items.len().saturating_sub(2))
+        };
+        let kind = match &self.screen {
+            Screen::Browse | Screen::Installed => MenuKind::Plugin,
+            _ => MenuKind::Skill,
         };
         let payload = MenuPayload {
             items: final_items,
             selected,
-            kind: MenuKind::Plugin,
+            kind,
         };
 
         let (text, cursor) = if matches!(self.screen, Screen::AddUrl) {
