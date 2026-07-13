@@ -2117,21 +2117,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body content still showing from earlier frames (see
         // `pad_row_to_width` for full rationale).
         //
-        // The approval panel sits at the very TOP of the footer block, above
-        // the todo panel. The todo panel is pinned directly after the approval
-        // panel. Everything else (rules, input, attachments, menu, goal/loop,
-        // status) shifts down by approval_rows + todo_rows.
-        let approval_top = footer_top;
-        for (i, ar) in approval_cells.into_iter().enumerate() {
-            let mut padded = ar;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(approval_top + i, 0, &padded);
-        }
-        let todo_top = footer_top + approval_rows;
+        // The todo panel sits at the very TOP of the footer block. The approval
+        // panel is pinned directly BELOW the todo panel and ABOVE the top rule.
+        // Everything else (rules, input, attachments, menu, goal/loop, status)
+        // shifts down by todo_rows + approval_rows.
+        let todo_top = footer_top;
         for (i, tr) in todo_cells.into_iter().enumerate() {
             let mut padded = tr;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(todo_top + i, 0, &padded);
+        }
+        let approval_top = footer_top + todo_rows;
+        for (i, ar) in approval_cells.into_iter().enumerate() {
+            let mut padded = ar;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(approval_top + i, 0, &padded);
         }
         let rules_top = footer_top + todo_rows + approval_rows;
 
