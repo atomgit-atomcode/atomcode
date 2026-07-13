@@ -220,6 +220,9 @@ const MAX_TODO_PANEL_ROWS: usize = 6;
 /// i18n words, styling and width-fitting are applied in `build_todo_rows`.
 #[derive(Debug, Clone, PartialEq)]
 enum TodoPanelRow {
+    /// A blank spacer row prepended before the Header to add visual breathing
+    /// room between the transcript body and the todo panel.
+    Spacer,
     Header { completed: usize, total: usize },
     CompletedFold { count: usize },
     Item {
@@ -242,8 +245,11 @@ fn todo_panel_rows(
     max_rows: usize,
 ) -> Vec<TodoPanelRow> {
     use atomcode_capabilities::tools::todo::TodoStatus;
-    let mut rows = vec![TodoPanelRow::Header { completed, total }];
-    let body_budget = max_rows.saturating_sub(1);
+    // Spacer is always first — it adds one blank line between the transcript
+    // body above and the `☑ Todos` header, so the panel doesn't feel cramped.
+    let mut rows = vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, total }];
+    // body_budget accounts for the Spacer + Header already in `rows` (2 slots).
+    let body_budget = max_rows.saturating_sub(2);
     if body_budget == 0 {
         return rows;
     }
@@ -1899,6 +1905,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         rows.into_iter()
             .map(|r| match r {
+                // Blank spacer: empty cell list — paint_footer pads it to width.
+                TodoPanelRow::Spacer => Vec::new(),
                 TodoPanelRow::Header { completed, total } => {
                     // Colorless: the `☑ Todos` marker + title anchor the panel by
                     // weight (bold), the ` · N/M` count stays muted. No accent —
@@ -7099,7 +7107,7 @@ mod tests {
         // terminal — visible in `row_text` via the vterm.
         r.render(UiLine::ToolCallInFlight {
             id: "call-leak".into(),
-            name: "Bash".into(),
+            name: "Grep".into(),
             detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
             hint: None,
         });
@@ -14112,11 +14120,13 @@ mod todo_panel_rows_tests {
             (TodoStatus::Pending, "c"),
         ]);
         let rows = todo_panel_rows(&it, 1, 3, MAX_TODO_PANEL_ROWS);
-        assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0], TodoPanelRow::Header { completed: 1, total: 3 }));
-        assert!(matches!(rows[1], TodoPanelRow::CompletedFold { count: 1 }));
-        assert!(matches!(&rows[2], TodoPanelRow::Item { status: TodoStatus::InProgress, content } if content == "b"));
-        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::Pending, content } if content == "c"));
+        // Spacer prepended: [Spacer, Header, CompletedFold, InProgress, Pending] = 5 rows.
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], TodoPanelRow::Spacer));
+        assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, total: 3 }));
+        assert!(matches!(rows[2], TodoPanelRow::CompletedFold { count: 1 }));
+        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::InProgress, content } if content == "b"));
+        assert!(matches!(&rows[4], TodoPanelRow::Item { status: TodoStatus::Pending, content } if content == "c"));
     }
 
     #[test]
@@ -14135,19 +14145,24 @@ mod todo_panel_rows_tests {
             (TodoStatus::Pending, "p3"),
             (TodoStatus::Pending, "p4"),
         ]);
-        // max_rows=4 → header + ip + 1 pending + More{3}
+        // max_rows=4: body_budget = 4-2 = 2. ip takes 1, pend_budget=1 → shown=0, hidden=4.
+        // Result: [Spacer, Header, ip, More{4}] = 4 rows.
         let rows = todo_panel_rows(&it, 0, 5, 4);
         assert_eq!(rows.len(), 4);
-        assert!(matches!(rows.last().unwrap(), TodoPanelRow::More { hidden: 3 }));
+        assert!(matches!(rows[0], TodoPanelRow::Spacer));
+        assert!(matches!(rows.last().unwrap(), TodoPanelRow::More { hidden: 4 }));
     }
 
     #[test]
     fn in_progress_survives_tight_budget() {
-        // body budget = 1: in-progress wins the single slot over the completed fold.
+        // body_budget = max_rows - 2 (Spacer + Header). With max_rows=3: budget=1.
+        // in-progress wins the single body slot over the completed fold.
         let it = items(&[(TodoStatus::Completed, "done"), (TodoStatus::InProgress, "ip")]);
-        let rows = todo_panel_rows(&it, 1, 2, 2);
-        assert_eq!(rows.len(), 2);
-        assert!(matches!(&rows[1], TodoPanelRow::Item { status: TodoStatus::InProgress, .. }));
+        let rows = todo_panel_rows(&it, 1, 2, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], TodoPanelRow::Spacer));
+        assert!(matches!(rows[1], TodoPanelRow::Header { .. }));
+        assert!(matches!(&rows[2], TodoPanelRow::Item { status: TodoStatus::InProgress, .. }));
     }
 
     #[test]
@@ -14183,11 +14198,13 @@ mod todo_panel_rows_tests {
         let rows = r.build_todo_rows(&todo, 40);
         let text = |cells: &Vec<Cell>| cells.iter().map(|c| c.ch).collect::<String>();
         use crate::render::theme::Palette;
-        // header shows the i18n title + N/M, is bold, and carries NO color.
-        assert!(text(&rows[0]).contains("Todos") && text(&rows[0]).contains("1/3"));
-        assert!(rows[0].iter().any(|c| c.style.bold), "header title is bold");
+        // rows[0] is the blank Spacer row — no cells.
+        assert!(rows[0].is_empty(), "first row must be the blank spacer");
+        // rows[1] is the header: shows the i18n title + N/M, is bold, and carries NO color.
+        assert!(text(&rows[1]).contains("Todos") && text(&rows[1]).contains("1/3"));
+        assert!(rows[1].iter().any(|c| c.style.bold), "header title is bold");
         assert!(
-            rows[0].iter().all(|c| c.style.fg != Some(Palette::BRAND)),
+            rows[1].iter().all(|c| c.style.fg != Some(Palette::BRAND)),
             "header must carry no Brand (pink) color"
         );
         // the in-progress row is bold but NOT pink — the panel is colorless.

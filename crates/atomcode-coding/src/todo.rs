@@ -21,7 +21,11 @@ impl LifecycleHooks for TodoHook {
         // ASCII-safe body (the model doesn't need glyph prettiness; the TUI renders
         // the pretty version). Tail-append so the cached prefix is preserved.
         let body = format!(
-            "Current task list (keep statuses current; work through them):\n{}",
+            "Current task list — keep it accurate and finish it:\n\
+- The MOMENT you finish an item, call `todowrite` to mark it `completed` (do not leave a done item showing incomplete).\n\
+- Mark an item `in_progress` when you start it.\n\
+- Do NOT stop, summarize, or hand back to the user while ANY item is still pending or in_progress — keep working through them until EVERY item is completed.\n\
+{}",
             render_todos_text(&todos, false)
         );
         messages.push(Message::user(system_reminder(&body)));
