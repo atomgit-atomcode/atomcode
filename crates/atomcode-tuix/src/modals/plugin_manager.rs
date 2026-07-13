@@ -490,12 +490,12 @@ impl PluginManager {
                     .iter()
                     .map(|i| {
                         let scope_label = match i.scope {
-                            InstallScope::User => String::new(),
-                            InstallScope::Project => " [project]".into(),
-                            InstallScope::Local => " [local]".into(),
+                            InstallScope::User => t(Msg::PluginScopeUserShort).into_owned(),
+                            InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
+                            InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
                         };
-                        let name = format!("{}{}", i.plugin, scope_label);
-                        let status = format!("@{}", i.marketplace);
+                        let name = i.plugin.clone();
+                        let status = format!("@{} ({})", i.marketplace, scope_label);
                         let desc = if let Some(d) = descriptions.get(&i.plugin) {
                             if !d.is_empty() {
                                 format!("{}  ·  {}", status, d)
@@ -1075,5 +1075,26 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let (_name, desc) = &rows[0];
         assert!(desc.contains("Git"));
+    }
+
+    #[test]
+    fn installed_list_shows_scopes() {
+        let mut m = manager(
+            vec![],
+            vec![
+                InstalledPluginInfo {
+                    plugin: "git-lens".to_string(),
+                    marketplace: "official".to_string(),
+                    plugin_dir: "installed/official/git-lens".to_string(),
+                    scope: InstallScope::Project,
+                },
+            ],
+        );
+        m.goto(Screen::Installed);
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        let (name, desc) = &rows[0];
+        assert_eq!(name, "git-lens");
+        assert!(desc.contains("project") || desc.contains("项目级"));
     }
 }

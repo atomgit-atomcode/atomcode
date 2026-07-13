@@ -534,6 +534,9 @@ pub enum Msg<'a> {
     PluginScopeLocal,
     PluginScopeLocalDesc,
     PluginScopeHint,
+    PluginScopeUserShort,
+    PluginScopeProjectShort,
+    PluginScopeLocalShort,
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
@@ -557,7 +560,6 @@ pub enum Msg<'a> {
     PluginInstallDone {
         plugin: &'a str,
         marketplace: &'a str,
-        scope: &'a str,
         loaded: usize,
         skipped: usize,
         show_details_hint: bool,

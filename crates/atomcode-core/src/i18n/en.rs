@@ -741,6 +741,9 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginScopeLocal => "Install for you, in this repo only (local scope)".into(),
         Msg::PluginScopeLocalDesc => ".atomcode/plugins/local — not committed".into(),
         Msg::PluginScopeHint => "↑↓ Select scope · Enter confirm · Esc back".into(),
+        Msg::PluginScopeUserShort => "user".into(),
+        Msg::PluginScopeProjectShort => "project".into(),
+        Msg::PluginScopeLocalShort => "local".into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -758,8 +761,8 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, scope, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin} ({scope}). Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
+            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
