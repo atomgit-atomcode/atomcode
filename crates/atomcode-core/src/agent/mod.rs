@@ -131,6 +131,9 @@ pub enum AgentCommand {
     SetSessionId(String),
     /// Set plan mode (read-only exploration, no edits).
     SetPlanMode(bool),
+    /// Set the unified execution mode (replaces SetPlanMode; SetPlanMode is
+    /// removed in a later task once all producers migrate).
+    SetMode(crate::agent::Mode),
     /// Manually compact conversation history. `prompt` is accepted for
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.

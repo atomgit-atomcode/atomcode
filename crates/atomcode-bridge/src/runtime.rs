@@ -208,9 +208,6 @@ struct Bridge {
     pending_local_shell: Vec<String>,
     /// Monotonic id for `!cmd` tool-call display events.
     local_shell_seq: u64,
-    /// `--dangerously-skip-permissions`: auto-approve kernel approval round-trips
-    /// instead of prompting the driver (see [`bypass_auto_approval`]).
-    dangerously_skip_permissions: bool,
     /// `true` when the bridge was built with a [`noop_handle`] because the kernel
     /// agent could not be initialised. In this state `SendMessage` is answered with
     /// an `Error` instead of being forwarded to the (nonexistent) kernel so the user
@@ -409,6 +406,12 @@ impl Bridge {
 
         let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
 
+        // `--dangerously-skip-permissions` seeds the runtime bypass atomic (initial Auto).
+        // After startup the mode is switchable at runtime; the flag is consumed once here.
+        parts
+            .bypass_mode
+            .store(cfg.dangerously_skip_permissions, std::sync::atomic::Ordering::Relaxed);
+
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
@@ -429,7 +432,6 @@ impl Bridge {
             background_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_local_shell: Vec::new(),
             local_shell_seq: 0,
-            dangerously_skip_permissions: cfg.dangerously_skip_permissions,
             degraded,
             goal: None,
             goal_provider: None,
@@ -1068,6 +1070,31 @@ impl Bridge {
                     );
                 }
             }
+            CoreCmd::SetMode(mode) => {
+                let (plan_on, bypass_on) = mode_to_flags(mode);
+                let was_plan = self
+                    .parts
+                    .plan_mode
+                    .swap(plan_on, std::sync::atomic::Ordering::Relaxed);
+                self.parts
+                    .bypass_mode
+                    .store(bypass_on, std::sync::atomic::Ordering::Relaxed);
+                // Reuse the plan-note mechanism only for the plan on/off transition
+                // (same wording as SetPlanMode). Auto/Build carry no system note.
+                if was_plan != plan_on {
+                    self.pending_plan_note = Some(
+                        if plan_on {
+                            "[PLAN MODE ACTIVATED] You are now in plan mode: only read-only tools \
+                             are available — do NOT edit, create, or delete anything. Explore and \
+                             present a detailed plan for the user to approve before making changes."
+                        } else {
+                            "[PLAN MODE ENDED] Plan mode is off. You may now edit files and carry \
+                             out the plan."
+                        }
+                        .to_string(),
+                    );
+                }
+            }
             CoreCmd::Background { task } => {
                 use std::sync::atomic::Ordering;
                 if self.background_running.swap(true, Ordering::AcqRel) {
@@ -1410,6 +1437,7 @@ impl Bridge {
         parts.approval = self.parts.approval.clone();
         // Plan mode survives a respawn (/resume, /clear, model swap).
         parts.plan_mode = self.parts.plan_mode.clone();
+        parts.bypass_mode = self.parts.bypass_mode.clone();
         // Re-mount the kernel-side schedule_wakeup tool on the FRESH parts (a respawn
         // rebuilds `parts` from scratch, so the tool registered in `run` is gone). Hand
         // it the bridge's stored sender so the new agent's wakeups still reach THIS
@@ -1759,7 +1787,8 @@ impl Bridge {
                 // Risky tool here, so the bypass belongs at this driver seam. The
                 // normal ToolStarted/ToolResult events still render the call; only the
                 // approval prompt is skipped.
-                if let Some(resp) = bypass_auto_approval(self.dangerously_skip_permissions) {
+                let bypass = self.parts.bypass_mode.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(resp) = bypass_auto_approval(bypass) {
                     let value = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
                     let _ = self.handle.commands.send(KCmd::Respond { id, value });
                     return;
@@ -2032,6 +2061,17 @@ impl Bridge {
 /// path does.
 fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
     skip_permissions.then(ApprovalResponse::allow)
+}
+
+/// Translate a Mode into the (plan_mode, bypass_mode) atomic pair the bridge
+/// enforces. Pure seam so the mapping is unit-testable.
+pub(crate) fn mode_to_flags(mode: atomcode_core::agent::Mode) -> (bool, bool) {
+    use atomcode_core::agent::Mode;
+    match mode {
+        Mode::Build => (false, false),
+        Mode::Auto => (false, true),
+        Mode::Plan => (true, false),
+    }
 }
 
 /// TAKE a parked approval out of the bridge's mirror and return the kernel command
@@ -3548,5 +3588,16 @@ mod ai_name_tests {
         assert!(!should_attempt(true, true, true)); // already attempted
         assert!(!should_attempt(false, false, true)); // disabled
         assert!(!should_attempt(true, false, false)); // no user msg yet
+    }
+}
+
+#[cfg(test)]
+mod mode_flag_tests {
+    #[test]
+    fn mode_to_flags_maps_all_three() {
+        use atomcode_core::agent::Mode;
+        assert_eq!(super::mode_to_flags(Mode::Build), (false, false));
+        assert_eq!(super::mode_to_flags(Mode::Auto), (false, true));
+        assert_eq!(super::mode_to_flags(Mode::Plan), (true, false));
     }
 }

@@ -130,6 +130,9 @@ pub struct CodingParts {
     /// `SetPlanMode`); the [`PlanModeGate`](crate::PlanModeGate) middleware reads it to
     /// block mutating tools. Shared (not rebuilt) so a respawn preserves the mode.
     pub plan_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime auto-approve (bypass) flag. `SetMode(Auto)` sets it; the bridge
+    /// approval seam auto-Allows while set. Mirrors `plan_mode`.
+    pub bypass_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -420,6 +423,7 @@ pub async fn prepare_with_plugin_hooks(
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
