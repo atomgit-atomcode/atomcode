@@ -2354,6 +2354,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
         let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let is_add_url = hide_input_box
+            && menu_kind == super::MenuKind::Marketplace
+            && self.menu.as_ref()
+                .and_then(|m| m.items.get(2))
+                .map(|(name, _)| name == "Add Marketplace")
+                .unwrap_or(false);
         let total_rows = self.footer_total_rows(
             middle_rows,
             attachment_rows,
@@ -2541,17 +2547,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
-        if hide_input_box {
-            let is_add_url = menu_kind == super::MenuKind::Marketplace
-                && self.menu.as_ref()
-                    .and_then(|m| m.items.get(2))
-                    .map(|(name, _)| name == "Add Marketplace")
-                    .unwrap_or(false);
-            if is_add_url {
-                let cursor_abs_row = (menu_top + 11 + 1) as u16;
-                let cursor_abs_col = (2 + self.input_cursor_byte + 1) as u16;
-                self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
-            }
+        if is_add_url {
+            let cursor_abs_row = (menu_top + 11 + 1) as u16;
+            let cursor_abs_col = (2 + self.input_cursor_byte + 1) as u16;
+            self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
         }
         // Invalidate prev_cells for the menu rows so the next render_diff
         // emits explicit patches for EVERY cell (including blank padding at
@@ -2610,9 +2609,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // so hiding the caret would leave the user typing blind — the
         // "no cursor while replying" bug.
         //
-        // When approval is active there is no input box — hide the caret
-        // regardless of inflight_tool state (user navigates with ↑↓/Enter).
-        let suppress_cursor = self.inflight_tool.is_some() || approval_active;
+        // When approval is active or a plugin modal without text input is open,
+        // hide the caret (user navigates with ↑↓/Enter/Tab).
+        let suppress_cursor = self.inflight_tool.is_some()
+            || approval_active
+            || (hide_input_box && !is_add_url);
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 
@@ -7702,6 +7703,60 @@ mod tests {
             "input cursor must stay visible during spinner activity — \
              the input box is editable during streaming (type-ahead), \
              hiding it leaves the user typing blind"
+        );
+    }
+
+    /// Test that when input box is hidden (e.g. MenuKind::Plugin or
+    /// MenuKind::PluginInfo), the terminal cursor is suppressed (hidden),
+    /// EXCEPT when MenuKind::Marketplace has "Add Marketplace" as item 2 (which is
+    /// Screen::AddUrl).
+    #[test]
+    fn retained_plugin_modal_hides_stray_cursor() {
+        let term_w: u16 = 80;
+        let (mut r, buf) = new_capturing(term_w, 24);
+
+        // 1. MenuKind::Plugin (e.g., browse/installed list) -> cursor must be hidden
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![("Browse".into(), "Desc".into())],
+                selected: 0,
+                kind: crate::render::MenuKind::Plugin,
+            }),
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            !vterm.cursor_visible(),
+            "cursor must be hidden in plugin modal when not entering text"
+        );
+
+        // 2. MenuKind::Marketplace WITH Add Marketplace -> cursor must be visible
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![
+                    ("Browse".into(), "Desc".into()),
+                    ("".into(), "".into()),
+                    ("Add Marketplace".into(), "".into()),
+                ],
+                selected: 0,
+                kind: crate::render::MenuKind::Marketplace,
+            }),
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let mut vterm2 = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm2);
+        assert!(
+            vterm2.cursor_visible(),
+            "cursor must be visible on the Add Marketplace screen"
         );
     }
 

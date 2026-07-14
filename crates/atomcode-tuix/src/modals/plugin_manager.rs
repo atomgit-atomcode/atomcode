@@ -490,10 +490,6 @@ impl PluginManager {
         let (plugin, mp, scope) = (plugin.clone(), mp.clone(), scope.clone());
         match self.selected {
             0 => {
-                // Update
-                self.dispatch_install(plugin, mp, scope, true, ctx);
-            }
-            1 => {
                 // Uninstall
                 match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
                     Ok(()) => {
@@ -509,6 +505,10 @@ impl PluginManager {
                     )),
                 }
                 renderer.flush();
+            }
+            1 => {
+                // Update
+                self.dispatch_install(plugin, mp, scope, true, ctx);
             }
             2 => {
                 // Back to parent
@@ -647,17 +647,17 @@ impl PluginManager {
             Screen::ScopeSelect { .. } => {
                 let installing = self.installing_plugin.is_some();
                 let (user_lbl, user_desc) = if installing && self.installing_scope == Some(InstallScope::User) {
-                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
                     (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned())
                 };
                 let (project_lbl, project_desc) = if installing && self.installing_scope == Some(InstallScope::Project) {
-                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
                     (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned())
                 };
                 let (local_lbl, local_desc) = if installing && self.installing_scope == Some(InstallScope::Local) {
-                    (format!("⏳ {}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
                 } else {
                     (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned())
                 };
@@ -685,14 +685,14 @@ impl PluginManager {
             Screen::InstalledDetails { plugin, .. } => {
                 let installing = self.installing_plugin.as_deref() == Some(plugin.as_str());
                 let (update_label, update_desc) = if installing {
-                    (format!("⏳ {}...", t(Msg::PluginMgrUpdatingStatus)), "".to_string())
+                    (format!("{}...", t(Msg::PluginMgrUpdatingStatus)), "".to_string())
                 } else {
                     (t(Msg::PluginActionUpdate).into_owned(), t(Msg::PluginActionUpdateDesc).into_owned())
                 };
 
                 let rows = vec![
-                    (update_label, update_desc),
                     (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
+                    (update_label, update_desc),
                     (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
                 ];
                 let hint = if installing {
@@ -716,6 +716,21 @@ impl Modal for PluginManager {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
+        // If an install/clone is pending, restrict key inputs.
+        // ESC is allowed so the user can cancel the action.
+        // Other navigation keys (Up, Down, Left, Right, Tab, BackTab) and inputs are blocked.
+        if self.pending.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    // fall through to normal Esc handling
+                }
+                _ => {
+                    // swallow all other key inputs
+                    return Ok(ModalAction::Continue);
+                }
+            }
+        }
+
         // Text-entry screen: capture characters into url_input.
         if matches!(self.screen, Screen::AddUrl) {
             match code {
@@ -887,8 +902,8 @@ impl Modal for PluginManager {
         if let Some((plugin, mp, version, description, scope_opt)) = details_opt {
             final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
             final_items.push((format!("  Name:        {}", plugin), String::new()));
-            final_items.push((format!("  Marketplace: @{}", mp), String::new()));
-            final_items.push((format!("  Version:     {}", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
+            final_items.push((format!("  Marketplace: \x1b[90m@{}\x1b[39m", mp), String::new()));
+            final_items.push((format!("  Version:     \x1b[90m{}\x1b[39m", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
             selected_offset += 4;
             if let Some(scope) = scope_opt {
                 let scope_label = match scope {
@@ -896,7 +911,7 @@ impl Modal for PluginManager {
                     InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
                     InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
                 };
-                final_items.push((format!("  Scope:       {}", scope_label), String::new()));
+                final_items.push((format!("  Scope:       \x1b[90m{}\x1b[39m", scope_label), String::new()));
                 selected_offset += 1;
             }
             if let Some(desc) = description {
@@ -907,7 +922,7 @@ impl Modal for PluginManager {
                     } else {
                         trimmed.to_string()
                     };
-                    final_items.push((format!("  Description: {}", truncated), String::new()));
+                    final_items.push((format!("  Description: \x1b[90m{}\x1b[39m", truncated), String::new()));
                     selected_offset += 1;
                 }
             }
@@ -922,7 +937,7 @@ impl Modal for PluginManager {
                 selected_offset += 3;
             } else {
                 let installing_label = t(Msg::PluginMgrInstallingStatus).into_owned();
-                final_items.push((format!("  Status:      ⏳ {}...", installing_label), String::new()));
+                final_items.push((format!("  Status:      {}...", installing_label), String::new()));
                 final_items.push((String::new(), String::new()));
                 selected_offset += 3;
             }
@@ -938,6 +953,9 @@ impl Modal for PluginManager {
         } else {
             for item in items {
                 final_items.push(item);
+            }
+            if matches!(self.screen, Screen::InstalledDetails { .. } | Screen::ScopeSelect { .. }) {
+                final_items.push((String::new(), String::new()));
             }
         }
         final_items.push((format!("— {} —", hint), String::new()));
@@ -1356,8 +1374,8 @@ mod tests {
         let (rows, _) = m.rows();
         assert_eq!(rows.len(), 3);
         // Action options
-        assert!(rows[0].0.contains("Update") || rows[0].0.contains("更新"));
-        assert!(rows[1].0.contains("Uninstall") || rows[1].0.contains("卸载"));
+        assert!(rows[0].0.contains("Uninstall") || rows[0].0.contains("卸载"));
+        assert!(rows[1].0.contains("Update") || rows[1].0.contains("更新"));
         assert!(rows[2].0.contains("Back") || rows[2].0.contains("返回"));
     }
 
