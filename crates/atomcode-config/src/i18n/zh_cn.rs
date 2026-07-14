@@ -310,9 +310,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllowFolder => "本会话总是允许写入此目录".into(),
         Msg::ApprovalDeny => "拒绝".into(),
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
+        Msg::ApprovalHeader { tool, detail } => {
+            if detail.is_empty() {
+                tool.to_string().into()
+            } else {
+                format!("{tool}({detail})").into()
+            }
+        }
         Msg::ToolDenied => "已拒绝".into(),
 
         Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
+        Msg::CmdSwitchedAcceptEditsMode => "  已切换到自动接受编辑模式(文件编辑免审批;bash 仍会询问)。\n".into(),
 
         Msg::SessionTimeJustNow => "刚刚".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),

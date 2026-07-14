@@ -1610,8 +1610,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_build_next_is_auto() {
-        assert_eq!(AgentMode::Build.next(), AgentMode::Auto);
+    fn agent_mode_build_next_is_accept_edits() {
+        assert_eq!(AgentMode::Build.next(), AgentMode::AcceptEdits);
+        assert_eq!(AgentMode::AcceptEdits.next(), AgentMode::Auto);
     }
 
     #[test]

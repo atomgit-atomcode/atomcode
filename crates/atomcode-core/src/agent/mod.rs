@@ -29,45 +29,55 @@ use crate::tool::{ToolCall, ToolRegistry};
 pub enum Mode {
     #[default]
     Build,
+    /// Auto-accept file edits (edit/write tools auto-approve), while bash and
+    /// sensitive paths still prompt — the safe middle tier between Build and Auto.
+    #[serde(rename = "accept_edits")]
+    AcceptEdits,
     #[serde(rename = "bypass")]
     Auto,
     Plan,
 }
 
 impl Mode {
-    /// Forward cycle: Build → Auto → Plan → Build.
+    /// Forward cycle: Build → AcceptEdits → Auto → Plan → Build (escalating
+    /// permissiveness, then Plan to close the loop).
     pub fn next(self) -> Self {
         match self {
-            Mode::Build => Mode::Auto,
+            Mode::Build => Mode::AcceptEdits,
+            Mode::AcceptEdits => Mode::Auto,
             Mode::Auto => Mode::Plan,
             Mode::Plan => Mode::Build,
         }
     }
-    /// Reverse cycle: Build → Plan → Auto → Build.
+    /// Reverse cycle: Build → Plan → Auto → AcceptEdits → Build.
     pub fn prev(self) -> Self {
         match self {
             Mode::Build => Mode::Plan,
             Mode::Plan => Mode::Auto,
-            Mode::Auto => Mode::Build,
+            Mode::Auto => Mode::AcceptEdits,
+            Mode::AcceptEdits => Mode::Build,
         }
     }
     pub fn is_plan(self) -> bool { matches!(self, Mode::Plan) }
     pub fn is_auto(self) -> bool { matches!(self, Mode::Auto) }
-    /// The `(plan_mode, bypass_mode)` enforcement flags this mode maps to — the
-    /// authoritative decomposition the bridge applies to its two atomics.
-    /// Exhaustive so a new variant forces an update here.
-    pub fn to_flags(self) -> (bool, bool) {
+    pub fn is_accept_edits(self) -> bool { matches!(self, Mode::AcceptEdits) }
+    /// The `(plan_mode, bypass_mode, accept_edits)` enforcement flags this mode
+    /// maps to — the authoritative decomposition the runtime applies to its
+    /// atomics. Exhaustive so a new variant forces an update here.
+    pub fn to_flags(self) -> (bool, bool, bool) {
         match self {
-            Mode::Build => (false, false),
-            Mode::Auto => (false, true),
-            Mode::Plan => (true, false),
+            Mode::Build => (false, false, false),
+            Mode::AcceptEdits => (false, false, true),
+            Mode::Auto => (false, true, false),
+            Mode::Plan => (true, false, false),
         }
     }
-    /// Canonical wire string (`build`/`plan`/`bypass`). Must match the serde
-    /// rename on the enum above; the `mode_wire_matches_serde` test locks that.
+    /// Canonical wire string (`build`/`accept_edits`/`plan`/`bypass`). Must match
+    /// the serde rename on the enum above; `mode_wire_matches_serde` locks that.
     pub fn wire(self) -> &'static str {
         match self {
             Mode::Build => "build",
+            Mode::AcceptEdits => "accept_edits",
             Mode::Auto => "bypass",
             Mode::Plan => "plan",
         }
@@ -76,6 +86,7 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::Build => "Build",
+            Mode::AcceptEdits => "AcceptEdits",
             Mode::Auto => "Auto",
             Mode::Plan => "Plan",
         }
@@ -87,33 +98,42 @@ mod mode_tests {
     use super::Mode;
     #[test]
     fn mode_cycles_forward_and_back() {
-        assert_eq!(Mode::Build.next(), Mode::Auto);
+        // Forward: Build → AcceptEdits → Auto → Plan → Build.
+        assert_eq!(Mode::Build.next(), Mode::AcceptEdits);
+        assert_eq!(Mode::AcceptEdits.next(), Mode::Auto);
         assert_eq!(Mode::Auto.next(), Mode::Plan);
         assert_eq!(Mode::Plan.next(), Mode::Build);
+        // Reverse is the exact inverse.
         assert_eq!(Mode::Build.prev(), Mode::Plan);
         assert_eq!(Mode::Plan.prev(), Mode::Auto);
-        assert_eq!(Mode::Auto.prev(), Mode::Build);
+        assert_eq!(Mode::Auto.prev(), Mode::AcceptEdits);
+        assert_eq!(Mode::AcceptEdits.prev(), Mode::Build);
         assert_eq!(Mode::default(), Mode::Build);
     }
     #[test]
-    fn mode_wire_is_build_plan_bypass() {
+    fn mode_wire_is_build_accept_plan_bypass() {
         assert_eq!(serde_json::to_string(&Mode::Build).unwrap(), "\"build\"");
+        assert_eq!(serde_json::to_string(&Mode::AcceptEdits).unwrap(), "\"accept_edits\"");
         assert_eq!(serde_json::to_string(&Mode::Auto).unwrap(), "\"bypass\"");
         assert_eq!(serde_json::to_string(&Mode::Plan).unwrap(), "\"plan\"");
         assert_eq!(serde_json::from_str::<Mode>("\"bypass\"").unwrap(), Mode::Auto);
+        assert_eq!(serde_json::from_str::<Mode>("\"accept_edits\"").unwrap(), Mode::AcceptEdits);
     }
     #[test]
     fn mode_flags_and_predicates() {
-        assert_eq!(Mode::Build.to_flags(), (false, false));
-        assert_eq!(Mode::Auto.to_flags(), (false, true));
-        assert_eq!(Mode::Plan.to_flags(), (true, false));
+        // (plan, bypass, accept_edits)
+        assert_eq!(Mode::Build.to_flags(), (false, false, false));
+        assert_eq!(Mode::AcceptEdits.to_flags(), (false, false, true));
+        assert_eq!(Mode::Auto.to_flags(), (false, true, false));
+        assert_eq!(Mode::Plan.to_flags(), (true, false, false));
         assert!(Mode::Auto.is_auto() && !Mode::Auto.is_plan());
         assert!(Mode::Plan.is_plan() && !Mode::Plan.is_auto());
-        assert!(!Mode::Build.is_auto() && !Mode::Build.is_plan());
+        assert!(Mode::AcceptEdits.is_accept_edits() && !Mode::AcceptEdits.is_auto());
+        assert!(!Mode::Build.is_auto() && !Mode::Build.is_plan() && !Mode::Build.is_accept_edits());
     }
     #[test]
     fn mode_wire_matches_serde() {
-        for m in [Mode::Build, Mode::Auto, Mode::Plan] {
+        for m in [Mode::Build, Mode::AcceptEdits, Mode::Auto, Mode::Plan] {
             assert_eq!(format!("\"{}\"", m.wire()), serde_json::to_string(&m).unwrap());
         }
     }

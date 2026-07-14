@@ -322,9 +322,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
+        Msg::ApprovalHeader { tool, detail } => {
+            if detail.is_empty() {
+                tool.to_string().into()
+            } else {
+                format!("{tool}({detail})").into()
+            }
+        }
         Msg::ToolDenied => "denied".into(),
 
         Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
+        Msg::CmdSwitchedAcceptEditsMode => {
+            "  Switched to accept-edits mode (file edits auto-approved; bash still prompts).\n".into()
+        }
 
         Msg::SessionTimeJustNow => "just now".into(),
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),

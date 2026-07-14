@@ -36,7 +36,13 @@ use crate::CachedMcpRegistry;
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
         ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Auto => PermissionDecision::Allow,
+        // AcceptEdits groups with Build here: this coarse daemon/webui fallback has no
+        // per-tool granularity yet (webui 4th-mode support is deferred). The real
+        // AcceptEdits enforcement (edits auto-approve, bash still prompts) is the
+        // WriteApprovalGate middleware on the interactive path.
+        ApprovalMode::Build | ApprovalMode::Auto | ApprovalMode::AcceptEdits => {
+            PermissionDecision::Allow
+        }
     }
 }
 

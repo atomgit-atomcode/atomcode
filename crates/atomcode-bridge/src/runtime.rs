@@ -1068,7 +1068,7 @@ impl Bridge {
                 }
             }
             CoreCmd::SetMode(mode) => {
-                let (plan_on, bypass_on) = mode.to_flags();
+                let (plan_on, bypass_on, accept_on) = mode.to_flags();
                 let was_plan = self
                     .parts
                     .plan_mode
@@ -1076,6 +1076,9 @@ impl Bridge {
                 self.parts
                     .bypass_mode
                     .store(bypass_on, std::sync::atomic::Ordering::Relaxed);
+                self.parts
+                    .accept_edits
+                    .store(accept_on, std::sync::atomic::Ordering::Relaxed);
                 // Reuse the plan-note mechanism only for the plan on/off transition
                 // (same wording as SetPlanMode). Auto/Build carry no system note.
                 if was_plan != plan_on {

@@ -155,6 +155,10 @@ pub struct WriteApprovalGate {
     /// in-workspace boundary with it. Grant keys are canonicalized to ABSOLUTE paths, so a
     /// remembered out-of-workspace grant survives a `/cd`.
     cwd: Arc<RwLock<PathBuf>>,
+    /// Auto-accept-edits flag (SetMode(AcceptEdits)). While set, NON-sensitive edits
+    /// auto-approve with no prompt; sensitive paths still prompt every time. Defaults
+    /// to a private always-false Arc for construction sites that have no mode concept.
+    accept_edits: Arc<std::sync::atomic::AtomicBool>,
     kind: String,
 }
 
@@ -164,6 +168,7 @@ impl WriteApprovalGate {
         Self {
             store: Arc::new(InMemoryPermissionStore::new()),
             cwd,
+            accept_edits: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kind: APPROVAL_KIND.to_string(),
         }
     }
@@ -175,7 +180,20 @@ impl WriteApprovalGate {
 
     /// Use a caller-supplied (e.g. shared / persisted) grant store.
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, cwd, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            cwd,
+            accept_edits: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kind: APPROVAL_KIND.to_string(),
+        }
+    }
+
+    /// Wire the shared auto-accept-edits flag (from `CodingParts::accept_edits`). When
+    /// set, non-sensitive edits auto-approve without a prompt. Builder so the existing
+    /// constructors stay source-compatible.
+    pub fn with_accept_edits(mut self, accept_edits: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.accept_edits = accept_edits;
+        self
     }
 
     /// Round-trip the driver for an approval decision (same wire shape as [`ApprovalMiddleware`],
@@ -248,6 +266,14 @@ impl ToolMiddleware for WriteApprovalGate {
             raw_sensitive || targets.iter().any(|t| path_is_sensitive(&resolve_path(t, &cwd)));
         if sensitive {
             return self.prompt_unremembered(call, tool, rt).await;
+        }
+
+        // Auto-accept-edits mode: a non-sensitive edit auto-approves with NO prompt
+        // (sensitive was handled above and still prompts). This only affects the write
+        // tools this gate owns — bash still flows to ApprovalMiddleware and prompts.
+        // Enforced here (middleware), so it is independent of the bridge approval seam.
+        if self.accept_edits.load(std::sync::atomic::Ordering::Relaxed) {
+            return BeforeOutcome::Allow { reason: Some("accept-edits mode".into()) };
         }
 
         // (2)+(3) classification CANONICALIZES paths (touches the filesystem). Run it OFF the
@@ -433,6 +459,43 @@ mod tests {
         assert!(
             gate.before(&mut o, &edit, &silent_rt()).await.is_deny(),
             "a file in a different folder must still prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_edits_auto_approves_nonsensitive_but_not_sensitive() {
+        // accept-edits mode: a non-sensitive out-of-workspace edit auto-approves with
+        // NO prompt; a sensitive path still prompts every time (never auto-accepted).
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true)); // accept-edits ON
+        let gate = WriteApprovalGate::new(Arc::new(RwLock::new(ws.path().to_path_buf())))
+            .with_accept_edits(flag.clone());
+        let tool = write_tool();
+
+        // Non-sensitive out-of-workspace file: normally prompts; with accept-edits → Allow.
+        let ordinary = outside.path().join("report.md");
+        let mut c = write_call(ordinary.to_str().unwrap());
+        assert!(
+            matches!(gate.before(&mut c, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "accept-edits must auto-approve a non-sensitive edit"
+        );
+
+        // Sensitive path: accept-edits does NOT apply — silent_rt denies the prompt.
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, "k").unwrap();
+        let mut s = write_call(secret.to_str().unwrap());
+        assert!(
+            gate.before(&mut s, &tool, &silent_rt()).await.is_deny(),
+            "accept-edits must NOT auto-approve a sensitive path (still prompts)"
+        );
+
+        // Flag off → back to normal prompting for the ordinary out-of-workspace file.
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut c2 = write_call(ordinary.to_str().unwrap());
+        assert!(
+            gate.before(&mut c2, &tool, &silent_rt()).await.is_deny(),
+            "with accept-edits off, a non-sensitive out-of-workspace edit prompts again"
         );
     }
 

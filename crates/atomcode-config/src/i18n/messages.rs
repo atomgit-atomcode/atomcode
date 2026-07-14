@@ -240,12 +240,16 @@ pub enum Msg<'a> {
     ApprovalAlwaysAllowFolder,
     ApprovalDeny,
     ApprovalHint,
+    /// Header line above the interactive approval options, naming what is being
+    /// approved (the `▸ Tool(detail)` scrollback row can be far above / hidden).
+    ApprovalHeader { tool: &'a str, detail: &'a str },
 
     // ── Tool result markers ──
     ToolDenied,
 
     // ── Execution mode ──
     CmdSwitchedAutoMode,
+    CmdSwitchedAcceptEditsMode,
 
     SessionTimeJustNow,
     SessionTimeMinAgo { n: u64 },

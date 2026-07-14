@@ -133,6 +133,12 @@ pub struct CodingParts {
     /// Runtime auto-approve (bypass) flag. `SetMode(Auto)` sets it; the bridge
     /// approval seam auto-Allows while set. Mirrors `plan_mode`.
     pub bypass_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Auto-accept-edits flag. `SetMode(AcceptEdits)` sets it; the
+    /// [`WriteApprovalGate`](crate::tools) reads it to auto-approve NON-sensitive
+    /// file edits without a prompt (bash + sensitive paths still prompt). Unlike
+    /// `bypass_mode` this is enforced in a middleware (bridge-independent), mirroring
+    /// `plan_mode`. Shared (not rebuilt) so a respawn preserves the mode.
+    pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -424,6 +430,7 @@ pub async fn prepare_with_plugin_hooks(
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -654,7 +661,10 @@ pub fn assemble(
         // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
         // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
         // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
-        .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
+        .middleware(Arc::new(
+            WriteApprovalGate::new(parts.shared_cwd.clone())
+                .with_accept_edits(parts.accept_edits.clone()),
+        ))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.

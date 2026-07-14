@@ -7125,6 +7125,7 @@ pub(crate) fn set_agent_mode(
     if ctx.is_plain_renderer {
         let msg = match mode {
             crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
+            crate::state::AgentMode::AcceptEdits => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAcceptEditsMode).into_owned(),
             crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
             crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
         };
@@ -10800,6 +10801,12 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             // `⏸ plan` — glyph downgrades to `||` on non-unicode terminals.
             let pause = if ctx.caps.unicode_symbols { "\u{23f8}" } else { "||" };
             Some(format!("{pause} plan"))
+        }
+        crate::state::AgentMode::AcceptEdits => {
+            // `⏵ accept edits` — single play glyph (U+23F5, renders 1-cell text form),
+            // downgrades to `>` on non-unicode terminals.
+            let play = if ctx.caps.unicode_symbols { "\u{23f5}" } else { ">" };
+            Some(format!("{play} accept edits"))
         }
         crate::state::AgentMode::Build => None,
         // Auto's visual is the warning-colored left badge below (via bypass_indicator).
