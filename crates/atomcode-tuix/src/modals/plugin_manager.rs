@@ -596,8 +596,10 @@ impl PluginManager {
 
                 let root_opt = atomcode_core::plugin::plugins_root();
                 let cwd = std::env::current_dir().ok();
+                let mp_root_opt = atomcode_core::plugin::marketplaces_root();
                 let mut descriptions = std::collections::HashMap::new();
                 for i in &inst {
+                    let mut found_desc = None;
                     let dir_opt = match i.scope {
                         InstallScope::User => root_opt.clone(),
                         InstallScope::Project | InstallScope::Local => {
@@ -612,9 +614,28 @@ impl PluginManager {
                         let plugin_dir = root.join(&i.plugin_dir);
                         if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
                             if let Some(desc) = manifest.description {
-                                descriptions.insert(i.plugin.clone(), desc);
+                                if !desc.trim().is_empty() {
+                                    found_desc = Some(desc);
+                                }
                             }
                         }
+                    }
+                    if found_desc.is_none() {
+                        if let Some(ref mp_root) = mp_root_opt {
+                            let mp_dir = mp_root.join(&i.marketplace);
+                            if let Ok(Some(mp_manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                                if let Some(p) = mp_manifest.plugins.iter().find(|p| p.name == i.plugin || sanitize(&p.name) == i.plugin) {
+                                    if let Some(desc) = &p.description {
+                                        if !desc.trim().is_empty() {
+                                            found_desc = Some(desc.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(desc) = found_desc {
+                        descriptions.insert(i.plugin.clone(), desc);
                     }
                 }
 

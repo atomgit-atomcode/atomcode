@@ -1707,11 +1707,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let is_installed = status.ends_with("(installed)")
             || status.ends_with("(已安装)")
             || status.ends_with("(User)")
+            || status.ends_with("(user)")
             || status.ends_with("(用户)")
+            || status.ends_with("(用户级)")
             || status.ends_with("(Project)")
+            || status.ends_with("(project)")
             || status.ends_with("(项目)")
+            || status.ends_with("(项目级)")
             || status.ends_with("(Local)")
-            || status.ends_with("(本地)");
+            || status.ends_with("(local)")
+            || status.ends_with("(本地)")
+            || status.ends_with("(本地级)");
         let name_width = unicode_width::UnicodeWidthStr::width(name);
         let check_width = 2; // "✓ " or "  "
         let pad = 24usize.saturating_sub(name_width + check_width);
@@ -2504,14 +2510,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status_rows,
             hide_input_box,
         );
-        let pad_style = if hide_input_box {
-            CellStyle {
-                bg: role(self.caps, Role::PanelBg),
-                ..CellStyle::default()
-            }
-        } else {
-            CellStyle::default()
-        };
+        let pad_style = CellStyle::default();
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
         // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
@@ -2724,12 +2723,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.screen.invalidate_rows_from(menu_top);
         for (i, r) in menu_cells.into_iter().enumerate() {
             let mut padded = r;
-            if hide_input_box {
-                let bg_color = role(self.caps, Role::PanelBg);
-                for cell in &mut padded {
-                    cell.style.bg = bg_color;
-                }
-            }
             Self::pad_row_to_width(&mut padded, w, pad_style.clone());
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
