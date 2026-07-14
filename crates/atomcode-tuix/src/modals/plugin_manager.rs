@@ -43,6 +43,7 @@ enum Screen {
     Installing { plugin: String, mp: String },
     InstalledDetails { plugin: String, mp: String, scope: InstallScope },
     Marketplaces,
+    MarketplaceDetails { mp: String },
 }
 
 #[derive(Clone)]
@@ -190,7 +191,7 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::Marketplaces | Screen::AddUrl => 2,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
         };
         let installed_count = self.installed.len();
         let t0 = if current_tab == 0 {
@@ -217,7 +218,7 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::Marketplaces | Screen::AddUrl => 2,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
         };
         let next_tab = if forward {
             (current_tab + 1) % 3
@@ -257,6 +258,7 @@ impl PluginManager {
             Screen::Installing { .. } => 0, // No selectable rows — just status text
             Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
             Screen::Marketplaces => 1 + self.marketplaces.len(),
+            Screen::MarketplaceDetails { .. } => 4,
         }
     }
 
@@ -368,14 +370,42 @@ impl PluginManager {
         });
     }
 
-    fn enter_marketplaces(&mut self, ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+    fn enter_marketplaces(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
         if self.selected == 0 {
             self.url_input.clear();
             self.url_cursor = 0;
             self.goto(Screen::AddUrl);
         } else {
             if let Some(m) = self.marketplaces.get(self.selected - 1) {
-                self.dispatch_update_marketplace(m.name.clone(), ctx);
+                self.goto(Screen::MarketplaceDetails { mp: m.name.clone() });
+            }
+        }
+    }
+
+    fn enter_marketplace_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        if let Screen::MarketplaceDetails { mp } = &self.screen {
+            let mp_name = mp.clone();
+            match self.selected {
+                0 => {
+                    self.search_query = mp_name;
+                    self.goto(Screen::Browse);
+                }
+                1 => {
+                    self.dispatch_update_marketplace(mp_name, ctx);
+                }
+                2 => {
+                    let mut set = load_auto_update_marketplaces();
+                    if set.contains(&mp_name) {
+                        set.remove(&mp_name);
+                    } else {
+                        set.insert(mp_name);
+                    }
+                    save_auto_update_marketplaces(&set);
+                }
+                3 => {
+                    self.dispatch_remove_marketplace(mp_name, ctx, renderer);
+                }
+                _ => {}
             }
         }
     }
@@ -386,22 +416,23 @@ impl PluginManager {
         }
         if let Some(m) = self.marketplaces.get(self.selected - 1) {
             let name = m.name.clone();
-            match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
-                Ok(()) => {
-                    reload_plugins(ctx);
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
-                    ));
-                    self.reload();
-                    let n = self.current_len();
-                    if self.selected >= n && n > 0 {
-                        self.selected = n - 1;
-                    }
-                }
-                Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
-            }
-            renderer.flush();
+            self.dispatch_remove_marketplace(name, ctx, renderer);
         }
+    }
+
+    fn dispatch_remove_marketplace(&mut self, name: String, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
+            Ok(()) => {
+                reload_plugins(ctx);
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
+                ));
+                self.reload();
+                self.goto(Screen::Marketplaces);
+            }
+            Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+        }
+        renderer.flush();
     }
 
     fn dispatch_update_marketplace(&mut self, name: String, ctx: &LoopCtx) {
@@ -706,6 +737,28 @@ impl PluginManager {
                 };
                 (rows, hint)
             }
+            Screen::MarketplaceDetails { mp } => {
+                let mut rows = Vec::new();
+                if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                    let available_count = m.plugins.len();
+                    rows.push((format!("Browse plugins ({})", available_count), String::new()));
+                    
+                    let last_updated = get_directory_modified_date(&m.name);
+                    rows.push((format!("Update marketplace (last updated {})", last_updated), String::new()));
+                    
+                    let set = load_auto_update_marketplaces();
+                    let auto_update_enabled = set.contains(&m.name);
+                    let auto_update_text = if auto_update_enabled {
+                        "Disable auto-update"
+                    } else {
+                        "Enable auto-update"
+                    };
+                    rows.push((auto_update_text.to_string(), String::new()));
+                    
+                    rows.push(("Remove marketplace".to_string(), String::new()));
+                }
+                (rows, t(Msg::PluginMgrHintNav).into_owned())
+            }
         }
     }
 }
@@ -870,6 +923,9 @@ impl Modal for PluginManager {
                             }
                             self.goto(Screen::Installed);
                         }
+                        Screen::MarketplaceDetails { .. } => {
+                            self.goto(Screen::Marketplaces);
+                        }
                         _ => {
                             return Ok(ModalAction::Close);
                         }
@@ -892,6 +948,7 @@ impl Modal for PluginManager {
                         Screen::InstalledDetails { .. } => self.enter_installed_details(ctx, renderer),
                         Screen::AddUrl => {}
                         Screen::Marketplaces => self.enter_marketplaces(ctx, renderer),
+                        Screen::MarketplaceDetails { .. } => self.enter_marketplace_details(ctx, renderer),
                     }
                 }
             }
@@ -983,6 +1040,45 @@ impl Modal for PluginManager {
             }
         }
 
+        if let Screen::MarketplaceDetails { mp } = &self.screen {
+            if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                let installed_plugins: Vec<&InstalledPluginInfo> = self.installed
+                    .iter()
+                    .filter(|i| &i.marketplace == mp)
+                    .collect();
+                let installed_count = installed_plugins.len();
+
+                final_items.push((format!("  \x1b[1m{}\x1b[22m", m.name), String::new()));
+                final_items.push((format!("  \x1b[90m{}\x1b[39m", m.source), String::new()));
+                final_items.push((String::new(), String::new()));
+                final_items.push((format!("  {} available plugins", m.plugins.len()), String::new()));
+                final_items.push((String::new(), String::new()));
+                final_items.push((format!("  \x1b[1mInstalled plugins ({}):\x1b[22m", installed_count), String::new()));
+
+                if installed_count == 0 {
+                    final_items.push(("  No plugins installed from this marketplace.".to_string(), String::new()));
+                } else {
+                    for inst in installed_plugins {
+                        final_items.push((format!("  ● {}", inst.plugin), String::new()));
+                        let (_, description) = self.get_installed_plugin_details(&inst.plugin, &inst.marketplace, &inst.scope);
+                        if let Some(desc) = description {
+                            let trimmed = desc.trim();
+                            if !trimmed.is_empty() {
+                                let truncated = if trimmed.len() > 60 {
+                                    format!("{}...", &trimmed[..57])
+                                } else {
+                                    trimmed.to_string()
+                                };
+                                final_items.push((format!("    \x1b[90m{}\x1b[39m", truncated), String::new()));
+                            }
+                        }
+                    }
+                }
+                final_items.push((String::new(), String::new()));
+                selected_offset = final_items.len();
+            }
+        }
+
         if matches!(self.screen, Screen::Marketplaces) {
             final_items.push(("+ Add Marketplace".to_string(), String::new()));
             final_items.push((String::new(), String::new()));
@@ -994,7 +1090,12 @@ impl Modal for PluginManager {
             for item in items {
                 final_items.push(item);
             }
-            if matches!(self.screen, Screen::InstalledDetails { .. } | Screen::ScopeSelect { .. }) {
+            if matches!(
+                self.screen,
+                Screen::InstalledDetails { .. }
+                    | Screen::ScopeSelect { .. }
+                    | Screen::MarketplaceDetails { .. }
+            ) {
                 final_items.push((String::new(), String::new()));
             } else if matches!(self.screen, Screen::AddUrl) {
                 final_items.push((format!("❯ {}", self.url_input), String::new()));
@@ -1018,7 +1119,10 @@ impl Modal for PluginManager {
         let kind = match &self.screen {
             Screen::Browse | Screen::Installed => MenuKind::Plugin,
             Screen::Marketplaces | Screen::AddUrl => MenuKind::Marketplace,
-            Screen::ScopeSelect { .. } | Screen::Installing { .. } | Screen::InstalledDetails { .. } => MenuKind::PluginInfo,
+            Screen::ScopeSelect { .. }
+            | Screen::Installing { .. }
+            | Screen::InstalledDetails { .. }
+            | Screen::MarketplaceDetails { .. } => MenuKind::PluginInfo,
         };
         let payload = MenuPayload {
             items: final_items,
@@ -1125,6 +1229,27 @@ fn get_directory_modified_date(name: &str) -> String {
         }
     }
     "unknown".to_string()
+}
+
+fn load_auto_update_marketplaces() -> HashSet<String> {
+    if let Some(root) = atomcode_core::plugin::plugins_root() {
+        let path = root.join("auto_update_marketplaces.json");
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(set) = serde_json::from_str(&content) {
+                return set;
+            }
+        }
+    }
+    HashSet::new()
+}
+
+fn save_auto_update_marketplaces(set: &HashSet<String>) {
+    if let Some(root) = atomcode_core::plugin::plugins_root() {
+        let path = root.join("auto_update_marketplaces.json");
+        if let Ok(content) = serde_json::to_string(set) {
+            let _ = std::fs::write(path, content);
+        }
+    }
 }
 
 fn get_mock_category(name: &str) -> &'static str {
