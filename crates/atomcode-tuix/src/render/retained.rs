@@ -1622,7 +1622,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let is_add_marketplace = name == "+ Add Marketplace";
         if is_add_marketplace {
-            style = self.style_bold(Role::Brand);
+            if selected {
+                style = self.style_bold(Role::Brand);
+            } else {
+                style = self.style_for(Role::Secondary);
+            }
         }
         let is_add_title = name == "Add Marketplace";
         if is_add_title {
@@ -1638,7 +1642,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if is_muted {
             style = self.style_for(Role::Muted);
         }
-        push_str_cells_sgr(&mut row, &content, style.clone());
+        if selected && content.starts_with("▸ ") {
+            let mut brand_style = style.clone();
+            brand_style.fg = self.style_for(Role::Brand).fg;
+            push_str_cells_sgr(&mut row, "▸ ", brand_style);
+            push_str_cells_sgr(&mut row, &content[4..], style.clone());
+        } else {
+            push_str_cells_sgr(&mut row, &content, style.clone());
+        }
 
         if selected {
             let content_w = crate::width::display_width(&content);
@@ -1704,7 +1715,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let part_b = format!("  {}", status);
 
         let mut row1 = Vec::new();
-        push_str_cells_sgr(&mut row1, &part_a, name_style.clone());
+        if selected && part_a.starts_with("▸ ") {
+            let brand_style = self.style_for(Role::Brand);
+            push_str_cells_sgr(&mut row1, "▸ ", brand_style);
+            push_str_cells_sgr(&mut row1, &part_a[4..], name_style.clone());
+        } else {
+            push_str_cells_sgr(&mut row1, &part_a, name_style.clone());
+        }
         push_str_cells_sgr(&mut row1, &part_b, status_style);
         let content_w1 = crate::width::display_width(&part_a) + crate::width::display_width(&part_b);
         let right_pad1 = rule_width.saturating_sub(content_w1);
@@ -1764,7 +1781,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let installed = parts.get(2).copied().unwrap_or("0");
         let updated = parts.get(3).copied().unwrap_or("");
 
-        let bullet = if selected { "▸ " } else { "  " };
+        let bullet = if selected { "▸ ● " } else { "  ● " };
         let bullet_style = if selected {
             self.style_for(Role::Accent)
         } else {
@@ -1780,7 +1797,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
 
         let mut row1 = Vec::new();
-        push_str_cells_sgr(&mut row1, bullet, bullet_style);
+        if selected {
+            let brand_style = self.style_for(Role::Brand);
+            push_str_cells_sgr(&mut row1, "▸ ", brand_style);
+            push_str_cells_sgr(&mut row1, "● ", bullet_style);
+        } else {
+            push_str_cells_sgr(&mut row1, bullet, bullet_style);
+        }
         push_str_cells_sgr(&mut row1, name, name_style.clone());
         let content_w1 = crate::width::display_width(bullet) + crate::width::display_width(name);
         let right_pad1 = rule_width.saturating_sub(content_w1);
