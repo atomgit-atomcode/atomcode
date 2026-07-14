@@ -99,9 +99,9 @@ async fn drive_and_collect_results(
     outcome.tool_results
 }
 
-const DEFAULT_CAP: usize = 256 * 1024; // kernel default = production MAX_BYTES_PER_RESPONSE
+const DEFAULT_CAP: usize = 64 * 1024; // kernel default (~16K tokens per tool output)
 
-// CLAIM 20a: the DEFAULT cap bounds a 1 MiB runaway result to ~256 KiB + marker,
+// CLAIM 20a: the DEFAULT cap bounds a 1 MiB runaway result to ~64 KiB + marker,
 // not the full 1 MiB — the model and the driver never see the megabyte.
 #[tokio::test]
 async fn default_cap_bounds_runaway_tool_result() {

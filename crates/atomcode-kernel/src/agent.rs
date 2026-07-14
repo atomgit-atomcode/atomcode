@@ -21,14 +21,15 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Default kernel cap on a single tool result's `content` byte length.
 ///
-/// 256 KiB, matched to production's per-tool-response byte budget
-/// (`atomcode-core` `crates/atomcode-core/src/tool/read.rs` `MAX_BYTES_PER_RESPONSE
-/// = 256 * 1024`), which is explicitly sized for AtomCode's bigger-context models.
-/// A mounted third-party tool may not self-cap, so the kernel applies this
-/// CENTRAL backstop regardless of any per-tool limit. `0` disables the cap
-/// (UNBOUNDED) — see `AgentBuilder::max_tool_result_bytes` — but the default is
-/// bounded.
-pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// 64 KiB (~16K tokens). A single tool output rarely needs more, and an
+/// uncapped-or-generously-capped output is the dominant cause of context bloat in
+/// long sessions: several 256 KiB outputs (~64K tokens each) alone can fill a 200K
+/// window and survive compaction (which keeps recent turns verbatim). Bounding each
+/// output tightly at INGESTION keeps the retained window small. A mounted
+/// third-party tool may not self-cap, so the kernel applies this CENTRAL backstop
+/// regardless of any per-tool limit. `0` disables the cap (UNBOUNDED) — see
+/// `AgentBuilder::max_tool_result_bytes` — but the default is bounded.
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
 /// Bounded overflow-recovery retries per round (covers ladder tiers 0..=2). After this
 /// many failed compact-and-retry attempts the kernel surfaces the overflow error rather
@@ -380,13 +381,15 @@ fn sort_json_object_keys(value: Value) -> Value {
 /// Contract:
 /// * `max == 0` → UNBOUNDED: returns without touching the content.
 /// * `content.len() <= max` (byte length) → untouched, no marker.
-/// * `content.len() > max` → TRUNCATE the body to the largest UTF-8 char
-///   boundary `<= max` (never splits a multi-byte char → never panics), then
-///   APPEND a neutral marker `\n…[truncated: N of M bytes elided by kernel cap]`
-///   where `M` is the original byte length and `N = M - kept` is the elided
-///   count. The marker counts ON TOP of the cap, so the final stored length is
-///   `kept (<= max) + marker.len()` — i.e. it may slightly exceed `max` by the
-///   marker; this is intentional and keeps the math reported in the marker exact.
+/// * `content.len() > max` → HEAD+TAIL truncate: keep the first `max/2` and the
+///   last `max/2` bytes (each backed off to a UTF-8 char boundary → never splits a
+///   multi-byte char → never panics), dropping the MIDDLE, and splice a neutral
+///   marker `…[truncated: N of M bytes elided by kernel cap]…` between them. The
+///   middle is dropped rather than the tail because a tool output's signal usually
+///   lives at BOTH ends — a read's opening + a command's final result / error — so
+///   head-only truncation (the old behavior) silently lost the conclusion. The
+///   marker counts ON TOP of the ~`max` kept bytes; the model sees it was elided
+///   and can re-run the tool with a narrower query to see the middle.
 ///
 /// DETERMINISTIC: same content + same cap → byte-identical output, so the cap
 /// never breaks the append-only wire-prefix (prefix-cache) invariant.
@@ -398,17 +401,33 @@ fn cap_tool_result(result: &mut ToolResult, max: usize) {
     if total <= max {
         return; // under cap: untouched
     }
-    // Back off to the largest UTF-8 char boundary <= max so we never split a
-    // multi-byte char. `is_char_boundary(0)` is always true, so this terminates.
-    let mut keep = max;
-    while keep > 0 && !result.content.is_char_boundary(keep) {
-        keep -= 1;
+    // Head: largest char boundary <= max/2. Tail: smallest char boundary >= total-max/2.
+    // `is_char_boundary(0)` / `(total)` are always true, so both loops terminate.
+    let half = max / 2;
+    let mut head = half;
+    while head > 0 && !result.content.is_char_boundary(head) {
+        head -= 1;
     }
-    let elided = total - keep;
-    result.content.truncate(keep);
-    result.content.push_str(&format!(
-        "\n…[truncated: {elided} of {total} bytes elided by kernel cap]"
-    ));
+    let mut tail_start = total.saturating_sub(half);
+    while tail_start < total && !result.content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // If the boundary walks collapsed the window (tiny cap / wide chars) so nothing
+    // would be elided, fall back to the old head-only truncation for determinism.
+    if tail_start <= head {
+        result.content.truncate(head);
+        result.content.push_str(&format!(
+            "\n…[truncated: {} of {total} bytes elided by kernel cap]",
+            total - head
+        ));
+        return;
+    }
+    let elided = tail_start - head;
+    let head_str = &result.content[..head];
+    let tail_str = &result.content[tail_start..];
+    result.content = format!(
+        "{head_str}\n…[truncated: {elided} of {total} bytes elided by kernel cap]…\n{tail_str}"
+    );
 }
 
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
@@ -3013,6 +3032,38 @@ mod over_window_advisory_tests {
             "must give actionable advice (trim / larger window): {m}"
         );
         assert!(!m.contains("/compact"), "must NOT suggest /compact (already ran): {m}");
+    }
+}
+
+#[cfg(test)]
+mod cap_tool_result_tests {
+    use super::cap_tool_result;
+    use crate::tool::ToolResult;
+
+    fn res(content: String) -> ToolResult {
+        ToolResult { call_id: String::new(), content, is_error: false, images: vec![] }
+    }
+
+    #[test]
+    fn head_and_tail_survive_middle_elided() {
+        // HEAD + 100k filler + TAIL, cap 1000 → both ends survive, middle dropped.
+        let mut r = res(format!("HEADHEAD{}TAILTAIL", "x".repeat(100_000)));
+        cap_tool_result(&mut r, 1000);
+        assert!(r.content.starts_with("HEADHEAD"), "head preserved: {:?}", &r.content[..16]);
+        assert!(r.content.ends_with("TAILTAIL"), "tail preserved");
+        assert!(r.content.contains("[truncated:") && r.content.contains("by kernel cap]"));
+        assert!(r.content.len() < 1300, "≈ cap + marker, not 100k; got {}", r.content.len());
+    }
+
+    #[test]
+    fn under_cap_untouched_and_zero_unbounded() {
+        let mut small = res("small".into());
+        cap_tool_result(&mut small, 1000);
+        assert_eq!(small.content, "small");
+        let big = "a".repeat(10_000);
+        let mut r = res(big.clone());
+        cap_tool_result(&mut r, 0); // 0 = unbounded
+        assert_eq!(r.content, big);
     }
 }
 
