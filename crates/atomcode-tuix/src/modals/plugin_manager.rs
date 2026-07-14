@@ -521,8 +521,7 @@ impl PluginManager {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
                         ));
-                        self.reload();
-                        self.goto(Screen::Installed);
+                        self.close_requested = true;
                     }
                     Err(e) => renderer.render(UiLine::Error(
                         t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
