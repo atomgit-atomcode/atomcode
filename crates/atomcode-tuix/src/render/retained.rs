@@ -1765,7 +1765,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let updated = parts.get(3).copied().unwrap_or("");
 
         let bullet = if selected { "▸ ● " } else { "  ● " };
-        let bullet_style = self.style_for(Role::Brand);
+        let bullet_style = if selected {
+            self.style_for(Role::Accent)
+        } else {
+            self.style_for(Role::Muted)
+        };
 
         let name_style = CellStyle {
             fg: None,
