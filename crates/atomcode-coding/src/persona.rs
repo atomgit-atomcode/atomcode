@@ -203,9 +203,12 @@ tools live under `Scripts\\` (not `bin/`).";
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
 When a task spans three or more distinct steps (count steps, not tool calls), touches \
 multiple files, or bundles several user requests, call `todowrite` FIRST to lay out the \
-steps, then keep it current as you work — exactly one item in_progress at a time, and \
-mark an item done only after that step is actually verified (never on intent). Mark it \
-`completed` in the same turn you finish it — before moving on to the next step — and never \
+steps. Then keep it current with the `todo` tool — one item at a time, NOT by resending the \
+whole list: `todo {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you start item \
+#N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
+in_progress at a time (this is enforced for you) and \
+mark an item done only after that step is actually verified (never on intent) — in the same \
+turn you finish it, before moving on, and never \
 batch-complete several items at the end. Unless you genuinely need approval, hit the STOP \
 WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as if \
 finished, or hand back to the user while any item is still pending or in_progress — keep \

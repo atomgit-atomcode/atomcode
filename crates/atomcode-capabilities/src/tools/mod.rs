@@ -82,7 +82,7 @@ pub use read::ReadFileTool;
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use todo::TodoTool;
+pub use todo::{TodoActionTool, TodoTool};
 pub use write::WriteFileTool;
 pub use write_approval::WriteApprovalGate;
 #[cfg(feature = "web")]
@@ -95,7 +95,7 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory"]
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "todo", "memory"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -130,6 +130,9 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
         .unwrap_or(false);
     if !todo_env_off {
         reg.register(Arc::new(TodoTool::new()));
+        // Incremental sibling (`todo`): single-item status patches for weak models. Same env
+        // gate — the two ship together (todowrite = plan, todo = patch).
+        reg.register(Arc::new(TodoActionTool::new()));
     }
     // Gate on ATOMCODE_MEMORY_TOOL (0/false/off → skip; absent/other → register).
     // Mirrors the TodoTool env gate; the tool name stays in `coding_tool_names()`
@@ -343,6 +346,7 @@ mod tests {
         "search_replace",
         "ast_grep",
         "todowrite",
+        "todo",
     ];
 
     #[test]

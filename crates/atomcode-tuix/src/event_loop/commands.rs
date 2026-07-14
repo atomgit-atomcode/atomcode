@@ -2163,6 +2163,7 @@ fn execute_slash_command_impl(
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / SessionSwitched).
                     state.active_todos = None;
+                    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
                     state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
@@ -4262,6 +4263,7 @@ pub(crate) fn reset_to_new_session(
     state.thinking_idx = 0;
     state.on_turn_complete();
     state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
     state.approval_panel = None;
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just

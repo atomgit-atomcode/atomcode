@@ -8899,6 +8899,15 @@ fn handle_agent_event(
             let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
 
+            // Incremental `todo` action (add / update id=N status): fold it into the live footer
+            // panel + title cache HERE — ABOVE the batch / approval early-returns below — so
+            // batched and approval-gated `todo` calls update the panel too (they return before
+            // the generic tool path). Mirrors the canonical `reduce_todos`. Unlike todowrite we
+            // do NOT suppress the row; the compact `todo #N → status` line is a useful marker.
+            if name == "todo" {
+                patch_live_todos_from_action(state, &arguments);
+            }
+
             // If this call is part of an active batch, the
             // ToolBatchStarted handler already rendered the group header
             // + child rows — skip the standalone ▸ ToolCallInFlight
@@ -8935,12 +8944,14 @@ fn handle_agent_event(
             if name == "todowrite" {
                 if let Some(progress) = todo_progress_from_args(&arguments) {
                     state.active_todos = Some(progress);
+                    sync_todo_titles(state); // titles follow the new plan (id = position)
                     // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                     pending_tools.insert(id, (display.clone(), detail, true));
                     state.on_tool_call_started(&display);
                     return;
                 }
             }
+
 
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
@@ -9017,11 +9028,11 @@ fn handle_agent_event(
             if name == "task" {
                 state.subagent_activity = None;
             }
-            // Learn task id → content from every todo result (each action
-            // returns the full list). This is what later `todo update`
-            // rows look up to show the task NAME instead of a bare id.
-            // Parsed before the batch early-return below so both batched
-            // and single todo results feed the map.
+            // Title cache (id → content, for `todo update #N` row names) is maintained by
+            // `sync_todo_titles` from `active_todos` at every panel mutation. This legacy parse
+            // stays as a harmless backstop: it only INSERTS from a full-list-shaped result and
+            // never clears, so it can't clobber the derived titles (a delta result yields no
+            // matching lines and is a no-op).
             if name == "todo" {
                 parse_todo_titles_into(&mut state.todo_titles, &output);
             }
@@ -10341,6 +10352,7 @@ fn handle_agent_event(
             state.thinking_idx = 0;
             state.on_turn_complete();
             state.active_todos = None;
+            sync_todo_titles(state); // drop prior session's titles
             state.approval_panel = None;
 
             // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
@@ -11960,6 +11972,39 @@ pub(crate) fn todo_progress_from_items(
 /// the row) — distinct from `None`, which means "unparseable, keep whatever the
 /// footer already shows". The footer todo row is live-only (cleared at turn end),
 /// so this is its sole source.
+/// Rebuild the id→title cache from the live panel's current items (id = 1-based position), so a
+/// `todo update #N` row can show the task NAME. DERIVED from `active_todos` (not accumulated from
+/// tool outputs), so a re-plan or /resume that reassigns ids never splices a stale title.
+pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
+    state.todo_titles = state
+        .active_todos
+        .as_ref()
+        .map(|p| {
+            p.items
+                .iter()
+                .enumerate()
+                .map(|(i, (_, content))| ((i + 1) as u64, content.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
+/// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
+/// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
+/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
+/// creates the panel.
+pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
+    use atomcode_capabilities::tools::todo::{apply_todo_action, TodoItem};
+    let mut items: Vec<TodoItem> = state
+        .active_todos
+        .as_ref()
+        .map(|p| p.items.iter().map(|(s, c)| TodoItem { status: *s, content: c.clone() }).collect())
+        .unwrap_or_default();
+    apply_todo_action(&mut items, args);
+    state.active_todos = if items.is_empty() { None } else { Some(todo_progress_from_items(&items)) };
+    sync_todo_titles(state);
+}
+
 pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
     atomcode_capabilities::tools::todo::parse_todos(args)
         .ok()
@@ -11976,20 +12021,23 @@ pub(crate) fn todo_progress_from_messages(
     messages: &[atomcode_core::conversation::message::Message],
 ) -> Option<crate::render::TodoProgress> {
     use atomcode_core::conversation::message::MessageContent;
-    for m in messages.iter().rev() {
-        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-            for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
-                if let Ok(todos) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
-                    if todos.is_empty() {
-                        return None; // last valid call cleared the list → hide panel
-                    }
-                    return Some(todo_progress_from_items(&todos));
-                }
-                // invalid args: skip, keep scanning for an earlier valid call
-            }
-        }
+    // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
+    // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
+    // not just the last full-list todowrite. Collect (name, args) in order first.
+    let calls: Vec<(&str, &str)> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flat_map(|tcs| tcs.iter())
+        .map(|c| (c.name.as_str(), c.arguments.as_str()))
+        .collect();
+    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    if todos.is_empty() {
+        return None; // no list, or the last valid todowrite cleared it → hide panel
     }
-    None
+    Some(todo_progress_from_items(&todos))
 }
 
 #[cfg(test)]
@@ -12060,6 +12108,37 @@ mod todo_block_tests {
         assert_eq!(p.current.as_deref(), Some("b"));
         assert_eq!(p.items.len(), 2);
         assert!(todo_progress_from_messages(&[]).is_none()); // no todowrite → None
+    }
+
+    #[test]
+    fn todo_progress_from_messages_folds_incremental_todo_events() {
+        // Replay parity: a resumed session must reflect `todo` add/update events, not just the
+        // last full-list todowrite (this was the gap the incremental tool introduced).
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_core::tool::ToolCall;
+        let call = |id: &str, name: &str, args: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments: args.into() }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let msgs = vec![
+            call("1", "todowrite", r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#),
+            call("2", "todo", r#"{"action":"update","id":1,"status":"completed"}"#),
+            call("3", "todo", r#"{"action":"add","content":"c"}"#),
+            call("4", "todo", r#"{"action":"update","id":3,"status":"in_progress"}"#),
+        ];
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        let p = todo_progress_from_messages(&msgs).expect("Some");
+        assert_eq!(p.total, 3, "the added task is counted");
+        assert_eq!(p.completed, 1);
+        assert_eq!(p.current.as_deref(), Some("c"), "the in_progress item is #3 'c'");
+        assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
     }
 }
 

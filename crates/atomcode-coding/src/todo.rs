@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::system_reminder;
-use atomcode_capabilities::tools::todo::{derive_current_todos, render_todos_text};
+use atomcode_capabilities::tools::todo::{derive_current_todos, render_todos_numbered};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 
@@ -21,12 +21,13 @@ impl LifecycleHooks for TodoHook {
         // ASCII-safe body (the model doesn't need glyph prettiness; the TUI renders
         // the pretty version). Tail-append so the cached prefix is preserved.
         let body = format!(
-            "Current task list — keep it accurate and finish it:\n\
-- The MOMENT you finish an item, call `todowrite` to mark it `completed` (do not leave a done item showing incomplete).\n\
-- Mark an item `in_progress` when you start it.\n\
+            "Current task list (each line is `#<id> <task>`) — keep it accurate and finish it:\n\
+- The MOMENT you START an item: `todo` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}}`.\n\
+- The MOMENT you FINISH an item: `todo` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}}` (do not leave a done item showing incomplete).\n\
+- Update ONE item at a time with `todo` — do NOT resend the whole list with `todowrite` (that is only for the initial plan or a full re-plan).\n\
 - Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.\n\
 {}",
-            render_todos_text(&todos, false)
+            render_todos_numbered(&todos, false)
         );
         messages.push(Message::user(system_reminder(&body)));
     }

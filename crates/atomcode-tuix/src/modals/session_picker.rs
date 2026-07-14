@@ -656,8 +656,11 @@ pub(crate) fn replay_session(
 
     // Seed the persistent todo panel from the transcript (zero extra storage) —
     // resets the previous session's panel and rehydrates the loaded one, so a
-    // session switch / resume lands on the correct list (last valid todowrite wins).
+    // session switch / resume lands on the correct list (folds todowrite + todo events).
     state.active_todos = crate::event_loop::todo_progress_from_messages(&session.messages);
+    // Rehydrate the id→title cache from the seeded panel so `todo update #N` rows resolve
+    // names immediately after a resume (and drop the previous session's titles).
+    crate::event_loop::sync_todo_titles(state);
 }
 
 #[cfg(test)]
