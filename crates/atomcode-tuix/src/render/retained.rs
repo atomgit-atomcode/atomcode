@@ -3095,22 +3095,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return;
         }
         let total = self.body_lines.len();
+        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let has_trailing_empty = total > 0 && self.body_lines[total - 1].is_empty();
+        let display_total = if hide_input_box && has_trailing_empty {
+            total - 1
+        } else {
+            total
+        };
         // Visible window starts no earlier than `scrolled_off` —
         // anything before that index already lives in native
         // scrollback and must not be re-painted into the viewport,
         // otherwise the next overflow LF promotes it a second time
         // (see `scrolled_off` doc).
-        let start = total
+        let start = display_total
             .saturating_sub(body_height)
             .max(self.scrolled_off);
-        if start >= total {
+        if start >= display_total {
             return;
         }
         let body_width = self.screen.width() as usize;
         // Clone the slice before drawing — `screen.draw_row` takes
         // &mut self.screen and the iteration would otherwise double-
         // borrow.
-        let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
+        let rows: Vec<Vec<Cell>> = self.body_lines[start..display_total].to_vec();
         for (i, row) in rows.iter().enumerate() {
             let clipped = clip_cells_to_width(row, body_width);
             self.screen.draw_row(i, 0, &clipped);
