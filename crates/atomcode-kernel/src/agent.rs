@@ -262,20 +262,19 @@ fn empty_exhaustion_message(
     }
 }
 
-/// Pre-send advisory: when the estimated OUTGOING request already meets or
-/// exceeds the model's context window, warn the user BEFORE the (likely-doomed)
-/// request. Some OpenAI-compatible gateways answer an over-window prompt with a
-/// content-free 200 instead of a 4xx, which would otherwise silently burn the
-/// empty-response retry budget. Compaction can't shrink the live user message
-/// being asked about, so the actionable advice is to trim input / `/compact` /
-/// use a larger-window model. Returns `None` within the window or when the
-/// window is unknown (`ctx_window == 0`).
+/// Pre-send advisory: the estimated OUTGOING request still meets/exceeds the
+/// model window AFTER the pre-send emergency compaction already tried (or had
+/// nothing to drain). At this point the cause is a single oversized input that
+/// compaction cannot shrink, so the ONLY actionable advice is to trim it or use a
+/// larger-window model — `/compact` is no longer suggested (we just ran it). Kept
+/// to a single concise line, matching codex/opencode's terse overflow messaging.
+/// Returns `None` within the window or when the window is unknown (`ctx_window == 0`).
 fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<String> {
     if ctx_window == 0 || (est_prompt_tokens as u64) < (ctx_window as u64) {
         return None;
     }
     Some(format!(
-        "本次请求约 {}K tokens，已达到或超过当前模型的上下文窗口（约 {}K），模型可能直接返回空响应。建议先用 /compact 压缩历史；若仍超限（单条输入本身过大），请精简输入或改用更大窗口的模型。",
+        "请求约 {}K tokens 超出当前模型窗口（约 {}K）：单条输入过大，请精简输入或换用更大窗口的模型。",
         est_prompt_tokens / 1000,
         ctx_window / 1000,
     ))
@@ -2834,13 +2833,15 @@ mod over_window_advisory_tests {
     }
 
     #[test]
-    fn advisory_is_actionable() {
+    fn advisory_is_actionable_and_one_line() {
         let m = over_window_advisory(339_000, 200_000).expect("over-window must warn");
-        assert!(m.contains("/compact"), "must suggest /compact: {m}");
+        assert!(!m.contains('\n'), "must be a single line: {m}");
+        assert!(m.contains("窗口"), "must name the window: {m}");
         assert!(
-            m.contains("上下文窗口"),
-            "must name the context window: {m}"
+            m.contains("精简") || m.contains("更大窗口"),
+            "must give actionable advice (trim / larger window): {m}"
         );
+        assert!(!m.contains("/compact"), "must NOT suggest /compact (already ran): {m}");
     }
 }
 
