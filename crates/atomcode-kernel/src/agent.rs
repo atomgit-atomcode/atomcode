@@ -89,13 +89,23 @@ const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 /// A cap of 1 makes Phase ② effectively serial (one permit) without disabling the
 /// gate. Side-effecting tools always take the exclusive write-lock regardless of
 /// this cap, so it bounds only read-only overlap.
-fn max_parallel_tools() -> usize {
+///
+/// Returns the RAW env value (or default). The caller is responsible for clamping
+/// with [`MAX_PARALLEL_TOOLS_CEILING`] before passing to `Semaphore::new`.
+fn env_max_parallel_tools() -> usize {
     std::env::var("ATOMCODE_MAX_PARALLEL_TOOLS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(4)
 }
+
+/// Hard upper bound applied to the parallel-tools cap (both the env path and the
+/// injectable `AgentBuilder::max_parallel_tools` path) before the value reaches
+/// `tokio::sync::Semaphore::new`. `Semaphore::new` panics if `permits >
+/// usize::MAX >> 3` (≈ `MAX_PERMITS`); 256 is far below that limit and is a sane
+/// practical ceiling — no real workload needs more than 256 concurrent tool calls.
+const MAX_PARALLEL_TOOLS_CEILING: usize = 256;
 
 /// Synthetic user message injected after an output-limit truncation. Mirrors v1's
 /// wording but steers toward INCREMENTAL file writes (the durable fix for output
@@ -501,6 +511,12 @@ pub struct Agent {
     /// Byte cap on a single tool result's `content` (the kernel's only built-in
     /// safety at this altitude; see `cap_tool_result`). `0` = unbounded.
     max_tool_result_bytes: usize,
+    /// Injectable override for the parallel-tools concurrency cap (Phase ②).
+    /// `None` = read `ATOMCODE_MAX_PARALLEL_TOOLS` env (default 4). `Some(n)` wins
+    /// over the env var. Either path is clamped to `[1, MAX_PARALLEL_TOOLS_CEILING]`
+    /// at the `Semaphore::new` call site so the semaphore can never panic.
+    /// See `AgentBuilder::max_parallel_tools`.
+    max_parallel_tools: Option<usize>,
     /// The REPLACEABLE compaction policy. Default `NoCompaction` (always plans a
     /// noop) → a neutral kernel never compacts. Swap it per scenario via
     /// `AgentBuilder::compaction`.
@@ -610,6 +626,7 @@ impl Agent {
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
@@ -703,6 +720,8 @@ struct RunningAgent {
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    /// Injectable parallel-tools cap (see `Agent::max_parallel_tools`). `None` = env/default.
+    max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
@@ -2324,7 +2343,14 @@ impl RunningAgent {
             // side effects in `pending_calls` order exactly as the serial loop did.
             use futures::stream::FuturesOrdered;
             let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel_tools()));
+            // Resolve the cap from the injectable override or the env/default, then
+            // clamp to [1, MAX_PARALLEL_TOOLS_CEILING] to guard Semaphore::new's
+            // internal assert (panics when permits > usize::MAX >> 3 ≈ MAX_PERMITS).
+            let cap = self
+                .max_parallel_tools
+                .unwrap_or_else(env_max_parallel_tools)
+                .clamp(1, MAX_PARALLEL_TOOLS_CEILING);
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
 
             // Results aligned to `plans`: `None` for Skip / not-executed slots; the
             // ready `Result(r)` payloads are moved into place so Phase ③ has a
@@ -2570,6 +2596,9 @@ pub struct AgentBuilder {
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    /// Injectable override for the Phase ② concurrency cap. `None` = env/default.
+    /// See `Agent::max_parallel_tools` and `AgentBuilder::max_parallel_tools`.
+    max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     stream_timeout: Option<std::time::Duration>,
@@ -2608,6 +2637,9 @@ impl Default for AgentBuilder {
             // BOUNDED by default — a mounted tool's content cannot blow the
             // context window / OOM the host unless the embedder opts into `0`.
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            // NEUTRAL default: `None` → read ATOMCODE_MAX_PARALLEL_TOOLS env (or
+            // fall back to 4). An embedder opts in via `AgentBuilder::max_parallel_tools`.
+            max_parallel_tools: None,
             // NEUTRAL default: no strategy injected → NoCompaction (always noop) and
             // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
             compaction: Arc::new(NoCompaction),
@@ -2710,6 +2742,16 @@ impl AgentBuilder {
     /// cap (UNBOUNDED) — only do this if every mounted tool self-caps.
     pub fn max_tool_result_bytes(mut self, n: usize) -> Self {
         self.max_tool_result_bytes = n;
+        self
+    }
+    /// Override the Phase ② parallel-tools concurrency cap. `n` controls how many
+    /// `parallel_safe` (read-only) tools may execute simultaneously; it is clamped
+    /// to `[1, MAX_PARALLEL_TOOLS_CEILING]` at the `Semaphore::new` call site.
+    /// When not set, the cap is read from `ATOMCODE_MAX_PARALLEL_TOOLS` env (default
+    /// 4). Use this in tests and embedders that need a deterministic, process-global-
+    /// env-free cap (avoids the env-var race between parallel test threads).
+    pub fn max_parallel_tools(mut self, n: usize) -> Self {
+        self.max_parallel_tools = Some(n);
         self
     }
     /// RESUME a persisted session: SEED the conversation from `snapshot.messages`
@@ -2867,6 +2909,7 @@ impl AgentBuilder {
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             stream_timeout: self.stream_timeout,
@@ -3315,6 +3358,48 @@ mod session_affinity_tests {
         assert!(
             seen.lock().unwrap().is_none(),
             "without a session id the provider must stay unbound so the affinity header is omitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parallel_tools_cap_clamp_tests {
+    use super::{env_max_parallel_tools, MAX_PARALLEL_TOOLS_CEILING};
+
+    /// A huge env value must clamp to the ceiling — not reach `Semaphore::new`
+    /// and panic. We test the clamp expression directly (no env mutation needed).
+    #[test]
+    fn huge_value_clamps_to_ceiling() {
+        assert_eq!(
+            usize::MAX.clamp(1, MAX_PARALLEL_TOOLS_CEILING),
+            MAX_PARALLEL_TOOLS_CEILING,
+            "usize::MAX must clamp to MAX_PARALLEL_TOOLS_CEILING before Semaphore::new"
+        );
+    }
+
+    /// The ceiling constant must itself be safely below tokio's MAX_PERMITS
+    /// (usize::MAX >> 3). If this assertion ever fails, raise the guard.
+    #[test]
+    fn ceiling_is_below_tokio_max_permits() {
+        let tokio_max_permits = usize::MAX >> 3;
+        assert!(
+            MAX_PARALLEL_TOOLS_CEILING < tokio_max_permits,
+            "MAX_PARALLEL_TOOLS_CEILING ({}) must be below tokio MAX_PERMITS ({})",
+            MAX_PARALLEL_TOOLS_CEILING,
+            tokio_max_permits
+        );
+    }
+
+    /// The default (no env set) must be a valid, clamped value.
+    #[test]
+    fn default_cap_is_within_bounds() {
+        // env_max_parallel_tools() reads the env; in a test context with no env var set
+        // it returns 4. We only care that the value survives the clamp unchanged.
+        let raw = env_max_parallel_tools();
+        let clamped = raw.clamp(1, MAX_PARALLEL_TOOLS_CEILING);
+        assert_eq!(
+            raw, clamped,
+            "the default cap ({raw}) must already be within [1, {MAX_PARALLEL_TOOLS_CEILING}]"
         );
     }
 }

@@ -75,7 +75,8 @@ async fn read_only_tools_run_concurrently() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn concurrency_is_capped() {
-    std::env::set_var("ATOMCODE_MAX_PARALLEL_TOOLS", "2");
+    // Use the injectable cap (no process-global env mutation → no race with
+    // parallel test threads that read the same env var).
     let inflight = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let mut reg = ToolRegistry::new();
@@ -88,12 +89,16 @@ async fn concurrency_is_capped() {
         calls,
         vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
     ]));
-    let mut handle = Agent::builder().provider(provider).tools(reg.mount(&names)).build().spawn();
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&names))
+        .max_parallel_tools(2)
+        .build()
+        .spawn();
     handle.commands.send(send("go")).unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) { break; }
     }
-    std::env::remove_var("ATOMCODE_MAX_PARALLEL_TOOLS");
     assert!(peak.load(Ordering::SeqCst) <= 2, "cap=2 must bound in-flight, got {}", peak.load(Ordering::SeqCst));
 }
 
