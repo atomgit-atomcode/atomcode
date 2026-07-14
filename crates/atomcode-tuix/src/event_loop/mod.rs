@@ -7547,6 +7547,31 @@ fn handle_streaming_key(
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
     let menu_items = menu_for_display(&app.buf, ctx);
+
+    // Tab / Shift+Tab cycle execution mode MID-TURN (when no completion menu is
+    // up), mirroring the idle handler. `SetMode` flips atomic flags the agent loop
+    // reads on each subsequent tool call, so the switch applies LIVE to the rest of
+    // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
+    // approvals are not retroactively changed — only later tool calls see the new
+    // mode. Repaint the spinner footer so the mode badge updates immediately.
+    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
+        let next = if code == KeyCode::BackTab {
+            app.state.agent_mode.prev()
+        } else {
+            app.state.agent_mode.next()
+        };
+        set_agent_mode(app, ctx, renderer, next);
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
