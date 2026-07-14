@@ -15,7 +15,7 @@
 //!   nothing; rating it `Risky` stops nothing on its own.
 //! * The kernel's ONE built-in safety mechanism at this altitude is the
 //!   **tool-result size cap** (`agent::AgentBuilder::max_tool_result_bytes`,
-//!   default 256 KiB): it bounds how many bytes a tool result can inject into the
+//!   default 64 KiB): it bounds how many bytes a tool result can inject into the
 //!   context window / host memory. That is the limit of what the kernel can own
 //!   here.
 //! * **OS-level isolation is the EMBEDDER's responsibility**, not the kernel's.

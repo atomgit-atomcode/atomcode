@@ -2706,7 +2706,7 @@ impl AgentBuilder {
     /// trust-model contract on `crate::tool`). A result whose content exceeds `n`
     /// bytes is truncated on a UTF-8 char boundary with a marker before it reaches
     /// the model, the stored history, or the driver — bounding context growth.
-    /// Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`] (256 KiB). `0` DISABLES the
+    /// Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`] (64 KiB). `0` DISABLES the
     /// cap (UNBOUNDED) — only do this if every mounted tool self-caps.
     pub fn max_tool_result_bytes(mut self, n: usize) -> Self {
         self.max_tool_result_bytes = n;
