@@ -87,10 +87,18 @@ pub struct McpToolAnnotations {
 }
 
 impl McpToolDefinition {
-    /// True only when the server EXPLICITLY annotated this tool `readOnlyHint: true`.
-    /// Conservative: unknown / unannotated → false.
+    /// True only when the server EXPLICITLY annotated this tool `readOnlyHint: true`
+    /// AND did NOT also flag it `destructiveHint: true`. A tool that claims to be both
+    /// read-only and destructive is contradictory self-attestation, so we fail closed
+    /// and treat it as NOT read-only — matching codex, which forces approval whenever
+    /// `destructiveHint: true`, even alongside `readOnlyHint`. Conservative throughout:
+    /// unknown / unannotated → false.
     pub fn is_read_only(&self) -> bool {
-        matches!(self.annotations, Some(McpToolAnnotations { read_only_hint: Some(true), .. }))
+        matches!(
+            self.annotations,
+            Some(McpToolAnnotations { read_only_hint: Some(true), destructive_hint, .. })
+                if destructive_hint != Some(true)
+        )
     }
 }
 
@@ -182,5 +190,18 @@ mod tests {
         }))
         .unwrap();
         assert!(!write.is_read_only());
+    }
+
+    #[test]
+    fn destructive_hint_overrides_read_only_hint() {
+        // Contradictory self-attestation: readOnlyHint AND destructiveHint both true.
+        // Fail closed → NOT read-only, so it still requires approval (codex parity —
+        // codex forces approval on destructiveHint:true even alongside readOnlyHint).
+        let contradictory: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "wipe", "inputSchema": {},
+            "annotations": { "readOnlyHint": true, "destructiveHint": true }
+        }))
+        .unwrap();
+        assert!(!contradictory.is_read_only(), "destructiveHint:true must veto readOnlyHint");
     }
 }

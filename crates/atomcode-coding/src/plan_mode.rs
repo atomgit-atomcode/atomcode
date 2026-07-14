@@ -71,8 +71,10 @@ impl ToolMiddleware for PlanModeGate {
         }
 
         if call.name.starts_with("mcp__") {
-            // A server-declared read-only external query can't modify anything → allow it
-            // (it is `Safe`, so the downstream approval gate won't prompt either).
+            // A server-declared read-only external query can't modify anything → proceed.
+            // It is `Safe`, so the ApprovalMiddleware won't prompt for it either; a later
+            // guard (e.g. SensitivePathGate) may still fire if the args touch a secret path,
+            // which is the intended exfiltration guard — same as outside plan mode.
             if tool.read_only_hint() {
                 return BeforeOutcome::Proceed;
             }
