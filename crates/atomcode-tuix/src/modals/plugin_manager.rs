@@ -191,17 +191,17 @@ impl PluginManager {
         };
         let installed_count = self.installed.len();
         let t0 = if current_tab == 0 {
-            " \x1b[1;7m Browse Marketplaces \x1b[22;27m "
+            "  \x1b[1;92mBrowse Marketplaces\x1b[22;39m  "
         } else {
             "  \x1b[1mBrowse Marketplaces\x1b[22m  "
         };
         let t1 = if current_tab == 1 {
-            format!(" \x1b[1;7m Installed ({}) \x1b[22;27m ", installed_count)
+            format!("  \x1b[1;92mInstalled ({})\x1b[22;39m  ", installed_count)
         } else {
             format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
         };
         let t2 = if current_tab == 2 {
-            " \x1b[1;7m Marketplaces \x1b[22;27m "
+            "  \x1b[1;92mMarketplaces\x1b[22;39m  "
         } else {
             "  \x1b[1mMarketplaces\x1b[22m  "
         };
