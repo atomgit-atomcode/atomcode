@@ -743,7 +743,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
         Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
         Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
-        Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+        Msg::PluginMgrHintUrl => "Enter to add · Esc to cancel".into(),
 Msg::PluginMgrHintPending => "Installing, please wait… · esc back".into(),
 Msg::PluginMgrHintUpdating => "Updating, please wait… · esc back".into(),
 Msg::PluginMgrInstallingLabel => "Installing…".into(),

@@ -728,7 +728,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
         Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
         Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
-        Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+        Msg::PluginMgrHintUrl => "⏎ 确认添加 · esc 取消".into(),
 Msg::PluginMgrHintPending => "安装中，请稍候… · esc 返回".into(),
 Msg::PluginMgrHintUpdating => "更新中，请稍候… · esc 返回".into(),
 Msg::PluginMgrInstallingLabel => "安装中…".into(),

@@ -389,6 +389,8 @@ pub enum MenuKind {
     /// Row 1: Plugin Name + Marketplace + Installation Status
     /// Row 2: Description
     Plugin,
+    /// Marketplace list tab screen: 3-line rendering + 1 blank line separator per item
+    Marketplace,
 }
 
 impl MenuKind {
@@ -404,6 +406,12 @@ impl MenuKind {
                 let max_plugins = (screen_height / 4).max(2);
                 let visible_plugins = plugin_count.min(max_plugins);
                 3 + visible_plugins * 2
+            }
+            MenuKind::Marketplace => {
+                let mp_count = (item_count.saturating_sub(4)) / 2;
+                let max_mps = (screen_height / 6).max(1);
+                let visible_mps = mp_count.min(max_mps);
+                5 + visible_mps * 4
             }
         }
     }

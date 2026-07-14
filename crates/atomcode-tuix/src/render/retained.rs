@@ -1591,6 +1591,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
+            super::MenuKind::Marketplace => {
+                if selected {
+                    format!("▸ {}", name)
+                } else {
+                    format!("  {}", name)
+                }
+            }
         };
 
         let mut style = if selected {
@@ -1615,6 +1622,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let is_hint = name.starts_with('—') && name.ends_with('—');
         if is_hint {
+            style = self.style_for(Role::Muted);
+        }
+        let is_add_marketplace = name == "+ Add Marketplace";
+        if is_add_marketplace && !selected {
+            style = self.style_bold(Role::Brand);
+        }
+        let is_add_title = name == "Add Marketplace";
+        if is_add_title {
+            style = CellStyle {
+                fg: None,
+                bold: true,
+                reverse: false,
+                faint: false,
+            };
+        }
+        let is_muted = name == "Examples:" || name.starts_with("  ·");
+        if is_muted {
             style = self.style_for(Role::Muted);
         }
         push_str_cells_sgr(&mut row, &content, style.clone());
@@ -1725,6 +1749,92 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         vec![row1, row2]
+    }
+
+    fn build_marketplace_menu_rows(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let parts: Vec<&str> = desc.split('|').collect();
+        let source = parts.get(0).copied().unwrap_or("");
+        let available = parts.get(1).copied().unwrap_or("0");
+        let installed = parts.get(2).copied().unwrap_or("0");
+        let updated = parts.get(3).copied().unwrap_or("");
+
+        let bullet = "● ";
+        let bullet_style = self.style_for(Role::Brand);
+
+        let name_style = if selected {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: true,
+                faint: false,
+            }
+        } else {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: false,
+                faint: false,
+            }
+        };
+
+        let mut row1 = Vec::new();
+        push_str_cells_sgr(&mut row1, bullet, bullet_style);
+        push_str_cells_sgr(&mut row1, name, name_style.clone());
+        let content_w1 = crate::width::display_width(bullet) + crate::width::display_width(name);
+        let right_pad1 = rule_width.saturating_sub(content_w1);
+        for _ in 0..right_pad1 {
+            row1.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected { name_style.clone() } else { CellStyle::default() },
+            });
+        }
+
+        let style2 = if selected {
+            CellStyle {
+                fg: None,
+                bold: false,
+                reverse: true,
+                faint: true,
+            }
+        } else {
+            let mut s = self.style_for(Role::Secondary);
+            s.faint = true;
+            s
+        };
+        let line2_str = format!("  {}", source);
+        let mut row2 = Vec::new();
+        push_str_cells_sgr(&mut row2, &line2_str, style2.clone());
+        let content_w2 = crate::width::display_width(&line2_str);
+        let right_pad2 = rule_width.saturating_sub(content_w2);
+        for _ in 0..right_pad2 {
+            row2.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected { style2.clone() } else { CellStyle::default() },
+            });
+        }
+
+        let line3_str = format!("  {} available • {} installed • Updated {}", available, installed, updated);
+        let mut row3 = Vec::new();
+        push_str_cells_sgr(&mut row3, &line3_str, style2.clone());
+        let content_w3 = crate::width::display_width(&line3_str);
+        let right_pad3 = rule_width.saturating_sub(content_w3);
+        for _ in 0..right_pad3 {
+            row3.push(Cell {
+                ch: ' ',
+                width: 1,
+                style: if selected { style2.clone() } else { CellStyle::default() },
+            });
+        }
+
+        vec![row1, row2, row3]
     }
 
     fn build_status_row(&self, status: &StatusLine, rule_width: usize) -> Vec<Cell> {
@@ -2195,7 +2305,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_rows = if let Some(m) = self.menu.as_ref() {
             let mut sum = menu_items.iter().enumerate().map(|(i, _)| {
                 let orig_idx = actual_offset + i;
-                if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < m.items.len().saturating_sub(1) {
+                if menu_kind == super::MenuKind::Marketplace && orig_idx >= 3 && orig_idx < m.items.len().saturating_sub(1) {
+                    if orig_idx % 2 == 0 {
+                        3
+                    } else {
+                        1
+                    }
+                } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < m.items.len().saturating_sub(1) {
                     2
                 } else {
                     1
@@ -2262,6 +2378,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
+        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace);
         let total_rows = self.footer_total_rows(
             middle_rows,
             attachment_rows,
@@ -2270,6 +2387,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             todo_rows,
             approval_rows,
             status_rows,
+            hide_input_box,
         );
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
@@ -2298,7 +2416,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let hidden_rows = lines.len() - middle_rows;
         let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows);
         let status_clone = self.status.clone();
-        let status_cells = if has_status {
+        let status_cells = if has_status && !hide_input_box {
             Some(self.build_status_row(&status_clone, rule_width))
         } else {
             None
@@ -2332,7 +2450,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = actual_offset + i;
             let selected = selected_in_view == Some(i);
-            if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < final_len.saturating_sub(1) {
+            if menu_kind == super::MenuKind::Marketplace && orig_idx >= 3 && orig_idx < final_len.saturating_sub(1) {
+                if orig_idx % 2 == 0 {
+                    menu_cells.extend(self.build_marketplace_menu_rows(name, desc, selected, rule_width));
+                } else {
+                    menu_cells.push(Vec::new());
+                }
+            } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < final_len.saturating_sub(1) {
                 menu_cells.extend(self.build_plugin_menu_rows(name, desc, selected, rule_width));
             } else {
                 menu_cells.push(self.build_menu_row(name, desc, selected, rule_width, menu_kind));
@@ -2376,9 +2500,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let rules_top = footer_top + todo_rows;
 
-        let mut top_rule = top_rule;
-        Self::pad_row_to_width(&mut top_rule, w);
-        self.screen.draw_row(rules_top, 0, &top_rule);
+        if !hide_input_box {
+            let mut top_rule = top_rule;
+            Self::pad_row_to_width(&mut top_rule, w);
+            self.screen.draw_row(rules_top, 0, &top_rule);
+        }
 
         // `post_approval` is the row index immediately after whatever occupies the
         // slot between the top rule and the attachment rows — either the approval
@@ -2394,6 +2520,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             // Cursor visibility handled by the common suppress_cursor block below.
             rules_top + 1 + approval_rows
+        } else if hide_input_box {
+            rules_top
         } else {
             // Normal (no approval): draw middle rows then bot_rule.
             for (i, r) in middle_cells.into_iter().enumerate() {
@@ -2430,6 +2558,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
+        if hide_input_box {
+            let is_add_url = menu_kind == super::MenuKind::Marketplace
+                && self.menu.as_ref()
+                    .and_then(|m| m.items.get(2))
+                    .map(|(name, _)| name == "Add Marketplace")
+                    .unwrap_or(false);
+            if is_add_url {
+                let cursor_abs_row = (menu_top + 11 + 1) as u16;
+                let cursor_abs_col = (2 + self.input_cursor_byte + 1) as u16;
+                self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+            }
+        }
         // Invalidate prev_cells for the menu rows so the next render_diff
         // emits explicit patches for EVERY cell (including blank padding at
         // the right edge). Without this, a CJK character from a prior frame's
@@ -2508,12 +2648,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         todo: usize,
         approval: usize,
         status: usize,
+        hide_input_box: bool,
     ) -> usize {
         let approval_active = approval > 0;
-        let eff_middle   = if approval_active { 0 } else { middle };
-        let eff_bot_rule = if approval_active { 0 } else { 1 };
-        let eff_status   = if approval_active { 0 } else { status };
-        1 /* top rule */ + eff_middle + eff_bot_rule + attachment + menu + goal + todo + approval + eff_status
+        let eff_middle   = if approval_active || hide_input_box { 0 } else { middle };
+        let eff_bot_rule = if approval_active || hide_input_box { 0 } else { 1 };
+        let eff_status   = if approval_active || hide_input_box { 0 } else { status };
+        let eff_top_rule = if hide_input_box { 0 } else { 1 };
+        eff_top_rule + eff_middle + eff_bot_rule + attachment + menu + goal + todo + approval + eff_status
     }
 
     /// Footer total height — mirrors the computation inside
@@ -2566,6 +2708,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
         // Delegates to footer_total_rows so both functions share one formula.
+        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
+        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace);
         self.footer_total_rows(
             capped_middle,
             attachment_rows,
@@ -2574,6 +2718,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             todo_rows,
             approval_rows,
             status_rows,
+            hide_input_box,
         )
     }
 

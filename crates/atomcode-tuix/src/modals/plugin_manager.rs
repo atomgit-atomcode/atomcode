@@ -42,6 +42,7 @@ enum Screen {
     /// Waits for async install to complete; Esc cancels.
     Installing { plugin: String, mp: String },
     InstalledDetails { plugin: String, mp: String, scope: InstallScope },
+    Marketplaces,
 }
 
 #[derive(Clone)]
@@ -186,7 +187,7 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::AddUrl => 2,
+            Screen::Marketplaces | Screen::AddUrl => 2,
         };
         let installed_count = self.installed.len();
         let t0 = if current_tab == 0 {
@@ -200,9 +201,9 @@ impl PluginManager {
             format!("  Installed ({})  ", installed_count)
         };
         let t2 = if current_tab == 2 {
-            " \x1b[1;7m Add Marketplace... \x1b[22;27m "
+            " \x1b[1;7m Marketplaces \x1b[22;27m "
         } else {
-            "  Add Marketplace...  "
+            "  Marketplaces  "
         };
         format!("{}   {}   {}", t0, t1, t2)
     }
@@ -213,7 +214,7 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::AddUrl => 2,
+            Screen::Marketplaces | Screen::AddUrl => 2,
         };
         let next_tab = if forward {
             (current_tab + 1) % 3
@@ -225,8 +226,7 @@ impl PluginManager {
             0 => self.goto(Screen::Browse),
             1 => self.goto(Screen::Installed),
             2 => {
-                self.url_input.clear();
-                self.goto(Screen::AddUrl);
+                self.goto(Screen::Marketplaces);
             }
             _ => {}
         }
@@ -253,6 +253,7 @@ impl PluginManager {
             Screen::ScopeSelect { .. } => 3, // user / project / local
             Screen::Installing { .. } => 0, // No selectable rows — just status text
             Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
+            Screen::Marketplaces => 1 + self.marketplaces.len(),
         }
     }
 
@@ -359,6 +360,53 @@ impl PluginManager {
             let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
                 Ok(info) => PluginJobEvent::MarketplaceAdded(info),
                 Err(e) => PluginJobEvent::Failed { op: "add".into(), msg: format!("{:#}", e) },
+            };
+            let _ = tx.send(ev);
+        });
+    }
+
+    fn enter_marketplaces(&mut self, ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            self.url_input.clear();
+            self.goto(Screen::AddUrl);
+        } else {
+            if let Some(m) = self.marketplaces.get(self.selected - 1) {
+                self.dispatch_update_marketplace(m.name.clone(), ctx);
+            }
+        }
+    }
+
+    fn remove_selected_marketplace(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            return;
+        }
+        if let Some(m) = self.marketplaces.get(self.selected - 1) {
+            let name = m.name.clone();
+            match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
+                Ok(()) => {
+                    reload_plugins(ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
+                    ));
+                    self.reload();
+                    let n = self.current_len();
+                    if self.selected >= n && n > 0 {
+                        self.selected = n - 1;
+                    }
+                }
+                Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+            }
+            renderer.flush();
+        }
+    }
+
+    fn dispatch_update_marketplace(&mut self, name: String, ctx: &LoopCtx) {
+        let tx = ctx.plugin_job_tx.clone();
+        self.pending = Some(format!("Updating marketplace '{}'...", name));
+        tokio::task::spawn_blocking(move || {
+            let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
+                Ok(info) => PluginJobEvent::MarketplaceUpdated(info),
+                Err(e) => PluginJobEvent::Failed { op: "update".into(), msg: format!("{:#}", e) },
             };
             let _ = tx.send(ev);
         });
@@ -571,7 +619,31 @@ impl PluginManager {
                     .collect();
                 (rows, t(Msg::PluginMgrHintUninstall).into_owned())
             }
-            Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
+            Screen::AddUrl => {
+                let rows = vec![
+                    ("Add Marketplace".to_string(), String::new()),
+                    (String::new(), String::new()),
+                    ("Enter marketplace source:".to_string(), String::new()),
+                    ("Examples:".to_string(), String::new()),
+                    ("  · owner/repo (GitHub)".to_string(), String::new()),
+                    ("  · git@github.com:owner/repo.git (SSH)".to_string(), String::new()),
+                    ("  · https://example.com/marketplace.json".to_string(), String::new()),
+                    ("  · ./path/to/marketplace".to_string(), String::new()),
+                    (String::new(), String::new()),
+                ];
+                (rows, t(Msg::PluginMgrHintUrl).into_owned())
+            }
+            Screen::Marketplaces => {
+                let mut rows = Vec::new();
+                for m in &self.marketplaces {
+                    let available = m.plugins.len();
+                    let installed = self.installed.iter().filter(|i| i.marketplace == m.name).count();
+                    let updated = get_directory_modified_date(&m.name);
+                    let desc = format!("{}|{}|{}|{}", m.source, available, installed, updated);
+                    rows.push((m.name.clone(), desc));
+                }
+                (rows, t(Msg::PluginMgrHintNav).into_owned())
+            }
             Screen::ScopeSelect { .. } => {
                 let installing = self.installing_plugin.is_some();
                 let (user_lbl, user_desc) = if installing && self.installing_scope == Some(InstallScope::User) {
@@ -649,7 +721,7 @@ impl Modal for PluginManager {
             match code {
                 KeyCode::Esc => {
                     self.url_input.clear();
-                    return Ok(ModalAction::Close);
+                    self.goto(Screen::Marketplaces);
                 }
                 KeyCode::Left | KeyCode::BackTab => {
                     self.switch_tab(false);
@@ -698,11 +770,15 @@ impl Modal for PluginManager {
                     self.selected = 0;
                 } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
+                } else if matches!(self.screen, Screen::Marketplaces) {
+                    self.remove_selected_marketplace(ctx, renderer);
                 }
             }
             KeyCode::Delete => {
                 if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
+                } else if matches!(self.screen, Screen::Marketplaces) {
+                    self.remove_selected_marketplace(ctx, renderer);
                 }
             }
             KeyCode::Esc => {
@@ -760,6 +836,7 @@ impl Modal for PluginManager {
                         Screen::Installed => self.enter_installed(ctx, renderer),
                         Screen::InstalledDetails { .. } => self.enter_installed_details(ctx, renderer),
                         Screen::AddUrl => {}
+                        Screen::Marketplaces => self.enter_marketplaces(ctx, renderer),
                     }
                 }
             }
@@ -851,8 +928,17 @@ impl Modal for PluginManager {
             }
         }
 
-        for item in items {
-            final_items.push(item);
+        if matches!(self.screen, Screen::Marketplaces) {
+            final_items.push(("+ Add Marketplace".to_string(), String::new()));
+            final_items.push((String::new(), String::new()));
+            for item in items {
+                final_items.push(item);
+                final_items.push((String::new(), String::new()));
+            }
+        } else {
+            for item in items {
+                final_items.push(item);
+            }
         }
         final_items.push((format!("— {} —", hint), String::new()));
 
@@ -860,11 +946,18 @@ impl Modal for PluginManager {
         let selected = if selectable == 0 {
             // No items are selectable, so nothing should be highlighted.
             final_items.len()
+        } else if matches!(self.screen, Screen::Marketplaces) {
+            if self.selected == 0 {
+                2
+            } else {
+                4 + (self.selected - 1) * 2
+            }
         } else {
             (self.selected + selected_offset).min(final_items.len().saturating_sub(2))
         };
         let kind = match &self.screen {
             Screen::Browse | Screen::Installed => MenuKind::Plugin,
+            Screen::Marketplaces | Screen::AddUrl => MenuKind::Marketplace,
             _ => MenuKind::Skill,
         };
         let payload = MenuPayload {
@@ -941,11 +1034,36 @@ impl Modal for PluginManager {
         if let Screen::Installing { .. } = &self.screen {
             self.goto(Screen::Browse);
         }
+        if let Screen::AddUrl = &self.screen {
+            self.goto(Screen::Marketplaces);
+        }
     }
 
+
+    
     fn close_requested(&self) -> bool {
         self.close_requested
     }
+}
+
+fn get_directory_modified_date(name: &str) -> String {
+    if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+        let dir = root.join(name);
+        let target = if dir.join(".atomcode-plugin/marketplace.json").exists() {
+            dir.join(".atomcode-plugin/marketplace.json")
+        } else if dir.join(".git").exists() {
+            dir.join(".git")
+        } else {
+            dir
+        };
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            if let Ok(modified) = metadata.modified() {
+                let dt: chrono::DateTime<chrono::Local> = modified.into();
+                return dt.format("%-m/%-d/%Y").to_string();
+            }
+        }
+    }
+    "unknown".to_string()
 }
 
 fn get_mock_category(name: &str) -> &'static str {
@@ -1241,5 +1359,49 @@ mod tests {
         assert!(rows[0].0.contains("Update") || rows[0].0.contains("更新"));
         assert!(rows[1].0.contains("Uninstall") || rows[1].0.contains("卸载"));
         assert!(rows[2].0.contains("Back") || rows[2].0.contains("返回"));
+    }
+
+    #[test]
+    fn marketplaces_screen_rows_and_navigation() {
+        let mps = vec![
+            MarketplaceInfo {
+                name: "test-marketplace".to_string(),
+                source: "https://example.com/test-marketplace.git".to_string(),
+                git_commit: "commit123".to_string(),
+                plugins: vec!["plugin1".to_string(), "plugin2".to_string()],
+            }
+        ];
+        let mut m = manager(mps, vec![]);
+        m.goto(Screen::Marketplaces);
+        
+        // current_len should be 1 (+ Add Marketplace) + 1 (test-marketplace) = 2
+        assert_eq!(m.current_len(), 2);
+        
+        // rows should return test-marketplace with formatting info
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "test-marketplace");
+        assert!(rows[0].1.contains("https://example.com/test-marketplace.git"));
+        assert!(rows[0].1.contains("2|0|unknown")); // 2 available, 0 installed, unknown updated
+    }
+
+    #[test]
+    fn add_marketplace_help_screen_rows() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::AddUrl);
+        
+        // current_len should be 0 since it is text-entry only
+        assert_eq!(m.current_len(), 0);
+        
+        let (rows, hint) = m.rows();
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[0].0, "Add Marketplace");
+        assert_eq!(rows[2].0, "Enter marketplace source:");
+        assert_eq!(rows[3].0, "Examples:");
+        assert!(rows[4].0.contains("owner/repo"));
+        assert!(rows[5].0.contains("git@github.com"));
+        assert!(rows[6].0.contains("https://example.com/marketplace.json"));
+        assert!(rows[7].0.contains("./path/to/marketplace"));
+        assert!(hint.contains("to add") || hint.contains("添加"));
     }
 }
