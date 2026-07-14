@@ -258,7 +258,7 @@ impl PluginManager {
             Screen::Installing { .. } => 0, // No selectable rows — just status text
             Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
             Screen::Marketplaces => 1 + self.marketplaces.len(),
-            Screen::MarketplaceDetails { .. } => 4,
+            Screen::MarketplaceDetails { .. } => 3,
         }
     }
 
@@ -394,15 +394,6 @@ impl PluginManager {
                     self.dispatch_update_marketplace(mp_name, ctx);
                 }
                 2 => {
-                    let mut set = load_auto_update_marketplaces();
-                    if set.contains(&mp_name) {
-                        set.remove(&mp_name);
-                    } else {
-                        set.insert(mp_name);
-                    }
-                    save_auto_update_marketplaces(&set);
-                }
-                3 => {
                     self.dispatch_remove_marketplace(mp_name, ctx, renderer);
                 }
                 _ => {}
@@ -745,15 +736,6 @@ impl PluginManager {
                     
                     let last_updated = get_directory_modified_date(&m.name);
                     rows.push((format!("Update marketplace (last updated {})", last_updated), String::new()));
-                    
-                    let set = load_auto_update_marketplaces();
-                    let auto_update_enabled = set.contains(&m.name);
-                    let auto_update_text = if auto_update_enabled {
-                        "Disable auto-update"
-                    } else {
-                        "Enable auto-update"
-                    };
-                    rows.push((auto_update_text.to_string(), String::new()));
                     
                     rows.push(("Remove marketplace".to_string(), String::new()));
                 }
@@ -1231,26 +1213,7 @@ fn get_directory_modified_date(name: &str) -> String {
     "unknown".to_string()
 }
 
-fn load_auto_update_marketplaces() -> HashSet<String> {
-    if let Some(root) = atomcode_core::plugin::plugins_root() {
-        let path = root.join("auto_update_marketplaces.json");
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(set) = serde_json::from_str(&content) {
-                return set;
-            }
-        }
-    }
-    HashSet::new()
-}
 
-fn save_auto_update_marketplaces(set: &HashSet<String>) {
-    if let Some(root) = atomcode_core::plugin::plugins_root() {
-        let path = root.join("auto_update_marketplaces.json");
-        if let Ok(content) = serde_json::to_string(set) {
-            let _ = std::fs::write(path, content);
-        }
-    }
-}
 
 fn get_mock_category(name: &str) -> &'static str {
     let lower = name.to_lowercase();
