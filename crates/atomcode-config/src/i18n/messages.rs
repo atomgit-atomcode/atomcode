@@ -235,6 +235,9 @@ pub enum Msg<'a> {
     // ── Approval panel ──
     ApprovalAllowOnce,
     ApprovalAlwaysAllow { tool: &'a str },
+    /// "Always" for the single-file write tools, whose grant is scoped to the
+    /// target's DIRECTORY (not the whole tool) — so the label names the folder.
+    ApprovalAlwaysAllowFolder,
     ApprovalDeny,
     ApprovalHint,
 

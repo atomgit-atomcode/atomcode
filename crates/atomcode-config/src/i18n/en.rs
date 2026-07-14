@@ -317,6 +317,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Approval panel ──
         Msg::ApprovalAllowOnce => "Allow once".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
+        Msg::ApprovalAlwaysAllowFolder => {
+            "Always allow writes to this folder (this session)".into()
+        }
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
         Msg::ToolDenied => "denied".into(),

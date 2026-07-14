@@ -8,7 +8,7 @@
 //! `edit_file::`), so one approval silently covered every later write this session — to ANY
 //! path, including `~/.ssh/authorized_keys` / `.env` / `/etc/...`. v1 instead:
 //! - AUTO-APPROVED in-workspace non-sensitive writes (no prompt at all), and
-//! - scoped "Always" PER CANONICAL FILE PATH for out-of-workspace writes, while
+//! - scoped "Always" PER CANONICAL DIRECTORY for out-of-workspace writes, while
 //! - treating SENSITIVE writes as un-grantable (prompt every time, never remembered).
 //!
 //! This gate reproduces that, in v2's middleware idiom. It fully OWNS approval for the write
@@ -24,7 +24,7 @@
 //! |---|---|
 //! | sensitive path (any location) | prompt EVERY time, never remembered |
 //! | in-workspace, non-sensitive | auto-approve, no prompt (v1 parity) |
-//! | out-of-workspace, non-sensitive | prompt; "Always" remembered PER canonical path (`edit_file`/`write_file`) or PER tool (`search_replace`/`parallel_edit_files`, which have no single target file) |
+//! | out-of-workspace, non-sensitive | prompt; "Always" remembered PER canonical DIRECTORY across `edit_file`/`write_file` (codex `grant_root` style — one approval covers sibling writes in that folder) or PER tool (`search_replace`/`parallel_edit_files`, which have no single target file) |
 //!
 //! Sensitivity is checked FIRST, so an in-workspace `.env` / `id_rsa` still prompts. New files
 //! (not yet on disk) are classified by their deepest EXISTING ancestor, and `..` escapes are
@@ -117,21 +117,30 @@ pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
     false
 }
 
-/// The session-grant key for an out-of-workspace, non-sensitive write. `edit_file`/`write_file`
-/// scope PER canonical file path (so "Always" on one file does not cover another); the bulk /
-/// multi-file tools have no single target and stay tool-wide.
-fn canonical_key(raw: &str, cwd: &Path) -> String {
+/// The session-grant key fragment for an out-of-workspace, non-sensitive write:
+/// the canonical PARENT DIRECTORY of the target (codex `grant_root` style). Scoping
+/// to the folder — not the exact file — means approving one write under a directory
+/// covers sibling writes in that same directory this session (e.g. several report
+/// files under `~/Downloads/…`), without opening any other location.
+fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     let resolved = resolve_path(raw, cwd);
-    // Lexical fallback when the file does not exist yet (v1 did the same — keeps the key stable
-    // across the create-then-edit sequence in the common case where the parent exists).
-    std::fs::canonicalize(&resolved).unwrap_or(resolved).to_string_lossy().into_owned()
+    // Scope to the parent directory, which usually EXISTS even when the file being
+    // created does not — so canonicalizing it gives a stable key across the
+    // create-then-edit sequence. Fall back to the resolved path if there is no parent.
+    let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
+    std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned()
 }
 
-/// Grant key for an out-of-workspace write (see [`canonical_key`]). Free fn (no `self`)
-/// so it can run inside the off-thread, bounded classification in `before()`.
+/// Grant key for an out-of-workspace write. Free fn (no `self`) so it can run inside
+/// the off-thread, bounded classification in `before()`.
+///
+/// `edit_file`/`write_file` (a single target) share the `writedir::` namespace keyed by
+/// the target's canonical directory — so "always" covers BOTH write tools writing to
+/// that folder this session, but not other folders. The bulk / multi-file tools have no
+/// single target and stay tool-wide.
 fn grant_key(tool: &str, targets: &[String], cwd: &Path) -> String {
     if matches!(tool, "edit_file" | "write_file") && targets.len() == 1 {
-        format!("{tool}::{}", canonical_key(&targets[0], cwd))
+        format!("writedir::{}", canonical_dir_key(&targets[0], cwd))
     } else {
         // No single target file → tool-wide (v1 routed these to its un-scoped tier).
         format!("{tool}::")
@@ -274,7 +283,7 @@ impl ToolMiddleware for WriteApprovalGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow { reason: Some("approved once".into()) },
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                BeforeOutcome::Allow { reason: Some("approved always (this path)".into()) }
+                BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
             }
             PermissionDecision::Deny => {
                 BeforeOutcome::deny(format!("denied by approval policy: {name} {}", call.arguments))
@@ -381,31 +390,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_workspace_grant_is_per_path() {
-        // Pre-grant ONE out-of-workspace file's canonical key; the SAME file then auto-approves,
-        // a DIFFERENT out-of-workspace file still prompts. Proves "Always" is per-path, not tool-wide.
+    async fn out_of_workspace_grant_is_per_directory() {
+        // Pre-grant ONE out-of-workspace DIRECTORY; any file in that folder (incl. a
+        // sibling never itself granted, and via the OTHER write tool) auto-approves,
+        // while a file in a DIFFERENT folder still prompts. Proves "Always" is
+        // per-folder (codex grant_root style) — not per-file, not tool-wide.
         let ws = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let granted = outside.path().join("granted.rs");
-        let other = outside.path().join("other.rs");
-        std::fs::write(&granted, "x").unwrap();
-        std::fs::write(&other, "x").unwrap();
+        let dir_a = outside.path().join("a");
+        let dir_b = outside.path().join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let granted = dir_a.join("granted.rs");
+        let sibling = dir_a.join("sibling.rs");
+        let other = dir_b.join("other.rs");
+        for f in [&granted, &sibling, &other] {
+            std::fs::write(f, "x").unwrap();
+        }
 
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("edit_file::{}", canonical_key(granted.to_str().unwrap(), ws.path())));
+        // Grant is keyed by the folder, from the `granted` file's target.
+        store.grant(&format!("writedir::{}", canonical_dir_key(granted.to_str().unwrap(), ws.path())));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
-        let tool = edit_tool();
 
-        let mut g = edit_call(granted.to_str().unwrap());
+        // A sibling in the SAME folder auto-approves — via edit_file...
+        let edit = edit_tool();
+        let mut s = edit_call(sibling.to_str().unwrap());
         assert!(
-            matches!(gate.before(&mut g, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
-            "granted path must auto-approve"
+            matches!(gate.before(&mut s, &edit, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "a sibling in the granted folder must auto-approve (edit_file)"
         );
+        // ...and via write_file (proves the grant is cross-tool, not per-tool).
+        let write = write_tool();
+        let mut w = write_call(dir_a.join("fresh.rs").to_str().unwrap());
+        assert!(
+            matches!(gate.before(&mut w, &write, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "a new file in the granted folder must auto-approve (write_file)"
+        );
+        // A file in a DIFFERENT folder still prompts.
         let mut o = edit_call(other.to_str().unwrap());
         assert!(
-            gate.before(&mut o, &tool, &silent_rt()).await.is_deny(),
-            "a different out-of-workspace file must still prompt"
+            gate.before(&mut o, &edit, &silent_rt()).await.is_deny(),
+            "a file in a different folder must still prompt"
         );
     }
 
@@ -488,7 +515,7 @@ mod tests {
         let secret = outside.path().join("id_rsa");
         std::fs::write(&secret, "k").unwrap();
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("edit_file::{}", canonical_key(secret.to_str().unwrap(), ws.path())));
+        store.grant(&format!("writedir::{}", canonical_dir_key(secret.to_str().unwrap(), ws.path())));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = edit_tool();

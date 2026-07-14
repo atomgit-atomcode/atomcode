@@ -7119,13 +7119,18 @@ pub(crate) fn set_agent_mode(
     app.state.agent_mode = mode;
     ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode)).ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
-    let msg = match mode {
-        crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
-        crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
-        crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
-    };
-    renderer.render(UiLine::CommandOutput(msg));
-    renderer.flush();
+    // The footer persistently shows the current mode, so a scrollback feedback line
+    // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+    // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
+    if ctx.is_plain_renderer {
+        let msg = match mode {
+            crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
+            crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
+            crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
+        };
+        renderer.render(UiLine::CommandOutput(msg));
+        renderer.flush();
+    }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
 }
 
@@ -7903,9 +7908,17 @@ fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::Perm
 
 /// The three approval options for `tool`, in display order (Allow once is the
 /// default selection). The "Always allow" label carries the tool name because
-/// `AgentEvent::ApprovalNeeded` does not carry the grant scope.
+/// `AgentEvent::ApprovalNeeded` does not carry the grant scope — except for the
+/// single-file write tools (`WriteFile`/`EditFile`), whose grant `WriteApprovalGate`
+/// scopes to the target's DIRECTORY, so their label names the folder instead.
 pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
     use crate::state::{ApprovalKind, ApprovalOption};
+    // Display names (snake→Pascal) of the directory-scoped write tools.
+    let always_label = if matches!(tool, "WriteFile" | "EditFile") {
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
+    } else {
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
+    };
     vec![
         ApprovalOption {
             label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
@@ -7913,7 +7926,7 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
             accel: 'y',
         },
         ApprovalOption {
-            label: crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned(),
+            label: always_label,
             kind: ApprovalKind::AlwaysAllow,
             accel: 'a',
         },
@@ -7991,6 +8004,23 @@ mod bypass_approval_tests {
         assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
         assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
         assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+    }
+
+    #[test]
+    fn build_approval_options_write_tools_use_folder_label() {
+        // WriteFile/EditFile grants are directory-scoped, so their "always" label
+        // must name the folder — NOT the tool (which would mislead as tool-wide).
+        for tool in ["WriteFile", "EditFile"] {
+            let opts = super::build_approval_options(tool);
+            let label = &opts[1].label;
+            assert!(
+                !label.contains(tool),
+                "{tool} always-allow must not name the tool (folder-scoped): {label}"
+            );
+        }
+        // A tool-wide write tool (no single target) keeps the tool-named label.
+        let opts = super::build_approval_options("SearchReplace");
+        assert!(opts[1].label.contains("SearchReplace"), "{}", opts[1].label);
     }
 
     #[test]
