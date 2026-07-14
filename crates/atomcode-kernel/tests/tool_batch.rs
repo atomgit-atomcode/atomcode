@@ -132,9 +132,6 @@ async fn mutating_tool_is_exclusive_barrier() {
     while let Some(ev) = handle.events.recv().await { if matches!(ev, AgentEvent::TurnComplete { .. }) { break; } }
     // r1 and r2 must NOT overlap the write tool: while "w" holds the exclusive lock,
     // inflight can never exceed 1. A write-preferring lock also stops r2 starting until w done.
-    assert!(peak.load(Ordering::SeqCst) >= 1);
-    // The strong assertion: the write tool never ran alongside a read. Because the
-    // ExclusiveProbe records peak-while-inflight, and reads are gated out during the
-    // write-lock, peak observed DURING the write window is 1. (r1 finishes before w
-    // acquires the write-lock; r2 waits behind w.)
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1,
+        "mutating tool must serialize the batch — nothing ever runs alongside it");
 }

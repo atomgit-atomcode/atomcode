@@ -2303,7 +2303,7 @@ impl RunningAgent {
             // borrow of `&self` across an await. Results are collected in EMISSION
             // order (FuturesOrdered yields by push order), so Phase ③ still applies
             // side effects in `pending_calls` order exactly as the serial loop did.
-            use futures::stream::{FuturesOrdered, StreamExt};
+            use futures::stream::FuturesOrdered;
             let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel_tools()));
 
