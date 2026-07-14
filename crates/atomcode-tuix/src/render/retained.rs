@@ -2639,7 +2639,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let rules_top = footer_top + todo_rows;
 
-        if !hide_input_box {
+        if hide_input_box {
+            let mut brand_rule = Vec::with_capacity(rule_width);
+            let brand_style = self.style_for(Role::Brand);
+            for _ in 0..rule_width {
+                brand_rule.push(Cell {
+                    ch: '─',
+                    style: brand_style.clone(),
+                    width: 1,
+                });
+            }
+            Self::pad_row_to_width(&mut brand_rule, w, CellStyle::default());
+            self.screen.draw_row(rules_top, 0, &brand_rule);
+        } else {
             let mut top_rule = top_rule;
             Self::pad_row_to_width(&mut top_rule, w, CellStyle::default());
             self.screen.draw_row(rules_top, 0, &top_rule);
@@ -2660,7 +2672,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // Cursor visibility handled by the common suppress_cursor block below.
             rules_top + 1 + approval_rows
         } else if hide_input_box {
-            rules_top
+            rules_top + 1
         } else {
             // Normal (no approval): draw middle rows then bot_rule.
             for (i, r) in middle_cells.into_iter().enumerate() {
@@ -2794,7 +2806,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let eff_middle   = if approval_active || hide_input_box { 0 } else { middle };
         let eff_bot_rule = if approval_active || hide_input_box { 0 } else { 1 };
         let eff_status   = if approval_active || hide_input_box { 0 } else { status };
-        let eff_top_rule = if hide_input_box { 0 } else { 1 };
+        let eff_top_rule = 1;
         eff_top_rule + eff_middle + eff_bot_rule + attachment + menu + goal + todo + approval + eff_status
     }
 
