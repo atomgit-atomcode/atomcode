@@ -1704,26 +1704,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
             s
         };
 
+        let is_installed = status.ends_with("(installed)")
+            || status.ends_with("(已安装)")
+            || status.ends_with("(User)")
+            || status.ends_with("(用户)")
+            || status.ends_with("(Project)")
+            || status.ends_with("(项目)")
+            || status.ends_with("(Local)")
+            || status.ends_with("(本地)");
         let name_width = unicode_width::UnicodeWidthStr::width(name);
-        let pad = 24usize.saturating_sub(name_width);
+        let check_width = 2; // "✓ " or "  "
+        let pad = 24usize.saturating_sub(name_width + check_width);
         let padded = format!("{}{}", name, " ".repeat(pad));
-        let part_a = if selected {
-            format!("▸ {}", padded)
-        } else {
-            format!("  {}", padded)
-        };
         let part_b = format!("  {}", status);
 
         let mut row1 = Vec::new();
-        if selected && part_a.starts_with("▸ ") {
+        if selected {
             let brand_style = self.style_for(Role::Brand);
             push_str_cells_sgr(&mut row1, "▸ ", brand_style);
-            push_str_cells_sgr(&mut row1, &part_a[4..], name_style.clone());
         } else {
-            push_str_cells_sgr(&mut row1, &part_a, name_style.clone());
+            push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
+
+        if is_installed {
+            let mut green_style = CellStyle::default();
+            green_style.fg = Some(crossterm::style::Color::Green);
+            if selected {
+                green_style.bold = true;
+            }
+            push_str_cells_sgr(&mut row1, "✓ ", green_style);
+        } else {
+            push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
+        }
+
+        push_str_cells_sgr(&mut row1, &padded, name_style.clone());
         push_str_cells_sgr(&mut row1, &part_b, status_style);
-        let content_w1 = crate::width::display_width(&part_a) + crate::width::display_width(&part_b);
+
+        let part_a_w = 2 + 2 + crate::width::display_width(&padded);
+        let content_w1 = part_a_w + crate::width::display_width(&part_b);
         let right_pad1 = rule_width.saturating_sub(content_w1);
         for _ in 0..right_pad1 {
             row1.push(Cell {
