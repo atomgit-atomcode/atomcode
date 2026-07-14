@@ -956,6 +956,8 @@ impl Modal for PluginManager {
             }
             if matches!(self.screen, Screen::InstalledDetails { .. } | Screen::ScopeSelect { .. }) {
                 final_items.push((String::new(), String::new()));
+            } else if matches!(self.screen, Screen::AddUrl) {
+                final_items.push((format!("❯ {}", self.url_input), String::new()));
             }
         }
         final_items.push((format!("— {} —", hint), String::new()));
