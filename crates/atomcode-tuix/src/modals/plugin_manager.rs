@@ -193,17 +193,17 @@ impl PluginManager {
         let t0 = if current_tab == 0 {
             " \x1b[1;7m Browse Marketplaces \x1b[22;27m "
         } else {
-            "  Browse Marketplaces  "
+            "  \x1b[1mBrowse Marketplaces\x1b[22m  "
         };
         let t1 = if current_tab == 1 {
             format!(" \x1b[1;7m Installed ({}) \x1b[22;27m ", installed_count)
         } else {
-            format!("  Installed ({})  ", installed_count)
+            format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
         };
         let t2 = if current_tab == 2 {
             " \x1b[1;7m Marketplaces \x1b[22;27m "
         } else {
-            "  Marketplaces  "
+            "  \x1b[1mMarketplaces\x1b[22m  "
         };
         format!("{}   {}   {}", t0, t1, t2)
     }
