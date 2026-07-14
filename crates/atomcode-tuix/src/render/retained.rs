@@ -199,9 +199,11 @@ fn format_loop_row(
     format!("{marker}{lbl}{meta}")
 }
 
-/// Max rows the footer todo panel may occupy, INCLUDING the header. The panel
-/// is additionally clamped against screen height by the caller.
-const MAX_TODO_PANEL_ROWS: usize = 6;
+/// Max rows the footer todo panel may occupy, INCLUDING the spacer + header. The
+/// panel is additionally clamped against screen height by the caller. When the whole
+/// list fits within the budget it renders every item; otherwise it folds (see
+/// `todo_panel_rows`). No blank padding — a short list shows short.
+const MAX_TODO_PANEL_ROWS: usize = 7;
 
 /// One logical row of the collapsed todo panel. Pure structure — glyphs,
 /// i18n words, styling and width-fitting are applied in `build_todo_rows`.
@@ -211,7 +213,6 @@ enum TodoPanelRow {
     /// room between the transcript body and the todo panel.
     Spacer,
     Header { completed: usize, total: usize },
-    CompletedFold { count: usize },
     Item {
         /// 0-based position in the FULL todo list, rendered as `#{index+1}`.
         index: usize,
@@ -221,12 +222,12 @@ enum TodoPanelRow {
     More { hidden: usize },
 }
 
-/// Collapse a todo list into at most `max_rows` panel rows (incl. header).
+/// Collapse a todo list into at most `max_rows` panel rows (incl. spacer + header).
 ///
-/// Selection priority under a tight budget: the in-progress task always shows
-/// when present, then the completed fold, then pending items. Pending overflow
-/// collapses into a single `More` row (which itself costs a row). Display order
-/// is: Header, CompletedFold?, InProgress?, Pending…, More?.
+/// When the whole list fits, every item shows in order. Otherwise a WINDOW around
+/// the current frontier (in-progress / first pending) shows recent history + the
+/// current/next work; pending items hidden below become a single `More` row. Items
+/// hidden above need no indicator — the header already reports the done/open totals.
 fn todo_panel_rows(
     items: &[(atomcode_capabilities::tools::todo::TodoStatus, String)],
     completed: usize,
@@ -249,58 +250,41 @@ fn todo_panel_rows(
         return rows;
     }
 
-    let in_progress: Option<(usize, &String)> = items
-        .iter()
-        .enumerate()
-        .find(|(_, (s, _))| *s == TodoStatus::InProgress)
-        .map(|(i, (_, c))| (i, c));
-    let pendings: Vec<(usize, &String)> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, (s, _))| *s == TodoStatus::Pending)
-        .map(|(i, (_, c))| (i, c))
-        .collect();
-
-    // Reserve high-priority slots first (in-progress, then completed fold).
-    let mut used = 0usize;
-    let show_ip = in_progress.is_some() && used < body_budget;
-    if show_ip {
-        used += 1;
-    }
-    let show_fold = completed > 0 && used < body_budget;
-    if show_fold {
-        used += 1;
-    }
-
-    // Remaining budget for pending rows (+ possible More row).
-    let pend_budget = body_budget.saturating_sub(used);
-    let (shown_pending, hidden) = if pend_budget == 0 {
-        (0usize, 0usize) // header N/M still reflects them
-    } else if pendings.len() <= pend_budget {
-        (pendings.len(), 0)
-    } else {
-        let shown = pend_budget - 1; // reserve 1 row for the More marker
-        (shown, pendings.len() - shown)
-    };
-
-    // Emit in display order.
-    if show_fold {
-        rows.push(TodoPanelRow::CompletedFold { count: completed });
-    }
-    if show_ip {
-        if let Some((idx, c)) = in_progress {
-            rows.push(TodoPanelRow::Item {
-                index: idx,
-                status: TodoStatus::InProgress,
-                content: c.clone(),
-            });
+    // If the WHOLE list fits, show every item in order with its real status
+    // (✔ completed, ☐ open) — no fold, no `+N more`, no padding. Only when the
+    // list overflows the budget do we fall through to the compact folded view.
+    if items.len() <= body_budget {
+        for (i, (status, content)) in items.iter().enumerate() {
+            rows.push(TodoPanelRow::Item { index: i, status: *status, content: content.clone() });
         }
+        return rows;
     }
-    for (idx, c) in pendings.iter().take(shown_pending) {
+
+    // Overflow: show a WINDOW of `body_budget` items that ALWAYS contains the current
+    // frontier (in-progress / first pending / last). Prefer recent items (window bottom
+    // at the list end); pull the window back if the tail would drop the frontier. Pending
+    // hidden BELOW the window get a `+N more` row; items hidden above need no indicator
+    // (the header already reports the done/open totals).
+    let n = items.len();
+    let anchor = items
+        .iter()
+        .position(|(s, _)| *s == TodoStatus::InProgress)
+        .or_else(|| items.iter().position(|(s, _)| *s == TodoStatus::Pending))
+        .unwrap_or(n.saturating_sub(1));
+    let mut start = n.saturating_sub(body_budget);
+    if start > anchor {
+        start = anchor;
+    }
+    let mut end = (start + body_budget).min(n);
+    if n - end > 0 {
+        end -= 1; // reserve the last row for the `+N more` marker
+    }
+    let hidden = n - end;
+    for (idx, (status, content)) in items.iter().enumerate().take(end).skip(start) {
         rows.push(TodoPanelRow::Item {
-            index: *idx,
-            status: TodoStatus::Pending,
-            content: (*c).clone(),
+            index: idx,
+            status: *status,
+            content: content.clone(),
         });
     }
     if hidden > 0 {
@@ -2034,7 +2018,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
         // directly on non-unicode terminals so the cell backstop never has to guess.
         let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
-        let done_glyph = if unicode { "\u{2714}" } else { "[x]" };
+        // U+2713 (light check) not U+2714 (heavy) — the heavy one triggers emoji
+        // presentation on many terminals (renders green + width-2, leaking a stray cell).
+        let done_glyph = if unicode { "\u{2713}" } else { "[x]" };
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
@@ -2059,10 +2045,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let mut row = Vec::new();
                     push_str_cells(&mut row, &format!("Tasks ({completed} done, {open} open)"), &bold);
                     row
-                }
-                TodoPanelRow::CompletedFold { count } => {
-                    let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
-                    item_line(done_glyph, &format!("{count} done"), &style)
                 }
                 TodoPanelRow::Item { index, status, content } => {
                     let (glyph, style) = match status {
@@ -14377,20 +14359,24 @@ mod todo_panel_rows_tests {
             (TodoStatus::Pending, "c"),
         ]);
         let rows = todo_panel_rows(&it, 1, 3, MAX_TODO_PANEL_ROWS);
-        // Spacer prepended: [Spacer, Header, CompletedFold, InProgress, Pending] = 5 rows.
+        // The whole list fits (3 items ≤ budget) → show EVERY item in order with its
+        // real status (no fold): [Spacer, Header, Completed, InProgress, Pending] = 5 rows.
         assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, total: 3 }));
-        assert!(matches!(rows[2], TodoPanelRow::CompletedFold { count: 1 }));
-        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::InProgress, content, .. } if content == "b"));
-        assert!(matches!(&rows[4], TodoPanelRow::Item { status: TodoStatus::Pending, content, .. } if content == "c"));
+        assert!(matches!(&rows[2], TodoPanelRow::Item { index: 0, status: TodoStatus::Completed, content, .. } if content == "a"));
+        assert!(matches!(&rows[3], TodoPanelRow::Item { index: 1, status: TodoStatus::InProgress, content, .. } if content == "b"));
+        assert!(matches!(&rows[4], TodoPanelRow::Item { index: 2, status: TodoStatus::Pending, content, .. } if content == "c"));
     }
 
     #[test]
     fn no_fold_when_none_completed() {
         let it = items(&[(TodoStatus::InProgress, "b"), (TodoStatus::Pending, "c")]);
         let rows = todo_panel_rows(&it, 0, 2, MAX_TODO_PANEL_ROWS);
-        assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::CompletedFold { .. })));
+        // Both items fit → shown individually (in-progress + pending), no More.
+        assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::InProgress, .. })));
+        assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::Pending, .. })));
+        assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })));
     }
 
     #[test]
@@ -14428,6 +14414,22 @@ mod todo_panel_rows_tests {
         for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
         let rows = todo_panel_rows(&it, 1, 22, MAX_TODO_PANEL_ROWS);
         assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
+    }
+
+    #[test]
+    fn mostly_done_shows_recent_window_not_a_fold() {
+        // 11 completed + 1 open. The frontier (the open task) is the last item, so the
+        // window is the last `body_budget` (5) items — recent completed shown INDIVIDUALLY
+        // plus the open one. No fold, no `+N more` (nothing hidden after the frontier).
+        let mut it: Vec<(TodoStatus, String)> =
+            (1..=11).map(|i| (TodoStatus::Completed, format!("s{i}"))).collect();
+        it.push((TodoStatus::Pending, "final".into()));
+        let rows = todo_panel_rows(&it, 11, 12, MAX_TODO_PANEL_ROWS); // MAX_TODO_PANEL_ROWS = 7
+        assert_eq!(rows.len(), 7, "Spacer + Header + 5 items");
+        assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })), "frontier at end → no More");
+        // Window is items[7..12] = #8..#12, each shown with its real index + status.
+        assert!(matches!(&rows[2], TodoPanelRow::Item { index: 7, status: TodoStatus::Completed, .. }));
+        assert!(matches!(&rows[6], TodoPanelRow::Item { index: 11, status: TodoStatus::Pending, content, .. } if content == "final"));
     }
 
     #[test]
