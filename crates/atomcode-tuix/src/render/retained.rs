@@ -1623,7 +1623,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let is_add_marketplace = name == "+ Add Marketplace";
         if is_add_marketplace {
             if selected {
-                style = self.style_bold(Role::Brand);
+                style = self.style_bold(Role::Border);
             } else {
                 style = self.style_for(Role::Secondary);
             }
@@ -1643,9 +1643,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             style = self.style_for(Role::Muted);
         }
         if selected && content.starts_with("▸ ") && is_plugin_mgr {
-            let mut brand_style = style.clone();
-            brand_style.fg = self.style_for(Role::Brand).fg;
-            push_str_cells_sgr(&mut row, "▸ ", brand_style);
+            let mut border_style = style.clone();
+            border_style.fg = self.style_for(Role::Border).fg;
+            push_str_cells_sgr(&mut row, "▸ ", border_style);
             push_str_cells_sgr(&mut row, &content[4..], style.clone());
         } else {
             push_str_cells_sgr(&mut row, &content, style.clone());
@@ -1726,19 +1726,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let mut row1 = Vec::new();
         if selected {
-            let brand_style = self.style_for(Role::Brand);
-            push_str_cells_sgr(&mut row1, "▸ ", brand_style);
+            let border_style = self.style_for(Role::Border);
+            push_str_cells_sgr(&mut row1, "▸ ", border_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
 
         if is_installed {
-            let mut green_style = CellStyle::default();
-            green_style.fg = Some(crossterm::style::Color::Green);
+            let mut gray_style = self.style_for(Role::Muted);
             if selected {
-                green_style.bold = true;
+                gray_style.bold = true;
             }
-            push_str_cells_sgr(&mut row1, "✓ ", green_style);
+            push_str_cells_sgr(&mut row1, "✓ ", gray_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -1822,9 +1821,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let mut row1 = Vec::new();
         if selected {
-            let brand_style = self.style_for(Role::Brand);
-            push_str_cells_sgr(&mut row1, "▸ ", brand_style.clone());
-            push_str_cells_sgr(&mut row1, "● ", brand_style);
+            let border_style = self.style_for(Role::Border);
+            push_str_cells_sgr(&mut row1, "▸ ", border_style.clone());
+            push_str_cells_sgr(&mut row1, "● ", border_style);
         } else {
             push_str_cells_sgr(&mut row1, bullet, bullet_style);
         }
@@ -2640,17 +2639,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let rules_top = footer_top + todo_rows;
 
         if hide_input_box {
-            let mut brand_rule = Vec::with_capacity(rule_width);
-            let brand_style = self.style_for(Role::Brand);
+            let mut border_rule = Vec::with_capacity(rule_width);
+            let border_style = self.style_for(Role::Border);
             for _ in 0..rule_width {
-                brand_rule.push(Cell {
+                border_rule.push(Cell {
                     ch: '─',
-                    style: brand_style.clone(),
+                    style: border_style.clone(),
                     width: 1,
                 });
             }
-            Self::pad_row_to_width(&mut brand_rule, w, CellStyle::default());
-            self.screen.draw_row(rules_top, 0, &brand_rule);
+            Self::pad_row_to_width(&mut border_rule, w, CellStyle::default());
+            self.screen.draw_row(rules_top, 0, &border_rule);
         } else {
             let mut top_rule = top_rule;
             Self::pad_row_to_width(&mut top_rule, w, CellStyle::default());
