@@ -139,6 +139,10 @@ pub struct CodingParts {
     /// `bypass_mode` this is enforced in a middleware (bridge-independent), mirroring
     /// `plan_mode`. Shared (not rebuilt) so a respawn preserves the mode.
     pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session grant store for mutating MCP tools the user approved "always" while in
+    /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
+    /// preserves the grants — the same reason the mode flags above are shared.
+    pub mcp_plan_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -432,6 +436,9 @@ pub async fn prepare_with_plugin_hooks(
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mcp_plan_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -628,7 +635,10 @@ pub fn assemble(
         // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
-        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(parts.plan_mode.clone())))
+        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(
+            parts.plan_mode.clone(),
+            parts.mcp_plan_grants.clone(),
+        )))
         // Plan-mode reminder (ephemeral request tail) — pairs with the gate: the gate
         // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
         // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).

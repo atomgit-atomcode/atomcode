@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::{
-    ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+    ApprovalRequest, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
@@ -37,13 +37,15 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall};
 pub struct PlanModeGate {
     active: Arc<AtomicBool>,
     /// Session grants for mutating MCP tools the user approved "always" while in plan
-    /// mode — keyed by the tool's full name so a repeat call skips the prompt.
+    /// mode — keyed by the tool's full name so a repeat call skips the prompt. Supplied
+    /// by `CodingParts` (shared, not rebuilt in `assemble`) so it survives a respawn /
+    /// model-swap, matching how the write gate and approval middleware persist grants.
     mcp_grants: Arc<dyn PermissionStore>,
 }
 
 impl PlanModeGate {
-    pub fn new(active: Arc<AtomicBool>) -> Self {
-        Self { active, mcp_grants: Arc::new(InMemoryPermissionStore::new()) }
+    pub fn new(active: Arc<AtomicBool>, mcp_grants: Arc<dyn PermissionStore>) -> Self {
+        Self { active, mcp_grants }
     }
 
     /// The hard-block message for a built-in mutating tool under plan mode.
@@ -152,12 +154,17 @@ impl LifecycleHooks for PlanModeReminderHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_capabilities::tools::InMemoryPermissionStore;
     use atomcode_kernel::testkit::{EchoTool, RiskyWriteTool};
     use atomcode_kernel::tool::{ToolContext, ToolResult};
 
     fn rt() -> RequestCtx {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         RequestCtx::new(tx, None)
+    }
+
+    fn grants() -> Arc<dyn PermissionStore> {
+        Arc::new(InMemoryPermissionStore::new())
     }
 
     /// An rt whose approval requests time out fast (no driver answers in tests),
@@ -192,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn blocks_risky_only_when_active() {
         let flag = Arc::new(AtomicBool::new(false));
-        let gate = PlanModeGate::new(flag.clone());
+        let gate = PlanModeGate::new(flag.clone(), grants());
         let risky: Arc<dyn Tool> = Arc::new(RiskyWriteTool); // always Risky
         let safe: Arc<dyn Tool> = Arc::new(EchoTool); // Safe
         let mut call =
@@ -213,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_mcp_allowed_in_plan_mode() {
         let flag = Arc::new(AtomicBool::new(true));
-        let gate = PlanModeGate::new(flag);
+        let gate = PlanModeGate::new(flag, grants());
         let ro: Arc<dyn Tool> = Arc::new(ReadOnlyMcpTool);
         let mut call =
             ToolCall { id: "c".into(), name: "mcp__docs__query".into(), arguments: "{}".into() };
@@ -228,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn mutating_mcp_prompts_not_hard_blocked_in_plan_mode() {
         let flag = Arc::new(AtomicBool::new(true));
-        let gate = PlanModeGate::new(flag);
+        let gate = PlanModeGate::new(flag, grants());
         let safe: Arc<dyn Tool> = Arc::new(EchoTool); // read_only_hint()==false, mcp__ name
         let mut call =
             ToolCall { id: "c".into(), name: "mcp__docs__delete".into(), arguments: "{}".into() };
@@ -238,6 +245,28 @@ mod tests {
             out.deny_reason().unwrap().contains("not approved"),
             "must reach the PROMPT path, not the hard-block path: {:?}",
             out.deny_reason()
+        );
+    }
+
+    /// The "always allow" grant lives in a store supplied by `CodingParts`, so it
+    /// survives a respawn (model-swap / MCP-reload) that rebuilds the gate. Two gates
+    /// sharing ONE store model that: a grant seen by the second gate skips the prompt.
+    #[tokio::test]
+    async fn always_grant_survives_gate_rebuild_via_shared_store() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let store = grants();
+        // First gate records an "always" grant (as the AllowAlways arm would).
+        store.grant("mcp__docs__delete");
+        // A freshly-built gate (post-respawn) sharing the SAME store honors it — and
+        // short-circuits BEFORE rt.request, so the no-timeout rt() can't hang.
+        let gate = PlanModeGate::new(flag, store);
+        let safe: Arc<dyn Tool> = Arc::new(EchoTool);
+        let mut call =
+            ToolCall { id: "c".into(), name: "mcp__docs__delete".into(), arguments: "{}".into() };
+        let out = gate.before(&mut call, &safe, &rt()).await;
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "shared grant must skip the prompt after a respawn, got {out:?}"
         );
     }
 
