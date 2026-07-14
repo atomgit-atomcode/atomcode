@@ -221,9 +221,8 @@ impl WriteApprovalGate {
                 BeforeOutcome::Allow { reason: Some("sensitive write approved (not remembered)".into()) }
             }
             PermissionDecision::Deny => BeforeOutcome::deny(format!(
-                "writing a sensitive path needs approval and was denied: {} {}",
-                tool.name(),
-                call.arguments
+                "writing a sensitive path needs approval and was denied: {}",
+                tool.name()
             )),
         }
     }
@@ -312,7 +311,7 @@ impl ToolMiddleware for WriteApprovalGate {
                 BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
             }
             PermissionDecision::Deny => {
-                BeforeOutcome::deny(format!("denied by approval policy: {name} {}", call.arguments))
+                BeforeOutcome::deny(format!("denied by approval policy: {name}"))
             }
         }
     }

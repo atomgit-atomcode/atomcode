@@ -210,7 +210,10 @@ impl ToolMiddleware for ApprovalMiddleware {
                 BeforeOutcome::Proceed
             }
             PermissionDecision::Deny => {
-                BeforeOutcome::deny(format!("denied by approval policy: {} {}", tool.name(), call.arguments))
+                // Deny reason goes back to the model as the tool result; it made the call, so
+                // don't echo its full arguments back (token waste + the arg preview already
+                // renders in the tool header). Name the tool and the policy — that's the signal.
+                BeforeOutcome::deny(format!("denied by approval policy: {}", tool.name()))
             }
         }
     }

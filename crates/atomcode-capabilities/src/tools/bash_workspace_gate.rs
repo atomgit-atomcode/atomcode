@@ -525,10 +525,9 @@ impl BashWorkspaceGate {
             PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
                 BeforeOutcome::Allow { reason: Some("destructive bash approved (not remembered)".into()) }
             }
-            PermissionDecision::Deny => BeforeOutcome::deny(format!(
-                "a destructive bash command needs approval and was denied: {}",
-                call.arguments
-            )),
+            PermissionDecision::Deny => {
+                BeforeOutcome::deny("a destructive bash command needs approval and was denied".to_string())
+            }
         }
     }
 }
@@ -607,7 +606,7 @@ impl ToolMiddleware for BashWorkspaceGate {
                 BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
             }
             PermissionDecision::Deny => {
-                BeforeOutcome::deny(format!("destructive bash denied by approval policy: {}", call.arguments))
+                BeforeOutcome::deny("destructive bash denied by approval policy".to_string())
             }
         }
     }
