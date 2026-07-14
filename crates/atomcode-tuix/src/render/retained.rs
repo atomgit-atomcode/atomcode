@@ -4813,16 +4813,57 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &style);
             }
             UiLine::DiffBlock(entries) => {
+                use crate::render::DiffKind;
                 let gutter = crate::render::diff::diff_gutter_width(&entries);
+                let unicode = self.caps.unicode_symbols;
+                let muted = self.style_for(Role::Muted);
+                let add_style = self.style_for(Role::DiffAdd);
+                let del_style = self.style_for(Role::DiffRemove);
+
+                // Summary header `+N −M` (codex/opencode style): a glance shows
+                // the size of the change without reading every row.
+                let adds = entries.iter().filter(|e| e.kind == DiffKind::Add).count();
+                let dels = entries.iter().filter(|e| e.kind == DiffKind::Del).count();
+                if adds > 0 || dels > 0 {
+                    let minus = if unicode { '\u{2212}' } else { '-' };
+                    self.push_body_text(&format!("  +{adds} {minus}{dels}"), &muted);
+                }
+
+                // Display cap: at most MAX_DIFF_DISPLAY changed/context rows, then
+                // a muted `… +N more lines`. The MODEL still gets the full diff —
+                // this caps only the scrollback render. Separator/summary rows
+                // don't count toward the cap.
+                const MAX_DIFF_DISPLAY: usize = 25;
+                let content_total =
+                    entries.iter().filter(|e| e.kind != DiffKind::Separator).count();
+                let ellipsis = if unicode { "\u{2026}" } else { "..." };
+                let mut shown = 0usize;
                 for entry in &entries {
-                    let role = match entry.kind {
-                        crate::render::DiffKind::Add => Role::DiffAdd,
-                        crate::render::DiffKind::Del => Role::DiffRemove,
-                        crate::render::DiffKind::Context => Role::Muted,
+                    if entry.kind == DiffKind::Separator {
+                        let sep = if unicode {
+                            crate::render::diff::diff_row_text(entry, gutter)
+                        } else {
+                            format!("  {:>gutter$} ...", "")
+                        };
+                        self.push_body_text(&sep, &muted);
+                        continue;
+                    }
+                    if shown >= MAX_DIFF_DISPLAY {
+                        let more = content_total - shown;
+                        self.push_body_text(
+                            &format!("  {ellipsis} +{more} more lines"),
+                            &muted,
+                        );
+                        break;
+                    }
+                    let style = match entry.kind {
+                        DiffKind::Add => &add_style,
+                        DiffKind::Del => &del_style,
+                        _ => &muted,
                     };
-                    let style = self.style_for(role);
                     let body = crate::render::diff::diff_row_text(entry, gutter);
-                    self.push_body_text(&scrub_controls(&body), &style);
+                    self.push_body_text(&scrub_controls(&body), style);
+                    shown += 1;
                 }
             }
 

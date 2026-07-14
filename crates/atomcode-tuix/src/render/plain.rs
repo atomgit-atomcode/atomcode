@@ -292,7 +292,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                         match entry.kind {
                             crate::render::DiffKind::Add => SGR_GREEN,
                             crate::render::DiffKind::Del => SGR_RED,
-                            crate::render::DiffKind::Context => "",
+                            _ => "",
                         }
                     } else {
                         ""

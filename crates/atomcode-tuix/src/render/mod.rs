@@ -568,6 +568,9 @@ pub enum DiffKind {
     Add,
     Del,
     Context,
+    /// A gap between two hunks — rendered as a dim `⋮` so far-apart edits in one
+    /// file read as one block without showing the unchanged run between them.
+    Separator,
 }
 
 /// One line of a rendered diff, with the file line number for its side.

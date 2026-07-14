@@ -18,6 +18,17 @@ pub(crate) fn parse_unified_diff(diff: &str, max_lines: usize) -> Vec<DiffEntry>
         }
         if let Some(rest) = line.strip_prefix("@@") {
             if let Some((o, n)) = parse_hunk_header(rest) {
+                // A second/later hunk = a gap of unchanged lines was elided.
+                // Mark it with a `⋮` separator so the two hunks read as one file
+                // block (codex style) instead of running together.
+                if !out.is_empty() {
+                    out.push(DiffEntry {
+                        kind: DiffKind::Separator,
+                        old_lineno: None,
+                        new_lineno: None,
+                        text: String::new(),
+                    });
+                }
                 old_ln = o;
                 new_ln = n;
             }
@@ -100,6 +111,11 @@ pub(crate) fn diff_gutter_width(entries: &[DiffEntry]) -> usize {
 /// (WITHOUT color and WITHOUT control-scrubbing; the caller applies the theme
 /// role and scrubs controls). `text` is the raw entry text.
 pub(crate) fn diff_row_text(entry: &DiffEntry, gutter: usize) -> String {
+    // Hunk-gap marker: a dim `⋮` in the sign column, blank gutter. (The retained
+    // renderer downgrades `⋮` to `...` on non-unicode terminals.)
+    if entry.kind == DiffKind::Separator {
+        return format!("  {:>gutter$} \u{22ee}", "");
+    }
     let num = match entry.kind {
         DiffKind::Del => entry.old_lineno,
         _ => entry.new_lineno,
@@ -108,7 +124,7 @@ pub(crate) fn diff_row_text(entry: &DiffEntry, gutter: usize) -> String {
     let sign = match entry.kind {
         DiffKind::Add => '+',
         DiffKind::Del => '-',
-        DiffKind::Context => ' ',
+        _ => ' ',
     };
     format!("  {numstr:>gutter$} {sign} {}", entry.text)
 }
@@ -181,6 +197,26 @@ Edited a.rs (1 replacement)
         }
         let e = parse_unified_diff(&diff, 10);
         assert_eq!(e.len(), 10);
+    }
+
+    #[test]
+    fn second_hunk_gets_a_separator() {
+        let diff = "\
+@@ -1,1 +1,1 @@
+-a
++b
+@@ -50,1 +50,1 @@
+-c
++d";
+        let e = parse_unified_diff(diff, 100);
+        // del a / add b / SEPARATOR / del c / add d
+        assert_eq!(e.len(), 5);
+        assert_eq!(e[2].kind, DiffKind::Separator);
+        assert_eq!((e[2].old_lineno, e[2].new_lineno), (None, None));
+        // no leading separator before the first hunk
+        assert_ne!(e[0].kind, DiffKind::Separator);
+        // separator renders as a dim ⋮ with a blank gutter
+        assert!(diff_row_text(&e[2], 2).trim_end().ends_with('\u{22ee}'));
     }
 
     #[test]
