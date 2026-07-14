@@ -1,7 +1,7 @@
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
-use atomcode_kernel::testkit::{ConcurrencyProbeTool, MockProvider};
+use atomcode_kernel::testkit::{ApprovalMiddleware, ConcurrencyProbeTool, MockProvider, RiskyWriteTool};
 use atomcode_kernel::tool::{Tool, ToolContext, ToolRegistry, ToolResult};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -134,4 +134,194 @@ async fn mutating_tool_is_exclusive_barrier() {
     // inflight can never exceed 1. A write-preferring lock also stops r2 starting until w done.
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1,
         "mutating tool must serialize the batch — nothing ever runs alongside it");
+}
+
+// GUARD 1: Cancel-mid-batch rolls back cleanly and does NOT hang.
+//
+// Two slow (10 s virtual) read-only tools are dispatched concurrently. We send
+// `AgentCommand::Cancel` shortly after the turn starts (while both futures are
+// parked in their sleep). The FuturesOrdered drain racingly wakes them via the
+// inside-execute `select! { biased; execute, cancel.cancelled() }` backstop in
+// Phase ②; when cancel fires, each future resolves to the synthetic
+// "(cancelled)" result or is skipped by the pre-execute `is_cancelled()` check.
+// After the drain, `cancelled_during_batch` is true → the batch is closed
+// (ToolBatchCompleted) and `finish_cancelled` runs → `AgentEvent::Cancelled`
+// then `AgentEvent::TurnComplete`.
+//
+// `start_paused = true` so `tokio::time::sleep(10_000 ms)` is virtual: the
+// cancel arrives before any simulated time elapses, so the backstop fires
+// immediately without actually waiting.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancel_mid_parallel_batch_rolls_back_cleanly() {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    // Two slow read-only probes (10 s virtual time — instantly cancelled).
+    for n in ["a", "b"] {
+        reg.register(Arc::new(ConcurrencyProbeTool {
+            name: n,
+            inflight: inflight.clone(),
+            peak: peak.clone(),
+            delay_ms: 10_000,
+        }));
+    }
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tc("1", "a")),
+            StreamEvent::ToolCall(tc("2", "b")),
+            StreamEvent::Done { truncated: false },
+        ],
+        // Round 2 would only run if the turn weren't cancelled — it must NOT run.
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+    ]));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["a", "b"]))
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+
+    // Yield once so the agent task starts and the futures are polled into their
+    // sleep. Then cancel immediately (virtual time does not advance until we
+    // yield again, so the 10 s sleep is still pending).
+    tokio::task::yield_now().await;
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+
+    let mut saw_batch_completed = false;
+    let mut saw_cancelled = false;
+    let mut completed = false;
+
+    // Generous outer timeout (5 s real time). With `start_paused`, virtual
+    // timers only advance via `tokio::time::advance` or when no real work
+    // remains — the cancel resolves the parked sleeps without any real delay.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::ToolBatchCompleted { .. } => saw_batch_completed = true,
+                AgentEvent::Cancelled => saw_cancelled = true,
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(completed, "cancelled turn must terminate (rolled back), not hang");
+    assert!(saw_cancelled, "AgentEvent::Cancelled must be emitted before TurnComplete");
+    assert!(saw_batch_completed, "ToolBatchCompleted must be emitted even when the batch is cancelled");
+}
+
+// GUARD 2: Serial approval — two risky tools in one batch produce their
+// approval `Request` events SEQUENTIALLY (second only after first is answered).
+//
+// `ApprovalMiddleware.before` runs inside Phase ① (the serial `before`-chain
+// loop), which processes one tool at a time — it awaits `rt.request(…)` and
+// only moves on after the driver sends `AgentCommand::Respond`. This means the
+// second `Request` is NEVER emitted while the first is still outstanding,
+// regardless of Phase ② concurrency (which comes later).
+//
+// The test measures the sequence: we record each Request arrival and confirm
+// that by the time the second Request arrives, the first has already been
+// answered (Respond was sent), proving the approval loop is strictly serial.
+#[tokio::test]
+async fn approval_requests_are_sequential_not_concurrent() {
+    // A second distinct risky tool (same behaviour as RiskyWriteTool, different name).
+    struct RiskyWriteTool2;
+    #[async_trait::async_trait]
+    impl atomcode_kernel::tool::Tool for RiskyWriteTool2 {
+        fn name(&self) -> &str { "risky_write2" }
+        fn description(&self) -> &str { "Second risky tool" }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
+            atomcode_kernel::tool::RiskLevel::Risky
+        }
+        async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+            ToolResult { call_id: String::new(), content: format!("wrote2: {args}"), is_error: false, images: vec![] }
+        }
+    }
+
+    let mut reg = ToolRegistry::new();
+    // Both tools are non-parallel-safe (read_only_hint=false by default), so
+    // even Phase ② would serialize them — but the serialization we guard here
+    // happens earlier, in Phase ①'s before-chain.
+    reg.register(Arc::new(RiskyWriteTool));
+    reg.register(Arc::new(RiskyWriteTool2));
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tc("1", "risky_write")),
+            StreamEvent::ToolCall(tc("2", "risky_write2")),
+            StreamEvent::Done { truncated: false },
+        ],
+        // Round 2 must carry text: a bare `Done` triggers the empty-response
+        // retry loop (empty-200 retry logic). A TextDelta makes the response
+        // content-bearing so the agent stops normally within the 5 s timeout.
+        vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+    ]));
+
+    let handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["risky_write", "risky_write2"]))
+        .middleware(Arc::new(ApprovalMiddleware::new()))
+        .build()
+        .spawn();
+
+    // Destructure early (mirrors the pattern in spike_claims approval tests)
+    // so that `commands` (Sender = Clone + Send) and `events` (Receiver =
+    // !Clone) can be used independently without moving all of `handle`.
+    let commands = handle.commands.clone();
+    let mut events = handle.events;
+    commands.send(send("run both")).unwrap();
+
+    // Track how many Responds have been sent when each Request arrives.
+    // If approval were concurrent, both Requests could arrive before any
+    // Respond — the second Request would arrive with responds_sent == 0.
+    // With serial approval, the second Request only arrives after the first
+    // is answered — responds_sent == 1 when the second Request arrives.
+    let mut responds_sent: u32 = 0;
+    let mut responds_sent_at_second_request: Option<u32> = None;
+    let mut request_count: u32 = 0;
+    let mut completed = false;
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                AgentEvent::Request { id, kind, .. } if kind == "approval" => {
+                    request_count += 1;
+                    if request_count == 2 {
+                        responds_sent_at_second_request = Some(responds_sent);
+                    }
+                    // Answer immediately so Phase ① can proceed to the next tool.
+                    commands
+                        .send(AgentCommand::Respond {
+                            id,
+                            value: serde_json::json!({ "decision": "allow" }),
+                        })
+                        .unwrap();
+                    responds_sent += 1;
+                }
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(completed, "turn must complete after both approvals");
+    assert_eq!(request_count, 2, "both risky tools must request approval");
+    assert_eq!(
+        responds_sent_at_second_request,
+        Some(1),
+        "second approval Request must only arrive AFTER the first is answered \
+         (responds_sent at arrival of request #2 must be 1, not 0 — serial approval guard)"
+    );
 }
