@@ -1799,8 +1799,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut row1 = Vec::new();
         if selected {
             let brand_style = self.style_for(Role::Brand);
-            push_str_cells_sgr(&mut row1, "▸ ", brand_style);
-            push_str_cells_sgr(&mut row1, "● ", bullet_style);
+            push_str_cells_sgr(&mut row1, "▸ ", brand_style.clone());
+            push_str_cells_sgr(&mut row1, "● ", brand_style);
         } else {
             push_str_cells_sgr(&mut row1, bullet, bullet_style);
         }
