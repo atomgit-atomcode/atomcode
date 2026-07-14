@@ -122,7 +122,7 @@ pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
 /// to the folder — not the exact file — means approving one write under a directory
 /// covers sibling writes in that same directory this session (e.g. several report
 /// files under `~/Downloads/…`), without opening any other location.
-fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
+pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     let resolved = resolve_path(raw, cwd);
     // Scope to the parent directory, which usually EXISTS even when the file being
     // created does not — so canonicalizing it gives a stable key across the

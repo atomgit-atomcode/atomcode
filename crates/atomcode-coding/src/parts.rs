@@ -30,8 +30,8 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate, ReadFileTool,
-    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate, OpenFileWorkspaceGate,
+    ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_core::provider::model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
@@ -676,6 +676,14 @@ pub fn assemble(
             WriteApprovalGate::new(parts.shared_cwd.clone())
                 .with_accept_edits(parts.accept_edits.clone()),
         ))
+        // Workspace-aware approval for DESTRUCTIVE bash (rm/mv/cp/dd/redirect…) whose target
+        // lands OUTSIDE the workspace: prompt with a per-directory "Always", mirroring
+        // WriteApprovalGate for the write tools. In-workspace destructive bash is unchanged
+        // (single-file rm stays Safe→runs; recursive rm still reaches ApprovalMiddleware).
+        // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
+        // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
+        // edits only); full Auto bypasses it via the driver auto-answering.
+        .middleware(Arc::new(BashWorkspaceGate::new(parts.shared_cwd.clone())))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.

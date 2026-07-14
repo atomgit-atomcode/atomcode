@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub mod approval;
 pub mod ast_grep;
 pub mod bash;
+pub mod bash_workspace_gate;
 pub mod cd;
 pub mod edit;
 pub mod glob;
@@ -68,6 +69,7 @@ pub use approval::{
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
+pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
