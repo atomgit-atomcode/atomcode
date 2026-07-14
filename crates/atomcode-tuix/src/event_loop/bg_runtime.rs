@@ -1,6 +1,10 @@
-use atomcode_core::agent::{AgentClient, AgentEvent};
+use atomcode_core::agent::AgentEvent;
+#[cfg(test)]
+use atomcode_core::agent::AgentClient;
 use atomcode_config::i18n::{t, Msg};
 use atomcode_core::session::{Session, SessionManager};
+
+use super::RuntimeEndpoint;
 
 pub const MAX_BACKGROUND_SLOTS: usize = 16;
 
@@ -62,13 +66,13 @@ pub enum BgError {
 
 pub struct ForegroundRuntime {
     pub runtime_id: RuntimeId,
-    pub client: Option<AgentClient>,
+    pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
 }
 
 pub struct BackgroundSlot {
     pub runtime_id: RuntimeId,
-    pub client: Option<AgentClient>,
+    pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
     pub state: RuntimeState,
     pub created_at: u64,
@@ -80,7 +84,7 @@ impl BackgroundSlot {
     fn into_foreground(self) -> ForegroundRuntime {
         ForegroundRuntime {
             runtime_id: self.runtime_id,
-            client: self.client,
+            endpoint: self.endpoint,
             session: self.session,
         }
     }
@@ -230,7 +234,7 @@ impl BackgroundSlots {
     ) -> Result<usize, BgError> {
         self.push_slot(BackgroundSlot {
             runtime_id: RuntimeId::new(self.slots.len() as u64 + 1),
-            client: None,
+            endpoint: None,
             summary: session.name.clone(),
             session,
             state,
@@ -243,7 +247,7 @@ impl BackgroundSlots {
 pub struct ResumeOutcome {
     pub resumed_session: Session,
     pub resumed_runtime_id: RuntimeId,
-    pub resumed_client: Option<AgentClient>,
+    pub resumed_endpoint: Option<RuntimeEndpoint>,
     pub previous_foreground_slot: Option<usize>,
 }
 
@@ -254,11 +258,11 @@ pub struct BgRuntimeManager {
 }
 
 impl BgRuntimeManager {
-    pub fn new(session: Session, runtime_id: RuntimeId, client: AgentClient) -> Self {
+    pub fn new(session: Session, runtime_id: RuntimeId, endpoint: RuntimeEndpoint) -> Self {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id,
-                client: Some(client),
+                endpoint: Some(endpoint),
                 session,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
@@ -286,19 +290,19 @@ impl BgRuntimeManager {
     pub fn set_foreground_runtime(
         &mut self,
         runtime_id: RuntimeId,
-        client: AgentClient,
+        endpoint: RuntimeEndpoint,
         session: Session,
     ) {
         self.foreground = ForegroundRuntime {
             runtime_id,
-            client: Some(client),
+            endpoint: Some(endpoint),
             session,
         };
     }
 
     pub fn background_current(
         &mut self,
-        new_client: AgentClient,
+        new_endpoint: RuntimeEndpoint,
         new_session: Session,
         new_runtime_id: RuntimeId,
         current_state: RuntimeState,
@@ -312,14 +316,14 @@ impl BgRuntimeManager {
             &mut self.foreground,
             ForegroundRuntime {
                 runtime_id: new_runtime_id,
-                client: Some(new_client),
+                endpoint: Some(new_endpoint),
                 session: new_session,
             },
         );
         let summary = session_summary(&old.session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id: old.runtime_id,
-            client: old.client,
+            endpoint: old.endpoint,
             session: old.session,
             state: current_state,
             created_at: current_timestamp(),
@@ -331,14 +335,14 @@ impl BgRuntimeManager {
     pub fn push_background_runtime(
         &mut self,
         runtime_id: RuntimeId,
-        client: AgentClient,
+        endpoint: RuntimeEndpoint,
         session: Session,
         state: RuntimeState,
     ) -> Result<usize, BgError> {
         let summary = session_summary(&session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id,
-            client: Some(client),
+            endpoint: Some(endpoint),
             session,
             state,
             created_at: current_timestamp(),
@@ -360,7 +364,7 @@ impl BgRuntimeManager {
             let summary = session_summary(&old_foreground.session);
             Some(self.backgrounds.push_slot(BackgroundSlot {
                 runtime_id: old_foreground.runtime_id,
-                client: old_foreground.client,
+                endpoint: old_foreground.endpoint,
                 session: old_foreground.session,
                 state: current_state,
                 created_at: current_timestamp(),
@@ -374,7 +378,7 @@ impl BgRuntimeManager {
         Ok(ResumeOutcome {
             resumed_session: self.foreground.session.clone(),
             resumed_runtime_id: self.foreground.runtime_id,
-            resumed_client: self.foreground.client.clone(),
+            resumed_endpoint: self.foreground.endpoint.clone(),
             previous_foreground_slot,
         })
     }
@@ -405,7 +409,7 @@ impl BgRuntimeManager {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id: RuntimeId::new(1),
-                client: None,
+                endpoint: None,
                 session,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
@@ -433,7 +437,7 @@ impl BgRuntimeManager {
         let summary = session_summary(&session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id,
-            client: None,
+            endpoint: None,
             session,
             state,
             created_at: 0,
@@ -446,7 +450,7 @@ impl BgRuntimeManager {
     pub fn background_current_for_test(&mut self) -> Result<usize, BgError> {
         let runtime_id = self.allocate_runtime_id();
         self.background_current(
-            test_client(),
+            test_endpoint(),
             Session::default_session(self.foreground.session.working_dir.clone()),
             runtime_id,
             RuntimeState::Idle,
@@ -551,6 +555,15 @@ fn test_client() -> AgentClient {
         skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
             atomcode_core::skill::SkillRegistry::new(),
         )),
+    }
+}
+
+#[cfg(test)]
+fn test_endpoint() -> RuntimeEndpoint {
+    let (native, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
+    RuntimeEndpoint {
+        legacy: test_client(),
+        native,
     }
 }
 
@@ -697,6 +710,53 @@ mod tests {
 
         assert_eq!(resumed.name, "background task");
         assert_eq!(manager.backgrounds().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_restores_the_native_handle_for_that_runtime() {
+        use atomcode_coding::runtime::{
+            coding_runtime_control_channel, CodingRuntimeControl,
+        };
+        use atomcode_kernel::event::AgentCommand as KernelCommand;
+
+        let (first_native, mut first_controls) = coding_runtime_control_channel();
+        let first_endpoint = RuntimeEndpoint {
+            legacy: test_client(),
+            native: first_native,
+        };
+        let mut manager = BgRuntimeManager::new(
+            session("first"),
+            RuntimeId::new(1),
+            first_endpoint,
+        );
+
+        let (second_native, _second_controls) = coding_runtime_control_channel();
+        manager
+            .background_current(
+                RuntimeEndpoint {
+                    legacy: test_client(),
+                    native: second_native,
+                },
+                session("second"),
+                RuntimeId::new(2),
+                RuntimeState::Idle,
+            )
+            .unwrap();
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        resumed
+            .resumed_endpoint
+            .unwrap()
+            .native
+            .compact(Some("first runtime".into()))
+            .unwrap();
+
+        assert!(matches!(
+            first_controls.recv().await,
+            Some(CodingRuntimeControl::Kernel(KernelCommand::Compact {
+                focus: Some(focus)
+            })) if focus == "first runtime"
+        ));
     }
 
     #[test]

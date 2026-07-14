@@ -314,7 +314,6 @@ impl KernelToWebui {
                 self.plan_mode = on;
                 None
             }
-            CoreCmd::Compact { prompt } => Some(KCmd::Compact { focus: prompt }),
             CoreCmd::Shutdown => Some(KCmd::Shutdown),
             // Out-of-band respawn / no-op: Task 6 owns respawn and peels these off
             // BEFORE calling this translator (`ChangeDir`/`ReloadConfig`/
@@ -2020,12 +2019,8 @@ mod kernel_runtime_translate_tests {
     }
 
     #[test]
-    fn compact_and_shutdown_map_directly() {
+    fn shutdown_maps_directly() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
-        assert!(matches!(
-            t.to_kernel_command(CoreCmd::Compact { prompt: Some("focus".into()) }),
-            Some(KCmd::Compact { focus: Some(f) }) if f == "focus"
-        ));
         assert!(matches!(t.to_kernel_command(CoreCmd::Shutdown), Some(KCmd::Shutdown)));
     }
 

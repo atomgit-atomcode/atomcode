@@ -1593,9 +1593,13 @@ async fn run() -> Result<i32> {
         !is_headless,
     );
     eprintln!("[engine] active (model {})", bridge_cfg.model);
-    let (client, event_rx) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+    let initial_runtime = atomcode_bridge::spawn_bridged_runtime_with_control(bridge_cfg);
+    let runtime_control = initial_runtime.control;
     let mut v2_handle: Option<atomcode_core::agent::AgentHandle> =
-        Some(atomcode_core::agent::AgentHandle { client, event_rx });
+        Some(atomcode_core::agent::AgentHandle {
+            client: initial_runtime.client,
+            event_rx: initial_runtime.event_rx,
+        });
 
     // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
     // builds a fresh bridge from the CURRENT config, so a /provider switch inside
@@ -1608,15 +1612,24 @@ async fn run() -> Result<i32> {
         let skip_perms = cli.dangerously_skip_permissions;
         std::sync::Arc::new(
             move |config: &atomcode_config::config::Config, working_dir: &std::path::Path| {
-                atomcode_bridge::spawn_bridged_runtime(bridge_config_from(
-                    config,
-                    working_dir,
-                    None,
-                    Some(tel.clone()),
-                    skip_perms,
-                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                    true,
-                ))
+                let runtime = atomcode_bridge::spawn_bridged_runtime_with_control(
+                    bridge_config_from(
+                        config,
+                        working_dir,
+                        None,
+                        Some(tel.clone()),
+                        skip_perms,
+                        // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
+                        true,
+                    ),
+                );
+                atomcode_tuix::SpawnedRuntime {
+                    endpoint: atomcode_tuix::RuntimeEndpoint {
+                        legacy: runtime.client,
+                        native: runtime.control,
+                    },
+                    event_rx: runtime.event_rx,
+                }
             },
         )
     };
@@ -1755,7 +1768,7 @@ async fn run() -> Result<i32> {
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            match atomcode_tuix::run(config, model_name, tui_handle, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+            match atomcode_tuix::run(config, model_name, tui_handle, runtime_control, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
             }

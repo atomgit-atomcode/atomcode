@@ -188,12 +188,6 @@ pub enum AgentCommand {
     /// Set the unified execution mode (replaces SetPlanMode; SetPlanMode is
     /// removed in a later task once all producers migrate).
     SetMode(crate::agent::Mode),
-    /// Manually compact conversation history. `prompt` is accepted for
-    /// forward-compat with an eventual LLM-backed summarize-with-instruction
-    /// path; currently unused — this is the mechanical path only.
-    Compact {
-        prompt: Option<String>,
-    },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
     /// cache is only refreshed on LLM round-trips, so between turns (or

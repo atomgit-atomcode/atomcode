@@ -151,16 +151,20 @@ fn spawn_runtime(
     session: Session,
 ) -> (
     bg_runtime::RuntimeId,
-    atomcode_core::agent::AgentClient,
+    super::RuntimeEndpoint,
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
     // Spawn through the injected engine-v2 bridge so in-TUI session switches run
     // on the new stack too. It reads the CURRENT config/working_dir, keeping
     // /model /provider /cd honoured.
-    let (client, event_rx) = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
-    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
-    (runtime_id, client, session)
+    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
+    bg_runtime::spawn_event_forwarder(
+        runtime_id,
+        spawned.event_rx,
+        ctx.runtime_event_tx.clone(),
+    );
+    (runtime_id, spawned.endpoint, session)
 }
 
 /// Synchronise the current foreground session into `BgRuntimeManager`.
@@ -174,7 +178,10 @@ fn spawn_runtime(
 fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
-        ctx.agent.clone(),
+        super::RuntimeEndpoint {
+            legacy: ctx.agent.clone(),
+            native: ctx.runtime.clone(),
+        },
         ctx.current_session.clone(),
     );
 }
@@ -1588,12 +1595,15 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-            // Agent streams the authoritative result back as TextDelta
-            // ("nothing to compact" / "compacted — dropped N messages").
-            // Don't pre-render a placeholder — the agent's reply could
-            // contradict it when the conversation is too short.
-            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+            let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            // The runtime reports the authoritative outcome asynchronously.
+            // Don't pre-render a placeholder: a committed shrink and a
+            // short-conversation no-op produce different output based on the
+            // current runtime state.
+            if let Err(error) = ctx.runtime.compact(focus) {
+                renderer.render(UiLine::Error(error.to_string()));
+                renderer.flush();
+            }
         }
         "remember" => {
             let text = arg.trim();
@@ -2124,10 +2134,10 @@ fn execute_slash_command_impl(
                     let old_short_id = ctx.current_session.short_id().to_string();
                     let new_session = Session::default_session(ctx.working_dir.clone());
                     let new_short_id = new_session.short_id().to_string();
-                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let (runtime_id, endpoint, new_session) = spawn_runtime(ctx, new_session);
                     let old_state = foreground_state_from_ui(state);
                     let slot = match ctx.bg_manager.background_current(
-                        client.clone(),
+                        endpoint.clone(),
                         new_session.clone(),
                         runtime_id,
                         old_state,
@@ -2143,7 +2153,8 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
                     };
 
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
@@ -2198,7 +2209,7 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                     };
-                    let Some(client) = outcome.resumed_client else {
+                    let Some(endpoint) = outcome.resumed_endpoint else {
                         renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
                         renderer.flush();
                         return Ok(());
@@ -2209,7 +2220,8 @@ fn execute_slash_command_impl(
                     // session (and clear the stale footer). ClearLoop reaches the outgoing
                     // agent before the swap below.
                     stop_active_loop(state, ctx);
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
@@ -2270,8 +2282,8 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
-                        if let Some(client) = dropped.client.as_ref() {
-                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        if let Some(endpoint) = dropped.endpoint.as_ref() {
+                            endpoint.legacy.cmd_tx.send(AgentCommand::Cancel).ok();
                         }
                     }
                     if !dropped.session.messages.is_empty() {
@@ -2311,10 +2323,10 @@ fn execute_slash_command_impl(
             let mut session = Session::default_session(ctx.working_dir.clone());
             session.name = short_task_name(task);
             let short_id = session.short_id().to_string();
-            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let (runtime_id, endpoint, session) = spawn_runtime(ctx, session);
             let slot = match ctx.bg_manager.push_background_runtime(
                 runtime_id,
-                client.clone(),
+                endpoint.clone(),
                 session,
                 bg_runtime::RuntimeState::Running,
             ) {
@@ -2328,7 +2340,8 @@ fn execute_slash_command_impl(
                 }
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
             };
-            client
+            endpoint
+                .legacy
                 .cmd_tx
                 .send(AgentCommand::SendMessage {
                     text: task.to_string(),

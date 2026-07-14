@@ -42,6 +42,7 @@ pub mod discipline;
 pub mod parts;
 pub mod persona;
 pub mod plan_mode;
+pub mod runtime;
 pub mod telemetry;
 
 mod assemble;
@@ -54,6 +55,7 @@ pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::{CodingAgentConfig, SubagentProvider, TierProvider};
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
+pub use runtime::{CodingRuntimeHandle, RuntimeUnavailable};
 pub use todo::TodoHook;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{

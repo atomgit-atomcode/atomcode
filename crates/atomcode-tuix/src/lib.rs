@@ -38,6 +38,7 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
+use atomcode_coding::CodingRuntimeHandle;
 use atomcode_core::agent::AgentHandle;
 use atomcode_config::config::Config;
 use crossterm::{
@@ -52,7 +53,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
-pub use crate::event_loop::RuntimeSpawnOverride;
+pub use crate::event_loop::{RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime};
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -283,6 +284,7 @@ pub async fn run(
     config: Config,
     model_name: String,
     agent_handle: AgentHandle,
+    runtime: CodingRuntimeHandle,
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
@@ -646,7 +648,10 @@ pub async fn run(
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
         foreground_runtime_id,
-        agent_client.clone(),
+        event_loop::RuntimeEndpoint {
+            legacy: agent_client.clone(),
+            native: runtime.clone(),
+        },
     );
 
     // ── Askpass server startup (unix-only, TUI path) ────────────────────────
@@ -700,6 +705,7 @@ pub async fn run(
         config,
         model_name,
         agent: agent_client,
+        runtime,
         shutdown_deadline: None,
         runtime_spawn_override,
         bg_manager,

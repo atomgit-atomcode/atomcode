@@ -6,8 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+use atomcode_coding::runtime::{
+    coding_runtime_control_channel, CodingRuntimeControl, CodingRuntimeControlReceiver,
+};
 use atomcode_coding::{
-    assemble, prepare_with_plugin_hooks, CodingAgentConfig, PrepareOptions, SessionMode,
+    assemble, prepare_with_plugin_hooks, CodingAgentConfig, CodingRuntimeHandle, PrepareOptions,
+    SessionMode,
 };
 use atomcode_core::agent::{
     AgentClient, AgentCommand as CoreCmd, AgentEvent as CoreEv, AgentPhase, TurnStopReason,
@@ -100,8 +104,23 @@ pub struct BridgeConfig {
 pub fn spawn_bridged_runtime(
     cfg: BridgeConfig,
 ) -> (AgentClient, mpsc::UnboundedReceiver<CoreEv>) {
+    let runtime = spawn_bridged_runtime_with_control(cfg);
+    (runtime.client, runtime.event_rx)
+}
+
+/// A transitional bridge endpoint: legacy channels for commands/events that have
+/// not migrated yet, plus a stable native runtime control handle.
+pub struct BridgedRuntime {
+    pub client: AgentClient,
+    pub control: CodingRuntimeHandle,
+    pub event_rx: mpsc::UnboundedReceiver<CoreEv>,
+}
+
+/// Spawn a bridged runtime and expose its stable native control plane.
+pub fn spawn_bridged_runtime_with_control(cfg: BridgeConfig) -> BridgedRuntime {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CoreCmd>();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<CoreEv>();
+    let (control, control_rx) = coding_runtime_control_channel();
 
     // The legacy client carries two shared registries the TUI reads for its slash
     // palette / dynamic MCP tools. Loaded via core's OWN loaders so the palette
@@ -118,10 +137,14 @@ pub fn spawn_bridged_runtime(
     };
 
     tokio::spawn(async move {
-        Bridge::run(cfg, cmd_rx, ev_tx).await;
+        Bridge::run(cfg, cmd_rx, control_rx, ev_tx).await;
     });
 
-    (client, ev_rx)
+    BridgedRuntime {
+        client,
+        control,
+        event_rx: ev_rx,
+    }
 }
 
 /// Wait for the kernel agent task to finish after a `Shutdown`, bounded by
@@ -275,6 +298,7 @@ impl Bridge {
     async fn run(
         cfg: BridgeConfig,
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+        mut control_rx: CodingRuntimeControlReceiver,
         ev_tx: mpsc::UnboundedSender<CoreEv>,
     ) {
         let mut coding_cfg = CodingAgentConfig::new(
@@ -365,7 +389,7 @@ impl Bridge {
                 // prepare() failed — we can't build a Bridge at all (no parts).
                 // Enter a keep-alive loop so the TUI doesn't exit, but the user
                 // must restart atomcode to recover.
-                Self::keep_alive_loop(ev_tx, cmd_rx).await;
+                Self::keep_alive_loop(ev_tx, cmd_rx, control_rx).await;
                 return;
             }
         };
@@ -446,6 +470,8 @@ impl Bridge {
             loop_fire_rx,
         };
 
+        let mut legacy_open = true;
+        let mut control_open = true;
         loop {
             tokio::select! {
                 // Deterministic branch order: a loop wakeup/fire that's ready in the
@@ -453,13 +479,18 @@ impl Bridge {
                 // is set before the turn-end Snapshot reads it (else a self-paced loop
                 // could be misjudged as "completed"). cmd_rx stays first for Cancel.
                 biased;
-                cmd = cmd_rx.recv() => match cmd {
+                cmd = cmd_rx.recv(), if legacy_open => match cmd {
                     Some(c) => {
                         if bridge.on_command(c).await {
                             break;
                         }
                     }
-                    None => break, // driver gone
+                    None => {
+                        legacy_open = false;
+                        if !control_open {
+                            break;
+                        }
+                    }
                 },
                 // Goal evaluations run on a spawned task and report here, so a
                 // Cancel arriving mid-eval is still processed (cmd_rx stays live).
@@ -478,6 +509,15 @@ impl Bridge {
                 Some(wake) = bridge.loop_fire_rx.recv() => {
                     bridge.on_loop_fire(wake);
                 }
+                control = control_rx.recv(), if control_open => match control {
+                    Some(control) => bridge.on_runtime_control(control),
+                    None => {
+                        control_open = false;
+                        if !legacy_open {
+                            break;
+                        }
+                    }
+                },
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
@@ -513,6 +553,10 @@ impl Bridge {
 
     fn emit(&self, ev: CoreEv) {
         let _ = self.ev_tx.send(ev);
+    }
+
+    fn on_runtime_control(&mut self, control: CodingRuntimeControl) {
+        forward_runtime_control(control, &self.handle.commands);
     }
 
     /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold
@@ -919,9 +963,6 @@ impl Bridge {
                 self.answer_approval(ApprovalResponse::allow_always())
             }
             CoreCmd::DenyTool => self.answer_approval(ApprovalResponse::deny()),
-            CoreCmd::Compact { prompt } => {
-                let _ = self.handle.commands.send(KCmd::Compact { focus: prompt });
-            }
             CoreCmd::ChangeDir(dir) => {
                 let target = {
                     let base = self
@@ -1512,6 +1553,7 @@ impl Bridge {
     async fn keep_alive_loop(
         ev_tx: mpsc::UnboundedSender<CoreEv>,
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
+        mut control_rx: CodingRuntimeControlReceiver,
     ) {
         // Clone ev_tx so we can still send error feedback from this loop while
         // holding the original open in the spawned task (keeps forwarder alive).
@@ -1520,29 +1562,55 @@ impl Bridge {
             let _hold = ev_tx;
             std::future::pending::<()>().await;
         });
+        let mut legacy_open = true;
+        let mut control_open = true;
         loop {
-            match cmd_rx.recv().await {
-                Some(CoreCmd::Shutdown) | None => break,
-                Some(CoreCmd::ReloadConfig(_)) => {
-                    // The TUI already rendered the switch confirmation
-                    // optimistically; this error makes it clear a restart
-                    // is needed.
-                    let _ = feedback_tx.send(CoreEv::Error {
-                        error: "engine v2 is in degraded mode — /model and /provider \
-                                require a restart. Please quit and re-launch atomcode."
-                            .into(),
-                        snapshot: ConversationSnapshot::default(),
-                    });
-                }
-                Some(CoreCmd::SendMessage { .. }) => {
-                    let _ = feedback_tx.send(CoreEv::Error {
-                        error: "engine v2 failed to initialise — messages cannot be \
-                                processed. Please quit and re-launch atomcode."
-                            .into(),
-                        snapshot: ConversationSnapshot::default(),
-                    });
-                }
-                _ => {} // drain: ignore all other commands
+            tokio::select! {
+                command = cmd_rx.recv(), if legacy_open => match command {
+                    Some(CoreCmd::Shutdown) => break,
+                    None => {
+                        legacy_open = false;
+                        if !control_open {
+                            break;
+                        }
+                    }
+                    Some(CoreCmd::ReloadConfig(_)) => {
+                        // The TUI already rendered the switch confirmation
+                        // optimistically; this error makes it clear a restart
+                        // is needed.
+                        let _ = feedback_tx.send(CoreEv::Error {
+                            error: "engine v2 is in degraded mode — /model and /provider \
+                                    require a restart. Please quit and re-launch atomcode."
+                                .into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                    }
+                    Some(CoreCmd::SendMessage { .. }) => {
+                        let _ = feedback_tx.send(CoreEv::Error {
+                            error: "engine v2 failed to initialise — messages cannot be \
+                                    processed. Please quit and re-launch atomcode."
+                                .into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                    }
+                    _ => {} // drain: ignore all other commands
+                },
+                control = control_rx.recv(), if control_open => match control {
+                    Some(_) => {
+                        let _ = feedback_tx.send(CoreEv::Error {
+                            error: "engine v2 failed to initialise — runtime controls cannot be processed. \
+                                    Please quit and re-launch atomcode."
+                                .into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                    }
+                    None => {
+                        control_open = false;
+                        if !legacy_open {
+                            break;
+                        }
+                    }
+                },
             }
         }
         _keep.abort();
@@ -2029,6 +2097,44 @@ impl Bridge {
             }
             _ => {}
         }
+    }
+}
+
+fn forward_runtime_control(
+    control: CodingRuntimeControl,
+    commands: &mpsc::UnboundedSender<KCmd>,
+) {
+    match control {
+        CodingRuntimeControl::Kernel(command) => {
+            let _ = commands.send(command);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_control_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stable_handle_forwards_to_the_current_kernel_sender() {
+        let (handle, mut controls) = coding_runtime_control_channel();
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+
+        handle.compact(Some("before respawn".into())).unwrap();
+        forward_runtime_control(controls.recv().await.unwrap(), &old_tx);
+
+        handle.compact(Some("after respawn".into())).unwrap();
+        forward_runtime_control(controls.recv().await.unwrap(), &new_tx);
+
+        assert!(matches!(
+            old_rx.recv().await,
+            Some(KCmd::Compact { focus: Some(focus) }) if focus == "before respawn"
+        ));
+        assert!(matches!(
+            new_rx.recv().await,
+            Some(KCmd::Compact { focus: Some(focus) }) if focus == "after respawn"
+        ));
     }
 }
 
@@ -3451,4 +3557,3 @@ mod ai_name_tests {
         assert!(!should_attempt(true, false, false)); // no user msg yet
     }
 }
-

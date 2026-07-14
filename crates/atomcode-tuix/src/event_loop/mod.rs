@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
+use atomcode_coding::CodingRuntimeHandle;
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
 use atomcode_config::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
@@ -709,14 +710,25 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
+/// The two command planes that must move together when the TUI switches runtime.
+#[derive(Clone)]
+pub struct RuntimeEndpoint {
+    pub legacy: AgentClient,
+    pub native: CodingRuntimeHandle,
+}
+
+/// A newly spawned runtime endpoint and its single-consumer legacy event stream.
+pub struct SpawnedRuntime {
+    pub endpoint: RuntimeEndpoint,
+    pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
 /// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
 /// `/resume`). The cli injects the engine-v2 bridge here. It receives the
 /// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
-/// and returns the `(client, event_rx)` pair.
+/// and returns both command planes with the event receiver.
 pub type RuntimeSpawnOverride = std::sync::Arc<
-    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
-        + Send
-        + Sync,
+    dyn Fn(&Config, &std::path::Path) -> SpawnedRuntime + Send + Sync,
 >;
 
 /// Bag of handles passed into the loop.
@@ -724,6 +736,7 @@ pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
+    pub runtime: CodingRuntimeHandle,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
     /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
