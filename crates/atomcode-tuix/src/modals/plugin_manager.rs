@@ -258,7 +258,17 @@ impl PluginManager {
             Screen::Installing { .. } => 0, // No selectable rows — just status text
             Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
             Screen::Marketplaces => 1 + self.marketplaces.len(),
-            Screen::MarketplaceDetails { .. } => 3,
+            Screen::MarketplaceDetails { mp } => {
+                if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                    if is_official_marketplace(&m.source) {
+                        2
+                    } else {
+                        3
+                    }
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -385,6 +395,11 @@ impl PluginManager {
     fn enter_marketplace_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         if let Screen::MarketplaceDetails { mp } = &self.screen {
             let mp_name = mp.clone();
+            let is_official = self.marketplaces.iter()
+                .find(|x| x.name == mp_name)
+                .map(|x| is_official_marketplace(&x.source))
+                .unwrap_or(false);
+
             match self.selected {
                 0 => {
                     self.search_query = mp_name;
@@ -393,7 +408,7 @@ impl PluginManager {
                 1 => {
                     self.dispatch_update_marketplace(mp_name, ctx);
                 }
-                2 => {
+                2 if !is_official => {
                     self.dispatch_remove_marketplace(mp_name, ctx, renderer);
                 }
                 _ => {}
@@ -737,7 +752,9 @@ impl PluginManager {
                     let last_updated = get_directory_modified_date(&m.name);
                     rows.push((format!("Update marketplace (last updated {})", last_updated), String::new()));
                     
-                    rows.push(("Remove marketplace".to_string(), String::new()));
+                    if !is_official_marketplace(&m.source) {
+                        rows.push(("Remove marketplace".to_string(), String::new()));
+                    }
                 }
                 (rows, t(Msg::PluginMgrHintNav).into_owned())
             }
@@ -1211,6 +1228,11 @@ fn get_directory_modified_date(name: &str) -> String {
         }
     }
     "unknown".to_string()
+}
+
+fn is_official_marketplace(source: &str) -> bool {
+    source == "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git"
+        || source == "git@atomgit.com:atomgit_atomcode/atomcode-plugins-official.git"
 }
 
 
