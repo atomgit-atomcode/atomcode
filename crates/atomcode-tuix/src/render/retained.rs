@@ -910,6 +910,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    fn max_menu_rows(&self, h: usize, default: usize) -> usize {
+        self.menu
+            .as_ref()
+            .map(|m| {
+                let base = m.kind.max_visible_rows(h, m.items.len());
+                let has_hint = m.items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
+                if has_hint {
+                    base + 1
+                } else {
+                    base
+                }
+            })
+            .unwrap_or(default)
+    }
+
     fn tool_bullet_style(&self) -> CellStyle {
         self.style_bold(Role::ToolName)
     }
@@ -1598,6 +1613,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if is_uninstall {
             style.fg = Some(crossterm::style::Color::Red);
         }
+        let is_hint = name.starts_with('—') && name.ends_with('—');
+        if is_hint {
+            style = self.style_for(Role::Muted);
+        }
         push_str_cells_sgr(&mut row, &content, style.clone());
 
         if selected {
@@ -2090,11 +2109,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Paginate menu using the kind-specific cap.
-        let max_menu = self
-            .menu
-            .as_ref()
-            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
-            .unwrap_or(4);
+        let max_menu = self.max_menu_rows(h, 4);
         let menu_kind = self
             .menu
             .as_ref()
@@ -2121,7 +2136,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     end += 1;
                 }
 
-                if m.selected >= end {
+                if m.selected < len && m.selected >= end {
                     while offset < len && m.selected >= end {
                         offset += 1;
                         let mut h_sum = 0;
@@ -2156,15 +2171,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Spinner moved to body as a live paragraph row — footer no
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
+        let has_hint_at_end = menu_items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
         let menu_rows = if let Some(m) = self.menu.as_ref() {
-            menu_items.iter().enumerate().map(|(i, _)| {
+            let mut sum = menu_items.iter().enumerate().map(|(i, _)| {
                 let orig_idx = actual_offset + i;
                 if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < m.items.len().saturating_sub(1) {
                     2
                 } else {
                     1
                 }
-            }).sum::<usize>()
+            }).sum::<usize>();
+            if has_hint_at_end {
+                sum += 1;
+            }
+            sum
         } else {
             0
         };
@@ -2297,6 +2317,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 menu_cells.push(self.build_menu_row(name, desc, selected, rule_width, menu_kind));
             }
+        }
+        if has_hint_at_end {
+            menu_cells.push(Vec::new());
         }
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
@@ -2488,11 +2511,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .max(1)
         };
         let h = self.screen.height() as usize;
-        let menu_rows = self
-            .menu
-            .as_ref()
-            .map(|m| m.kind.max_visible_rows(h, m.items.len()))
-            .unwrap_or(0);
+        let menu_rows = self.max_menu_rows(h, 0);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
@@ -5446,11 +5465,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
             let h = self.screen.height() as usize;
-            let menu_rows = self
-                .menu
-                .as_ref()
-                .map(|m| m.kind.max_visible_rows(h, m.items.len()))
-                .unwrap_or(0);
+            let menu_rows = self.max_menu_rows(h, 0);
             let middle_rows = footer_rows.saturating_sub(
                 1 /* spinner */
                 + 1 /* top rule */
