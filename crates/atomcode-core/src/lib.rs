@@ -8,7 +8,10 @@ fn _isolate_atomcode_home() {
 }
 
 pub mod agent;
-pub mod auth;
+// `auth` (OAuth login + secure chmod-600 token file) fully lives in the leaf `atomcode-auth`
+// crate now; re-export it so core's own `crate::auth::…` uses and external
+// `atomcode_core::auth` consumers keep working during the transition.
+pub use atomcode_auth as auth;
 pub mod process_utils;
 pub mod coding_plan;
 // `config` fully lives in the leaf `atomcode-config` crate now; core code (and its

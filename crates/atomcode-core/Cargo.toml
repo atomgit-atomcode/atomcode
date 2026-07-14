@@ -12,6 +12,9 @@ tar = "0.4"
 # Config system is being extracted here (leaf crate); core re-exports it during the
 # transition. See docs/superpowers/plans/2026-07-11-extract-atomcode-config.md.
 atomcode-config = { path = "../atomcode-config" }
+# `auth` (OAuth login + secure token file) extracted to this leaf; core re-exports it as
+# `atomcode_core::auth` during the transition.
+atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

@@ -352,6 +352,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-auth"
+version = "4.26.0"
+dependencies = [
+ "anyhow",
+ "atomcode-config",
+ "atomcode-telemetry",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "atomcode-bridge"
 version = "4.26.0"
 dependencies = [
@@ -487,6 +505,7 @@ version = "4.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomcode-auth",
  "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-kernel",

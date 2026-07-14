@@ -79,6 +79,23 @@ pub fn user_url() -> String {
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
 /// Centralized so a future UA format change (e.g. append install-id)
 /// happens in one spot rather than at each `Client::new()` site.
+/// Apply the process proxy policy to a blocking reqwest client builder: honor `no_proxy`
+/// mode, otherwise leave reqwest's env-based proxy detection intact. Inlined from the former
+/// `atomcode_core::proxy` so this crate stays a leaf — it reads only the `atomcode_config::proxy`
+/// env contract (no HTTP-stack glue that would pull in core).
+fn apply_blocking_proxy_policy(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    if std::env::var(atomcode_config::proxy::MODE_ENV).ok().as_deref()
+        == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 fn blocking_client() -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
@@ -91,7 +108,7 @@ fn blocking_client() -> Result<reqwest::blocking::Client> {
     // helper *panics* on TLS/resolver init failure, and with `panic =
     // "abort"` that takes down the whole process. `build()` reports the
     // same failure as a catchable `Err` — propagate it.
-    crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
+    apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
