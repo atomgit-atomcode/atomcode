@@ -2581,6 +2581,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 actual_offset + i
             };
             let selected = selected_in_view == Some(i);
+
+            if has_hint_at_end && i == menu_items.len() - 1 {
+                // Prepend a blank line BEFORE the bottom hint row!
+                menu_cells.push(Vec::new());
+            }
+
             if menu_kind == super::MenuKind::Marketplace && !is_add_url && orig_idx >= 3 && orig_idx < final_len.saturating_sub(1) {
                 if orig_idx % 2 == 0 {
                     menu_cells.extend(self.build_marketplace_menu_rows(name, desc, selected, rule_width));
@@ -2592,9 +2598,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 menu_cells.push(self.build_menu_row(name, desc, selected, rule_width, menu_kind));
             }
-        }
-        if has_hint_at_end {
-            menu_cells.push(Vec::new());
         }
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
