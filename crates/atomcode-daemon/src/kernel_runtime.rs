@@ -475,6 +475,7 @@ impl KernelToWebui {
                             id: c.id,
                             name: c.name,
                             arguments: c.arguments,
+                            parallel_safe: c.parallel_safe,
                         })
                         .collect(),
                 }]
@@ -1456,6 +1457,7 @@ mod kernel_runtime_translate_tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 arguments: "{}".into(),
+                parallel_safe: false, // no classification here — test only checks mapping
             }],
         });
         match &started[..] {

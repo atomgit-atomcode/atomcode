@@ -934,6 +934,7 @@ impl TurnRunner {
                     id: c.id.clone(),
                     name: c.name.clone(),
                     arguments: c.arguments.clone(),
+                    parallel_safe: false, // v1 engine runs tools serially — never concurrent
                 })
                 .collect();
             let _ = event_tx.send(TurnEvent::ToolBatchStarted {

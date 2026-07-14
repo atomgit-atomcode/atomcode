@@ -1821,6 +1821,7 @@ impl Bridge {
                         id: c.id,
                         name: c.name,
                         arguments: c.arguments,
+                        parallel_safe: c.parallel_safe,
                     }).collect(),
                 });
             }

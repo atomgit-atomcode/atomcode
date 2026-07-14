@@ -2158,6 +2158,7 @@ impl RunningAgent {
                         id: c.id.clone(),
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
+                        parallel_safe: self.tools.get(&c.name).map(|t| t.parallel_safe()).unwrap_or(false),
                     })
                     .collect();
                 self.rt.emit(AgentEvent::ToolBatchStarted {

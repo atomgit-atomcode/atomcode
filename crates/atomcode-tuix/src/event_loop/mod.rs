@@ -3624,6 +3624,92 @@ mod tool_format_tests {
             update_text
         );
     }
+
+    /// Batch label logic: a 2-call batch where both are NOT parallel_safe (e.g.
+    /// bash) must NOT say "in parallel" — they run serially behind the write-lock.
+    #[test]
+    fn tool_batch_label_serial_calls_omit_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        // Simulate two bash calls — parallel_safe:false (write-lock, serial)
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            !label.contains("in parallel"),
+            "serial (write-lock) bash batch must NOT say 'in parallel', got: {label}"
+        );
+        assert!(
+            label.contains("bash"),
+            "same-name batch should show tool name, got: {label}"
+        );
+    }
+
+    /// Batch label logic: a 2-call batch where ≥2 are parallel_safe (e.g.
+    /// read_file) MUST say "in parallel" — they run concurrently.
+    #[test]
+    fn tool_batch_label_parallel_safe_calls_include_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        // Simulate two read_file calls — parallel_safe:true (read-lock, concurrent)
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+            ToolBatchCall { id: "2".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            label.contains("in parallel"),
+            "read-only (parallel_safe) batch MUST say 'in parallel', got: {label}"
+        );
+        assert!(
+            label.contains("read_file"),
+            "same-name batch should show tool name, got: {label}"
+        );
+    }
+
+    /// Mixed batch: 1 read_file (parallel_safe) + 1 bash (not parallel_safe) →
+    /// fewer than 2 concurrent, so NO "in parallel" even though one is read-only.
+    #[test]
+    fn tool_batch_label_mixed_one_safe_one_not_omits_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            !label.contains("in parallel"),
+            "mixed batch with only 1 parallel_safe call must NOT say 'in parallel', got: {label}"
+        );
+        assert_eq!(
+            label, "Running 2 tools",
+            "mixed-name serial batch must be generic, got: {label}"
+        );
+    }
 }
 
 pub(crate) enum BufferResult {
@@ -9869,6 +9955,11 @@ fn handle_agent_event(
             // parallel". No tech-stack hardcoding — tool names come from
             // the model's own tool_calls.name.
             let count = calls.len();
+            // A batch only runs CONCURRENTLY when ≥2 of its calls are parallel_safe
+            // (read-only). Fewer than 2 (all bash, or 1 read + writes) run serially,
+            // so "in parallel" would be a lie. `parallel_safe` is threaded from
+            // Tool::parallel_safe() in the kernel so we never re-classify by name here.
+            let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
             let unique_names: std::collections::HashSet<&str> =
                 calls.iter().map(|c| c.name.as_str()).collect();
             // Generic header — no per-tool verb table inside the
@@ -9877,11 +9968,19 @@ fn handle_agent_event(
             // a `match tool_name { "bash" => "Running" ... }` table
             // that drifts whenever new tools land or models invent
             // names (mcp.foo, custom plugins).
-            let label = if unique_names.len() == 1 {
-                let single = unique_names.iter().next().copied().unwrap_or("tool");
-                format!("Running {} {} calls in parallel", count, single)
-            } else {
-                format!("Running {} tools in parallel", count)
+            let label = match (unique_names.len() == 1, concurrent) {
+                (true, true) => format!(
+                    "Running {} {} calls in parallel",
+                    count,
+                    unique_names.iter().next().copied().unwrap_or("tool")
+                ),
+                (true, false) => format!(
+                    "Running {} {} calls",
+                    count,
+                    unique_names.iter().next().copied().unwrap_or("tool")
+                ),
+                (false, true) => format!("Running {} tools in parallel", count),
+                (false, false) => format!("Running {} tools", count),
             };
             // Header alone — child rows are NOT pre-rendered. Each
             // child surfaces as a `  ↳ ✓ name` line when its
