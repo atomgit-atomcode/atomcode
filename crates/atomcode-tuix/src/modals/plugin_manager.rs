@@ -738,12 +738,8 @@ impl Modal for PluginManager {
                     self.url_input.clear();
                     self.goto(Screen::Marketplaces);
                 }
-                KeyCode::Left | KeyCode::BackTab => {
-                    self.switch_tab(false);
-                }
-                KeyCode::Right | KeyCode::Tab => {
-                    self.switch_tab(true);
-                }
+                KeyCode::Left | KeyCode::BackTab => {}
+                KeyCode::Right | KeyCode::Tab => {}
                 KeyCode::Enter => {
                     let url = self.url_input.trim().to_string();
                     if !url.is_empty() {
@@ -774,10 +770,14 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Left | KeyCode::BackTab => {
-                self.switch_tab(false);
+                if matches!(self.screen, Screen::Browse | Screen::Installed | Screen::Marketplaces) {
+                    self.switch_tab(false);
+                }
             }
             KeyCode::Right | KeyCode::Tab => {
-                self.switch_tab(true);
+                if matches!(self.screen, Screen::Browse | Screen::Installed | Screen::Marketplaces) {
+                    self.switch_tab(true);
+                }
             }
             KeyCode::Backspace => {
                 if !self.search_query.is_empty() {
