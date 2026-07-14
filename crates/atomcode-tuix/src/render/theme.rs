@@ -166,10 +166,14 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::Success => Some(Palette::DIFF_ADD),
         Role::DiffAdd => Some(diff_add_for_current_theme()),
         Role::DiffRemove => Some(diff_remove_for_current_theme()),
-        // Tool names: emphasise with bold only; the caller adds `\x1b[1m`.
-        // No colour means the name picks up the terminal's default fg,
-        // which guarantees readability on any theme.
         Role::ToolName => None,
+        Role::PanelBg => {
+            if md_theme::is_light_for_render() {
+                Some(Color::AnsiValue(254)) // Light gray for light theme
+            } else {
+                Some(Color::AnsiValue(236)) // Sleek dark gray for dark theme
+            }
+        }
     }
 }
 
@@ -187,6 +191,7 @@ pub enum Role {
     DiffAdd,
     DiffRemove,
     ToolName,
+    PanelBg,
 }
 
 #[cfg(test)]

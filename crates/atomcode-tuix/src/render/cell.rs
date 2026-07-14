@@ -20,7 +20,7 @@
 // output) keeps the pure-append path — body lines enter scrollback and
 // never need a diff cycle.
 
-use crossterm::style::{Color, SetForegroundColor};
+use crossterm::style::{Color, SetForegroundColor, SetBackgroundColor};
 use std::io::Write as _;
 
 /// Visual attributes that can vary per cell in our footer. Kept minimal
@@ -34,6 +34,9 @@ pub struct CellStyle {
     /// Foreground colour via crossterm SGR. `None` = terminal default
     /// foreground (emitted as `\x1b[39m` by the serialiser).
     pub fg: Option<Color>,
+    /// Background colour via crossterm SGR. `None` = terminal default
+    /// background (emitted as `\x1b[49m` by the serialiser).
+    pub bg: Option<Color>,
     /// SGR bold (`\x1b[1m` / `\x1b[22m`).
     pub bold: bool,
     /// SGR reverse video (`\x1b[7m` / `\x1b[27m`). Used for the
@@ -611,11 +614,13 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     // always goes through full reset to avoid clobbering bold state.
     let faint_off = from.faint && !to.faint;
     let fg_change = from.fg != to.fg;
+    let bg_change = from.bg != to.bg;
 
     let needs_reset = bold_off
         || reverse_off
         || faint_off
-        || (from.fg.is_some() && to.fg.is_none());
+        || (from.fg.is_some() && to.fg.is_none())
+        || (from.bg.is_some() && to.bg.is_none());
 
     if needs_reset {
         out.extend_from_slice(b"\x1b[0m");
@@ -631,6 +636,9 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if let Some(c) = to.fg {
             let _ = write!(out, "{}", SetForegroundColor(c));
+        }
+        if let Some(c) = to.bg {
+            let _ = write!(out, "{}", SetBackgroundColor(c));
         }
     } else {
         // Additive path — current attributes stay, just flip on whatever
@@ -652,6 +660,13 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
                 out.extend_from_slice(b"\x1b[39m");
             }
         }
+        if bg_change {
+            if let Some(c) = to.bg {
+                let _ = write!(out, "{}", SetBackgroundColor(c));
+            } else {
+                out.extend_from_slice(b"\x1b[49m");
+            }
+        }
     }
 }
 
@@ -669,6 +684,7 @@ mod tests {
             bold: true,
             reverse: false,
             faint: false,
+            bg: None,
         }
     }
 
@@ -856,6 +872,7 @@ mod tests {
                     bold: true,
                     reverse: false,
                     faint: false,
+                    bg: None,
                 },
                 width: 1,
             },
@@ -880,6 +897,7 @@ mod tests {
                     bold: false,
                     reverse: false,
                     faint: true,
+                    bg: None,
                 },
                 width: 1,
             },
@@ -907,6 +925,7 @@ mod tests {
                     bold: false,
                     reverse: false,
                     faint: true,
+                    bg: None,
                 },
                 width: 1,
             },
