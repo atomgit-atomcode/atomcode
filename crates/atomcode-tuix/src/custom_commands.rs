@@ -65,10 +65,16 @@ impl CustomCommand {
     }
 
     /// Render the template, replacing `$ARGUMENTS` / `${ARGUMENTS}` with `args`.
+    ///
+    /// Normalizes `${ARGUMENTS}` → `$ARGUMENTS` first so the chained
+    /// `.replace()` never re-scans the interpolated `args` for the other
+    /// placeholder — otherwise user input containing a literal
+    /// `${ARGUMENTS}` or `$ARGUMENTS` would cause recursive replacement
+    /// and corrupt the output.
     pub fn render(&self, args: &str) -> String {
         self.template
+            .replace("${ARGUMENTS}", "$ARGUMENTS")
             .replace("$ARGUMENTS", args)
-            .replace("${ARGUMENTS}", args)
     }
 }
 
