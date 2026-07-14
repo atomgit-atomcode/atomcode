@@ -176,6 +176,15 @@ pub trait Tool: Send + Sync {
     fn risk(&self, _args: &str) -> RiskLevel {
         RiskLevel::Safe
     }
+    /// Whether this tool is KNOWN to be read-only (no side effects) — an intrinsic
+    /// property of the tool, distinct from `risk()` (which folds in trust/approval
+    /// state). Default `false` (unknown). An MCP tool sets this from the server's
+    /// `annotations.readOnlyHint`. A specialization (e.g. plan mode) reads it to allow
+    /// read-only external queries that it would otherwise gate — a read-only tool
+    /// cannot modify anything, so it is safe during read-only exploration.
+    fn read_only_hint(&self) -> bool {
+        false
+    }
     /// The scope under which an "always" approval grant ("总是 / Always") is
     /// remembered for THIS call. Two calls that yield the SAME scope string share a
     /// single grant — approving "always" on one auto-approves the other for the

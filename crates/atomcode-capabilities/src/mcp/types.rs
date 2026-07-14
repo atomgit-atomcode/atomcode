@@ -66,6 +66,32 @@ pub struct McpToolDefinition {
     pub description: String,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Optional MCP tool annotations (`readOnlyHint`, `destructiveHint`, …). Captured
+    /// so plan mode can allow read-only external queries. Absent on servers that don't
+    /// annotate → treated as unknown (not read-only).
+    #[serde(default)]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+/// MCP tool behavior hints from `tools/list` (`annotations` object). All optional and
+/// advisory — a missing hint means "unknown", handled conservatively.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    /// The tool does not modify its environment (safe to run during read-only work).
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    /// The tool may perform destructive updates (only meaningful when not read-only).
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
+}
+
+impl McpToolDefinition {
+    /// True only when the server EXPLICITLY annotated this tool `readOnlyHint: true`.
+    /// Conservative: unknown / unannotated → false.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.annotations, Some(McpToolAnnotations { read_only_hint: Some(true), .. }))
+    }
 }
 
 /// List tools result.
@@ -124,5 +150,37 @@ impl std::fmt::Display for ServerStatus {
             ServerStatus::Failed(e) => write!(f, "failed: {}", e),
             ServerStatus::Disconnected => write!(f, "disconnected"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_read_only_hint_annotation() {
+        let def: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "query_users",
+            "description": "list users",
+            "inputSchema": {},
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        }))
+        .unwrap();
+        assert!(def.is_read_only());
+    }
+
+    #[test]
+    fn unannotated_or_non_readonly_is_not_read_only() {
+        // No annotations object at all.
+        let bare: McpToolDefinition =
+            serde_json::from_value(serde_json::json!({ "name": "x", "inputSchema": {} })).unwrap();
+        assert!(!bare.is_read_only());
+        // Annotations present but readOnlyHint absent/false.
+        let write: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "delete_user", "inputSchema": {},
+            "annotations": { "destructiveHint": true }
+        }))
+        .unwrap();
+        assert!(!write.is_read_only());
     }
 }
