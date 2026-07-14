@@ -1055,7 +1055,7 @@ impl Modal for PluginManager {
                 final_items.push((String::new(), String::new()));
                 final_items.push((format!("  {} available plugins", m.plugins.len()), String::new()));
                 final_items.push((String::new(), String::new()));
-                final_items.push((format!("  \x1b[90mInstalled plugins ({}):\x1b[39m", installed_count), String::new()));
+                final_items.push((format!("  \x1b[1mInstalled plugins ({}):\x1b[22m", installed_count), String::new()));
 
                 if installed_count == 0 {
                     final_items.push(("  \x1b[90mNo plugins installed from this marketplace.\x1b[39m".to_string(), String::new()));
