@@ -297,6 +297,29 @@ fn auto_compact_trigger(
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
 }
 
+/// Classification of a single tool call for the three-phase tool loop.
+///
+/// Phase ① CLASSIFY maps every `pending_call` (in order) to a `CallPlan`;
+/// Phase ② EXECUTE runs the `Execute` variants; Phase ③ APPLY walks the plans
+/// in order and applies each produced result. Task 3 replaces ONLY the serial
+/// Phase ② body with a concurrent one — this shape is its contract.
+enum CallPlan {
+    /// Mode-A duplicate (same call_id already resulted this batch) — produces NO
+    /// result row: nothing is emitted, pushed, or executed for it.
+    Skip,
+    /// A ready-to-apply result: mode-B stub, middleware `blocked:` error, or an
+    /// unknown/unmounted-tool error. Applied verbatim in Phase ③ (no execute).
+    Result(ToolResult),
+    /// Run this tool in Phase ②. `parallel_safe` is captured at classification
+    /// time (Task 3 uses it to decide concurrency).
+    Execute {
+        tool: std::sync::Arc<dyn crate::tool::Tool>,
+        call: crate::tool::ToolCall,
+        #[allow(dead_code)] // consumed by Task 3's concurrent Phase ②
+        parallel_safe: bool,
+    },
+}
+
 /// Build the equality key for calls emitted by the model before middleware
 /// rewrites their arguments. Object-key order and insignificant whitespace do
 /// not change call identity; array order and malformed input still do.
@@ -2109,26 +2132,37 @@ impl RunningAgent {
             // collected to attach to ONE follow-up user message AFTER every tool_result
             // is in — see the injection at the loop's end for why this is deferred.
             let mut turn_images: Vec<crate::message::ImageContent> = vec![];
-            for mut call in pending_calls {
-                // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
-                // tool_call once cancelled. Under "cancel = undo" the whole turn is
-                // rolled back below, so the skipped calls vanish with it — no
-                // "(cancelled)" backfill needed (nothing dangles when the turn's
-                // messages are gone).
-                if cancel.is_cancelled() {
-                    // Close any active batch so the UI doesn't have a dangling group.
-                    if let Some((batch_id, started_at)) = &batch_start {
-                        self.rt.emit(AgentEvent::ToolBatchCompleted {
-                            batch_id: batch_id.clone(),
-                            ok: batch_ok,
-                            total: total_non_dup,
-                            elapsed_ms: started_at.elapsed().as_millis() as u64,
-                        });
-                    }
-                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                    return;
-                }
 
+            // ══ THREE-PHASE TOOL EXECUTION ══
+            // ① CLASSIFY (in order): dedup gates, tool lookup, `before`-chain →
+            //    a `CallPlan` per call. ② EXECUTE (SERIAL for now — Task 3 makes
+            //    this concurrent): run each `Execute` plan. ③ APPLY (in order):
+            //    after-chain, cap, hooks, image harvest, emit, push, record.
+            // Behavior is IDENTICAL to the old single-pass loop: every plan's
+            // side effects fire in `pending_calls` order, so results land in
+            // emission order and the dedup/cancel invariants are preserved.
+
+            // ── Phase ① CLASSIFY ──
+            // Cancel is re-checked at the TOP of classification (the old
+            // between-tools checkpoint moved here) AND again before each execute
+            // in Phase ② — the classification pass touches no external state
+            // (only local dedup sets), so a cancel discovered mid-classify simply
+            // means Phase ② never runs.
+            if cancel.is_cancelled() {
+                // Close any active batch so the UI doesn't have a dangling group.
+                if let Some((batch_id, started_at)) = &batch_start {
+                    self.rt.emit(AgentEvent::ToolBatchCompleted {
+                        batch_id: batch_id.clone(),
+                        ok: batch_ok,
+                        total: total_non_dup,
+                        elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    });
+                }
+                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                return;
+            }
+            let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
+            for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
                 // multiple times in ONE assistant message. The dedup KEY is the
@@ -2147,15 +2181,19 @@ impl RunningAgent {
                 // the next request (each tool_use id must map to EXACTLY ONE
                 // tool_result). SKIP it ENTIRELY: no execute, no push, no events.
                 // The first occurrence's result already covers this id, so there is
-                // nothing dangling for backfill to repair either.
+                // nothing dangling for backfill to repair either. IN-BATCH update:
+                // `result_ids` is updated as plans are built, so a second identical
+                // call in THIS batch classifies as Skip here.
                 if result_ids.contains(&call.id) {
+                    plans.push(CallPlan::Skip);
                     continue;
                 }
 
                 // (2) SAME (name, arguments) with a NEW id (mode B — carry
                 // production runner.rs:933-942): do NOT re-execute. Push a stub
                 // result so this distinct id STILL gets exactly one result (parity
-                // → API-valid), emit its ToolResult, record the id, and continue.
+                // → API-valid). The stub is a ready result applied in Phase ③;
+                // record the id NOW so a later same-id call classifies as Skip.
                 if seen_calls.contains(&dedup_key) {
                     let result = ToolResult {
                         call_id: call.id.clone(),
@@ -2166,28 +2204,23 @@ impl RunningAgent {
                         images: vec![],
                     };
                     result_ids.insert(call.id.clone());
-                    self.rt.emit(AgentEvent::ToolResult {
-                        result: result.clone(),
-                    });
-                    convo.push(Message::tool_result(
-                        &result.call_id,
-                        &result.content,
-                        result.is_error,
-                    ));
+                    plans.push(CallPlan::Result(result));
                     continue;
                 }
 
-                // Whether the tool's `execute` ACTUALLY ran (not unknown-tool, not
-                // blocked-by-middleware). Gates whether we record `(name,args)` into
-                // the seen-executed set for mode-B dedup (see record block below).
-                let mut executed = false;
-                let mut result = match self.tools.get(&call.name) {
-                    None => ToolResult {
-                        call_id: call.id.clone(),
-                        content: format!("unknown or unmounted tool: {}", call.name),
-                        is_error: true,
-                        images: vec![],
-                    },
+                match self.tools.get(&call.name) {
+                    None => {
+                        // Unknown / unmounted tool: a ready error result. Record the
+                        // id (mode A) but NOT the (name,args) key — a later distinct
+                        // id may legitimately retry once the tool is mounted.
+                        result_ids.insert(call.id.clone());
+                        plans.push(CallPlan::Result(ToolResult {
+                            call_id: call.id.clone(),
+                            content: format!("unknown or unmounted tool: {}", call.name),
+                            is_error: true,
+                            images: vec![],
+                        }));
+                    }
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
                         // round-trip via rt (approval), and returns a BeforeOutcome
@@ -2214,67 +2247,134 @@ impl RunningAgent {
                             }
                         }
                         if let Some(reason) = blocked {
-                            ToolResult {
+                            // Middleware-blocked: a ready error result. Record the id
+                            // (mode A) but NOT the (name,args) key — a later distinct
+                            // id may legitimately RETRY a previously blocked call.
+                            result_ids.insert(call.id.clone());
+                            plans.push(CallPlan::Result(ToolResult {
                                 call_id: call.id.clone(),
                                 content: format!("blocked: {reason}"),
                                 is_error: true,
                                 images: vec![],
-                            }
+                            }));
                         } else {
-                            executed = true;
-                            self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                            // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
-                            // context's dir instead of reading the process-global
-                            // `current_dir()`. SNAPSHOT the shared `cwd` here so a tool
-                            // (e.g. change_dir) that mutated it on a prior call is
-                            // reflected this call. Unset = prior process-cwd behavior.
-                            let ctx = ToolContext {
-                                working_dir: match &self.cwd {
-                                    Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
-                                        std::env::current_dir().unwrap_or_default()
-                                    }),
-                                    None => std::env::current_dir().unwrap_or_default(),
-                                },
-                                cancel: cancel.clone(),
-                                // Live progress seam: a tool MAY report mid-execution status,
-                                // tagged with THIS call's id, straight to the driver (e.g. a
-                                // sub-agent tool's per-task progress). noop unless used.
-                                progress: {
-                                    let events = self.rt.events.clone();
-                                    let call_id = call.id.clone();
-                                    ProgressSink::new(std::sync::Arc::new(move |message| {
-                                        let _ = events.send(AgentEvent::ToolProgress {
-                                            call_id: call_id.clone(),
-                                            message,
-                                        });
-                                    }))
-                                },
-                            };
-                            // INSIDE-EXECUTE backstop: poll cancel while the tool
-                            // future runs so a long tool is interrupted mid-flight.
-                            // DEVIATES from production runner.rs:1431 (a FAIR select)
-                            // by being `biased` execute-first: a tool that already
-                            // completed deterministically keeps its real result,
-                            // rather than losing a coin-flip to the cancel branch.
-                            // Cooperative tools that poll ctx.cancel win this race and
-                            // clean up properly. A tool still PENDING when cancel fires
-                            // is dropped as a backstop — its side effects (if any) are
-                            // unknown, so the synthetic result says so (see ToolContext
-                            // doc: drop stops polling, it is NOT resource cleanup).
-                            let mut r = tokio::select! {
-                                biased;
-                                r = tool.execute(&call.arguments, &ctx) => r,
-                                _ = cancel.cancelled() => ToolResult {
-                                    call_id: call.id.clone(),
-                                    content: "(cancelled — side effects unknown)".into(),
-                                    is_error: true,
-                                    images: vec![],
-                                },
-                            };
-                            r.call_id = call.id.clone();
-                            r
+                            // Executes in Phase ②. Record BOTH dedup keys NOW so a
+                            // later call in THIS batch that repeats the id classifies as
+                            // Skip (mode A) and one that repeats (name,args) with a new
+                            // id classifies as the mode-B stub — mirroring the old loop's
+                            // incremental update, which happened as calls ran in order.
+                            let parallel_safe = tool.parallel_safe();
+                            result_ids.insert(call.id.clone());
+                            seen_calls.insert(dedup_key);
+                            plans.push(CallPlan::Execute {
+                                tool: tool.clone(),
+                                call,
+                                parallel_safe,
+                            });
                         }
                     }
+                }
+            }
+
+            // ── Phase ② EXECUTE (SERIAL — Task 3 makes this concurrent) ──
+            // Results aligned to `plans`: `None` for Skip and (temporarily) for
+            // Execute slots until this phase fills them; the ready `Result(r)`
+            // payloads are moved into place so Phase ③ has a single uniform view.
+            let mut results: Vec<Option<ToolResult>> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                match plan {
+                    CallPlan::Skip => results.push(None),
+                    CallPlan::Result(r) => results.push(Some(r.clone())),
+                    CallPlan::Execute { .. } => results.push(None),
+                }
+            }
+            // If a BETWEEN-TOOLS cancel is observed, `cancel_boundary` marks the
+            // first plan index NOT reached (nothing at/after it executes). Phase ③
+            // applies results only for plans strictly BEFORE the boundary — exactly
+            // the plans the old single-pass loop had already applied when its
+            // top-of-iteration checkpoint fired — then finishes the cancelled turn.
+            let mut cancel_boundary: Option<usize> = None;
+            for (idx, plan) in plans.iter().enumerate() {
+                // BETWEEN-TOOLS cancel checkpoint, checked at the TOP of EVERY plan
+                // (mirroring the old loop's top-of-iteration checkpoint) — not just
+                // Execute plans — so a ready `Result`/`Skip` sitting AFTER the call
+                // that triggered the cancel is left UN-applied exactly as before.
+                // Under "cancel = undo" the whole turn is rolled back below, so the
+                // skipped calls vanish with it — no "(cancelled)" backfill needed.
+                // A result produced BEFORE the cancel (e.g. a tool that self-cancelled
+                // inside its own execute) is still applied in Phase ③ so its
+                // ToolResult event fires before Cancelled — preserving the old loop's
+                // interleaved emit-then-checkpoint order.
+                if cancel.is_cancelled() {
+                    cancel_boundary = Some(idx);
+                    break;
+                }
+                let CallPlan::Execute { tool, call, .. } = plan else {
+                    continue;
+                };
+                self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
+                // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
+                // context's dir instead of reading the process-global
+                // `current_dir()`. SNAPSHOT the shared `cwd` here so a tool
+                // (e.g. change_dir) that mutated it on a prior call is
+                // reflected this call. Unset = prior process-cwd behavior.
+                let ctx = ToolContext {
+                    working_dir: match &self.cwd {
+                        Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
+                            std::env::current_dir().unwrap_or_default()
+                        }),
+                        None => std::env::current_dir().unwrap_or_default(),
+                    },
+                    cancel: cancel.clone(),
+                    // Live progress seam: a tool MAY report mid-execution status,
+                    // tagged with THIS call's id, straight to the driver (e.g. a
+                    // sub-agent tool's per-task progress). noop unless used.
+                    progress: {
+                        let events = self.rt.events.clone();
+                        let call_id = call.id.clone();
+                        ProgressSink::new(std::sync::Arc::new(move |message| {
+                            let _ = events.send(AgentEvent::ToolProgress {
+                                call_id: call_id.clone(),
+                                message,
+                            });
+                        }))
+                    },
+                };
+                // INSIDE-EXECUTE backstop: poll cancel while the tool
+                // future runs so a long tool is interrupted mid-flight.
+                // DEVIATES from production runner.rs:1431 (a FAIR select)
+                // by being `biased` execute-first: a tool that already
+                // completed deterministically keeps its real result,
+                // rather than losing a coin-flip to the cancel branch.
+                // Cooperative tools that poll ctx.cancel win this race and
+                // clean up properly. A tool still PENDING when cancel fires
+                // is dropped as a backstop — its side effects (if any) are
+                // unknown, so the synthetic result says so (see ToolContext
+                // doc: drop stops polling, it is NOT resource cleanup).
+                let mut r = tokio::select! {
+                    biased;
+                    r = tool.execute(&call.arguments, &ctx) => r,
+                    _ = cancel.cancelled() => ToolResult {
+                        call_id: call.id.clone(),
+                        content: "(cancelled — side effects unknown)".into(),
+                        is_error: true,
+                        images: vec![],
+                    },
+                };
+                r.call_id = call.id.clone();
+                results[idx] = Some(r);
+            }
+
+            // ── Phase ③ APPLY (in order) ──
+            // For each produced result (Skip contributes nothing): after-chain,
+            // cap, hooks, image harvest, emit, push, dedup record — IDENTICAL to
+            // the old single-pass tail, run in `plans` order so ordering and all
+            // side-effect sequencing are preserved. On a between-tools cancel, only
+            // plans BEFORE `cancel_boundary` are applied (the rest never executed).
+            let apply_end = cancel_boundary.unwrap_or(plans.len());
+            for result_slot in results.iter_mut().take(apply_end) {
+                let Some(mut result) = result_slot.take() else {
+                    continue; // Skip plan (no result to apply)
                 };
                 // ToolMiddleware after-chain: transform / observe the result and
                 // collect any CONTINUATION decision. Middleware sees the RAW
@@ -2327,20 +2427,30 @@ impl RunningAgent {
                     convo.push(Message::synthetic_user(reason));
                 }
 
-                // (3) Record this id as "resulted" so a later SAME-id call (mode A)
-                // is skipped. Recorded for EVERY path that produces a result —
-                // including an unknown-tool error and a middleware-`blocked:` error
-                // (each still pushed exactly one tool_result for `call.id`, so a
-                // later same-id call would create the API-invalid duplicate we must
-                // skip). Record `(name, arguments)` (the ORIGINAL key captured at
-                // the top, before any middleware rewrite) only when the tool
-                // ACTUALLY ran — i.e. not for unknown-tool / blocked cases — so a
-                // later distinct id that the model intends to RETRY a previously
-                // failed/blocked call is not mistaken for a no-op duplicate.
-                result_ids.insert(call.id.clone());
-                if executed {
-                    seen_calls.insert(dedup_key);
+                // (3) Dedup RECORD is HOISTED to Phase ① classification: the old
+                // loop recorded `result_ids` (mode A) and `seen_calls` (mode B,
+                // executed only) at the END of each iteration, but the keys must be
+                // visible to later calls in the SAME batch — and in the phase split
+                // every call is classified before ANY apply runs — so both keys are
+                // now inserted during classification. The record semantics are
+                // identical, just moved earlier; nothing to record here.
+            }
+            // ── Between-tools cancel: close batch + roll back the turn ──
+            // Reached only when Phase ② observed a cancel and stopped early. The
+            // already-produced results (before the boundary) were applied above so
+            // their ToolResult events fired; now close any batch and finish the
+            // cancelled turn — exactly the old loop's checkpoint-fires path.
+            if cancel_boundary.is_some() {
+                if let Some((batch_id, started_at)) = &batch_start {
+                    self.rt.emit(AgentEvent::ToolBatchCompleted {
+                        batch_id: batch_id.clone(),
+                        ok: batch_ok,
+                        total: total_non_dup,
+                        elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    });
                 }
+                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                return;
             }
             // ── Close batch (if one was opened) ──
             if let Some((batch_id, started_at)) = batch_start {
