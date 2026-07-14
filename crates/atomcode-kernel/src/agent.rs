@@ -82,6 +82,20 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// many) so a model that truncates every round cannot livelock the loop.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 
+/// Maximum number of `parallel_safe` (read-only) tools that run CONCURRENTLY in
+/// Phase ② of the tool loop. Read from `ATOMCODE_MAX_PARALLEL_TOOLS` (a positive
+/// integer); anything unset, unparseable, or `< 1` falls back to the default 4.
+/// A cap of 1 makes Phase ② effectively serial (one permit) without disabling the
+/// gate. Side-effecting tools always take the exclusive write-lock regardless of
+/// this cap, so it bounds only read-only overlap.
+fn max_parallel_tools() -> usize {
+    std::env::var("ATOMCODE_MAX_PARALLEL_TOOLS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4)
+}
+
 /// Synthetic user message injected after an output-limit truncation. Mirrors v1's
 /// wording but steers toward INCREMENTAL file writes (the durable fix for output
 /// that exceeds a single response's token budget) instead of re-emitting it all.
@@ -315,7 +329,8 @@ enum CallPlan {
     Execute {
         tool: std::sync::Arc<dyn crate::tool::Tool>,
         call: crate::tool::ToolCall,
-        #[allow(dead_code)] // consumed by Task 3's concurrent Phase ②
+        /// Captured from `Tool::parallel_safe()` at classification time; Phase ②
+        /// uses it to pick a read-lock (concurrent) vs write-lock (barrier).
         parallel_safe: bool,
     },
 }
@@ -2276,103 +2291,148 @@ impl RunningAgent {
                 }
             }
 
-            // ── Phase ② EXECUTE (SERIAL — Task 3 makes this concurrent) ──
-            // Results aligned to `plans`: `None` for Skip and (temporarily) for
-            // Execute slots until this phase fills them; the ready `Result(r)`
-            // payloads are moved into place so Phase ③ has a single uniform view.
-            let mut results: Vec<Option<ToolResult>> = Vec::with_capacity(plans.len());
-            for plan in &plans {
-                match plan {
-                    CallPlan::Skip => results.push(None),
-                    CallPlan::Result(r) => results.push(Some(r.clone())),
-                    CallPlan::Execute { .. } => results.push(None),
+            // ── Phase ② EXECUTE (CONCURRENT — Task 3) ──
+            // `Execute` plans run concurrently, gated by an RwLock: `parallel_safe`
+            // (read-only) tools take a READ-lock (they overlap), side-effecting
+            // tools take a WRITE-lock (an exclusive barrier — no read or write runs
+            // alongside them, so a mutation is never observed mid-flight by a
+            // concurrent read). A `Semaphore` bounds how many run at once
+            // (`ATOMCODE_MAX_PARALLEL_TOOLS`, default 4). Futures are polled on the
+            // CURRENT task via `FuturesOrdered` (NOT `tokio::spawn`) so no `Send`
+            // bound is imposed and each future owns cloned handles — it holds NO
+            // borrow of `&self` across an await. Results are collected in EMISSION
+            // order (FuturesOrdered yields by push order), so Phase ③ still applies
+            // side effects in `pending_calls` order exactly as the serial loop did.
+            use futures::stream::{FuturesOrdered, StreamExt};
+            let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel_tools()));
+
+            // Results aligned to `plans`: `None` for Skip / not-executed slots; the
+            // ready `Result(r)` payloads are moved into place so Phase ③ has a
+            // single uniform view. Execute slots are filled by the drain below.
+            let mut results: Vec<Option<ToolResult>> =
+                (0..plans.len()).map(|_| None).collect();
+            for (i, plan) in plans.iter().enumerate() {
+                if let CallPlan::Result(r) = plan {
+                    results[i] = Some(r.clone());
                 }
-            }
-            // If a BETWEEN-TOOLS cancel is observed, `cancel_boundary` marks the
-            // first plan index NOT reached (nothing at/after it executes). Phase ③
-            // applies results only for plans strictly BEFORE the boundary — exactly
-            // the plans the old single-pass loop had already applied when its
-            // top-of-iteration checkpoint fired — then finishes the cancelled turn.
-            let mut cancel_boundary: Option<usize> = None;
-            for (idx, plan) in plans.iter().enumerate() {
-                // BETWEEN-TOOLS cancel checkpoint, checked at the TOP of EVERY plan
-                // (mirroring the old loop's top-of-iteration checkpoint) — not just
-                // Execute plans — so a ready `Result`/`Skip` sitting AFTER the call
-                // that triggered the cancel is left UN-applied exactly as before.
-                // Under "cancel = undo" the whole turn is rolled back below, so the
-                // skipped calls vanish with it — no "(cancelled)" backfill needed.
-                // A result produced BEFORE the cancel (e.g. a tool that self-cancelled
-                // inside its own execute) is still applied in Phase ③ so its
-                // ToolResult event fires before Cancelled — preserving the old loop's
-                // interleaved emit-then-checkpoint order.
-                if cancel.is_cancelled() {
-                    cancel_boundary = Some(idx);
-                    break;
-                }
-                let CallPlan::Execute { tool, call, .. } = plan else {
-                    continue;
-                };
-                self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
-                // context's dir instead of reading the process-global
-                // `current_dir()`. SNAPSHOT the shared `cwd` here so a tool
-                // (e.g. change_dir) that mutated it on a prior call is
-                // reflected this call. Unset = prior process-cwd behavior.
-                let ctx = ToolContext {
-                    working_dir: match &self.cwd {
-                        Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
-                            std::env::current_dir().unwrap_or_default()
-                        }),
-                        None => std::env::current_dir().unwrap_or_default(),
-                    },
-                    cancel: cancel.clone(),
-                    // Live progress seam: a tool MAY report mid-execution status,
-                    // tagged with THIS call's id, straight to the driver (e.g. a
-                    // sub-agent tool's per-task progress). noop unless used.
-                    progress: {
-                        let events = self.rt.events.clone();
-                        let call_id = call.id.clone();
-                        ProgressSink::new(std::sync::Arc::new(move |message| {
-                            let _ = events.send(AgentEvent::ToolProgress {
-                                call_id: call_id.clone(),
-                                message,
-                            });
-                        }))
-                    },
-                };
-                // INSIDE-EXECUTE backstop: poll cancel while the tool
-                // future runs so a long tool is interrupted mid-flight.
-                // DEVIATES from production runner.rs:1431 (a FAIR select)
-                // by being `biased` execute-first: a tool that already
-                // completed deterministically keeps its real result,
-                // rather than losing a coin-flip to the cancel branch.
-                // Cooperative tools that poll ctx.cancel win this race and
-                // clean up properly. A tool still PENDING when cancel fires
-                // is dropped as a backstop — its side effects (if any) are
-                // unknown, so the synthetic result says so (see ToolContext
-                // doc: drop stops polling, it is NOT resource cleanup).
-                let mut r = tokio::select! {
-                    biased;
-                    r = tool.execute(&call.arguments, &ctx) => r,
-                    _ = cancel.cancelled() => ToolResult {
-                        call_id: call.id.clone(),
-                        content: "(cancelled — side effects unknown)".into(),
-                        is_error: true,
-                        images: vec![],
-                    },
-                };
-                r.call_id = call.id.clone();
-                results[idx] = Some(r);
             }
 
+            let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
+            for (idx, plan) in plans.iter().enumerate() {
+                let CallPlan::Execute {
+                    tool,
+                    call,
+                    parallel_safe,
+                } = plan
+                else {
+                    continue;
+                };
+                // Capture OWNED clones BEFORE the `async move` so the future is
+                // self-contained — no `&self` borrow is held across an await while
+                // it is polled inside `FuturesOrdered`.
+                let gate = gate.clone();
+                let sem = sem.clone();
+                let cancel = cancel.clone();
+                // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
+                // context's dir instead of the process-global `current_dir()`.
+                let cwd = self.cwd.clone();
+                // Same mpsc sender `ProgressSink`/`self.rt.emit` uses today. Emitting
+                // via `events.send` directly (rather than `self.rt.emit`) keeps the
+                // future free of any `&self` borrow.
+                let events = self.rt.events.clone();
+                let parallel_safe = *parallel_safe;
+                let tool = tool.clone();
+                let call = call.clone();
+                ordered.push_back(async move {
+                    let _permit = sem.acquire().await.expect("semaphore not closed");
+                    // Read-lock ⇒ concurrent; write-lock ⇒ exclusive barrier.
+                    let _guard = if parallel_safe {
+                        futures::future::Either::Left(gate.read().await)
+                    } else {
+                        futures::future::Either::Right(gate.write().await)
+                    };
+                    // CANCEL CHECKPOINT (concurrent analogue of the serial
+                    // between-tools checkpoint): if the turn was already cancelled by
+                    // the time this future acquired its lock (e.g. an EARLIER future
+                    // self-cancelled from inside its own execute, or an out-of-band
+                    // Cancel landed), this tool is NOT reached — it does not start,
+                    // emits no ToolStarted, and yields `None` so Phase ③ leaves its
+                    // tool_call dangling (rolled back under cancel=undo, backfilled
+                    // with `(cancelled)` under keep_interrupted_context) — exactly the
+                    // serial loop's skip-the-rest behavior.
+                    if cancel.is_cancelled() {
+                        return (idx, None);
+                    }
+                    // SNAPSHOT cwd AFTER acquiring the lock so a prior write-locked
+                    // `change_dir` (which held the exclusive barrier) is visible here.
+                    let ctx = ToolContext {
+                        working_dir: match &cwd {
+                            Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
+                                std::env::current_dir().unwrap_or_default()
+                            }),
+                            None => std::env::current_dir().unwrap_or_default(),
+                        },
+                        cancel: cancel.clone(),
+                        // Live progress seam: a tool MAY report mid-execution status,
+                        // tagged with THIS call's id, straight to the driver.
+                        progress: {
+                            let events = events.clone();
+                            let call_id = call.id.clone();
+                            ProgressSink::new(std::sync::Arc::new(move |message| {
+                                let _ = events.send(AgentEvent::ToolProgress {
+                                    call_id: call_id.clone(),
+                                    message,
+                                });
+                            }))
+                        },
+                    };
+                    // Emit ToolStarted as THIS tool actually starts (inside the
+                    // future, once it holds its lock) via `events.send` — NOT
+                    // `self.rt.emit`, to avoid borrowing self across the await.
+                    let _ = events.send(AgentEvent::ToolStarted { call: call.clone() });
+                    // INSIDE-EXECUTE backstop: poll cancel while the tool future
+                    // runs so a long tool is interrupted mid-flight. `biased`
+                    // execute-first: a tool that already completed deterministically
+                    // keeps its real result rather than losing a coin-flip to cancel.
+                    // A tool still PENDING when cancel fires is dropped as a backstop
+                    // (side effects unknown → the synthetic result says so).
+                    let mut r = tokio::select! {
+                        biased;
+                        r = tool.execute(&call.arguments, &ctx) => r,
+                        _ = cancel.cancelled() => ToolResult {
+                            call_id: call.id.clone(),
+                            content: "(cancelled — side effects unknown)".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    };
+                    r.call_id = call.id.clone();
+                    (idx, Some(r))
+                });
+            }
+            // Drain in emission order. A future may yield `None` (cancel-skipped);
+            // that slot stays `None`, so Phase ③ applies nothing for it.
+            while let Some((idx, r)) = ordered.next().await {
+                results[idx] = r;
+            }
+            // If a cancel was observed during the concurrent batch, Phase ③ still
+            // applies every result that DID complete (their ToolResult events fire
+            // before Cancelled — preserving the emit-then-finalize order), then the
+            // between-tools cancel tail closes the batch and finishes the cancelled
+            // turn. Cancel-skipped slots are already `None` and apply nothing.
+            let cancelled_during_batch = cancel.is_cancelled();
+
             // ── Phase ③ APPLY (in order) ──
-            // For each produced result (Skip contributes nothing): after-chain,
-            // cap, hooks, image harvest, emit, push, dedup record — IDENTICAL to
-            // the old single-pass tail, run in `plans` order so ordering and all
-            // side-effect sequencing are preserved. On a between-tools cancel, only
-            // plans BEFORE `cancel_boundary` are applied (the rest never executed).
-            let apply_end = cancel_boundary.unwrap_or(plans.len());
-            for result_slot in results.iter_mut().take(apply_end) {
+            // For each produced result (Skip / cancel-skipped contributes nothing):
+            // after-chain, cap, hooks, image harvest, emit, push, dedup record —
+            // IDENTICAL to the old single-pass tail, run in `plans` order so ordering
+            // and all side-effect sequencing are preserved. On a cancel during the
+            // batch, the cancel-skipped Execute slots are already `None`, so a tool
+            // that never started applies nothing (its tool_call is left dangling for
+            // the roll-back / backfill tail below) — the concurrent analogue of the
+            // serial `cancel_boundary` cut.
+            for result_slot in results.iter_mut() {
                 let Some(mut result) = result_slot.take() else {
                     continue; // Skip plan (no result to apply)
                 };
@@ -2435,12 +2495,13 @@ impl RunningAgent {
                 // now inserted during classification. The record semantics are
                 // identical, just moved earlier; nothing to record here.
             }
-            // ── Between-tools cancel: close batch + roll back the turn ──
-            // Reached only when Phase ② observed a cancel and stopped early. The
-            // already-produced results (before the boundary) were applied above so
-            // their ToolResult events fired; now close any batch and finish the
-            // cancelled turn — exactly the old loop's checkpoint-fires path.
-            if cancel_boundary.is_some() {
+            // ── Cancel during the batch: close batch + roll back the turn ──
+            // Reached only when Phase ② observed a cancel. The results that DID
+            // complete were applied above so their ToolResult events fired; the
+            // cancel-skipped Execute slots applied nothing (dangling tool_calls now
+            // rolled back / backfilled by finish_cancelled). Close any batch and
+            // finish the cancelled turn — exactly the old loop's checkpoint path.
+            if cancelled_during_batch {
                 if let Some((batch_id, started_at)) = &batch_start {
                     self.rt.emit(AgentEvent::ToolBatchCompleted {
                         batch_id: batch_id.clone(),
