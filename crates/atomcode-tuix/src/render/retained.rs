@@ -1593,11 +1593,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
-        let mut style = if selected {
+        let is_marketplace = kind == super::MenuKind::Marketplace;
+        let mut style = if selected && !is_marketplace {
             CellStyle {
                 fg: None,
                 bold: true,
                 reverse: true,
+                faint: false,
+            }
+        } else if selected && is_marketplace {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: false,
                 faint: false,
             }
         } else {
@@ -1618,7 +1626,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             style = self.style_for(Role::Muted);
         }
         let is_add_marketplace = name == "+ Add Marketplace";
-        if is_add_marketplace && !selected {
+        if is_add_marketplace {
             style = self.style_bold(Role::Brand);
         }
         let is_add_title = name == "Add Marketplace";
@@ -1757,23 +1765,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let installed = parts.get(2).copied().unwrap_or("0");
         let updated = parts.get(3).copied().unwrap_or("");
 
-        let bullet = "● ";
+        let bullet = if selected { "▸ ● " } else { "  ● " };
         let bullet_style = self.style_for(Role::Brand);
 
-        let name_style = if selected {
-            CellStyle {
-                fg: None,
-                bold: true,
-                reverse: true,
-                faint: false,
-            }
-        } else {
-            CellStyle {
-                fg: None,
-                bold: true,
-                reverse: false,
-                faint: false,
-            }
+        let name_style = CellStyle {
+            fg: None,
+            bold: true,
+            reverse: false,
+            faint: false,
         };
 
         let mut row1 = Vec::new();
@@ -1785,22 +1784,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row1.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected { name_style.clone() } else { CellStyle::default() },
+                style: CellStyle::default(),
             });
         }
 
-        let style2 = if selected {
-            CellStyle {
-                fg: None,
-                bold: false,
-                reverse: true,
-                faint: true,
-            }
-        } else {
-            let mut s = self.style_for(Role::Secondary);
-            s.faint = true;
-            s
-        };
+        let mut style2 = self.style_for(Role::Secondary);
+        style2.faint = true;
+
         let line2_str = format!("  {}", source);
         let mut row2 = Vec::new();
         push_str_cells_sgr(&mut row2, &line2_str, style2.clone());
@@ -1810,7 +1800,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row2.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected { style2.clone() } else { CellStyle::default() },
+                style: CellStyle::default(),
             });
         }
 
@@ -1823,7 +1813,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row3.push(Cell {
                 ch: ' ',
                 width: 1,
-                style: if selected { style2.clone() } else { CellStyle::default() },
+                style: CellStyle::default(),
             });
         }
 
