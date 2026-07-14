@@ -958,7 +958,7 @@ impl Modal for PluginManager {
         let kind = match &self.screen {
             Screen::Browse | Screen::Installed => MenuKind::Plugin,
             Screen::Marketplaces | Screen::AddUrl => MenuKind::Marketplace,
-            _ => MenuKind::Skill,
+            Screen::ScopeSelect { .. } | Screen::Installing { .. } | Screen::InstalledDetails { .. } => MenuKind::PluginInfo,
         };
         let payload = MenuPayload {
             items: final_items,

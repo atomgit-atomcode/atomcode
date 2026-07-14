@@ -1591,7 +1591,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
-            super::MenuKind::Marketplace => {
+            super::MenuKind::Marketplace | super::MenuKind::PluginInfo => {
                 if selected {
                     format!("▸ {}", name)
                 } else {
@@ -2378,7 +2378,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
-        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace);
+        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
         let total_rows = self.footer_total_rows(
             middle_rows,
             attachment_rows,
@@ -2709,7 +2709,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // a live paragraph — see `push_or_update_live_spinner`.)
         // Delegates to footer_total_rows so both functions share one formula.
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
-        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace);
+        let hide_input_box = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
         self.footer_total_rows(
             capped_middle,
             attachment_rows,

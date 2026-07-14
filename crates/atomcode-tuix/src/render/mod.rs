@@ -391,6 +391,8 @@ pub enum MenuKind {
     Plugin,
     /// Marketplace list tab screen: 3-line rendering + 1 blank line separator per item
     Marketplace,
+    /// Plugin manager details / scope selection screens: 1-line rendering per item, input box hidden
+    PluginInfo,
 }
 
 impl MenuKind {
@@ -413,6 +415,7 @@ impl MenuKind {
                 let visible_mps = mp_count.min(max_mps);
                 5 + visible_mps * 4
             }
+            MenuKind::PluginInfo => item_count,
         }
     }
 }
