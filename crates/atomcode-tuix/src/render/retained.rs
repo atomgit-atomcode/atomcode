@@ -199,19 +199,6 @@ fn format_loop_row(
     format!("{marker}{lbl}{meta}")
 }
 
-/// Todo-row marker: `☑` (Ballot Box With Check, U+2611) when unicode is
-/// available, `+` fallback for legacy terminals. Width-1 + trailing space,
-/// matching the layout contract of `goal_marker`/`loop_marker`. The ASCII
-/// fallback is `+` (not the goal/loop `*`) so a todo row stays distinguishable
-/// from a co-shown goal/loop row on non-unicode terminals.
-fn todo_marker(unicode: bool) -> &'static str {
-    if unicode {
-        "\u{2611} "
-    } else {
-        "+ "
-    }
-}
-
 /// Max rows the footer todo panel may occupy, INCLUDING the header. The panel
 /// is additionally clamped against screen height by the caller.
 const MAX_TODO_PANEL_ROWS: usize = 6;
@@ -226,6 +213,8 @@ enum TodoPanelRow {
     Header { completed: usize, total: usize },
     CompletedFold { count: usize },
     Item {
+        /// 0-based position in the FULL todo list, rendered as `#{index+1}`.
+        index: usize,
         status: atomcode_capabilities::tools::todo::TodoStatus,
         content: String,
     },
@@ -260,14 +249,16 @@ fn todo_panel_rows(
         return rows;
     }
 
-    let in_progress: Option<&String> = items
+    let in_progress: Option<(usize, &String)> = items
         .iter()
-        .find(|(s, _)| *s == TodoStatus::InProgress)
-        .map(|(_, c)| c);
-    let pendings: Vec<&String> = items
+        .enumerate()
+        .find(|(_, (s, _))| *s == TodoStatus::InProgress)
+        .map(|(i, (_, c))| (i, c));
+    let pendings: Vec<(usize, &String)> = items
         .iter()
-        .filter(|(s, _)| *s == TodoStatus::Pending)
-        .map(|(_, c)| c)
+        .enumerate()
+        .filter(|(_, (s, _))| *s == TodoStatus::Pending)
+        .map(|(i, (_, c))| (i, c))
         .collect();
 
     // Reserve high-priority slots first (in-progress, then completed fold).
@@ -297,15 +288,17 @@ fn todo_panel_rows(
         rows.push(TodoPanelRow::CompletedFold { count: completed });
     }
     if show_ip {
-        if let Some(c) = in_progress {
+        if let Some((idx, c)) = in_progress {
             rows.push(TodoPanelRow::Item {
+                index: idx,
                 status: TodoStatus::InProgress,
                 content: c.clone(),
             });
         }
     }
-    for c in pendings.iter().take(shown_pending) {
+    for (idx, c) in pendings.iter().take(shown_pending) {
         rows.push(TodoPanelRow::Item {
+            index: *idx,
             status: TodoStatus::Pending,
             content: (*c).clone(),
         });
@@ -2024,19 +2017,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
         todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap()).len()
     }
 
-    /// Build the multi-line todo panel: a header row (`☑ Todos · N/M`) followed
-    /// by collapsed item rows. Pinned at the top of the footer. Theme-safe and
-    /// COLORLESS — hierarchy is by weight, matching the footer's minimal grey
-    /// palette: bold `☑ Todos` header + bold in-progress, faint completed/fold,
-    /// Muted pending/more/count. ASCII fallback via `todo_marker`/`todo_glyph`.
+    /// Build the multi-line todo panel: a header row (`Tasks (N done, M open)`)
+    /// followed by collapsed rows — `✔ N done` fold, then `☐ #k content` items
+    /// (in-progress bold, pending muted), then a `+N more…` fold. Pinned at the top
+    /// of the footer. Theme-safe and COLORLESS — hierarchy is by weight. Checkbox
+    /// glyphs downgrade to `[ ]`/`[x]` on non-unicode terminals.
     fn build_todo_rows(
         &self,
         todo: &crate::render::TodoProgress,
         rule_width: usize,
     ) -> Vec<Vec<Cell>> {
-        use atomcode_capabilities::tools::todo::{todo_glyph, TodoStatus};
+        use atomcode_capabilities::tools::todo::TodoStatus;
         let unicode = self.caps.unicode_symbols;
         let rows = todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap());
+        // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
+        // directly on non-unicode terminals so the cell backstop never has to guess.
+        let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
+        let done_glyph = if unicode { "\u{2714}" } else { "[x]" };
+        let ellipsis = if unicode { "\u{2026}" } else { "..." };
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
         let item_line = |glyph: &str, body: &str, style: &CellStyle| -> Vec<Cell> {
@@ -2053,49 +2051,38 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // Blank spacer: empty cell list — paint_footer pads it to width.
                 TodoPanelRow::Spacer => Vec::new(),
                 TodoPanelRow::Header { completed, total } => {
-                    // Colorless: the `☑ Todos` marker + title anchor the panel by
-                    // weight (bold), the ` · N/M` count stays muted. No accent —
-                    // matches the footer's minimal grey palette.
+                    // `Tasks (N done, M open)` — bold, no checkbox glyph (the per-item
+                    // boxes already say "checklist"). English regardless of locale.
+                    let open = total.saturating_sub(completed);
                     let bold = CellStyle { bold: true, ..CellStyle::default() };
                     let mut row = Vec::new();
-                    push_str_cells(&mut row, todo_marker(unicode), &bold);
-                    push_str_cells(
-                        &mut row,
-                        &crate::i18n::t(crate::i18n::Msg::TodoPanelTitle).into_owned(),
-                        &bold,
-                    );
-                    push_str_cells(
-                        &mut row,
-                        &format!(" \u{b7} {completed}/{total}"),
-                        &self.style_for(Role::Muted),
-                    );
+                    push_str_cells(&mut row, &format!("Tasks ({completed} done, {open} open)"), &bold);
                     row
                 }
                 TodoPanelRow::CompletedFold { count } => {
                     let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
-                    let label = crate::i18n::t(crate::i18n::Msg::TodoPanelCompleted { n: count })
-                        .into_owned();
-                    item_line(todo_glyph(TodoStatus::Completed, unicode), &label, &style)
+                    item_line(done_glyph, &format!("{count} done"), &style)
                 }
-                TodoPanelRow::Item { status, content } => {
-                    let style = match status {
+                TodoPanelRow::Item { index, status, content } => {
+                    let (glyph, style) = match status {
+                        // Bold for the current task; no color (accent stays off in the footer).
                         TodoStatus::InProgress => {
-                            // Bold for emphasis, but NO color — the pink read as
-                            // jarring; the accent is reserved for the header.
-                            CellStyle { bold: true, ..CellStyle::default() }
+                            (open_glyph, CellStyle { bold: true, ..CellStyle::default() })
                         }
+                        // Completed items are normally folded; render defensively if one slips through.
                         TodoStatus::Completed => {
-                            CellStyle { faint: true, ..self.style_for(Role::Muted) }
+                            (done_glyph, CellStyle { faint: true, ..self.style_for(Role::Muted) })
                         }
-                        TodoStatus::Pending => self.style_for(Role::Muted),
+                        TodoStatus::Pending => (open_glyph, self.style_for(Role::Muted)),
                     };
-                    item_line(todo_glyph(status, unicode), &content, &style)
+                    item_line(glyph, &format!("#{}  {}", index + 1, content), &style)
                 }
                 TodoPanelRow::More { hidden } => {
+                    // Fold indicator, not a task — no checkbox, just an indented muted note.
                     let style = self.style_for(Role::Muted);
-                    let label =
-                        crate::i18n::t(crate::i18n::Msg::TodoPanelMore { n: hidden }).into_owned();
-                    item_line(todo_glyph(TodoStatus::Pending, unicode), &label, &style)
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, &format!("  +{hidden} more{ellipsis}"), &style);
+                    row
                 }
             })
             .collect()
@@ -10873,7 +10860,7 @@ mod tests {
 
         let h = vterm.height() as usize;
         let row_of = |needle: &str| (0..h).find(|&i| vterm.row_text(i).contains(needle));
-        let panel = row_of("Todos").expect("panel header rendered");
+        let panel = row_of("Tasks").expect("panel header rendered");
         let input = row_of("TYPEDHERE").expect("input text rendered");
         assert!(
             panel < input,
@@ -14376,8 +14363,8 @@ mod todo_panel_rows_tests {
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, total: 3 }));
         assert!(matches!(rows[2], TodoPanelRow::CompletedFold { count: 1 }));
-        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::InProgress, content } if content == "b"));
-        assert!(matches!(&rows[4], TodoPanelRow::Item { status: TodoStatus::Pending, content } if content == "c"));
+        assert!(matches!(&rows[3], TodoPanelRow::Item { status: TodoStatus::InProgress, content, .. } if content == "b"));
+        assert!(matches!(&rows[4], TodoPanelRow::Item { status: TodoStatus::Pending, content, .. } if content == "c"));
     }
 
     #[test]
@@ -14467,8 +14454,14 @@ mod todo_panel_rows_tests {
         use crate::render::theme::Palette;
         // rows[0] is the blank Spacer row — no cells.
         assert!(rows[0].is_empty(), "first row must be the blank spacer");
-        // rows[1] is the header: shows the i18n title + N/M, is bold, and carries NO color.
-        assert!(text(&rows[1]).contains("Todos") && text(&rows[1]).contains("1/3"));
+        // rows[1] is the header: `Tasks (N done, M open)`, bold, NO color.
+        assert!(
+            text(&rows[1]).contains("Tasks (")
+                && text(&rows[1]).contains("1 done")
+                && text(&rows[1]).contains("2 open"),
+            "header must be 'Tasks (1 done, 2 open)', got: {:?}",
+            text(&rows[1])
+        );
         assert!(rows[1].iter().any(|c| c.style.bold), "header title is bold");
         assert!(
             rows[1].iter().all(|c| c.style.fg != Some(Palette::BRAND)),
@@ -14481,5 +14474,7 @@ mod todo_panel_rows_tests {
             ip.iter().all(|c| c.style.fg != Some(Palette::BRAND)),
             "in-progress task must not be Brand-colored"
         );
+        // Tasks-panel style: every item carries a `#N` positional number.
+        assert!(text(ip).contains('#'), "item must show a #N number, got: {:?}", text(ip));
     }
 }
