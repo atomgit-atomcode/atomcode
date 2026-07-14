@@ -1642,7 +1642,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if is_muted {
             style = self.style_for(Role::Muted);
         }
-        if selected && content.starts_with("▸ ") {
+        if selected && content.starts_with("▸ ") && is_plugin_mgr {
             let mut brand_style = style.clone();
             brand_style.fg = self.style_for(Role::Brand).fg;
             push_str_cells_sgr(&mut row, "▸ ", brand_style);
