@@ -1201,13 +1201,51 @@ impl RunningAgent {
             let start = self.clock.now_millis();
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
+            // meets/exceeds the model window, COMPACT before sending rather than firing a
+            // doomed over-window request. This is the case the between-turn `should_compact`
+            // (evaluated only at turn boundaries) misses: a mid-turn burst of large tool
+            // outputs can outgrow the window WITHIN one agentic turn, and a gateway that
+            // answers over-window with a content-free 200 never returns the overflow error
+            // that would otherwise trigger the hard-overflow recovery below. Bounded by
+            // MAX_OVERFLOW_ATTEMPTS; re-projects (clone + pre_request) after each pass and
+            // stops early when a pass drains nothing (single oversized input at the sacred
+            // floor — unrecoverable, so fall through to the advisory).
+            {
+                let window = self.provider.context_window();
+                let est = |msgs: &[Message]| -> u64 {
+                    msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
+                };
+                // Only worth compacting if a COMPLETED exchange exists to drain. On the
+                // very first request an over-window prompt is a single oversized input that
+                // compaction can't shrink (it IS the active turn) — skip to the advisory.
+                let has_drainable = convo
+                    .messages
+                    .iter()
+                    .any(|m| m.role == crate::message::Role::Assistant);
+                let mut attempts: u8 = 0;
+                while has_drainable
+                    && window > 0
+                    && est(&messages) >= window as u64
+                    && attempts < MAX_OVERFLOW_ATTEMPTS
+                {
+                    let before = est(&convo.messages);
+                    self.run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
+                        .await;
+                    attempts += 1;
+                    if est(&convo.messages) >= before {
+                        break; // nothing drained (sacred floor / single huge input) — warn below
+                    }
+                    messages = convo.messages.clone();
+                    self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                }
+            }
             // PRE-SEND over-window advisory (at most ONCE per turn — the
             // `over_window_warned` latch survives the empty-retry / provider-retry
             // `round -= 1` decrements that would otherwise re-trip a round-based
-            // guard). If the outgoing request already meets/exceeds the model
-            // window, warn BEFORE the (likely-doomed) request rather than after
-            // burning the empty-retry budget on a gateway that answers over-window
-            // with a content-free 200.
+            // guard). Fires only when emergency compaction above could NOT bring the
+            // request under the window (single input too large), so the user gets the
+            // actionable advice instead of a silent doomed request.
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 if let Some(advisory) = over_window_advisory(est, self.provider.context_window()) {
