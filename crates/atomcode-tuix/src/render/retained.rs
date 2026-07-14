@@ -1593,15 +1593,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
-        let is_marketplace = kind == super::MenuKind::Marketplace;
-        let mut style = if selected && !is_marketplace {
+        let is_plugin_mgr = matches!(kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
+        let mut style = if selected && !is_plugin_mgr {
             CellStyle {
                 fg: None,
                 bold: true,
                 reverse: true,
                 faint: false,
             }
-        } else if selected && is_marketplace {
+        } else if selected && is_plugin_mgr {
             CellStyle {
                 fg: None,
                 bold: true,
@@ -1675,7 +1675,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             CellStyle {
                 fg: None,
                 bold: true,
-                reverse: true,
+                reverse: false,
                 faint: false,
             }
         } else {
@@ -1686,7 +1686,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             CellStyle {
                 fg: None,
                 bold: false,
-                reverse: true,
+                reverse: false,
                 faint: true,
             }
         } else {
@@ -1724,7 +1724,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             CellStyle {
                 fg: None,
                 bold: false,
-                reverse: true,
+                reverse: false,
                 faint: true,
             }
         } else {
