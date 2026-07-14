@@ -143,7 +143,13 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
         // badge over-reserve a cell, leaving a stale-glyph residual after ⏸.
         (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x24C2, 0x24C2),
         (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE),
-        (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611), (0x2614, 0x2615),
+        // NOTE: U+2611 (☑ ballot box with check) is deliberately NOT here. Like
+        // ⏸ (see the 0x23F8 note above), it is Emoji_Presentation=No — bare (no
+        // VS16) it renders NARROW (width 1). It is the `☑ Todos` panel marker
+        // (`todo_marker`), emitted bare; listing it wide over-reserved a cell and
+        // desynced the cursor, intermittently blanking a following glyph ("Todos"→
+        // "To os"). Text-default symbols belong at their unicode-width (1).
+        (0x2600, 0x2604), (0x260E, 0x260E), (0x2614, 0x2615),
         (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623),
         (0x2626, 0x2626), (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A),
         (0x2640, 0x2640), (0x2642, 0x2642), (0x2648, 0x2653), (0x265F, 0x2660),
@@ -918,6 +924,9 @@ mod tests {
         assert_eq!(display_width("\u{23F9}"), 1, "⏹ stop");
         assert_eq!(display_width("\u{23FA}"), 1, "⏺ record");
         assert_eq!(display_width("\u{23F8} plan"), 6, "the whole plan badge");
+        // ☑ U+2611 (todo panel marker, emitted bare) is likewise text-default → width 1.
+        assert_eq!(display_width("\u{2611}"), 1, "☑ ballot box with check");
+        assert_eq!(display_width("\u{2611} Todos"), 7, "the todo header marker + title");
         // With VS16 they DO become emoji (width 2) — the exclusion is bare-only.
         assert_eq!(display_width("\u{23F8}\u{FE0F}"), 2, "⏸️ with VS16");
     }
