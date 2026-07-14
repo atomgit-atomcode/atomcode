@@ -996,7 +996,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let frame_style = self.style_for(Role::Brand);
         push_str_cells(&mut row, frame, &frame_style);
         push_str_cells(&mut row, " ", &CellStyle::default());
-        let label_style = self.style_bold(Role::Secondary);
+        // Label (`Pondering… · 161ms`) shares the frame's brand hue so the whole
+        // spinner reads as one colored unit. It was `Role::Secondary` (terminal-
+        // default fg) after the 16-colour theme-adaptivity migration, which left the
+        // text uncolored; `Brand` is a defined palette colour (theme-safe, same as the
+        // glyph) so it restores the colour without hardcoding a raw SGR.
+        let label_style = self.style_bold(Role::Brand);
         push_str_cells(&mut row, &scrub_controls(label), &label_style);
         row
     }
