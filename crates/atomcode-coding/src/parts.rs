@@ -383,9 +383,10 @@ pub async fn prepare_with_plugin_hooks(
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
-    // with date + context-window usage + round budget. Serves recall's relative-date
-    // resolution and lets the model pace itself. Injected from round 2 of each turn (round 1
-    // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
+    // with date + round budget (NO context-usage gauge — pressure is handled silently by
+    // auto-compaction, never pushed to the model). Serves recall's relative-date resolution and
+    // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
+    // StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
     // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the

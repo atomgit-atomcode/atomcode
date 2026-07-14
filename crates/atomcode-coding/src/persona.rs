@@ -230,7 +230,7 @@ const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
 ## SYSTEM REMINDERS:
-Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
+Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
 
 ## CONTEXT MANAGEMENT:
 The context window is managed for you: as it fills, older turns are automatically compacted (tool results are stubbed, then summarized). Do NOT tell the user to start a new conversation, clear the history, or that you are \"running low on context\" in order to manage it — that is handled automatically. Keep working; if some earlier detail was condensed and you need it, re-read the source.
