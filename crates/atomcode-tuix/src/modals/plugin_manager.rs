@@ -1096,6 +1096,9 @@ impl Modal for PluginManager {
                 final_items.push((format!("❯ {}", self.url_input), String::new()));
             }
         }
+        if final_items.last().map(|(n, _)| !n.is_empty()).unwrap_or(false) {
+            final_items.push((String::new(), String::new()));
+        }
         final_items.push((format!("— {} —", hint), String::new()));
 
         let selectable = self.current_len();
