@@ -896,10 +896,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|m| {
                 let base = m.kind.max_visible_rows(h, m.items.len());
                 let has_hint = m.items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
-                if has_hint {
-                    base + 1
+                let extra = if m.kind == super::MenuKind::Marketplace
+                    && m.items.iter().any(|(n, _)| n.starts_with("❯ "))
+                {
+                    2
                 } else {
-                    base
+                    0
+                };
+                if has_hint {
+                    base + 1 + extra
+                } else {
+                    base + extra
                 }
             })
             .unwrap_or(default)
@@ -2600,7 +2607,101 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < final_len.saturating_sub(1) {
                 menu_cells.extend(self.build_plugin_menu_rows(name, desc, selected, rule_width));
             } else {
-                menu_cells.push(self.build_menu_row(name, desc, selected, rule_width, menu_kind));
+                let row = self.build_menu_row(name, desc, selected, rule_width, menu_kind);
+                if is_add_url && i >= 2 && i < final_len.saturating_sub(1) {
+                    let border_style = self.style_for(Role::Muted);
+                    if i == 2 {
+                        let mut top_border = Vec::with_capacity(rule_width);
+                        top_border.push(Cell {
+                            ch: '╭',
+                            style: border_style.clone(),
+                            width: 1,
+                        });
+                        for _ in 0..(rule_width.saturating_sub(2)) {
+                            top_border.push(Cell {
+                                ch: '─',
+                                style: border_style.clone(),
+                                width: 1,
+                            });
+                        }
+                        if rule_width >= 2 {
+                            top_border.push(Cell {
+                                ch: '╮',
+                                style: border_style.clone(),
+                                width: 1,
+                            });
+                        }
+                        menu_cells.push(top_border);
+                    }
+
+                    let mut boxed_row = Vec::with_capacity(rule_width);
+                    boxed_row.push(Cell {
+                        ch: '│',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                    let mut content_cells = row.into_iter();
+                    if let Some(first) = content_cells.next() {
+                        if first.ch != ' ' {
+                            boxed_row.push(first);
+                        }
+                    }
+                    for cell in content_cells {
+                        boxed_row.push(cell);
+                    }
+                    let mut current_w = 0;
+                    for cell in &boxed_row {
+                        current_w += cell.width as usize;
+                    }
+                    let pad_w = (rule_width.saturating_sub(1)).saturating_sub(current_w);
+                    for _ in 0..pad_w {
+                        boxed_row.push(Cell {
+                            ch: ' ',
+                            style: CellStyle::default(),
+                            width: 1,
+                        });
+                    }
+                    if boxed_row.len() < rule_width {
+                        boxed_row.push(Cell {
+                            ch: '│',
+                            style: border_style.clone(),
+                            width: 1,
+                        });
+                    } else {
+                        boxed_row[rule_width - 1] = Cell {
+                            ch: '│',
+                            style: border_style.clone(),
+                            width: 1,
+                        };
+                    }
+                    menu_cells.push(boxed_row);
+
+                    if i == final_len.saturating_sub(2) {
+                        let mut bot_border = Vec::with_capacity(rule_width);
+                        bot_border.push(Cell {
+                            ch: '╰',
+                            style: border_style.clone(),
+                            width: 1,
+                        });
+                        for _ in 0..(rule_width.saturating_sub(2)) {
+                            bot_border.push(Cell {
+                                ch: '─',
+                                style: border_style.clone(),
+                                width: 1,
+                            });
+                        }
+                        if rule_width >= 2 {
+                            bot_border.push(Cell {
+                                ch: '╯',
+                                style: border_style,
+                                width: 1,
+                            });
+                        }
+                        menu_cells.push(bot_border);
+                    }
+                } else {
+                    menu_cells.push(row);
+                }
             }
         }
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
@@ -2709,7 +2810,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let menu_top = attach_top + attachment_rows;
         if is_add_url {
-            let cursor_abs_row = (menu_top + 11 + 1) as u16;
+            let input_row_idx = menu_cells.iter().position(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("❯ ")
+            }).unwrap_or(11);
+            let cursor_abs_row = (menu_top + input_row_idx + 1) as u16;
             let prefix = if self.input_buf.is_char_boundary(self.input_cursor_byte) {
                 &self.input_buf[..self.input_cursor_byte]
             } else {

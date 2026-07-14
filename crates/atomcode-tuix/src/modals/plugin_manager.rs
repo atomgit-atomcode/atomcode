@@ -669,7 +669,6 @@ impl PluginManager {
                     (String::new(), String::new()),
                     ("Enter marketplace source:".to_string(), String::new()),
                     ("Examples:".to_string(), String::new()),
-                    ("  · owner/repo (GitHub)".to_string(), String::new()),
                     ("  · git@atomgit.com:owner/repo.git (SSH)".to_string(), String::new()),
                     ("  · https://example.com/marketplace.json".to_string(), String::new()),
                     ("  · ./path/to/marketplace".to_string(), String::new()),
@@ -1570,14 +1569,13 @@ mod tests {
         assert_eq!(m.current_len(), 0);
         
         let (rows, hint) = m.rows();
-        assert_eq!(rows.len(), 9);
+        assert_eq!(rows.len(), 8);
         assert_eq!(rows[0].0, "Add Marketplace");
         assert_eq!(rows[2].0, "Enter marketplace source:");
         assert_eq!(rows[3].0, "Examples:");
-        assert!(rows[4].0.contains("owner/repo"));
-        assert!(rows[5].0.contains("git@atomgit.com"));
-        assert!(rows[6].0.contains("https://example.com/marketplace.json"));
-        assert!(rows[7].0.contains("./path/to/marketplace"));
+        assert!(rows[4].0.contains("git@atomgit.com"));
+        assert!(rows[5].0.contains("https://example.com/marketplace.json"));
+        assert!(rows[6].0.contains("./path/to/marketplace"));
         assert!(hint.contains("to add") || hint.contains("添加"));
     }
 }
