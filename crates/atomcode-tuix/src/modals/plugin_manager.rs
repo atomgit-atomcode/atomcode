@@ -59,6 +59,8 @@ pub struct PluginManager {
     installed: Vec<InstalledPluginInfo>,
     /// Buffer for the Add-marketplace URL entry screen.
     url_input: String,
+    /// Cursor character position in url_input.
+    url_cursor: usize,
     /// Set while an async clone/install is in flight; shown as a status row
     /// and cleared by `on_plugin_event` when the job result arrives.
     pending: Option<String>,
@@ -105,6 +107,7 @@ impl PluginManager {
             marketplaces: Vec::new(),
             installed: Vec::new(),
             url_input: String::new(),
+            url_cursor: 0,
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
@@ -368,6 +371,7 @@ impl PluginManager {
     fn enter_marketplaces(&mut self, ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
         if self.selected == 0 {
             self.url_input.clear();
+            self.url_cursor = 0;
             self.goto(Screen::AddUrl);
         } else {
             if let Some(m) = self.marketplaces.get(self.selected - 1) {
@@ -736,22 +740,58 @@ impl Modal for PluginManager {
             match code {
                 KeyCode::Esc => {
                     self.url_input.clear();
+                    self.url_cursor = 0;
                     self.goto(Screen::Marketplaces);
                 }
-                KeyCode::Left | KeyCode::BackTab => {}
-                KeyCode::Right | KeyCode::Tab => {}
+                KeyCode::Left => {
+                    if self.url_cursor > 0 {
+                        self.url_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    let char_len = self.url_input.chars().count();
+                    if self.url_cursor < char_len {
+                        self.url_cursor += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    self.url_cursor = 0;
+                }
+                KeyCode::End => {
+                    self.url_cursor = self.url_input.chars().count();
+                }
+                KeyCode::BackTab => {}
+                KeyCode::Tab => {}
                 KeyCode::Enter => {
                     let url = self.url_input.trim().to_string();
                     if !url.is_empty() {
                         self.dispatch_add(url, ctx);
                         self.url_input.clear();
+                        self.url_cursor = 0;
                     }
                 }
                 KeyCode::Backspace => {
-                    self.url_input.pop();
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor > 0 && self.url_cursor <= chars.len() {
+                        chars.remove(self.url_cursor - 1);
+                        self.url_cursor -= 1;
+                        self.url_input = chars.into_iter().collect();
+                    }
+                }
+                KeyCode::Delete => {
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor < chars.len() {
+                        chars.remove(self.url_cursor);
+                        self.url_input = chars.into_iter().collect();
+                    }
                 }
                 KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                    self.url_input.push(c);
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor <= chars.len() {
+                        chars.insert(self.url_cursor, c);
+                        self.url_cursor += 1;
+                        self.url_input = chars.into_iter().collect();
+                    }
                 }
                 _ => {}
             }
@@ -987,7 +1027,8 @@ impl Modal for PluginManager {
         };
 
         let (text, cursor) = if matches!(self.screen, Screen::AddUrl) {
-            (self.url_input.clone(), self.url_input.len())
+            let byte_idx = self.url_input.chars().take(self.url_cursor).map(|c| c.len_utf8()).sum::<usize>();
+            (self.url_input.clone(), byte_idx)
         } else {
             (self.search_query.clone(), self.search_query.len())
         };
@@ -1147,6 +1188,7 @@ mod tests {
             marketplaces: mps,
             installed: inst,
             url_input: String::new(),
+            url_cursor: 0,
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
