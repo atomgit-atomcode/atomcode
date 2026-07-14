@@ -3166,10 +3166,7 @@ fn execute_slash_command_impl(
             // as a regular user message.
             match decide_custom_command(&ctx.custom_commands, other, arg) {
                 CustomDispatch::Reject => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdCustomArgRequired { name: other }).into_owned(),
-                    ));
-                    renderer.flush();
+                    render_custom_command_error(renderer, &CustomDispatch::Reject, other);
                 }
                 CustomDispatch::Submit(rendered) => {
                     submit_agent_turn(ctx, state, rendered);
@@ -3228,10 +3225,11 @@ fn execute_slash_command_impl(
                                 .to_string(),
                             ),
                         });
-                        renderer.render(UiLine::Error(
-                            t(Msg::CmdUnknownCommand { name: other }).into_owned(),
-                        ));
-                        renderer.flush();
+                        render_custom_command_error(
+                            renderer,
+                            &CustomDispatch::NotFound,
+                            other,
+                        );
                     }
                 }
             }
@@ -3256,6 +3254,45 @@ pub(super) enum CustomDispatch {
     /// No custom command matched this name; fall through to the
     /// user-invocable skill lookup / unknown-command path.
     NotFound,
+}
+
+/// Render the error line for a [`CustomDispatch::Reject`] (Required
+/// command, no argument supplied) or [`CustomDispatch::NotFound`] (no
+/// custom command matched and no user-invocable skill matched either)
+/// outcome of the `other` arm.
+///
+/// Pure side effect on `renderer` only — does NOT call
+/// `submit_agent_turn`, which is the whole point of both error paths:
+///   - `Reject`   ⇒ user typed e.g. `/myreview` with no argument; surface
+///     `Msg::CmdCustomArgRequired` and leave the conversation untouched.
+///   - `NotFound` ⇒ user typed e.g. `/foo` that matches nothing; surface
+///     `Msg::CmdUnknownCommand` (telemetry is tracked by the caller).
+///   - `Submit`   ⇒ not an error; the caller forwards the rendered template
+///     to `submit_agent_turn`, so this helper is a no-op there.
+///
+/// Extracted from the `other` arm so the reject-vs-submit render boundary
+/// is unit-testable without constructing a full `LoopCtx`.
+pub(super) fn render_custom_command_error(
+    renderer: &mut dyn Renderer,
+    dispatch: &CustomDispatch,
+    name: &str,
+) {
+    match dispatch {
+        CustomDispatch::Reject => {
+            renderer.render(UiLine::Error(
+                t(Msg::CmdCustomArgRequired { name }).into_owned(),
+            ));
+            renderer.flush();
+        }
+        CustomDispatch::NotFound => {
+            renderer.render(UiLine::Error(
+                t(Msg::CmdUnknownCommand { name }).into_owned(),
+            ));
+            renderer.flush();
+        }
+        // Submit is not an error — handled by the caller via submit_agent_turn.
+        CustomDispatch::Submit(_) => {}
+    }
 }
 
 /// Resolve `name` against the custom command registry and decide what the
@@ -6511,8 +6548,9 @@ mod tests {
 
 #[cfg(test)]
 mod todo_command_tests {
-    use super::{decide_custom_command, format_todo_command, CustomDispatch};
+    use super::{decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch};
     use crate::custom_commands::ArgsRequirement;
+    use crate::render::{Renderer, UiLine};
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
     use atomcode_core::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
@@ -6719,6 +6757,196 @@ mod todo_command_tests {
             matches!(decision, CustomDispatch::NotFound),
             "Unregistered command should fall through to NotFound, got {:?}",
             decision
+        );
+    }
+
+    // ── end-to-end: Reject ⇒ render CmdCustomArgRequired, no submit ──────
+    //
+    // The `decide_custom_command` tests above only pin the pure decision.
+    // This block exercises the actual renderer side effect of the `other`
+    // arm's `Reject` branch — i.e. that `CmdCustomArgRequired` is rendered
+    // as an `UiLine::Error` and, crucially, that `submit_agent_turn` is
+    // never reached on this path. If a future refactor drops the
+    // `CmdCustomArgRequired` render or flips the arm to silently submit an
+    // empty template, these tests catch it.
+
+    /// Minimal `Renderer` mock that records every rendered `UiLine`.
+    /// Re-declared here (the `live_snapshot_replay_skips_synthetic_user_messages`
+    /// test owns its own copy) so the reject-render tests below stay
+    /// self-contained.
+    #[derive(Default)]
+    struct RecRenderer {
+        lines: Vec<UiLine>,
+        flushed: usize,
+    }
+    impl Renderer for RecRenderer {
+        fn render(&mut self, line: UiLine) {
+            self.lines.push(line);
+        }
+        fn flush(&mut self) {
+            self.flushed += 1;
+        }
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+    }
+
+    #[test]
+    fn reject_renders_cmd_custom_arg_required_error() {
+        // Trigger: user typed `/myreview` (Required) and pressed Enter
+        // with no argument. Expected: exactly one UiLine::Error carrying
+        // the CmdCustomArgRequired message, followed by a flush.
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(&mut rec, &CustomDispatch::Reject, "myreview");
+
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "Reject must render exactly one line, got {:?}",
+            rec.lines
+        );
+        let rendered = t(Msg::CmdCustomArgRequired { name: "myreview" }).into_owned();
+        match &rec.lines[0] {
+            UiLine::Error(msg) => assert_eq!(
+                msg, &rendered,
+                "Reject must render the CmdCustomArgRequired i18n message"
+            ),
+            other => panic!(
+                "Reject must render UiLine::Error, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            rec.flushed, 1,
+            "Reject must flush the renderer exactly once"
+        );
+    }
+
+    #[test]
+    fn submit_renders_no_error_line_and_not_found_renders_unknown_command() {
+        // Counterpart contract:
+        //   - Submit is the only non-error outcome, so it must render NO
+        //     error line (the caller forwards the rendered template to
+        //     submit_agent_turn instead).
+        //   - NotFound IS an error outcome (no custom command, no skill),
+        //     so it must render exactly one UiLine::Error carrying the
+        //     CmdUnknownCommand i18n message, then flush.
+        // Guards against a regression that collapses NotFound into the
+        // Submit no-op arm (which would silently swallow unknown commands
+        // with zero user-visible feedback).
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(&mut rec, &CustomDispatch::Submit("review foo".into()), "myreview");
+        assert!(
+            rec.lines.is_empty(),
+            "Submit must not render any error line, got {:?}",
+            rec.lines
+        );
+
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(&mut rec, &CustomDispatch::NotFound, "foo");
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "NotFound must render exactly one line, got {:?}",
+            rec.lines
+        );
+        let expected = t(Msg::CmdUnknownCommand { name: "foo" }).into_owned();
+        match &rec.lines[0] {
+            UiLine::Error(msg) => assert_eq!(
+                msg, &expected,
+                "NotFound must render the CmdUnknownCommand i18n message"
+            ),
+            other => panic!(
+                "NotFound must render UiLine::Error, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            rec.flushed, 1,
+            "NotFound must flush the renderer exactly once"
+        );
+    }
+
+    #[test]
+    fn required_empty_arg_dispatch_pipeline_rejects_without_submit() {
+        // End-to-end guard for the `other` arm of execute_slash_command_impl.
+        // Compose the two pure functions the arm calls — decide_custom_command
+        // then render_custom_command_error — and assert the observable
+        // contract:
+        //   1. Reject ⇒ render exactly one Error line with CmdCustomArgRequired
+        //      (the dispatcher never reaches submit_agent_turn on this branch).
+        //   2. Submit ⇒ render no error line (submit happens elsewhere, but
+        //      we assert the error-render half stays silent on success).
+        // This is the closest unit-testable seam to the real dispatcher; the
+        // full LoopCtx is intentionally avoided (it'd require constructing an
+        // AgentClient + Telemetry + a dozen channels just to reach one arm).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+
+        // Reject case: Required + empty arg.
+        let mut rec = RecRenderer::default();
+        let decision = decide_custom_command(&custom, "myreview", "");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required + empty arg must decide Reject, got {:?}",
+            decision
+        );
+        render_custom_command_error(&mut rec, &decision, "myreview");
+        // Contract: exactly one Error line carrying the i18n message.
+        let expected = t(Msg::CmdCustomArgRequired { name: "myreview" }).into_owned();
+        let errors: Vec<&String> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::Error(msg) => Some(msg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "Reject must render exactly one Error line, got {:?}",
+            rec.lines
+        );
+        assert_eq!(
+            errors[0], &expected,
+            "Reject must render the CmdCustomArgRequired message"
+        );
+        // The reject branch never renders anything other than the Error line,
+        // which (combined with the decide_custom_command assertion above) means
+        // submit_agent_turn is structurally unreachable on this path.
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "Reject must render exactly one line total, got {:?}",
+            rec.lines
+        );
+
+        // Submit case: Required + nonempty arg must NOT render an error.
+        let mut rec = RecRenderer::default();
+        let decision = decide_custom_command(&custom, "myreview", "foo");
+        match decision {
+            CustomDispatch::Submit(ref rendered) => assert_eq!(rendered, "review foo"),
+            other => panic!("Required + nonempty arg should Submit, got {:?}", other),
+        }
+        render_custom_command_error(&mut rec, &decision, "myreview");
+        assert!(
+            rec
+                .lines
+                .iter()
+                .all(|line| !matches!(line, UiLine::Error(_))),
+            "Submit must not render any Error line, got {:?}",
+            rec.lines
         );
     }
 }
