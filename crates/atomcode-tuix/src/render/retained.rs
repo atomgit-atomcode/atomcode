@@ -2269,6 +2269,81 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
+            } else if matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo) {
+                if len < 2 {
+                    let sel = if m.selected < len { Some(m.selected) } else { None };
+                    (m.items.clone(), sel, 0)
+                } else {
+                    let has_hint = len > 2 && m.items[len - 1].0.starts_with('—') && m.items[len - 1].0.ends_with('—');
+                let hint_h = if has_hint { 1 } else { 0 };
+                let header_h = 2;
+                let budget = max_menu.saturating_sub(header_h + hint_h);
+                let mut offset = 2;
+                let mut end = offset;
+                let mut height_sum = 0;
+                while end < len - hint_h {
+                    let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len - hint_h {
+                        2
+                    } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                        let orig_idx = end;
+                        if orig_idx >= 3 && orig_idx < len - hint_h {
+                            if orig_idx % 2 == 0 { 3 } else { 1 }
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+                    if height_sum + item_h > budget {
+                        break;
+                    }
+                    height_sum += item_h;
+                    end += 1;
+                }
+
+                if m.selected >= 2 && m.selected < len - hint_h && m.selected >= end {
+                    while offset < len - hint_h && m.selected >= end {
+                        offset += 1;
+                        let mut h_sum = 0;
+                        end = offset;
+                        while end < len - hint_h {
+                            let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len - hint_h {
+                                2
+                            } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                                let orig_idx = end;
+                                if orig_idx >= 3 && orig_idx < len - hint_h {
+                                    if orig_idx % 2 == 0 { 3 } else { 1 }
+                                } else {
+                                    1
+                                }
+                            } else {
+                                1
+                            };
+                            if h_sum + item_h > budget {
+                                break;
+                            }
+                            h_sum += item_h;
+                            end += 1;
+                        }
+                    }
+                }
+
+                let mut items = Vec::new();
+                items.extend_from_slice(&m.items[0..2]);
+                items.extend_from_slice(&m.items[offset..end]);
+                if has_hint {
+                    items.push(m.items[len - 1].clone());
+                }
+
+                let sel = if m.selected < 2 {
+                    Some(m.selected)
+                } else if m.selected >= offset && m.selected < end {
+                    Some(2 + (m.selected - offset))
+                } else {
+                    None
+                };
+                (items, sel, offset)
+                }
             } else {
                 let mut offset = 0;
                 let mut height_sum = 0;
@@ -2323,8 +2398,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         //   top_rule / middle... / bot_rule / menu... / status
         let has_hint_at_end = menu_items.last().map(|(n, _)| n.starts_with('—') && n.ends_with('—')).unwrap_or(false);
         let menu_rows = if let Some(m) = self.menu.as_ref() {
+            let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
             let mut sum = menu_items.iter().enumerate().map(|(i, _)| {
-                let orig_idx = actual_offset + i;
+                let orig_idx = if is_sticky {
+                    if i < 2 {
+                        i
+                    } else if has_hint_at_end && i == menu_items.len() - 1 {
+                        m.items.len() - 1
+                    } else {
+                        actual_offset + (i - 2)
+                    }
+                } else {
+                    actual_offset + i
+                };
                 if menu_kind == super::MenuKind::Marketplace && orig_idx >= 3 && orig_idx < m.items.len().saturating_sub(1) {
                     if orig_idx % 2 == 0 {
                         3
@@ -2481,8 +2567,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .unwrap_or_default();
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
+        let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
         for (i, (name, desc)) in menu_items.iter().enumerate() {
-            let orig_idx = actual_offset + i;
+            let orig_idx = if is_sticky {
+                if i < 2 {
+                    i
+                } else if has_hint_at_end && i == menu_items.len() - 1 {
+                    final_len - 1
+                } else {
+                    actual_offset + (i - 2)
+                }
+            } else {
+                actual_offset + i
+            };
             let selected = selected_in_view == Some(i);
             if menu_kind == super::MenuKind::Marketplace && !is_add_url && orig_idx >= 3 && orig_idx < final_len.saturating_sub(1) {
                 if orig_idx % 2 == 0 {
