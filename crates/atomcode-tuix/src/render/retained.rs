@@ -1733,12 +1733,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         if is_installed {
-            let mut green_style = CellStyle::default();
-            green_style.fg = Some(crossterm::style::Color::Green);
+            let mut gray_style = self.style_for(Role::Muted);
             if selected {
-                green_style.bold = true;
+                gray_style.bold = true;
             }
-            push_str_cells_sgr(&mut row1, "✓ ", green_style);
+            push_str_cells_sgr(&mut row1, "✓ ", gray_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
