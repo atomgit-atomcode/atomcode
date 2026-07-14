@@ -2424,7 +2424,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }).sum::<usize>();
             if has_hint_at_end {
-                sum += 1;
+                let prev_is_empty = menu_items.len() > 1 && menu_items[menu_items.len() - 2].0.is_empty();
+                if !prev_is_empty {
+                    sum += 1;
+                }
             }
             sum
         } else {
@@ -2583,8 +2586,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let selected = selected_in_view == Some(i);
 
             if has_hint_at_end && i == menu_items.len() - 1 {
-                // Prepend a blank line BEFORE the bottom hint row!
-                menu_cells.push(Vec::new());
+                let prev_is_empty = i > 0 && menu_items[i - 1].0.is_empty();
+                if !prev_is_empty {
+                    // Prepend a blank line BEFORE the bottom hint row!
+                    menu_cells.push(Vec::new());
+                }
             }
 
             if menu_kind == super::MenuKind::Marketplace && !is_add_url && orig_idx >= 3 && orig_idx < final_len.saturating_sub(1) {

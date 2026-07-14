@@ -453,7 +453,7 @@ impl PluginManager {
 
 
 
-    fn enter_browse(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    fn enter_browse(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
         let plugins = self.filtered_browse_plugins();
         let Some(item) = plugins.get(self.selected) else { return };
         let (plugin, mp) = (item.name.clone(), item.marketplace.clone());
@@ -467,20 +467,7 @@ impl PluginManager {
                 })
                 .map(|i| i.scope.clone())
                 .unwrap_or(InstallScope::User);
-            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
-                Ok(()) => {
-                    reload_plugins(ctx);
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp })
-                            .into_owned(),
-                    ));
-                    self.reload();
-                }
-                Err(e) => renderer.render(UiLine::Error(
-                    t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
-                )),
-            }
-            renderer.flush();
+            self.goto(Screen::InstalledDetails { plugin, mp, scope });
         } else {
             self.goto(Screen::ScopeSelect { plugin, mp });
         }
