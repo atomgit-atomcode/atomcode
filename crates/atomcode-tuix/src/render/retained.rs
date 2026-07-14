@@ -1764,7 +1764,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let installed = parts.get(2).copied().unwrap_or("0");
         let updated = parts.get(3).copied().unwrap_or("");
 
-        let bullet = if selected { "▸ ● " } else { "  ● " };
+        let bullet = if selected { "▸ " } else { "  " };
         let bullet_style = if selected {
             self.style_for(Role::Accent)
         } else {
