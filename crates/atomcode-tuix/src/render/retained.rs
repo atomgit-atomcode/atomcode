@@ -2549,7 +2549,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_top = attach_top + attachment_rows;
         if is_add_url {
             let cursor_abs_row = (menu_top + 11 + 1) as u16;
-            let cursor_abs_col = (2 + self.input_cursor_byte + 1) as u16;
+            let prefix = if self.input_buf.is_char_boundary(self.input_cursor_byte) {
+                &self.input_buf[..self.input_cursor_byte]
+            } else {
+                &self.input_buf
+            };
+            let prefix_w = crate::width::display_width(prefix);
+            let cursor_abs_col = (4 + prefix_w + 1) as u16;
             self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
         }
         // Invalidate prev_cells for the menu rows so the next render_diff
