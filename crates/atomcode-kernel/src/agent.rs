@@ -43,6 +43,11 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// a real chance to recover (the stale keep-alive class). NON-retryable errors
 /// (auth / 400 / balance) never enter this path — they fail fast.
 const MAX_PROVIDER_RETRIES: u32 = 3;
+/// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
+/// (codex parity: 5). Each reconnect re-issues the SAME round from history
+/// (partial output discarded), with exponential backoff. Distinct from
+/// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
+const MAX_STREAM_RETRIES: u32 = 5;
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -1136,6 +1141,12 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
+        // MID-STREAM reconnect counter for the WHOLE turn: incremented on each
+        // reconnect after a stream idle-timeout. NOT reset on open (a re-open must
+        // not refill it, else a persistently-stalling stream would retry forever);
+        // reset to 0 only when a stream COMPLETES normally. Capped at
+        // MAX_STREAM_RETRIES (codex parity).
+        let mut stream_retry: u32 = 0;
         // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
         // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
         // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
@@ -1455,6 +1466,32 @@ impl RunningAgent {
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
+                        // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
+                        // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
+                        // (codex parity) — re-issue the SAME round from history (the
+                        // per-round accumulators reset on `continue`, so partial output is
+                        // discarded and never pushed), with exponential backoff. Only after
+                        // the budget is spent do we take the clean-fail path.
+                        if stream_retry < MAX_STREAM_RETRIES {
+                            stream_retry += 1;
+                            self.rt.emit(AgentEvent::Warning(format!(
+                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                            )));
+                            // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
+                            let backoff = std::time::Duration::from_millis(
+                                (200u64 << (stream_retry - 1)).min(8_000),
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            retry_this_round = true;
+                            break;
+                        }
                         let msg = "stream timeout".to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
@@ -1710,6 +1747,10 @@ impl RunningAgent {
                 round -= 1;
                 continue;
             }
+            // The stream reached its natural end this round (no timeout, no 429
+            // retry) — refill the reconnect budget so a LATER round's stall gets a
+            // fresh MAX_STREAM_RETRIES.
+            stream_retry = 0;
             // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
             // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
             // return a 200 with a COMPLETELY empty completion — the stream opened fine

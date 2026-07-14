@@ -115,6 +115,52 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+/// Opens OK but its stream PENDS FOREVER on the first `stall_calls` `chat_stream`
+/// calls (driving the stream idle-timeout), then returns `events` on the next
+/// call. Drives the RECONNECT path: with `stall_calls = 1` the first attempt
+/// times out and the reconnect succeeds; a large `stall_calls` exhausts the
+/// reconnect budget and the turn clean-fails.
+pub struct StallThenProvider {
+    stall_calls: usize,
+    calls: AtomicUsize,
+    events: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl StallThenProvider {
+    pub fn new(stall_calls: usize, events: Vec<StreamEvent>) -> Self {
+        Self {
+            stall_calls,
+            calls: AtomicUsize::new(0),
+            events: Mutex::new(Some(events)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for StallThenProvider {
+    fn model_name(&self) -> &str {
+        "stall-then"
+    }
+    fn context_window(&self) -> u32 {
+        0
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.stall_calls {
+            // Open OK, then never yield → the kernel's stream idle-timeout fires.
+            Ok(Box::pin(futures::stream::pending::<StreamEvent>()))
+        } else {
+            let events = self.events.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+}
+
 /// Scripted, RICH-recording provider for prefix-cache regression tests. Unlike
 /// `MockProvider` (which snapshots only `(role, text)` and discards tools /
 /// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>, ChatOptions)`
