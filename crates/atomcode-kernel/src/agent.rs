@@ -1141,11 +1141,13 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
-        // MID-STREAM reconnect counter for the WHOLE turn: incremented on each
-        // reconnect after a stream idle-timeout. NOT reset on open (a re-open must
-        // not refill it, else a persistently-stalling stream would retry forever);
-        // reset to 0 only when a stream COMPLETES normally. Capped at
-        // MAX_STREAM_RETRIES (codex parity).
+        // MID-STREAM reconnect counter. Lives across the whole turn (declared
+        // here, outside the round loop) but the BUDGET is PER model-request /
+        // round: incremented on each idle-timeout reconnect, and reset to 0 once a
+        // round's stream completes normally — so each round independently gets up
+        // to MAX_STREAM_RETRIES reconnects (codex's per-request semantics). It is
+        // deliberately NOT reset on `open` (a re-open must not refill it mid-round,
+        // else a permanently-stalling stream would retry forever within one round).
         let mut stream_retry: u32 = 0;
         // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
         // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
@@ -1479,7 +1481,10 @@ impl RunningAgent {
                             )));
                             // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
                             let backoff = std::time::Duration::from_millis(
-                                (200u64 << (stream_retry - 1)).min(8_000),
+                                // `.min(31)` on the shift keeps it well-defined if
+                                // MAX_STREAM_RETRIES is ever raised past 32 (the cap
+                                // clamps the value regardless).
+                                (200u64 << (stream_retry - 1).min(31)).min(8_000),
                             );
                             tokio::select! {
                                 biased;

@@ -141,9 +141,6 @@ impl LlmProvider for StallThenProvider {
     fn model_name(&self) -> &str {
         "stall-then"
     }
-    fn context_window(&self) -> u32 {
-        0
-    }
     async fn chat_stream(
         &self,
         _messages: &[Message],
