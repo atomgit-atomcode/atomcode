@@ -1938,14 +1938,26 @@ fn execute_slash_command_impl(
                                                 );
                                                 // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
                                                 attach_live_session(ctx, renderer, session, false);
+                                                use base64::Engine;
+                                                let encoded = base64::engine::general_purpose::STANDARD
+                                                    .encode(pair_uri.as_bytes());
                                                 match crate::render::qr::render_login_qr(
                                                     &pair_uri,
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 GitCode App 扫码连接
-                                                        \n{q}\n\
-                                                         （/app stop 断开）"
+                                                        "📱 使用 GitCode App 连接\n\
+                                                        \n\
+                                                        1. 在手机应用商店搜索「GitCode」下载最新版 App\n\
+                                                        2. 打开 App → 首页 → AtomCode 模块 → 扫一扫\n\
+                                                        3. 对准下方二维码即可配对连接\n\
+                                                        \n\
+                                                        {q}\n\
+                                                        \n\
+                                                        也可复制以下口令在App中连接：\n\
+                                                        {encoded}\n\
+                                                        \n\
+                                                        （/app stop 断开连接）"
                                                     ),
                                                     None => format!(
                                                         "配对链接（二维码生成失败，手动填）：{pair_uri}"
