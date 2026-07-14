@@ -58,6 +58,63 @@ pub fn fmt_tokens(n: usize) -> String {
     }
 }
 
+/// Format the localized marker shown after a committed compaction.
+pub fn format_compaction_mark(
+    removed_messages: usize,
+    estimated_tokens_before: usize,
+    estimated_tokens_after: usize,
+) -> String {
+    if removed_messages > 0 {
+        let before = fmt_compaction_tokens(estimated_tokens_before);
+        let after = fmt_compaction_tokens(estimated_tokens_after);
+        t(Msg::CompactMarkDrain {
+            messages: removed_messages,
+            before: &before,
+            after: &after,
+        })
+        .into_owned()
+    } else {
+        let saved = fmt_compaction_tokens(
+            estimated_tokens_before.saturating_sub(estimated_tokens_after),
+        );
+        t(Msg::CompactMarkStub { saved: &saved }).into_owned()
+    }
+}
+
+/// Format the localized acknowledgement for a user-requested compaction that
+/// left the conversation unchanged.
+pub fn format_compaction_noop(
+    estimated_tokens_before: usize,
+    estimated_tokens_after: usize,
+    summary_would_grow: bool,
+) -> String {
+    if summary_would_grow {
+        let before = fmt_compaction_tokens(estimated_tokens_before);
+        let after = fmt_compaction_tokens(estimated_tokens_after);
+        t(Msg::CompactNothingNoSavings {
+            before: &before,
+            after: &after,
+        })
+        .into_owned()
+    } else {
+        t(Msg::CompactNothingShort).into_owned()
+    }
+}
+
+/// Format the localized acknowledgement for an accepted compaction that was
+/// interrupted by runtime replacement or shutdown.
+pub fn format_compaction_interrupted() -> String {
+    t(Msg::CompactInterrupted).into_owned()
+}
+
+fn fmt_compaction_tokens(tokens: usize) -> String {
+    if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
 /// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
@@ -416,6 +473,35 @@ mod tests {
         assert!(s.contains("6.0K"), "saved figure missing: {s}");
         assert!(!s.contains('→'), "stub marker shows a single figure, no arrow: {s}");
         assert!(s.contains("tok"), "token unit missing: {s}");
+    }
+
+    #[test]
+    fn format_compaction_mark_renders_drain_estimates() {
+        let s = format_compaction_mark(129, 42_900, 11_103);
+
+        assert!(s.contains("129") && s.contains("42.9K") && s.contains("11.1K"));
+    }
+
+    #[test]
+    fn format_compaction_mark_renders_stub_savings() {
+        let s = format_compaction_mark(0, 42_900, 34_320);
+
+        assert!(s.contains("8.6K") && !s.contains('→'));
+    }
+
+    #[test]
+    fn format_compaction_noop_distinguishes_net_loss() {
+        let s = format_compaction_noop(5_000, 7_500, true);
+
+        assert!(s.contains("5.0K") && s.contains("7.5K") && s.contains('→'));
+    }
+
+    #[test]
+    fn format_compaction_interrupted_is_not_a_noop_message() {
+        let s = format_compaction_interrupted();
+
+        assert!(s.contains("interrupt") || s.contains("中断"));
+        assert!(!s.contains("nothing to compact") && !s.contains("无需压缩"));
     }
 
     #[test]

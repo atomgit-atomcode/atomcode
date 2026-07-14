@@ -26,5 +26,5 @@ mod sign;
 
 pub use runtime::{
     apply_reload_provider, build_provider, build_provider_for_acp, gather_plugin_cc_hooks,
-    spawn_bridged_runtime, spawn_bridged_runtime_with_control, BridgeConfig, BridgedRuntime,
+    spawn_bridged_runtime_with_control, BridgeConfig, BridgedRuntime,
 };

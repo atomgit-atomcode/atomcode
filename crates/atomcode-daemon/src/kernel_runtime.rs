@@ -14,6 +14,9 @@ use atomcode_bridge::BridgeConfig;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::config::CodingAgentConfig;
 use atomcode_coding::parts::{assemble, prepare, PrepareOptions};
+use atomcode_coding::runtime::{
+    CodingRuntimeEvent, CompactionCompletion, CompactionOutcome,
+};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::provider::LlmProvider;
 
@@ -110,6 +113,13 @@ type KEv = atomcode_kernel::event::AgentEvent;
 /// The kernel command shape the translator emits into `outbound`.
 #[allow(dead_code)]
 type KCmd = atomcode_kernel::event::AgentCommand;
+
+/// Ordered daemon runtime events during the incremental protocol migration.
+#[derive(Clone, Debug)]
+pub enum DaemonRuntimeEvent {
+    Legacy(atomcode_core::agent::AgentEvent),
+    Native(CodingRuntimeEvent),
+}
 
 use atomcode_kernel::event::StopReason;
 
@@ -254,6 +264,55 @@ impl KernelToWebui {
         match self.pending_finish.take() {
             Some(reason) => self.finish_turn(reason, Vec::new()),
             None => vec![],
+        }
+    }
+
+    /// Translate one kernel event into the daemon's ordered mixed-protocol stream.
+    pub fn translate_runtime(&mut self, ev: KEv) -> Vec<DaemonRuntimeEvent> {
+        match ev {
+            KEv::CompactionStarted { trigger } => vec![DaemonRuntimeEvent::Native(
+                CodingRuntimeEvent::CompactionStarted { trigger },
+            )],
+            KEv::Compacted {
+                committed,
+                trigger,
+                epoch,
+                removed,
+                bytes_before,
+                bytes_after,
+                ..
+            } => {
+                let observed_tokens_before = self
+                    .last_usage
+                    .as_ref()
+                    .map(|meta| meta.used_tokens as usize);
+                let outcome = CompactionOutcome::from_kernel(
+                    trigger,
+                    epoch,
+                    removed,
+                    bytes_before,
+                    bytes_after,
+                    committed,
+                    observed_tokens_before,
+                );
+
+                if committed {
+                    if let Some(meta) = self.last_usage.as_mut() {
+                        meta.used_tokens = outcome.estimated_tokens_after as u32;
+                    }
+                }
+
+                vec![DaemonRuntimeEvent::Native(
+                    CodingRuntimeEvent::CompactionFinished {
+                        completion: CompactionCompletion::Completed(outcome),
+                    },
+                )]
+            }
+            other => self
+                .translate(other)
+                .into_iter()
+                .map(DaemonRuntimeEvent::Legacy)
+                .collect(),
         }
     }
 
@@ -541,53 +600,7 @@ impl KernelToWebui {
                     vec![]
                 }
             }
-            KEv::CompactionStarted { .. } => {
-                vec![CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin)]
-            }
-            KEv::Compacted {
-                committed,
-                trigger,
-                removed,
-                bytes_before,
-                bytes_after,
-                ..
-            } => {
-                use atomcode_core::agent::CompactionUiKind;
-                // The kernel measures BYTES; token figures derive from the last
-                // provider usage. Capture it BEFORE mutating `last_usage` below.
-                let before_tokens =
-                    self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
-                let mut out = Vec::new();
-                if committed {
-                    // Unified marker for auto + manual. Drain (removed>0) shows
-                    // before→after; stub fold (removed==0) shows tokens saved.
-                    let label =
-                        compaction_mark_label(removed, bytes_before, bytes_after, before_tokens);
-                    out.push(CoreEv::CompactionUi(CompactionUiKind::Mark(label)));
-                    // Refresh the cached context size so footer / `/context` reflect
-                    // the shrink IMMEDIATELY (estimate post-shrink tokens from the
-                    // byte ratio — the next real turn overwrites it with the exact
-                    // count).
-                    if let Some(meta) = self.last_usage.as_mut() {
-                        meta.used_tokens =
-                            estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
-                    }
-                    out.push(self.context_stats());
-                } else {
-                    // No-op / refused: release the spinner, draw no marker. A manual
-                    // /compact also gets an inline "nothing to compact" note; the auto
-                    // path stays silent (nothing to acknowledge).
-                    out.push(CoreEv::CompactionUi(CompactionUiKind::End));
-                    if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                        out.push(CoreEv::TextDelta(manual_noop_result(
-                            bytes_before,
-                            bytes_after,
-                            before_tokens,
-                        )));
-                    }
-                }
-                out
-            }
+            KEv::CompactionStarted { .. } | KEv::Compacted { .. } => vec![],
             KEv::Error { message, http_status, .. } => {
                 let error = friendly_provider_error(message, http_status, &self.base_url);
                 vec![CoreEv::Error {
@@ -649,9 +662,8 @@ impl KernelToWebui {
 // ---------------- kernel-native driver (Task 6a) ----------------
 //
 // The DRIVER wires the `KernelToWebui` translator into a live kernel agent and
-// presents it through the LEGACY (`atomcode_core`) channel protocol, so
-// `spawn_kernel_runtime` is a byte-identical drop-in for
-// `atomcode_bridge::spawn_bridged_runtime` (see runtime.rs:101). The construction
+// presents legacy events plus native coding events through one ordered daemon
+// channel. The construction
 // (opts_template / prepare / provider / assemble / degraded fallback) and the lean
 // select loop are ported from `atomcode_bridge::runtime::Bridge::run` MINUS all
 // goal / loop / wakeup wiring (deferred on the daemon kernel path).
@@ -685,8 +697,8 @@ fn noop_handle() -> AgentHandle {
 }
 
 /// The kernel-native driver: owns the translator + live kernel handle and pumps
-/// core commands in / core events out. Private — only `spawn_kernel_runtime`
-/// constructs it. Field parity with `Bridge` minus the goal/loop/undo
+/// core commands in / ordered daemon runtime events out. Private — only
+/// `spawn_kernel_runtime` constructs it. Field parity with `Bridge` minus the goal/loop/undo
 /// state (deferred on this path).
 struct KernelDriver {
     /// The resolved coding config (kept for Task 6b respawn: model-switch /
@@ -705,7 +717,7 @@ struct KernelDriver {
     #[allow(dead_code)]
     parts: CodingParts,
     handle: AgentHandle,
-    ev_tx: mpsc::UnboundedSender<CoreEv>,
+    ev_tx: mpsc::UnboundedSender<DaemonRuntimeEvent>,
     /// The kernel session id this agent persists under. Kept for Task 6b respawn.
     #[allow(dead_code)]
     bridge_session: String,
@@ -743,9 +755,9 @@ impl KernelDriver {
                         // pending_finish branch; the goal/loop/undo hold-open branches
                         // are deferred on this path).
                         for ce in self.tx.terminate_pending() {
-                            let _ = self.ev_tx.send(ce);
+                            self.emit_legacy(ce);
                         }
-                        let _ = self.ev_tx.send(CoreEv::Error {
+                        self.emit_legacy(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
                             snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                         });
@@ -765,16 +777,20 @@ impl KernelDriver {
         }
     }
 
-    /// One kernel event → translate to `0..n` core events, then drain any outbound
+    /// One kernel event → translate to `0..n` daemon runtime events, then drain any outbound
     /// kernel commands the (stateless) translator queued (e.g. the `Snapshot`
     /// request `TurnComplete` pushes, or a displaced-approval deny).
     fn on_kernel_event(&mut self, e: KEv) {
-        for ce in self.tx.translate(e) {
-            let _ = self.ev_tx.send(ce);
+        for event in self.tx.translate_runtime(e) {
+            let _ = self.ev_tx.send(event);
         }
         for kc in self.tx.drain_kernel_commands() {
             let _ = self.handle.commands.send(kc);
         }
+    }
+
+    fn emit_legacy(&self, event: CoreEv) {
+        let _ = self.ev_tx.send(DaemonRuntimeEvent::Legacy(event));
     }
 
     /// One core command in. Returns `true` iff the driver should stop (`Shutdown`).
@@ -824,7 +840,7 @@ impl KernelDriver {
             // SendMessage can't be answered — surface an actionable error instead of
             // silently dropping it.
             CoreCmd::SendMessage { .. } if self.degraded => {
-                let _ = self.ev_tx.send(CoreEv::Error {
+                self.emit_legacy(CoreEv::Error {
                     error: "engine v2 failed to initialise — the kernel agent is not \
                             running. Use /model to switch to a working provider, or \
                             restart atomcode."
@@ -879,7 +895,7 @@ impl KernelDriver {
         // deferred (daemon kernel path): the loop_pending_finish hold-open branch
         // bridge also settles here is scoped out (no loop on this path).
         for ce in self.tx.terminate_pending() {
-            let _ = self.ev_tx.send(ce);
+            self.emit_legacy(ce);
         }
         self.tx.reset_turn_state();
 
@@ -904,7 +920,7 @@ impl KernelDriver {
             Ok(p) => p,
             Err(e) => {
                 if matches!(opts.session, SessionMode::Fresh) {
-                    let _ = self.ev_tx.send(CoreEv::Error {
+                    self.emit_legacy(CoreEv::Error {
                         error: format!("engine v2 respawn failed: {e}"),
                         snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                     });
@@ -922,7 +938,7 @@ impl KernelDriver {
                 {
                     Ok(p) => p,
                     Err(e2) => {
-                        let _ = self.ev_tx.send(CoreEv::Error {
+                        self.emit_legacy(CoreEv::Error {
                             error: format!(
                                 "engine v2 respawn failed (fresh fallback also failed): {e2}"
                             ),
@@ -964,7 +980,7 @@ impl KernelDriver {
                 // cancellation on a fresh respawn are scoped out.
             }
             Err(e) => {
-                let _ = self.ev_tx.send(CoreEv::Error {
+                self.emit_legacy(CoreEv::Error {
                     error: format!("engine v2 respawn failed: {e}"),
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                 });
@@ -1002,7 +1018,7 @@ impl KernelDriver {
                         let new_handle = a.spawn();
                         // Close the lifecycle + clear stale translator state, then swap.
                         for ce in self.tx.terminate_pending() {
-                            let _ = self.ev_tx.send(ce);
+                            self.emit_legacy(ce);
                         }
                         self.tx.reset_turn_state();
                         self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
@@ -1011,7 +1027,7 @@ impl KernelDriver {
                     }
                     Err(e) => {
                         // KEEP the old handle (may be noop) so the driver stays alive.
-                        let _ = self.ev_tx.send(CoreEv::Error {
+                        self.emit_legacy(CoreEv::Error {
                             error: format!("provider switch failed: {e}"),
                             snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                         });
@@ -1019,7 +1035,7 @@ impl KernelDriver {
                 }
             }
             Err(e) => {
-                let _ = self.ev_tx.send(CoreEv::Error {
+                self.emit_legacy(CoreEv::Error {
                     error: format!("engine v2 provider init failed: {e}"),
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                 });
@@ -1061,31 +1077,28 @@ impl KernelDriver {
                 // Ported EXACTLY from bridge (known footgun).
                 let d = atomcode_capabilities::pathnorm::strip_verbatim_path(&d);
                 self.coding_cfg.working_dir = d.clone();
-                let _ = self.ev_tx.send(CoreEv::WorkingDirChanged(d));
+                self.emit_legacy(CoreEv::WorkingDirChanged(d));
                 self.respawn(SessionMode::Fresh).await;
             }
             _ => {
-                let _ = self.ev_tx.send(CoreEv::Warning(format!("no such directory: {dir}")));
+                self.emit_legacy(CoreEv::Warning(format!("no such directory: {dir}")));
             }
         }
     }
 }
 
-/// Spawn a kernel-native agent presented through the LEGACY channel protocol.
-///
-/// Byte-identical drop-in for [`atomcode_bridge::spawn_bridged_runtime`]
-/// (runtime.rs:101): same signature, same `(AgentClient, ev_rx)` return, same
-/// "returns immediately; prepares asynchronously; the command channel buffers
-/// anything sent meanwhile" contract. Opt-in via `ATOMCODE_DAEMON_ENGINE=kernel`
+/// Spawn a kernel-native agent presented through the daemon's ordered transitional
+/// event protocol. It returns immediately, prepares asynchronously, and buffers
+/// commands sent during preparation. Opt-in via `ATOMCODE_DAEMON_ENGINE=kernel`
 /// (see [`engine_is_kernel`]); the daemon defaults to the bridge path.
 ///
 /// New-conversations-only in Task 6a: respawn / existing-conversation seeding /
 /// model-switch / ChangeDir are `// Task 6b:` no-ops in `on_command`.
 pub fn spawn_kernel_runtime(
     cfg: BridgeConfig,
-) -> (AgentClient, mpsc::UnboundedReceiver<CoreEv>) {
+) -> (AgentClient, mpsc::UnboundedReceiver<DaemonRuntimeEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CoreCmd>();
-    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<CoreEv>();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<DaemonRuntimeEvent>();
 
     // Mirror bridge's shared registries the (legacy) client carries for the slash
     // palette / dynamic MCP tools.
@@ -1125,10 +1138,10 @@ pub fn spawn_kernel_runtime(
                 // prepare() failed — no parts, so no agent can be built. Report and
                 // keep the event channel alive by draining commands until Shutdown
                 // (inlined, minimal: the daemon just needs the turn to fail cleanly).
-                let _ = ev_tx.send(CoreEv::Error {
+                let _ = ev_tx.send(DaemonRuntimeEvent::Legacy(CoreEv::Error {
                     error: format!("engine v2 prepare failed: {e}"),
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
-                });
+                }));
                 keep_alive_until_shutdown(ev_tx, cmd_rx).await;
                 return;
             }
@@ -1142,10 +1155,10 @@ pub fn spawn_kernel_runtime(
         let provider = match atomcode_bridge::build_provider(&coding_cfg) {
             Ok(p) => Some(p),
             Err(e) => {
-                let _ = ev_tx.send(CoreEv::Error {
+                let _ = ev_tx.send(DaemonRuntimeEvent::Legacy(CoreEv::Error {
                     error: format!("engine v2 provider init failed: {e}"),
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
-                });
+                }));
                 None
             }
         };
@@ -1153,10 +1166,10 @@ pub fn spawn_kernel_runtime(
             Some(provider) => match assemble(&mut parts, &coding_cfg, provider) {
                 Ok(a) => (a.spawn(), false),
                 Err(e) => {
-                    let _ = ev_tx.send(CoreEv::Error {
+                    let _ = ev_tx.send(DaemonRuntimeEvent::Legacy(CoreEv::Error {
                         error: format!("engine v2 assemble failed: {e}"),
                         snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
-                    });
+                    }));
                     (noop_handle(), true)
                 }
             },
@@ -1181,6 +1194,46 @@ pub fn spawn_kernel_runtime(
     (client, ev_rx)
 }
 
+/// Spawn the daemon's selected v2 runtime behind one ordered event protocol.
+pub fn spawn_daemon_runtime(
+    cfg: BridgeConfig,
+) -> (AgentClient, mpsc::UnboundedReceiver<DaemonRuntimeEvent>) {
+    if engine_is_kernel() {
+        return spawn_kernel_runtime(cfg);
+    }
+
+    let atomcode_bridge::BridgedRuntime {
+        client,
+        control: _control,
+        mut event_rx,
+        mut runtime_event_rx,
+    } = atomcode_bridge::spawn_bridged_runtime_with_control(cfg);
+    let (event_tx, daemon_event_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut legacy_open = true;
+        let mut native_open = true;
+        while legacy_open || native_open {
+            let payload = tokio::select! {
+                biased;
+                event = runtime_event_rx.recv(), if native_open => match event {
+                    Some(event) => Some(DaemonRuntimeEvent::Native(event)),
+                    None => { native_open = false; None }
+                },
+                event = event_rx.recv(), if legacy_open => match event {
+                    Some(event) => Some(DaemonRuntimeEvent::Legacy(event)),
+                    None => { legacy_open = false; None }
+                },
+            };
+            if let Some(payload) = payload {
+                if event_tx.send(payload).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (client, daemon_event_rx)
+}
+
 /// Drain driver commands until `Shutdown` (or the channel closes) after a failed
 /// `prepare`, holding `ev_tx` open so the daemon's forwarder doesn't see the
 /// channel close prematurely. The initial Error was already sent before entering.
@@ -1188,7 +1241,7 @@ pub fn spawn_kernel_runtime(
 /// daemon path does not need the ReloadConfig/SendMessage feedback branches (those
 /// are Task 6b), only a clean drain.
 async fn keep_alive_until_shutdown(
-    ev_tx: mpsc::UnboundedSender<CoreEv>,
+    ev_tx: mpsc::UnboundedSender<DaemonRuntimeEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
 ) {
     let _hold = ev_tx; // keep the event channel open until the driver is torn down
@@ -1229,65 +1282,6 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
         return atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatAuthExpired).to_string();
     }
     message
-}
-
-/// Localized completion marker for a COMMITTED compaction, unified across auto +
-/// manual. A drain (`removed > 0`) reports the messages summarized and the token
-/// before→after; an in-place stub fold (`removed == 0`) reports the tokens saved.
-#[allow(dead_code)]
-fn compaction_mark_label(
-    removed: usize,
-    bytes_before: usize,
-    bytes_after: usize,
-    before_tokens: usize,
-) -> String {
-    use atomcode_config::i18n::{t, Msg};
-    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
-    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
-    if removed > 0 {
-        let before = fmt_k_tokens(before_tokens);
-        let after = fmt_k_tokens(after_tokens);
-        t(Msg::CompactMarkDrain { messages: removed, before: &before, after: &after }).into_owned()
-    } else {
-        let saved = fmt_k_tokens(before_tokens.saturating_sub(after_tokens));
-        t(Msg::CompactMarkStub { saved: &saved }).into_owned()
-    }
-}
-
-/// Inline note for a manual `/compact` that did NOT commit (nothing to drop).
-#[allow(dead_code)]
-fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
-    use atomcode_config::i18n::{t, Msg};
-    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
-    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
-    let before = fmt_k_tokens(before_tokens);
-    let after = fmt_k_tokens(after_tokens);
-    if bytes_after > bytes_before {
-        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
-    } else {
-        t(Msg::CompactNothingShort).into_owned()
-    }
-}
-
-/// Estimate the post-compaction token count by scaling the pre-compaction count by
-/// the kernel's byte-reduction ratio. `bytes_before == 0` ⇒ unchanged.
-#[allow(dead_code)]
-fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
-    if bytes_before > 0 {
-        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
-    } else {
-        before_tokens
-    }
-}
-
-/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
-#[allow(dead_code)]
-fn fmt_k_tokens(t: usize) -> String {
-    if t >= 1000 {
-        format!("{:.1}K", t as f64 / 1000.0)
-    } else {
-        t.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -1609,19 +1603,21 @@ mod kernel_runtime_translate_tests {
     }
 
     #[test]
-    fn compaction_started_maps_to_begin() {
+    fn compaction_started_maps_to_native_event() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
-        let out = t.translate(KEv::CompactionStarted {
+        let out = t.translate_runtime(KEv::CompactionStarted {
             trigger: CompactTrigger::Manual { focus: None },
         });
         assert!(matches!(
             &out[..],
-            [CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin)]
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionStarted {
+                trigger: CompactTrigger::Manual { focus: None }
+            })]
         ));
     }
 
     #[test]
-    fn compacted_committed_emits_mark_and_context_stats() {
+    fn compacted_committed_emits_only_native_outcome() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         // Seed last_usage so before_tokens is non-zero.
         t.translate(KEv::Usage(MessageMeta {
@@ -1630,7 +1626,7 @@ mod kernel_runtime_translate_tests {
             ctx_window: 64_000,
             ..Default::default()
         }));
-        let out = t.translate(KEv::Compacted {
+        let out = t.translate_runtime(KEv::Compacted {
             trigger: CompactTrigger::Auto { utilization: 0.8 },
             epoch: 1,
             removed: 5,
@@ -1638,23 +1634,23 @@ mod kernel_runtime_translate_tests {
             bytes_after: 1000,
             committed: true,
         });
-        assert!(
-            out.iter().any(|e| matches!(
-                e,
-                CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(_))
-            )),
-            "expected a Mark, got {out:?}"
-        );
-        assert!(
-            out.iter().any(|e| matches!(e, CoreEv::ContextStats { .. })),
-            "expected a ContextStats refresh, got {out:?}"
-        );
+        match &out[..] {
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            })] => {
+                assert!(outcome.committed);
+                assert_eq!(outcome.removed_messages, 5);
+                assert_eq!(outcome.estimated_tokens_before, 1000);
+                assert_eq!(outcome.estimated_tokens_after, 250);
+            }
+            _ => panic!("expected only native compaction finish, got {out:?}"),
+        }
     }
 
     #[test]
-    fn compacted_noop_manual_emits_end_and_text() {
+    fn compacted_noop_manual_emits_only_native_outcome() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
-        let out = t.translate(KEv::Compacted {
+        let out = t.translate_runtime(KEv::Compacted {
             trigger: CompactTrigger::Manual { focus: None },
             epoch: 1,
             removed: 0,
@@ -1662,16 +1658,19 @@ mod kernel_runtime_translate_tests {
             bytes_after: 100,
             committed: false,
         });
-        assert!(out
-            .iter()
-            .any(|e| matches!(e, CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::End))));
-        assert!(out.iter().any(|e| matches!(e, CoreEv::TextDelta(_))));
+        assert!(matches!(
+            &out[..],
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            })]
+                if !outcome.committed && outcome.is_manual()
+        ));
     }
 
     #[test]
     fn compacted_noop_auto_stays_silent() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
-        let out = t.translate(KEv::Compacted {
+        let out = t.translate_runtime(KEv::Compacted {
             trigger: CompactTrigger::Auto { utilization: 0.8 },
             epoch: 1,
             removed: 0,
@@ -1679,11 +1678,13 @@ mod kernel_runtime_translate_tests {
             bytes_after: 100,
             committed: false,
         });
-        // End only — no TextDelta note on the auto path.
-        assert!(out
-            .iter()
-            .any(|e| matches!(e, CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::End))));
-        assert!(!out.iter().any(|e| matches!(e, CoreEv::TextDelta(_))));
+        assert!(matches!(
+            &out[..],
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            })]
+                if !outcome.committed && !outcome.is_manual()
+        ));
     }
 
     #[test]

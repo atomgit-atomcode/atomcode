@@ -1593,13 +1593,7 @@ async fn run() -> Result<i32> {
         !is_headless,
     );
     eprintln!("[engine] active (model {})", bridge_cfg.model);
-    let initial_runtime = atomcode_bridge::spawn_bridged_runtime_with_control(bridge_cfg);
-    let runtime_control = initial_runtime.control;
-    let mut v2_handle: Option<atomcode_core::agent::AgentHandle> =
-        Some(atomcode_core::agent::AgentHandle {
-            client: initial_runtime.client,
-            event_rx: initial_runtime.event_rx,
-        });
+    let mut v2_runtime = Some(atomcode_bridge::spawn_bridged_runtime_with_control(bridge_cfg));
 
     // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
     // builds a fresh bridge from the CURRENT config, so a /provider switch inside
@@ -1623,13 +1617,7 @@ async fn run() -> Result<i32> {
                         true,
                     ),
                 );
-                atomcode_tuix::SpawnedRuntime {
-                    endpoint: atomcode_tuix::RuntimeEndpoint {
-                        legacy: runtime.client,
-                        native: runtime.control,
-                    },
-                    event_rx: runtime.event_rx,
-                }
+                into_tui_runtime(runtime)
             },
         )
     };
@@ -1684,8 +1672,8 @@ async fn run() -> Result<i32> {
         // Headless `-c`: the TUI rebinds itself, so only push to the agent
         // here, so the continued session's id reaches the header + datalog.
         if effective_prompt.is_some() {
-            if let Some(h) = v2_handle.as_ref() {
-                h.client
+            if let Some(runtime) = v2_runtime.as_ref() {
+                runtime.client
                     .cmd_tx
                     .send(AgentCommand::SetSessionId(s.id.as_str().to_string()))
                     .ok();
@@ -1714,10 +1702,10 @@ async fn run() -> Result<i32> {
             // mpsc events are lost. Capture the Result and let it bubble up only
             // *after* the flush. The run routes through the bridged handle.
             let notifications_cfg = config.notifications.clone();
-            let engine_handle = v2_handle.take().expect("v2 handle built above");
+            let engine_runtime = v2_runtime.take().expect("v2 runtime built above");
             match run_headless(
                 notifications_cfg,
-                engine_handle,
+                engine_runtime,
                 prompt,
                 cli.provider.as_deref(),
                 verbose,
@@ -1764,11 +1752,13 @@ async fn run() -> Result<i32> {
             // The bridge task already runs the engine behind this handle; the TUI
             // just drives it. In-TUI /session and /resume spawn via
             // runtime_spawn_override.
-            let tui_handle = v2_handle.take().expect("v2 handle built above");
+            let tui_runtime = into_tui_runtime(
+                v2_runtime.take().expect("v2 runtime built above"),
+            );
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
             // the error propagates only after telemetry is drained.
-            match atomcode_tuix::run(config, model_name, tui_handle, runtime_control, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
+            match atomcode_tuix::run(config, model_name, tui_runtime, runtime_spawn_override, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone(), cli.dangerously_skip_permissions, is_admin).await {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
             }
@@ -1785,6 +1775,46 @@ async fn run() -> Result<i32> {
     .await;
 
     result
+}
+
+fn into_tui_runtime(runtime: atomcode_bridge::BridgedRuntime) -> atomcode_tuix::SpawnedRuntime {
+    let atomcode_bridge::BridgedRuntime {
+        client,
+        control,
+        mut event_rx,
+        mut runtime_event_rx,
+    } = runtime;
+    let (event_tx, tui_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut legacy_open = true;
+        let mut native_open = true;
+        while legacy_open || native_open {
+            let payload = tokio::select! {
+                biased;
+                event = runtime_event_rx.recv(), if native_open => match event {
+                    Some(event) => Some(atomcode_tuix::RuntimeEventPayload::Native(event)),
+                    None => { native_open = false; None }
+                },
+                event = event_rx.recv(), if legacy_open => match event {
+                    Some(event) => Some(atomcode_tuix::RuntimeEventPayload::Legacy(event)),
+                    None => { legacy_open = false; None }
+                },
+            };
+            if let Some(payload) = payload {
+                if event_tx.send(payload).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    atomcode_tuix::SpawnedRuntime {
+        endpoint: atomcode_tuix::RuntimeEndpoint {
+            legacy: client,
+            native: control,
+        },
+        event_rx: tui_event_rx,
+    }
 }
 
 /// On macOS the NSPasteboard runtime prints deprecation warnings to
@@ -1909,7 +1939,7 @@ fn bridge_config_from(
 /// dir changes, and sub-agent progress on stderr.
 async fn run_headless(
     notifications_cfg: atomcode_config::config::NotificationConfig,
-    agent_handle: atomcode_core::agent::AgentHandle,
+    runtime: atomcode_bridge::BridgedRuntime,
     prompt: String,
     _provider_name: Option<&str>,
     verbose: bool,
@@ -1942,10 +1972,36 @@ async fn run_headless(
     }
 
     let notifications = notifications_cfg;
-    let (cmd_tx, mut event_rx) = {
-        let handle = agent_handle;
-        (handle.client.cmd_tx, handle.event_rx)
-    };
+    let atomcode_bridge::BridgedRuntime {
+        client,
+        control: _control,
+        mut event_rx,
+        mut runtime_event_rx,
+    } = runtime;
+    let cmd_tx = client.cmd_tx;
+    let (merged_tx, mut merged_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut legacy_open = true;
+        let mut native_open = true;
+        while legacy_open || native_open {
+            let payload = tokio::select! {
+                biased;
+                event = runtime_event_rx.recv(), if native_open => match event {
+                    Some(event) => Some(atomcode_tuix::RuntimeEventPayload::Native(event)),
+                    None => { native_open = false; None }
+                },
+                event = event_rx.recv(), if legacy_open => match event {
+                    Some(event) => Some(atomcode_tuix::RuntimeEventPayload::Legacy(event)),
+                    None => { legacy_open = false; None }
+                },
+            };
+            if let Some(payload) = payload {
+                if merged_tx.send(payload).is_err() {
+                    break;
+                }
+            }
+        }
+    });
 
     let mut exit_code: i32 = 0;
 
@@ -1990,7 +2046,62 @@ async fn run_headless(
         }
     }
 
-    while let Some(event) = event_rx.recv().await {
+    while let Some(event) = merged_rx.recv().await {
+        let event = match event {
+            atomcode_tuix::RuntimeEventPayload::Legacy(event) => event,
+            atomcode_tuix::RuntimeEventPayload::Native(event) => {
+                match event {
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionStarted { .. } => {}
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished {
+                        completion:
+                            atomcode_coding::runtime::CompactionCompletion::Completed(outcome),
+                    } if outcome.committed => {
+                        close_thinking_line(&mut thinking_line_open);
+                        eprintln!(
+                            "[compact] {}",
+                            atomcode_config::i18n::format_compaction_mark(
+                                outcome.removed_messages,
+                                outcome.estimated_tokens_before,
+                                outcome.estimated_tokens_after,
+                            )
+                        );
+                    }
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished {
+                        completion:
+                            atomcode_coding::runtime::CompactionCompletion::Completed(outcome),
+                    } if outcome.is_manual() => {
+                        close_thinking_line(&mut thinking_line_open);
+                        let text = atomcode_config::i18n::format_compaction_noop(
+                            outcome.estimated_tokens_before,
+                            outcome.estimated_tokens_after,
+                            outcome.summary_would_grow(),
+                        );
+                        if !text.is_empty() {
+                            last_text_ended_with_newline = text.ends_with('\n');
+                        }
+                        if let Some(buf) = captured.as_mut() {
+                            buf.push_str(&text);
+                        }
+                        print!("{}", text);
+                        io::stdout().flush()?;
+                    }
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished {
+                        completion:
+                            atomcode_coding::runtime::CompactionCompletion::Interrupted {
+                                trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                                ..
+                            },
+                    } => {
+                        close_thinking_line(&mut thinking_line_open);
+                        eprint!("{}", atomcode_config::i18n::format_compaction_interrupted());
+                        let _ = io::stderr().flush();
+                    }
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished { .. } => {}
+                    _ => {}
+                }
+                continue;
+            }
+        };
         match event {
             AgentEvent::TextDelta(text) => {
                 close_thinking_line(&mut thinking_line_open);
@@ -2331,13 +2442,6 @@ async fn run_headless(
             }
             AgentEvent::GoalUpdate { .. } => {
                 // Goal progress — headless mode ignores for now.
-            }
-            AgentEvent::CompactionUi(kind) => {
-                // Headless: no spinner / scrollback. Echo a committed marker to
-                // stderr so non-interactive runs still note the compaction.
-                if let atomcode_core::agent::CompactionUiKind::Mark(label) = kind {
-                    eprintln!("[compact] {}", label);
-                }
             }
             AgentEvent::LoopUpdate { .. } => {
                 // Loop progress — headless mode ignores for now.

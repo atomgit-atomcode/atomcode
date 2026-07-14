@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
 use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
@@ -32,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
+use crate::kernel_runtime::DaemonRuntimeEvent;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
@@ -556,7 +558,7 @@ pub(crate) struct KernelTurnExecutor {
 
 struct BridgeState {
     client: AgentClient,
-    events: mpsc::UnboundedReceiver<AgentEvent>,
+    events: mpsc::UnboundedReceiver<DaemonRuntimeEvent>,
     /// Whether the pre-existing history has been seeded into the bridge.
     seeded: bool,
     /// The provider name used to build this bridge. Compared against
@@ -741,11 +743,7 @@ impl TurnExecutor for KernelTurnExecutor {
             };
             let provider_name = self.resolve_provider_name();
             let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = if crate::kernel_runtime::engine_is_kernel() {
-                crate::kernel_runtime::spawn_kernel_runtime(cfg)
-            } else {
-                atomcode_bridge::spawn_bridged_runtime(cfg)
-            };
+            let (client, rx) = crate::kernel_runtime::spawn_daemon_runtime(cfg);
             *guard = Some(BridgeState {
                 client,
                 events: rx,
@@ -924,6 +922,15 @@ impl TurnExecutor for KernelTurnExecutor {
                 bridge_dead = true;
                 break None;
             };
+            let ev = match ev {
+                DaemonRuntimeEvent::Legacy(event) => event,
+                DaemonRuntimeEvent::Native(event) => {
+                    if let Some(event) = coding_runtime_to_turn(event) {
+                        emit(event);
+                    }
+                    continue;
+                }
+            };
             match ev {
                 AgentEvent::TextDelta(t) => {
                     // fix B: accumulate, then throttle a crash-durable progress save.
@@ -998,9 +1005,6 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
                 AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-                    emit(TurnEvent::Warning(label))
-                }
                 AgentEvent::ApprovalNeeded {
                     tool_name,
                     reason,
@@ -1346,11 +1350,48 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
             secs_until_reset,
             auto_resuming,
         },
-        AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-            TurnEvent::Warning(label)
-        }
         _ => return None,
     })
+}
+
+/// Convert driver-neutral coding runtime events to the daemon streaming surface.
+pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent> {
+    match ev {
+        CodingRuntimeEvent::CompactionStarted { .. } => None,
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.committed => {
+            Some(TurnEvent::Warning(
+                atomcode_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.is_manual() => {
+            Some(TurnEvent::TextDelta(
+                atomcode_config::i18n::format_compaction_noop(
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                    outcome.summary_would_grow(),
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion:
+                CompactionCompletion::Interrupted {
+                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                    ..
+                },
+        } => Some(TurnEvent::Warning(
+            atomcode_config::i18n::format_compaction_interrupted(),
+        )),
+        CodingRuntimeEvent::CompactionFinished { .. } => None,
+        _ => None,
+    }
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
@@ -1403,11 +1444,7 @@ pub(crate) async fn run_chat_turn_v2(
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = if crate::kernel_runtime::engine_is_kernel() {
-        crate::kernel_runtime::spawn_kernel_runtime(bridge_cfg)
-    } else {
-        atomcode_bridge::spawn_bridged_runtime(bridge_cfg)
-    };
+    let (client, mut events) = crate::kernel_runtime::spawn_daemon_runtime(bridge_cfg);
 
     // Seed the bridge from conv (which already has the just-sent user message), then
     // send that message to actually run the turn.
@@ -1470,6 +1507,15 @@ pub(crate) async fn run_chat_turn_v2(
             ev = events.recv() => ev,
         };
         let Some(ev) = ev else { break None };
+        let ev = match ev {
+            DaemonRuntimeEvent::Legacy(event) => event,
+            DaemonRuntimeEvent::Native(event) => {
+                if let Some(event) = coding_runtime_to_turn(event) {
+                    let _ = turn_tx.send(event);
+                }
+                continue;
+            }
+        };
         match ev {
             AgentEvent::ApprovalNeeded {
                 tool_name,
@@ -2573,20 +2619,59 @@ mod tests {
     }
 
     #[test]
-    fn compaction_mark_maps_to_warning_wire_event() {
-        // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
-        // drivers. The bridge now emits CompactionUi(Mark) instead of the old
-        // Warning("conversation compacted"); the daemon must translate it to a warning
-        // wire event so /webui + /chat clients still see the notice. Begin/End are TUI
-        // spinner lifecycle and are intentionally dropped (web has no compaction spinner).
-        use atomcode_core::agent::{AgentEvent, CompactionUiKind};
-        let label = "已压缩 · 摘要 3 条 · ~40K→~10K".to_string();
+    fn coding_compaction_events_preserve_daemon_display_policy() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let outcome = |trigger, committed| CompactionOutcome {
+            trigger,
+            epoch: 1,
+            removed_messages: 3,
+            bytes_before: 160_000,
+            bytes_after: 40_000,
+            committed,
+            estimated_tokens_before: 40_000,
+            estimated_tokens_after: 10_000,
+        };
+
         assert!(matches!(
-            agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Mark(label.clone()))),
-            Some(TurnEvent::Warning(w)) if w == label
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Auto { utilization: 0.8 },
+                    true,
+                )),
+            }),
+            Some(TurnEvent::Warning(label)) if label.contains("40.0K") && label.contains("10.0K")
         ));
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Manual { focus: None },
+                    false,
+                )),
+            }),
+            Some(TurnEvent::TextDelta(_))
+        ));
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome(
+                CompactTrigger::Auto { utilization: 0.8 },
+                false,
+            )),
+        })
+        .is_none());
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
+            trigger: CompactTrigger::Manual { focus: None },
+        })
+        .is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                },
+            }),
+            Some(TurnEvent::Warning(text)) if text.contains("interrupt") || text.contains("中断")
+        ));
     }
 
     // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，

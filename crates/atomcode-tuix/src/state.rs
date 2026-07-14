@@ -173,10 +173,11 @@ pub struct UiState {
     pub spinner_frame: usize,
     /// A compaction's slow LLM summary is currently running — the footer
     /// spinner shows "Compacting…" instead of a thinking label and the stall
-    /// hint is compaction-specific. Set by `AgentEvent::CompactionUi(Begin)`,
-    /// cleared on `End`/`Mark`.
+    /// hint is compaction-specific. Set by
+    /// `CodingRuntimeEvent::CompactionStarted`, then cleared when compaction
+    /// finishes.
     pub compacting: bool,
-    /// Whether `CompactionUi(Begin)` forced `phase = Streaming` (a standalone
+    /// Whether `CodingRuntimeEvent::CompactionStarted` forced `phase = Streaming` (a standalone
     /// manual `/compact` started from Idle, which otherwise animates no
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
@@ -261,6 +262,10 @@ pub struct UiState {
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
     pub last_context: Option<ContextSnapshot>,
+    /// Temporary occupancy projected from a committed native compaction. The
+    /// bridge's legacy `/context` refresh still holds pre-compaction usage, so
+    /// its sent-token field is ignored until the next real TokenUsage arrives.
+    pub post_compaction_used_tokens: Option<usize>,
     /// Verbatim text of the message that is currently running. Set
     /// on every submit, cleared on turn-complete. When the user hits
     /// Ctrl+C / Esc mid-stream the streaming-key handler takes this
@@ -486,6 +491,7 @@ impl UiState {
             phase_started_at: None,
             last_stream_activity: None,
             last_context: None,
+            post_compaction_used_tokens: None,
             last_submitted_message: None,
             pending_context_render: None,
             pending_images: Vec::new(),
@@ -554,7 +560,7 @@ impl UiState {
             // Preserve a value restored from the persisted session on resume so
             // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
             // the moment the user runs it. A real turn always sends `sent > 0`.
-            if sent_tokens > 0 {
+            if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
                 snap.sent_tokens = sent_tokens;
             }
             snap.tool_defs_tokens = tool_defs_tokens;
@@ -570,7 +576,7 @@ impl UiState {
         if system_tokens > 0 {
             snap.system_tokens = system_tokens;
         }
-        if sent_tokens > 0 {
+        if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
             snap.sent_tokens = sent_tokens;
         }
         if tool_defs_tokens > 0 {
@@ -610,6 +616,7 @@ impl UiState {
     /// with no cached snapshot) so a fresh session still reads "no turns yet"
     /// rather than a fabricated `0/0` "waiting for window" state.
     pub fn restore_context(&mut self, used_tokens: usize, ctx_window: usize) {
+        self.post_compaction_used_tokens = None;
         if used_tokens == 0 && ctx_window == 0 && self.last_context.is_none() {
             return;
         }
@@ -620,6 +627,21 @@ impl UiState {
         if ctx_window > 0 && snap.ctx_window == 0 {
             snap.ctx_window = ctx_window;
         }
+    }
+
+    /// Project the committed `/compact` result into the context gauge without
+    /// migrating the legacy `/context` command protocol in this slice.
+    pub fn on_compaction_committed(&mut self, used_tokens: usize) {
+        self.last_context
+            .get_or_insert_with(ContextSnapshot::default)
+            .sent_tokens = used_tokens;
+        self.post_compaction_used_tokens = Some(used_tokens);
+    }
+
+    /// A provider usage event is authoritative and releases the temporary
+    /// post-compaction projection before its ContextStats companion arrives.
+    pub fn on_token_usage(&mut self) {
+        self.post_compaction_used_tokens = None;
     }
 
     /// Refresh the cached context window after a model switch.
@@ -1086,6 +1108,29 @@ mod tests {
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
         assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn stale_context_refresh_does_not_clobber_post_compaction_usage() {
+        let mut s = UiState::new();
+        s.on_context_stats(0, 40_000, 0, 0, 10, 128_000, "engine-v2", "");
+        s.on_compaction_committed(12_000);
+
+        s.on_context_stats(0, 40_000, 0, 0, 6, 128_000, "engine-v2", "");
+
+        assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 12_000);
+        assert_eq!(s.post_compaction_used_tokens, Some(12_000));
+    }
+
+    #[test]
+    fn real_usage_releases_post_compaction_projection() {
+        let mut s = UiState::new();
+        s.on_compaction_committed(12_000);
+        s.on_token_usage();
+        s.on_context_stats(0, 14_000, 0, 0, 8, 128_000, "engine-v2", "");
+
+        assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 14_000);
+        assert!(s.post_compaction_used_tokens.is_none());
     }
 
     #[test]

@@ -1333,6 +1333,38 @@ CLI/daemon：
   事件仍透明通过有序 envelope；
 - WebUI 离线 `/compact` 不受影响。
 
+### 16.15 实施结果（release/v5.0.0）
+
+本切片已按本节设计落地。实施基线为
+`release/v5.0.0@0b94fa8a1a7fcb585f43456564b0b98b67707e86`。
+
+实际完成：
+
+- `atomcode-coding::runtime` 现在拥有 driver-neutral 的
+  `CodingRuntimeEvent` 与 `CompactionOutcome`；
+- bridge、TUI 和 daemon 分别使用单 channel 的有序 `Legacy/Native` envelope；
+- CLI headless、TUI foreground/background、daemon `/live`、`/chat`、bridge fallback
+  和 daemon kernel path 均已切换 native compaction event；
+- committed compaction 后仍按 `CompactionFinished → ContextStats` 的顺序立即刷新 usage；
+- compaction 展示文案统一由 `atomcode-config::i18n` 格式化；
+- 已删除 core `CompactionUiKind`、`AgentEvent::CompactionUi`、所有生产/消费分支、
+  重复 helper、旧测试以及旧 tuple 版 `spawn_bridged_runtime`。
+
+迁移状态：
+
+```text
+kernel compaction 逻辑已实现                 是
+TUI manual compact 命令 driver 已切换         是
+compaction native 事件 driver 已切换           是
+core CompactionUi event variant 已退役         是
+跨 driver /compact 整体接口面已退役            否
+bridge fallback 已删除                         否
+```
+
+仍可达的 legacy surface 与 16.11 一致。该结果只完成了 compaction 事件面的迁移，
+不能据此转去 `/context`：`/compact` 控制仍由 bridge 转发、结果仍由 bridge 消费，
+daemon 离线 `/compact` 仍使用 core compression，因此 `/compact` 整体尚未退役。
+
 退役验收：
 
 ```text
@@ -1343,12 +1375,197 @@ rg "CompactionUi|CompactionUiKind" crates
 转换的测试均已删除。之后依次运行受影响 crate 的针对性测试和实际可行的最广
 workspace check。
 
-### 16.15 第二切片验收口径与后续唯一下一步
+### 16.16 第二切片验收口径与后续唯一下一步
 
 第二切片只有在 core variant、生产者、消费者和转换全部删除后，才能称为
 “compaction legacy 事件面已退役”。若只是 driver 能收到 native 事件但旧路径仍可达，
 必须报告为“driver 已切换、legacy fallback 仍保留”。
 
-完成第二切片后的唯一下一步是迁移与 compaction 紧邻的 context/usage 事件所有权，
-让 compaction 后的统计刷新也脱离 core `ContextStats`。daemon 离线 `/compact` 仍留到
-session 所有权切片处理，不能混入事件迁移的完成度。
+完成第二切片后的唯一下一步是继续完成 `/compact`，而不是迁移 `/context`。只有控制、
+事件、compaction 后统计刷新和 daemon 离线执行都不再经过 bridge/core compression，
+才能把该 slash 命令标记为退役。
+
+## 17. 第三切片：`/compact` 完整脱离 bridge
+
+### 17.1 当前基线与目标状态
+
+设计复核基线为 `release/v5.0.0@cfda1c319fe3f34406fafba992019009ed65ab56`。
+当前工作树无未提交改动，分支相对远端 ahead 1 / behind 5；本切片不得顺带拉取、合并、
+提交或推送。
+
+当前调用链为：
+
+```text
+TUI /compact
+  -> CodingRuntimeHandle
+  -> bridge CodingRuntimeControlReceiver
+  -> bridge 当前 AgentHandle.commands
+  -> kernel Compact
+  -> bridge 当前 AgentHandle.events
+  -> bridge CompactionStarted/Compacted 转换
+  -> driver native event
+```
+
+因此第二切片后的准确状态是：逻辑已实现、driver 已切换、core `CompactionUi` 已退役，
+但 bridge fallback 仍可达，`/compact` 整体尚未退役。
+
+第三切片目标是让 `atomcode-coding` runtime 成为当前 kernel `AgentHandle` 的唯一所有者：
+
+```text
+driver CodingRuntimeHandle -- Compact --> coding runtime owner --> kernel
+kernel -- CompactionStarted/Compacted --> coding runtime owner --> native driver receiver
+kernel -- other events --> coding runtime adapter --> bridge --> legacy driver receiver
+bridge -- replace/stop/shutdown --> coding runtime owner --> current kernel AgentHandle
+```
+
+这不是把整个 bridge 一次搬进 coding。bridge 仍负责尚未迁移的 legacy 命令、事件转换及
+goal/loop/session 协调，但不再接触 compaction 控制或 compaction kernel event。
+
+### 17.2 所有权与中间态约束
+
+- coding runtime owner 独占 kernel event receiver，避免 bridge 与 runtime 竞争消费；
+- driver 持有稳定 `CodingRuntimeHandle`，provider/session respawn 后仍指向 owner 当前 agent；
+- bridge 通过内部 adapter 发送其他 kernel 命令、接收过滤后的非 compaction 事件；
+- handle 替换必须经 `replace_agent`，停止必须经 `stop_agent`，最终退出经 `shutdown`；
+- owner 必须保留 session id、working directory、snapshot、provider、approval 和 gateway
+  affinity 的现有 respawn 时序；本切片不改变这些策略，只改变 AgentHandle 所有权；
+- native compaction receiver 与 legacy receiver 分离，driver 在本地合流；不得重新包装成
+  core event，也不得由 bridge 重新转发 native event；
+- committed compaction 不再触发 bridge `ContextStats`。`/context` 本身的 legacy 查询路径
+  保留，本切片不迁移它；compaction outcome 已携带展示所需的 before/after 数据。
+
+### 17.3 本切片预计删除的 legacy surface
+
+- bridge 的 `CodingRuntimeControlReceiver` select 分支和 `forward_runtime_control`；
+- bridge 的 `on_runtime_control`；
+- bridge `on_kernel_event` 中 `CompactionStarted`、`Compacted` 两个分支；
+- bridge compaction 后调用 `emit_context_stats()` 的路径；
+- bridge 只验证 compact 转发的测试；
+- `BridgedRuntimeEvent::Native` 及 bridge 对 native compaction 的生产职责；
+- daemon bridge fallback 对 `BridgedRuntimeEvent::Native` 的依赖；
+- daemon 离线 `/compact` 对 `atomcode_core::agent::compression` 的调用。
+
+不会删除的一般 legacy surface：core `ContextStats`、其他 core command/event、bridge 的
+session/provider/cd/resume/approval/goal/loop handler，以及 daemon kernel path 为兼容现有
+WebUI wire 所做的其他 core event 转换。
+
+### 17.4 daemon 离线 `/compact`
+
+`POST /command` 的 `/compact` 是同一个用户命令的另一入口，不能留到 `/context` 或笼统的
+session 切片后仍宣称完成。它应复用 kernel `Conversation`、`CompactionStrategy::plan` 和
+`Conversation::apply_plan`，由 kernel 保持 sacred floor、net-loss guard、cache epoch 与
+tool pair 不变量；持久化层仅负责 core session message 的边界转换和 display/turn anchor
+重建。不得继续调用 core `compression_plan/run_llm_summary/try_apply_compression`。
+
+### 17.5 验收状态
+
+本切片只有同时满足以下条件才完成：
+
+```text
+kernel compaction 逻辑已实现                  是
+CLI/TUI/daemon compact driver 已切换           是
+compact 控制经过 bridge                       否
+compact kernel event 经过 bridge              否
+compact 后由 bridge 发送 ContextStats          否
+daemon 离线 compact 使用 core compression      否
+core Compact/CompactionUi variant 可达          否
+其他 slash 命令的 bridge fallback              允许保留
+```
+
+若 daemon 离线路径或任一 driver 仍可达旧实现，最终说明必须写“`/compact` 尚未退役”，
+不能因为交互式 TUI 已工作而标记完成。
+
+### 17.6 实施结果
+
+本切片已在上述基线落地：
+
+- `atomcode-coding::runtime` 现在持有当前 kernel `AgentHandle`，稳定 handle 在
+  provider/session agent replacement 后仍直接命中当前 agent；
+- runtime owner 独占 kernel event receiver，compaction started/finished 直接进入 native
+  receiver，其他事件才进入 `KernelRuntimeAdapter`；
+- bridge 不再接收 runtime control，不再匹配 compaction kernel event，也不再因 compaction
+  发送 core `ContextStats`；
+- CLI/TUI/daemon bridge fallback 分别接收 legacy 与 native channel，并只在 driver 本地合流；
+- daemon kernel driver 的 compaction 结果不再附带 legacy `ContextStats`；
+- daemon 离线 `/compact` 已改用 v2 `OverflowCompaction` 生成 plan，并由 kernel
+  `Conversation::apply_plan` 执行；core compression 调用已删除；
+- daemon 本地 provider adapter 仅承担持久化命令边界的 core provider stream → kernel
+  provider stream 映射，不经过 bridge runtime、`AgentClient` 或 bridge handler。
+
+本切片实际删除：bridge control select/forwarder、bridge compaction event handler、bridge
+compaction 后 stats 发送、`BridgedRuntimeEvent::Native`、对应 bridge 转发测试，以及 daemon
+离线命令的 core compression 路径。
+
+完成状态：
+
+```text
+kernel compaction 逻辑已实现                  是
+CLI/TUI/daemon compact driver 已切换           是
+compact 控制经过 bridge                       否
+compact kernel event 经过 bridge              否
+compact 后由 bridge/daemon 发送 ContextStats   否
+daemon 离线 compact 使用 core compression      否
+core Compact/CompactionUi variant 可达          否
+/compact legacy 接口面已退役                   是
+其他 slash 命令的 bridge fallback              仍保留
+```
+
+下一步应先验证本切片的最广测试与实际交互，再选择下一个 slash 命令；不得把仍保留的一般
+core event、session/provider/goal/loop bridge surface 计入 `/compact` 的完成度，也不得据此
+宣称整个 bridge 已退役。
+
+### 17.7 合并后 review 加固
+
+2026-07-14 在 `release/v5.0.0@9d649c2340e7f18fdb84fe15f9619dc39f3cad29`
+及其未提交迁移 diff 上重新复核后，第三切片增加以下限定修复，范围仍只覆盖
+`/compact`：
+
+- daemon 离线压缩不再把全部 session message 经过 lossy core/kernel 双向转换；runtime
+  返回 `Noop`、`RewriteOnly` 或精确 `Replace` mutation，持久化层复用所有 surviving core
+  message，只把 kernel 新生成的 summary/note 转回 core。`ToolResultRef` 的 hash/byte_size、
+  Claude thinking signature 和其他 core-only 字段因此不会因 `/compact` 丢失；
+- UI anchor 只在 `Replace` mutation 下按真实 old/new span 重排；多个不连续的原位 rewrite
+  不再被误判成一个大 replacement，从而不会删除中间的 display message 或 turn stat；
+- runtime owner 在 respawn/provider reload 前暂停 compaction control，replacement 成功后才
+  恢复；stop/degraded 状态会拒绝新 compact，失败路径不再由 noop agent 伪造
+  `committed=false` 结果；
+- CLI、TUI 和 daemon bridge fallback 各自用一个有偏序 merger task 合流 legacy/native
+  receiver；background consumer 同时保证晚到的 manual finish 不能把 Done/Cancelled/Error
+  降级为 Idle；
+- committed outcome 在 TUI 内建立临时 post-compaction usage projection。旧
+  `RefreshContextStats` 返回的 pre-compaction sent tokens 在下一次真实 TokenUsage 前不会覆盖
+  它。该逻辑只是 `/compact` 的兼容投影，`/context` command/event 协议仍明确尚未迁移。
+
+本切片保证 native compaction 自身的 Started/Finished 顺序，并加固 compact 与 terminal 的
+消费顺序；它没有引入全局 sequence id，也不宣称所有 legacy/native runtime event 已形成
+统一的严格总序。全局混合事件协议、`/context` 和其他 slash 命令仍属于后续切片。
+
+加固后的迁移判定不变：`/compact` 专用 core variant、bridge compact handler、core
+compression fallback 已退役；一般 core `ContextStats`、bridge session/provider/goal/loop
+surface 仍可达，不能据此宣称整个 core/bridge 已退役。core compression 模块中的
+`run_llm_summary` 目前仍被 bridge 的 AI session naming 复用，但它已不在 `/compact` 调用链，
+因此既不能算 `/compact` fallback，也不能宣称整个 compression 模块已经删除。
+
+### 17.8 runtime 重建期间的 compact 终态
+
+第二轮 review 发现，旧 owner 在 `Stop/Replace` 中只等待 kernel task，不继续消费旧
+`AgentHandle.events`。若 driver 已收到 `CompactionStarted`，旧 agent 随后产生的
+`Compacted` 会随 receiver 一起被丢弃，TUI 可能永久停在 compacting/Streaming。
+
+本切片将 compact 生命周期约束补充为：runtime 接受的每个请求必须产生且只产生一个
+`CompactionFinished`。终态分为正常 `Completed(CompactionOutcome)` 和
+`Interrupted { trigger, reason }`；runtime 重建或停止不得伪装成 `committed=false` 的
+“无需压缩”。具体边界如下：
+
+- owner 记录已投递的 manual compact 和已开始的 auto/overflow compact；
+- Stop/Replace 等待旧 task 时继续抽取 compact event，task 结束后再次排空 receiver；
+- kernel 未产生 `Compacted` 时，owner 为剩余请求产生一次 `Interrupted`，随后清空旧状态；
+- control 携带 runtime generation。suspend 立即关闭可用性并推进 generation，旧 generation
+  请求只能结束为 `Interrupted`，不得在 replacement agent 或新 session 上延迟执行；
+- provider reload 必须先 suspend compact，再 settle turn、assemble、replace、resume；
+- CLI、TUI、daemon 对 Interrupted 只显示中断结果，不能输出成功 marker 或“无需压缩”；
+  TUI 同时清除 compacting 和由 compact 强制进入的 Streaming 状态。
+
+该修复只扩展 `atomcode-coding` 的 native compact terminal，不恢复 core
+`Compact/CompactionUi`，不新增 bridge compact handler，也不改变 kernel compaction command、
+capability strategy、`/context` 或其他 slash 命令协议。

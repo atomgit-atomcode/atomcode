@@ -963,6 +963,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CtxTokensSuffix => "tokens".into(),
         Msg::CompactNothingShort => "（无需压缩 — 当前对话较短）\n".into(),
         Msg::CompactStarting => "（正在使用 LLM 摘要进行压缩...）\n".into(),
+        Msg::CompactInterrupted => "（压缩已中断 — coding runtime 已变更或停止）\n".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>

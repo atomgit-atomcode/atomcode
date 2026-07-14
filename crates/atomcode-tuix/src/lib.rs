@@ -38,8 +38,6 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_coding::CodingRuntimeHandle;
-use atomcode_core::agent::AgentHandle;
 use atomcode_config::config::Config;
 use crossterm::{
     event::{
@@ -53,6 +51,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
+pub use crate::event_loop::bg_runtime::RuntimeEventPayload;
 pub use crate::event_loop::{RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime};
 use crate::input::history::History;
 use crate::input::reader;
@@ -283,8 +282,7 @@ pub fn panic_restore_terminal() {
 pub async fn run(
     config: Config,
     model_name: String,
-    agent_handle: AgentHandle,
-    runtime: CodingRuntimeHandle,
+    spawned_runtime: SpawnedRuntime,
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
@@ -295,6 +293,11 @@ pub async fn run(
     dangerously_skip_permissions: bool,
     is_admin: bool,
 ) -> Result<()> {
+    let SpawnedRuntime { endpoint, event_rx } = spawned_runtime;
+    let RuntimeEndpoint {
+        legacy: agent_client,
+        native: runtime,
+    } = endpoint;
     let mut caps = TerminalCaps::probe();
 
     // Decide force_plain BEFORE activating TerminalGuard. Plain mode
@@ -592,7 +595,6 @@ pub async fn run(
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
-    let agent_client = agent_handle.client.clone();
     let skill_registry = agent_client.skill_registry.clone();
 
     // ── Plugin marketplace bootstrap (detached) ──
@@ -642,7 +644,7 @@ pub async fn run(
         tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
     event_loop::bg_runtime::spawn_event_forwarder(
         foreground_runtime_id,
-        agent_handle.event_rx,
+        event_rx,
         runtime_event_tx.clone(),
     );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(

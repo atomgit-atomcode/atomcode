@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use atomcode_coding::runtime::{
-    coding_runtime_control_channel, CodingRuntimeControl, CodingRuntimeControlReceiver,
+    coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
+    CodingRuntimeControlReceiver, CodingRuntimeEvent, KernelRuntimeAdapter,
 };
 use atomcode_coding::{
     assemble, prepare_with_plugin_hooks, CodingAgentConfig, CodingRuntimeHandle, PrepareOptions,
@@ -98,28 +99,20 @@ pub struct BridgeConfig {
     pub loop_max_rounds: u32,
 }
 
-/// Spawn a new-stack agent presented through the LEGACY channel protocol.
-/// Returns immediately (like `AgentRuntimeFactory::spawn_runtime`); the engine
-/// prepares asynchronously and the command channel buffers anything sent meanwhile.
-pub fn spawn_bridged_runtime(
-    cfg: BridgeConfig,
-) -> (AgentClient, mpsc::UnboundedReceiver<CoreEv>) {
-    let runtime = spawn_bridged_runtime_with_control(cfg);
-    (runtime.client, runtime.event_rx)
-}
-
 /// A transitional bridge endpoint: legacy channels for commands/events that have
-/// not migrated yet, plus a stable native runtime control handle.
+/// not migrated yet, plus native runtime controls/events that bypass the bridge.
 pub struct BridgedRuntime {
     pub client: AgentClient,
     pub control: CodingRuntimeHandle,
     pub event_rx: mpsc::UnboundedReceiver<CoreEv>,
+    pub runtime_event_rx: mpsc::UnboundedReceiver<CodingRuntimeEvent>,
 }
 
 /// Spawn a bridged runtime and expose its stable native control plane.
 pub fn spawn_bridged_runtime_with_control(cfg: BridgeConfig) -> BridgedRuntime {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CoreCmd>();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<CoreEv>();
+    let (runtime_event_tx, runtime_event_rx) = mpsc::unbounded_channel();
     let (control, control_rx) = coding_runtime_control_channel();
 
     // The legacy client carries two shared registries the TUI reads for its slash
@@ -137,13 +130,14 @@ pub fn spawn_bridged_runtime_with_control(cfg: BridgeConfig) -> BridgedRuntime {
     };
 
     tokio::spawn(async move {
-        Bridge::run(cfg, cmd_rx, control_rx, ev_tx).await;
+        Bridge::run(cfg, cmd_rx, control_rx, ev_tx, runtime_event_tx).await;
     });
 
     BridgedRuntime {
         client,
         control,
         event_rx: ev_rx,
+        runtime_event_rx,
     }
 }
 
@@ -154,6 +148,7 @@ pub fn spawn_bridged_runtime_with_control(cfg: BridgeConfig) -> BridgedRuntime {
 /// returns) would otherwise hang `/quit` forever. On timeout we `abort()` the
 /// task and return regardless; a backstop TUI watchdog covers the (now far
 /// rarer) case where even this isn't enough.
+#[cfg(test)]
 async fn await_kernel_or_abort(task: &mut tokio::task::JoinHandle<()>, grace: Duration) {
     if tokio::time::timeout(grace, &mut *task).await.is_err() {
         task.abort();
@@ -197,7 +192,7 @@ struct Bridge {
     /// `prepare` (initial + respawns) so plugin hooks survive a model swap / reload.
     plugin_cc_hooks: Vec<atomcode_coding::cc_hooks::HookConfig>,
     parts: atomcode_coding::CodingParts,
-    handle: atomcode_kernel::agent::AgentHandle,
+    handle: KernelRuntimeAdapter,
     ev_tx: mpsc::UnboundedSender<CoreEv>,
     /// The new-stack session id the bridge persists under (gives SetMessages /
     /// ClearConversation respawns + recall; legacy drivers persist their own
@@ -298,8 +293,9 @@ impl Bridge {
     async fn run(
         cfg: BridgeConfig,
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
-        mut control_rx: CodingRuntimeControlReceiver,
+        control_rx: CodingRuntimeControlReceiver,
         ev_tx: mpsc::UnboundedSender<CoreEv>,
+        runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
     ) {
         let mut coding_cfg = CodingAgentConfig::new(
             &cfg.api_key,
@@ -389,7 +385,9 @@ impl Bridge {
                 // prepare() failed — we can't build a Bridge at all (no parts).
                 // Enter a keep-alive loop so the TUI doesn't exit, but the user
                 // must restart atomcode to recover.
-                Self::keep_alive_loop(ev_tx, cmd_rx, control_rx).await;
+                let handle =
+                    spawn_runtime_owner(noop_agent_handle(), control_rx, runtime_event_tx, false);
+                Self::keep_alive_loop(ev_tx, cmd_rx, handle).await;
                 return;
             }
         };
@@ -420,10 +418,10 @@ impl Bridge {
                         error: engine_init_error_message("assemble", &e),
                         snapshot: ConversationSnapshot::default(),
                     });
-                    (Self::noop_handle(), true)
+                    (noop_agent_handle(), true)
                 }
             },
-            None => (Self::noop_handle(), true),
+            None => (noop_agent_handle(), true),
         };
 
         let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
@@ -434,6 +432,7 @@ impl Bridge {
             .bypass_mode
             .store(cfg.dangerously_skip_permissions, std::sync::atomic::Ordering::Relaxed);
 
+        let handle = spawn_runtime_owner(handle, control_rx, runtime_event_tx, !degraded);
         let mut bridge = Bridge {
             coding_cfg,
             opts_template,
@@ -470,8 +469,6 @@ impl Bridge {
             loop_fire_rx,
         };
 
-        let mut legacy_open = true;
-        let mut control_open = true;
         loop {
             tokio::select! {
                 // Deterministic branch order: a loop wakeup/fire that's ready in the
@@ -479,18 +476,13 @@ impl Bridge {
                 // is set before the turn-end Snapshot reads it (else a self-paced loop
                 // could be misjudged as "completed"). cmd_rx stays first for Cancel.
                 biased;
-                cmd = cmd_rx.recv(), if legacy_open => match cmd {
+                cmd = cmd_rx.recv() => match cmd {
                     Some(c) => {
                         if bridge.on_command(c).await {
                             break;
                         }
                     }
-                    None => {
-                        legacy_open = false;
-                        if !control_open {
-                            break;
-                        }
-                    }
+                    None => break,
                 },
                 // Goal evaluations run on a spawned task and report here, so a
                 // Cancel arriving mid-eval is still processed (cmd_rx stays live).
@@ -509,15 +501,6 @@ impl Bridge {
                 Some(wake) = bridge.loop_fire_rx.recv() => {
                     bridge.on_loop_fire(wake);
                 }
-                control = control_rx.recv(), if control_open => match control {
-                    Some(control) => bridge.on_runtime_control(control),
-                    None => {
-                        control_open = false;
-                        if !legacy_open {
-                            break;
-                        }
-                    }
-                },
                 ev = bridge.handle.events.recv() => match ev {
                     Some(e) => bridge.on_kernel_event(e).await,
                     None => {
@@ -547,16 +530,11 @@ impl Bridge {
                 },
             }
         }
-        let _ = bridge.handle.commands.send(KCmd::Shutdown);
-        await_kernel_or_abort(&mut bridge.handle.task, Duration::from_secs(5)).await;
+        let _ = bridge.handle.shutdown().await;
     }
 
     fn emit(&self, ev: CoreEv) {
         let _ = self.ev_tx.send(ev);
-    }
-
-    fn on_runtime_control(&mut self, control: CodingRuntimeControl) {
-        forward_runtime_control(control, &self.handle.commands);
     }
 
     /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold
@@ -1021,18 +999,30 @@ impl Bridge {
             CoreCmd::ReloadConfig(config) => {
                 // Switch to the (possibly new) default provider, same parts —
                 // approval grants + conversation survive (C1 respawn semantics).
-                // FIRST settle any in-flight turn/approval so the kernel persists a
-                // clean snapshot before `assemble` below re-reads it — otherwise a
-                // turn cancelled by this swap leaves a dangling tool_use that the
-                // fresh agent re-triggers on the next prompt.
-                if self.turn_running || self.pending_approval.is_some() {
-                    self.settle_in_flight_turn().await;
-                } else if let Some(messages) = self.loop_pending_finish.take() {
-                    // A loop sleeping between rounds holds the turn open (turn_running=false);
-                    // finish it so the post-swap UI returns to Idle instead of stuck Streaming.
-                    self.finish_turn(StopReason::Cancelled, messages);
-                }
                 if let Some(p) = config.providers.get(&config.default_provider) {
+                    // Freeze native compact delivery before settling the current turn.
+                    // Otherwise `/compact` can enter the old kernel during the settle
+                    // window and lose its terminal when the provider handle is replaced.
+                    if self.handle.suspend_compaction().await.is_err() {
+                        self.emit(CoreEv::Error {
+                            error: "provider switch failed: coding runtime is unavailable".into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                        self.degraded = true;
+                        return false;
+                    }
+                    // Settle any in-flight turn/approval so the kernel persists a clean
+                    // snapshot before `assemble` below re-reads it — otherwise a turn
+                    // cancelled by this swap leaves a dangling tool_use that the fresh
+                    // agent re-triggers on the next prompt.
+                    if self.turn_running || self.pending_approval.is_some() {
+                        self.settle_in_flight_turn().await;
+                    } else if let Some(messages) = self.loop_pending_finish.take() {
+                        // A loop sleeping between rounds holds the turn open
+                        // (turn_running=false); finish it so the post-swap UI returns to
+                        // Idle instead of stuck Streaming.
+                        self.finish_turn(StopReason::Cancelled, messages);
+                    }
                     apply_reload_provider(&mut self.coding_cfg, p);
                     // Re-resolve the subagent tier cells against the NEW host model so
                     // strong/weak routing follows a `/model` swap (the cells are shared with
@@ -1046,14 +1036,17 @@ impl Bridge {
                             match assemble(&mut self.parts, &self.coding_cfg, provider) {
                                 Ok(a) => {
                                     let new_handle = a.spawn();
-                                    // Shut down old handle and swap.
-                                    let _ = self.handle.commands.send(KCmd::Shutdown);
-                                    let mut old_task = std::mem::replace(
-                                        &mut self.handle.task,
-                                        tokio::spawn(async {}),
-                                    );
-                                    await_kernel_or_abort(&mut old_task, Duration::from_secs(5)).await;
-                                    self.handle = new_handle;
+                                    if self.handle.replace_agent(new_handle).await.is_err()
+                                        || self.handle.resume_compaction().await.is_err()
+                                    {
+                                        self.emit(CoreEv::Error {
+                                            error: "provider switch failed: coding runtime is unavailable"
+                                                .into(),
+                                            snapshot: ConversationSnapshot::default(),
+                                        });
+                                        self.degraded = true;
+                                        return false;
+                                    }
                                     self.degraded = false;
                                     // Clear any stale state that may have accumulated
                                     // while the (possibly noop) old handle was active.
@@ -1073,6 +1066,7 @@ impl Bridge {
                                     self.loop_pending_finish = None;
                                 }
                                 Err(e) => {
+                                    let _ = self.handle.resume_compaction().await;
                                     self.emit(CoreEv::Error {
                                         error: format!("provider switch failed: {e}"),
                                         snapshot: ConversationSnapshot::default(),
@@ -1082,7 +1076,10 @@ impl Bridge {
                                 }
                             }
                         }
-                        Err(e) => self.emit(provider_init_event(&e)),
+                        Err(e) => {
+                            let _ = self.handle.resume_compaction().await;
+                            self.emit(provider_init_event(&e));
+                        }
                     }
                 }
             }
@@ -1378,6 +1375,14 @@ impl Bridge {
     }
 
     async fn respawn(&mut self, session: SessionMode) {
+        if self.handle.suspend_compaction().await.is_err() {
+            self.emit(CoreEv::Error {
+                error: "engine v2 respawn failed: coding runtime is unavailable".into(),
+                snapshot: ConversationSnapshot::default(),
+            });
+            self.degraded = true;
+            return;
+        }
         // If a turn (or an approval) was still live, tearing the kernel down would
         // drop its in-flight events and strand the driver in a busy/waiting phase.
         // Close the lifecycle FIRST so the driver returns to Idle.
@@ -1390,9 +1395,14 @@ impl Bridge {
             // post-respawn UI stays stuck in Streaming.
             self.finish_turn(StopReason::Cancelled, messages);
         }
-        let _ = self.handle.commands.send(KCmd::Shutdown);
-        let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
-        await_kernel_or_abort(&mut task, Duration::from_secs(5)).await;
+        if self.handle.stop_agent().await.is_err() {
+            self.emit(CoreEv::Error {
+                error: "engine v2 respawn failed: coding runtime is unavailable".into(),
+                snapshot: ConversationSnapshot::default(),
+            });
+            self.degraded = true;
+            return;
+        }
         let mut opts = self.opts_template.clone();
         // Whether this respawn starts a genuinely NEW conversation. `Fresh` =
         // /clear or /cd-into-new-project → a new session that should get an AI
@@ -1421,7 +1431,6 @@ impl Bridge {
                         error: format!("engine v2 respawn failed: {e}"),
                         snapshot: ConversationSnapshot::default(),
                     });
-                    self.handle = Self::noop_handle();
                     self.degraded = true;
                     return;
                 }
@@ -1441,7 +1450,6 @@ impl Bridge {
                             ),
                             snapshot: ConversationSnapshot::default(),
                         });
-                        self.handle = Self::noop_handle();
                         self.degraded = true;
                         // Stop any active loop on prepare failure too (parity with Ok).
                         self.loop_cancel.cancel();
@@ -1471,7 +1479,16 @@ impl Bridge {
             .and_then(|p| assemble(&mut parts, &self.coding_cfg, p).map_err(Into::into))
         {
             Ok(a) => {
-                self.handle = a.spawn();
+                if self.handle.replace_agent(a.spawn()).await.is_err()
+                    || self.handle.resume_compaction().await.is_err()
+                {
+                    self.emit(CoreEv::Error {
+                        error: "engine v2 respawn failed: coding runtime is unavailable".into(),
+                        snapshot: ConversationSnapshot::default(),
+                    });
+                    self.degraded = true;
+                    return;
+                }
                 self.bridge_session = parts
                     .session
                     .as_ref()
@@ -1501,9 +1518,6 @@ impl Bridge {
                     error: format!("engine v2 respawn failed: {e}"),
                     snapshot: ConversationSnapshot::default(),
                 });
-                // Must install a live handle so the bridge event loop's
-                // recv() never returns None and kills the process.
-                self.handle = Self::noop_handle();
                 self.degraded = true;
                 // Stop any active loop too (parity with the Ok branch): a respawn
                 // failure must not leave a pending continuation firing into a dead
@@ -1512,35 +1526,6 @@ impl Bridge {
                 self.loop_state = None;
                 self.pending_wakeup = None;
             }
-        }
-    }
-
-    /// Replace `self.handle` with a no-op handle that keeps the bridge event loop
-    /// alive (its events channel never closes). Used as a safety net when respawn
-    /// fails — the bridge stays running and can still process driver commands even
-    /// though the agent kernel is gone.
-    ///
-    /// The task listens for `Shutdown` on the kernel command channel (sent by
-    /// `respawn()` and the `run()` shutdown path) instead of blocking forever on
-    /// `std::future::pending()` — otherwise `task.await` hangs permanently and the
-    /// bridge can never exit cleanly.
-    fn noop_handle() -> atomcode_kernel::agent::AgentHandle {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<KCmd>();
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<KEv>();
-        atomcode_kernel::agent::AgentHandle {
-            commands: cmd_tx,
-            events: ev_rx,
-            // Hold ev_tx in the task so the receiver side stays open forever.
-            // Listen for Shutdown on cmd_rx so the task can be cleanly awaited.
-            task: tokio::spawn(async move {
-                let _keep_alive = ev_tx;
-                loop {
-                    match cmd_rx.recv().await {
-                        Some(KCmd::Shutdown) | None => break,
-                        _ => {} // drain: ignore all other kernel commands
-                    }
-                }
-            }),
         }
     }
 
@@ -1553,7 +1538,7 @@ impl Bridge {
     async fn keep_alive_loop(
         ev_tx: mpsc::UnboundedSender<CoreEv>,
         mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>,
-        mut control_rx: CodingRuntimeControlReceiver,
+        handle: KernelRuntimeAdapter,
     ) {
         // Clone ev_tx so we can still send error feedback from this loop while
         // holding the original open in the spawned task (keeps forwarder alive).
@@ -1562,18 +1547,10 @@ impl Bridge {
             let _hold = ev_tx;
             std::future::pending::<()>().await;
         });
-        let mut legacy_open = true;
-        let mut control_open = true;
         loop {
-            tokio::select! {
-                command = cmd_rx.recv(), if legacy_open => match command {
+            match cmd_rx.recv().await {
                     Some(CoreCmd::Shutdown) => break,
-                    None => {
-                        legacy_open = false;
-                        if !control_open {
-                            break;
-                        }
-                    }
+                    None => break,
                     Some(CoreCmd::ReloadConfig(_)) => {
                         // The TUI already rendered the switch confirmation
                         // optimistically; this error makes it clear a restart
@@ -1594,25 +1571,9 @@ impl Bridge {
                         });
                     }
                     _ => {} // drain: ignore all other commands
-                },
-                control = control_rx.recv(), if control_open => match control {
-                    Some(_) => {
-                        let _ = feedback_tx.send(CoreEv::Error {
-                            error: "engine v2 failed to initialise — runtime controls cannot be processed. \
-                                    Please quit and re-launch atomcode."
-                                .into(),
-                            snapshot: ConversationSnapshot::default(),
-                        });
-                    }
-                    None => {
-                        control_open = false;
-                        if !legacy_open {
-                            break;
-                        }
-                    }
-                },
             }
         }
+        let _ = handle.shutdown().await;
         _keep.abort();
     }
 
@@ -2043,50 +2004,6 @@ impl Bridge {
                 let error = friendly_provider_error(message, http_status, &self.coding_cfg.base_url);
                 self.emit(CoreEv::Error { error, snapshot: ConversationSnapshot::default() });
             }
-            // The kernel emits CompactionStarted ONLY for a slow one-shot LLM
-            // summary (manual `/compact`, overflow tier 2, or auto past the
-            // high-water mark). Unified: take over the spinner with a
-            // "Compacting…" label for BOTH auto and manual — the old split
-            // (manual=TextDelta, auto=Warning) is gone. The 70% stub tier does
-            // NOT emit CompactionStarted, so it never spins (it's instantaneous).
-            KEv::CompactionStarted { .. } => {
-                self.emit(CoreEv::CompactionUi(atomcode_core::agent::CompactionUiKind::Begin));
-            }
-            KEv::Compacted { committed, trigger, removed, bytes_before, bytes_after, .. } => {
-                use atomcode_core::agent::CompactionUiKind;
-                // The kernel measures BYTES; token figures derive from the last
-                // provider usage. Capture it BEFORE mutating `last_usage` below.
-                let before_tokens =
-                    self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
-                if committed {
-                    // Unified marker for auto + manual. Drain (removed>0) shows
-                    // before→after; stub fold (removed==0) shows tokens saved.
-                    let label =
-                        compaction_mark_label(removed, bytes_before, bytes_after, before_tokens);
-                    self.emit(CoreEv::CompactionUi(CompactionUiKind::Mark(label)));
-                    // Refresh the cached context size so footer / `/context`
-                    // reflect the shrink IMMEDIATELY (kernel tracks bytes only;
-                    // estimate post-shrink tokens from the byte ratio — the next
-                    // real turn overwrites it with the exact count).
-                    if let Some(meta) = self.last_usage.as_mut() {
-                        meta.used_tokens =
-                            estimate_after_tokens(before_tokens, bytes_before, bytes_after) as u32;
-                    }
-                    self.emit_context_stats();
-                } else {
-                    // No-op / refused: release the spinner, draw no marker. A
-                    // manual /compact also gets an inline "nothing to compact"
-                    // note; the auto path stays silent (nothing to acknowledge).
-                    self.emit(CoreEv::CompactionUi(CompactionUiKind::End));
-                    if matches!(trigger, atomcode_kernel::message::CompactTrigger::Manual { .. }) {
-                        self.emit(CoreEv::TextDelta(manual_noop_result(
-                            bytes_before,
-                            bytes_after,
-                            before_tokens,
-                        )));
-                    }
-                }
-            }
             KEv::TurnComplete { reason } => {
                 self.turn_running = false;
                 self.pending_approval = None;
@@ -2098,44 +2015,6 @@ impl Bridge {
             }
             _ => {}
         }
-    }
-}
-
-fn forward_runtime_control(
-    control: CodingRuntimeControl,
-    commands: &mpsc::UnboundedSender<KCmd>,
-) {
-    match control {
-        CodingRuntimeControl::Kernel(command) => {
-            let _ = commands.send(command);
-        }
-    }
-}
-
-#[cfg(test)]
-mod runtime_control_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn stable_handle_forwards_to_the_current_kernel_sender() {
-        let (handle, mut controls) = coding_runtime_control_channel();
-        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
-        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
-
-        handle.compact(Some("before respawn".into())).unwrap();
-        forward_runtime_control(controls.recv().await.unwrap(), &old_tx);
-
-        handle.compact(Some("after respawn".into())).unwrap();
-        forward_runtime_control(controls.recv().await.unwrap(), &new_tx);
-
-        assert!(matches!(
-            old_rx.recv().await,
-            Some(KCmd::Compact { focus: Some(focus) }) if focus == "before respawn"
-        ));
-        assert!(matches!(
-            new_rx.recv().await,
-            Some(KCmd::Compact { focus: Some(focus) }) if focus == "after respawn"
-        ));
     }
 }
 
@@ -2790,72 +2669,6 @@ fn friendly_provider_error(message: String, http_status: Option<u16>, base_url: 
     message
 }
 
-/// Localized completion marker for a COMMITTED compaction, unified across auto
-/// + manual. A drain (`removed > 0`) reports the messages summarized and the
-/// token before→after; an in-place stub fold (`removed == 0`) reports the
-/// tokens saved. Token figures are byte-ratio ESTIMATES (`estimate_after_tokens`),
-/// flagged with `~` in the i18n copy; `removed` is exact. `before_tokens` is the
-/// last real provider usage; falls back to bytes/4 if none has been reported.
-fn compaction_mark_label(
-    removed: usize,
-    bytes_before: usize,
-    bytes_after: usize,
-    before_tokens: usize,
-) -> String {
-    use atomcode_config::i18n::{t, Msg};
-    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
-    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
-    if removed > 0 {
-        let before = fmt_k_tokens(before_tokens);
-        let after = fmt_k_tokens(after_tokens);
-        t(Msg::CompactMarkDrain { messages: removed, before: &before, after: &after }).into_owned()
-    } else {
-        let saved = fmt_k_tokens(before_tokens.saturating_sub(after_tokens));
-        t(Msg::CompactMarkStub { saved: &saved }).into_owned()
-    }
-}
-
-/// Inline note for a manual `/compact` that did NOT commit (nothing to drop):
-/// "(nothing to compact — conversation is short)" for a true no-op, or
-/// "(… would not save tokens: X → Y)" when a summary was built but didn't
-/// shrink. The auto path stays silent on a no-op (no user action to ack).
-fn manual_noop_result(bytes_before: usize, bytes_after: usize, before_tokens: usize) -> String {
-    use atomcode_config::i18n::{t, Msg};
-    let before_tokens = if before_tokens > 0 { before_tokens } else { bytes_before / 4 };
-    let after_tokens = estimate_after_tokens(before_tokens, bytes_before, bytes_after);
-    let before = fmt_k_tokens(before_tokens);
-    let after = fmt_k_tokens(after_tokens);
-    if bytes_after > bytes_before {
-        t(Msg::CompactNothingNoSavings { before: &before, after: &after }).into_owned()
-    } else {
-        t(Msg::CompactNothingShort).into_owned()
-    }
-}
-
-/// Estimate the post-compaction token count by scaling the pre-compaction count by
-/// the kernel's byte-reduction ratio. The kernel measures conversation BYTES, not
-/// tokens; `before_tokens` (the real provider count) also covers the fixed
-/// system + tools prefix, so this slightly UNDER-states a compaction that left a
-/// large prefix. v1 estimates too (via `build_messages`); this tracks its numbers
-/// closely and is honest about being an estimate. `bytes_before == 0` ⇒ unchanged.
-fn estimate_after_tokens(before_tokens: usize, bytes_before: usize, bytes_after: usize) -> usize {
-    if bytes_before > 0 {
-        ((before_tokens as u128 * bytes_after as u128) / bytes_before as u128) as usize
-    } else {
-        before_tokens
-    }
-}
-
-/// Port of core's (private) `fmt_k_tokens`: `1234` → `"1.2K"`, `< 1000` → verbatim.
-/// Kept local to the bridge so the manual-compact line matches v1's formatting.
-fn fmt_k_tokens(t: usize) -> String {
-    if t >= 1000 {
-        format!("{:.1}K", t as f64 / 1000.0)
-    } else {
-        t.to_string()
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -2974,9 +2787,8 @@ mod goal_summary_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::{
-        apply_reload_provider, build_provider, compaction_mark_label, compute_undo,
-        default_max_tokens, estimate_after_tokens, fmt_k_tokens, friendly_provider_error,
-        manual_noop_result,
+        apply_reload_provider, build_provider, compute_undo, default_max_tokens,
+        friendly_provider_error,
     };
     use atomcode_config::config::provider::ProviderConfig;
     use atomcode_coding::CodingAgentConfig;
@@ -3015,64 +2827,6 @@ mod undo_tests {
         let raw = "HTTP 500: upstream overloaded".to_string();
         let out = friendly_provider_error(raw.clone(), Some(500), "https://api-ai.gitcode.com/v1");
         assert_eq!(out, raw);
-    }
-
-    #[test]
-    fn compaction_mark_label_drain_reports_messages_and_token_reduction() {
-        // 129 messages summarized; pre = 42.9K tokens; bytes 170k→44k ⇒ after ≈ 11.1K.
-        let label = compaction_mark_label(129, 170_000, 44_000, 42_900);
-        assert!(label.contains("129"), "count: {label}");
-        assert!(label.contains("42.9K") && label.contains("11.1K"), "figures: {label}");
-        assert!(label.contains('→'), "drain shows before→after arrow: {label}");
-        assert!(label.contains('~'), "estimate marker: {label}");
-    }
-
-    #[test]
-    fn compaction_mark_label_stub_reports_saved_no_arrow() {
-        // removed == 0 ⇒ stub fold. pre = 42.9K; bytes 170k→136k ⇒ after ≈ 34.3K, saved ≈ 8.6K.
-        let label = compaction_mark_label(0, 170_000, 136_000, 42_900);
-        assert!(!label.contains('→'), "stub shows saved delta, not before→after: {label}");
-        assert!(label.contains('~'), "estimate marker: {label}");
-        assert!(label.contains("8.6K"), "saved figure: {label}");
-    }
-
-    #[test]
-    fn compaction_mark_label_falls_back_to_byte_estimate_without_usage() {
-        // No provider usage yet (before_tokens = 0): fall back to bytes/4 rather
-        // than showing "0 → 0". 40_000 bytes → ~10K before; halved bytes → ~5K after.
-        let label = compaction_mark_label(3, 40_000, 20_000, 0);
-        assert!(label.contains("10.0K"), "byte-fallback before figure: {label}");
-        assert!(label.contains("5.0K"), "byte-fallback after figure: {label}");
-    }
-
-    #[test]
-    fn manual_noop_short_has_no_arrow() {
-        // True no-op (byte-identical candidate) → "conversation is short", no arrow.
-        assert!(!manual_noop_result(8_000, 8_000, 6_000).contains('→'));
-    }
-
-    #[test]
-    fn manual_noop_net_loss_reports_no_savings_with_arrow() {
-        // Refused because the candidate GREW (bytes_after > bytes_before).
-        let line = manual_noop_result(10_000, 15_000, 5_000);
-        assert!(line.contains('→'), "net-loss shows a token comparison: {line}");
-        assert!(line.contains("5.0K") && line.contains("7.5K"), "figures: {line}");
-    }
-
-    #[test]
-    fn estimate_after_tokens_scales_by_byte_ratio() {
-        // 42.9K tokens, conversation bytes 170K → 44K → ~11.1K (the screenshot's case).
-        assert_eq!(estimate_after_tokens(42_900, 170_000, 44_000), 11_103);
-        // Degenerate bytes_before == 0 leaves the count unchanged (no divide-by-zero).
-        assert_eq!(estimate_after_tokens(5_000, 0, 0), 5_000);
-    }
-
-    #[test]
-    fn fmt_k_tokens_matches_core_format() {
-        assert_eq!(fmt_k_tokens(0), "0");
-        assert_eq!(fmt_k_tokens(999), "999");
-        assert_eq!(fmt_k_tokens(1000), "1.0K");
-        assert_eq!(fmt_k_tokens(42_900), "42.9K");
     }
 
     fn coding_cfg(reasoning_history: Option<&str>) -> CodingAgentConfig {

@@ -1,6 +1,9 @@
 use atomcode_core::agent::AgentEvent;
 #[cfg(test)]
 use atomcode_core::agent::AgentClient;
+use atomcode_coding::runtime::CodingRuntimeEvent;
+#[cfg(test)]
+use atomcode_coding::runtime::CompactionCompletion;
 use atomcode_config::i18n::{t, Msg};
 use atomcode_core::session::{Session, SessionManager};
 
@@ -19,12 +22,18 @@ impl RuntimeId {
 
 pub struct RuntimeEvent {
     pub runtime_id: RuntimeId,
-    pub event: AgentEvent,
+    pub event: RuntimeEventPayload,
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeEventPayload {
+    Legacy(AgentEvent),
+    Native(CodingRuntimeEvent),
 }
 
 pub fn spawn_event_forwarder(
     runtime_id: RuntimeId,
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEventPayload>,
     fan_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
 ) {
     tokio::spawn(async move {
@@ -390,13 +399,28 @@ impl BgRuntimeManager {
     pub fn apply_background_event(
         &mut self,
         runtime_id: RuntimeId,
-        event: AgentEvent,
+        event: RuntimeEventPayload,
         session_manager: &SessionManager,
     ) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
             return;
         };
-        let terminal = self.backgrounds.apply_event_to_slot(slot, &event);
+        let terminal = match event {
+            RuntimeEventPayload::Legacy(event) => {
+                self.backgrounds.apply_event_to_slot(slot, &event)
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished { completion })
+                if completion.is_manual() =>
+            {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    if matches!(bg.state, RuntimeState::Running) {
+                        bg.state = RuntimeState::Idle;
+                    }
+                }
+                false
+            }
+            RuntimeEventPayload::Native(_) => false,
+        };
         if terminal {
             if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
                 let _ = session_manager.save(&bg.session);
@@ -717,7 +741,6 @@ mod tests {
         use atomcode_coding::runtime::{
             coding_runtime_control_channel, CodingRuntimeControl,
         };
-        use atomcode_kernel::event::AgentCommand as KernelCommand;
 
         let (first_native, mut first_controls) = coding_runtime_control_channel();
         let first_endpoint = RuntimeEndpoint {
@@ -753,9 +776,8 @@ mod tests {
 
         assert!(matches!(
             first_controls.recv().await,
-            Some(CodingRuntimeControl::Kernel(KernelCommand::Compact {
-                focus: Some(focus)
-            })) if focus == "first runtime"
+            Some(CodingRuntimeControl::Compact { focus: Some(focus), .. })
+                if focus == "first runtime"
         ));
     }
 
@@ -787,11 +809,102 @@ mod tests {
 
         spawn_event_forwarder(runtime_id, agent_rx, fan_tx);
         agent_tx
-            .send(AgentEvent::TextDelta("hello".to_string()))
+            .send(RuntimeEventPayload::Legacy(AgentEvent::TextDelta(
+                "hello".to_string(),
+            )))
             .unwrap();
 
         let event = fan_rx.recv().await.unwrap();
         assert_eq!(event.runtime_id, runtime_id);
-        assert!(matches!(event.event, AgentEvent::TextDelta(text) if text == "hello"));
+        assert!(matches!(
+            event.event,
+            RuntimeEventPayload::Legacy(AgentEvent::TextDelta(text)) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_finish_releases_background_runtime() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 0,
+                    bytes_before: 0,
+                    bytes_after: 0,
+                    committed: false,
+                    estimated_tokens_before: 0,
+                    estimated_tokens_after: 0,
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+    }
+
+    #[test]
+    fn manual_compaction_interruption_releases_background_runtime() {
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                },
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+    }
+
+    #[test]
+    fn late_compaction_finish_does_not_downgrade_terminal_background_state() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("completed"), RuntimeState::Done)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 2,
+                    bytes_before: 100,
+                    bytes_after: 50,
+                    committed: true,
+                    estimated_tokens_before: 25,
+                    estimated_tokens_after: 12,
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Done);
     }
 }

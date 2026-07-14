@@ -978,6 +978,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CtxTokensSuffix => "tokens".into(),
         Msg::CompactNothingShort => "(nothing to compact — conversation is short)\n".into(),
         Msg::CompactStarting => "(compacting with LLM summary...)\n".into(),
+        Msg::CompactInterrupted =>
+            "(compaction interrupted — the coding runtime changed or stopped)\n".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("(nothing to compact — would not save tokens: {} → {})\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } => {

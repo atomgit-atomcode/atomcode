@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
 use atomcode_config::config::Config;
@@ -717,10 +718,10 @@ pub struct RuntimeEndpoint {
     pub native: CodingRuntimeHandle,
 }
 
-/// A newly spawned runtime endpoint and its single-consumer legacy event stream.
+/// A newly spawned runtime endpoint and its single-consumer ordered event stream.
 pub struct SpawnedRuntime {
     pub endpoint: RuntimeEndpoint,
-    pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    pub event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEventPayload>,
 }
 
 /// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
@@ -4633,7 +4634,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -5100,7 +5101,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -8886,6 +8887,269 @@ mod ctrl_o_hint_gating_tests {
     }
 }
 
+fn handle_runtime_event(
+    event: bg_runtime::RuntimeEventPayload,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+    pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
+    ctx: &mut LoopCtx,
+    setup_pending: &mut bool,
+    reasoning_buffer: &mut String,
+    buf: &mut Buffer,
+) {
+    match event {
+        bg_runtime::RuntimeEventPayload::Legacy(event) => handle_agent_event(
+            event,
+            state,
+            think,
+            renderer,
+            pending_tools,
+            ctx,
+            setup_pending,
+            reasoning_buffer,
+            buf,
+        ),
+        bg_runtime::RuntimeEventPayload::Native(event) => {
+            handle_coding_runtime_event(event, state, think, renderer);
+        }
+    }
+}
+
+fn handle_coding_runtime_event(
+    event: CodingRuntimeEvent,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+) {
+    state.note_stream_activity();
+
+    match event {
+        CodingRuntimeEvent::CompactionStarted { .. } => {
+            state.compacting = true;
+            if !matches!(state.phase, UiPhase::Streaming) {
+                state.compaction_forced_streaming = true;
+                state.phase = UiPhase::Streaming;
+                state.phase_started_at = Some(std::time::Instant::now());
+            }
+        }
+        CodingRuntimeEvent::CompactionFinished { completion } => {
+            state.compacting = false;
+            match completion {
+                CompactionCompletion::Completed(outcome) if outcome.committed => {
+                    state.on_compaction_committed(outcome.estimated_tokens_after);
+                    renderer.render(UiLine::CompactionMark(
+                        atomcode_config::i18n::format_compaction_mark(
+                            outcome.removed_messages,
+                            outcome.estimated_tokens_before,
+                            outcome.estimated_tokens_after,
+                        ),
+                    ));
+                    renderer.flush();
+                }
+                CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
+                    render_assistant_text(
+                        atomcode_config::i18n::format_compaction_noop(
+                            outcome.estimated_tokens_before,
+                            outcome.estimated_tokens_after,
+                            outcome.summary_would_grow(),
+                        ),
+                        state,
+                        think,
+                        renderer,
+                    );
+                }
+                CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { .. },
+                    ..
+                } => {
+                    render_assistant_text(
+                        atomcode_config::i18n::format_compaction_interrupted(),
+                        state,
+                        think,
+                        renderer,
+                    );
+                }
+                CompactionCompletion::Completed(_)
+                | CompactionCompletion::Interrupted { .. } => {}
+            }
+
+            if state.compaction_forced_streaming {
+                state.compaction_forced_streaming = false;
+                state.phase = UiPhase::Idle;
+                state.spinner_label.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_assistant_text(
+    text: String,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+) {
+    let visible = think.feed(&text);
+    if visible.is_empty() {
+        return;
+    }
+
+    state.turn_rendered_visible_text = true;
+    if state.response_finalized {
+        state.last_assistant_response.clear();
+        state.response_finalized = false;
+    }
+    state.last_assistant_response.push_str(&visible);
+    renderer.render(UiLine::AssistantText(visible));
+    renderer.flush();
+}
+
+#[cfg(test)]
+mod coding_runtime_event_tests {
+    use super::*;
+    use atomcode_coding::runtime::CompactionOutcome;
+    use atomcode_kernel::message::CompactTrigger;
+
+    fn outcome(trigger: CompactTrigger, committed: bool) -> CompactionOutcome {
+        CompactionOutcome {
+            trigger,
+            epoch: 1,
+            removed_messages: 3,
+            bytes_before: 40_000,
+            bytes_after: 10_000,
+            committed,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 2_500,
+        }
+    }
+
+    #[test]
+    fn manual_compaction_drives_spinner_then_committed_marker() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+            assert!(state.compacting);
+            assert!(state.compaction_forced_streaming);
+            assert!(matches!(state.phase, UiPhase::Streaming));
+
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(!state.compaction_forced_streaming);
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn interrupted_manual_compaction_clears_spinner_and_restores_idle() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Interrupted {
+                        trigger: CompactTrigger::Manual { focus: None },
+                        reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                    },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(!state.compaction_forced_streaming);
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn automatic_noop_is_silent_and_keeps_streaming() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Auto { utilization: 0.8 },
+                        false,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn manual_noop_renders_acknowledgement_and_restores_idle() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        state.compacting = true;
+        state.compaction_forced_streaming = true;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        false,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(state.turn_rendered_visible_text);
+        assert!(!output.is_empty());
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -8938,22 +9202,7 @@ fn handle_agent_event(
 
     match ev {
         AgentEvent::TextDelta(text) => {
-            let visible = think.feed(&text);
-            if !visible.is_empty() {
-                // Mark that this turn produced a real visible answer, so the
-                // TurnComplete handler does not surface a "blank turn" notice.
-                state.turn_rendered_visible_text = true;
-                // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
-                // the first delta of a new turn wipes the sealed prior reply,
-                // so between turns the buffer still holds the last reply.
-                if state.response_finalized {
-                    state.last_assistant_response.clear();
-                    state.response_finalized = false;
-                }
-                state.last_assistant_response.push_str(&visible);
-                renderer.render(UiLine::AssistantText(visible));
-                renderer.flush();
-            }
+            render_assistant_text(text, state, think, renderer);
         }
         AgentEvent::ReasoningDelta(text) => {
             // Record that reasoning was produced this turn REGARDLESS of
@@ -9742,40 +9991,6 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
-        AgentEvent::CompactionUi(kind) => match kind {
-            atomcode_core::agent::CompactionUiKind::Begin => {
-                state.compacting = true;
-                // A standalone manual `/compact` runs from Idle (its command
-                // handler does NOT call on_submit), so the spinner wouldn't
-                // animate. Force Streaming so "Compacting…" shows, and record
-                // it so completion restores Idle. An auto-compaction is already
-                // mid-turn (Streaming) — leave its phase to the turn lifecycle.
-                if !matches!(state.phase, UiPhase::Streaming) {
-                    state.compaction_forced_streaming = true;
-                    state.phase = UiPhase::Streaming;
-                    state.phase_started_at = Some(std::time::Instant::now());
-                }
-                state.note_stream_activity();
-            }
-            atomcode_core::agent::CompactionUiKind::End => {
-                state.compacting = false;
-                if state.compaction_forced_streaming {
-                    state.compaction_forced_streaming = false;
-                    state.phase = UiPhase::Idle;
-                    state.spinner_label.clear();
-                }
-            }
-            atomcode_core::agent::CompactionUiKind::Mark(label) => {
-                state.compacting = false;
-                renderer.render(UiLine::CompactionMark(label));
-                renderer.flush();
-                if state.compaction_forced_streaming {
-                    state.compaction_forced_streaming = false;
-                    state.phase = UiPhase::Idle;
-                    state.spinner_label.clear();
-                }
-            }
-        },
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -9838,6 +10053,7 @@ fn handle_agent_event(
             // pending state on its own.
         }
         AgentEvent::TokenUsage(u) => {
+            state.on_token_usage();
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
