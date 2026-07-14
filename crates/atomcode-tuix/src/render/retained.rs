@@ -2721,9 +2721,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // IS generated, yet the physical glyph remnant survives on iTerm2.
         // Sentinel prev forces every column through the diff, blanks included.
         self.screen.invalidate_rows_from(menu_top);
+        let is_plugin_mgr = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
         for (i, r) in menu_cells.into_iter().enumerate() {
             let mut padded = r;
-            Self::pad_row_to_width(&mut padded, w, pad_style.clone());
+            let current_pad_style = if is_plugin_mgr && i == 0 {
+                let bg_color = role(self.caps, Role::PanelBg);
+                for cell in &mut padded {
+                    cell.style.bg = bg_color;
+                }
+                CellStyle {
+                    bg: bg_color,
+                    ..CellStyle::default()
+                }
+            } else {
+                pad_style.clone()
+            };
+            Self::pad_row_to_width(&mut padded, w, current_pad_style);
             self.screen.draw_row(menu_top + i, 0, &padded);
         }
         // Stack below the input box: `· menu / goal|loop / status ·`
