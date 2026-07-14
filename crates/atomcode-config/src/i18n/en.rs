@@ -324,9 +324,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
         Msg::ApprovalHeader { tool, detail } => {
             if detail.is_empty() {
-                tool.to_string().into()
+                format!("Allow {tool}?").into()
             } else {
-                format!("{tool}({detail})").into()
+                format!("Allow {tool}({detail})?").into()
             }
         }
         Msg::ToolDenied => "denied".into(),

@@ -312,9 +312,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
         Msg::ApprovalHeader { tool, detail } => {
             if detail.is_empty() {
-                tool.to_string().into()
+                format!("允许 {tool}？").into()
             } else {
-                format!("{tool}({detail})").into()
+                format!("允许 {tool}（{detail}）？").into()
             }
         }
         Msg::ToolDenied => "已拒绝".into(),

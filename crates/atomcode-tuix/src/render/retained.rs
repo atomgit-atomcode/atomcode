@@ -1995,7 +1995,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        panel.options.len() + 1
+        // 1 header row ("Allow Tool(detail)?") + N option rows + 1 hint row.
+        panel.options.len() + 2
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -2016,6 +2017,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ) -> Vec<Vec<Cell>> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
+
+        // Header row: name what is being approved. The `▸ Tool(detail)` scrollback row
+        // can scroll off / be separated by the todo panel, so restate it here. The DETAIL
+        // is truncated (not the whole line) so the "Allow Tool(…)?" frame — tool name +
+        // closing ")?" — stays visible; a final width-truncate is the hard one-line backstop.
+        {
+            let tool_w = crate::width::display_width(&panel.tool);
+            // Reserve for the localized frame ("Allow " + "(" + ")?") + the 2-col indent.
+            let detail_budget = rule_width.saturating_sub(tool_w + 12);
+            let detail = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.detail), detail_budget);
+            let raw = crate::i18n::t(crate::i18n::Msg::ApprovalHeader { tool: &panel.tool, detail: &detail });
+            let header = crate::glyph::downgrade_glyphs(&raw, unicode);
+            let header_trunc = crate::width::truncate_with_ellipsis(&header, rule_width.saturating_sub(2));
+            let style = CellStyle { bold: true, ..CellStyle::default() };
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &header_trunc, &style);
+            out.push(row);
+        }
 
         // option rows: `<marker><n>. <label>` (selected: ▸ + reverse padded to screen_width)
         for (i, label) in panel.options.iter().enumerate() {
@@ -10753,7 +10773,7 @@ mod tests {
     /// selected row (`selected=0`) spans the full terminal width with reverse
     /// highlight, and a hint row appears after the last option.
     ///
-    /// `approval_panel_row_count` must equal `options.len() + 1` (hint row).
+    /// `approval_panel_row_count` must equal `options.len() + 2` (header + hint rows).
     #[test]
     fn approval_panel_numbered_prefixes_fullwidth_hint() {
         const W: u16 = 80;
@@ -10800,11 +10820,17 @@ mod tests {
         let hint_present = vterm.any_row(|r| r.contains("select") || r.contains("选择") || r.contains("Enter"));
         assert!(hint_present, "hint row with keyboard hint text not found\n{dump}");
 
-        // 4. approval_panel_row_count == options.len() + 1.
+        // 4. Header row names what is being approved.
+        assert!(
+            vterm.any_row(|r| r.contains("Allow Bash(echo hi)")),
+            "approval header 'Allow Bash(echo hi)?' not found\n{dump}"
+        );
+
+        // 5. approval_panel_row_count == 1 header + options + 1 hint.
         assert_eq!(
             r.approval_panel_row_count(&panel),
-            panel.options.len() + 1,
-            "row count must be options.len()+1"
+            panel.options.len() + 2,
+            "row count must be header + options + hint"
         );
     }
 
