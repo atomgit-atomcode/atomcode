@@ -2640,17 +2640,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let rules_top = footer_top + todo_rows;
 
         if hide_input_box {
-            let mut brand_rule = Vec::with_capacity(rule_width);
-            let brand_style = self.style_for(Role::Brand);
+            let mut border_rule = Vec::with_capacity(rule_width);
+            let border_style = self.style_for(Role::Border);
             for _ in 0..rule_width {
-                brand_rule.push(Cell {
+                border_rule.push(Cell {
                     ch: '─',
-                    style: brand_style.clone(),
+                    style: border_style.clone(),
                     width: 1,
                 });
             }
-            Self::pad_row_to_width(&mut brand_rule, w, CellStyle::default());
-            self.screen.draw_row(rules_top, 0, &brand_rule);
+            Self::pad_row_to_width(&mut border_rule, w, CellStyle::default());
+            self.screen.draw_row(rules_top, 0, &border_rule);
         } else {
             let mut top_rule = top_rule;
             Self::pad_row_to_width(&mut top_rule, w, CellStyle::default());
