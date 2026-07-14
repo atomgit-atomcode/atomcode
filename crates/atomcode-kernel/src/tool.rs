@@ -185,6 +185,16 @@ pub trait Tool: Send + Sync {
     fn read_only_hint(&self) -> bool {
         false
     }
+    /// Whether this tool may run CONCURRENTLY with other tools in the same
+    /// assistant message. A `parallel_safe` tool has no side effects, so running
+    /// it alongside others cannot interleave-corrupt state. Defaults to
+    /// `read_only_hint()` — the single "no side effects" property (also read by
+    /// plan mode) — so a tool becomes parallel-safe exactly when it is read-only.
+    /// A tool with side effects (bash/edit/write/change_dir) leaves this `false`
+    /// and is serialized behind a write-lock by the executor.
+    fn parallel_safe(&self) -> bool {
+        self.read_only_hint()
+    }
     /// The scope under which an "always" approval grant ("总是 / Always") is
     /// remembered for THIS call. Two calls that yield the SAME scope string share a
     /// single grant — approving "always" on one auto-approves the other for the
@@ -253,6 +263,33 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    #[test]
+    fn parallel_safe_defaults_to_read_only_hint() {
+        struct Plain;
+        #[async_trait::async_trait]
+        impl Tool for Plain {
+            fn name(&self) -> &str { "plain" }
+            fn description(&self) -> &str { "" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+            }
+        }
+        struct RO;
+        #[async_trait::async_trait]
+        impl Tool for RO {
+            fn name(&self) -> &str { "ro" }
+            fn description(&self) -> &str { "" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn read_only_hint(&self) -> bool { true }
+            async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+            }
+        }
+        assert!(!Plain.parallel_safe(), "default (no read_only_hint) is NOT parallel-safe");
+        assert!(RO.parallel_safe(), "a read-only tool IS parallel-safe");
+    }
 
     struct Dummy(&'static str, RiskLevel);
 
