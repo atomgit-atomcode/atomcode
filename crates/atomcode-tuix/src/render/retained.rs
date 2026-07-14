@@ -1623,7 +1623,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let is_add_marketplace = name == "+ Add Marketplace";
         if is_add_marketplace {
             if selected {
-                style = self.style_bold(Role::Brand);
+                style = self.style_bold(Role::Border);
             } else {
                 style = self.style_for(Role::Secondary);
             }
@@ -1643,9 +1643,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             style = self.style_for(Role::Muted);
         }
         if selected && content.starts_with("▸ ") && is_plugin_mgr {
-            let mut brand_style = style.clone();
-            brand_style.fg = self.style_for(Role::Brand).fg;
-            push_str_cells_sgr(&mut row, "▸ ", brand_style);
+            let mut border_style = style.clone();
+            border_style.fg = self.style_for(Role::Border).fg;
+            push_str_cells_sgr(&mut row, "▸ ", border_style);
             push_str_cells_sgr(&mut row, &content[4..], style.clone());
         } else {
             push_str_cells_sgr(&mut row, &content, style.clone());
@@ -1726,8 +1726,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let mut row1 = Vec::new();
         if selected {
-            let brand_style = self.style_for(Role::Brand);
-            push_str_cells_sgr(&mut row1, "▸ ", brand_style);
+            let border_style = self.style_for(Role::Border);
+            push_str_cells_sgr(&mut row1, "▸ ", border_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -1822,9 +1822,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         let mut row1 = Vec::new();
         if selected {
-            let brand_style = self.style_for(Role::Brand);
-            push_str_cells_sgr(&mut row1, "▸ ", brand_style.clone());
-            push_str_cells_sgr(&mut row1, "● ", brand_style);
+            let border_style = self.style_for(Role::Border);
+            push_str_cells_sgr(&mut row1, "▸ ", border_style.clone());
+            push_str_cells_sgr(&mut row1, "● ", border_style);
         } else {
             push_str_cells_sgr(&mut row1, bullet, bullet_style);
         }
