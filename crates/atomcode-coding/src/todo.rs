@@ -40,6 +40,17 @@ fn completion_nudge_already_present(convo: &Conversation) -> bool {
     })
 }
 
+/// True iff the model actively MANAGED the task list this turn (a `todo`/`todowrite` call after
+/// the last real-user message). We only nudge when it did — so a stop where the model is asking
+/// the user something unrelated to a STALE list from an earlier turn isn't hijacked into a
+/// continuation. Mirrors `VerifyCadenceHook`'s narrow "only right after an edit" scoping.
+fn managed_todos_this_turn(convo: &Conversation) -> bool {
+    let start = current_real_user_start(convo);
+    convo.messages[start..]
+        .iter()
+        .any(|m| m.tool_calls.iter().any(|c| c.name == "todo" || c.name == "todowrite"))
+}
+
 #[async_trait]
 impl LifecycleHooks for TodoHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
@@ -68,7 +79,7 @@ impl LifecycleHooks for TodoHook {
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
         let todos = derive_current_todos(&convo.messages);
         let has_open = todos.iter().any(|t| t.status != TodoStatus::Completed);
-        if !has_open || completion_nudge_already_present(convo) {
+        if !has_open || !managed_todos_this_turn(convo) || completion_nudge_already_present(convo) {
             return None;
         }
         Some(TODO_COMPLETION_NUDGE.to_string())
@@ -142,6 +153,23 @@ mod tests {
     async fn no_nudge_when_no_todos() {
         let convo = convo_of(vec![Message::user("hi"), Message::assistant("hi there", vec![])]);
         assert!(TodoHook.offer_continuation(&convo).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_nudge_when_list_untouched_this_turn() {
+        // An open item lingers from a PRIOR turn, but this turn the model only answered a
+        // question (no todo/todowrite call) → don't hijack the stop into a continuation.
+        let convo = convo_of(vec![
+            Message::user("plan it"),
+            todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
+            Message::assistant("planned", vec![]),
+            Message::user("what does foo do?"),
+            Message::assistant("foo does X.", vec![]),
+        ]);
+        assert!(
+            TodoHook.offer_continuation(&convo).await.is_none(),
+            "a stale open list not touched this turn must not force a continuation"
+        );
     }
 
     #[tokio::test]

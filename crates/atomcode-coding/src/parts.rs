@@ -393,6 +393,18 @@ pub async fn prepare_with_plugin_hooks(
     // StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Todo hook (bridge/daemon path — the live TUI + webui): per-turn <system-reminder> of the
+    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
+    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
+    // ATOMCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
+    // references tools that aren't mounted). Pushed AFTER VerifyCadenceHook so verify's
+    // "first Some wins" continuation outranks the todo-completion nudge. This is the ONLY
+    // production registration of TodoHook — every real entrypoint (bridge, daemon, clix) goes
+    // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
+    // it) is reachable only from tests + examples, so there is no double-registration.
+    if crate::persona::todo_switch_enabled() {
+        hooks.push(Arc::new(crate::todo::TodoHook));
+    }
     // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
     // right wait-vs-pause decision (decide_from_windows). Returns None for
     // non-CodingPlan providers / fetch failures so the kernel falls back to its
