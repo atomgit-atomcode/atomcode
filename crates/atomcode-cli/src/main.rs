@@ -2994,8 +2994,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 Script(&'a String, &'a atomcode_core::hook::script_runner::ScriptHookConfig),
             }
 
-            let tested = json_match.map(TestedHook::Json)
-                .or_else(|| script_match.map(TestedHook::Script));
+            let tested = json_match.map(|(n, h)| TestedHook::Json(n, h))
+                .or_else(|| script_match.map(|(n, h)| TestedHook::Script(n, h)));
 
             match tested {
                 None => {
@@ -3047,7 +3047,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         }
                     }
                 }
-                Some(TestedHook::Json((hook_name, hook))) => {
+                Some(TestedHook::Json(hook_name, hook)) => {
                     // ── JSON hook test (existing logic) ──────────
                     let event_str: String = serde_json::to_value(&hook.event)
                         .and_then(|v| Ok(v.as_str().unwrap_or("?").to_string()))
@@ -3165,7 +3165,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         }
                     }
                 }
-                Some(TestedHook::Script((hook_name, hook))) => {
+                Some(TestedHook::Script(hook_name, hook)) => {
                     // ── TOML script hook test (aligned with script_runner.rs production) ──
                     let trigger_display = match hook.trigger.as_str() {
                         "pre_tool" | "pre_tool_execution" => "pre_tool_use",
