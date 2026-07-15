@@ -7248,6 +7248,37 @@ mod bash_input_hint_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitRoute {
+    SendIdle,
+    SteerNow,
+    Queue,
+}
+
+/// Where a submitted prompt goes. On the ASYNC kernel path, a submit DURING a
+/// running turn steers (sent to the kernel immediately, folded into the turn).
+/// On the SYNC/LiveSession path, keep the local-queue behavior. Idle → normal send.
+fn midturn_submit_route(streaming: bool, sync: bool) -> SubmitRoute {
+    match (streaming, sync) {
+        (true, false) => SubmitRoute::SteerNow,
+        (true, true) => SubmitRoute::Queue,
+        (false, _) => SubmitRoute::SendIdle,
+    }
+}
+
+#[cfg(test)]
+mod midturn_submit_route_tests {
+    use super::{midturn_submit_route, SubmitRoute};
+
+    #[test]
+    fn midturn_submit_steers_on_async_queues_on_sync() {
+        assert_eq!(midturn_submit_route(true, false), SubmitRoute::SteerNow);
+        assert_eq!(midturn_submit_route(true, true), SubmitRoute::Queue);
+        assert_eq!(midturn_submit_route(false, false), SubmitRoute::SendIdle);
+        assert_eq!(midturn_submit_route(false, true), SubmitRoute::SendIdle);
+    }
+}
+
 /// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
 /// /build /auto /plan commands. Sends the unified SetMode to the bridge, mirrors
 /// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
@@ -7928,17 +7959,34 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            app.message_queue.push_back(crate::state::QueuedMessage {
-                text: expanded,
-                images: q_images,
-                image_markers: q_markers,
-            });
-            crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
+            match midturn_submit_route(true, ctx.sync_session.is_some()) {
+                SubmitRoute::SteerNow => {
+                    // Fold into the running turn: the kernel drains this at the next
+                    // round boundary (see AgentEvent::Steered). No local queue.
+                    ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                        text: expanded,
+                        images: q_images,
+                        image_markers: q_markers,
+                    }).ok();
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  ↳ {}: {}\n",
+                        crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
+                        line
+                    )));
+                }
+                _ => {
+                    app.message_queue.push_back(crate::state::QueuedMessage {
+                        text: expanded,
+                        images: q_images,
+                        image_markers: q_markers,
+                    });
+                    crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
+                    renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
+                }
+            }
             app.buf.text.clear();
             app.buf.cursor = 0;
             app.buf.clear_pastes();
-            // Echo as a queued entry so the user sees it landed.
-            renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
             renderer.flush();
             draw_spinner_now(
                 &mut app.state,

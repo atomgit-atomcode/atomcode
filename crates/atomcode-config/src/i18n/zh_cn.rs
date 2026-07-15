@@ -1048,6 +1048,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::EscAgainToUndo => "  （再次按 Esc 撤销上一轮）\n".into(),
         Msg::BashInputHint => "回车执行 bash 命令".into(),
         Msg::ShellModeHint => "! 进入 shell 模式".into(),
+        Msg::SteerFoldedHint => "已并入当前回合".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \

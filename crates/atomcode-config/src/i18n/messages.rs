@@ -995,6 +995,10 @@ pub enum Msg<'a> {
     /// ("Enter to run…") takes over once a command is typed.
     ShellModeHint,
 
+    /// Echo label appended to the `↳` line when a mid-turn submit on the async
+    /// kernel path is steered into the running turn instead of queued locally.
+    SteerFoldedHint,
+
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the
     /// guaranteed-works `\<Enter>` multi-line trick. Multi-line
