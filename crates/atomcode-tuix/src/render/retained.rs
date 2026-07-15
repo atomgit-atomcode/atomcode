@@ -4309,17 +4309,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             for cell in 0..MASCOT_WIDTH {
                 let top = bytes.get(2 * cell).copied().unwrap_or(b'.');
                 let bot = bytes.get(2 * cell + 1).copied().unwrap_or(b'.');
-                let fg = mascot_color(top);
-                let bg = mascot_color(bot);
-                if fg.is_none() && bg.is_none() {
-                    row.push(Cell::blank());
-                } else {
-                    row.push(Cell {
+                let top_c = mascot_color(top);
+                let bot_c = mascot_color(bot);
+                // Half-block choice matters for TRANSPARENT pixels: `▀` fills its
+                // top half with the fg and leaves the bottom as the cell bg, so a
+                // transparent-top pixel would paint the top half in the terminal's
+                // DEFAULT fg (a dark/white bar). Use `▄` (bottom half) when only
+                // the bottom pixel is coloured, keeping the transparent half as the
+                // terminal background on any theme.
+                let cell = match (top_c, bot_c) {
+                    (None, None) => Cell::blank(),
+                    (Some(t), None) => Cell {
                         ch: '▀',
-                        style: CellStyle { fg, bg, ..CellStyle::default() },
+                        style: CellStyle { fg: Some(t), bg: None, ..CellStyle::default() },
                         width: 1,
-                    });
-                }
+                    },
+                    (None, Some(b)) => Cell {
+                        ch: '▄',
+                        style: CellStyle { fg: Some(b), bg: None, ..CellStyle::default() },
+                        width: 1,
+                    },
+                    (Some(t), Some(b)) => Cell {
+                        ch: '▀',
+                        style: CellStyle { fg: Some(t), bg: Some(b), ..CellStyle::default() },
+                        width: 1,
+                    },
+                };
+                row.push(cell);
             }
             rows.push(row);
         }
@@ -4382,7 +4398,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // ---- Left block: mascot (if colors) + cwd + model ----
         let secondary = self.style_for(Role::Secondary);
         let bullet = self.style_for(Role::AccentDim);
-        let show_mascot = self.caps.colors;
+        // The mascot is half-block art (`▀`/`▄`) in 256-colour. It needs BOTH
+        // colour and unicode: on a classic Windows console (`unicode_symbols =
+        // false`) the glyphs downgrade to `#`, so omit the mascot there (a
+        // `#`-soup reads worse than no mascot) and let the tips stack.
+        let show_mascot = self.caps.colors && self.caps.unicode_symbols;
         let mascot_w = crate::render::mascot::MASCOT_WIDTH;
 
         let mut left: Vec<Vec<Cell>> = Vec::new();
@@ -14971,6 +14991,46 @@ mod tests {
         let after = tip_cmds(&r);
         assert_eq!(before, after, "resize (body_log replay) must not re-roll tips");
         assert!(before.iter().any(|c| c == "/login"), "pinned /login present");
+    }
+
+    /// A cell whose TOP pixel is transparent but bottom is coloured must use the
+    /// lower-half block `▄` (colour on fg, transparent bg), NOT `▀` with a `None`
+    /// fg — the latter paints the top half in the terminal's default foreground
+    /// (a dark bar on a light background / wrong colour), which is the mascot
+    /// "dark bar across the ears" bug.
+    #[test]
+    fn build_mascot_rows_transparent_top_uses_lower_half_block() {
+        let (r, _c) = new_counting(80, 24);
+        let rows = r.build_mascot_rows();
+        for row in &rows {
+            for c in row {
+                assert!(
+                    !(c.ch == '\u{2580}' && c.style.fg.is_none()),
+                    "'▀' with no fg paints the top half as the terminal default fg"
+                );
+            }
+        }
+        assert!(
+            rows.iter()
+                .flatten()
+                .any(|c| c.ch == '\u{2584}' && c.style.fg.is_some()),
+            "transparent-top pixels must render as lower-half '▄'"
+        );
+    }
+
+    /// On a terminal that can't render half-block glyphs (classic Windows
+    /// console → `unicode_symbols = false`), the mascot must be omitted rather
+    /// than downgraded to a `#`-soup. Tips still render.
+    #[test]
+    fn welcome_no_unicode_omits_mascot() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = false;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let text = body_text(&r);
+        assert!(!text.contains('#'), "mascot must be omitted, not '#'-downgraded");
+        assert!(!text.contains('\u{2580}') && !text.contains('\u{2584}'));
+        assert!(text.contains("/login"), "tips still present without a mascot");
     }
 
     /// With colours disabled the mascot is omitted, so the welcome must STACK
