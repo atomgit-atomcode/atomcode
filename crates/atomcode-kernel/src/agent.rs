@@ -2158,7 +2158,7 @@ impl RunningAgent {
                         id: c.id.clone(),
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
-                        parallel_safe: self.tools.get(&c.name).map(|t| t.parallel_safe()).unwrap_or(false),
+                        parallel_safe: self.tools.get(&c.name).map(|t| t.parallel_safe(&c.arguments)).unwrap_or(false),
                     })
                     .collect();
                 self.rt.emit(AgentEvent::ToolBatchStarted {
@@ -2317,7 +2317,7 @@ impl RunningAgent {
                             // Skip (mode A) and one that repeats (name,args) with a new
                             // id classifies as the mode-B stub — mirroring the old loop's
                             // incremental update, which happened as calls ran in order.
-                            let parallel_safe = tool.parallel_safe();
+                            let parallel_safe = tool.parallel_safe(&call.arguments);
                             result_ids.insert(call.id.clone());
                             seen_calls.insert(dedup_key);
                             plans.push(CallPlan::Execute {

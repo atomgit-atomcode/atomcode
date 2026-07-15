@@ -638,6 +638,6 @@ mod tests {
     fn read_file_is_parallel_safe() {
         let t = ReadFileTool::new(false); // vision flag irrelevant here
         assert!(t.read_only_hint(), "read_file has no side effects");
-        assert!(t.parallel_safe(), "read_file may run concurrently");
+        assert!(t.parallel_safe("{}"), "read_file may run concurrently");
     }
 }

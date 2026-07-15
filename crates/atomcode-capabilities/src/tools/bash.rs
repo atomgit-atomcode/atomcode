@@ -61,6 +61,15 @@ impl Tool for BashTool {
             Err(_) => RiskLevel::Risky,
         }
     }
+    /// Read-only bash commands (per [`is_read_only_bash`]) may run concurrently;
+    /// everything else serializes behind the write-lock. A parse failure is
+    /// conservatively NOT parallel-safe.
+    fn parallel_safe(&self, args: &str) -> bool {
+        serde_json::from_str::<Args>(args)
+            .ok()
+            .map(|a| is_read_only_bash(&a.command))
+            .unwrap_or(false)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
@@ -1958,6 +1967,16 @@ mod tests {
         let r = BashTool.execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path())).await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("timed out after 1s"), "{}", r.content);
+    }
+
+    #[test]
+    fn bash_tool_parallel_safe_follows_classifier() {
+        let t = BashTool;
+        assert!(t.parallel_safe(r#"{"command":"grep -rn x crates/"}"#), "read-only grep");
+        assert!(t.parallel_safe(r#"{"command":"grep x | grep -v y | head"}"#), "read-only pipe");
+        assert!(!t.parallel_safe(r#"{"command":"cargo build"}"#), "cargo not read-only");
+        assert!(!t.parallel_safe(r#"{"command":"rm -rf build"}"#), "destructive");
+        assert!(!t.parallel_safe("not json"), "parse failure → not parallel-safe");
     }
 
     #[test]

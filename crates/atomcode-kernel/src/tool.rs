@@ -185,14 +185,14 @@ pub trait Tool: Send + Sync {
     fn read_only_hint(&self) -> bool {
         false
     }
-    /// Whether this tool may run CONCURRENTLY with other tools in the same
-    /// assistant message. A `parallel_safe` tool has no side effects, so running
-    /// it alongside others cannot interleave-corrupt state. Defaults to
-    /// `read_only_hint()` — the single "no side effects" property (also read by
-    /// plan mode) — so a tool becomes parallel-safe exactly when it is read-only.
-    /// A tool with side effects (bash/edit/write/change_dir) leaves this `false`
-    /// and is serialized behind a write-lock by the executor.
-    fn parallel_safe(&self) -> bool {
+    /// Whether THIS call (with these args) may run CONCURRENTLY with other tools in
+    /// the same assistant message. Arg-aware: a tool's safety can depend on its
+    /// arguments — `bash` is parallel-safe only for provably read-only commands, so
+    /// it inspects `_args`. Arg-independent tools ignore `_args` and defer to
+    /// `read_only_hint()` (the single "no side effects" property, also read by plan
+    /// mode). A side-effecting tool leaves this `false` and is serialized behind the
+    /// write-lock by the executor.
+    fn parallel_safe(&self, _args: &str) -> bool {
         self.read_only_hint()
     }
     /// The scope under which an "always" approval grant ("总是 / Always") is
@@ -287,8 +287,8 @@ mod tests {
                 ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
             }
         }
-        assert!(!Plain.parallel_safe(), "default (no read_only_hint) is NOT parallel-safe");
-        assert!(RO.parallel_safe(), "a read-only tool IS parallel-safe");
+        assert!(!Plain.parallel_safe("{}"), "default (no read_only_hint) is NOT parallel-safe");
+        assert!(RO.parallel_safe("{}"), "a read-only tool IS parallel-safe");
     }
 
     struct Dummy(&'static str, RiskLevel);
