@@ -877,6 +877,7 @@ mod tests {
 
     // ---- temp-dir whitelist tests (codex parity) -------------------------------------------
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn redirect_to_slash_tmp_proceeds() {
         let ws = tempfile::tempdir().unwrap();
@@ -887,6 +888,7 @@ mod tests {
         assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn redirect_to_system_tmpdir_proceeds() {
         let ws = tempfile::tempdir().unwrap();
@@ -897,6 +899,7 @@ mod tests {
         assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn traversal_out_of_tmp_still_prompts() {
         let ws = tempfile::tempdir().unwrap();
