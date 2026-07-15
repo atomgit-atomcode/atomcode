@@ -71,6 +71,15 @@ fn is_noop_redirect_target(t: &str) -> bool {
     t.starts_with('&') || matches!(t, "/dev/null" | "/dev/stdout" | "/dev/stderr")
 }
 
+/// A destructive/redirect TARGET whose location does NOT depend on the cwd: an absolute path
+/// (`/…`) or a `~`-home path. A preceding `cd` cannot move such a target, so it stays statically
+/// classifiable even when the same command also runs a `cd` — only RELATIVE targets are made
+/// ambiguous by a `cd` (see [`scan_destructive_bash`]).
+fn target_is_cwd_independent(t: &str) -> bool {
+    let t = strip_quotes(t.trim());
+    t.starts_with('/') || t == "~" || t.starts_with("~/")
+}
+
 /// Result of statically scanning a bash command line for filesystem-destructive operations.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BashScan {
@@ -422,6 +431,7 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
     let mut targets: Vec<String> = Vec::new();
     let mut any_destructive = false;
     let mut unresolvable = false;
+    let mut saw_cd = false;
 
     for seg in split_segments(cmd) {
         let toks = tokenize(seg.trim());
@@ -450,10 +460,12 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
 
         if let Some(ci) = ci {
             let effcmd = effcmd.unwrap();
-            // A `cd` moves the resolution base for later relative paths — we can't trust static
-            // resolution once a destructive op is in the mix. Fail closed.
+            // A `cd` moves the resolution base for later RELATIVE paths. Record it and fail
+            // closed only if a cwd-DEPENDENT (relative) target is actually present (checked after
+            // the scan) — an absolute / `~` target lands the same place regardless of the cd, so
+            // it stays classifiable (e.g. `cd ws && cargo build > /tmp/log` is not ambiguous).
             if effcmd == "cd" {
-                unresolvable = true;
+                saw_cd = true;
             } else if DESTRUCTIVE_CMDS.contains(&effcmd) {
                 match extract_targets(effcmd, &toks[ci + 1..]) {
                     Some(ts) if ts.is_empty() => {} // recognized but writes no path → not destructive
@@ -468,6 +480,12 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
                 }
             }
         }
+    }
+
+    // A `cd` in the command makes only RELATIVE targets unresolvable (their base moved);
+    // absolute / `~` targets remain statically classifiable.
+    if saw_cd && targets.iter().any(|t| !target_is_cwd_independent(t)) {
+        unresolvable = true;
     }
 
     if !any_destructive {
@@ -681,6 +699,34 @@ mod tests {
     }
 
     #[test]
+    fn cd_then_absolute_target_is_resolvable() {
+        // A `cd` only makes RELATIVE targets ambiguous; an ABSOLUTE target lands the same place
+        // regardless of cwd, so it must classify normally (→ temp/workspace check), not fail
+        // closed. This is the `cd ws && cargo build > /tmp/log` false-positive fix.
+        assert_eq!(
+            scan("cd /ws && cargo build > /tmp/out.txt"),
+            BashScan::Targets(vec!["/tmp/out.txt".into()])
+        );
+        assert_eq!(
+            scan("cd /ws && rm /outside/a.txt"),
+            BashScan::Targets(vec!["/outside/a.txt".into()])
+        );
+        // `~`-home targets are also cwd-independent (a preceding cd cannot move them).
+        assert_eq!(
+            scan("cd /ws && echo x > ~/out.txt"),
+            BashScan::Targets(vec!["~/out.txt".into()])
+        );
+    }
+
+    #[test]
+    fn cd_then_relative_target_still_unresolvable() {
+        // With a cd in the mix, a RELATIVE destructive target genuinely can't be resolved.
+        assert_eq!(scan("cd /ws && echo x > rel.txt"), BashScan::Unresolvable);
+        // A mix: any relative target taints the whole command (fail closed).
+        assert_eq!(scan("cd /ws && rm /abs/a.txt rel.txt"), BashScan::Unresolvable);
+    }
+
+    #[test]
     fn command_substitution_is_unresolvable() {
         assert_eq!(scan("rm $(cat list.txt)"), BashScan::Unresolvable);
         assert_eq!(scan("rm `cat list.txt`"), BashScan::Unresolvable);
@@ -886,6 +932,35 @@ mod tests {
         let mut call = bash_call("cargo build > /tmp/build_all.json");
         // /tmp is a writable temp root (codex parity) → no prompt.
         assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cd_then_redirect_to_slash_tmp_proceeds() {
+        // The reported false positive: `cd <ws> && cargo build > /tmp/x; wc -l /tmp/x` must NOT
+        // prompt — the absolute /tmp target is a writable temp root, and the leading `cd` cannot
+        // move it, so it stays classifiable instead of failing closed on the cd.
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let cmd = format!(
+            "cd {} && cargo build --workspace 2>&1 > /tmp/atomcode_dead_full.txt; wc -l /tmp/atomcode_dead_full.txt",
+            ws.path().to_str().unwrap()
+        );
+        let mut call = bash_call(&cmd);
+        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cd_then_relative_redirect_still_prompts() {
+        // Counterpart: with a cd, a RELATIVE redirect target can't be resolved → still fail closed.
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("cd /somewhere && echo x > out.txt");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(out.is_deny(), "cd + relative redirect target must still prompt, got {out:?}");
     }
 
     #[cfg(unix)]
