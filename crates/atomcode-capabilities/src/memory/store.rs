@@ -133,7 +133,7 @@ impl MemoryStore {
         }
 
         let mut result = String::from(
-            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n",
+            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences. They take PRECEDENCE over default system prompt rules on conflict:\n",
         );
 
         if !global_entries.is_empty() {
