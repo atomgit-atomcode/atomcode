@@ -1901,13 +1901,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let brand = self.style_for(Role::Brand);
 
         // Left mode badge — a single left-aligned badge covers all non-default
-        // modes: Plan → brand-colored "PLAN"; Auto → warning-colored "⏵⏵ auto"
-        // (auto-approve-all is a caution state the user must always see).
-        // `mode_indicator` (Plan) and `bypass_indicator` (Auto) are mutually
-        // exclusive, so one slot serves both — there is no separate right badge.
+        // modes: Plan / accept-edits → `Role::Mode` purple "PLAN"; Auto →
+        // warning-colored "⏵⏵ auto" (auto-approve-all is a caution state the
+        // user must always see). `mode_indicator` (Plan) and `bypass_indicator`
+        // (Auto) are mutually exclusive, so one slot serves both — there is no
+        // separate right badge.
         let (left_badge, left_badge_style): (Option<String>, CellStyle) =
             if let Some(m) = status.mode_indicator.as_ref() {
-                (Some(scrub_controls(m)), brand.clone())
+                (Some(scrub_controls(m)), self.style_for(Role::Mode))
             } else if let Some(b) = status.bypass_indicator.as_ref() {
                 (Some(scrub_controls(b)), self.style_for(Role::Warning))
             } else {
@@ -6688,6 +6689,46 @@ mod tests {
             !visible.contains("BYPASS"),
             "bypass must not render when a mode indicator is present; got: {:?}",
             visible
+        );
+    }
+
+    /// The left mode badge (Plan / accept edits) is coloured with the dedicated
+    /// `Role::Mode` purple (`AnsiValue(104)`), NOT the global `Role::Brand`
+    /// magenta. This keeps the recolour scoped to the mode indicator — tool
+    /// markers, the spinner, and the prompt glyph stay Brand.
+    #[test]
+    fn build_status_row_mode_indicator_uses_mode_purple() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some("PLAN".into()),
+            bypass_indicator: None,
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            approval: None,
+        };
+        let row = r.build_status_row(&status, 60);
+        let idx = row
+            .iter()
+            .position(|c| c.ch == 'P')
+            .expect("PLAN badge must be present");
+        let badge: String = row[idx..idx + 4].iter().map(|c| c.ch).collect();
+        assert_eq!(badge, "PLAN", "expected the PLAN mode badge at the left");
+        assert!(
+            row[idx..idx + 4]
+                .iter()
+                .all(|c| c.style.fg == Some(crossterm::style::Color::AnsiValue(104))),
+            "PLAN mode badge must use the mode purple AnsiValue(104); got: {:?}",
+            row[idx..idx + 4].iter().map(|c| c.style.fg).collect::<Vec<_>>()
         );
     }
 

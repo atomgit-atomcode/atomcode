@@ -33,6 +33,15 @@ impl Palette {
     // default background).
     pub const BRAND: Color = Color::Magenta; // bright magenta (95)
 
+    /// Colour for the footer **mode badge** (`⏵ accept edits`, `PLAN`).
+    /// Deliberately a soft 256-colour periwinkle (`AnsiValue(104)` ≈ `#8787d7`)
+    /// rather than the global `BRAND` magenta: the mode indicator reads as a
+    /// distinct "current interaction mode" pill (mirrors Claude Code's purple)
+    /// while tool markers / spinner / prompt glyph stay Brand. 256-colour (not
+    /// truecolor) keeps parity with the `PanelBg` `AnsiValue` usage and stays
+    /// portable across terminals.
+    pub const MODE: Color = Color::AnsiValue(104);
+
     /// Muted text on **light** backgrounds. SGR 90 ("bright black") maps
     /// to a mid-gray on most light themes — contrast against `#FFFFFF`
     /// lands around 4.5–5:1, comfortably above AA.
@@ -153,6 +162,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     }
     match role {
         Role::Brand => Some(Palette::BRAND),
+        Role::Mode => Some(Palette::MODE),
         Role::Muted => Some(muted_for_current_theme()),
         Role::Accent => Some(Palette::ACCENT),
         Role::AccentDim => Some(muted_for_current_theme()),
@@ -180,6 +190,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
 #[derive(Debug, Clone, Copy)]
 pub enum Role {
     Brand,
+    Mode,
     Muted,
     Accent,
     AccentDim,
