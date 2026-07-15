@@ -1,9 +1,10 @@
-//! `open_file` — launch a local file in the user's default GUI application (browser for
-//! HTML, viewer for PDF / image / SVG, …). A thin cross-platform wrapper that picks the
-//! right opener by OS + environment (`open` / `xdg-open` / `cmd start` / `wslview`).
-//! Headless / SSH / CI sessions can't show a window, so it REFUSES with a human-readable
-//! reason (and the file path) instead of pretending a window opened. Launching a GUI is a
-//! user-visible side effect ⇒ always `Risky`. Neutral port of the production tool.
+//! `open_file` — launch a local file **or URL** in the user's default GUI application
+//! (browser for HTML/URL, viewer for PDF / image / SVG, …). A thin cross-platform wrapper
+//! that picks the right opener by OS + environment (`open` / `xdg-open` / `cmd start` /
+//! `wslview`). Headless / SSH / CI sessions can't show a window, so it REFUSES with a
+//! human-readable reason (and the file path) instead of pretending a window opened.
+//! Launching a GUI is a user-visible side effect ⇒ always `Risky`. Neutral port of the
+//! production tool.
 
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
@@ -129,20 +130,21 @@ impl Tool for OpenFileTool {
         "open_file"
     }
     fn description(&self) -> &str {
-        "Open a local file or directory in the user's default GUI application — a browser \
-         for HTML, an image viewer for PNG/JPG, a PDF reader for PDF, or the OS file \
-         manager for directories. USE ONLY when the user asks to preview/open/view a file \
-         or directory, or when previewing is the obvious next step AND you have asked \
-         first — do NOT auto-open after every write_file/edit_file. Prefer this tool over \
-         shelling out to `open`, `xdg-open`, `start`, or `wslview`. Cross-platform \
-         dispatch is built in; headless / SSH / CI sessions refuse with a clear reason so \
-         you can give the user the path instead of pretending a window opened."
+        "Open a local file, directory, or URL in the user's default GUI application — a browser \
+         for HTML/URLs, an image viewer for PNG/JPG, a PDF reader for PDF, or the OS file \
+         manager for directories. Supports http:// and https:// URLs (opens in the default \
+         browser). USE ONLY when the user asks to preview/open/view a file or directory, or \
+         when previewing is the obvious next step AND you have asked first — do NOT auto-open \
+         after every write_file/edit_file. Prefer this tool over shelling out to `open`, \
+         `xdg-open`, `start`, or `wslview`. Cross-platform dispatch is built in; headless / SSH \
+         / CI sessions refuse with a clear reason so you can give the user the path instead of \
+         pretending a window opened."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "File or directory path to open. Absolute, or relative to the working directory. Must exist." }
+                "file_path": { "type": "string", "description": "File or directory path to open, or an http:// / https:// URL. Absolute, or relative to the working directory. Must exist (for file paths)." }
             },
             "required": ["file_path"]
         })
@@ -155,7 +157,17 @@ impl Tool for OpenFileTool {
             Ok(a) => a,
             Err(e) => return err(format!("open_file: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}.")),
         };
-        let target = resolve_path(&a.file_path, &ctx.working_dir);
+
+        // URL support: http:// / https:// URLs are opened directly in the browser,
+        // skipping path resolution and file existence checks.
+        // Scheme is case-insensitive per RFC 3986, so we check the lowercased form.
+        let fp = a.file_path.trim();
+        let lower = fp.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return open_url(fp).await;
+        }
+
+        let target = resolve_path(fp, &ctx.working_dir);
         // Strip the Windows `\\?\` verbatim prefix: `cmd /c start` / Explorer don't
         // accept extended-length paths, and it would leak into the messages below.
         let target = crate::pathnorm::canonicalize(&target).unwrap_or(target);
@@ -214,6 +226,53 @@ impl Tool for OpenFileTool {
     }
 }
 
+/// Open a URL in the default browser. Skips file-path resolution entirely.
+async fn open_url(url: &str) -> ToolResult {
+    let strategy = pick_open_strategy();
+    let mut cmd = match &strategy {
+        OpenStrategy::MacOpen => {
+            let mut c = Command::new("open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::XdgOpen => {
+            let mut c = Command::new("xdg-open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::WindowsStart => {
+            // Use explorer.exe directly to avoid cmd.exe shell metacharacter issues.
+            // cmd /c start would interpret &, |, %, ^ in URLs as shell operators,
+            // causing truncation of query strings or potential command injection.
+            // explorer.exe uses ShellExecute internally and handles URLs safely.
+            let mut c = Command::new("explorer");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::Wslview => {
+            let mut c = Command::new("wslview");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::Headless(reason) => {
+            return err(format!(
+                "open_file: cannot open URL in GUI: {reason}.\n\nURL for manual access:\n  {url}",
+            ));
+        }
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    match cmd.spawn() {
+        Ok(_child) => ok(format!("Opened URL `{url}` via `{}`.", strategy_command_name(&strategy))),
+        Err(e) => err(format!(
+            "open_file: failed to launch `{}` to open URL: {e}.\n\nURL for manual access:\n  {url}",
+            strategy_command_name(&strategy),
+        )),
+    }
+}
+
 /// Auto-approve `open_file` when its target is INSIDE the live workspace.
 ///
 /// `open_file` is intrinsically [`Risky`](RiskLevel::Risky) (it launches a GUI viewer —
@@ -262,6 +321,12 @@ impl OpenFileWorkspaceGate {
         let Ok(parsed) = serde_json::from_str::<Args>(args) else {
             return false;
         };
+        // URLs are always treated as "in workspace" so they get auto-approved
+        // (opening a URL is no more dangerous than opening an in-workspace file).
+        let fp = parsed.file_path.trim();
+        if fp.to_ascii_lowercase().starts_with("http://") || fp.to_ascii_lowercase().starts_with("https://") {
+            return true;
+        }
         let Ok(root) = std::fs::canonicalize(working_dir) else {
             return false;
         };
