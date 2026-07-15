@@ -407,6 +407,10 @@ pub enum Msg<'a> {
         cost: &'a str,
     },
 
+    // ── /usage command ──
+    /// Shown when the user runs /usage but has no stored CodingPlan auth.
+    UsageCodingPlanOnly,
+
     // ── /think command ──
     ThinkStatus { status: &'a str, budget: u32, provider: &'a str },
     ThinkEnabled { budget: u32 },
@@ -654,6 +658,8 @@ pub enum Msg<'a> {
     CmdDescClear,
     CmdDescSession,
     CmdDescCost,
+    /// Description for the `/usage` slash command — opens the CodingPlan usage modal.
+    CmdDescUsage,
     CmdDescContext,
     CmdDescCompact,
     CmdDescRemember,
