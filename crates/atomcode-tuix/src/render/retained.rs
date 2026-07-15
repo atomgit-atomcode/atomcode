@@ -1395,9 +1395,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    fn build_rule_row(&self, rule_width: usize) -> Vec<Cell> {
+    fn build_rule_row(&self, rule_width: usize, shell: bool) -> Vec<Cell> {
         let mut row = Vec::with_capacity(rule_width);
-        let border = self.style_for(Role::Border);
+        // `!` shell mode tints the box rules atomcode brand-purple so the whole
+        // input frame reads as "this runs in the shell, not the agent".
+        let border = self.style_for(if shell { Role::Shell } else { Role::Border });
         for _ in 0..rule_width {
             row.push(Cell {
                 ch: '─',
@@ -1424,8 +1426,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         &self,
         rule_width: usize,
         session_name: Option<&str>,
+        shell: bool,
     ) -> Vec<Cell> {
-        let mut row = self.build_rule_row(rule_width);
+        let mut row = self.build_rule_row(rule_width, shell);
         let Some(name) = session_name else {
             return row;
         };
@@ -1479,14 +1482,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
+    fn build_middle_row(&self, line: &str, is_first: bool, shell: bool) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
         if is_first {
-            let accent = self.style_for(Role::Accent);
-            push_str_cells(&mut row, self.caps.prompt_chevron(), &accent);
+            // Shell mode tints the chevron (and the leading `!` below) brand-purple.
+            let chevron = self.style_for(if shell { Role::Shell } else { Role::Accent });
+            push_str_cells(&mut row, self.caps.prompt_chevron(), &chevron);
         } else {
             push_str_cells(&mut row, "  ", &pad);
+        }
+        // In shell mode, paint ONLY the leading `!` purple; the command itself
+        // keeps the default fg so it stays readable. `input_shell_mode` trims
+        // leading whitespace, so honour the same trim here — otherwise `  !ls`
+        // leaves the `!` untinted while the box around it is purple.
+        if is_first && shell {
+            let ws = line.len() - line.trim_start().len();
+            if line[ws..].starts_with('!') {
+                push_str_cells(&mut row, &line[..ws], &pad); // leading spaces, untinted
+                push_str_cells(&mut row, "!", &self.style_for(Role::Shell));
+                push_str_cells(&mut row, &line[ws + 1..], &pad);
+                return row;
+            }
         }
         push_str_cells(&mut row, line, &pad);
         row
@@ -1885,7 +1902,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         vec![row1, row2, row3]
     }
 
-    fn build_status_row(&self, status: &StatusLine, rule_width: usize) -> Vec<Cell> {
+    fn build_status_row(&self, status: &StatusLine, rule_width: usize, shell: bool) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
         push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
@@ -1906,14 +1923,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // user must always see). `mode_indicator` (Plan) and `bypass_indicator`
         // (Auto) are mutually exclusive, so one slot serves both — there is no
         // separate right badge.
-        let (left_badge, left_badge_style): (Option<String>, CellStyle) =
-            if let Some(m) = status.mode_indicator.as_ref() {
-                (Some(scrub_controls(m)), self.style_for(Role::Mode))
-            } else if let Some(b) = status.bypass_indicator.as_ref() {
-                (Some(scrub_controls(b)), self.style_for(Role::Warning))
-            } else {
-                (None, brand.clone())
-            };
+        // `!` shell mode takes the slot over plan/auto: a `!` line runs in the
+        // shell (bypassing the agent), so the agent mode is momentarily moot —
+        // the `shell` badge (brand-purple, sibling of PLAN/auto) is what matters.
+        let (left_badge, left_badge_style): (Option<String>, CellStyle) = if shell {
+            (Some("shell".to_string()), self.style_for(Role::Shell))
+        } else if let Some(m) = status.mode_indicator.as_ref() {
+            (Some(scrub_controls(m)), self.style_for(Role::Mode))
+        } else if let Some(b) = status.bypass_indicator.as_ref() {
+            (Some(scrub_controls(b)), self.style_for(Role::Warning))
+        } else {
+            (None, brand.clone())
+        };
         let mode_badge_w = left_badge
             .as_ref()
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
@@ -1996,6 +2017,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let hint_style = match severity {
                 crate::render::HintSeverity::Warning => error,
                 crate::render::HintSeverity::Info => secondary.clone(),
+                // `!` shell-mode affordance — brand purple, matching the box/badge.
+                crate::render::HintSeverity::Shell => self.style_for(Role::Shell),
             };
             let right_w = hint_w;
             if right_w + 1 < left_max {
@@ -2538,23 +2561,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let body_rows_on_screen = visible_body_len.min(h.saturating_sub(total_rows));
         let footer_top = body_rows_on_screen;
 
+        // `!` shell mode: derived live from the buffer, so the purple treatment
+        // arms/reverts with the leading `!` (no persistent mode state).
+        let shell = super::input_shell_mode(&self.input_buf);
         // Pre-build every row vector (immutable borrows of self).
         let top_rule = self.build_top_rule_with_badge(
             input_rule_width,
             self.status.session_name.as_deref(),
+            shell,
         );
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
-            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0))
+            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0, shell))
             .collect();
         // When the input is scrolled (windowed), show "+N more lines" on the
         // bottom rule so it's visible that content is hidden, not lost.
         let hidden_rows = lines.len() - middle_rows;
-        let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows);
+        let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows, shell);
         let status_clone = self.status.clone();
         let status_cells = if has_status && !hide_input_box {
-            Some(self.build_status_row(&status_clone, rule_width))
+            Some(self.build_status_row(&status_clone, rule_width, shell))
         } else {
             None
         };
@@ -3001,8 +3028,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Bottom rule of the input box. When `hidden_rows > 0` (the input is
     /// scrolled), embed a muted `+N more lines` hint at the right so the user
     /// sees the content is hidden (still in `input_buf`), not lost.
-    fn build_input_bot_rule(&self, rule_width: usize, hidden_rows: usize) -> Vec<Cell> {
-        let mut row = self.build_rule_row(rule_width);
+    fn build_input_bot_rule(&self, rule_width: usize, hidden_rows: usize, shell: bool) -> Vec<Cell> {
+        let mut row = self.build_rule_row(rule_width, shell);
         if hidden_rows == 0 {
             return row;
         }
@@ -6593,6 +6620,53 @@ mod tests {
         }
     }
 
+    /// Shell mode (`!`) paints the input box rules + the prompt chevron + the
+    /// leading `!` in atomcode's brand purple (`Role::Shell`), NOT the normal
+    /// cyan border/accent — and leaves the normal (non-shell) rows untouched.
+    #[test]
+    fn shell_mode_paints_input_box_chevron_and_bang_purple() {
+        use crate::highlight::theme as md_theme;
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        md_theme::set_theme_mode(false); // dark → deterministic Role::Shell
+        let shell_fg = role(r.caps, Role::Shell);
+        let border_fg = role(r.caps, Role::Border);
+        assert_ne!(shell_fg, border_fg, "precondition: shell purple differs from border");
+
+        // Rule rows: purple in shell mode, border otherwise.
+        let shell_rule = r.build_rule_row(40, true);
+        assert!(
+            shell_rule.iter().all(|c| c.style.fg == shell_fg),
+            "shell-mode rule must be brand purple"
+        );
+        let normal_rule = r.build_rule_row(40, false);
+        assert!(
+            normal_rule.iter().all(|c| c.style.fg == border_fg),
+            "non-shell rule stays cyan border"
+        );
+
+        // First middle row: chevron + the leading `!` go purple in shell mode.
+        let mid = r.build_middle_row("!ls -la", true, true);
+        assert_eq!(mid[0].style.fg, shell_fg, "chevron painted shell purple");
+        let bang = mid.iter().find(|c| c.ch == '!').expect("leading ! present");
+        assert_eq!(bang.style.fg, shell_fg, "leading ! painted shell purple");
+        // The rest of the command keeps the default fg (not purple).
+        let s_cell = mid.iter().find(|c| c.ch == 's').expect("command char present");
+        assert_ne!(s_cell.style.fg, shell_fg, "only the ! is tinted, not the whole command");
+
+        // Leading whitespace before the `!` (buffer `  !ls`) still tints the `!`
+        // — `input_shell_mode` trims, so the box is purple; the `!` must match.
+        let ws = r.build_middle_row("  !ls", true, true);
+        let ws_bang = ws.iter().find(|c| c.ch == '!').expect("leading ! present");
+        assert_eq!(ws_bang.style.fg, shell_fg, "! after leading spaces still painted purple");
+
+        // Non-shell first row: chevron stays accent, no purple leak.
+        let plain = r.build_middle_row("ls", true, false);
+        assert_eq!(plain[0].style.fg, role(r.caps, Role::Accent), "normal chevron stays accent");
+        md_theme::set_theme_mode(false); // restore
+    }
+
     /// Mode indicator (Plan badge) renders BEFORE the model · cwd · tokens
     /// run. Default Build mode (`mode_indicator = None`) keeps the row
     /// unchanged so existing layout / byte-budget tests stay valid.
@@ -6619,7 +6693,7 @@ mod tests {
             todo: None,
             approval: None,
         };
-        let row = r.build_status_row(&status, 60);
+        let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
         // spaces, then the badge, then a separator space, then the body.
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -6636,6 +6710,51 @@ mod tests {
         );
     }
 
+    /// While composing a `!` command the status row shows a `shell` mode badge
+    /// (sibling of `PLAN`/`auto`), in atomcode brand-purple, and it TAKES
+    /// PRECEDENCE over the persistent plan/auto badge — a `!` line runs in the
+    /// shell, bypassing the agent, so the agent mode is momentarily irrelevant.
+    #[test]
+    fn shell_mode_shows_shell_badge_overriding_plan() {
+        use crate::highlight::theme as md_theme;
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        md_theme::set_theme_mode(false); // dark → deterministic Role::Shell
+        let shell_fg = role(r.caps, Role::Shell);
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some("PLAN".into()), // plan is active…
+            bypass_indicator: None,
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            approval: None,
+        };
+        let row = r.build_status_row(&status, 60, /* shell */ true);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.trim_start().starts_with("shell "),
+            "shell badge takes the slot while composing !; got: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("PLAN"),
+            "plan badge is suppressed while the shell badge is showing; got: {:?}",
+            visible
+        );
+        // Badge cells are brand-purple, not the plan periwinkle / border cyan.
+        let first_glyph = row.iter().find(|c| c.ch != ' ').expect("badge glyph present");
+        assert_eq!(first_glyph.style.fg, shell_fg, "shell badge painted brand purple");
+        md_theme::set_theme_mode(false); // restore
+    }
+
     /// Default Build mode produces no badge — row is identical to the
     /// pre-mode-indicator layout. Guards against accidental "PLAN" leak
     /// when no mode is active.
@@ -6644,7 +6763,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_status_row(&status_basic(), 60);
+        let row = r.build_status_row(&status_basic(), 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
         assert!(
             !visible.contains("PLAN"),
@@ -6676,7 +6795,7 @@ mod tests {
             todo: None,
             approval: None,
         };
-        let row = r.build_status_row(&status, 60);
+        let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
         // PLAN badge on the left.
         assert!(
@@ -6716,7 +6835,7 @@ mod tests {
             todo: None,
             approval: None,
         };
-        let row = r.build_status_row(&status, 60);
+        let row = r.build_status_row(&status, 60, false);
         let idx = row
             .iter()
             .position(|c| c.ch == 'P')
@@ -6754,7 +6873,7 @@ mod tests {
             todo: None,
             approval: None,
         };
-        let row = r.build_status_row(&status, 60);
+        let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
         assert!(
             visible.contains("BYPASS"),
@@ -6777,7 +6896,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_badge(60, Some("atomcode加解密"));
+        let row = r.build_top_rule_with_badge(60, Some("atomcode加解密"), false);
         // Skip continuation cells (width 0 placeholders that follow a
         // wide glyph) — they carry `ch = ' '` and would break a naive
         // substring check on a CJK name.
@@ -6802,7 +6921,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_badge(60, None);
+        let row = r.build_top_rule_with_badge(60, None, false);
         assert_eq!(row.len(), 60, "rule width must be preserved");
         assert!(
             row.iter().all(|c| c.ch == '─'),
@@ -6823,7 +6942,7 @@ mod tests {
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
         let long = "这是一个非常非常非常非常长的会话名字应当被截断省略";
-        let row = r.build_top_rule_with_badge(40, Some(long));
+        let row = r.build_top_rule_with_badge(40, Some(long), false);
         // Same continuation-cell filter rationale as the badge-render
         // test above: width-0 cells carry ' ' and would obscure the
         // substring assertions on CJK names.

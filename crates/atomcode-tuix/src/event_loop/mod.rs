@@ -7186,9 +7186,51 @@ fn bash_input_hint(buf: &str) -> bool {
         .is_some_and(|rest| !rest.trim().is_empty())
 }
 
+/// The shell-mode footer hint for the current buffer, or `None` when not in
+/// shell mode. Bare `!` → the `ShellModeHint` affordance ("! for shell mode");
+/// a runnable `!cmd` → the actionable `BashInputHint` ("Enter to run…"). Always
+/// `HintSeverity::Shell` (brand purple), matching the shell-mode box + badge.
+/// Derived purely from the buffer, so it arms/reverts with the leading `!`.
+fn shell_mode_hint(buf: &str) -> Option<(crate::i18n::Msg<'static>, crate::render::HintSeverity)> {
+    if !crate::render::input_shell_mode(buf) {
+        return None;
+    }
+    let msg = if bash_input_hint(buf) {
+        crate::i18n::Msg::BashInputHint
+    } else {
+        crate::i18n::Msg::ShellModeHint
+    };
+    Some((msg, crate::render::HintSeverity::Shell))
+}
+
 #[cfg(test)]
 mod bash_input_hint_tests {
-    use super::bash_input_hint;
+    use super::{bash_input_hint, shell_mode_hint};
+    use crate::render::HintSeverity;
+
+    // Resolve to (text, severity) — `Msg` has no PartialEq/Debug, so compare the
+    // observable output instead (locale-agnostic: we assert bare ≠ runnable, not
+    // exact strings).
+    fn resolved(buf: &str) -> Option<(String, HintSeverity)> {
+        shell_mode_hint(buf).map(|(m, s)| (crate::i18n::t(m).into_owned(), s))
+    }
+
+    #[test]
+    fn shell_hint_is_purple_and_switches_bare_vs_runnable() {
+        let bare = resolved("!").expect("bare ! arms shell mode");
+        let cmd = resolved("!ls -la").expect("runnable !cmd is shell mode");
+        // Both brand-purple (Shell severity), matching the box + badge.
+        assert_eq!(bare.1, HintSeverity::Shell, "bare ! hint is brand purple");
+        assert_eq!(cmd.1, HintSeverity::Shell, "!cmd hint is brand purple");
+        // Distinct affordance vs actionable text (bare "! for shell mode" vs
+        // "Enter to run…") without pinning the active locale's exact strings.
+        assert_ne!(bare.0, cmd.0, "bare ! and runnable !cmd show different text");
+        assert_eq!(resolved("  !git status").map(|(_, s)| s), Some(HintSeverity::Shell));
+        // Not shell mode → no hint (so a normal `/webui` etc. keeps the slot).
+        assert!(resolved("ls").is_none());
+        assert!(resolved("").is_none());
+        assert!(resolved("echo !x").is_none(), "bang not at start");
+    }
 
     #[test]
     fn shows_only_for_a_nonempty_bang_command() {
@@ -7238,21 +7280,19 @@ pub(crate) fn set_agent_mode(
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_status(state, ctx);
-    // Discoverability: while composing a `!bash` command, surface a footer hint.
+    // Discoverability: while composing a `!` shell command, surface a brand-purple
+    // footer hint (bare `!` → "! for shell mode"; `!cmd` → "Enter to run…").
     // `build_status` always fills the slot with at least the lowest-priority
     // `/webui` fallback, so gate on "slot is free OR only holds that fallback" —
-    // this shows the bash hint over the webui nudge but still yields to a
+    // this shows the shell hint over the webui nudge but still yields to a
     // higher-priority hint (no-provider / high token usage / upgrade).
-    if bash_input_hint(&buf.text) {
+    if let Some((msg, severity)) = shell_mode_hint(&buf.text) {
         let slot_is_free = match &status.hint {
             None => true,
             Some((h, _)) => *h == crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
         };
         if slot_is_free {
-            status.hint = Some((
-                crate::i18n::t(crate::i18n::Msg::BashInputHint).into_owned(),
-                crate::render::HintSeverity::Info,
-            ));
+            status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
         }
     }
     renderer.render(UiLine::InputPrompt {

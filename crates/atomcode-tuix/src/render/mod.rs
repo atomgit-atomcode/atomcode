@@ -440,6 +440,9 @@ pub enum HintSeverity {
     #[default]
     Warning,
     Info,
+    /// `!` shell-mode affordance — renders in atomcode brand purple
+    /// (`Role::Shell`), matching the shell-mode box / badge.
+    Shell,
 }
 
 /// "model · cwd · ctx_used / ctx_window" chrome. Visible in both Idle
@@ -605,6 +608,17 @@ pub struct ToolGroupChild {
     pub text: String,
 }
 
+/// True when the live input buffer puts the user in `!` shell mode: a `!` leads
+/// the (left-trimmed) buffer, INCLUDING a bare `!`. Drives the shell-mode visual
+/// treatment (purple input box / chevron / status badge / `! for shell mode`
+/// hint). Pure fn of the buffer, so the treatment is transient — it arms the
+/// instant `!` is typed and reverts the instant it's gone (submit / clear /
+/// delete), no persistent mode state (unlike `/plan` `/auto`). Distinct from
+/// `bash_input_hint`, which needs a runnable command (non-empty after `!`).
+pub fn input_shell_mode(buf: &str) -> bool {
+    buf.trim_start().starts_with('!')
+}
+
 /// Wrap a compaction marker label in a dash rule: `─── {label} ───` (unicode)
 /// or `--- {label} ---` (ASCII fallback for fonts lacking box-drawing — the
 /// same `unicode_symbols` gate the spinner `◐`→`|/-\` and ellipsis `…`→`...`
@@ -640,6 +654,23 @@ pub fn fmt_dur(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_mode_is_a_leading_bang_including_bare() {
+        // Drives the shell-mode visual treatment (purple box / chevron / badge /
+        // `! for shell mode` hint). Active the instant `!` leads the buffer —
+        // INCLUDING a bare `!` (the affordance shows before a command is typed),
+        // unlike `bash_input_hint` which needs a runnable command.
+        assert!(input_shell_mode("!"), "bare ! already arms shell mode");
+        assert!(input_shell_mode("!ls -la"));
+        assert!(input_shell_mode("  !git status"), "leading whitespace tolerated");
+        // Reverts the instant the `!` is gone — pure fn of the live buffer, so a
+        // submit/clear/delete flips it back with no persistent state.
+        assert!(!input_shell_mode(""), "empty buffer is not shell mode");
+        assert!(!input_shell_mode("   "), "blank buffer is not shell mode");
+        assert!(!input_shell_mode("ls"), "no leading bang");
+        assert!(!input_shell_mode("echo !x"), "bang not at the start");
+    }
 
     #[test]
     fn compaction_rule_wraps_label_unicode() {

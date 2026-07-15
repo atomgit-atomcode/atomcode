@@ -955,6 +955,11 @@ pub enum Msg<'a> {
     /// `!<cmd>` line runs a local shell command directly (user-invoked bash).
     BashInputHint,
 
+    /// Footer affordance shown the instant the input is a BARE `!` (no command
+    /// yet) — signals the user has entered `!` shell mode, before `BashInputHint`
+    /// ("Enter to run…") takes over once a command is typed.
+    ShellModeHint,
+
     /// Startup hint shown on terminals where Kitty CSI-u keyboard
     /// disambiguation isn't available, telling the user the
     /// guaranteed-works `\<Enter>` multi-line trick. Multi-line

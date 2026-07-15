@@ -42,6 +42,20 @@ impl Palette {
     /// portable across terminals.
     pub const MODE: Color = Color::AnsiValue(104);
 
+    /// Shell-mode (`!`) accent — atomcode's brand **purple** (`#7c3aed` family),
+    /// deliberately NOT the reddish global `BRAND` magenta. Terminal chrome has
+    /// no 16-colour "purple" (SGR magenta is the red-leaning one), so we use
+    /// 256-colour `AnsiValue` like `MODE`. Split light/dark because `AnsiValue`
+    /// is fixed (doesn't track the terminal palette) — the periwinkle that pops
+    /// on dark washes out on white.
+    ///
+    /// Dark → periwinkle `AnsiValue(104)` (≈`#8787d7`, same hue as the mode
+    /// badge, so `!` shell mode reads as a sibling of `PLAN`/`auto`).
+    pub const SHELL_DARK: Color = Color::AnsiValue(104);
+    /// Light → deeper violet `AnsiValue(56)` (≈`#5f00d7`, close to the `#7c3aed`
+    /// brand) so the border / hint keep contrast on a white background.
+    pub const SHELL_LIGHT: Color = Color::AnsiValue(56);
+
     /// Muted text on **light** backgrounds. SGR 90 ("bright black") maps
     /// to a mid-gray on most light themes — contrast against `#FFFFFF`
     /// lands around 4.5–5:1, comfortably above AA.
@@ -122,6 +136,19 @@ pub fn warning_for_current_theme() -> Color {
     }
 }
 
+/// Resolve the shell-mode (`!`) accent for the active palette — atomcode's
+/// brand purple, kept readable on both backgrounds.
+///
+/// Light theme → `SHELL_LIGHT` (deeper violet, contrast on white).
+/// Dark theme  → `SHELL_DARK`  (periwinkle, pops on dark).
+pub fn shell_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::SHELL_LIGHT
+    } else {
+        Palette::SHELL_DARK
+    }
+}
+
 /// Resolve the diff add shade for the active palette.
 ///
 /// Light theme → `DIFF_ADD_LIGHT` (SGR 32 dark green, readable on white).
@@ -163,6 +190,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     match role {
         Role::Brand => Some(Palette::BRAND),
         Role::Mode => Some(Palette::MODE),
+        Role::Shell => Some(shell_for_current_theme()),
         Role::Muted => Some(muted_for_current_theme()),
         Role::Accent => Some(Palette::ACCENT),
         Role::AccentDim => Some(muted_for_current_theme()),
@@ -191,6 +219,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
 pub enum Role {
     Brand,
     Mode,
+    Shell,
     Muted,
     Accent,
     AccentDim,
@@ -289,6 +318,27 @@ mod tests {
         );
         // Distinct shades, else the split is pointless.
         assert_ne!(Palette::WARNING_LIGHT, Palette::WARNING_DARK);
+        md_theme::set_theme_mode(false); // restore default
+    }
+
+    #[test]
+    fn shell_mode_uses_brand_purple_and_switches_with_theme() {
+        // The `!` shell-mode accent is atomcode's brand PURPLE (#7c3aed family),
+        // NOT the reddish `Brand` magenta. Because `AnsiValue` is fixed (doesn't
+        // track the terminal palette), a light-theme-safe deeper purple is used
+        // on light backgrounds and the periwinkle pops on dark.
+        use crate::highlight::theme as md_theme;
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(role(caps(true), Role::Shell), Some(Palette::SHELL_DARK));
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(
+            role(caps(true), Role::Shell),
+            Some(Palette::SHELL_LIGHT),
+            "light theme must use the deeper purple — periwinkle washes out on white"
+        );
+        // Distinct shades, else the split is pointless; and never the red magenta.
+        assert_ne!(Palette::SHELL_LIGHT, Palette::SHELL_DARK);
+        assert_ne!(Palette::SHELL_DARK, Palette::BRAND, "shell must not be the red brand magenta");
         md_theme::set_theme_mode(false); // restore default
     }
 
