@@ -817,6 +817,7 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.approval_panel = None;
+        self.steered_folded = 0;
     }
 
     /// A mid-turn steer was folded into the running turn (kernel `Steered` event).
@@ -838,6 +839,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
+        self.steered_folded = 0;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -1855,5 +1857,12 @@ mod tests {
         st.on_steered(5);
         st.on_submit();
         assert_eq!(st.steered_folded, 0, "a fresh turn starts at 0");
+        // Every turn-end path clears it, for parity with the other per-turn counters.
+        st.on_steered(4);
+        st.on_turn_cancelled();
+        assert_eq!(st.steered_folded, 0, "cleared on cancel");
+        st.on_steered(6);
+        st.on_error();
+        assert_eq!(st.steered_folded, 0, "cleared on error");
     }
 }
