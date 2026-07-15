@@ -838,6 +838,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescClear => "Clear screen".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
         Msg::CmdDescCost => "Show token cost".into(),
+        Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
         Msg::CmdDescContext => "Show context budget breakdown".into(),
         Msg::CmdDescCompact => "Compact conversation history".into(),
         Msg::CmdDescRemember => "Save a fact to memory (/remember --global for global)".into(),
@@ -1203,6 +1204,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::UsageNoData => "No usage data available".into(),
         Msg::UsageFooterHint => "Tab / 1·2·3 switch · Esc close".into(),
         Msg::UsageFetchFailed { error } => format!("Failed to load usage: {error}").into(),
+        Msg::UsageCodingPlanOnly =>
+            "Usage is only available on CodingPlan — run /login.".into(),
 
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>

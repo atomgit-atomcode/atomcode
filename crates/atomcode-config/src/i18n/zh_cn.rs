@@ -823,6 +823,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescClear => "清屏".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
         Msg::CmdDescCost => "显示 Token 费用".into(),
+        Msg::CmdDescUsage => "显示 CodingPlan 用量（标签：当前窗口 / 总览 / 模型）".into(),
         Msg::CmdDescContext => "显示上下文预算明细".into(),
         Msg::CmdDescCompact => "压缩对话历史".into(),
         Msg::CmdDescRemember => "保存记忆（/remember --global 为全局）".into(),
@@ -1181,6 +1182,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::UsageNoData => "暂无用量数据".into(),
         Msg::UsageFooterHint => "Tab / 1·2·3 切换 · Esc 关闭".into(),
         Msg::UsageFetchFailed { error } => format!("加载用量失败：{error}").into(),
+        Msg::UsageCodingPlanOnly =>
+            "使用情况仅 CodingPlan 可用 — 请先 /login。".into(),
 
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
