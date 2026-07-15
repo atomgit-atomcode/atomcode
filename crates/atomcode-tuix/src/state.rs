@@ -409,11 +409,15 @@ pub struct UiState {
     /// Any other event flushes this buffer with the usual `↻ goal round N`
     /// or `✓ done` label.
     pub pending_separator: Option<PendingSeparator>,
-    /// Running count of mid-turn steers folded into the current turn by the
-    /// kernel (`AgentEvent::Steered { count }`). Accumulates over the turn;
-    /// cleared at turn end and at new turn start. Surfaced in the footer
-    /// spinner label as `· 已并入 N` when non-zero.
-    pub steered_folded: usize,
+    /// Mid-turn steers submitted but NOT YET folded into the turn by the kernel
+    /// — i.e. still waiting for the next model-request boundary. Incremented when
+    /// the TUI dispatches a steer (`on_steer_sent`), decremented when the kernel
+    /// confirms the fold (`AgentEvent::Steered { count }` → `on_steered`), and
+    /// cleared at turn end / new turn start. Surfaced in the footer as
+    /// `· N to fold` while non-zero, so it DRAINS to nothing once folded (it is a
+    /// pending indicator, not a cumulative tally). Mirrors codex's pending-steer
+    /// list / opencode's draining `N queued`.
+    pub steer_pending: usize,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -538,7 +542,7 @@ impl UiState {
             loop_round: 0,
             loop_started_at: None,
             pending_separator: None,
-            steered_folded: 0,
+            steer_pending: 0,
         }
     }
 
@@ -770,7 +774,7 @@ impl UiState {
         self.last_stream_activity = Some(now);
         // Belt-and-suspenders: a fresh turn always starts with zero steers, even
         // if the previous turn ended abnormally and never fired on_turn_complete.
-        self.steered_folded = 0;
+        self.steer_pending = 0;
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -800,7 +804,7 @@ impl UiState {
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
-        self.steered_folded = 0;
+        self.steer_pending = 0;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -817,13 +821,20 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.approval_panel = None;
-        self.steered_folded = 0;
+        self.steer_pending = 0;
     }
 
-    /// A mid-turn steer was folded into the running turn (kernel `Steered` event).
-    /// Accumulates over the turn; cleared at turn end.
+    /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
+    /// to fold into the running turn at the next model-request boundary.
+    pub fn on_steer_sent(&mut self) {
+        self.steer_pending += 1;
+    }
+
+    /// The kernel confirmed it folded `count` steered prompt(s) into the turn
+    /// (`AgentEvent::Steered`). Drain the pending count; `saturating_sub` so a
+    /// steer folded from another client (no local `on_steer_sent`) can't underflow.
     pub fn on_steered(&mut self, count: usize) {
-        self.steered_folded += count;
+        self.steer_pending = self.steer_pending.saturating_sub(count);
     }
 
     pub fn on_error(&mut self) {
@@ -839,7 +850,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
-        self.steered_folded = 0;
+        self.steer_pending = 0;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -1847,22 +1858,29 @@ mod tests {
     }
 
     #[test]
-    fn steered_folded_accumulates_and_clears_per_turn() {
+    fn steer_pending_counts_unfolded_and_drains_on_fold() {
         let mut st = UiState::new();
+        st.on_steer_sent();
+        st.on_steer_sent();
+        assert_eq!(st.steer_pending, 2, "two steers dispatched, none folded yet");
+        st.on_steered(1); // kernel confirms one fold
+        assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
         st.on_steered(1);
-        st.on_steered(2);
-        assert_eq!(st.steered_folded, 3, "folded count accumulates within a turn");
+        assert_eq!(st.steer_pending, 0, "back to zero once all folded — a draining indicator");
+        st.on_steered(3); // spurious / cross-client fold never underflows
+        assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
+        // Every turn-end path clears it, parity with the other per-turn counters.
+        st.on_steer_sent();
         st.on_turn_complete();
-        assert_eq!(st.steered_folded, 0, "cleared at turn end");
-        st.on_steered(5);
-        st.on_submit();
-        assert_eq!(st.steered_folded, 0, "a fresh turn starts at 0");
-        // Every turn-end path clears it, for parity with the other per-turn counters.
-        st.on_steered(4);
+        assert_eq!(st.steer_pending, 0, "cleared at turn end");
+        st.on_steer_sent();
         st.on_turn_cancelled();
-        assert_eq!(st.steered_folded, 0, "cleared on cancel");
-        st.on_steered(6);
+        assert_eq!(st.steer_pending, 0, "cleared on cancel");
+        st.on_steer_sent();
         st.on_error();
-        assert_eq!(st.steered_folded, 0, "cleared on error");
+        assert_eq!(st.steer_pending, 0, "cleared on error");
+        st.on_steer_sent();
+        st.on_submit();
+        assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
     }
 }

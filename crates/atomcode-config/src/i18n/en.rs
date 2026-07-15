@@ -1070,7 +1070,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::EscAgainToUndo => "  (press Esc again to undo last turn)\n".into(),
         Msg::BashInputHint => "Enter to run as a bash command".into(),
         Msg::ShellModeHint => "! for shell mode".into(),
-        Msg::SteerFoldedHint => "folded into current turn".into(),
+        Msg::SteerFoldedHint => "will fold into current turn".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \

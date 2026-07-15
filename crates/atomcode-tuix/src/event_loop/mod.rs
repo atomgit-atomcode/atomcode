@@ -7900,13 +7900,15 @@ fn handle_streaming_key(
             });
             match midturn_submit_route(true, ctx.sync_session.is_some()) {
                 SubmitRoute::SteerNow => {
-                    // Fold into the running turn: the kernel drains this at the next
-                    // round boundary (see AgentEvent::Steered). No local queue.
+                    // Steer into the running turn: the kernel folds this at the next
+                    // round boundary (see AgentEvent::Steered). No local queue. Count
+                    // it as PENDING now; the Steered event drains it once folded.
                     ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
                         text: expanded,
                         images: q_images,
                         image_markers: q_markers,
                     }).ok();
+                    app.state.on_steer_sent();
                     renderer.render(UiLine::CommandOutput(format!(
                         "  ↳ {}: {}\n",
                         crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
@@ -11592,8 +11594,10 @@ fn format_spinner_label(
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
-    if state.steered_folded > 0 {
-        out.push_str(&format!(" · folded {}", state.steered_folded));
+    if state.steer_pending > 0 {
+        // Draining "waiting to fold" count — appears when you steer, gone once the
+        // kernel folds it into the turn (mirrors codex/opencode's pending indicator).
+        out.push_str(&format!(" · {} to fold", state.steer_pending));
     }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall
