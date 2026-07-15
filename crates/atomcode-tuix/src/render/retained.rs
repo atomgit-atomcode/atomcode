@@ -624,9 +624,9 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// region monotonically advance through `body_lines` regardless of
     /// tail mutations.
     scrolled_off: usize,
-    /// Cached semantic welcome payload so resize can rebuild the
-    /// startup banner for the new terminal width.
-    welcome_banner: Option<(String, String)>,
+    /// Cached `(model, working_dir, chosen_pool_indices)` so resize rebuilds
+    /// the SAME mascot + tips instead of re-rolling the random pick.
+    welcome_banner: Option<(String, String, Vec<usize>)>,
     /// Number of rows occupied by the welcome banner prefix in
     /// `body_lines`.
     welcome_line_count: usize,
@@ -4267,6 +4267,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         normalized
     }
 
+    #[allow(dead_code)]
     fn build_wrapped_text_rows(
         &self,
         parts: &[(&str, CellStyle)],
@@ -4317,11 +4318,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows
     }
 
-    fn build_welcome_rows(&self, model: &str, working_dir: &str) -> Vec<Vec<Cell>> {
+    fn build_welcome_rows(
+        &self,
+        model: &str,
+        working_dir: &str,
+        tip_indices: &[usize],
+    ) -> Vec<Vec<Cell>> {
         // Mirror AnsiRenderer::render_welcome, but allow narrow terminals
         // to reflow path/model/tips instead of truncating or colliding.
         let w = self.screen.width() as usize;
         let content_w = w.saturating_sub(PAD_COL * 2).max(1);
+
+        // ---- Row 0: header (unchanged from the previous implementation) ----
         // Row 1: brand left + version · license right
         let left_txt = "◆ AtomCode";
         let right_ver = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -4329,7 +4337,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let left_w = crate::width::display_width(left_txt);
         let right_txt = format!("{}  ·  {}", right_ver, right_lic);
         let right_w = crate::width::display_width(&right_txt);
-        let mut rows = Vec::with_capacity(6);
+        let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(12);
         let pad = CellStyle::default();
         if content_w > left_w + right_w {
             let gap = content_w.saturating_sub(left_w + right_w);
@@ -4361,139 +4369,87 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rows.push(row1b);
         }
 
-        let bullet_style = self.style_for(Role::AccentDim);
-        let secondary_style = self.style_for(Role::Secondary);
-        let path_cells = {
+        rows.push(Vec::new()); // blank separator
+
+        // ---- Left block: mascot (if colors) + cwd + model ----
+        let secondary = self.style_for(Role::Secondary);
+        let bullet = self.style_for(Role::AccentDim);
+        let show_mascot = self.caps.colors;
+        let mascot_w = crate::render::mascot::MASCOT_WIDTH;
+
+        let mut left: Vec<Vec<Cell>> = Vec::new();
+        if show_mascot {
+            for mut mrow in self.build_mascot_rows() {
+                // leading pad so the mascot aligns under the header's PAD_COL
+                let mut row = Vec::with_capacity(PAD_COL + mrow.len());
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                row.append(&mut mrow);
+                left.push(row);
+            }
+        }
+        // cwd + model bullets (reuse the existing wrapped-bullet helper)
+        for text in [working_dir, model] {
             let mut cells = Vec::new();
-            push_str_cells(&mut cells, working_dir, &secondary_style);
-            cells
-        };
-        rows.extend(self.build_prefixed_wrapped_rows(
-            "∙ ",
-            &bullet_style,
-            "  ",
-            &CellStyle::default(),
-            path_cells,
-            content_w,
-        ));
-
-        let model_cells = {
-            let mut cells = Vec::new();
-            push_str_cells(&mut cells, model, &secondary_style);
-            cells
-        };
-        rows.extend(self.build_prefixed_wrapped_rows(
-            "∙ ",
-            &bullet_style,
-            "  ",
-            &CellStyle::default(),
-            model_cells,
-            content_w,
-        ));
-
-        // Blank separator.
-        rows.push(Vec::new());
-
-        // Hint rows. The prose around the slash shortcuts is onboarding-
-        // critical text — first thing a new user reads. Use faint
-        // (SGR 2) over the terminal's default fg so the hint reads as
-        // subordinate to primary content without picking a fixed gray
-        // (DarkGrey would vanish on some iTerm2 light presets, default
-        // fg unmuted competes with the user's input on dark presets).
-        // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
-        // Hint row(s): input prompt + /provider + /login.
-        //
-        // Wide enough to fit on one visual row → emit a single combined
-        // line (user's preferred shape on standard 100+ col terminals).
-        // Narrower → fall back to three separate rows; the alternative
-        // is a single line that `build_wrapped_text_rows` would
-        // hard-break mid-token (`/provider` → `/provi`+`der`), which
-        // looks worse than three short rows on a small terminal.
-        let hint_text = self.style_faint(Role::Secondary);
-        let accent_bold = self.style_bold(Role::Accent);
-        let idle_prefix = t(Msg::IdleHintPrefix);
-        let idle_slash = t(Msg::IdleHintSlash);
-        let idle_suffix = t(Msg::IdleHintSuffix);
-        let provider_cmd = t(Msg::IdleHintProvider);
-        let provider_suffix = t(Msg::IdleHintProviderSuffix);
-        let codingplan_cmd = t(Msg::IdleHintCodingplan);
-        let codingplan_suffix = t(Msg::IdleHintCodingplanSuffix);
-        let webui_cmd = t(Msg::IdleHintWebui);
-        let webui_suffix = t(Msg::IdleHintWebuiSuffix);
-        let combined_width: usize = [
-            idle_prefix.as_ref(),
-            idle_slash.as_ref(),
-            idle_suffix.as_ref(),
-            "   ",
-            provider_cmd.as_ref(),
-            "  ",
-            provider_suffix.as_ref(),
-            "   ",
-            codingplan_cmd.as_ref(),
-            "  ",
-            codingplan_suffix.as_ref(),
-            "   ",
-            webui_cmd.as_ref(),
-            "  ",
-            webui_suffix.as_ref(),
-        ]
-        .iter()
-        .map(|s| unicode_width::UnicodeWidthStr::width(*s))
-        .sum();
-        if combined_width <= content_w {
-            rows.extend(self.build_wrapped_text_rows(
-                &[
-                    (&idle_prefix, hint_text.clone()),
-                    (&idle_slash, accent_bold.clone()),
-                    (&idle_suffix, hint_text.clone()),
-                    ("   ", hint_text.clone()),
-                    (&provider_cmd, accent_bold.clone()),
-                    ("  ", hint_text.clone()),
-                    (&provider_suffix, hint_text.clone()),
-                    ("   ", hint_text.clone()),
-                    (&codingplan_cmd, accent_bold.clone()),
-                    ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text.clone()),
-                    ("   ", hint_text.clone()),
-                    (&webui_cmd, accent_bold),
-                    ("  ", hint_text.clone()),
-                    (&webui_suffix, hint_text),
-                ],
+            push_str_cells(&mut cells, text, &secondary);
+            left.extend(self.build_prefixed_wrapped_rows(
+                "∙ ",
+                &bullet,
+                "  ",
+                &CellStyle::default(),
+                cells,
                 content_w,
             ));
+        }
+
+        // ---- Right block: tips heading + [pinned + chosen] ----
+        let heading = self.style_faint(Role::Secondary);
+        let cmd_style = self.style_bold(Role::Accent);
+        let desc_style = self.style_faint(Role::Secondary);
+        let tips = crate::render::welcome_tips::tips_from_indices(tip_indices);
+        let cmd_col = tips.iter().map(|tip| tip.cmd.len()).max().unwrap_or(0) + 2;
+
+        let mut right: Vec<Vec<Cell>> = Vec::new();
+        {
+            let mut hrow = Vec::new();
+            push_str_cells(&mut hrow, &t(Msg::WelcomeTipsHeading), &heading);
+            right.push(hrow);
+        }
+        for tip in &tips {
+            let mut trow = Vec::new();
+            push_str_cells(&mut trow, tip.cmd, &cmd_style);
+            let pad_spaces = cmd_col.saturating_sub(tip.cmd.len());
+            push_str_cells(&mut trow, &" ".repeat(pad_spaces), &CellStyle::default());
+            push_str_cells(&mut trow, &t(tip.desc), &desc_style);
+            right.push(trow);
+        }
+
+        // ---- Compose: two columns if wide enough, else stacked ----
+        let gap = 4usize;
+        let left_w = if show_mascot { PAD_COL + mascot_w } else { PAD_COL };
+        let tips_col = left_w + gap;
+        let min_right = 24usize;
+        if content_w >= tips_col + min_right {
+            let n = left.len().max(right.len());
+            for i in 0..n {
+                let mut row = left.get(i).cloned().unwrap_or_default();
+                let cur_w: usize = row.iter().map(|c| c.width as usize).sum();
+                for _ in cur_w..tips_col {
+                    row.push(Cell::blank());
+                }
+                if let Some(rrow) = right.get(i) {
+                    row.extend(rrow.clone());
+                }
+                rows.push(row);
+            }
         } else {
-            rows.extend(self.build_wrapped_text_rows(
-                &[
-                    (&idle_prefix, hint_text.clone()),
-                    (&idle_slash, accent_bold.clone()),
-                    (&idle_suffix, hint_text.clone()),
-                ],
-                content_w,
-            ));
-            rows.extend(self.build_wrapped_text_rows(
-                &[
-                    (&provider_cmd, accent_bold.clone()),
-                    ("  ", hint_text.clone()),
-                    (&provider_suffix, hint_text.clone()),
-                ],
-                content_w,
-            ));
-            rows.extend(self.build_wrapped_text_rows(
-                &[
-                    (&codingplan_cmd, accent_bold.clone()),
-                    ("  ", hint_text.clone()),
-                    (&codingplan_suffix, hint_text.clone()),
-                ],
-                content_w,
-            ));
-            rows.extend(self.build_wrapped_text_rows(
-                &[
-                    (&webui_cmd, accent_bold),
-                    ("  ", hint_text.clone()),
-                    (&webui_suffix, hint_text),
-                ],
-                content_w,
-            ));
+            // stacked: left block, then right block (indented by PAD_COL)
+            rows.extend(left);
+            for rrow in right {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                row.extend(rrow);
+                rows.push(row);
+            }
         }
 
         // Trailing blank so subsequent async events (MCP "已连接",
@@ -4504,8 +4460,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn push_welcome(&mut self, model: &str, working_dir: &str) {
-        let rows = self.build_welcome_rows(model, working_dir);
-        self.welcome_banner = Some((model.to_string(), working_dir.to_string()));
+        // Roll the random tip pick ONCE; cache the chosen POOL indices so a
+        // later resize reflows the same tips.
+        let mut rng = rand::thread_rng();
+        let chosen = crate::render::welcome_tips::choose_pool_indices(&mut rng);
+        let rows = self.build_welcome_rows(model, working_dir, &chosen);
+        self.welcome_banner = Some((model.to_string(), working_dir.to_string(), chosen));
         self.welcome_line_count = rows.len();
         for row in rows {
             self.push_body_row(row);
@@ -4600,13 +4560,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn reflow_welcome_prefix(&mut self) {
-        let Some((ref model, ref working_dir)) = self.welcome_banner else {
+        let Some((model, working_dir, chosen)) = self.welcome_banner.clone() else {
             return;
         };
         if self.welcome_line_count == 0 || self.body_lines.len() < self.welcome_line_count {
             return;
         }
-        let rows = self.build_welcome_rows(model, working_dir);
+        let rows = self.build_welcome_rows(&model, &working_dir, &chosen);
         let new_len = rows.len();
         self.body_lines
             .splice(0..self.welcome_line_count, rows.into_iter());
@@ -5584,7 +5544,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         let model_scrubbed = scrub_controls(model);
         let wd_scrubbed = scrub_controls(working_dir);
-        self.welcome_banner = Some((model_scrubbed, wd_scrubbed));
+        // Preserve the existing chosen_pool_indices so model/cwd update
+        // doesn't re-roll the random tip selection.
+        let chosen = self
+            .welcome_banner
+            .as_ref()
+            .map(|(_, _, c)| c.clone())
+            .unwrap_or_default();
+        self.welcome_banner = Some((model_scrubbed, wd_scrubbed, chosen));
         self.reflow_welcome_prefix();
 
         let bottom = self.body_bottom_row() as usize;
@@ -8524,14 +8491,13 @@ mod tests {
         );
     }
 
-    /// Welcome via vterm: after receiving UiLine::Welcome, the
-    /// six welcome lines (brand / cwd / model / blank / type hint
-    /// / provider hint) must all appear on the screen above the
-    /// footer.
+    /// Welcome via vterm: after receiving UiLine::Welcome, all expected
+    /// welcome pieces (brand / cwd / model / tips heading / /login) must
+    /// appear on the screen above the footer.
     #[test]
     fn retained_welcome_lines_render_via_vterm() {
-        let (mut r, buf) = new_capturing(80, 24);
-        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let (mut r, buf) = new_capturing(80, 30);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 30);
         let status = status_basic();
 
         r.render(UiLine::Welcome {
@@ -8549,13 +8515,13 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Append-only top-anchored: 7 welcome rows occupy rows 0..=6,
-        // footer 4 rows occupies rows 7..=10, blank below. Verify
-        // each expected piece exists somewhere in the body region.
-        let found_brand = (0..=6).any(|r| vterm.row_text(r).contains("AtomCode"));
-        let found_cwd = (0..=6).any(|r| vterm.row_text(r).contains("~/p/a"));
-        let found_model = (0..=6).any(|r| vterm.row_text(r).contains("glm-5"));
-        let found_hint = (0..=6).any(|r| vterm.row_text(r).contains("browse commands"));
+        // Two-column layout: brand + blank + (mascot | tips) rows + cwd/model +
+        // trailing blank. All pieces should be somewhere in the visible body.
+        let found_brand = (0..30).any(|r| vterm.row_text(r).contains("AtomCode"));
+        let found_cwd = (0..30).any(|r| vterm.row_text(r).contains("~/p/a"));
+        let found_model = (0..30).any(|r| vterm.row_text(r).contains("glm-5"));
+        // New layout shows tips (/login always pinned) instead of idle hint text.
+        let found_hint = (0..30).any(|r| vterm.row_text(r).contains("/login"));
         assert!(
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
@@ -8733,9 +8699,11 @@ mod tests {
 
     #[test]
     fn retained_resize_reflows_welcome_brand_row_when_shrinking() {
-        // Height 20 (not 18): the idle hints take one extra row since the
-        // /webui shortcut was added, so the welcome block is one row taller.
-        let (mut r, buf) = new_capturing(80, 20);
+        // Height 30: the two-column layout produces more rows when stacked on
+        // a narrow terminal (brand×1-2 + blank + mascot×6 + cwd + model +
+        // tips×5 + blank ≈ 17 body rows). We need enough height so the brand
+        // row stays in the visible viewport after the banner expands on shrink.
+        let (mut r, buf) = new_capturing(80, 30);
 
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
@@ -8749,19 +8717,19 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
-        let mut pre = crate::test_term::VirtualTerminal::new(80, 20);
+        let mut pre = crate::test_term::VirtualTerminal::new(80, 30);
         drain_into_vterm(&buf, &mut pre);
 
-        r.on_resize(24, 20);
+        r.on_resize(24, 30);
         r.flush_deferred();
-        let mut post = crate::test_term::VirtualTerminal::new(24, 20);
+        let mut post = crate::test_term::VirtualTerminal::new(24, 30);
         drain_into_vterm(&buf, &mut post);
 
-        let brand_row = (0..20)
+        let brand_row = (0..30)
             .map(|row| post.row_text(row))
             .find(|row| row.contains("AtomCode"))
             .expect("brand row should remain visible after shrinking");
-        let version_row = (0..20)
+        let version_row = (0..30)
             .map(|row| post.row_text(row))
             .find(|row| row.contains(concat!("v", env!("CARGO_PKG_VERSION"))))
             .expect("version row should remain visible after shrinking");
@@ -8875,14 +8843,12 @@ mod tests {
     #[test]
     fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
         // 22-col WIDTH is the test's actual subject (column reflow).
-        // Use 26-row HEIGHT — large enough that the reflowed banner
-        // (title × 2 + path × 4 + model × 2 + blank + hint_a × 3 +
-        // hint_b × 2 + hint_c × 3 = 17 body rows, plus 4 footer rows)
-        // fits entirely in the viewport with headroom. With a 20-row
-        // viewport the brand line scrolled into scrollback and made the
-        // assertion brittle to small additions to the hint block.
-        let (mut r, buf) = new_capturing(22, 26);
-        let mut vterm = crate::test_term::VirtualTerminal::new(22, 26);
+        // Use 30-row HEIGHT — large enough that the reflowed banner
+        // (title × 2 + blank + mascot × 6 + path × 4 + model × 2 +
+        //  heading + tips × 4 + blank ≈ 21 body rows, plus 4 footer rows)
+        // fits entirely in the viewport with headroom.
+        let (mut r, buf) = new_capturing(22, 30);
+        let mut vterm = crate::test_term::VirtualTerminal::new(22, 30);
 
         r.render(UiLine::Welcome {
             model: "MiniMax-M2.7-long".into(),
@@ -8899,33 +8865,33 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("AtomCode")),
+            (0..30).any(|row| vterm.row_text(row).contains("AtomCode")),
             "brand missing on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("workspace")),
+            (0..30).any(|row| vterm.row_text(row).contains("workspace")),
             "path should wrap instead of disappearing on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("MiniMax")),
+            (0..30).any(|row| vterm.row_text(row).contains("MiniMax")),
             "model should wrap instead of disappearing on narrow terminal\n{}",
             vterm.dump()
         );
+        // New layout: tips replace old idle hint text. /login is always
+        // pinned; tips heading is always present.
         assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("type something")),
-            "welcome input hint should remain visible on narrow terminal\n{}",
+            (0..30).any(|row| vterm.row_text(row).contains("/login")),
+            "pinned /login tip should be visible on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("commands")),
-            "welcome commands hint should remain visible on narrow terminal\n{}",
-            vterm.dump()
-        );
-        assert!(
-            (0..26).any(|row| vterm.row_text(row).contains("/provider")),
-            "provider hint should remain visible on narrow terminal\n{}",
+            (0..30).any(|row| {
+                let t = vterm.row_text(row);
+                t.contains("Tips") || t.contains("提示")
+            }),
+            "tips heading should be visible on narrow terminal\n{}",
             vterm.dump()
         );
     }
@@ -14907,6 +14873,62 @@ mod tests {
         assert!(row_after_footer.trim().is_empty(),
             "row {} (just below footer) must be blank; got: {:?}",
             expected_footer_rows, row_after_footer);
+    }
+
+    // helper: collect body_lines chars, skipping wide-glyph continuation cells
+    // (width==0) so CJK "上手提示" doesn't become "上 手 提 示".
+    fn body_text(r: &RetainedRenderer<CountingSink>) -> String {
+        r.body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.width != 0)
+            .map(|c| c.ch)
+            .collect()
+    }
+
+    // helper: extract "/xxx" tokens from the rendered welcome body
+    fn tip_cmds(r: &RetainedRenderer<CountingSink>) -> Vec<String> {
+        body_text(r)
+            .split_whitespace()
+            .filter(|w| w.starts_with('/'))
+            .map(|w| w.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn welcome_wide_has_mascot_and_pinned_login() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let text = body_text(&r);
+        assert!(text.contains('▀'), "mascot half-blocks must be present");
+        assert!(text.contains("/login"), "pinned /login must be present");
+        assert!(
+            text.contains("Tips for getting started") || text.contains("上手提示"),
+            "tips heading present"
+        );
+    }
+
+    #[test]
+    fn welcome_colors_off_omits_mascot() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = false;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let text = body_text(&r);
+        assert!(!text.contains('▀'), "no mascot when colors are disabled");
+        assert!(text.contains("/login"), "tips still present without color");
+    }
+
+    #[test]
+    fn welcome_reflow_keeps_same_tips() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = true;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let before: Vec<String> = tip_cmds(&r);
+        r.reflow_welcome_prefix();
+        let after: Vec<String> = tip_cmds(&r);
+        assert_eq!(before, after, "reflow must not re-roll the random tips");
     }
 }
 
