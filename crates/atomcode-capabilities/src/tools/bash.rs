@@ -61,6 +61,15 @@ impl Tool for BashTool {
             Err(_) => RiskLevel::Risky,
         }
     }
+    /// Read-only bash commands (per [`is_read_only_bash`]) may run concurrently;
+    /// everything else serializes behind the write-lock. A parse failure is
+    /// conservatively NOT parallel-safe.
+    fn parallel_safe(&self, args: &str) -> bool {
+        serde_json::from_str::<Args>(args)
+            .ok()
+            .map(|a| is_read_only_bash(&a.command))
+            .unwrap_or(false)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
@@ -77,7 +86,7 @@ impl Tool for BashTool {
         // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
         // the askpass helper is actually active; off Windows the command is untouched.
         #[cfg(unix)]
-        let effective_command = if atomcode_askpass::current_env().is_some() {
+        let effective_command = if crate::askpass::current_env().is_some() {
             rewrite_sudo_for_askpass(&a.command)
         } else {
             a.command.clone()
@@ -129,7 +138,7 @@ impl Tool for BashTool {
         // for /dev/tty, and inject the askpass env vars so they use our password prompt.
         #[cfg(unix)]
         {
-            if let Some(env) = atomcode_askpass::current_env() {
+            if let Some(env) = crate::askpass::current_env() {
                 apply_askpass_env(&mut cmd, env);
             }
             // Mirror exactly how atomcode-core/src/tool/bash.rs attaches setsid:
@@ -157,13 +166,22 @@ impl Tool for BashTool {
             biased;
             // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
             _ = ctx.cancel.cancelled() => {
-                err(format!("bash: cancelled before completion. Command: {}", a.command))
+                // The command itself is already shown in the `● Bash(…)`
+                // header above (for the user) and in the tool-call record
+                // (for the model), so don't echo it back — a long command
+                // just wraps into several redundant error lines.
+                err("bash: cancelled before completion.".to_string())
             }
             res = tokio::time::timeout(dur, wait) => match res {
                 Ok(Ok(output)) => format_output(&output),
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
-                Err(_) => err(format!("bash: timed out after {secs}s. Command: {}", a.command)),
+                // Don't echo the command (see the cancel arm); point at the actionable
+                // knob — a larger `timeout` — the way the core bash tool does.
+                Err(_) => err(format!(
+                    "bash: timed out after {secs}s — pass a larger `timeout` if this command \
+                     legitimately needs longer."
+                )),
             }
         }
     }
@@ -273,7 +291,7 @@ fn shell_tool_description(is_windows: bool, bash_present: bool) -> &'static str 
 /// Set the five askpass/socket env vars on the command so sudo/ssh use our TUI
 /// password prompt instead of fighting the TUI for /dev/tty.
 #[cfg(unix)]
-fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &atomcode_askpass::server::AskpassEnv) {
+fn apply_askpass_env(cmd: &mut tokio::process::Command, env: &crate::askpass::server::AskpassEnv) {
     cmd.env("SUDO_ASKPASS", &env.askpass_script)
         .env("SSH_ASKPASS", &env.askpass_script)
         .env("SSH_ASKPASS_REQUIRE", "force")
@@ -1334,10 +1352,207 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
+/// The strict read-only command allowlist: the FIRST word of every pipeline
+/// segment must be one of these for the command to be considered parallel-safe.
+/// Deliberately tiny — these commands do not write files, mutate state, or run
+/// other programs (with the `find` carve-out handled below). Widening this is a
+/// future step, not a v1 concern.
+const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
+    "grep", "rg", "cat", "head", "tail", "ls", "find", "wc", "echo", "pwd",
+    "which", "stat", "cut", "tr", "nl", "rev", "basename",
+    "dirname", "file", "printf", "true", "false", "seq", "column",
+    "cd", // read-only builtin: only changes THIS process's cwd, scoped to this bash call.
+];
+
+/// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
+/// completely unparseable input. The caller must still reject trees containing
+/// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
+fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+    use std::cell::RefCell;
+    thread_local! {
+        static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
+    }
+    PARSER.with(|slot| {
+        let mut opt = slot.borrow_mut();
+        if opt.is_none() {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
+            *opt = Some(p);
+        }
+        opt.as_mut().unwrap().parse(command, None)
+    })
+}
+
+/// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
+/// sandbox. AST-based (tree-sitter-bash): only a fixed set of STRUCTURAL node kinds is
+/// allowed; any other NAMED kind (command substitution, subshell, expansion, …) means
+/// "cannot prove read-only" → false. Each `command` node's first word must be in
+/// [`READ_ONLY_BASH_ALLOWLIST`] (with the `find` write/exec carve-out); every redirect
+/// must target `/dev/null` or be an fd-dup. Fail CLOSED: parse failure / ERROR node /
+/// unknown named kind / non-discard redirect → false.
+///
+/// **Backgrounding (`&`):** a bare `&` (background/async operator) is an ANONYMOUS
+/// token in the tree-sitter-bash grammar — it is NOT a named node and therefore does
+/// NOT trigger the unknown-named-kind rejection. A backgrounded command chain is
+/// read-only iff EVERY command in it is allowlisted, exactly like `&&` / `;` / `|`.
+/// For example `grep x PWN & grep y PWN` → true (both greps allowlisted), while
+/// `touch HACKED & grep x PWN` → false (touch is not allowlisted).
+///
+/// A false negative only costs parallelism; a false positive would let a
+/// side-effecting command run concurrently — so the bar is "provably safe".
+///
+/// The AST subsumes the old hand-rolled string classifier: quoted metacharacters are
+/// DATA, not operators (`grep 'a\|b'` → true), `cd && grep` parses as a `list` of two
+/// allowlisted commands (true, no `cd`-prefix hack), and — load-bearing — a
+/// single-quoted `'$(rm)'` stays a `raw_string` (SAFE literal) while a double-quoted
+/// `"$(rm)"` contains a `command_substitution` child that the walk rejects.
+pub(crate) fn is_read_only_bash(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    let tree = match parse_bash(cmd) {
+        Some(t) => t,
+        None => return false,
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false; // partial / ambiguous parse → fail closed
+    }
+    // Structural node kinds a read-only command may contain — CONFIRMED against
+    // tree-sitter-bash 0.25.1 by the `probe_bash_node_kinds` test. Danger-only kinds
+    // (command_substitution — covers `$()` AND backtick; subshell — `(...)`;
+    // simple_expansion / variable_name — `$HOME`) are DELIBERATELY absent: hitting any
+    // of them fails the walk. `string` IS allowed (a double-quoted literal is safe),
+    // but a double-quoted `"$(...)"` nests a `command_substitution` CHILD → still
+    // rejected; a single-quoted `'$(...)'` is a leaf `raw_string` → safe.
+    const ALLOWED_KINDS: &[&str] = &[
+        "program", "list", "pipeline", "command", "command_name", "word",
+        "raw_string", "string", "string_content", "concatenation", "number",
+        // redirect wrapper + parts — the TARGET is validated in `redirect_is_readonly`:
+        "redirected_statement", "file_redirect", "file_descriptor",
+    ];
+    let src = cmd.as_bytes();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        // Anonymous tokens (`&&`, `|`, `;`, `>`, `"`, `'`, …) are `!is_named()` — their
+        // named parent gates them, so they are not checked here. Any UNKNOWN named kind
+        // is a construct we cannot prove read-only → fail closed.
+        if node.is_named() && !ALLOWED_KINDS.contains(&kind) {
+            return false;
+        }
+        if kind == "command" && !command_first_word_allowed(node, src) {
+            return false;
+        }
+        if kind == "file_redirect" && !redirect_is_readonly(node, src) {
+            return false;
+        }
+        for i in 0..node.child_count() as u32 {
+            stack.push(node.child(i).unwrap());
+        }
+    }
+    true
+}
+
+/// The first word (`command_name`) of a `command` node must be in the read-only
+/// allowlist; a `find` command must not carry write/exec actions.
+fn command_first_word_allowed(command_node: tree_sitter::Node, src: &[u8]) -> bool {
+    // `command_name` is the first child of a `command`; its text is the invoked program.
+    let mut name: Option<&str> = None;
+    for i in 0..command_node.child_count() as u32 {
+        let c = command_node.child(i).unwrap();
+        if c.kind() == "command_name" {
+            name = c.utf8_text(src).ok();
+            break;
+        }
+    }
+    let first = match name {
+        Some(n) => n,
+        None => return false, // no command name (e.g. a bare assignment) → not read-only
+    };
+    if !READ_ONLY_BASH_ALLOWLIST.contains(&first) {
+        return false;
+    }
+    // `find` carve-out: pure traversal is read-only, but `-delete` / `-exec` / `-ok` /
+    // `-fprint*` / `-fls` mutate or run arbitrary programs. Scan the command's argv text.
+    if first == "find" {
+        let text = command_node.utf8_text(src).unwrap_or("");
+        if text.contains("-delete")
+            || text.contains("-exec")
+            || text.contains("-ok")
+            || text.contains("-fprint")
+            || text.contains("-fls")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `file_redirect` is read-only iff its target is exactly `/dev/null` or an fd-dup
+/// (`>&1`, `2>&1`, `>&-`). Any other target writes a real file → not read-only.
+///
+/// ## Numeric target discrimination
+///
+/// A numeric target (`number` node in tree-sitter-bash) is ambiguous:
+/// - `2>&1`  → fd-dup: the `1` is a file DESCRIPTOR, not a filename.  SAFE.
+/// - `> 9`   → plain redirect: the `9` is a real filename.  WRITES A FILE.
+///
+/// The discriminator is the redirect operator text: an fd-dup form contains `>&` or
+/// `<&` (e.g. `>&`, `2>&`, `<&`); a plain write form does not.  We obtain the full
+/// redirect node text and check for those substrings.
+///
+/// ## Other forms
+/// - `word`/`raw_string`/`string`/`concatenation` target → must be exactly `/dev/null`,
+///   regardless of the operator direction.  This is **conservative/fail-closed**: a
+///   non-`/dev/null` word target of ANY redirect — output (`> file`, `>> file`) OR input
+///   (`< file`) — is rejected.  Only `/dev/null` and fd-dups pass.  `cat <file` is
+///   therefore rejected (the word `file` ≠ `/dev/null`), even though reading a file via
+///   input redirect does not write anything; we prefer false-negatives over false-positives.
+/// - `>&out.txt` → target is a `word` (not `/dev/null`) → rejected.  Correct: writes a file.
+/// - `&>/dev/null` → target is a `word` `/dev/null`; operator `&>` has no `>&` → word arm
+///   accepts it.  Correct: discard-all redirect.
+fn redirect_is_readonly(redirect_node: tree_sitter::Node, src: &[u8]) -> bool {
+    let redir_text = redirect_node.utf8_text(src).unwrap_or("");
+    // A PURE input redirect (`< f`, `3< f`) only READS the file — harmless for
+    // concurrency. `<>` (read-write, has `>`) and `<&N` (fd-dup, has `&`) are NOT
+    // pure input and fall through to the normal checks. Heredoc/herestring are
+    // separate node kinds rejected upstream.
+    let is_input_read = redir_text.contains('<') && !redir_text.contains('>') && !redir_text.contains('&');
+    if is_input_read {
+        return true;
+    }
+    // Detect fd-dup form by inspecting the raw redirect text.  An fd-dup (`>&N`, `2>&1`,
+    // `<&N`, `>&-`) contains `>&` or `<&`; a plain write (`>`, `>>`, `2>`, `&>`) does not.
+    let is_fd_dup = redir_text.contains(">&") || redir_text.contains("<&");
+
+    for i in 0..redirect_node.child_count() as u32 {
+        let c = redirect_node.child(i).unwrap();
+        match c.kind() {
+            // A file target: must be exactly /dev/null (word/quoted/concatenated).
+            "word" | "raw_string" | "string" | "concatenation" => {
+                let target = c.utf8_text(src).unwrap_or("");
+                if target != "/dev/null" {
+                    return false; // writes a real file (out.txt, /dev/nullX, >&file, …)
+                }
+            }
+            // A numeric target: safe ONLY as an fd-dup (`2>&1`); a plain `> 9` writes file "9".
+            "number" => {
+                if !is_fd_dup {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 #[cfg(all(test, unix))]
 #[test]
 fn apply_askpass_env_sets_sudo_ssh_vars() {
-    use atomcode_askpass::server::AskpassEnv;
+    use crate::askpass::server::AskpassEnv;
     let env = AskpassEnv { sock_path: "/run/x.sock".into(), token: "tok".into(), askpass_script: "/run/askpass.sh".into() };
     let mut cmd = tokio::process::Command::new("bash");
     apply_askpass_env(&mut cmd, &env);
@@ -1355,6 +1570,77 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    /// PROBE (kept as a living record): dumps the node kinds tree-sitter-bash produces
+    /// for representative commands, so ALLOWED_KINDS in `is_read_only_bash` is derived
+    /// from the ACTUAL grammar, not guessed. Asserts the kinds we depend on exist.
+    #[test]
+    fn probe_bash_node_kinds() {
+        fn kinds(cmd: &str) -> Vec<String> {
+            let tree = parse_bash(cmd).expect("parse");
+            let mut out = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(n) = stack.pop() {
+                out.push(n.kind().to_string());
+                // tree-sitter 0.26 indexes children by `u32` (child_count is usize).
+                for i in 0..n.child_count() as u32 {
+                    stack.push(n.child(i).unwrap());
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+        // Read-only commands: print their kinds so we can read them in test output.
+        for cmd in [
+            "grep -rn 'pub mod\\|mod ' --include='*.rs' | head -40",
+            "cd /a && grep x | head",
+            "grep -E 'warning.*(unused|dead_code)' crates/ 2>/dev/null",
+            "cat f.txt",
+            "ls -la",
+            "grep x && grep y",
+            "find . -name '*.rs'",
+        ] {
+            eprintln!("SAFE {:?} -> {:?}", cmd, kinds(cmd));
+        }
+        // Dangerous commands: print the kind that flags them (must be OUTSIDE the safe set).
+        for cmd in [
+            "grep \"$(rm -rf x)\"",   // command_substitution
+            "grep `rm x`",             // command_substitution (backtick)
+            "(rm x)",                  // subshell
+            "grep $HOME",              // expansion / variable
+            "ls > out.txt",           // redirect to a real file
+            "grep x | tee f",         // tee (allowlist, not node)
+        ] {
+            eprintln!("DANGER {:?} -> {:?}", cmd, kinds(cmd));
+        }
+        // LOAD-BEARING: single- vs double-quoted $(...). The whole design depends on the
+        // grammar distinguishing a single-quoted literal `'$(rm)'` (raw_string, NO
+        // command_substitution child) from a double-quoted `"$(rm)"` that actually
+        // executes (a command_substitution node appears).
+        eprintln!("QUOTE single {:?} -> {:?}", "grep '$(rm)'", kinds("grep '$(rm)'"));
+        eprintln!("QUOTE double {:?} -> {:?}", "grep \"$(rm)\"", kinds("grep \"$(rm)\""));
+
+        // Assert the kinds we hardcode in Task 2 actually appear (adjust names in Task 2
+        // to whatever THIS prints — codex uses program/list/pipeline/command/command_name/
+        // word/string/raw_string/string_content/concatenation; bash 0.25.1 may differ).
+        let ro = kinds("cd /a && grep x | head");
+        assert!(ro.iter().any(|k| k == "command"), "must have a `command` kind: {ro:?}");
+        assert!(ro.iter().any(|k| k == "command_name"), "must have `command_name`: {ro:?}");
+        let sub = kinds("grep \"$(rm x)\"");
+        assert!(sub.iter().any(|k| k == "command_substitution"), "subst kind: {sub:?}");
+        // The load-bearing distinction, asserted (not merely printed).
+        let single = kinds("grep '$(rm)'");
+        assert!(
+            !single.iter().any(|k| k == "command_substitution"),
+            "single-quoted $(...) must NOT parse as command_substitution: {single:?}"
+        );
+        let double = kinds("grep \"$(rm)\"");
+        assert!(
+            double.iter().any(|k| k == "command_substitution"),
+            "double-quoted $(...) MUST parse as command_substitution: {double:?}"
+        );
+    }
 
     #[test]
     fn sanitize_strips_ansi_colour_codes() {
@@ -1524,7 +1810,7 @@ mod tests {
     // rewrite `sudo` command words to `sudo -A` so a plain `sudo` pops our password modal.
     #[cfg(unix)]
     #[test]
-    fn rewrite_sudo_inserts_dash_A_only_when_appropriate() {
+    fn rewrite_sudo_inserts_dash_a_only_when_appropriate() {
         // bare sudo in command position → gets -A
         assert_eq!(rewrite_sudo_for_askpass("sudo find / -name x"), "sudo -A find / -name x");
         // already has -A → unchanged
@@ -1834,5 +2120,205 @@ mod tests {
         let r = BashTool.execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path())).await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("timed out after 1s"), "{}", r.content);
+    }
+
+    #[test]
+    fn bash_tool_parallel_safe_follows_classifier() {
+        let t = BashTool;
+        assert!(t.parallel_safe(r#"{"command":"grep -rn x crates/"}"#), "read-only grep");
+        assert!(t.parallel_safe(r#"{"command":"grep x | grep -v y | head"}"#), "read-only pipe");
+        assert!(!t.parallel_safe(r#"{"command":"cargo build"}"#), "cargo not read-only");
+        assert!(!t.parallel_safe(r#"{"command":"rm -rf build"}"#), "destructive");
+        assert!(!t.parallel_safe("not json"), "parse failure → not parallel-safe");
+    }
+
+    #[test]
+    fn is_read_only_bash_allows_pure_reads() {
+        // Quoted metacharacters are DATA, not operators (the core fix).
+        assert!(is_read_only_bash("grep -rn 'pub mod\\|mod ' --include='*.rs' | head -40"));
+        assert!(is_read_only_bash("grep -E 'warning.*(unused|dead_code)' crates/ | head"));
+        assert!(is_read_only_bash("grep 'reqwest\\|url::' --include='*.rs'"));
+        // Pipes / && / ; between read-only commands.
+        assert!(is_read_only_bash("grep x | grep -v y | head -20"));
+        assert!(is_read_only_bash("grep x && grep y"));
+        assert!(is_read_only_bash("cat f; ls"));
+        // cd is read-only; cd && read-only now works via the AST (no hack).
+        assert!(is_read_only_bash("cd /Users/theo/proj && grep -rn foo crates/"));
+        assert!(is_read_only_bash("cd /a && cat f | head"));
+        // /dev/null discard + fd-dup.
+        assert!(is_read_only_bash("grep x 2>/dev/null"));
+        assert!(is_read_only_bash("grep -rn foo crates/ 2>/dev/null | head -10"));
+        assert!(is_read_only_bash("cat f 2>&1 | grep err"));
+        // fd-dup forms: numeric target is a descriptor, not a filename.
+        assert!(is_read_only_bash("grep x 2>&1 | head"), "2>&1 fd-dup is safe");
+        assert!(is_read_only_bash("cat f 2>&1 | grep err"));
+        assert!(is_read_only_bash("grep x foo.txt >/dev/null 2>&1"));
+        // Single-quoted $(...) is a literal string, not a substitution.
+        assert!(is_read_only_bash("grep '$(rm -rf x)' file.txt"));
+        // Plain reads.
+        assert!(is_read_only_bash("cat a.txt"));
+        assert!(is_read_only_bash("ls -la"));
+        assert!(is_read_only_bash("find crates -name '*.rs'"));
+        // Input redirects only READ a file — read-only.
+        assert!(is_read_only_bash("wc -l < f.txt"), "input redirect reads, harmless");
+        assert!(is_read_only_bash("grep x < in.txt | head"), "input redirect in a pipe");
+    }
+
+    #[test]
+    fn is_read_only_bash_rejects_side_effects() {
+        // Real redirects (non-/dev/null) write files.
+        assert!(!is_read_only_bash("ls > out.txt"));
+        assert!(!is_read_only_bash("ls >> out.txt"));
+        assert!(!is_read_only_bash("grep x >&out.txt"));   // >&file is a write
+        assert!(!is_read_only_bash("grep x >/dev/nullX")); // different file
+        // Non-allowlisted commands.
+        assert!(!is_read_only_bash("rm -rf b"));
+        assert!(!is_read_only_bash("git commit -m x"));
+        assert!(!is_read_only_bash("cargo build"));
+        assert!(!is_read_only_bash("cd /a && cargo check"));
+        assert!(!is_read_only_bash("grep x | tee f"));
+        assert!(!is_read_only_bash("grep x | xargs rm"));
+        // Command / process substitution (DOUBLE-quoted or bare) executes — reject.
+        assert!(!is_read_only_bash("grep \"$(rm -rf x)\""));
+        assert!(!is_read_only_bash("grep `rm x`"));
+        assert!(!is_read_only_bash("echo $(whoami)"));
+        // Subshell / background / variable expansion.
+        assert!(!is_read_only_bash("(rm x)"));
+        assert!(!is_read_only_bash("grep x & rm y"));
+        assert!(!is_read_only_bash("cat $HOME/.ssh/id_rsa"));
+        // find write actions.
+        assert!(!is_read_only_bash("find . -delete"));
+        assert!(!is_read_only_bash("find . -exec rm {} ;"));
+        // Bare-number redirect target writes a real file (fail-open fixed).
+        assert!(!is_read_only_bash("cat /etc/passwd > 9"), "> 9 writes file '9'");
+        assert!(!is_read_only_bash("grep secret f > 1"), "> 1 truncates file '1'");
+        assert!(!is_read_only_bash("echo pwn >> 5"), ">> 5 appends to file '5'");
+        assert!(!is_read_only_bash("ls >2"), ">2 writes file '2'");
+        assert!(!is_read_only_bash("grep x &>9"), "&>9 writes file '9'");
+        // Parse junk / empty → fail closed.
+        assert!(!is_read_only_bash(""));
+        assert!(!is_read_only_bash("   "));
+        assert!(!is_read_only_bash("grep x |"));    // trailing pipe (parse error / empty stage)
+        // `<>` is read-WRITE (has `>`), must NOT be treated as a pure input redirect.
+        assert!(!is_read_only_bash("wc <> f.txt"), "<> is read-WRITE, not pure input");
+        // Output redirect must still be rejected even when an input redirect is also present.
+        assert!(!is_read_only_bash("grep x < in.txt > out.txt"), "output redirect still writes");
+    }
+
+    /// Differential fuzz: for every command the classifier calls read-only, execute it in
+    /// a fresh throwaway tmpdir seeded with a `PWN` sentinel and assert that neither the
+    /// sentinel is mutated nor a `HACKED` file is created.  Commands classified `false` are
+    /// NOT executed (they may be destructive).  This is the load-bearing safety proof — it
+    /// catches any classifier fail-open: a command that SHOULD be rejected but is passed
+    /// through as "read-only" would create or mutate files, and the assertion fires.
+    ///
+    /// The corpus is adversarial and fixed (no randomness) so it is safe in CI.  Each
+    /// command runs in its OWN tmpdir (indexed by `enumerate()` to avoid collisions between
+    /// commands of the same string length) and the dir is removed afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn differential_fuzz_readonly_never_writes() {
+        use std::process::Command;
+
+        // Each entry is (command_string, expected_is_read_only).
+        // The `expected` column is documentation only — the test EXECUTES whatever the
+        // classifier says is true; if the classifier is WRONG (a fail-open), the execution
+        // assert fires and exposes the real command.
+        let corpus: &[(&str, bool)] = &[
+            // ── READ-ONLY (expected true) — must not write ──────────────────────────────
+            // plain reads
+            ("cat PWN",                                      true),
+            ("ls -la",                                       true),
+            ("ls",                                           true),
+            // grep with quoted metacharacters (single-quote = raw_string, no subst)
+            ("grep 'a\\|b' PWN",                            true),
+            ("grep -E '(x|y)' PWN",                         true),
+            // single-quoted $(...) is a LITERAL string — classified true, must NOT exec it
+            ("grep '$(touch HACKED)' PWN",                  true),
+            // safe redirects: /dev/null discard and fd-dup
+            ("grep x 2>/dev/null PWN",                      true),
+            ("grep x PWN >/dev/null 2>&1",                  true),
+            ("cat PWN 2>&1 | grep SENTINEL",                true),
+            // chains of read-only commands
+            ("grep a PWN && grep b PWN",                    true),
+            ("cat PWN; ls",                                  true),
+            ("cd . && grep x PWN",                          true),
+            // pipelines through read-only programs
+            ("echo hi | grep h",                            true),
+            ("grep -rn 'a\\|b' . | head",                  true),
+            // find without write actions
+            ("find . -name '*.txt'",                        true),
+            ("find . -name 'PWN'",                          true),
+            // wc, head, tail
+            ("wc -l PWN",                                   true),
+            ("head -1 PWN",                                 true),
+            ("tail -1 PWN",                                 true),
+            // backgrounded (&) chains: read-only iff EVERY command is allowlisted
+            ("grep x PWN & grep y PWN",                    true),  // both sides read-only → safe; when run, writes nothing
+
+            // ── SIDE-EFFECTING (expected false) — MUST be classified false; NOT executed ─
+            // output redirects that write real files
+            ("echo x > HACKED",                             false),
+            ("grep x > 9",                                  false),
+            ("grep x >&HACKED",                             false),
+            ("grep x >>HACKED",                             false),
+            ("ls &>9",                                      false),
+            // double-quoted $(...) executes the inner command
+            ("grep \"$(touch HACKED)\" PWN",                false),
+            // subshell
+            ("(touch HACKED)",                              false),
+            // non-allowlisted commands
+            ("touch HACKED",                                false),
+            ("touch HACKED & grep x PWN",                  false),  // background touch → not read-only (touch not allowlisted)
+            ("rm PWN",                                      false),
+            ("cargo build",                                 false),
+            // piping through tee / xargs writes
+            ("grep x | tee HACKED",                        false),
+            ("grep x | xargs touch HACKED",                false),
+            // subshell via sh -c
+            ("sh -c 'touch HACKED'",                       false),
+            // find write actions
+            ("find . -delete",                              false),
+            ("find . -exec touch HACKED {} ;",             false),
+            // plain write to PWN
+            ("echo pwned > PWN",                            false),
+        ];
+
+        for (i, &(cmd, _expected)) in corpus.iter().enumerate() {
+            let ro = is_read_only_bash(cmd);
+            if !ro {
+                // Not classified read-only → the parallel-safe path would never execute it.
+                // We do NOT run it here (it may be destructive).
+                continue;
+            }
+
+            // Fresh sandbox per command — indexed so collisions between equal-length strings
+            // cannot cause cross-command interference.
+            let dir = std::env::temp_dir().join(format!("rofuzz_{i}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("PWN"), "SENTINEL").unwrap();
+
+            let before = std::fs::read_to_string(dir.join("PWN")).unwrap();
+
+            // Execute: ignore the exit status (grep may return 1 on no-match, which is fine).
+            let _ = Command::new("bash")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&dir)
+                .output();
+
+            let after = std::fs::read_to_string(dir.join("PWN")).unwrap_or_default();
+            assert_eq!(
+                before, after,
+                "read-only-classified command MUTATED the sentinel!\n  cmd = {cmd:?}",
+            );
+            assert!(
+                !dir.join("HACKED").exists(),
+                "read-only-classified command CREATED a file!\n  cmd = {cmd:?}",
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

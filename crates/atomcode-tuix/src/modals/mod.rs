@@ -21,7 +21,6 @@ use crate::state::UiState;
 
 pub mod dir_picker;
 pub mod file_viewer;
-pub mod issue_wizard;
 pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
@@ -33,7 +32,6 @@ mod qr;
 pub mod session_picker;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
-pub use issue_wizard::IssueWizard;
 pub use language_picker::LanguagePicker;
 pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
@@ -111,4 +109,10 @@ pub trait Modal: Send {
     /// interactive `/plugin` manager overrides this. The event loop calls it
     /// before rendering the job result and before redrawing the modal.
     fn on_plugin_event(&mut self, _ev: &atomcode_core::plugin::PluginJobEvent) {}
+
+    /// Whether this modal has requested to close. The event loop checks this
+    /// to clean up the modal asynchronously.
+    fn close_requested(&self) -> bool {
+        false
+    }
 }

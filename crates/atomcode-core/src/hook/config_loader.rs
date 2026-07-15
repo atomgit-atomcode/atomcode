@@ -529,34 +529,60 @@ script = "report.sh"
 
     #[test]
     fn test_hook_engine_load_all_from_dir() {
-        let dir = std::env::temp_dir().join(format!("hook_engine_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(dir.join(".atomcode").join("hooks"));
-        fs::write(dir.join(".atomcode").join("hooks").join("hooks.toml"), r#"
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_dir = dir.path().join(".atomcode").join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create project hooks dir");
+        fs::write(hooks_dir.join("project-hook.sh"), "").expect("create hook script");
+        fs::write(hooks_dir.join("hooks.toml"), r#"
 [[hooks]]
 name = "test-hook"
 trigger = "pre_tool"
-script = "/bin/echo"
+script = "project-hook.sh"
 enabled = true
 "#).expect("Should write test file");
 
         let mut engine = HookEngine::new();
-        engine.load_all(&dir);
+        engine.load_all(dir.path());
         assert!(engine.has_any(), "load_all should register hooks from dir");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_hook_engine_load_all_empty_dir() {
-        let dir = std::env::temp_dir().join(format!("hook_engine_empty_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _home = crate::plugin::test_support::isolated_home();
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let mut engine = HookEngine::new();
-        engine.load_all(&dir);
-        // built-ins are always registered, so has_any() may be true
-        // This test just verifies load_all doesn't panic on empty dir
-        assert!(engine.has_any());
+        engine.load_all(dir.path());
+        assert!(!engine.has_any(), "empty dir must register no hooks");
+    }
 
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    #[serial_test::serial]
+    fn test_hook_engine_load_all_uses_atomcode_home_for_global_toml() {
+        let home = crate::plugin::test_support::isolated_home();
+        let hooks_dir = home.path().join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create global hooks dir");
+        fs::write(hooks_dir.join("global-hook.sh"), "").expect("create hook script");
+        fs::write(
+            hooks_dir.join("hooks.toml"),
+            r#"
+[[hooks]]
+name = "global-test-hook"
+trigger = "pre_tool"
+script = "global-hook.sh"
+enabled = true
+"#,
+        )
+        .expect("write global hooks config");
+
+        let project = tempfile::tempdir().expect("tempdir");
+        let mut engine = HookEngine::new();
+        engine.load_all(project.path());
+
+        assert!(
+            engine.has_any(),
+            "global TOML hooks must resolve from ATOMCODE_HOME"
+        );
     }
 }

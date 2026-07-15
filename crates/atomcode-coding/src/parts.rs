@@ -30,8 +30,8 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate, ReadFileTool,
-    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate, OpenFileWorkspaceGate,
+    ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_core::provider::model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
@@ -130,6 +130,22 @@ pub struct CodingParts {
     /// `SetPlanMode`); the [`PlanModeGate`](crate::PlanModeGate) middleware reads it to
     /// block mutating tools. Shared (not rebuilt) so a respawn preserves the mode.
     pub plan_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime auto-approve (bypass) flag. `SetMode(Auto)` sets it; the bridge
+    /// approval seam auto-Allows while set. Mirrors `plan_mode`.
+    pub bypass_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Auto-accept-edits flag. `SetMode(AcceptEdits)` sets it; the
+    /// [`WriteApprovalGate`](crate::tools) reads it to auto-approve NON-sensitive
+    /// file edits without a prompt (bash + sensitive paths still prompt). Unlike
+    /// `bypass_mode` this is enforced in a middleware (bridge-independent), mirroring
+    /// `plan_mode`. Shared (not rebuilt) so a respawn preserves the mode.
+    pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session grant store for mutating MCP tools the user approved "always" while in
+    /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
+    /// preserves the grants — the same reason the mode flags above are shared.
+    pub mcp_plan_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub write_approval_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub bash_workspace_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub sensitive_path_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -374,11 +390,24 @@ pub async fn prepare_with_plugin_hooks(
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
-    // with date + context-window usage + round budget. Serves recall's relative-date
-    // resolution and lets the model pace itself. Injected from round 2 of each turn (round 1
-    // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
+    // with date + round budget (NO context-usage gauge — pressure is handled silently by
+    // auto-compaction, never pushed to the model). Serves recall's relative-date resolution and
+    // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
+    // StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Todo hook (bridge/daemon path — the live TUI + webui): per-turn <system-reminder> of the
+    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
+    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
+    // ATOMCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
+    // references tools that aren't mounted). Pushed AFTER VerifyCadenceHook so verify's
+    // "first Some wins" continuation outranks the todo-completion nudge. This is the ONLY
+    // production registration of TodoHook — every real entrypoint (bridge, daemon, clix) goes
+    // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
+    // it) is reachable only from tests + examples, so there is no double-registration.
+    if crate::persona::todo_switch_enabled() {
+        hooks.push(Arc::new(crate::todo::TodoHook));
+    }
     // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
     // right wait-vs-pause decision (decide_from_windows). Returns None for
     // non-CodingPlan providers / fetch failures so the kernel falls back to its
@@ -420,6 +449,20 @@ pub async fn prepare_with_plugin_hooks(
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mcp_plan_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        write_approval_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        bash_workspace_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        sensitive_path_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -616,7 +659,10 @@ pub fn assemble(
         // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
-        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(parts.plan_mode.clone())))
+        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(
+            parts.plan_mode.clone(),
+            parts.mcp_plan_grants.clone(),
+        )))
         // Plan-mode reminder (ephemeral request tail) — pairs with the gate: the gate
         // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
         // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
@@ -624,7 +670,9 @@ pub fn assemble(
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::new()));
+        .middleware(Arc::new(SensitivePathGate::with_store(
+            parts.sensitive_path_grants.clone(),
+        )));
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
@@ -650,7 +698,24 @@ pub fn assemble(
         // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
         // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
         // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
-        .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
+        .middleware(Arc::new(
+            WriteApprovalGate::with_store(
+                parts.shared_cwd.clone(),
+                parts.write_approval_grants.clone(),
+            )
+            .with_accept_edits(parts.accept_edits.clone()),
+        ))
+        // Workspace-aware approval for DESTRUCTIVE bash (rm/mv/cp/dd/redirect…) whose target
+        // lands OUTSIDE the workspace: prompt with a per-directory "Always", mirroring
+        // WriteApprovalGate for the write tools. In-workspace destructive bash is unchanged
+        // (single-file rm stays Safe→runs; recursive rm still reaches ApprovalMiddleware).
+        // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
+        // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
+        // edits only); full Auto bypasses it via the driver auto-answering.
+        .middleware(Arc::new(BashWorkspaceGate::with_store(
+            parts.shared_cwd.clone(),
+            parts.bash_workspace_grants.clone(),
+        )))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.

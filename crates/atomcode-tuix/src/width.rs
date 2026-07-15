@@ -136,9 +136,20 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
     const RANGES: &[(u32, u32)] = &[
         (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
         (0x2194, 0x2199), (0x21A9, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328),
-        (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2),
+        // NOTE: U+23F8..23FA (⏸⏹⏺ pause/stop/record) are deliberately NOT here.
+        // They are Emoji_Presentation=No — bare (without VS16) they default to
+        // TEXT presentation and render NARROW (width 1), like the text-default
+        // ©/® excluded above. Listing them as wide made the status-line `⏸ plan`
+        // badge over-reserve a cell, leaving a stale-glyph residual after ⏸.
+        (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x24C2, 0x24C2),
         (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE),
-        (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611), (0x2614, 0x2615),
+        // NOTE: U+2611 (☑ ballot box with check) is deliberately NOT here. Like
+        // ⏸ (see the 0x23F8 note above), it is Emoji_Presentation=No — bare (no
+        // VS16) it renders NARROW (width 1). It is the `☑ Todos` panel marker
+        // (`todo_marker`), emitted bare; listing it wide over-reserved a cell and
+        // desynced the cursor, intermittently blanking a following glyph ("Todos"→
+        // "To os"). Text-default symbols belong at their unicode-width (1).
+        (0x2600, 0x2604), (0x260E, 0x260E), (0x2614, 0x2615),
         (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623),
         (0x2626, 0x2626), (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A),
         (0x2640, 0x2640), (0x2642, 0x2642), (0x2648, 0x2653), (0x265F, 0x2660),
@@ -902,6 +913,22 @@ mod tests {
     fn display_width_emoji_with_skin_tone_modifier() {
         // 👍🏽 = U+1F44D U+1F3FD. Sum = 4; cluster = 2.
         assert_eq!(display_width("👍\u{1F3FD}"), 2);
+    }
+
+    #[test]
+    fn display_width_bare_media_control_symbols_are_narrow() {
+        // ⏸⏹⏺ (U+23F8..23FA) are Emoji_Presentation=No: bare (no VS16) they
+        // default to text presentation and render at width 1. The status-line
+        // `⏸ plan` badge relies on this — a width-2 reservation left a residual.
+        assert_eq!(display_width("\u{23F8}"), 1, "⏸ pause");
+        assert_eq!(display_width("\u{23F9}"), 1, "⏹ stop");
+        assert_eq!(display_width("\u{23FA}"), 1, "⏺ record");
+        assert_eq!(display_width("\u{23F8} plan"), 6, "the whole plan badge");
+        // ☑ U+2611 (todo panel marker, emitted bare) is likewise text-default → width 1.
+        assert_eq!(display_width("\u{2611}"), 1, "☑ ballot box with check");
+        assert_eq!(display_width("\u{2611} Todos"), 7, "the todo header marker + title");
+        // With VS16 they DO become emoji (width 2) — the exclusion is bare-only.
+        assert_eq!(display_width("\u{23F8}\u{FE0F}"), 2, "⏸️ with VS16");
     }
 
     #[test]

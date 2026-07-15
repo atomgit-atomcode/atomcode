@@ -1,7 +1,7 @@
 //! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 AgentEvent，
 //! 投进现有 runtime_event_tx，复用 handle_agent_event 渲染。
 
-use super::bg_runtime::{RuntimeEvent, RuntimeId};
+use super::bg_runtime::{RuntimeEvent, RuntimeEventPayload, RuntimeId};
 use atomcode_core::agent::AgentEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
@@ -140,7 +140,7 @@ pub(crate) fn spawn_live_forwarder(
                         if fan_tx
                             .send(RuntimeEvent {
                                 runtime_id,
-                                event: ae,
+                                event: RuntimeEventPayload::Legacy(ae),
                             })
                             .is_err()
                         {
@@ -154,7 +154,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::UserEcho(text),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::UserEcho(text)),
                         })
                         .is_err()
                     {
@@ -167,7 +167,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::PeerBusy(running),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::PeerBusy(running)),
                         })
                         .is_err()
                     {
@@ -179,7 +179,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::ProviderChanged(provider),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::ProviderChanged(provider)),
                         })
                         .is_err()
                     {
@@ -194,7 +194,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::ProjectSwitched(dir),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::ProjectSwitched(dir)),
                         })
                         .is_err()
                     {
@@ -207,7 +207,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::SessionSwitched(session_id),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionSwitched(session_id)),
                         })
                         .is_err()
                     {
@@ -224,7 +224,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::SessionRenamed { name },
+                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionRenamed { name }),
                         })
                         .is_err()
                     {
@@ -238,7 +238,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::RemoteSlashCommand(line),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::RemoteSlashCommand(line)),
                         })
                         .is_err()
                     {
@@ -251,7 +251,13 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::ModeChanged(mode)) => {
                     crate::tuix_trace!("FWD", "ModeChanged: {}", mode);
                     if let Some(event) = mode_to_agent_event(&mode) {
-                        if fan_tx.send(RuntimeEvent { runtime_id, event }).is_err() {
+                        if fan_tx
+                            .send(RuntimeEvent {
+                                runtime_id,
+                                event: RuntimeEventPayload::Legacy(event),
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }

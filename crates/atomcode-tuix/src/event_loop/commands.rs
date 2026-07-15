@@ -24,15 +24,15 @@ use std::path::PathBuf;
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
     ProxyPicker, SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
+use atomcode_capabilities::memory::MemoryStore;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
+use atomcode_config::config::Config;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 use crate::markdown::{fence_start, is_closing_fence};
@@ -151,19 +151,20 @@ fn spawn_runtime(
     session: Session,
 ) -> (
     bg_runtime::RuntimeId,
-    atomcode_core::agent::AgentClient,
+    super::RuntimeEndpoint,
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    // Engine v2: spawn through the injected bridge so in-TUI session switches run
-    // on the new stack too. The override reads the CURRENT config/working_dir (the
-    // same values the v1 factory would), keeping /model /provider /cd honoured.
-    let (client, event_rx) = match &ctx.runtime_spawn_override {
-        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
-        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
-    };
-    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
-    (runtime_id, client, session)
+    // Spawn through the injected engine-v2 bridge so in-TUI session switches run
+    // on the new stack too. It reads the CURRENT config/working_dir, keeping
+    // /model /provider /cd honoured.
+    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
+    bg_runtime::spawn_event_forwarder(
+        runtime_id,
+        spawned.event_rx,
+        ctx.runtime_event_tx.clone(),
+    );
+    (runtime_id, spawned.endpoint, session)
 }
 
 /// Synchronise the current foreground session into `BgRuntimeManager`.
@@ -177,7 +178,10 @@ fn spawn_runtime(
 fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
-        ctx.agent.clone(),
+        super::RuntimeEndpoint {
+            legacy: ctx.agent.clone(),
+            native: ctx.runtime.clone(),
+        },
         ctx.current_session.clone(),
     );
 }
@@ -252,7 +256,7 @@ pub fn perform_session_rename(
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
 fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_core::config::instructions::LayeredInstructions;
+    use atomcode_config::config::instructions::LayeredInstructions;
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
     for (level, path) in instructions.status_lines() {
@@ -396,9 +400,6 @@ impl Renderer for CaptureRenderer<'_> {
     fn flush_deferred(&mut self) {
         self.inner.flush_deferred();
     }
-    fn pop_approval_prompt(&mut self) {
-        self.inner.pop_approval_prompt();
-    }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
@@ -489,16 +490,13 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
 ///   returns `Stop`).
 ///
 /// Callers must thread `execute_slash_command`'s extra params through so a
-/// slash payload can open modals / drive the fixissue + setup side-channels
-/// exactly as a typed command would.
-#[allow(clippy::too_many_arguments)]
+/// slash payload can open modals / drive setup side-channels exactly as a
+/// typed command would.
 pub(crate) fn fire_interval_payload(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let payload = match ctx.loop_ctrl.as_mut() {
@@ -539,8 +537,6 @@ pub(crate) fn fire_interval_payload(
                 ctx,
                 renderer,
                 active_modal,
-                fixissue_pending,
-                fixissue_buffer,
                 setup_pending,
             );
             if let Some(c) = ctx.loop_ctrl.as_mut() {
@@ -574,7 +570,6 @@ pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
 ///
 /// A payload starting with `/` is a slash command (split into cmd + arg on
 /// the first whitespace); anything else is a free-text prompt.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_interval_loop(
     state: &mut UiState,
     ctx: &mut LoopCtx,
@@ -582,8 +577,6 @@ pub(crate) fn start_interval_loop(
     secs: u64,
     payload: String,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let p = if payload.starts_with('/') {
@@ -610,8 +603,6 @@ pub(crate) fn start_interval_loop(
         ctx,
         renderer,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
 }
@@ -623,8 +614,6 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
     // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
@@ -641,8 +630,6 @@ pub(super) fn execute_slash_command(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         );
     };
@@ -657,8 +644,6 @@ pub(super) fn execute_slash_command(
         ctx,
         &mut cap,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
     if !cap.captured.is_empty() {
@@ -1059,19 +1044,8 @@ fn execute_slash_command_impl(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
-    // entry that consumes them (the `/fixissue` arm was removed; the
-    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
-    // event_loop/mod.rs's AgentEvent handler still drains them on
-    // TurnComplete). They stay in the signature so callers don't have to
-    // change, and so a future restoration of the slash command is a
-    // one-arm-add rather than a refactor.
-    let _ = (&fixissue_pending, &fixissue_buffer);
-
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
@@ -1310,18 +1284,23 @@ fn execute_slash_command_impl(
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedPlanMode).into_owned(),
-            ));
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Plan)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Plan);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedPlanMode).into_owned()));
             renderer.flush();
         }
         "build" => {
             state.agent_mode = AgentMode::Build;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedBuildMode).into_owned(),
-            ));
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Build)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Build);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedBuildMode).into_owned()));
+            renderer.flush();
+        }
+        "auto" => {
+            state.agent_mode = AgentMode::Auto;
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Auto)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Auto);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedAutoMode).into_owned()));
             renderer.flush();
         }
         "review" => {
@@ -1394,7 +1373,6 @@ fn execute_slash_command_impl(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
-                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     // Refresh the footer context window now (see model_picker
                     // Enter handler) — no turn fires here either, so the cached
@@ -1448,11 +1426,11 @@ fn execute_slash_command_impl(
             if arg.is_empty() {
                 *active_modal = Some(Box::new(LanguagePicker::open()));
             } else {
-                match arg.parse::<atomcode_core::locale::Locale>() {
+                match arg.parse::<atomcode_config::locale::Locale>() {
                     Ok(locale) => {
                         crate::i18n::set_locale(locale);
                         ctx.config.language = Some(locale);
-                        let config_path = atomcode_core::config::Config::default_path();
+                        let config_path = atomcode_config::config::Config::default_path();
                         if let Err(e) = ctx.config.save(&config_path) {
                             // TODO: surface via renderer once a non-modal error display is available
                             eprintln!("[language] failed to save config: {e}");
@@ -1461,8 +1439,8 @@ fn execute_slash_command_impl(
                         // so /language en and /language zh both echo a
                         // human-readable name, not just the locale code.
                         let label = match locale {
-                            atomcode_core::locale::Locale::En => "English",
-                            atomcode_core::locale::Locale::ZhCn => "简体中文",
+                            atomcode_config::locale::Locale::En => "English",
+                            atomcode_config::locale::Locale::ZhCn => "简体中文",
                         };
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::LanguageSwitched {
@@ -1597,53 +1575,67 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-            // Agent streams the authoritative result back as TextDelta
-            // ("nothing to compact" / "compacted — dropped N messages").
-            // Don't pre-render a placeholder — the agent's reply could
-            // contradict it when the conversation is too short.
-            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+            let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            // The runtime reports the authoritative outcome asynchronously.
+            // Don't pre-render a placeholder: a committed shrink and a
+            // short-conversation no-op produce different output based on the
+            // current runtime state.
+            if let Err(error) = ctx.runtime.compact(focus) {
+                renderer.render(UiLine::Error(error.to_string()));
+                renderer.flush();
+            }
         }
         "remember" => {
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
                 renderer.flush();
             } else {
-                let (content, global) = if text.starts_with("--global ") {
-                    (text[9..].trim().to_string(), true)
+                let (content, global) = if let Some(rest) = text.strip_prefix("--global ") {
+                    (rest.trim().to_string(), true)
                 } else {
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
-                    renderer.flush();
                 } else {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::Remember { content, global })
-                        .ok();
+                    let store = if global { MemoryStore::global() } else { MemoryStore::project(&ctx.working_dir) };
+                    let scope = if global { "global" } else { "project" };
+                    // Dedup on write (parity with the model-facing `memory` tool) so a
+                    // repeated /remember of the same line doesn't double-write.
+                    match store.append_deduped(&content) {
+                        Ok(true) => renderer.render(UiLine::CommandOutput(format!("Remembered ({scope}): {content}"))),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(format!("Already remembered ({scope}): {content}"))),
+                        Err(e) => renderer.render(UiLine::Error(format!("Failed to remember: {e}"))),
+                    }
                 }
+                renderer.flush();
             }
         }
         "forget" => {
             let keyword = arg.trim();
             if keyword.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
-                renderer.flush();
             } else {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::Forget {
-                        keyword: keyword.to_string(),
-                    })
-                    .ok();
+                let mut removed = MemoryStore::project(&ctx.working_dir).remove_matching(keyword).unwrap_or_default();
+                removed.extend(MemoryStore::global().remove_matching(keyword).unwrap_or_default());
+                let msg = if removed.is_empty() {
+                    format!("No memory entries matched '{keyword}'.")
+                } else {
+                    format!("Forgot {} entr{}.", removed.len(), if removed.len() == 1 { "y" } else { "ies" })
+                };
+                renderer.render(UiLine::CommandOutput(msg));
             }
+            renderer.flush();
         }
         "memory" => {
-            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&ctx.working_dir);
+            let name = ctx.working_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+            let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
+            let out = if merged.trim().is_empty() { "(memory is empty)".to_string() } else { merged };
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
         }
         "webui" => {
             let a = arg.trim();
@@ -2024,12 +2016,12 @@ fn execute_slash_command_impl(
                 // Rollback is sync and fast (three renames). Run inline
                 // so the user sees the result immediately without waiting
                 // for an async task to schedule.
-                match atomcode_core::self_update::run_rollback() {
+                match atomcode_updater::run_rollback() {
                     Ok(sum) => {
                         // Route through the event channel so rendering
                         // and "set done → exit" logic stays in one place.
                         let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                            atomcode_updater::UpgradeEvent::RolledBack {
                                 exe: sum.exe,
                                 backup: sum.backup,
                             },
@@ -2038,7 +2030,7 @@ fn execute_slash_command_impl(
                     Err(e) => {
                         let _ =
                             ctx.upgrade_tx
-                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                .send(atomcode_updater::UpgradeEvent::Failed(format!(
                                     "{:#}",
                                     e
                                 )));
@@ -2064,37 +2056,15 @@ fn execute_slash_command_impl(
                     // we translate to a Failed event so the TUI layer
                     // only has to handle one event stream.
                     if let Err(e) =
-                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                        atomcode_updater::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                        let _ = tx.send(atomcode_updater::UpgradeEvent::Failed(format!(
                             "{:#}",
                             e
                         )));
                     }
                 });
             }
-        }
-        "issue" => {
-            // Two-step wizard to file a NEW issue against the **atomcode
-            // upstream repo** (atomgit_atomcode/atomcode), NOT against
-            // the user's current working project. Use case is in-tool
-            // bug reports / feature requests for atomcode itself; using
-            // cwd would be confusing (a user reporting an atomcode bug
-            // while in some unrelated repo would land their issue in
-            // the wrong place, or get blocked by cwd validation).
-            //
-            // Step 1 collects a title (required), step 2 collects a
-            // description (required, Shift+Enter for newlines). On
-            // submit the event loop's post-close branch POSTs
-            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
-            // new issue URL into scrollback.
-            let _ = arg; // reserved for future options (e.g. --template)
-            let mut wiz = IssueWizard::open(
-                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
-                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
-            );
-            wiz.emit_prompt(renderer);
-            *active_modal = Some(Box::new(wiz));
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
@@ -2155,10 +2125,10 @@ fn execute_slash_command_impl(
                     let old_short_id = ctx.current_session.short_id().to_string();
                     let new_session = Session::default_session(ctx.working_dir.clone());
                     let new_short_id = new_session.short_id().to_string();
-                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let (runtime_id, endpoint, new_session) = spawn_runtime(ctx, new_session);
                     let old_state = foreground_state_from_ui(state);
                     let slot = match ctx.bg_manager.background_current(
-                        client.clone(),
+                        endpoint.clone(),
                         new_session.clone(),
                         runtime_id,
                         old_state,
@@ -2174,11 +2144,18 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
                     };
 
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // The todo panel is per-session and is NOT cleared at turn end;
+                    // this fresh foreground session has no todos, so drop the prior
+                    // session's list (mirrors reset_to_new_session / SessionSwitched).
+                    state.active_todos = None;
+                    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
+                    state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
                     // (same anti-flicker as `/resume`). Self-contained: the
@@ -2224,7 +2201,7 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                     };
-                    let Some(client) = outcome.resumed_client else {
+                    let Some(endpoint) = outcome.resumed_endpoint else {
                         renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
                         renderer.flush();
                         return Ok(());
@@ -2235,7 +2212,8 @@ fn execute_slash_command_impl(
                     // session (and clear the stale footer). ClearLoop reaches the outgoing
                     // agent before the swap below.
                     stop_active_loop(state, ctx);
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
@@ -2254,7 +2232,9 @@ fn execute_slash_command_impl(
                     // lack corresponding ToolResult entries.
                     let pending_approval = find_pending_approval(&ctx.current_session);
                     if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt {
+                        state.approval_panel = Some(crate::state::ApprovalPanel {
+                            options: crate::event_loop::build_approval_options(&tool_name),
+                            selected: 0,
                             tool: tool_name,
                             detail,
                         });
@@ -2294,8 +2274,8 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
-                        if let Some(client) = dropped.client.as_ref() {
-                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        if let Some(endpoint) = dropped.endpoint.as_ref() {
+                            endpoint.legacy.cmd_tx.send(AgentCommand::Cancel).ok();
                         }
                     }
                     if !dropped.session.messages.is_empty() {
@@ -2335,10 +2315,10 @@ fn execute_slash_command_impl(
             let mut session = Session::default_session(ctx.working_dir.clone());
             session.name = short_task_name(task);
             let short_id = session.short_id().to_string();
-            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let (runtime_id, endpoint, session) = spawn_runtime(ctx, session);
             let slot = match ctx.bg_manager.push_background_runtime(
                 runtime_id,
-                client.clone(),
+                endpoint.clone(),
                 session,
                 bg_runtime::RuntimeState::Running,
             ) {
@@ -2352,7 +2332,8 @@ fn execute_slash_command_impl(
                 }
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
             };
-            client
+            endpoint
+                .legacy
                 .cmd_tx
                 .send(AgentCommand::SendMessage {
                     text: task.to_string(),
@@ -2370,50 +2351,11 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "init" => {
-            // Generate .atomcode.md from project structure. Refuses to
-            // overwrite by default — `/init --force` opts in. The file is
-            // picked up by agent::prompt next time the system prompt is
-            // built; in-flight turns finish on the old prompt.
-            let target = ctx.working_dir.join(".atomcode.md");
-            let force = matches!(arg.trim(), "--force" | "force");
-            if target.exists() && !force {
-                let path_str = target.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::InitAlreadyExists { path: &path_str }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-            let content = crate::init::generate_project_instructions(&ctx.working_dir);
-            match std::fs::write(&target, &content) {
-                Ok(()) => {
-                    let path_str = target.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote {
-                            path: &path_str,
-                            bytes: content.len(),
-                        })
-                        .into_owned(),
-                    ));
-                    // Confirm the file is reachable for the prompt-builder by
-                    // re-running the same load that `/status` uses. If the
-                    // freshly written file does NOT appear under PROJECT here,
-                    // the user knows immediately — instead of asking the AI
-                    // a question and trying to infer load state from its
-                    // answer.
-                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
-                        &ctx.working_dir,
-                    )));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::InitFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
-            }
+            // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
+            // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
+            // static .atomcode.md generator.
+            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
         "mcp" => {
@@ -2987,8 +2929,6 @@ fn execute_slash_command_impl(
                         secs,
                         payload,
                         active_modal,
-                        fixissue_pending,
-                        fixissue_buffer,
                         setup_pending,
                     );
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
@@ -3178,39 +3118,12 @@ fn execute_slash_command_impl(
                 submit_agent_turn(ctx, state, rendered);
             } else {
                 // Unknown command — emit failure telemetry
-                let available_commands: Vec<&str> = vec![
-                    "help",
-                    "quit",
-                    "exit",
-                    "clear",
-                    "compact",
-                    "reload",
-                    "config",
-                    "plan",
-                    "build",
-                    "session",
-                    "model",
-                    "language",
-                    "resume",
-                    "rename",
-                    "provider",
-                    "status",
-                    "diff",
-                    "undo",
-                    "cost",
-                    "context",
-                    "remember",
-                    "forget",
-                    "memory",
-                    "login",
-                    "logout",
-                    "whoami",
-                    "upgrade",
-                    "issue",
-                    "cd",
-                    "bg",
-                    "codingplan",
-                ];
+                let available_commands: Vec<&str> =
+                    crate::commands::CommandRegistry::builtin()
+                        .all()
+                        .iter()
+                        .map(|command| command.name)
+                        .collect();
                 ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
                     type_: other.to_string(),
                     success: Some(false),
@@ -4189,67 +4102,6 @@ fn format_context_report(
     out
 }
 
-/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
-/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
-/// the event loop's post-close hook when `IssueWizard` has stashed a
-/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
-/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
-/// Run it arms the post-completion hook (`fixissue_pending` +
-/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
-/// UiState to Streaming via `state.on_submit()`.
-/// Currently unused — the `/fixissue` slash command was removed from
-/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
-/// a future restoration of the slash command can re-add a one-line
-/// dispatcher arm without re-implementing this whole flow. The
-/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
-/// directly and does not depend on this function.
-#[allow(dead_code)]
-pub(crate) fn launch_fixissue(
-    url: &str,
-    state: &mut UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
-) {
-    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
-            prompt,
-            issue_title,
-            issue_number,
-            issue_ref,
-        }) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
-                issue_number, issue_title,
-            )));
-            renderer.flush();
-            *fixissue_pending = Some(issue_ref);
-            fixissue_buffer.clear();
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: prompt,
-                    images: vec![],
-                    image_markers: vec![],
-                })
-                .ok();
-            state.on_submit();
-        }
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
-            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
-            renderer.flush();
-        }
-        Err(e) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  fixissue failed: {:#}\n",
-                e
-            )));
-            renderer.flush();
-        }
-    }
-}
-
 /// Assemble the `/status` body in canonical display order: the login line FIRST
 /// (so you see who you're signed in as at a glance), then the model/dir/config
 /// block, the CodingPlan section, an optional Proxy line (interactive `/status`
@@ -4401,6 +4253,9 @@ pub(crate) fn reset_to_new_session(
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
+    state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
+    state.approval_panel = None;
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.
@@ -4446,7 +4301,6 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
-    ctx.runtime_factory.set_working_dir(path.clone());
     // Re-index the @-mention file index for the new working directory.
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
@@ -4503,7 +4357,7 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
 /// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
 /// so stale entries from a deleted project don't linger in the picker.
 pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| {
@@ -4520,7 +4374,7 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
 /// failure (read-only HOME, permission denied) is swallowed so it can
 /// never break an interactive `/cd`.
 pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     let content = dirs
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -5123,10 +4977,10 @@ mod status_login_tests {
     #[test]
     fn status_body_no_longer_shows_a_token_line() {
         // /status is a quick-glance state view; per-session token count is /cost's job.
-        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
+        let en = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::En, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
-        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
+        let zh = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::ZhCn, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
         assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
@@ -5452,9 +5306,9 @@ fn run_oauth_with_renderer(
 /// inside an existing runtime panics with "Cannot drop a runtime in a
 /// context where blocking is not allowed".
 fn run_coding_plan_blocking(
-    config: &atomcode_core::config::Config,
+    config: &atomcode_config::config::Config,
     tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
-) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+) -> Result<(atomcode_config::config::Config, atomcode_core::coding_plan::SetupReport)> {
     let mut cfg = config.clone();
     let tel = tel.clone();
     // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
@@ -6460,10 +6314,25 @@ mod tests {
 }
 
 #[cfg(test)]
+mod memory_command_tests {
+    #[test]
+    fn remember_project_writes_directly_to_store() {
+        use atomcode_capabilities::memory::MemoryStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::project(tmp.path());
+        // 迁移后 /remember 走 MemoryStore::project(cwd).append —— 这里直接验证 store 语义,
+        // 命令臂在 Step 4 改为调用它。
+        store.append("uses tabs not spaces").unwrap();
+        let entries = MemoryStore::project(tmp.path()).load();
+        assert!(entries.iter().any(|e| e == "uses tabs not spaces"));
+    }
+}
+
+#[cfg(test)]
 mod todo_command_tests {
     use super::format_todo_command;
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
 
     #[test]
@@ -6490,8 +6359,15 @@ mod todo_command_tests {
                 thinking_blocks: vec![],
             },
             synthetic: false,
+            internal_origin: None,
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
+    }
+
+    #[test]
+    fn init_submits_the_coding_init_prompt() {
+        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
+        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
     }
 }

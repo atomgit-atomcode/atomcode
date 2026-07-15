@@ -682,7 +682,14 @@ mod tests {
             move || {
                 calls_clone.fetch_add(1, Ordering::SeqCst);
                 // Port 1 is never bound on localhost — guaranteed connection error.
-                reqwest::Client::new().post("http://127.0.0.1:1/unreachable")
+                // `.no_proxy()`: a machine-configured `http_proxy` (e.g. a local
+                // 127.0.0.1:7890 proxy) would otherwise route AND answer the request,
+                // making it succeed instead of erroring — and hang on the proxy timeout.
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post("http://127.0.0.1:1/unreachable")
             },
             &policy,
         )

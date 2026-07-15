@@ -66,6 +66,40 @@ pub struct McpToolDefinition {
     pub description: String,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Optional MCP tool annotations (`readOnlyHint`, `destructiveHint`, …). Captured
+    /// so plan mode can allow read-only external queries. Absent on servers that don't
+    /// annotate → treated as unknown (not read-only).
+    #[serde(default)]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+/// MCP tool behavior hints from `tools/list` (`annotations` object). All optional and
+/// advisory — a missing hint means "unknown", handled conservatively.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    /// The tool does not modify its environment (safe to run during read-only work).
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    /// The tool may perform destructive updates (only meaningful when not read-only).
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
+}
+
+impl McpToolDefinition {
+    /// True only when the server EXPLICITLY annotated this tool `readOnlyHint: true`
+    /// AND did NOT also flag it `destructiveHint: true`. A tool that claims to be both
+    /// read-only and destructive is contradictory self-attestation, so we fail closed
+    /// and treat it as NOT read-only — matching codex, which forces approval whenever
+    /// `destructiveHint: true`, even alongside `readOnlyHint`. Conservative throughout:
+    /// unknown / unannotated → false.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self.annotations,
+            Some(McpToolAnnotations { read_only_hint: Some(true), destructive_hint, .. })
+                if destructive_hint != Some(true)
+        )
+    }
 }
 
 /// List tools result.
@@ -124,5 +158,50 @@ impl std::fmt::Display for ServerStatus {
             ServerStatus::Failed(e) => write!(f, "failed: {}", e),
             ServerStatus::Disconnected => write!(f, "disconnected"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_read_only_hint_annotation() {
+        let def: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "query_users",
+            "description": "list users",
+            "inputSchema": {},
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        }))
+        .unwrap();
+        assert!(def.is_read_only());
+    }
+
+    #[test]
+    fn unannotated_or_non_readonly_is_not_read_only() {
+        // No annotations object at all.
+        let bare: McpToolDefinition =
+            serde_json::from_value(serde_json::json!({ "name": "x", "inputSchema": {} })).unwrap();
+        assert!(!bare.is_read_only());
+        // Annotations present but readOnlyHint absent/false.
+        let write: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "delete_user", "inputSchema": {},
+            "annotations": { "destructiveHint": true }
+        }))
+        .unwrap();
+        assert!(!write.is_read_only());
+    }
+
+    #[test]
+    fn destructive_hint_overrides_read_only_hint() {
+        // Contradictory self-attestation: readOnlyHint AND destructiveHint both true.
+        // Fail closed → NOT read-only, so it still requires approval (codex parity —
+        // codex forces approval on destructiveHint:true even alongside readOnlyHint).
+        let contradictory: McpToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "wipe", "inputSchema": {},
+            "annotations": { "readOnlyHint": true, "destructiveHint": true }
+        }))
+        .unwrap();
+        assert!(!contradictory.is_read_only(), "destructiveHint:true must veto readOnlyHint");
     }
 }

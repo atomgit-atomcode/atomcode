@@ -1,4 +1,4 @@
-use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
+use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 

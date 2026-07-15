@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 
 const FILE_NAME: &str = "codingplan_sync.json";
 

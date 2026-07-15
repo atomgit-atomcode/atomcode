@@ -10,7 +10,7 @@
 //! `Vec<Message>` passed to the VL provider is constructed locally from
 //! `caption + images` and contains exactly one user turn.
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
 use crate::provider::{create_provider, model_name_suggests_vision, LlmProvider};
 use futures::StreamExt;
@@ -193,7 +193,7 @@ pub async fn maybe_preprocess(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
 
     fn blank_config() -> Config {
         Config::default()

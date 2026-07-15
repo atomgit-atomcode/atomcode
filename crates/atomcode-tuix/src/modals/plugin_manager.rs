@@ -31,18 +31,26 @@ use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
 /// Which screen the manager is currently showing.
+#[allow(dead_code)]
 enum Screen {
-    Home,
     Browse,
-    Plugins { mp: String },
     AddUrl,
-    RemoveMarketplace,
     Installed,
     /// Scope selection — shown before installing a plugin.
     ScopeSelect { plugin: String, mp: String },
     /// Installing in progress — shown after scope is selected.
     /// Waits for async install to complete; Esc cancels.
     Installing { plugin: String, mp: String },
+    InstalledDetails { plugin: String, mp: String, scope: InstallScope },
+    Marketplaces,
+    MarketplaceDetails { mp: String },
+}
+
+#[derive(Clone)]
+struct BrowsePluginItem {
+    name: String,
+    marketplace: String,
+    description: String,
 }
 
 pub struct PluginManager {
@@ -52,6 +60,8 @@ pub struct PluginManager {
     installed: Vec<InstalledPluginInfo>,
     /// Buffer for the Add-marketplace URL entry screen.
     url_input: String,
+    /// Cursor character position in url_input.
+    url_cursor: usize,
     /// Set while an async clone/install is in flight; shown as a status row
     /// and cleared by `on_plugin_event` when the job result arrives.
     pending: Option<String>,
@@ -70,6 +80,12 @@ pub struct PluginManager {
     /// now-empty list whose render is indistinguishable from the idle prompt,
     /// silently swallowing keystrokes until the user discovered Esc.
     close_requested: bool,
+    /// Search / filter query. Captures printable characters when typing
+    /// on Browse, Plugins, and Installed screens.
+    search_query: String,
+    /// The install scope selected for the plugin currently being installed.
+    installing_scope: Option<InstallScope>,
+    is_updating: bool,
 }
 
 /// Path-safe segment, mirroring `marketplace::sanitize_name` (which is crate
@@ -87,18 +103,133 @@ impl PluginManager {
     /// show their empty-state hints.
     pub fn open() -> Self {
         let mut m = Self {
-            screen: Screen::Home,
+            screen: Screen::Browse,
             selected: 0,
             marketplaces: Vec::new(),
             installed: Vec::new(),
             url_input: String::new(),
+            url_cursor: 0,
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
             close_requested: false,
+            search_query: String::new(),
+            installing_scope: None,
+            is_updating: false,
         };
         m.reload();
         m
+    }
+
+    fn all_browse_plugins(&self) -> Vec<BrowsePluginItem> {
+        let mut items = Vec::new();
+        let root_opt = atomcode_core::plugin::marketplaces_root();
+
+        for m in &self.marketplaces {
+            let mut descriptions = std::collections::HashMap::new();
+            if let Some(ref root) = root_opt {
+                let mp_dir = root.join(&m.name);
+                if let Ok(Some(manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                    for p in manifest.plugins {
+                        if let Some(desc) = p.description {
+                            descriptions.insert(p.name, desc);
+                        }
+                    }
+                }
+            }
+
+            for p in &m.plugins {
+                let desc = descriptions.get(p).cloned().unwrap_or_default();
+                items.push(BrowsePluginItem {
+                    name: p.clone(),
+                    marketplace: m.name.clone(),
+                    description: desc,
+                });
+            }
+        }
+        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        items
+    }
+
+    fn filtered_browse_plugins(&self) -> Vec<BrowsePluginItem> {
+        let all = self.all_browse_plugins();
+
+        if self.search_query.is_empty() {
+            all
+        } else {
+            let q = self.search_query.to_lowercase();
+            all.into_iter()
+                .filter(|item| {
+                    item.name.to_lowercase().contains(&q)
+                        || item.marketplace.to_lowercase().contains(&q)
+                        || item.description.to_lowercase().contains(&q)
+                })
+                .collect()
+        }
+    }
+
+    fn filtered_installed(&self) -> Vec<InstalledPluginInfo> {
+        if self.search_query.is_empty() {
+            self.installed.clone()
+        } else {
+            let q = self.search_query.to_lowercase();
+            self.installed
+                .iter()
+                .filter(|i| i.plugin.to_lowercase().contains(&q))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn tab_bar(&self) -> String {
+        let current_tab = match &self.screen {
+            Screen::Browse
+            | Screen::ScopeSelect { .. }
+            | Screen::Installing { .. } => 0,
+            Screen::Installed | Screen::InstalledDetails { .. } => 1,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
+        };
+        let installed_count = self.installed.len();
+        let t0 = if current_tab == 0 {
+            "  \x1b[1mBrowse Marketplaces\x1b[22m  "
+        } else {
+            "  \x1b[1;90mBrowse Marketplaces\x1b[22;39m  "
+        };
+        let t1 = if current_tab == 1 {
+            format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
+        } else {
+            format!("  \x1b[1;90mInstalled ({})\x1b[22;39m  ", installed_count)
+        };
+        let t2 = if current_tab == 2 {
+            "  \x1b[1mMarketplaces\x1b[22m  "
+        } else {
+            "  \x1b[1;90mMarketplaces\x1b[22;39m  "
+        };
+        format!("{}   {}   {}", t0, t1, t2)
+    }
+
+    fn switch_tab(&mut self, forward: bool) {
+        let current_tab = match &self.screen {
+            Screen::Browse
+            | Screen::ScopeSelect { .. }
+            | Screen::Installing { .. } => 0,
+            Screen::Installed | Screen::InstalledDetails { .. } => 1,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
+        };
+        let next_tab = if forward {
+            (current_tab + 1) % 3
+        } else {
+            (current_tab + 2) % 3
+        };
+        self.search_query.clear();
+        match next_tab {
+            0 => self.goto(Screen::Browse),
+            1 => self.goto(Screen::Installed),
+            2 => {
+                self.goto(Screen::Marketplaces);
+            }
+            _ => {}
+        }
     }
 
     fn reload(&mut self) {
@@ -116,28 +247,80 @@ impl PluginManager {
     /// Number of selectable rows on the current screen (for nav clamping).
     fn current_len(&self) -> usize {
         match &self.screen {
-            Screen::Home => 4,
-            Screen::Browse | Screen::RemoveMarketplace => self.marketplaces.len(),
-            Screen::Plugins { mp } => self.plugins_of(mp).map(|p| p.len()).unwrap_or(0),
-            Screen::Installed => self.installed.len(),
+            Screen::Browse => self.filtered_browse_plugins().len(),
+            Screen::Installed => self.filtered_installed().len(),
             Screen::AddUrl => 0,
             Screen::ScopeSelect { .. } => 3, // user / project / local
             Screen::Installing { .. } => 0, // No selectable rows — just status text
+            Screen::InstalledDetails { .. } => 3, // Update, Uninstall, Back
+            Screen::Marketplaces => 1 + self.marketplaces.len(),
+            Screen::MarketplaceDetails { mp } => {
+                if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                    if is_official_marketplace(&m.source) {
+                        2
+                    } else {
+                        3
+                    }
+                } else {
+                    0
+                }
+            }
         }
     }
 
-    fn plugins_of(&self, mp: &str) -> Option<&Vec<String>> {
-        self.marketplaces
-            .iter()
-            .find(|m| m.name == mp)
-            .map(|m| &m.plugins)
-    }
 
     fn is_installed(&self, plugin: &str, mp: &str) -> bool {
         let key = sanitize(plugin);
         self.installed
             .iter()
             .any(|i| i.marketplace == mp && (i.plugin == plugin || i.plugin == key))
+    }
+
+    fn get_plugin_details(&self, plugin: &str, mp: &str) -> (Option<String>, Option<String>) {
+        let mut version = None;
+        let mut description = None;
+
+        if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+            let mp_dir = root.join(mp);
+
+            // Try loading from mp_dir/plugin first
+            let mut manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir.join(plugin)).ok();
+
+            // Fall back to mp_dir root
+            if manifest_opt.is_none() {
+                manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir).ok();
+            }
+
+            if let Some(manifest) = manifest_opt {
+                version = manifest.version;
+                description = manifest.description;
+            }
+        }
+        (version, description)
+    }
+
+    fn get_installed_plugin_details(&self, plugin: &str, mp: &str, scope: &InstallScope) -> (Option<String>, Option<String>) {
+        let root_opt = atomcode_core::plugin::plugins_root();
+        let cwd = std::env::current_dir().ok();
+        let dir_opt = match scope {
+            InstallScope::User => root_opt,
+            InstallScope::Project | InstallScope::Local => {
+                if let Some(ref wd) = cwd {
+                    atomcode_core::plugin::project_plugins_root(wd, scope)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(root) = dir_opt {
+            if let Some(info) = self.installed.iter().find(|i| i.plugin == plugin && i.marketplace == mp && i.scope == *scope) {
+                let plugin_dir = root.join(&info.plugin_dir);
+                if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                    return (manifest.version, manifest.description);
+                }
+            }
+        }
+        self.get_plugin_details(plugin, mp)
     }
 
     fn goto(&mut self, screen: Screen) {
@@ -147,13 +330,26 @@ impl PluginManager {
 
     // ─── Async dispatch (clone-heavy ops) ───
 
-    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, ctx: &LoopCtx) {
+    fn dispatch_install(&mut self, plugin: String, mp: String, scope: InstallScope, is_update: bool, ctx: &LoopCtx) {
         let tx = ctx.plugin_job_tx.clone();
         self.installing_plugin = Some(plugin.clone());
-        self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
+        self.installing_scope = Some(scope.clone());
+        self.is_updating = is_update;
+        if is_update {
+            self.pending = Some(t(Msg::PluginMgrUpdating { plugin: &plugin }).into_owned());
+        } else {
+            self.pending = Some(t(Msg::PluginMgrInstalling { plugin: &plugin }).into_owned());
+        }
         tokio::task::spawn_blocking(move || {
+            let _ = atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope.clone());
             let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
-                Ok(info) => PluginJobEvent::PluginInstalled(info),
+                Ok(info) => {
+                    if is_update {
+                        PluginJobEvent::PluginUpdated(info)
+                    } else {
+                        PluginJobEvent::PluginInstalled(info)
+                    }
+                }
                 Err(e) => {
                     if let Some(aie) = e
                         .downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>(
@@ -180,38 +376,88 @@ impl PluginManager {
         });
     }
 
+    fn enter_marketplaces(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            self.url_input.clear();
+            self.url_cursor = 0;
+            self.goto(Screen::AddUrl);
+        } else {
+            if let Some(m) = self.marketplaces.get(self.selected - 1) {
+                self.goto(Screen::MarketplaceDetails { mp: m.name.clone() });
+            }
+        }
+    }
+
+    fn enter_marketplace_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        if let Screen::MarketplaceDetails { mp } = &self.screen {
+            let mp_name = mp.clone();
+            let is_official = self.marketplaces.iter()
+                .find(|x| x.name == mp_name)
+                .map(|x| is_official_marketplace(&x.source))
+                .unwrap_or(false);
+
+            match self.selected {
+                0 => {
+                    self.search_query = mp_name;
+                    self.goto(Screen::Browse);
+                }
+                1 => {
+                    self.dispatch_update_marketplace(mp_name, ctx);
+                }
+                2 if !is_official => {
+                    self.dispatch_remove_marketplace(mp_name, ctx, renderer);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn remove_selected_marketplace(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            return;
+        }
+        if let Some(m) = self.marketplaces.get(self.selected - 1) {
+            let name = m.name.clone();
+            self.dispatch_remove_marketplace(name, ctx, renderer);
+        }
+    }
+
+    fn dispatch_remove_marketplace(&mut self, name: String, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
+            Ok(()) => {
+                reload_plugins(ctx);
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
+                ));
+                self.reload();
+                self.goto(Screen::Marketplaces);
+            }
+            Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+        }
+        renderer.flush();
+    }
+
+    fn dispatch_update_marketplace(&mut self, name: String, ctx: &LoopCtx) {
+        let tx = ctx.plugin_job_tx.clone();
+        self.pending = Some(format!("Updating marketplace '{}'...", name));
+        tokio::task::spawn_blocking(move || {
+            let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
+                Ok(info) => PluginJobEvent::MarketplaceUpdated(info),
+                Err(e) => PluginJobEvent::Failed { op: "update".into(), msg: format!("{:#}", e) },
+            };
+            let _ = tx.send(ev);
+        });
+    }
+
     // ─── Per-screen Enter handlers ───
 
-    fn enter_home(&mut self) {
-        match self.selected {
-            0 => self.goto(Screen::Browse),
-            1 => {
-                self.url_input.clear();
-                self.goto(Screen::AddUrl);
-            }
-            2 => self.goto(Screen::RemoveMarketplace),
-            3 => self.goto(Screen::Installed),
-            _ => {}
-        }
-    }
 
-    fn enter_browse(&mut self) {
-        if let Some(m) = self.marketplaces.get(self.selected) {
-            let mp = m.name.clone();
-            self.goto(Screen::Plugins { mp });
-        }
-    }
 
-    fn enter_plugins(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-        let Screen::Plugins { mp } = &self.screen else { return };
-        let mp = mp.clone();
-        let Some(plugin) = self.plugins_of(&mp).and_then(|p| p.get(self.selected)).cloned() else {
-            return;
-        };
+    fn enter_browse(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        let plugins = self.filtered_browse_plugins();
+        let Some(item) = plugins.get(self.selected) else { return };
+        let (plugin, mp) = (item.name.clone(), item.marketplace.clone());
         if self.is_installed(&plugin, &mp) {
-            // Uninstall is fast — run inline and refresh.
-            // Look up the actual scope of the installed plugin so we
-            // uninstall from the right location (User / Project / Local).
             let key = sanitize(&plugin);
             let scope = self
                 .installed
@@ -221,27 +467,8 @@ impl PluginManager {
                 })
                 .map(|i| i.scope.clone())
                 .unwrap_or(InstallScope::User);
-            match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
-                Ok(()) => {
-                    reload_plugins(ctx);
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp })
-                            .into_owned(),
-                    ));
-                    self.reload();
-                    // Stay in the manager after a successful uninstall so the
-                    // user can keep uninstalling. `reload` already refreshes
-                    // the lists and clamps `selected`; empty screens now show
-                    // an "esc back" hint, so lingering no longer mimics the
-                    // idle prompt.
-                }
-                Err(e) => renderer.render(UiLine::Error(
-                    t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
-                )),
-            }
-            renderer.flush();
+            self.goto(Screen::InstalledDetails { plugin, mp, scope });
         } else {
-            // Show scope selection instead of installing directly.
             self.goto(Screen::ScopeSelect { plugin, mp });
         }
     }
@@ -255,17 +482,13 @@ impl PluginManager {
             2 => InstallScope::Local,
             _ => return,
         };
-        self.dispatch_install(plugin.clone(), mp.clone(), scope, ctx);
-        // Stay on an Installing screen so the user sees the progress state,
-        // mirroring Claude Code's UX.  on_plugin_event will navigate back
-        // to the Plugins list once the job completes.
-        self.screen = Screen::Installing { plugin, mp };
-        self.selected = 0;
+        self.dispatch_install(plugin, mp, scope, false, ctx);
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-        let Some(m) = self.marketplaces.get(self.selected) else { return };
-        let name = m.name.clone();
+        let plugins = self.filtered_browse_plugins();
+        let Some(item) = plugins.get(self.selected) else { return };
+        let name = item.marketplace.clone();
         match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
                 reload_plugins(ctx);
@@ -273,31 +496,49 @@ impl PluginManager {
                     t(Msg::PluginMarketplaceRemoved { name: &name }).into_owned(),
                 ));
                 self.reload();
-                self.close_requested = true;
             }
             Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
         }
         renderer.flush();
     }
 
-    fn enter_installed(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-        let Some(i) = self.installed.get(self.selected) else { return };
+    fn enter_installed(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        let inst = self.filtered_installed();
+        let Some(i) = inst.get(self.selected) else { return };
         let (plugin, mp, scope) = (i.plugin.clone(), i.marketplace.clone(), i.scope.clone());
-        match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
-            Ok(()) => {
-                reload_plugins(ctx);
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
-                ));
-                self.reload();
-                // Stay in the manager so the user can keep uninstalling (see
-                // the Plugins-screen uninstall path for the rationale).
+        self.goto(Screen::InstalledDetails { plugin, mp, scope });
+    }
+
+    fn enter_installed_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        let Screen::InstalledDetails { plugin, mp, scope } = &self.screen else { return };
+        let (plugin, mp, scope) = (plugin.clone(), mp.clone(), scope.clone());
+        match self.selected {
+            0 => {
+                // Uninstall
+                match atomcode_core::plugin::installer::uninstall(&plugin, &mp, scope) {
+                    Ok(()) => {
+                        reload_plugins(ctx);
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned(),
+                        ));
+                        self.close_requested = true;
+                    }
+                    Err(e) => renderer.render(UiLine::Error(
+                        t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
+                    )),
+                }
+                renderer.flush();
             }
-            Err(e) => renderer.render(UiLine::Error(
-                t(Msg::PluginUninstallFailed { error: &format!("{:#}", e) }).into_owned(),
-            )),
+            1 => {
+                // Update
+                self.dispatch_install(plugin, mp, scope, true, ctx);
+            }
+            2 => {
+                // Back to parent
+                self.goto(Screen::Installed);
+            }
+            _ => {}
         }
-        renderer.flush();
     }
 
     // ─── Rendering helpers ───
@@ -305,54 +546,36 @@ impl PluginManager {
     /// Build (rows, hint) for the current screen.
     fn rows(&self) -> (Vec<(String, String)>, String) {
         match &self.screen {
-            Screen::Home => {
-                let rows = vec![
-                    (t(Msg::PluginMgrBrowse).into_owned(), String::new()),
-                    (t(Msg::PluginMgrAdd).into_owned(), String::new()),
-                    (t(Msg::PluginMgrRemove).into_owned(), String::new()),
-                    (
-                        t(Msg::PluginMgrInstalled { count: self.installed.len() }).into_owned(),
-                        String::new(),
-                    ),
-                ];
-                (rows, t(Msg::PluginMgrHintNav).into_owned())
-            }
             Screen::Browse => {
-                if self.marketplaces.is_empty() {
-                    return (Vec::new(), t(Msg::PluginMgrEmptyMarketplaces).into_owned());
+                let plugins = self.filtered_browse_plugins();
+                if plugins.is_empty() {
+                    let hint = if self.search_query.is_empty() {
+                        t(Msg::PluginMgrEmptyPlugins).into_owned()
+                    } else {
+                        format!("No plugins match '{}'", self.search_query)
+                    };
+                    return (Vec::new(), hint);
                 }
-                let rows = self
-                    .marketplaces
+                let installing_label = t(Msg::PluginMgrInstallingStatus).into_owned();
+                let installed_label = t(Msg::PluginMgrInstalledStatus).into_owned();
+                let rows = plugins
                     .iter()
-                    .map(|m| (m.name.clone(), format!("{} plugins", m.plugins.len())))
-                    .collect();
-                (rows, t(Msg::PluginMgrHintNav).into_owned())
-            }
-            Screen::Plugins { mp } => {
-                let mark = t(Msg::PluginMgrInstalledMark).into_owned();
-                let installing_label = t(Msg::PluginMgrInstallingLabel).into_owned();
-                let rows: Vec<(String, String)> = self
-                    .plugins_of(mp)
-                    .map(|plugins| {
-                        plugins
-                            .iter()
-                            .map(|p| {
-                                let desc = if self.installing_plugin.as_deref() == Some(p.as_str()) {
-                                    installing_label.clone()
-                                } else if self.is_installed(p, mp) {
-                                    mark.clone()
-                                } else {
-                                    String::new()
-                                };
-                                (p.clone(), desc)
-                            })
-                            .collect()
+                    .map(|item| {
+                        let status = if self.installing_plugin.as_deref() == Some(item.name.as_str()) {
+                            format!("@{} ({})", item.marketplace, installing_label)
+                        } else if self.is_installed(&item.name, &item.marketplace) {
+                            format!("@{} ({})", item.marketplace, installed_label)
+                        } else {
+                            format!("@{}  {}", item.marketplace, get_mock_category(&item.name))
+                        };
+                        let desc = if item.description.is_empty() {
+                            status
+                        } else {
+                            format!("{}  ·  {}", status, item.description)
+                        };
+                        (item.name.clone(), desc)
                     })
-                    .unwrap_or_default();
-                if rows.is_empty() {
-                    return (Vec::new(), t(Msg::PluginMgrEmptyPlugins).into_owned());
-                }
-                // Show installing hint when pending, otherwise normal toggle hint.
+                    .collect();
                 let hint = if self.pending.is_some() {
                     t(Msg::PluginMgrHintPending).into_owned()
                 } else {
@@ -360,43 +583,139 @@ impl PluginManager {
                 };
                 (rows, hint)
             }
-            Screen::RemoveMarketplace => {
-                if self.marketplaces.is_empty() {
-                    return (Vec::new(), t(Msg::PluginMgrEmptyMarketplaces).into_owned());
-                }
-                let rows = self
-                    .marketplaces
-                    .iter()
-                    .map(|m| (m.name.clone(), m.source.clone()))
-                    .collect();
-                (rows, t(Msg::PluginMgrHintRemove).into_owned())
-            }
             Screen::Installed => {
-                if self.installed.is_empty() {
-                    return (Vec::new(), t(Msg::PluginMgrEmptyInstalled).into_owned());
+                let inst = self.filtered_installed();
+                if inst.is_empty() {
+                    let hint = if self.search_query.is_empty() {
+                        t(Msg::PluginMgrEmptyInstalled).into_owned()
+                    } else {
+                        format!("No installed plugins match '{}'", self.search_query)
+                    };
+                    return (Vec::new(), hint);
                 }
-                let rows = self
-                    .installed
+
+                let root_opt = atomcode_core::plugin::plugins_root();
+                let cwd = std::env::current_dir().ok();
+                let mp_root_opt = atomcode_core::plugin::marketplaces_root();
+                let mut descriptions = std::collections::HashMap::new();
+                for i in &inst {
+                    let mut found_desc = None;
+                    let dir_opt = match i.scope {
+                        InstallScope::User => root_opt.clone(),
+                        InstallScope::Project | InstallScope::Local => {
+                            if let Some(ref wd) = cwd {
+                                atomcode_core::plugin::project_plugins_root(wd, &i.scope)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(root) = dir_opt {
+                        let plugin_dir = root.join(&i.plugin_dir);
+                        if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                            if let Some(desc) = manifest.description {
+                                if !desc.trim().is_empty() {
+                                    found_desc = Some(desc);
+                                }
+                            }
+                        }
+                    }
+                    if found_desc.is_none() {
+                        if let Some(ref mp_root) = mp_root_opt {
+                            let mp_dir = mp_root.join(&i.marketplace);
+                            if let Ok(Some(mp_manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                                if let Some(p) = mp_manifest.plugins.iter().find(|p| p.name == i.plugin || sanitize(&p.name) == i.plugin) {
+                                    if let Some(desc) = &p.description {
+                                        if !desc.trim().is_empty() {
+                                            found_desc = Some(desc.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(desc) = found_desc {
+                        descriptions.insert(i.plugin.clone(), desc);
+                    }
+                }
+
+                let rows = inst
                     .iter()
                     .map(|i| {
                         let scope_label = match i.scope {
-                            InstallScope::User => String::new(),
-                            InstallScope::Project => " [project]".into(),
-                            InstallScope::Local => " [local]".into(),
+                            InstallScope::User => t(Msg::PluginScopeUserShort).into_owned(),
+                            InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
+                            InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
                         };
-                        (format!("{}{}", i.plugin, scope_label), format!("@{}", i.marketplace))
+                        let name = i.plugin.clone();
+                        let status = format!("@{} ({})", i.marketplace, scope_label);
+                        let desc = if let Some(d) = descriptions.get(&i.plugin) {
+                            if !d.is_empty() {
+                                format!("{}  ·  {}", status, d)
+                            } else {
+                                status
+                            }
+                        } else {
+                            status
+                        };
+                        (name, desc)
                     })
                     .collect();
                 (rows, t(Msg::PluginMgrHintUninstall).into_owned())
             }
-            Screen::AddUrl => (Vec::new(), t(Msg::PluginMgrHintUrl).into_owned()),
-            Screen::ScopeSelect { .. } => {
+            Screen::AddUrl => {
                 let rows = vec![
-                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned()),
-                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned()),
-                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned()),
+                    ("Add Marketplace".to_string(), String::new()),
+                    (String::new(), String::new()),
+                    ("Enter marketplace source:".to_string(), String::new()),
+                    ("Examples:".to_string(), String::new()),
+                    ("  · git@atomgit.com:owner/repo.git (SSH)".to_string(), String::new()),
+                    ("  · https://example.com/marketplace.json".to_string(), String::new()),
+                    ("  · ./path/to/marketplace".to_string(), String::new()),
+                    (String::new(), String::new()),
                 ];
-                (rows, t(Msg::PluginScopeHint).into_owned())
+                (rows, t(Msg::PluginMgrHintUrl).into_owned())
+            }
+            Screen::Marketplaces => {
+                let mut rows = Vec::new();
+                for m in &self.marketplaces {
+                    let available = m.plugins.len();
+                    let installed = self.installed.iter().filter(|i| i.marketplace == m.name).count();
+                    let updated = get_directory_modified_date(&m.name);
+                    let desc = format!("{}|{}|{}|{}", m.source, available, installed, updated);
+                    rows.push((m.name.clone(), desc));
+                }
+                (rows, t(Msg::PluginMgrHintNav).into_owned())
+            }
+            Screen::ScopeSelect { .. } => {
+                let installing = self.installing_plugin.is_some();
+                let (user_lbl, user_desc) = if installing && self.installing_scope == Some(InstallScope::User) {
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                } else {
+                    (t(Msg::PluginScopeUser).into_owned(), t(Msg::PluginScopeUserDesc).into_owned())
+                };
+                let (project_lbl, project_desc) = if installing && self.installing_scope == Some(InstallScope::Project) {
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                } else {
+                    (t(Msg::PluginScopeProject).into_owned(), t(Msg::PluginScopeProjectDesc).into_owned())
+                };
+                let (local_lbl, local_desc) = if installing && self.installing_scope == Some(InstallScope::Local) {
+                    (format!("{}...", t(Msg::PluginMgrInstallingStatus)), "".to_string())
+                } else {
+                    (t(Msg::PluginScopeLocal).into_owned(), t(Msg::PluginScopeLocalDesc).into_owned())
+                };
+
+                let rows = vec![
+                    (user_lbl, user_desc),
+                    (project_lbl, project_desc),
+                    (local_lbl, local_desc),
+                ];
+                let hint = if installing {
+                    t(Msg::PluginMgrHintPending).into_owned()
+                } else {
+                    t(Msg::PluginScopeHint).into_owned()
+                };
+                (rows, hint)
             }
             Screen::Installing { plugin, .. } => {
                 let hint = format!(
@@ -405,6 +724,41 @@ impl PluginManager {
                     t(Msg::PluginMgrEscToCancel)
                 );
                 (Vec::new(), hint)
+            }
+            Screen::InstalledDetails { plugin, .. } => {
+                let installing = self.installing_plugin.as_deref() == Some(plugin.as_str());
+                let (update_label, update_desc) = if installing {
+                    (format!("{}...", t(Msg::PluginMgrUpdatingStatus)), "".to_string())
+                } else {
+                    (t(Msg::PluginActionUpdate).into_owned(), t(Msg::PluginActionUpdateDesc).into_owned())
+                };
+
+                let rows = vec![
+                    (t(Msg::PluginActionUninstall).into_owned(), t(Msg::PluginActionUninstallDesc).into_owned()),
+                    (update_label, update_desc),
+                    (t(Msg::PluginActionBack).into_owned(), t(Msg::PluginActionBackDesc).into_owned()),
+                ];
+                let hint = if installing {
+                    t(Msg::PluginMgrHintUpdating).into_owned()
+                } else {
+                    "↑↓ Select action · Enter confirm · Esc back".to_string()
+                };
+                (rows, hint)
+            }
+            Screen::MarketplaceDetails { mp } => {
+                let mut rows = Vec::new();
+                if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                    let available_count = m.plugins.len();
+                    rows.push((format!("Browse plugins ({})", available_count), String::new()));
+                    
+                    let last_updated = get_directory_modified_date(&m.name);
+                    rows.push((format!("Update marketplace (last updated {})", last_updated), String::new()));
+                    
+                    if !is_official_marketplace(&m.source) {
+                        rows.push(("Remove marketplace".to_string(), String::new()));
+                    }
+                }
+                (rows, t(Msg::PluginMgrHintNav).into_owned())
             }
         }
     }
@@ -420,26 +774,78 @@ impl Modal for PluginManager {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
+        // If an install/clone is pending, restrict key inputs.
+        // ESC is allowed so the user can cancel the action.
+        // Other navigation keys (Up, Down, Left, Right, Tab, BackTab) and inputs are blocked.
+        if self.pending.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    // fall through to normal Esc handling
+                }
+                _ => {
+                    // swallow all other key inputs
+                    return Ok(ModalAction::Continue);
+                }
+            }
+        }
+
         // Text-entry screen: capture characters into url_input.
         if matches!(self.screen, Screen::AddUrl) {
             match code {
                 KeyCode::Esc => {
                     self.url_input.clear();
-                    self.goto(Screen::Home);
+                    self.url_cursor = 0;
+                    self.goto(Screen::Marketplaces);
                 }
+                KeyCode::Left => {
+                    if self.url_cursor > 0 {
+                        self.url_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    let char_len = self.url_input.chars().count();
+                    if self.url_cursor < char_len {
+                        self.url_cursor += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    self.url_cursor = 0;
+                }
+                KeyCode::End => {
+                    self.url_cursor = self.url_input.chars().count();
+                }
+                KeyCode::BackTab => {}
+                KeyCode::Tab => {}
                 KeyCode::Enter => {
                     let url = self.url_input.trim().to_string();
                     if !url.is_empty() {
                         self.dispatch_add(url, ctx);
                         self.url_input.clear();
-                        self.goto(Screen::Home);
+                        self.url_cursor = 0;
                     }
                 }
                 KeyCode::Backspace => {
-                    self.url_input.pop();
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor > 0 && self.url_cursor <= chars.len() {
+                        chars.remove(self.url_cursor - 1);
+                        self.url_cursor -= 1;
+                        self.url_input = chars.into_iter().collect();
+                    }
+                }
+                KeyCode::Delete => {
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor < chars.len() {
+                        chars.remove(self.url_cursor);
+                        self.url_input = chars.into_iter().collect();
+                    }
                 }
                 KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                    self.url_input.push(c);
+                    let mut chars: Vec<char> = self.url_input.chars().collect();
+                    if self.url_cursor <= chars.len() {
+                        chars.insert(self.url_cursor, c);
+                        self.url_cursor += 1;
+                        self.url_input = chars.into_iter().collect();
+                    }
                 }
                 _ => {}
             }
@@ -457,29 +863,73 @@ impl Modal for PluginManager {
                     self.selected += 1;
                 }
             }
-            KeyCode::Esc => {
-                if matches!(self.screen, Screen::Home) {
-                    return Ok(ModalAction::Close);
+            KeyCode::Left | KeyCode::BackTab => {
+                if matches!(self.screen, Screen::Browse | Screen::Installed | Screen::Marketplaces) {
+                    self.switch_tab(false);
                 }
-                match &self.screen {
-                    Screen::ScopeSelect { plugin: _, mp } => {
-                        // Scope select → go back to Plugins list.
-                        let mp = mp.clone();
-                        self.goto(Screen::Plugins { mp });
-                    }
-                    Screen::Installing { plugin, mp } => {
-                        // Mark the install as cancelled so that when the
-                        // background job completes, on_plugin_event rolls
-                        // it back automatically.
-                        let id = format!("{}@{}", sanitize(plugin), mp);
-                        self.cancelled_installs.insert(id);
-                        self.pending = None;
-                        self.installing_plugin = None;
-                        let mp = mp.clone();
-                        self.goto(Screen::Plugins { mp });
-                    }
-                    _ => {
-                        self.goto(Screen::Home);
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                if matches!(self.screen, Screen::Browse | Screen::Installed | Screen::Marketplaces) {
+                    self.switch_tab(true);
+                }
+            }
+            KeyCode::Backspace => {
+                if !self.search_query.is_empty() {
+                    self.search_query.pop();
+                    self.selected = 0;
+                } else if matches!(self.screen, Screen::Browse) {
+                    self.enter_remove(ctx, renderer);
+                } else if matches!(self.screen, Screen::Marketplaces) {
+                    self.remove_selected_marketplace(ctx, renderer);
+                }
+            }
+            KeyCode::Delete => {
+                if matches!(self.screen, Screen::Browse) {
+                    self.enter_remove(ctx, renderer);
+                } else if matches!(self.screen, Screen::Marketplaces) {
+                    self.remove_selected_marketplace(ctx, renderer);
+                }
+            }
+            KeyCode::Esc => {
+                if !self.search_query.is_empty() {
+                    self.search_query.clear();
+                    self.selected = 0;
+                } else {
+                    match &self.screen {
+                        Screen::ScopeSelect { plugin, mp } => {
+                            if self.installing_plugin.is_some() {
+                                let id = format!("{}@{}", sanitize(plugin), mp);
+                                self.cancelled_installs.insert(id);
+                                self.pending = None;
+                                self.installing_plugin = None;
+                                self.installing_scope = None;
+                            }
+                            self.goto(Screen::Browse);
+                        }
+                        Screen::Installing { plugin, mp } => {
+                            let id = format!("{}@{}", sanitize(plugin), mp);
+                            self.cancelled_installs.insert(id);
+                            self.pending = None;
+                            self.installing_plugin = None;
+                            self.installing_scope = None;
+                            self.goto(Screen::Browse);
+                        }
+                        Screen::InstalledDetails { plugin, mp, .. } => {
+                            if self.installing_plugin.is_some() {
+                                let id = format!("{}@{}", sanitize(plugin), mp);
+                                self.cancelled_installs.insert(id);
+                                self.pending = None;
+                                self.installing_plugin = None;
+                                self.installing_scope = None;
+                            }
+                            self.goto(Screen::Installed);
+                        }
+                        Screen::MarketplaceDetails { .. } => {
+                            self.goto(Screen::Marketplaces);
+                        }
+                        _ => {
+                            return Ok(ModalAction::Close);
+                        }
                     }
                 }
             }
@@ -490,24 +940,25 @@ impl Modal for PluginManager {
                     // no-op: swallow the keystroke
                 } else {
                     match &self.screen {
-                        Screen::Home => self.enter_home(),
-                        Screen::Browse => self.enter_browse(),
-                        Screen::Plugins { .. } => self.enter_plugins(ctx, renderer),
+                        Screen::Browse => self.enter_browse(ctx, renderer),
                         Screen::ScopeSelect { .. } => self.enter_scope_select(ctx),
                         Screen::Installing { .. } => {
                             // No-op: already installing, Enter does nothing.
                         }
-                        Screen::RemoveMarketplace => self.enter_remove(ctx, renderer),
                         Screen::Installed => self.enter_installed(ctx, renderer),
+                        Screen::InstalledDetails { .. } => self.enter_installed_details(ctx, renderer),
                         Screen::AddUrl => {}
+                        Screen::Marketplaces => self.enter_marketplaces(ctx, renderer),
+                        Screen::MarketplaceDetails { .. } => self.enter_marketplace_details(ctx, renderer),
                     }
                 }
             }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                self.search_query.push(c);
+                self.selected = 0;
+            }
             _ => {}
         }
-        // Marketplace removal closes the manager (removing a marketplace is a
-        // bigger, rarer action). Plugin uninstall deliberately does NOT — the
-        // user usually wants to uninstall several in a row.
         if std::mem::take(&mut self.close_requested) {
             return Ok(ModalAction::Close);
         }
@@ -515,7 +966,7 @@ impl Modal for PluginManager {
         Ok(ModalAction::Continue)
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let (items, hint) = self.rows();
         // Status row: show a pending spinner-ish note if a job is in flight,
         // otherwise the navigation hint for this screen.
@@ -526,24 +977,165 @@ impl Modal for PluginManager {
                 None => hint,
             },
         };
-        // The hint rides as the last (non-selectable) menu row's label so it
-        // is visible under the list without a dedicated widget.
-        let mut items = items;
-        items.push((format!("— {} —", hint), String::new()));
+
+        let mut final_items = Vec::new();
+        // Prepend tab bar and a blank line separator
+        final_items.push((self.tab_bar(), String::new()));
+        final_items.push((String::new(), String::new()));
+
+        let mut selected_offset = 2;
+
+        let details_opt = match &self.screen {
+            Screen::ScopeSelect { plugin, mp } | Screen::Installing { plugin, mp } => {
+                let (version, description) = self.get_plugin_details(plugin, mp);
+                Some((plugin.clone(), mp.clone(), version, description, None))
+            }
+            Screen::InstalledDetails { plugin, mp, scope } => {
+                let (version, description) = self.get_installed_plugin_details(plugin, mp, scope);
+                Some((plugin.clone(), mp.clone(), version, description, Some(scope.clone())))
+            }
+            _ => None,
+        };
+
+        if let Some((plugin, mp, version, description, scope_opt)) = details_opt {
+            final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
+            final_items.push((format!("  Name:        {}", plugin), String::new()));
+            final_items.push((format!("  Marketplace: \x1b[90m@{}\x1b[39m", mp), String::new()));
+            final_items.push((format!("  Version:     \x1b[90m{}\x1b[39m", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
+            selected_offset += 4;
+            if let Some(scope) = scope_opt {
+                let scope_label = match scope {
+                    InstallScope::User => t(Msg::PluginScopeUserShort).into_owned(),
+                    InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
+                    InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
+                };
+                final_items.push((format!("  Scope:       \x1b[90m{}\x1b[39m", scope_label), String::new()));
+                selected_offset += 1;
+            }
+            if let Some(desc) = description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    let truncated = if trimmed.len() > 60 {
+                        format!("{}...", &trimmed[..57])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    final_items.push((format!("  Description: \x1b[90m{}\x1b[39m", truncated), String::new()));
+                    selected_offset += 1;
+                }
+            }
+            final_items.push((String::new(), String::new()));
+            if matches!(self.screen, Screen::ScopeSelect { .. }) {
+                final_items.push(("  Select Install Scope:".to_string(), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            } else if matches!(self.screen, Screen::InstalledDetails { .. }) {
+                final_items.push(("  Manage Plugin:".to_string(), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            } else {
+                let installing_label = t(Msg::PluginMgrInstallingStatus).into_owned();
+                final_items.push((format!("  Status:      {}...", installing_label), String::new()));
+                final_items.push((String::new(), String::new()));
+                selected_offset += 3;
+            }
+        }
+
+        if let Screen::MarketplaceDetails { mp } = &self.screen {
+            if let Some(m) = self.marketplaces.iter().find(|x| &x.name == mp) {
+                let installed_plugins: Vec<&InstalledPluginInfo> = self.installed
+                    .iter()
+                    .filter(|i| &i.marketplace == mp)
+                    .collect();
+                let installed_count = installed_plugins.len();
+
+                final_items.push((format!("  \x1b[1m{}\x1b[22m", m.name), String::new()));
+                final_items.push((format!("  \x1b[90m{}\x1b[39m", m.source), String::new()));
+                final_items.push((String::new(), String::new()));
+                final_items.push((format!("  {} available plugins", m.plugins.len()), String::new()));
+                final_items.push((String::new(), String::new()));
+                final_items.push((format!("  \x1b[1mInstalled plugins ({}):\x1b[22m", installed_count), String::new()));
+
+                if installed_count == 0 {
+                    final_items.push(("  \x1b[90mNo plugins installed from this marketplace.\x1b[39m".to_string(), String::new()));
+                } else {
+                    for inst in installed_plugins {
+                        final_items.push((format!("  \x1b[90m● {}\x1b[39m", inst.plugin), String::new()));
+                        let (_, description) = self.get_installed_plugin_details(&inst.plugin, &inst.marketplace, &inst.scope);
+                        if let Some(desc) = description {
+                            let trimmed = desc.trim();
+                            if !trimmed.is_empty() {
+                                let truncated = if trimmed.len() > 60 {
+                                    format!("{}...", &trimmed[..57])
+                                } else {
+                                    trimmed.to_string()
+                                };
+                                final_items.push((format!("    \x1b[90m{}\x1b[39m", truncated), String::new()));
+                            }
+                        }
+                    }
+                }
+                final_items.push((String::new(), String::new()));
+                selected_offset = final_items.len();
+            }
+        }
+
+        if matches!(self.screen, Screen::Marketplaces) {
+            final_items.push(("+ Add Marketplace".to_string(), String::new()));
+            final_items.push((String::new(), String::new()));
+            for item in items {
+                final_items.push(item);
+                final_items.push((String::new(), String::new()));
+            }
+        } else {
+            for item in items {
+                final_items.push(item);
+            }
+            if matches!(
+                self.screen,
+                Screen::InstalledDetails { .. }
+                    | Screen::ScopeSelect { .. }
+                    | Screen::MarketplaceDetails { .. }
+            ) {
+                final_items.push((String::new(), String::new()));
+            } else if matches!(self.screen, Screen::AddUrl) {
+                final_items.push((format!("❯ {}", self.url_input), String::new()));
+            }
+        }
+        final_items.push((format!("— {} —", hint), String::new()));
+
         let selectable = self.current_len();
         let selected = if selectable == 0 {
             // No items are selectable, so nothing should be highlighted.
-            // Using an out-of-bounds index (like items.len()) ensures that.
-            items.len()
+            final_items.len()
+        } else if matches!(self.screen, Screen::Marketplaces) {
+            if self.selected == 0 {
+                2
+            } else {
+                4 + (self.selected - 1) * 2
+            }
         } else {
-            self.selected.min(selectable.saturating_sub(1))
+            (self.selected + selected_offset).min(final_items.len().saturating_sub(2))
         };
-        let payload = MenuPayload { items, selected, kind: MenuKind::SlashCommand };
+        let kind = match &self.screen {
+            Screen::Browse | Screen::Installed => MenuKind::Plugin,
+            Screen::Marketplaces | Screen::AddUrl => MenuKind::Marketplace,
+            Screen::ScopeSelect { .. }
+            | Screen::Installing { .. }
+            | Screen::InstalledDetails { .. }
+            | Screen::MarketplaceDetails { .. } => MenuKind::PluginInfo,
+        };
+        let payload = MenuPayload {
+            items: final_items,
+            selected,
+            kind,
+        };
 
         let (text, cursor) = if matches!(self.screen, Screen::AddUrl) {
-            (self.url_input.clone(), self.url_input.len())
+            let byte_idx = self.url_input.chars().take(self.url_cursor).map(|c| c.len_utf8()).sum::<usize>();
+            (self.url_input.clone(), byte_idx)
         } else {
-            (buf.text.clone(), buf.cursor)
+            (self.search_query.clone(), self.search_query.len())
         };
         renderer.render(UiLine::InputPrompt {
             buf: text,
@@ -577,6 +1169,8 @@ impl Modal for PluginManager {
     fn on_plugin_event(&mut self, ev: &PluginJobEvent) {
         self.pending = None;
         self.installing_plugin = None;
+        self.installing_scope = None;
+        self.is_updating = false;
 
         // If a cancelled install completed successfully, roll it back
         // (uninstall) so the filesystem is not left in an inconsistent
@@ -584,7 +1178,7 @@ impl Modal for PluginManager {
         // a git clone is still in flight: the clone finishes and updates
         // installed_plugins.json, but the user already expressed intent to
         // cancel.
-        if let PluginJobEvent::PluginInstalled(info) = ev {
+        if let PluginJobEvent::PluginInstalled(info) | PluginJobEvent::PluginUpdated(info) = ev {
             let id = format!("{}@{}", info.plugin, info.marketplace);
             if self.cancelled_installs.take(&id).is_some() {
                 // Best-effort rollback — if this fails the stale dir
@@ -595,15 +1189,84 @@ impl Modal for PluginManager {
                     &info.marketplace,
                     info.scope.clone(),
                 );
+            } else {
+                self.close_requested = true;
             }
         }
 
         self.reload();
         // If we were on the Installing screen, navigate back to the
-        // Plugins list so the user sees the updated installed state.
-        if let Screen::Installing { mp, .. } = &self.screen {
-            let mp = mp.clone();
-            self.goto(Screen::Plugins { mp });
+        // Browse screen so the user sees the updated installed state.
+        if let Screen::Installing { .. } = &self.screen {
+            self.goto(Screen::Browse);
+        }
+        if let Screen::AddUrl = &self.screen {
+            self.goto(Screen::Marketplaces);
+        }
+    }
+
+
+    
+    fn close_requested(&self) -> bool {
+        self.close_requested
+    }
+}
+
+fn get_directory_modified_date(name: &str) -> String {
+    if let Some(root) = atomcode_core::plugin::marketplaces_root() {
+        let dir = root.join(name);
+        let target = if dir.join(".atomcode-plugin/marketplace.json").exists() {
+            dir.join(".atomcode-plugin/marketplace.json")
+        } else if dir.join(".git").exists() {
+            dir.join(".git")
+        } else {
+            dir
+        };
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            if let Ok(modified) = metadata.modified() {
+                let dt: chrono::DateTime<chrono::Local> = modified.into();
+                return dt.format("%-m/%-d/%Y").to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn is_official_marketplace(source: &str) -> bool {
+    source == "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git"
+        || source == "git@atomgit.com:atomgit_atomcode/atomcode-plugins-official.git"
+}
+
+
+
+fn get_mock_category(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("git") || lower.contains("commit") || lower.contains("lens") {
+        "Git"
+    } else if lower.contains("lint") || lower.contains("check") || lower.contains("eslint") {
+        "Linter"
+    } else if lower.contains("format") || lower.contains("prettier") || lower.contains("style") {
+        "Formatter"
+    } else if lower.contains("rust")
+        || lower.contains("go")
+        || lower.contains("python")
+        || lower.contains("lang")
+        || lower.contains("analyzer")
+    {
+        "Language"
+    } else if lower.contains("security") || lower.contains("auth") || lower.contains("guard") {
+        "Security"
+    } else if lower.contains("ai") || lower.contains("gpt") || lower.contains("copilot") || lower.contains("model") {
+        "AI"
+    } else {
+        let mut hash = 0u64;
+        for c in name.chars() {
+            hash = hash.wrapping_add(c as u64).wrapping_mul(31);
+        }
+        match hash % 3 {
+            0 => "Utility",
+            1 => "Tool",
+            _ => "Completion",
         }
     }
 }
@@ -632,37 +1295,42 @@ mod tests {
 
     fn manager(mps: Vec<MarketplaceInfo>, inst: Vec<InstalledPluginInfo>) -> PluginManager {
         PluginManager {
-            screen: Screen::Home,
+            screen: Screen::Browse,
             selected: 0,
             marketplaces: mps,
             installed: inst,
             url_input: String::new(),
+            url_cursor: 0,
             pending: None,
             installing_plugin: None,
             cancelled_installs: HashSet::new(),
             close_requested: false,
+            search_query: String::new(),
+            installing_scope: None,
+            is_updating: false,
         }
     }
 
     #[test]
-    fn home_has_four_rows() {
-        let m = manager(vec![], vec![]);
-        assert_eq!(m.current_len(), 4);
-    }
-
-    #[test]
-    fn browse_then_plugins_navigation() {
-        let mut m = manager(vec![mk_mp("official", &["a", "b", "c"])], vec![]);
-        // Home → Browse
-        m.selected = 0;
-        m.enter_home();
+    fn browse_displays_all_plugins() {
+        let m = manager(
+            vec![
+                mk_mp("official", &["a", "b"]),
+                mk_mp("community", &["c", "d"]),
+            ],
+            vec![],
+        );
+        // Starts at Browse screen
         assert!(matches!(m.screen, Screen::Browse));
         assert_eq!(m.selected, 0);
-        assert_eq!(m.current_len(), 1);
-        // Browse → Plugins{official}
-        m.enter_browse();
-        assert!(matches!(&m.screen, Screen::Plugins { mp } if mp == "official"));
-        assert_eq!(m.current_len(), 3);
+        assert_eq!(m.current_len(), 4);
+        
+        let plugins = m.all_browse_plugins();
+        assert_eq!(plugins.len(), 4);
+        assert_eq!(plugins[0].name, "a");
+        assert_eq!(plugins[0].marketplace, "official");
+        assert_eq!(plugins[2].name, "c");
+        assert_eq!(plugins[2].marketplace, "community");
     }
 
     #[test]
@@ -686,12 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn installed_count_in_home_rows() {
+    fn installed_count_in_tab_bar() {
         let m = manager(vec![], vec![mk_installed("a", "x"), mk_installed("b", "x")]);
-        let (rows, _hint) = m.rows();
-        // 4 home rows; the Installed row label should mention the count 2.
-        assert_eq!(rows.len(), 4);
-        assert!(rows[3].0.contains('2'));
+        let bar = m.tab_bar();
+        assert!(bar.contains("Installed (2)"));
     }
 
     #[test]
@@ -735,5 +1401,181 @@ mod tests {
         assert!(rows.is_empty());
         assert!(hint.contains("discrawl"));
         assert!(hint.contains("Esc"));
+    }
+
+    #[test]
+    fn search_filtering_browse_plugins() {
+        let mut m = manager(
+            vec![
+                mk_mp("official", &["git-lens", "rust-analyzer"]),
+                mk_mp("community", &["go-pls"]),
+            ],
+            vec![],
+        );
+        assert_eq!(m.filtered_browse_plugins().len(), 3);
+
+        m.search_query = "rust".to_string();
+        let filtered = m.filtered_browse_plugins();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "rust-analyzer");
+        assert_eq!(filtered[0].marketplace, "official");
+
+        m.search_query = "comm".to_string(); // filters by marketplace name too
+        let filtered = m.filtered_browse_plugins();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "go-pls");
+        assert_eq!(filtered[0].marketplace, "community");
+    }
+
+    #[test]
+    fn search_query_clears_on_tab_switch() {
+        let mut m = manager(vec![], vec![]);
+        m.search_query = "rust".to_string();
+        m.switch_tab(true);
+        assert!(m.search_query.is_empty());
+    }
+
+    #[test]
+    fn search_filtering_by_description() {
+        let items = vec![
+            BrowsePluginItem {
+                name: "git-lens".to_string(),
+                marketplace: "official".to_string(),
+                description: "Visualizes code history".to_string(),
+            },
+        ];
+        let q = "history".to_string();
+        let filtered: Vec<_> = items.into_iter()
+            .filter(|item| {
+                item.name.to_lowercase().contains(&q)
+                    || item.marketplace.to_lowercase().contains(&q)
+                    || item.description.to_lowercase().contains(&q)
+            })
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "git-lens");
+    }
+
+    #[test]
+    fn browse_retains_installed_plugins() {
+        let m = manager(
+            vec![
+                mk_mp("official", &["git-lens", "rust-analyzer"]),
+                mk_mp("community", &["go-pls"]),
+            ],
+            vec![
+                mk_installed("git-lens", "official"),
+            ],
+        );
+        let browse = m.filtered_browse_plugins();
+        assert_eq!(browse.len(), 3);
+        assert_eq!(browse[0].name, "git-lens");
+        assert_eq!(browse[1].name, "go-pls");
+        assert_eq!(browse[2].name, "rust-analyzer");
+    }
+
+    #[test]
+    fn browse_shows_categories() {
+        let m = manager(
+            vec![
+                mk_mp("official", &["git-lens"]),
+            ],
+            vec![],
+        );
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        let (_name, desc) = &rows[0];
+        assert!(desc.contains("Git"));
+    }
+
+    #[test]
+    fn installed_list_shows_scopes() {
+        let mut m = manager(
+            vec![],
+            vec![
+                InstalledPluginInfo {
+                    plugin: "git-lens".to_string(),
+                    marketplace: "official".to_string(),
+                    plugin_dir: "installed/official/git-lens".to_string(),
+                    scope: InstallScope::Project,
+                },
+            ],
+        );
+        m.goto(Screen::Installed);
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        let (name, desc) = &rows[0];
+        assert_eq!(name, "git-lens");
+        assert!(desc.contains("project") || desc.contains("项目级"));
+    }
+
+    #[test]
+    fn installed_details_actions() {
+        let mut m = manager(
+            vec![],
+            vec![
+                InstalledPluginInfo {
+                    plugin: "git-lens".to_string(),
+                    marketplace: "official".to_string(),
+                    plugin_dir: "installed/official/git-lens".to_string(),
+                    scope: InstallScope::Project,
+                },
+            ],
+        );
+        m.goto(Screen::InstalledDetails {
+            plugin: "git-lens".to_string(),
+            mp: "official".to_string(),
+            scope: InstallScope::Project,
+        });
+        assert_eq!(m.current_len(), 3);
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 3);
+        // Action options
+        assert!(rows[0].0.contains("Uninstall") || rows[0].0.contains("卸载"));
+        assert!(rows[1].0.contains("Update") || rows[1].0.contains("更新"));
+        assert!(rows[2].0.contains("Back") || rows[2].0.contains("返回"));
+    }
+
+    #[test]
+    fn marketplaces_screen_rows_and_navigation() {
+        let mps = vec![
+            MarketplaceInfo {
+                name: "test-marketplace".to_string(),
+                source: "https://example.com/test-marketplace.git".to_string(),
+                git_commit: "commit123".to_string(),
+                plugins: vec!["plugin1".to_string(), "plugin2".to_string()],
+            }
+        ];
+        let mut m = manager(mps, vec![]);
+        m.goto(Screen::Marketplaces);
+        
+        // current_len should be 1 (+ Add Marketplace) + 1 (test-marketplace) = 2
+        assert_eq!(m.current_len(), 2);
+        
+        // rows should return test-marketplace with formatting info
+        let (rows, _) = m.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "test-marketplace");
+        assert!(rows[0].1.contains("https://example.com/test-marketplace.git"));
+        assert!(rows[0].1.contains("2|0|unknown")); // 2 available, 0 installed, unknown updated
+    }
+
+    #[test]
+    fn add_marketplace_help_screen_rows() {
+        let mut m = manager(vec![], vec![]);
+        m.goto(Screen::AddUrl);
+        
+        // current_len should be 0 since it is text-entry only
+        assert_eq!(m.current_len(), 0);
+        
+        let (rows, hint) = m.rows();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0].0, "Add Marketplace");
+        assert_eq!(rows[2].0, "Enter marketplace source:");
+        assert_eq!(rows[3].0, "Examples:");
+        assert!(rows[4].0.contains("git@atomgit.com"));
+        assert!(rows[5].0.contains("https://example.com/marketplace.json"));
+        assert!(rows[6].0.contains("./path/to/marketplace"));
+        assert!(hint.contains("to add") || hint.contains("添加"));
     }
 }

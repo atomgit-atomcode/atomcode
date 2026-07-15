@@ -3,4 +3,4 @@
 // output. This module is a re-export shim so all existing
 // `crate::i18n::{t, Msg, Locale, …}` call sites keep compiling
 // unchanged.
-pub use atomcode_core::i18n::*;
+pub use atomcode_config::i18n::*;

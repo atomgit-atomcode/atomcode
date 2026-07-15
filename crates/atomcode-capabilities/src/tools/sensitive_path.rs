@@ -214,9 +214,8 @@ impl ToolMiddleware for SensitivePathGate {
                 BeforeOutcome::Proceed
             }
             PermissionDecision::Deny => BeforeOutcome::deny(format!(
-                "reading a sensitive path needs approval and was denied: {} {}",
-                tool.name(),
-                call.arguments
+                "reading a sensitive path needs approval and was denied: {}",
+                tool.name()
             )),
         }
     }

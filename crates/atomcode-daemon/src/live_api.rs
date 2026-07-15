@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
@@ -25,25 +26,25 @@ use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::PermissionDecision;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider, PlanPermissionDecider,
-};
-use atomcode_core::turn::runner::TurnRunner;
+use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use crate::approval_mode::{
-    approval_mode_tool_filter, approval_mode_wire, ApprovalMode, PLAN_MODE_SYSTEM_SUFFIX,
-};
+pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
+use crate::kernel_runtime::DaemonRuntimeEvent;
 
-fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
+pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
         ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Bypass => PermissionDecision::Allow,
+        // AcceptEdits groups with Build here: this coarse daemon/webui fallback has no
+        // per-tool granularity yet (webui 4th-mode support is deferred). The real
+        // AcceptEdits enforcement (edits auto-approve, bash still prompts) is the
+        // WriteApprovalGate middleware on the interactive path.
+        ApprovalMode::Build | ApprovalMode::Auto | ApprovalMode::AcceptEdits => {
+            PermissionDecision::Allow
+        }
     }
 }
 
@@ -76,7 +77,7 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 
 /// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
 fn live_current_mode_wire() -> String {
-    approval_mode_wire(live_current_approval_mode()).to_string()
+    live_current_approval_mode().wire().to_string()
 }
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
@@ -137,7 +138,7 @@ pub fn live_set_provider(provider: String) {
 pub fn live_set_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     if let Some(s) = current_live_session() {
-        s.notify_mode_changed(approval_mode_wire(mode).to_string());
+        s.notify_mode_changed(mode.wire().to_string());
     }
 }
 
@@ -173,7 +174,51 @@ impl Drop for ScopedApprovalModeForTest {
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
     // 记录进程级覆盖，供两个执行器下一轮读取（修复 #755：sync 模式下 /cd 后模型
     // 仍报旧目录——执行器的 working_dir 在创建时冻结，仅靠广播无法让引擎切目录）。
+    let dir = crate::normalize_working_dir_case(dir);
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+
+    if let Some(store) = crate::DAEMON_PROJECT.lock().unwrap().as_ref() {
+        let store = store.clone();
+        let dir = dir.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut project = store.write().await;
+                let old_dir = project.working_dir.clone();
+                if old_dir != dir {
+                    project.previous_dir = Some(old_dir);
+                    project.working_dir = dir.clone();
+                    project.name = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "project".to_string());
+                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    project
+                        .recent_dirs
+                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    project.recent_dirs.insert(0, dir.clone());
+                    project.recent_dirs.truncate(5);
+                }
+            });
+        } else {
+            let mut project = store.blocking_write();
+            let old_dir = project.working_dir.clone();
+            if old_dir != dir {
+                project.previous_dir = Some(old_dir);
+                project.working_dir = dir.clone();
+                project.name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string());
+                let new_key = atomcode_core::tool::path_case_key(&dir);
+                project
+                    .recent_dirs
+                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                project.recent_dirs.insert(0, dir.clone());
+                project.recent_dirs.truncate(5);
+            }
+        }
+    }
+
     if let Some(s) = current_live_session() {
         s.notify_working_dir_changed(dir);
     }
@@ -274,7 +319,9 @@ pub fn ensure_live_session(
 /// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
-    mcp_cache: Arc<
+    // Retained in the signature for call-site compatibility; the kernel executor
+    // resolves MCP itself, so this daemon-level cache is no longer read here.
+    _mcp_cache: Arc<
         tokio::sync::RwLock<
             std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
         >,
@@ -339,25 +386,14 @@ pub(crate) fn ensure_live_session_global(
     // 污染在另一项目里新建/替换的会话（issue #755）。仅在确实新建/替换时执行，
     // 复用既有会话的分支已在上方提前 return，不会走到这里。
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
-        atomcode_core::ctrace!("LIVE", "engine v2: daemon live turns on the new stack");
-        Arc::new(KernelTurnExecutor::new(
-            working_dir,
-            None,
-            false,
-            session_id,
-            telemetry,
-        ))
-    } else {
-        Arc::new(DaemonTurnExecutor {
-            working_dir,
-            provider_name: None,
-            mcp_cache,
-            telemetry,
-            auto_approve: false,
-            session_id,
-        })
-    };
+    atomcode_core::ctrace!("LIVE", "daemon live turns on the kernel stack");
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
+        working_dir,
+        None,
+        false,
+        session_id,
+        telemetry,
+    ));
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let (initial_messages, cold_summaries) = initial_session();
@@ -382,8 +418,6 @@ fn live_session_id_or_unknown() -> String {
 pub(crate) struct TurnParts {
     pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
     pub tools: Arc<ToolRegistry>,
-    pub context: ToolContext,
-    pub config: Config,
     pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
     pub system_prompt: String,
 }
@@ -424,58 +458,24 @@ pub(crate) async fn build_turn_parts(
 
     let mut tool_registry = ToolRegistry::new();
 
-    // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
-        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
-        tool_registry.register_sync(Box::new(WebFetchTool));
-    }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
+    tool_registry.register_sync(Box::new(ReadFileTool));
+    tool_registry.register_sync(Box::new(WriteFileTool));
+    tool_registry.register_sync(Box::new(EditFileTool));
+    tool_registry.register_sync(Box::new(BashTool));
+    tool_registry.register_sync(Box::new(GrepTool));
+    tool_registry.register_sync(Box::new(GlobTool));
+    tool_registry.register_sync(Box::new(ListDirTool));
+    tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
+    tool_registry.register_sync(Box::new(WebFetchTool));
+    tool_registry.register_sync(Box::new(SearchReplaceTool));
+    tool_registry.register_sync(Box::new(TodoTool::new()));
 
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
     skill_registry.reload(working_dir);
     let has_skills = !skill_registry.is_empty();
     let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
+    if has_skills {
         tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone(),
         }));
@@ -530,7 +530,7 @@ pub(crate) async fn build_turn_parts(
 
     // Build LSP manager from config and inject into ToolContext.
     let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
+    if lsp_manager.is_some() {
         tool_registry.register_sync(Box::new(DiagnosticsTool));
     }
     tool_context.lsp = lsp_manager;
@@ -542,7 +542,7 @@ pub(crate) async fn build_turn_parts(
     let ctx = match config.providers.get(&resolved_provider_name) {
         Some(pc) => atomcode_core::ctx::for_provider(pc),
         None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            atomcode_core::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),
@@ -571,274 +571,15 @@ pub(crate) async fn build_turn_parts(
     Ok(TurnParts {
         provider: provider.into(),
         tools: Arc::new(tool_registry),
-        context: tool_context,
-        config,
         ctx,
         system_prompt,
     })
 }
 
-/// 真实执行器：每个 turn 用 build_turn_parts 建 TurnRunner，跑 turn 循环，
-/// 把 TurnRunner 的 mpsc<TurnEvent> 桥接成 LiveEvent::Turn 广播。
-pub(crate) struct DaemonTurnExecutor {
-    pub working_dir: PathBuf,
-    pub provider_name: Option<String>,
-    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    pub telemetry: Arc<Telemetry>,
-    /// 阶段②：自动批准（true=BypassAll），便于多 tab 验证；阶段③改交互式审批。
-    pub auto_approve: bool,
-    /// 稳定的 session_id：进程内唯一，每轮落盘时覆盖同一文件（一会话=一条记录）。
-    pub session_id: atomcode_core::session::SessionId,
-}
-
-#[async_trait]
-impl TurnExecutor for DaemonTurnExecutor {
-    /// 非视觉主模型 + 带图时经 VL 把图转文字（原图保留用于缩略图）。在 coordinator
-    /// 追加用户消息前调用，TUI / webui 共享。provider 解析与 `run_turn` 同源
-    /// （LIVE_PROVIDER 优先，回退执行器默认）。
-    async fn preprocess_input(&self, input: UserInput) -> UserInput {
-        if input.images.is_empty() {
-            return input;
-        }
-        let live_provider = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(
-            &input.text,
-            &input.images,
-            provider_name,
-            Some(self.session_id.as_str()),
-        )
-        .await;
-        UserInput {
-            text,
-            images: input.images,
-        }
-    }
-    async fn run_turn(
-        &self,
-        conv: &Arc<Mutex<Conversation>>,
-        events: broadcast::Sender<LiveEvent>,
-        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
-        cancel: CancellationToken,
-    ) {
-        // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
-        let live_provider = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        // 每轮解析当前生效目录（LIVE_WORKING_DIR 覆盖 → 执行器创建时目录），使 sync
-        // 模式下 /cd 切目录对下一轮的 system prompt / 工具 cwd / 会话落盘全部生效
-        // （issue #755）。v1 每轮重建 parts，故读到新目录即重建出新的 system prompt。
-        let working_dir = live_current_working_dir(&self.working_dir);
-        let mut parts = match build_turn_parts(
-            &working_dir,
-            provider_name,
-            &self.mcp_cache,
-            self.telemetry.clone(),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!(
-                    "构造 turn 失败：{e}"
-                ))));
-                return;
-            }
-        };
-        // Plan mode: tell the model up-front it's read-only so it explores and
-        // presents a plan instead of firing edits that the DenyAll decider will
-        // reject. `parts.system_prompt` is per-turn (rebuilt every turn from the
-        // current working dir), so appending here never persists into the next
-        // non-plan turn. Mirrors the TUI PlanModeGate's intent for the v1 path.
-        if live_current_approval_mode() == ApprovalMode::Plan && !self.auto_approve {
-            parts.system_prompt.push_str(PLAN_MODE_SYSTEM_SUFFIX);
-        }
-        // Build the permission decider. When interactive, mirror process_chat_request:
-        // create two channels, register the response sender into the LiveSession approver
-        // slot (so any view calling LiveSession.approve() delivers the decision here),
-        // and keep the request receiver alive for the duration of the turn (the channel
-        // must stay open so InteractivePermissionDecider::decide() can send on it without
-        // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
-        // Effective mode: an executor forced to auto-approve (standalone / multi-tab
-        // BypassAll) always bypasses; otherwise honour the webui runtime pill
-        // (`LIVE_APPROVAL_MODE`, default Build). Read per-turn so a mid-session switch
-        // takes effect next turn — same rationale as LIVE_PROVIDER.
-        let effective_mode = if self.auto_approve {
-            ApprovalMode::Bypass
-        } else {
-            live_current_approval_mode()
-        };
-        let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
-            match effective_mode {
-                // 免审批：全放行。
-                ApprovalMode::Bypass => (
-                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-                    None,
-                ),
-                // Plan：拒改动类工具（放行只读、拒写/改/bash），配合下方注入的 plan 指令
-                // 让模型只探索+出方案。用 PlanPermissionDecider（而非 DenyAll）——其
-                // will_auto_approve=true 抑制了「等待审批」卡片的闪现（DenyAll 会为每个被
-                // 拒的工具先弹一张随即作废的审批卡）。无交互提示、不注册 approver。
-                ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
-                // Build：交互审批（现状，走 webui PermissionCard）。
-                ApprovalMode::Build => {
-                    let (perm_req_tx, perm_req_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                    let (perm_resp_tx, perm_resp_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
-                    // Register the response sender into the LiveSession approver slot.
-                    // LiveSession.approve(decision) will take this sender and deliver the decision.
-                    *approver.lock().await = Some(perm_resp_tx);
-                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                        atomcode_core::tool::PermissionStore::new(),
-                    ));
-                    (
-                        Box::new(InteractivePermissionDecider::new(
-                            perm_req_tx,
-                            perm_resp_rx,
-                            perm_store,
-                        )),
-                        Some(perm_req_rx),
-                    )
-                }
-            };
-
-        // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
-        // mirroring the TUI agent so LiveSession turns stay hook-aware.
-        let mut hook_engine = atomcode_core::hook::HookEngine::new();
-        hook_engine.load_all(&working_dir);
-        let mut runner = TurnRunner {
-            provider: parts.provider,
-            tools: parts.tools,
-            context: parts.context,
-            config: parts.config,
-            ctx: parts.ctx,
-            permission,
-            recently_edited_files: Vec::new(),
-            hook_engine: std::sync::Arc::new(hook_engine),
-            loop_guard: Default::default(),
-            current_turn_number: 0,
-        };
-
-        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
-        let ev2 = events.clone();
-        let forward = tokio::spawn(async move {
-            while let Some(te) = turn_rx.recv().await {
-                let _ = ev2.send(LiveEvent::Turn(te));
-            }
-        });
-
-        {
-            let mut c = conv.lock().await;
-            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
-            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
-            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
-            let scope_ctx = atomcode_telemetry::CurrentContext {
-                mode: live_mode,
-                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
-                ..atomcode_telemetry::CurrentContext::current()
-            };
-            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
-                loop {
-                    // ── Context compression check before each turn ──
-                    {
-                        let task_hint = c
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|m| {
-                                matches!(m.role, atomcode_core::conversation::message::Role::User)
-                                    && !m.synthetic
-                            })
-                            .and_then(|m| m.text())
-                            .map(|text| {
-                                if text.chars().count() > 200 {
-                                    format!(
-                                        "TASK: {}...",
-                                        text.chars().take(197).collect::<String>()
-                                    )
-                                } else {
-                                    format!("TASK: {}", text)
-                                }
-                            });
-                        let state_hint = task_hint.as_deref();
-                        atomcode_core::agent::compression::maybe_compress_history(
-                            &*runner.ctx,
-                            &mut c,
-                            &*runner.provider,
-                            &runner.tools,
-                            &parts.system_prompt,
-                            state_hint,
-                        )
-                        .await;
-                    }
-
-                    let tool_filter = approval_mode_tool_filter(effective_mode);
-                    let result = runner
-                        .run_with_filter(
-                            &mut c,
-                            &parts.system_prompt,
-                            "",
-                            &turn_tx,
-                            cancel.clone(),
-                            tool_filter,
-                        )
-                        .await;
-                    match result {
-                        TurnResult::UsedTools { .. } => continue,
-                        TurnResult::Responded { .. } | TurnResult::Cancelled => break,
-                        TurnResult::Failed(e) => {
-                            let _ = turn_tx.send(TurnEvent::Error(e));
-                            break;
-                        }
-                    }
-                }
-            })
-            .await;
-        }
-        drop(turn_tx);
-        let _ = forward.await;
-
-        // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
-        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
-        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
-        {
-            use atomcode_core::session::{Session, SessionManager};
-            let conv_guard = conv.lock().await;
-            let manager = SessionManager::new(&working_dir);
-            let mut session = manager
-                .load(&self.session_id)
-                .unwrap_or_else(|_| Session::new(working_dir.clone()));
-            session.id = self.session_id.clone();
-            session.update_from_conversation(&conv_guard);
-            session.auto_name_from_messages();
-            session.touch();
-            if let Err(e) = manager.save(&session) {
-                atomcode_core::ctrace!("LIVE", "failed to save live session: {e}");
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
 // ============================================================================
-
-/// True when the daemon should run live turns on the NEW stack (kernel +
-/// capabilities + coding) via atomcode-bridge. The new stack is the DEFAULT now
-/// (same strangler flip as the cli); opt OUT to the legacy `DaemonTurnExecutor`
-/// with `$ATOMCODE_ENGINE=v1` (or `legacy`/`old`).
-pub(crate) fn live_engine_v2() -> bool {
-    !matches!(
-        std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
-        Some("v1" | "1" | "legacy" | "old")
-    )
-}
 
 /// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
 /// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
@@ -861,7 +602,7 @@ pub(crate) struct KernelTurnExecutor {
 
 struct BridgeState {
     client: AgentClient,
-    events: mpsc::UnboundedReceiver<AgentEvent>,
+    events: mpsc::UnboundedReceiver<DaemonRuntimeEvent>,
     /// Whether the pre-existing history has been seeded into the bridge.
     seeded: bool,
     /// The provider name used to build this bridge. Compared against
@@ -1046,7 +787,7 @@ impl TurnExecutor for KernelTurnExecutor {
             };
             let provider_name = self.resolve_provider_name();
             let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
+            let (client, rx) = crate::kernel_runtime::spawn_daemon_runtime(cfg);
             *guard = Some(BridgeState {
                 client,
                 events: rx,
@@ -1118,7 +859,7 @@ impl TurnExecutor for KernelTurnExecutor {
             user_images
         };
         let effective_mode = if self.auto_approve {
-            ApprovalMode::Bypass
+            ApprovalMode::Auto
         } else {
             live_current_approval_mode()
         };
@@ -1225,6 +966,15 @@ impl TurnExecutor for KernelTurnExecutor {
                 bridge_dead = true;
                 break None;
             };
+            let ev = match ev {
+                DaemonRuntimeEvent::Legacy(event) => event,
+                DaemonRuntimeEvent::Native(event) => {
+                    if let Some(event) = coding_runtime_to_turn(event) {
+                        emit(event);
+                    }
+                    continue;
+                }
+            };
             match ev {
                 AgentEvent::TextDelta(t) => {
                     // fix B: accumulate, then throttle a crash-durable progress save.
@@ -1299,9 +1049,6 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
                 AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-                    emit(TurnEvent::Warning(label))
-                }
                 AgentEvent::ApprovalNeeded {
                     tool_name,
                     reason,
@@ -1647,11 +1394,48 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
             secs_until_reset,
             auto_resuming,
         },
-        AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-            TurnEvent::Warning(label)
-        }
         _ => return None,
     })
+}
+
+/// Convert driver-neutral coding runtime events to the daemon streaming surface.
+pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent> {
+    match ev {
+        CodingRuntimeEvent::CompactionStarted { .. } => None,
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.committed => {
+            Some(TurnEvent::Warning(
+                atomcode_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.is_manual() => {
+            Some(TurnEvent::TextDelta(
+                atomcode_config::i18n::format_compaction_noop(
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                    outcome.summary_would_grow(),
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion:
+                CompactionCompletion::Interrupted {
+                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                    ..
+                },
+        } => Some(TurnEvent::Warning(
+            atomcode_config::i18n::format_compaction_interrupted(),
+        )),
+        CodingRuntimeEvent::CompactionFinished { .. } => None,
+        _ => None,
+    }
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
@@ -1704,7 +1488,7 @@ pub(crate) async fn run_chat_turn_v2(
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+    let (client, mut events) = crate::kernel_runtime::spawn_daemon_runtime(bridge_cfg);
 
     // Seed the bridge from conv (which already has the just-sent user message), then
     // send that message to actually run the turn.
@@ -1767,6 +1551,15 @@ pub(crate) async fn run_chat_turn_v2(
             ev = events.recv() => ev,
         };
         let Some(ev) = ev else { break None };
+        let ev = match ev {
+            DaemonRuntimeEvent::Legacy(event) => event,
+            DaemonRuntimeEvent::Native(event) => {
+                if let Some(event) = coding_runtime_to_turn(event) {
+                    let _ = turn_tx.send(event);
+                }
+                continue;
+            }
+        };
         match ev {
             AgentEvent::ApprovalNeeded {
                 tool_name,
@@ -2257,7 +2050,7 @@ pub(crate) async fn live_message(
     Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
-    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    // 更新进程级 live mode，供 live turn 执行时设置 telemetry envelope mode。
     *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
@@ -2565,7 +2358,7 @@ mod tests {
         let cases = [
             (ApprovalMode::Build, "build"),
             (ApprovalMode::Plan, "plan"),
-            (ApprovalMode::Bypass, "bypass"),
+            (ApprovalMode::Auto, "bypass"),
         ];
         for (mode, wire) in cases {
             // Serialize (used by Snapshot.mode + ModeChanged broadcast).
@@ -2579,22 +2372,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_uses_the_read_only_tool_filter() {
-        let filter = approval_mode_tool_filter(ApprovalMode::Plan)
-            .expect("plan mode must filter advertised tools");
-        assert!(filter.contains(&"read_file"));
-        assert!(filter.contains(&"grep"));
-        assert!(filter.contains(&"web_fetch"));
-        assert!(!filter.contains(&"bash"));
-        assert!(!filter.contains(&"edit_file"));
-        assert!(!filter.contains(&"create_file"));
-        assert!(!filter.contains(&"search_replace"));
-
-        assert!(approval_mode_tool_filter(ApprovalMode::Build).is_none());
-        assert!(approval_mode_tool_filter(ApprovalMode::Bypass).is_none());
-    }
-
-    #[test]
     fn v2_fallback_approval_is_closed_for_plan_mode() {
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Plan),
@@ -2605,7 +2382,7 @@ mod tests {
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            fallback_approval_decision(ApprovalMode::Bypass),
+            fallback_approval_decision(ApprovalMode::Auto),
             PermissionDecision::Allow
         ));
     }
@@ -2613,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn approval_mode_get_returns_current_runtime_mode() {
         let _mode_guard = ScopedApprovalModeForTest::new();
-        live_set_mode(ApprovalMode::Bypass);
+        live_set_mode(ApprovalMode::Auto);
 
         let response = approval_mode_get().await.into_response();
         assert_eq!(response.status().as_u16(), 200);
@@ -2698,6 +2475,16 @@ mod tests {
         let dir_a = std::path::PathBuf::from("/tmp/atomcode-test-a");
         let dir_b = std::path::PathBuf::from("/tmp/atomcode-test-b");
 
+        // Initialize DAEMON_PROJECT with a test ProjectStateStore.
+        let project_state = crate::ProjectState {
+            working_dir: dir_a.clone(),
+            previous_dir: None,
+            recent_dirs: vec![dir_a.clone()],
+            name: "test-a".to_string(),
+        };
+        let project_store = Arc::new(tokio::sync::RwLock::new(project_state));
+        *crate::DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
+
         // 无覆盖时回退到执行器创建目录。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
         assert_eq!(live_current_working_dir(&dir_a), dir_a);
@@ -2710,12 +2497,22 @@ mod tests {
         );
         assert_eq!(live_current_working_dir(&dir_a), dir_b);
 
+        // 验证 DAEMON_PROJECT 也已被同步更新。
+        {
+            let project = project_store.blocking_read();
+            assert_eq!(project.working_dir, dir_b);
+            assert_eq!(project.previous_dir.as_ref(), Some(&dir_a));
+            assert_eq!(project.name, "atomcode-test-b");
+            assert_eq!(project.recent_dirs, vec![dir_b.clone(), dir_a.clone()]);
+        }
+
         // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
         // → 触发 ChangeDir / 重建 parts。
         assert_ne!(live_current_working_dir(&dir_a), dir_a);
 
         // 清理进程级状态，避免污染同进程其他测试。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
+        *crate::DAEMON_PROJECT.lock().unwrap() = None;
     }
 
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
@@ -2886,20 +2683,59 @@ mod tests {
     }
 
     #[test]
-    fn compaction_mark_maps_to_warning_wire_event() {
-        // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
-        // drivers. The bridge now emits CompactionUi(Mark) instead of the old
-        // Warning("conversation compacted"); the daemon must translate it to a warning
-        // wire event so /webui + /chat clients still see the notice. Begin/End are TUI
-        // spinner lifecycle and are intentionally dropped (web has no compaction spinner).
-        use atomcode_core::agent::{AgentEvent, CompactionUiKind};
-        let label = "已压缩 · 摘要 3 条 · ~40K→~10K".to_string();
+    fn coding_compaction_events_preserve_daemon_display_policy() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let outcome = |trigger, committed| CompactionOutcome {
+            trigger,
+            epoch: 1,
+            removed_messages: 3,
+            bytes_before: 160_000,
+            bytes_after: 40_000,
+            committed,
+            estimated_tokens_before: 40_000,
+            estimated_tokens_after: 10_000,
+        };
+
         assert!(matches!(
-            agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Mark(label.clone()))),
-            Some(TurnEvent::Warning(w)) if w == label
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Auto { utilization: 0.8 },
+                    true,
+                )),
+            }),
+            Some(TurnEvent::Warning(label)) if label.contains("40.0K") && label.contains("10.0K")
         ));
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Manual { focus: None },
+                    false,
+                )),
+            }),
+            Some(TurnEvent::TextDelta(_))
+        ));
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome(
+                CompactTrigger::Auto { utilization: 0.8 },
+                false,
+            )),
+        })
+        .is_none());
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
+            trigger: CompactTrigger::Manual { focus: None },
+        })
+        .is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                },
+            }),
+            Some(TurnEvent::Warning(text)) if text.contains("interrupt") || text.contains("中断")
+        ));
     }
 
     // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
@@ -3011,12 +2847,10 @@ mod tests {
     // is the helper the executor now also calls at turn start (user message durable) and
     // throttled mid-turn (partial assistant text durable).
 
-    use std::sync::Mutex as TestMutex;
-
-    /// Process-global env lock so ATOMCODE_HOME-mutating tests in THIS binary never race.
-    fn env_lock() -> &'static TestMutex<()> {
-        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TestMutex::new(()))
+    /// Shared process-global env lock so ATOMCODE_HOME-mutating tests across ALL
+    /// daemon test modules in this binary never race.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::atomcode_home_test_lock()
     }
 
     /// Point ATOMCODE_HOME (→ sessions root) at a tempdir for the duration of a test,

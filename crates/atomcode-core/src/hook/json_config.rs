@@ -48,21 +48,7 @@ fn default_timeout() -> u64 {
 /// Delegates to [`load_hooks_config_with_names`] and discards names so the
 /// two functions never drift out of sync.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
-    load_hooks_config_with_names(project_dir)
-        .into_iter()
-        .map(|(_, cfg)| cfg)
-        .collect()
-}
-
-/// Load all hooks (global + plugin + project) and return them **with their
-/// names**, so callers — e.g. the `atomcode hook test <name>` CLI command —
-/// can look up a specific hook by name.
-///
-/// The name is the key used in `.hooks.json` (or an auto-generated one for
-/// plugin-inline hooks such as `pre_tool_use-0-0`). Project hooks override
-/// global/plugin hooks with the same name.
-pub fn load_hooks_config_with_names(project_dir: &Path) -> Vec<(String, HookConfig)> {
-    let global_path = crate::config::Config::config_dir().join("hooks.json");
+    let global_path = atomcode_config::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
     let mut merged: BTreeMap<String, HookConfig> = BTreeMap::new();

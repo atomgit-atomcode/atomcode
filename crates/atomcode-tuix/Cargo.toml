@@ -5,12 +5,22 @@ edition.workspace = true
 
 [features]
 default = []
-distro-pm = ["atomcode-core/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm"]
 
 [dependencies]
-atomcode-askpass = { path = "../atomcode-askpass" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools"] }
+# Config/locale systems (leaf crate, extracted from core) — used directly, not via
+# the transitional atomcode_core::{config,locale} re-export shims. (proxy stays on
+# atomcode-core: its module keeps the reqwest-applying policy fns.)
+atomcode-config = { path = "../atomcode-config" }
+# Self-update mechanics (leaf crate, extracted from core).
+atomcode-updater = { path = "../atomcode-updater" }
+# Askpass lives in atomcode-capabilities (`::askpass`, unix-only); the TUI drives the
+# server + password modal via that path.
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory"] }
 atomcode-core = { path = "../atomcode-core" }
+# INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
+# coding agent explores the repo and writes AGENTS.md via its tools.
+atomcode-coding = { path = "../atomcode-coding" }
 zeroize = "1"
 atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
@@ -37,6 +47,7 @@ base64 = "0.22"
 urlencoding = "2"
 futures = "0.3"
 sha2 = "0.10"
+rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
@@ -70,7 +81,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module + every tests/*.rs binary) so tests
 # that persist commands/plugins/config never write into the developer's real home.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 tempfile = "3"
 vte = "0.15.0"

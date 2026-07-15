@@ -105,7 +105,7 @@ pub struct McpTokenStore {
 
 impl McpTokenStore {
     pub fn default_path() -> PathBuf {
-        crate::config::Config::config_dir().join("mcp_auth.toml")
+        atomcode_config::config::Config::config_dir().join("mcp_auth.toml")
     }
 
     pub fn new(path: PathBuf) -> Self {

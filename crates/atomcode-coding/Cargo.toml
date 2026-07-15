@@ -9,6 +9,9 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 # CodingPlan REST client + types for the RateLimitHook (rate_limit.rs).
 # L2 is allowed to depend on core (core does not depend on kernel/capabilities/coding).
 atomcode-core = { path = "../atomcode-core" }
+# Config system (leaf crate, extracted from core). Consumed directly instead of via
+# the transitional atomcode_core::config re-export shim.
+atomcode-config = { path = "../atomcode-config" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
 # with web/skills/mcp/session/memory wired (the leaner features exist for other
 # embedders, not for this crate).
@@ -22,7 +25,7 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
 atomcode-review = { path = "../atomcode-review" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 # Stream proxying for the compaction-summary telemetry provider decorator (folds
 # StreamEvent::Usage, emits one LlmChat at stream end). Also used by tests.
@@ -52,5 +55,5 @@ async-trait = "0.1"
 serial_test = "3"
 # Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so tests
 # never persist into the developer's real ~/.atomcode.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"

@@ -535,11 +535,8 @@ pub(crate) fn replay_session(
     // sessions). Without this the previous turn's last output butts straight
     // against the next user input.
     let mut seen_user = false;
-    // Render todowrite calls as the SAME compact status block the live path shows
-    // (not a generic tool row), and suppress their now-redundant tool RESULT. The
-    // unicode flag mirrors the live `ctx.caps.unicode_symbols` — `UiState` froze it
-    // at construction.
-    let unicode = state.unicode_symbols;
+    // Suppress successful todowrite tool RESULTs (the persistent panel is the sole
+    // view for todowrite output; errors still show). Track parseable call ids.
     let mut todowrite_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
@@ -574,22 +571,18 @@ pub(crate) fn replay_session(
                     }
                 }
                 for tc in tool_calls {
-                    // todowrite → the styled status block (same as live), and remember
-                    // its id so the matching tool RESULT below is suppressed.
-                    if tc.name == "todowrite" {
-                        let block = crate::event_loop::todo_block_styled_lines(&tc.arguments, unicode);
-                        if !block.is_empty() {
-                            renderer.render(UiLine::AssistantLineBreak);
-                            for styled in block {
-                                renderer.render(UiLine::CommandOutput(styled));
-                            }
-                            // Only track a non-empty id: an empty id would suppress the
-                            // FIRST empty-`call_id` result of ANY tool, not this todowrite's.
-                            if !tc.id.is_empty() {
-                                todowrite_call_ids.insert(tc.id.clone());
-                            }
-                            continue;
+                    // todowrite → no inline block; the persistent panel is the sole
+                    // view. Suppress the (successful) tool RESULT below by remembering
+                    // the call id. Mirror the live path: only a PARSEABLE call is
+                    // suppressed — a bad one falls through to a normal tool row so its
+                    // error still shows.
+                    if tc.name == "todowrite"
+                        && atomcode_capabilities::tools::todo::parse_todos(&tc.arguments).is_ok()
+                    {
+                        if !tc.id.is_empty() {
+                            todowrite_call_ids.insert(tc.id.clone());
                         }
+                        continue;
                     }
                     renderer.render(UiLine::ToolCall {
                         name: crate::event_loop::display_tool_name(&tc.name),
@@ -660,6 +653,14 @@ pub(crate) fn replay_session(
         .map(|s| (s.used_tokens, s.ctx_window))
         .unwrap_or((0, 0));
     state.restore_context(used, window);
+
+    // Seed the persistent todo panel from the transcript (zero extra storage) —
+    // resets the previous session's panel and rehydrates the loaded one, so a
+    // session switch / resume lands on the correct list (folds todowrite + todo events).
+    state.active_todos = crate::event_loop::todo_progress_from_messages(&session.messages);
+    // Rehydrate the id→title cache from the seeded panel so `todo update #N` rows resolve
+    // names immediately after a resume (and drop the previous session's titles).
+    crate::event_loop::sync_todo_titles(state);
 }
 
 #[cfg(test)]
@@ -745,6 +746,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message::new(Role::Assistant, "The answer is X."),
         ];
@@ -886,12 +888,12 @@ mod tests {
         assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
     }
 
-    // Parity: on /resume, a todowrite call must render as the SAME styled status
-    // block the live path shows (CommandOutput lines, in-progress bold) — NOT a
-    // generic `● Todowrite` tool row — and its redundant tool RESULT is suppressed.
-    // A normal tool call (read) is unaffected.
+    // On /resume, todowrite calls no longer render an inline block. Instead the
+    // persistent panel is seeded from the transcript (last valid todowrite wins),
+    // and successful todowrite tool RESULTs are suppressed. Normal tool rows and
+    // error results are unaffected.
     #[test]
-    fn replay_renders_todowrite_as_styled_block_and_suppresses_its_result() {
+    fn replay_seeds_todo_panel_and_suppresses_todowrite_result() {
         use atomcode_core::conversation::message::{Message, MessageContent, Role};
         use atomcode_core::session::Session;
         use atomcode_core::tool::{ToolCall, ToolResult as MToolResult};
@@ -919,6 +921,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Text("go".into()),
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Assistant,
@@ -940,6 +943,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -949,6 +953,7 @@ mod tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -958,9 +963,11 @@ mod tests {
                     success: true,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
-            // A FAILED todowrite: its block still renders, but its error result must
-            // NOT be suppressed (parity with live's `… && success` suppression).
+            // A FAILED todowrite (success=false): its error result must NOT be
+            // suppressed (parity with live's `… && success` suppression). It IS
+            // the last valid call, so the panel is seeded from it (task C).
             Message {
                 role: Role::Assistant,
                 content: MessageContent::AssistantWithToolCalls {
@@ -974,6 +981,7 @@ mod tests {
                     thinking_blocks: vec![],
                 },
                 synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -983,6 +991,7 @@ mod tests {
                     success: false,
                 }),
                 synthetic: false,
+                internal_origin: None,
             },
         ];
 
@@ -998,12 +1007,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(cmd_out.iter().any(|s| s.contains("task A")), "block shows task A: {cmd_out:?}");
-        assert!(cmd_out.iter().any(|s| s.contains("task B")), "block shows task B: {cmd_out:?}");
         assert!(
-            cmd_out.iter().any(|s| s.contains("\x1b[1m") && s.contains("task A")),
-            "in-progress task is bold: {cmd_out:?}"
+            !cmd_out.iter().any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
+            "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
+        // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
+        let panel = state.active_todos.clone().expect("panel seeded from transcript");
+        assert_eq!(panel.total, 1, "last todowrite (task C) seeds the panel: {panel:?}");
 
         let tool_call_names: Vec<&str> = rec
             .lines

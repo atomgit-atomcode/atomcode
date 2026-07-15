@@ -7,7 +7,7 @@
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 pub mod commands;
@@ -17,7 +17,6 @@ pub mod git;
 pub mod glyph;
 pub mod highlight;
 pub mod i18n;
-pub mod init;
 pub mod input;
 pub mod pricing;
 pub mod version_check;
@@ -39,8 +38,7 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentHandle, AgentRuntimeFactory};
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -53,7 +51,8 @@ use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
-pub use crate::event_loop::RuntimeSpawnOverride;
+pub use crate::event_loop::bg_runtime::RuntimeEventPayload;
+pub use crate::event_loop::{RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime};
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -283,9 +282,8 @@ pub fn panic_restore_terminal() {
 pub async fn run(
     config: Config,
     model_name: String,
-    agent_handle: AgentHandle,
-    runtime_factory: AgentRuntimeFactory,
-    runtime_spawn_override: Option<RuntimeSpawnOverride>,
+    spawned_runtime: SpawnedRuntime,
+    runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -295,6 +293,11 @@ pub async fn run(
     dangerously_skip_permissions: bool,
     is_admin: bool,
 ) -> Result<()> {
+    let SpawnedRuntime { endpoint, event_rx } = spawned_runtime;
+    let RuntimeEndpoint {
+        legacy: agent_client,
+        native: runtime,
+    } = endpoint;
     let mut caps = TerminalCaps::probe();
 
     // Decide force_plain BEFORE activating TerminalGuard. Plain mode
@@ -389,9 +392,9 @@ pub async fn run(
     //   into the input box. Terminals that answer neither query default to
     //   dark after the internal cap.
     let theme_light = match config.ui.theme {
-        atomcode_core::config::UiTheme::Light => true,
-        atomcode_core::config::UiTheme::Dark => false,
-        atomcode_core::config::UiTheme::Auto => {
+        atomcode_config::config::UiTheme::Light => true,
+        atomcode_config::config::UiTheme::Dark => false,
+        atomcode_config::config::UiTheme::Auto => {
             if caps.colors && !force_plain {
                 crate::terminal_bg::detect_light(
                     std::time::Duration::from_millis(60),
@@ -531,7 +534,7 @@ pub async fn run(
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
     // waiting for the next poll to rediscover it.
-    if let Ok(Some(pending)) = atomcode_core::self_update::read_pending() {
+    if let Ok(Some(pending)) = atomcode_updater::read_pending() {
         if let Ok(mut g) = update_hint.lock() {
             *g = Some(pending.version);
         }
@@ -571,7 +574,7 @@ pub async fn run(
     // loop's select!. Unbounded because progress events are tiny and
     // we never want the upgrade task to block on UI backpressure.
     let (upgrade_tx, upgrade_rx) =
-        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+        tokio::sync::mpsc::unbounded_channel::<atomcode_updater::UpgradeEvent>();
     // Mirror channel for /plugin add|update|install so git latency never
     // stalls the input loop. See LoopCtx::plugin_job_tx for the rationale.
     let (plugin_job_tx, plugin_job_rx) =
@@ -592,7 +595,6 @@ pub async fn run(
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
-    let agent_client = agent_handle.client.clone();
     let skill_registry = agent_client.skill_registry.clone();
 
     // ── Plugin marketplace bootstrap (detached) ──
@@ -642,13 +644,16 @@ pub async fn run(
         tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
     event_loop::bg_runtime::spawn_event_forwarder(
         foreground_runtime_id,
-        agent_handle.event_rx,
+        event_rx,
         runtime_event_tx.clone(),
     );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
         foreground_runtime_id,
-        agent_client.clone(),
+        event_loop::RuntimeEndpoint {
+            legacy: agent_client.clone(),
+            native: runtime.clone(),
+        },
     );
 
     // ── Askpass server startup (unix-only, TUI path) ────────────────────────
@@ -661,16 +666,16 @@ pub async fn run(
     // We bind it in the outer `run()` scope and explicitly reference it after
     // `run_loop` returns so the compiler does not drop it early.
     #[cfg(unix)]
-    let _askpass_guard: Option<atomcode_askpass::server::AskpassServerGuard>;
+    let _askpass_guard: Option<atomcode_capabilities::askpass::server::AskpassServerGuard>;
     #[cfg(unix)]
-    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>;
+    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>;
 
     #[cfg(unix)]
     {
         let cache = std::sync::Arc::new(
-            atomcode_askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
+            atomcode_capabilities::askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
         );
-        match atomcode_askpass::server::start(cache) {
+        match atomcode_capabilities::askpass::server::start(cache) {
             Ok((mut env, rx, guard)) => {
                 // Write the wrapper script next to the socket.  On failure,
                 // degrade (no askpass) rather than crashing the TUI.
@@ -680,12 +685,12 @@ pub async fn run(
                         env.sock_path
                             .parent()
                             .and_then(|dir| {
-                                atomcode_askpass::wrapper::write_askpass_script(&exe, dir).ok()
+                                atomcode_capabilities::askpass::wrapper::write_askpass_script(&exe, dir).ok()
                             })
                     });
                 if let Some(script) = script_result {
                     env.askpass_script = script;
-                    atomcode_askpass::set_env(env);
+                    atomcode_capabilities::askpass::set_env(env);
                 }
                 askpass_rx = Some(rx);
                 _askpass_guard = Some(guard);
@@ -702,8 +707,8 @@ pub async fn run(
         config,
         model_name,
         agent: agent_client,
+        runtime,
         shutdown_deadline: None,
-        runtime_factory,
         runtime_spawn_override,
         bg_manager,
         foreground_runtime_id,
@@ -736,7 +741,6 @@ pub async fn run(
         upgrade_rx,
         plugin_job_tx,
         plugin_job_rx,
-        pending_new_issue: None,
         pending_run_login_setup: false,
         pending_open_provider_wizard: false,
         mcp_registry,
@@ -804,7 +808,7 @@ pub async fn run(
         // Set env var so the new process can show a one-time "upgraded" banner
         // on the welcome screen.
         std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
-        match atomcode_core::self_update::re_exec_self(Some(exe)) {
+        match atomcode_updater::re_exec_self(Some(exe)) {
             Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
             Err(e) => {
                 // Re-exec failed. The upgrade is on disk, so the user just

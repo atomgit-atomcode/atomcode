@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::provider::ProviderConfig;
+use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
@@ -1870,7 +1870,7 @@ mod tests {
         // `reasoning_history = "exclude"` forces Exclude even on a model that
         // the heuristic would route to Include (deepseek-v4-pro).
         use super::OpenAiProvider;
-        use crate::config::provider::ProviderConfig;
+        use atomcode_config::config::provider::ProviderConfig;
         use crate::provider::{LlmProvider, ReasoningPolicy};
         let cfg = ProviderConfig {
             provider_type: "openai".into(),
@@ -1911,7 +1911,7 @@ mod tests {
         // Typos in config should surface at load time with a clear error,
         // not a silent policy-mismatch 400 mid-turn.
         use super::OpenAiProvider;
-        use crate::config::provider::ProviderConfig;
+        use atomcode_config::config::provider::ProviderConfig;
         let cfg = ProviderConfig {
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
@@ -1963,7 +1963,7 @@ mod tests {
     #[test]
     fn reasoning_effort_config_validates_and_normalises() {
         use super::OpenAiProvider;
-        use crate::config::provider::ProviderConfig;
+        use atomcode_config::config::provider::ProviderConfig;
         let mut cfg = ProviderConfig {
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
@@ -2301,7 +2301,7 @@ mod tests {
     fn thinking_fields_roundtrip_via_toml_provider_config() {
         // The TOML shape users will write in config.toml — flat, with a
         // `thinking_` prefix so each field's purpose is obvious on its own.
-        use crate::config::provider::ProviderConfig;
+        use atomcode_config::config::provider::ProviderConfig;
         let toml = r#"
             type = "openai"
             model = "kimi-k2.6"
@@ -2440,7 +2440,7 @@ mod tests {
     //   * 1 short chunk + tool_call + abrupt close     → Done(truncated=true)
     //     (model was making tool progress; let resume retry try again)
 
-    use crate::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use crate::provider::LlmProvider;
     use futures::StreamExt;
     use wiremock::matchers::{method, path};

@@ -490,7 +490,7 @@ impl SkillRegistry {
         // ~/.atomcode). This is the SAME root used by config.toml, history,
         // plugins/, etc. — see Config::config_dir() for the single source of
         // truth.
-        let atomcode_config_dir = crate::config::Config::config_dir();
+        let atomcode_config_dir = atomcode_config::config::Config::config_dir();
 
         // All "loose" skills (i.e. not loaded through a plugin manifest)
         // share the synthetic `skills:` namespace so they're visually

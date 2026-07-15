@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 use crate::agent::parallel_edit;
 use crate::agent::AgentEvent;
-use crate::config::Config;
+use atomcode_config::config::Config;
 use crate::provider::LlmProvider;
 
 /// One file's edit assignment. The model writes both fields; the

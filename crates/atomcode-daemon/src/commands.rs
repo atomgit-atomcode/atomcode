@@ -1,12 +1,228 @@
 //! `POST /command`: 无状态斜杠命令执行器（对已持久化会话/记忆施加一次性变更）。
 use axum::{extract::State, response::IntoResponse, Json};
+use futures::StreamExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::AppState;
-use atomcode_core::agent::compression;
-use atomcode_core::config::memory::MemoryStore;
+use atomcode_config::config::memory::MemoryStore;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::session::{Session, SessionId, SessionManager};
+
+struct KernelSummaryProvider {
+    inner: Arc<dyn atomcode_core::provider::LlmProvider>,
+    context_window: u32,
+}
+
+#[async_trait::async_trait]
+impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn context_window(&self) -> u32 {
+        self.context_window
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        _options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        let messages: Vec<_> = messages.iter().map(message_to_core).collect();
+        let stream = self.inner.chat_stream(&messages, None).map_err(|error| {
+            atomcode_kernel::stream::ProviderError {
+                message: error.to_string(),
+                ..Default::default()
+            }
+        })?;
+        Ok(stream
+            .filter_map(|event| async move {
+                use atomcode_core::stream::StreamEvent as Core;
+                use atomcode_kernel::stream::{ProviderError, StreamEvent as Kernel, TokenUsage};
+                match event {
+                    Ok(Core::Delta(text)) => Some(Kernel::TextDelta(text)),
+                    Ok(Core::Reasoning(text)) => Some(Kernel::Reasoning(text)),
+                    Ok(Core::Usage(usage)) => Some(Kernel::Usage(TokenUsage {
+                        prompt: usage.prompt_tokens as u32,
+                        completion: usage.completion_tokens as u32,
+                        cached: usage.cached_tokens as u32,
+                    })),
+                    Ok(Core::Done { truncated }) => Some(Kernel::Done { truncated }),
+                    Ok(Core::Error(message)) => Some(Kernel::Error(ProviderError {
+                        message: message.to_string(),
+                        ..Default::default()
+                    })),
+                    Err(error) => Some(Kernel::Error(ProviderError {
+                        message: error.to_string(),
+                        ..Default::default()
+                    })),
+                    _ => None,
+                }
+            })
+            .boxed())
+    }
+}
+
+fn message_to_kernel(
+    message: &atomcode_core::conversation::message::Message,
+) -> atomcode_kernel::message::Message {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    use atomcode_kernel::message::{ImageContent, Message, Role as KernelRole};
+    let mut converted = match &message.content {
+        MessageContent::Text(text) => {
+            let mut output = Message::user(text.clone());
+            output.role = match message.role {
+                Role::System => KernelRole::System,
+                Role::User => KernelRole::User,
+                Role::Assistant => KernelRole::Assistant,
+                Role::Tool => KernelRole::Tool,
+            };
+            output
+        }
+        MessageContent::AssistantWithToolCalls {
+            text,
+            tool_calls,
+            reasoning_content,
+            thinking_blocks,
+        } => {
+            let calls = tool_calls.iter().map(|call| atomcode_kernel::tool::ToolCall {
+                id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(),
+            }).collect();
+            let mut output = Message::assistant(text.clone().unwrap_or_default(), calls);
+            output.reasoning = reasoning_content.clone();
+            output.reasoning_blocks = thinking_blocks
+                .iter()
+                .map(|block| atomcode_kernel::message::ReasoningBlock {
+                    text: block.text.clone(),
+                    opaque: Some(block.signature.clone()),
+                    provider: Some("anthropic".into()),
+                })
+                .collect();
+            output
+        }
+        MessageContent::ToolResult(result) =>
+            Message::tool_result(result.call_id.clone(), result.output.clone(), !result.success),
+        MessageContent::ToolResultRef(result) =>
+            Message::tool_result(result.call_id.clone(), result.summary.clone(), !result.success),
+        MessageContent::MultiPart { text, images } => Message::user_with_images(
+            text.clone().unwrap_or_default(),
+            images.iter().map(|image| ImageContent {
+                media_type: image.media_type.clone(), data: image.data.clone(),
+            }).collect(),
+        ),
+    };
+    converted.synthetic = message.synthetic;
+    converted.internal_origin = message.internal_origin.clone();
+    converted
+}
+
+fn message_to_core(
+    message: &atomcode_kernel::message::Message,
+) -> atomcode_core::conversation::message::Message {
+    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+    use atomcode_kernel::message::Role as KernelRole;
+    let role = match message.role {
+        KernelRole::System => Role::System,
+        KernelRole::User => Role::User,
+        KernelRole::Assistant => Role::Assistant,
+        KernelRole::Tool => Role::Tool,
+    };
+    let content = if message.role == KernelRole::Tool {
+        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
+            call_id: message.tool_call_id.clone().unwrap_or_default(),
+            output: message.text.clone(), success: !message.is_error,
+        })
+    } else if !message.tool_calls.is_empty() {
+        MessageContent::AssistantWithToolCalls {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            tool_calls: message.tool_calls.iter().map(|call| atomcode_core::tool::ToolCall {
+                id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(),
+            }).collect(),
+            reasoning_content: message.reasoning.clone(),
+            thinking_blocks: message
+                .reasoning_blocks
+                .iter()
+                .map(|block| atomcode_core::conversation::message::ThinkingBlock {
+                    text: block.text.clone(),
+                    signature: block.opaque.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    } else if !message.images.is_empty() {
+        MessageContent::MultiPart {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            images: message.images.iter().map(|image| ImagePart {
+                media_type: image.media_type.clone(), data: image.data.clone(),
+            }).collect(),
+        }
+    } else {
+        MessageContent::Text(message.text.clone())
+    };
+    Message { role, content, synthetic: message.synthetic, internal_origin: message.internal_origin.clone() }
+}
+
+fn update_core_message_text(
+    message: &mut atomcode_core::conversation::message::Message,
+    compacted: &atomcode_kernel::message::Message,
+) {
+    use atomcode_core::conversation::message::MessageContent;
+    match &mut message.content {
+        MessageContent::Text(text) => *text = compacted.text.clone(),
+        MessageContent::AssistantWithToolCalls { text, reasoning_content, .. } => {
+            *text = (!compacted.text.is_empty()).then(|| compacted.text.clone());
+            *reasoning_content = compacted.reasoning.clone();
+        }
+        MessageContent::ToolResult(result) => result.output = compacted.text.clone(),
+        MessageContent::ToolResultRef(result) => result.summary = compacted.text.clone(),
+        MessageContent::MultiPart { text, .. } => {
+            *text = (!compacted.text.is_empty()).then(|| compacted.text.clone());
+        }
+    }
+    message.synthetic = compacted.synthetic;
+    message.internal_origin = compacted.internal_origin.clone();
+}
+
+fn merge_compacted_messages(
+    original: Vec<atomcode_core::conversation::message::Message>,
+    before: &[atomcode_kernel::message::Message],
+    after: &[atomcode_kernel::message::Message],
+    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
+) -> Vec<atomcode_core::conversation::message::Message> {
+    use atomcode_coding::runtime::SnapshotCompactionMutation;
+
+    match mutation {
+        SnapshotCompactionMutation::Noop => original,
+        SnapshotCompactionMutation::RewriteOnly => {
+            let common = original.len().min(after.len());
+            let mut merged = Vec::with_capacity(after.len());
+            for (index, mut message) in original.into_iter().take(common).enumerate() {
+                if before.get(index) != after.get(index) {
+                    update_core_message_text(&mut message, &after[index]);
+                }
+                merged.push(message);
+            }
+            merged.extend(after[common..].iter().map(message_to_core));
+            merged
+        }
+        SnapshotCompactionMutation::Replace { old_start, old_end, new_end } => {
+            let mut original = original;
+            let suffix = original.split_off(old_end.min(original.len()));
+            original.truncate(old_start.min(original.len()));
+            original.extend(
+                after[old_start.min(after.len())..new_end.min(after.len())]
+                    .iter()
+                    .map(message_to_core),
+            );
+            original.extend(suffix);
+            original
+        }
+    }
+}
 
 /// 撤销会话最后若干轮（arg 空 = 最后一轮；否则回退到第 arg 个用户提示之前——对齐 TUI /undo）。
 /// 就地修改 session.messages / cold_summaries / display_messages / turn_stats，
@@ -46,28 +262,48 @@ fn prune_orphaned_display(session: &mut Session) {
     session.turn_stats.retain(|t| t.after_message <= n);
 }
 
-/// 压缩从 FRONT 排走消息（不同于 undo 从尾部截断），所以 surviving display/turn 锚点
-/// 必须向前平移 `removed`：落在被排走范围内的丢弃，其余减去偏移量。
-/// (`after_message == 0` 表示"第一条消息之前"——无条件保留。)
-fn reindex_after_front_drain(session: &mut Session, removed: usize) {
+/// Re-index UI anchors after kernel compaction replaces one contiguous old span
+/// `[old_start, old_end)` with `[old_start, new_end)` (normally one summary).
+fn reindex_after_compaction(
+    session: &mut Session,
+    old_start: usize,
+    old_end: usize,
+    new_end: usize,
+) {
     session.display_messages.retain_mut(|d| {
-        if d.after_message == 0 {
+        if d.after_message <= old_start {
             true
-        } else if d.after_message <= removed {
+        } else if d.after_message < old_end {
             false
         } else {
-            d.after_message -= removed;
+            d.after_message = new_end + d.after_message.saturating_sub(old_end);
             true
         }
     });
     session.turn_stats.retain_mut(|t| {
-        if t.after_message <= removed {
+        if t.after_message > old_start && t.after_message < old_end {
             false
         } else {
-            t.after_message -= removed;
+            if t.after_message >= old_end {
+                t.after_message = new_end + t.after_message.saturating_sub(old_end);
+            }
             true
         }
     });
+}
+
+fn reindex_after_snapshot_compaction(
+    session: &mut Session,
+    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
+) {
+    if let atomcode_coding::runtime::SnapshotCompactionMutation::Replace {
+        old_start,
+        old_end,
+        new_end,
+    } = mutation
+    {
+        reindex_after_compaction(session, old_start, old_end, new_end);
+    }
 }
 
 /// 保存到与加载时相同的桶：若有 project_hash 则写 project_hash 桶，否则按 working_dir 桶。
@@ -286,6 +522,15 @@ async fn exec_compact(
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for compact"))?;
     let session_id = SessionId::from_string(sid.to_string());
     let mut session = load_command_session(working_dir, project_hash, &session_id)?;
+    let config = atomcode_config::config::Config::load(
+        &atomcode_config::config::Config::default_path(),
+    )?;
+    let provider_name = provider.unwrap_or(&config.default_provider);
+    let context_window = config
+        .providers
+        .get(provider_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?
+        .context_window as u32;
     let parts = crate::live_api::build_turn_parts(
         working_dir,
         provider,
@@ -294,73 +539,39 @@ async fn exec_compact(
     )
     .await?;
 
-    let mut conv = Conversation::from_snapshot(ConversationSnapshot {
-        messages: std::mem::take(&mut session.messages),
-        cold_summaries: session.cold_summaries.clone(),
+    let provider = Arc::new(KernelSummaryProvider {
+        inner: parts.provider,
+        context_window,
     });
-
-    let keep_ceiling = compression::compaction_keep_ceiling(
-        &*parts.ctx,
-        &parts.system_prompt,
-        &*parts.tools,
-        &conv.cold_summaries,
+    let original_messages = std::mem::take(&mut session.messages);
+    let messages: Vec<_> = original_messages
+        .iter()
+        .map(message_to_kernel)
+        .collect();
+    let before_messages = messages.clone();
+    let compacted = atomcode_coding::runtime::compact_snapshot(
+        messages,
+        provider,
+        (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
     )
     .await;
-
-    let Some((mechanical, n_msgs)) = parts.ctx.compression_plan(&conv, keep_ceiling) else {
-        // 没有可压缩的历史：原样还原，返回 applied=false。
-        let snap = conv.snapshot();
-        session.messages = snap.messages;
-        return Ok(CommandResult::Compact {
-            applied: false,
-            removed_messages: 0,
-            before_tokens: 0,
-            after_tokens: 0,
-        });
-    };
-
-    let summarize_prompt = if arg.trim().is_empty() {
-        compression::default_summarize_prompt(&mechanical)
-    } else {
-        format!(
-            "Summarize this conversation history, focusing on: {}.\n\
-             Keep: file names, what was changed, key decisions, errors encountered.\n\
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            arg.trim(),
-            mechanical
-        )
-    };
-
-    let (summary, _, _, _, _) =
-        compression::run_llm_summary(&*parts.provider, &summarize_prompt).await;
-    let content = if summary.trim().is_empty() {
-        mechanical
-    } else {
-        summary
-    };
-
-    let outcome = compression::try_apply_compression(
-        &*parts.ctx,
-        &mut conv,
-        &parts.system_prompt,
-        n_msgs,
-        content,
-        None,
+    session.messages = merge_compacted_messages(
+        original_messages,
+        &before_messages,
+        &compacted.messages,
+        compacted.mutation,
     );
-
-    let snap = conv.snapshot();
-    session.messages = snap.messages;
-    session.cold_summaries = snap.cold_summaries;
-    if outcome.applied {
-        reindex_after_front_drain(&mut session, outcome.removed_messages);
+    if compacted.outcome.committed {
+        reindex_after_snapshot_compaction(&mut session, compacted.mutation);
+        session.cold_summaries.clear();
         save_command_session(&mut session, project_hash)?;
     }
 
     Ok(CommandResult::Compact {
-        applied: outcome.applied,
-        removed_messages: outcome.removed_messages,
-        before_tokens: outcome.before_tokens,
-        after_tokens: outcome.after_tokens,
+        applied: compacted.outcome.committed,
+        removed_messages: compacted.outcome.removed_messages,
+        before_tokens: compacted.outcome.estimated_tokens_before,
+        after_tokens: compacted.outcome.estimated_tokens_after,
     })
 }
 
@@ -382,8 +593,8 @@ fn exec_whoami() -> anyhow::Result<CommandResult> {
 }
 
 fn exec_config() -> anyhow::Result<CommandResult> {
-    let path = atomcode_core::config::Config::default_path();
-    let provider = atomcode_core::config::Config::load(&path)
+    let path = atomcode_config::config::Config::default_path();
+    let provider = atomcode_config::config::Config::load(&path)
         .map(|c| c.default_provider)
         .unwrap_or_default();
     Ok(CommandResult::Config {
@@ -409,8 +620,8 @@ fn exec_status(
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
-    let config_path = atomcode_core::config::Config::default_path();
-    let config = atomcode_core::config::Config::load(&config_path).ok();
+    let config_path = atomcode_config::config::Config::default_path();
+    let config = atomcode_config::config::Config::load(&config_path).ok();
     let provider_name = provider
         .map(|s| s.to_string())
         .or_else(|| config.as_ref().map(|c| c.default_provider.clone()))
@@ -574,7 +785,7 @@ pub(crate) async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::config::memory::MemoryStore;
+    use atomcode_config::config::memory::MemoryStore;
     use atomcode_core::conversation::message::{Message, Role};
     use atomcode_core::session::{DisplayMessage, TurnStat};
 
@@ -586,6 +797,133 @@ mod tests {
                 .push(Message::new(Role::Assistant, &format!("a{i}")));
         }
         s
+    }
+
+    #[test]
+    fn compact_persistence_conversion_preserves_tool_pair() {
+        let assistant = Message {
+            role: Role::Assistant,
+            content: atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![atomcode_core::tool::ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"a.rs\"}".into(),
+                }],
+                reasoning_content: Some("reason".into()),
+                thinking_blocks: vec![
+                    atomcode_core::conversation::message::ThinkingBlock {
+                        text: "thinking".into(),
+                        signature: "signature".into(),
+                    },
+                ],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let result = Message {
+            role: Role::Tool,
+            content: atomcode_core::conversation::message::MessageContent::ToolResult(
+                atomcode_core::tool::ToolResult {
+                    call_id: "call-1".into(),
+                    output: "file body".into(),
+                    success: true,
+                },
+            ),
+            synthetic: false,
+            internal_origin: None,
+        };
+
+        let assistant_roundtrip = message_to_core(&message_to_kernel(&assistant));
+        let result_roundtrip = message_to_core(&message_to_kernel(&result));
+
+        match assistant_roundtrip.content {
+            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
+                tool_calls,
+                reasoning_content,
+                thinking_blocks,
+                ..
+            } => {
+                assert_eq!(tool_calls[0].id, "call-1");
+                assert_eq!(tool_calls[0].name, "read_file");
+                assert_eq!(reasoning_content.as_deref(), Some("reason"));
+                assert_eq!(thinking_blocks[0].signature, "signature");
+            }
+            _ => panic!("assistant tool call shape was not preserved"),
+        }
+        match result_roundtrip.content {
+            atomcode_core::conversation::message::MessageContent::ToolResult(result) => {
+                assert_eq!(result.call_id, "call-1");
+                assert_eq!(result.output, "file body");
+                assert!(result.success);
+            }
+            _ => panic!("tool result shape was not preserved"),
+        }
+    }
+
+    #[test]
+    fn compact_rewrite_preserves_core_only_message_fields() {
+        use atomcode_core::conversation::message::{MessageContent, ThinkingBlock};
+        use atomcode_core::tool::result_store::ToolResultRef;
+
+        let assistant = Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![atomcode_core::tool::ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: Some("reason".into()),
+                thinking_blocks: vec![ThinkingBlock {
+                    text: "private reasoning".into(),
+                    signature: "opaque-signature".into(),
+                }],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let tool_ref = Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResultRef(ToolResultRef {
+                call_id: "call-1".into(),
+                hash: "content-hash".into(),
+                summary: "large output".into(),
+                byte_size: 42_000,
+                success: true,
+            }),
+            synthetic: false,
+            internal_origin: None,
+        };
+        let original = vec![assistant, tool_ref];
+        let before: Vec<_> = original.iter().map(message_to_kernel).collect();
+        let mut after = before.clone();
+        after[0].text = "updated assistant text".into();
+        after[1].text = "[bash output compacted]".into();
+
+        let merged = merge_compacted_messages(
+            original,
+            &before,
+            &after,
+            atomcode_coding::runtime::SnapshotCompactionMutation::RewriteOnly,
+        );
+
+        match &merged[0].content {
+            MessageContent::AssistantWithToolCalls { text, thinking_blocks, .. } => {
+                assert_eq!(text.as_deref(), Some("updated assistant text"));
+                assert_eq!(thinking_blocks[0].signature, "opaque-signature");
+            }
+            _ => panic!("assistant shape changed"),
+        }
+        match &merged[1].content {
+            MessageContent::ToolResultRef(result) => {
+                assert_eq!(result.summary, "[bash output compacted]");
+                assert_eq!(result.hash, "content-hash");
+                assert_eq!(result.byte_size, 42_000);
+            }
+            _ => panic!("tool result reference was downgraded"),
+        }
     }
 
     #[test]
@@ -652,11 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn reindex_after_front_drain_shifts_survivors_drops_drained() {
-        // Build a session with 7 messages (simulating post-compaction state where 3 were drained).
-        // Before drain: display_messages had after_message 0 / 2 / 5; turn_stats had 2 / 6.
-        // After draining 3 from the front: 0 stays 0; 2 drops (<=3); 5 shifts to 2.
-        //                                  turn_stats: 2 drops (<=3); 6 shifts to 3.
+    fn reindex_after_compaction_preserves_prefix_and_shifts_suffix() {
         let mut s = session_with_turns(0);
         // after_message=0: "before the first message" — always kept.
         s.display_messages.push(DisplayMessage {
@@ -695,14 +1029,46 @@ mod tests {
             used_tokens: 0,
             ctx_window: 0,
         });
-        reindex_after_front_drain(&mut s, 3);
-        // display_messages: [0, 2] (0 kept, 2 dropped, 5→2)
+        // Replace old messages [1, 4) with one summary at [1, 2).
+        reindex_after_compaction(&mut s, 1, 4, 2);
         assert_eq!(s.display_messages.len(), 2);
         assert_eq!(s.display_messages[0].after_message, 0);
-        assert_eq!(s.display_messages[1].after_message, 2);
-        // turn_stats: single entry with after_message=3 (2 dropped, 6→3)
+        assert_eq!(s.display_messages[1].after_message, 3);
         assert_eq!(s.turn_stats.len(), 1);
-        assert_eq!(s.turn_stats[0].after_message, 3);
+        assert_eq!(s.turn_stats[0].after_message, 4);
+    }
+
+    #[test]
+    fn rewrite_only_compaction_preserves_all_ui_anchors() {
+        let mut s = session_with_turns(3);
+        s.display_messages.push(DisplayMessage {
+            after_message: 2,
+            message: Message::new(Role::Assistant, "first rewrite boundary"),
+        });
+        s.display_messages.push(DisplayMessage {
+            after_message: 5,
+            message: Message::new(Role::Assistant, "between rewrites"),
+        });
+        s.turn_stats.push(TurnStat {
+            after_message: 4,
+            turn_count: 2,
+            tool_call_count: 1,
+            duration_ms: 50,
+            total_tokens: 5,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+        });
+
+        reindex_after_snapshot_compaction(
+            &mut s,
+            atomcode_coding::runtime::SnapshotCompactionMutation::RewriteOnly,
+        );
+
+        assert_eq!(s.display_messages.len(), 2);
+        assert_eq!(s.display_messages[0].after_message, 2);
+        assert_eq!(s.display_messages[1].after_message, 5);
+        assert_eq!(s.turn_stats[0].after_message, 4);
     }
 
     #[test]
@@ -881,16 +1247,11 @@ mod tests {
     /// writing to a project-hash bucket and reading it back returns the same session.
     #[test]
     fn save_session_to_hash_roundtrip() {
-        use std::sync::Mutex as TestMutex;
-        use std::sync::OnceLock;
-
-        // Process-global env lock so ATOMCODE_HOME mutations don't race other tests.
-        fn env_lock() -> &'static TestMutex<()> {
-            static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-            LOCK.get_or_init(|| TestMutex::new(()))
-        }
-
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Shared process-global env lock so ATOMCODE_HOME mutations don't race
+        // the other daemon test modules in the same test binary.
+        let _guard = crate::atomcode_home_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var("ATOMCODE_HOME").ok();
         std::env::set_var("ATOMCODE_HOME", dir.path());

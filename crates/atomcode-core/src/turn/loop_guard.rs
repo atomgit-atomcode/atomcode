@@ -32,6 +32,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use super::tool_args::canonicalize_tool_args;
+
 /// Strict trigger: identical `(name, args, output, success)` repeats.
 /// Catches deterministic loops where output is byte-stable. With
 /// THRESHOLD = 3, the first two attempts execute normally and the
@@ -174,10 +176,7 @@ fn make_key(name: &str, arguments: &str) -> String {
     // same key. Mirrors the in-batch `is_dup` normalisation in `runner.rs`
     // so cross-batch and in-batch dedup share semantics. Non-JSON args
     // pass through unchanged.
-    let normalised = match serde_json::from_str::<serde_json::Value>(arguments) {
-        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| arguments.to_string()),
-        Err(_) => arguments.to_string(),
-    };
+    let normalised = canonicalize_tool_args(arguments);
     let mut s = String::with_capacity(name.len() + 1 + normalised.len());
     s.push_str(name);
     s.push('\0');

@@ -44,7 +44,6 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 | 环境变量 | 说明 |
 |----------|------|
 | `ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS` | 设为 `1` 启用 bash 和写文件的 daemon 工具 |
-| `ATOMCODE_DISABLE_TOOLS` | 逗号分隔的工具名列表，禁用指定工具（如 `bash,write_file`） |
 
 ## API 接口
 
@@ -61,7 +60,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 ```json
 {
   "status": "ok",
-  "version": "4.23.3",
+  "version": "4.26.0",
   "service": "atomcode-daemon"
 }
 ```
@@ -664,7 +663,7 @@ daemon 默认仅允许来自 loopback 地址的跨域请求：
 
 ## 可用工具
 
-daemon 聊天模式下注册的工具（可通过 `ATOMCODE_DISABLE_TOOLS` 环境变量禁用）：
+daemon 聊天模式下可用的工具：
 
 | 工具名 | 说明 |
 |--------|------|

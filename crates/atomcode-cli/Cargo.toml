@@ -18,18 +18,28 @@ path = "src/lib.rs"
 
 [features]
 default = []
-distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-atomcode-askpass = { path = "../atomcode-askpass" }
+# Config system (leaf crate, extracted from core) — used directly, not via the
+# transitional atomcode_core::config re-export shim.
+atomcode-config = { path = "../atomcode-config" }
+# Self-update mechanics (leaf crate, extracted from core).
+atomcode-updater = { path = "../atomcode-updater" }
 # Engine v2: the new stack presented through the legacy channel protocol.
 atomcode-bridge = { path = "../atomcode-bridge" }
-# ACP (Agent Client Protocol) stdio server mode.
-atomcode-acp = { path = "../atomcode-acp" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
+# ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine
+# lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
+# uses (kernel + coding + capabilities) + the protocol SDK. capabilities is all-platform
+# here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.
+agent-client-protocol = { workspace = true }
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding" }
+atomcode-capabilities = { path = "../atomcode-capabilities" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
@@ -50,6 +60,9 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# NOTE: the `atomcode __askpass` helper (src/askpass.rs, unix-only) uses
+# atomcode-capabilities::askpass — now covered by the all-platform capabilities dep
+# in [dependencies] above (pulled in for ACP), so no unix-specific entry needed here.
 
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc
@@ -71,7 +84,7 @@ assert_cmd = "2"
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in main.rs's #[cfg(test)] module + every tests/*.rs binary) so tests
 # never persist into the developer's real ~/.atomcode.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 predicates = "3"
 tempfile = "3"

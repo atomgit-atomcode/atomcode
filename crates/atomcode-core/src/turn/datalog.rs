@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use crate::config::DatalogConfig;
+use atomcode_config::config::DatalogConfig;
 
 /// Accumulates log entries for a single turn, flushing to disk after each operation.
 pub struct DatalogWriter {
@@ -145,7 +145,7 @@ impl DatalogWriter {
     /// Falls back to a CWD-relative path on the (vanishingly rare)
     /// platforms where `$HOME` can't be resolved.
     fn default_root() -> PathBuf {
-        crate::config::Config::config_dir().join("datalog")
+        atomcode_config::config::Config::config_dir().join("datalog")
     }
 
     /// Clear the current turn log state and delete the log file if it exists.
@@ -696,7 +696,7 @@ mod tests {
         let p = DatalogWriter::resolve_log_dir(&base, None);
         // default_root() uses Config::config_dir().join("datalog"),
         // which resolves ATOMCODE_HOME when set, else $HOME/.atomcode.
-        let expected_root = crate::config::Config::config_dir().join("datalog");
+        let expected_root = atomcode_config::config::Config::config_dir().join("datalog");
         assert!(
             p.starts_with(&expected_root),
             "{:?} should start with {:?}",

@@ -115,6 +115,49 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+/// Opens OK but its stream PENDS FOREVER on the first `stall_calls` `chat_stream`
+/// calls (driving the stream idle-timeout), then returns `events` on the next
+/// call. Drives the RECONNECT path: with `stall_calls = 1` the first attempt
+/// times out and the reconnect succeeds; a large `stall_calls` exhausts the
+/// reconnect budget and the turn clean-fails.
+pub struct StallThenProvider {
+    stall_calls: usize,
+    calls: AtomicUsize,
+    events: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl StallThenProvider {
+    pub fn new(stall_calls: usize, events: Vec<StreamEvent>) -> Self {
+        Self {
+            stall_calls,
+            calls: AtomicUsize::new(0),
+            events: Mutex::new(Some(events)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for StallThenProvider {
+    fn model_name(&self) -> &str {
+        "stall-then"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.stall_calls {
+            // Open OK, then never yield → the kernel's stream idle-timeout fires.
+            Ok(Box::pin(futures::stream::pending::<StreamEvent>()))
+        } else {
+            let events = self.events.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+}
+
 /// Scripted, RICH-recording provider for prefix-cache regression tests. Unlike
 /// `MockProvider` (which snapshots only `(role, text)` and discards tools /
 /// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>, ChatOptions)`
@@ -1091,6 +1134,87 @@ impl ScriptedRateLimitHook {
 impl LifecycleHooks for ScriptedRateLimitHook {
     async fn on_rate_limit(&self, _hint: &RateLimitHint) -> Option<RateLimitDecision> {
         Some(self.decision.clone())
+    }
+}
+
+/// A read-only tool that (a) bumps a shared "in-flight" counter on entry and
+/// records the peak, (b) awaits a short tokio sleep so concurrent instances
+/// overlap under `tokio::time`, (c) decrements on exit. Proves real overlap and
+/// enforces the cap. `read_only_hint` = true so it is `parallel_safe`.
+pub struct ConcurrencyProbeTool {
+    pub name: &'static str,
+    pub inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ConcurrencyProbeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: self.name.into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+/// A probe whose `parallel_safe` is decided by its ARGS (mirrors BashTool: the
+/// command string decides). If args contain `"ro":true` it is parallel-safe and
+/// overlaps; else it serializes. Shares inflight/peak counters like
+/// `ConcurrencyProbeTool` so a test can assert overlap vs. barrier.
+///
+/// The `name` field is used in `execute` output so tests can check which tool ran.
+/// Fields are `pub` to allow construction from integration tests.
+pub struct ArgGatedProbeTool {
+    pub name: &'static str,
+    pub inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ArgGatedProbeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn parallel_safe(&self, args: &str) -> bool {
+        args.contains("\"ro\":true")
+    }
+    async fn execute(&self, _args: &str, _c: &ToolContext) -> ToolResult {
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: self.name.into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
