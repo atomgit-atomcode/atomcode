@@ -1312,9 +1312,11 @@ impl RunningAgent {
                 b.drain(..).collect()
             };
             if !steered.is_empty() {
+                let n = steered.len();
                 for s in steered {
                     convo.push(Message::user_with_images(s.text, s.images));
                 }
+                self.rt.emit(AgentEvent::Steered { count: n });
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -3614,5 +3616,50 @@ mod steer_buffer_tests {
             calls.iter().any(|req| req.iter().any(|(_, t)| t.contains("STEER-TEXT"))),
             "a pure-text turn must continue and send the steered prompt; got {calls:?}"
         );
+    }
+
+    /// Injecting one steer during round 1 must emit exactly one
+    /// `AgentEvent::Steered { count: 1 }` before the turn completes.
+    #[tokio::test]
+    async fn steer_emits_a_steered_event_with_count() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        // Round 1: a tool call so the turn continues into round 2 (where the drain runs).
+        // Round 2: plain text so the turn ends cleanly.
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+            ],
+            1, // inject steer on first chat_stream call
+            "STEER-COUNT",
+            deferred_tx_clone,
+        ));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        let mut steered_total = 0usize;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Steered { count } => steered_total += count,
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(steered_total, 1, "one folded prompt → Steered {{ count: 1 }}");
     }
 }

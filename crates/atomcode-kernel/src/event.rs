@@ -169,6 +169,10 @@ pub enum AgentEvent {
         #[serde(default)]
         auto_resuming: bool,
     },
+    /// One or more user prompts were folded ("steered") into the running turn at
+    /// a round boundary. `count` folded this round. Drivers relabel their
+    /// type-ahead indicator from "queued" to "folded into current turn".
+    Steered { count: usize },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
     /// driver show a "compacting…" progress line before the possibly multi-second
