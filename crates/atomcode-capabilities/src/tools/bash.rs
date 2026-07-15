@@ -1385,7 +1385,7 @@ fn strip_leading_cd_prefix(cmd: &str) -> &str {
     // The cd-arg must be a plain path: NO shell metacharacter that could hide a
     // command, redirect, substitution, subshell, glob, background, or chaining.
     let has_metachar = arg.contains(|c: char| {
-        matches!(c, '&' | '|' | ';' | '$' | '`' | '<' | '>' | '(' | ')' | '\n' | '\r' | '*' | '?')
+        matches!(c, '&' | '|' | ';' | '$' | '`' | '<' | '>' | '(' | ')' | '\n' | '\r' | '*' | '?' | '\\')
     });
     if arg.is_empty() || has_metachar || rest.is_empty() {
         return cmd; // not a clean `cd … && rest` — leave unchanged
@@ -1499,7 +1499,12 @@ fn segment_has_write_redirect(segment: &str) -> bool {
             // Allowed discard targets. `>&2`/`2>&1` (fd dup) and `>&-` (close) are not
             // file writes; but `>&file` (non-digit, non-`-` after `&`) IS a write redirect
             // (bash redirects stdout+stderr to that file). Only exempt the fd-dup/close forms.
-            let is_discard = rest.starts_with("/dev/null");
+            // Discard target must be EXACTLY `/dev/null` — `/dev/nullX` is a different
+            // file. Accept `/dev/null` followed by end-of-string or whitespace only.
+            let is_discard = match rest.strip_prefix("/dev/null") {
+                Some(after) => after.is_empty() || after.starts_with(char::is_whitespace),
+                None => false,
+            };
             let is_fd_dup = rest
                 .strip_prefix('&')
                 .map_or(false, |after| {
@@ -2082,6 +2087,13 @@ mod tests {
         assert!(!is_read_only_bash("grep x >& out.txt"), ">& file (spaced) writes");
         assert!(!is_read_only_bash("grep x 1>&out.txt"), "1>&file writes");
         assert!(!is_read_only_bash("grep x 2>&err.log"), "2>&file writes");
+        // FIX 1 — backslash in cd-arg bypasses backgrounding guard: `\&&` splits at `&&`
+        // leaving the arg ending in `\`, which bash reads as a literal `&` arg + unescaped
+        // background `&`. A clean Unix path never contains a backslash so rejecting is safe.
+        assert!(!is_read_only_bash("cd /x \\&& grep secret file"), "backslash-escaped & backgrounds the cd");
+        // FIX 2 — /dev/null discard check must be exact; a suffix makes it a real file.
+        assert!(!is_read_only_bash("grep x >/dev/nullX"), "/dev/nullX is a real file, not the discard device");
+        assert!(!is_read_only_bash("grep x >/dev/null2"), "/dev/null2 is a real file");
     }
 
     #[test]
