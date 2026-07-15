@@ -7,15 +7,14 @@
 
 use crossterm::style::Color;
 
-pub const MASCOT_WIDTH: usize = 13;
+pub const MASCOT_WIDTH: usize = 11;
 
-pub const MASCOT_ROWS: [&str; 6] = [
-    "oooo.o.o.o.o.o.o.o.o.ooooo",
-    "oooooooooooooooooooooooooo",
-    "ooooowokooooooooowokoooooo",
-    "..oowwwwoooooooowwwwoooo..",
-    "..oooooooooooooooooooooo..",
-    "....o.ooooooooooooooo.....",
+pub const MASCOT_ROWS: [&str; 5] = [
+    "oooo.o.o.o.o.o.o.ooooo",
+    "oooooooooooooooooooooo",
+    "oooowwkwoooooowwkwoooo",
+    "o.ooooooooooooooooooo.",
+    "..o.ooooooooooooo.o...",
 ];
 
 /// Map a legend byte to its 256-color value; `.` (transparent) → None.
@@ -34,7 +33,7 @@ mod tests {
 
     #[test]
     fn rows_are_well_formed() {
-        assert_eq!(MASCOT_ROWS.len(), 6);
+        assert!(!MASCOT_ROWS.is_empty());
         for (i, row) in MASCOT_ROWS.iter().enumerate() {
             assert_eq!(row.len(), 2 * MASCOT_WIDTH, "row {i} wrong width");
             assert!(

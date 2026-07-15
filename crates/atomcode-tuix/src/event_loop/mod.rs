@@ -4432,9 +4432,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
-                        ));
+                        // Silent on success (parity with codex/opencode: they never
+                        // print a per-server "connected" line in scrollback). Failures
+                        // and warnings below are still surfaced; `/mcp` shows the full
+                        // inventory on demand.
                         // Register tools from this newly connected server.
                         // Important: do this in a background task so a slow `tools/list`
                         // can't block the TUI event loop and freeze input.
