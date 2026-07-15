@@ -1359,8 +1359,8 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
 /// future step, not a v1 concern.
 const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
     "grep", "rg", "cat", "head", "tail", "ls", "find", "wc", "echo", "pwd",
-    "which", "stat", "cut", "sort", "uniq", "tr", "nl", "rev", "basename",
-    "dirname", "file", "tree", "printf", "true", "false", "seq", "column",
+    "which", "stat", "cut", "tr", "nl", "rev", "basename",
+    "dirname", "file", "printf", "true", "false", "seq", "column",
 ];
 
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY with other
@@ -1382,6 +1382,11 @@ pub(crate) fn is_read_only_bash(command: &str) -> bool {
     // - command chaining (`&&`, `||`, `;`). `|` is handled separately below (pipes are
     //   allowed when every segment is allowlisted), so guard `||` explicitly.
     if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") {
+        return false;
+    }
+    // - A raw newline / carriage return is a statement separator (like `;`) that would
+    //   hide a second command from the first-word allowlist check — reject.
+    if cmd.contains('\n') || cmd.contains('\r') {
         return false;
     }
     // - backgrounding with a standalone `&`. The ONLY legitimate `&` in a read-only
@@ -2020,5 +2025,13 @@ mod tests {
         // fd-dup carve-out must require a preceding `>`, not just a following digit
         assert!(!is_read_only_bash("grep x &2"), "& followed by digit is still backgrounding, not fd-dup");
         assert!(!is_read_only_bash("cat f &1"), "& followed by digit is backgrounding");
+        // C1 — sort/uniq/tree removed from allowlist (write-via-flag, no `>` needed)
+        assert!(!is_read_only_bash("sort -o out.txt data.txt"), "sort -o writes a file");
+        assert!(!is_read_only_bash("sort --output=out.txt f"), "sort --output writes");
+        assert!(!is_read_only_bash("uniq in.txt out.txt"), "uniq 2nd positional is an output file");
+        assert!(!is_read_only_bash("tree -o out.html ."), "tree -o writes");
+        // M2 — raw newline / carriage return hides a second command
+        assert!(!is_read_only_bash("grep x\nrm -rf y"), "raw newline hides a 2nd command");
+        assert!(!is_read_only_bash("cat a\rrm b"), "carriage return separator");
     }
 }
