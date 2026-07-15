@@ -627,6 +627,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Cached `(model, working_dir, chosen_pool_indices)` so resize rebuilds
     /// the SAME mascot + tips instead of re-rolling the random pick.
     welcome_banner: Option<(String, String, Vec<usize>)>,
+    /// The randomly-chosen welcome-tip POOL indices, rolled ONCE per session
+    /// and reused for every subsequent welcome render. Deliberately survives
+    /// `reflow_body_to_current_width` (a resize clears `welcome_banner` and
+    /// replays `body_log`, re-emitting `UiLine::Welcome` → `push_welcome`) so a
+    /// resize does NOT re-roll the tips. Reset to `None` only in `reset()` (a
+    /// fresh session / `/clear`), where new tips are appropriate.
+    welcome_tip_indices: Option<Vec<usize>>,
     /// Number of rows occupied by the welcome banner prefix in
     /// `body_lines`.
     welcome_line_count: usize,
@@ -836,6 +843,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             skip_body_scroll_count: 0,
             scrolled_off: 0,
             welcome_banner: None,
+            welcome_tip_indices: None,
             welcome_line_count: 0,
             live_spinner_active: false,
             pending_scroll_flush: false,
@@ -4428,7 +4436,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let left_w = if show_mascot { PAD_COL + mascot_w } else { PAD_COL };
         let tips_col = left_w + gap;
         let min_right = 24usize;
-        if content_w >= tips_col + min_right {
+        // Two columns only make sense next to the mascot. With colours off the
+        // mascot is omitted, so `tips_col` would be tiny (just `PAD_COL`) and the
+        // wider cwd/model bullet rows would staircase the tips onto them — stack
+        // instead.
+        if show_mascot && content_w >= tips_col + min_right {
             let n = left.len().max(right.len());
             for i in 0..n {
                 let mut row = left.get(i).cloned().unwrap_or_default();
@@ -4460,10 +4472,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn push_welcome(&mut self, model: &str, working_dir: &str) {
-        // Roll the random tip pick ONCE; cache the chosen POOL indices so a
-        // later resize reflows the same tips.
-        let mut rng = rand::thread_rng();
-        let chosen = crate::render::welcome_tips::choose_pool_indices(&mut rng);
+        // Roll the random tip pick ONCE per session, then reuse it. `push_welcome`
+        // runs again on every resize (via `reflow_body_to_current_width` replaying
+        // the logged `UiLine::Welcome`), so rolling here unconditionally would
+        // re-roll the tips on every resize — instead reuse the persisted
+        // `welcome_tip_indices` (only `reset()` clears it for a fresh session).
+        let chosen = match &self.welcome_tip_indices {
+            Some(chosen) => chosen.clone(),
+            None => {
+                let mut rng = rand::thread_rng();
+                let chosen = crate::render::welcome_tips::choose_pool_indices(&mut rng);
+                self.welcome_tip_indices = Some(chosen.clone());
+                chosen
+            }
+        };
         let rows = self.build_welcome_rows(model, working_dir, &chosen);
         self.welcome_banner = Some((model.to_string(), working_dir.to_string(), chosen));
         self.welcome_line_count = rows.len();
@@ -5539,18 +5561,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Cursor is saved/restored via DECSC/DECRC so the surgical
         // update doesn't disturb whatever the active footer/spinner
         // path expects on its next paint.
-        if self.welcome_banner.is_none() {
+        // Preserve the existing chosen_pool_indices so a model/cwd update
+        // doesn't re-roll the random tip selection. No banner yet → nothing to
+        // refresh.
+        let Some((_, _, chosen)) = self.welcome_banner.clone() else {
             return;
-        }
+        };
         let model_scrubbed = scrub_controls(model);
         let wd_scrubbed = scrub_controls(working_dir);
-        // Preserve the existing chosen_pool_indices so model/cwd update
-        // doesn't re-roll the random tip selection.
-        let chosen = self
-            .welcome_banner
-            .as_ref()
-            .map(|(_, _, c)| c.clone())
-            .unwrap_or_default();
         self.welcome_banner = Some((model_scrubbed, wd_scrubbed, chosen));
         self.reflow_welcome_prefix();
 
@@ -5684,6 +5702,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.body_lines.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
+        // Fresh session (`/clear`, `/session`): forget the cached welcome banner
+        // AND the rolled tip selection so the next welcome rolls new tips. (A
+        // resize does NOT come through here — it uses reflow_body_to_current_width,
+        // which preserves `welcome_tip_indices`.)
+        self.welcome_banner = None;
+        self.welcome_tip_indices = None;
         self.message_marks.clear();
         self.assistant_line_buf.clear();
         self.md_state.reset();
@@ -14929,6 +14953,42 @@ mod tests {
         r.reflow_welcome_prefix();
         let after: Vec<String> = tip_cmds(&r);
         assert_eq!(before, after, "reflow must not re-roll the random tips");
+    }
+
+    /// The REAL resize path is `reflow_body_to_current_width` (it clears
+    /// `welcome_banner` and replays `body_log`, re-emitting `UiLine::Welcome`),
+    /// NOT `reflow_welcome_prefix`. A resize must not re-roll the random tips.
+    #[test]
+    fn welcome_resize_via_body_replay_keeps_same_tips() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = true;
+        r.render(UiLine::Welcome {
+            model: "GLM-5.2".into(),
+            working_dir: "~/proj".into(),
+        });
+        let before = tip_cmds(&r);
+        r.reflow_body_to_current_width();
+        let after = tip_cmds(&r);
+        assert_eq!(before, after, "resize (body_log replay) must not re-roll tips");
+        assert!(before.iter().any(|c| c == "/login"), "pinned /login present");
+    }
+
+    /// With colours disabled the mascot is omitted, so the welcome must STACK
+    /// (tips below path/model), never render a two-column layout that would
+    /// staircase the tips onto the cwd/model rows.
+    #[test]
+    fn welcome_colors_off_stacks_tips_below_not_beside() {
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = false;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let collides = r.body_lines.iter().any(|row| {
+            let s: String = row.iter().map(|c| c.ch).collect();
+            s.contains("GLM-5.2") && s.contains("/login")
+        });
+        assert!(
+            !collides,
+            "colors-off must stack tips below path/model, not beside them"
+        );
     }
 }
 
