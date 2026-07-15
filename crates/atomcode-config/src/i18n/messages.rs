@@ -310,6 +310,40 @@ pub enum Msg<'a> {
     /// Complete plain-text version: "/webui  open a synced session in the browser"
     IdleHintWebuiFull,
 
+    // ── Welcome screen tips ──
+    /// Heading above the tips list on the welcome screen.
+    WelcomeTipsHeading,
+    /// Welcome tip: /login command description.
+    WelcomeTipLogin,
+    /// Welcome tip: /provider command description.
+    WelcomeTipProvider,
+    /// Welcome tip: /model command description.
+    WelcomeTipModel,
+    /// Welcome tip: /resume command description.
+    WelcomeTipResume,
+    /// Welcome tip: /setup command description.
+    WelcomeTipSetup,
+    /// Welcome tip: /skills command description.
+    WelcomeTipSkills,
+    /// Welcome tip: /plugin command description.
+    WelcomeTipPlugin,
+    /// Welcome tip: /webui command description.
+    WelcomeTipWebui,
+    /// Welcome tip: /mcp command description.
+    WelcomeTipMcp,
+    /// Welcome tip: /plan command description.
+    WelcomeTipPlan,
+    /// Welcome tip: /session command description.
+    WelcomeTipSession,
+    /// Welcome tip: /loop command description.
+    WelcomeTipLoop,
+    /// Welcome tip: /goal command description.
+    WelcomeTipGoal,
+    /// Welcome tip: /init command description.
+    WelcomeTipInit,
+    /// Welcome tip: /language command description.
+    WelcomeTipLanguage,
+
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
     CmdSwitchedBuildMode,

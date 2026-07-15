@@ -388,6 +388,24 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IdleHintWebuiFull =>
             "使用 /webui 在浏览器中同步会话".into(),
 
+        // ── 欢迎屏幕提示 ──
+        Msg::WelcomeTipsHeading => "上手提示".into(),
+        Msg::WelcomeTipLogin => "领取免费额度".into(),
+        Msg::WelcomeTipProvider => "添加自定义模型".into(),
+        Msg::WelcomeTipModel => "切换模型".into(),
+        Msg::WelcomeTipResume => "恢复上次会话".into(),
+        Msg::WelcomeTipSetup => "一键推荐配置".into(),
+        Msg::WelcomeTipSkills => "浏览可用技能".into(),
+        Msg::WelcomeTipPlugin => "安装技能/命令插件".into(),
+        Msg::WelcomeTipWebui => "在浏览器打开同步会话".into(),
+        Msg::WelcomeTipMcp => "接入 MCP 工具".into(),
+        Msg::WelcomeTipPlan => "只读规划模式".into(),
+        Msg::WelcomeTipSession => "管理与切换会话".into(),
+        Msg::WelcomeTipLoop => "循环执行提示词".into(),
+        Msg::WelcomeTipGoal => "为本次会话设定目标".into(),
+        Msg::WelcomeTipInit => "扫描代码库生成 AGENTS.md".into(),
+        Msg::WelcomeTipLanguage => "切换界面语言".into(),
+
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
             "  已切换到 Plan 模式（只读探索）。\n".into(),
