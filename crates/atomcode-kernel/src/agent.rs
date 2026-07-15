@@ -1220,7 +1220,6 @@ impl RunningAgent {
         rollback_len: usize,
         steer: SteerBuf,
     ) {
-        let _ = &steer; // real drain in Task 2
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
@@ -1305,6 +1304,22 @@ impl RunningAgent {
                 }
             }
             let start = self.clock.now_millis();
+            // STEER: fold any prompts the user submitted mid-turn into THIS turn before
+            // building the next request. Real user messages (count toward prompt/undo),
+            // appended append-only (prefix-cache safe).
+            // Yield once before draining so the outer driver select! has a chance to
+            // move any pending cmd_rx::SendMessage entries into the steer buffer before
+            // we drain it. This is a lightweight cooperative yield — no sleep, no timer.
+            tokio::task::yield_now().await;
+            let steered: Vec<SteerInput> = {
+                let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
+                b.drain(..).collect()
+            };
+            if !steered.is_empty() {
+                for s in steered {
+                    convo.push(Message::user_with_images(s.text, s.images));
+                }
+            }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
@@ -2104,6 +2119,12 @@ impl RunningAgent {
             let pending_calls = assistant_msg.tool_calls.clone();
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
+                // A prompt steered in during this round keeps the turn going: loop back so the
+                // top-of-loop drain folds it in and the model responds to it in-turn.
+                // (needs_follow_up = model produced tool calls OR a steer is pending.)
+                if !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    continue;
+                }
                 // TRUNCATION auto-continuation (v1 parity). The response was cut off at
                 // the OUTPUT-token limit with no tool call ⇒ almost certainly unfinished.
                 // Nudge the model to resume (or to summarize+stop if it is actually done)
@@ -3447,6 +3468,7 @@ mod parallel_tools_cap_clamp_tests {
 #[cfg(test)]
 mod steer_buffer_tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use crate::stream::StreamEvent;
     use crate::testkit::{MockProvider, NoopTool};
     use crate::tool::{ToolCall, ToolRegistry};
@@ -3493,22 +3515,38 @@ mod steer_buffer_tests {
     }
 
     /// Full end-to-end steer test: steered prompt is folded into the same turn's
-    /// next request. Blocked until Task 2 implements the drain.
+    /// next request.
+    ///
+    /// Injection is via DeferredSteerProvider (deterministic): the steer is sent to
+    /// cmd_tx during the FIRST chat_stream call, and the stream yields once before
+    /// emitting events. This guarantees the driver's select-loop processes the steer
+    /// into steer.lock() before the round-2 drain runs — no task-scheduler timing
+    /// dependency.
     #[tokio::test]
-    #[ignore = "drain lands in Task 2"]
     async fn midturn_send_steers_into_same_turn_not_a_new_turn() {
-        let provider = Arc::new(MockProvider::new(vec![
+        // Use Arc<Mutex<Option<Sender>>> so the provider can be created before the
+        // agent handle exists (the handle gives us the command sender).
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        // Build provider that sends on first call.
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
             vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "c1".into(),
-                    name: "noop".into(),
-                    arguments: "{}".into(),
-                }),
-                StreamEvent::Done { truncated: false },
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
             ],
-            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
-        ]));
-        let received = provider.received.clone();
+            1, // inject on first chat_stream call
+            "STEER-ME",
+            deferred_tx_clone,
+        ));
+        let received = provider.received();
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(NoopTool));
         let mut handle = Agent::builder()
@@ -3516,18 +3554,14 @@ mod steer_buffer_tests {
             .tools(reg.mount(&["noop"]))
             .build()
             .spawn();
+        // Fill the deferred sender NOW that we have the handle.
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
         handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
         let mut turn_started = 0u32;
         let mut turn_complete = 0u32;
-        let steer_tx = handle.commands.clone();
-        let mut steered = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::TurnStarted => turn_started += 1,
-                AgentEvent::ToolResult { .. } if !steered => {
-                    steer_tx.send(AgentCommand::SendMessage { text: "STEER-ME".into(), images: vec![] }).unwrap();
-                    steered = true;
-                }
                 AgentEvent::TurnComplete { .. } => { turn_complete += 1; break; }
                 _ => {}
             }
@@ -3539,6 +3573,50 @@ mod steer_buffer_tests {
         assert!(
             round2.iter().any(|(_, text)| text.contains("STEER-ME")),
             "the steered prompt must be folded into the same turn's next request; got {round2:?}"
+        );
+    }
+
+    /// A pure-text turn (no tool calls) where the user steers mid-stream must
+    /// CONTINUE in the same turn rather than ending.
+    ///
+    /// Injection is via DeferredSteerProvider (deterministic): steer sent on call 1,
+    /// provider's stream yields once before events, giving the driver time to put
+    /// the steer into steer.lock() before the terminal-boundary steer check runs.
+    #[tokio::test]
+    async fn steer_continues_a_pure_text_turn_instead_of_ending() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done { truncated: false }],
+                vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done { truncated: false }],
+            ],
+            1, // inject on first call
+            "STEER-TEXT",
+            deferred_tx_clone,
+        ));
+        let received = provider.received();
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle.commands.send(AgentCommand::SendMessage { text: "hello".into(), images: vec![] }).unwrap();
+        let mut turn_started = 0u32;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(turn_started, 1, "the steered text response stays in ONE turn");
+        let calls = received.lock().unwrap();
+        assert!(
+            calls.iter().any(|req| req.iter().any(|(_, t)| t.contains("STEER-TEXT"))),
+            "a pure-text turn must continue and send the steered prompt; got {calls:?}"
         );
     }
 }

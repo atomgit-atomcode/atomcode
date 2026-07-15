@@ -747,8 +747,9 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
     let _ = handle.task.await;
 }
 
-// (b) A mid-turn SendMessage runs as its OWN turn after the current one completes —
-// the second prompt is NOT lost.
+// (b) A mid-turn SendMessage is FOLDED INTO the current turn's next round (Task 2
+// steer-drain semantics): the second prompt is NOT lost and NOT deferred to a new
+// turn — the kernel responds to it within the SAME turn.
 #[tokio::test]
 async fn mid_turn_send_message_runs_after_current_turn() {
     use atomcode_kernel::testkit::DeferredCommands;
@@ -765,7 +766,8 @@ async fn mid_turn_send_message_runs_after_current_turn() {
 
     let provider = Arc::new(
         RecordingProvider::new(vec![
-            // Turn 1, round 1: call `inject` (sends a mid-turn SendMessage), end round.
+            // Turn 1, round 1: call `inject` (sends a mid-turn SendMessage to cmd_rx),
+            // end round. The steer is drained at the top of round 2 below.
             vec![
                 StreamEvent::ToolCall(ToolCall {
                     id: "i1".into(),
@@ -774,10 +776,9 @@ async fn mid_turn_send_message_runs_after_current_turn() {
                 }),
                 StreamEvent::Done { truncated: false },
             ],
-            // Turn 1, round 2: final answer → turn 1 completes.
-            vec![StreamEvent::TextDelta("first done".into()), StreamEvent::Done { truncated: false }],
-            // Turn 2 (the QUEUED SendMessage): a final answer → completes.
-            vec![StreamEvent::TextDelta("second done".into()), StreamEvent::Done { truncated: false }],
+            // Turn 1, round 2: SECOND-PROMPT has been folded in as a real user message.
+            // Final answer → turn 1 completes. No turn 2 — the steer was handled here.
+            vec![StreamEvent::TextDelta("both done".into()), StreamEvent::Done { truncated: false }],
         ])
         .with_ctx_window(1000),
     );
@@ -793,35 +794,30 @@ async fn mid_turn_send_message_runs_after_current_turn() {
 
     handle.commands.send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] }).unwrap();
 
-    // Expect TWO TurnComplete events: turn 1, then the drained mid-turn SendMessage's
-    // turn 2. If the mid-turn SendMessage were dropped (the old no-op), only ONE
-    // would ever arrive and this would hang.
+    // Expect exactly ONE TurnComplete: the steer is folded into turn 1's round 2,
+    // so there is no separate turn 2. (Pre-Task-2 behavior was two turns; Task 2
+    // changes this to in-turn continuation.)
     let mut completes = 0;
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             completes += 1;
-            if completes == 2 {
-                break;
-            }
+            break; // one is all we need
         }
     }
-    assert_eq!(completes, 2, "the queued mid-turn SendMessage must run its own turn");
+    assert_eq!(completes, 1, "the steered mid-turn SendMessage must be folded into the same turn");
 
-    // The queued prompt actually entered history and was sent to the provider on
-    // turn 2 — proof it was not lost. Scope the lock so its guard is not held
-    // across the later `.await`.
+    // The steered prompt actually entered history and was sent to the provider in
+    // turn 1 round 2 — proof it was not lost.
     let second_prompt_reached = {
         let recorded = calls.lock().unwrap();
         recorded
-            .last()
-            .unwrap()
-            .0
             .iter()
-            .any(|m| m.role == Role::User && m.text == "SECOND-PROMPT")
+            .any(|call| call.0.iter().any(|m| m.role == Role::User && m.text == "SECOND-PROMPT"))
     };
     assert!(
         second_prompt_reached,
-        "the second (mid-turn-queued) prompt must reach the provider in turn 2"
+        "the steered prompt must reach the provider within the same turn; calls={:?}",
+        calls.lock().unwrap().iter().map(|c| c.0.iter().map(|m| &m.text).collect::<Vec<_>>()).collect::<Vec<_>>()
     );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
