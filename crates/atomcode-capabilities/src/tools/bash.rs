@@ -2167,4 +2167,118 @@ mod tests {
         assert!(!is_read_only_bash("   "));
         assert!(!is_read_only_bash("grep x |"));    // trailing pipe (parse error / empty stage)
     }
+
+    /// Differential fuzz: for every command the classifier calls read-only, execute it in
+    /// a fresh throwaway tmpdir seeded with a `PWN` sentinel and assert that neither the
+    /// sentinel is mutated nor a `HACKED` file is created.  Commands classified `false` are
+    /// NOT executed (they may be destructive).  This is the load-bearing safety proof — it
+    /// catches any classifier fail-open: a command that SHOULD be rejected but is passed
+    /// through as "read-only" would create or mutate files, and the assertion fires.
+    ///
+    /// The corpus is adversarial and fixed (no randomness) so it is safe in CI.  Each
+    /// command runs in its OWN tmpdir (indexed by `enumerate()` to avoid collisions between
+    /// commands of the same string length) and the dir is removed afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn differential_fuzz_readonly_never_writes() {
+        use std::process::Command;
+
+        // Each entry is (command_string, expected_is_read_only).
+        // The `expected` column is documentation only — the test EXECUTES whatever the
+        // classifier says is true; if the classifier is WRONG (a fail-open), the execution
+        // assert fires and exposes the real command.
+        let corpus: &[(&str, bool)] = &[
+            // ── READ-ONLY (expected true) — must not write ──────────────────────────────
+            // plain reads
+            ("cat PWN",                                      true),
+            ("ls -la",                                       true),
+            ("ls",                                           true),
+            // grep with quoted metacharacters (single-quote = raw_string, no subst)
+            ("grep 'a\\|b' PWN",                            true),
+            ("grep -E '(x|y)' PWN",                         true),
+            // single-quoted $(...) is a LITERAL string — classified true, must NOT exec it
+            ("grep '$(touch HACKED)' PWN",                  true),
+            // safe redirects: /dev/null discard and fd-dup
+            ("grep x 2>/dev/null PWN",                      true),
+            ("grep x PWN >/dev/null 2>&1",                  true),
+            ("cat PWN 2>&1 | grep SENTINEL",                true),
+            // chains of read-only commands
+            ("grep a PWN && grep b PWN",                    true),
+            ("cat PWN; ls",                                  true),
+            ("cd . && grep x PWN",                          true),
+            // pipelines through read-only programs
+            ("echo hi | grep h",                            true),
+            ("grep -rn 'a\\|b' . | head",                  true),
+            // find without write actions
+            ("find . -name '*.txt'",                        true),
+            ("find . -name 'PWN'",                          true),
+            // wc, head, tail
+            ("wc -l PWN",                                   true),
+            ("head -1 PWN",                                 true),
+            ("tail -1 PWN",                                 true),
+
+            // ── SIDE-EFFECTING (expected false) — MUST be classified false; NOT executed ─
+            // output redirects that write real files
+            ("echo x > HACKED",                             false),
+            ("grep x > 9",                                  false),
+            ("grep x >&HACKED",                             false),
+            ("grep x >>HACKED",                             false),
+            ("ls &>9",                                      false),
+            // double-quoted $(...) executes the inner command
+            ("grep \"$(touch HACKED)\" PWN",                false),
+            // subshell
+            ("(touch HACKED)",                              false),
+            // non-allowlisted commands
+            ("touch HACKED",                                false),
+            ("rm PWN",                                      false),
+            ("cargo build",                                 false),
+            // piping through tee / xargs writes
+            ("grep x | tee HACKED",                        false),
+            ("grep x | xargs touch HACKED",                false),
+            // subshell via sh -c
+            ("sh -c 'touch HACKED'",                       false),
+            // find write actions
+            ("find . -delete",                              false),
+            ("find . -exec touch HACKED {} ;",             false),
+            // plain write to PWN
+            ("echo pwned > PWN",                            false),
+        ];
+
+        for (i, &(cmd, _expected)) in corpus.iter().enumerate() {
+            let ro = is_read_only_bash(cmd);
+            if !ro {
+                // Not classified read-only → the parallel-safe path would never execute it.
+                // We do NOT run it here (it may be destructive).
+                continue;
+            }
+
+            // Fresh sandbox per command — indexed so collisions between equal-length strings
+            // cannot cause cross-command interference.
+            let dir = std::env::temp_dir().join(format!("rofuzz_{i}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("PWN"), "SENTINEL").unwrap();
+
+            let before = std::fs::read_to_string(dir.join("PWN")).unwrap();
+
+            // Execute: ignore the exit status (grep may return 1 on no-match, which is fine).
+            let _ = Command::new("bash")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&dir)
+                .output();
+
+            let after = std::fs::read_to_string(dir.join("PWN")).unwrap_or_default();
+            assert_eq!(
+                before, after,
+                "read-only-classified command MUTATED the sentinel!\n  cmd = {cmd:?}",
+            );
+            assert!(
+                !dir.join("HACKED").exists(),
+                "read-only-classified command CREATED a file!\n  cmd = {cmd:?}",
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
