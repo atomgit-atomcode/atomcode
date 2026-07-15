@@ -37,16 +37,29 @@ pub const POOL: &[Tip] = &[
 /// How many random tips to show below the pinned one.
 const RANDOM_COUNT: usize = 3;
 
-/// `[PINNED, r1, r2, r3]` — pinned first, then up to 3 distinct random picks.
-pub fn choose_tips(rng: &mut impl Rng) -> Vec<Tip> {
-    let mut out = Vec::with_capacity(1 + RANDOM_COUNT);
-    out.push(PINNED);
+/// Pick `RANDOM_COUNT` distinct POOL indices (for caching a stable selection).
+pub fn choose_pool_indices(rng: &mut impl Rng) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..POOL.len()).collect();
     idx.shuffle(rng);
-    for &i in idx.iter().take(RANDOM_COUNT.min(POOL.len())) {
-        out.push(POOL[i]);
+    idx.truncate(RANDOM_COUNT.min(POOL.len()));
+    idx
+}
+
+/// Resolve cached indices back to `[PINNED, ...selected]`.
+pub fn tips_from_indices(indices: &[usize]) -> Vec<Tip> {
+    let mut out = Vec::with_capacity(1 + indices.len());
+    out.push(PINNED);
+    for &i in indices {
+        if let Some(t) = POOL.get(i) {
+            out.push(*t);
+        }
     }
     out
+}
+
+/// `[PINNED, r1, r2, r3]` — pinned first, then up to 3 distinct random picks.
+pub fn choose_tips(rng: &mut impl Rng) -> Vec<Tip> {
+    tips_from_indices(&choose_pool_indices(rng))
 }
 
 #[cfg(test)]
