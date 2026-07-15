@@ -59,6 +59,91 @@ pub fn sparkline(values: &[u64], width: usize) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeatCell {
+    pub weekday: u8,     // 0=Sun .. 6=Sat
+    pub week_col: usize, // 0-based column (week index from the first date)
+    pub level: u8,       // 0..=4 intensity
+    pub month_start: bool,
+    pub month: u8,       // 1..=12
+}
+
+/// 0..=4 intensity per day. Level 0 = zero. Non-zero split into 4 quartiles of
+/// the non-zero values.
+pub fn heatmap_buckets(daily: &[u64]) -> Vec<u8> {
+    let mut nz: Vec<u64> = daily.iter().copied().filter(|v| *v > 0).collect();
+    if nz.is_empty() {
+        return daily.iter().map(|_| 0u8).collect();
+    }
+    nz.sort_unstable();
+    let q = |frac: f64| nz[((nz.len() as f64 - 1.0) * frac).round() as usize];
+    let (t1, t2, t3) = (q(0.25), q(0.50), q(0.75));
+    daily
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                0
+            } else if v <= t1 {
+                1
+            } else if v <= t2 {
+                2
+            } else if v <= t3 {
+                3
+            } else {
+                4
+            }
+        })
+        .collect()
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian (y, m, d). Howard Hinnant's
+/// algorithm. Used to derive weekday + week index without a date crate.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let mut it = s.split('-');
+    let y = it.next()?.parse().ok()?;
+    let m = it.next()?.parse().ok()?;
+    let d = it.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
+pub fn calendar_layout(rows: &[(String, u64)]) -> Vec<HeatCell> {
+    let daily: Vec<u64> = rows.iter().map(|(_, t)| *t).collect();
+    let levels = heatmap_buckets(&daily);
+    // Week column = (epoch_day - first_week_start_epoch_day) / 7, where the
+    // first week starts on the Sunday on/before the first date.
+    let first_epoch = match rows.first().and_then(|(d, _)| parse_ymd(d)) {
+        Some((y, m, d)) => days_from_civil(y, m, d),
+        None => return Vec::new(),
+    };
+    // weekday of epoch day: 1970-01-01 was a Thursday → (epoch + 4) % 7 gives 0=Sun.
+    let weekday_of = |epoch: i64| (((epoch % 7) + 4).rem_euclid(7)) as u8;
+    let first_week_start = first_epoch - weekday_of(first_epoch) as i64;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut prev_month = 0u32;
+    for (i, (date, _)) in rows.iter().enumerate() {
+        let Some((y, m, d)) = parse_ymd(date) else { continue };
+        let epoch = days_from_civil(y, m, d);
+        out.push(HeatCell {
+            weekday: weekday_of(epoch),
+            week_col: ((epoch - first_week_start) / 7) as usize,
+            level: levels[i],
+            month_start: m != prev_month,
+            month: m as u8,
+        });
+        prev_month = m;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +167,30 @@ mod tests {
         assert_eq!(cs[1], '█'); // max
         assert_eq!(sparkline(&[5, 5, 5], 3), "▄▄▄"); // all-equal → mid/flat, uniform
         assert_eq!(sparkline(&[], 3).chars().count(), 3); // empty → blanks, width kept
+    }
+
+    #[test]
+    fn heatmap_buckets_zero_and_levels() {
+        assert_eq!(heatmap_buckets(&[0, 0, 0]), vec![0, 0, 0]);
+        let b = heatmap_buckets(&[0, 1, 50, 100, 1000]);
+        assert_eq!(b[0], 0); // zero → level 0
+        assert!(b[4] >= b[1] && b[4] <= 4); // monotone, capped at 4
+        assert!(b.iter().all(|&l| l <= 4));
+    }
+
+    #[test]
+    fn calendar_layout_maps_weekday_and_week() {
+        // 2026-07-13 is a Monday. Give 3 consecutive days.
+        let rows = vec![
+            ("2026-07-13".to_string(), 10u64), // Mon
+            ("2026-07-14".to_string(), 0u64),  // Tue
+            ("2026-07-15".to_string(), 99u64), // Wed
+        ];
+        let cells = calendar_layout(&rows);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].weekday, 1); // Mon (0=Sun)
+        assert_eq!(cells[2].weekday, 3); // Wed
+        assert_eq!(cells[0].week_col, cells[2].week_col); // same week
+        assert_eq!(cells[1].level, 0); // zero day
     }
 }
