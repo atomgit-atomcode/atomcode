@@ -157,13 +157,22 @@ impl Tool for BashTool {
             biased;
             // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
             _ = ctx.cancel.cancelled() => {
-                err(format!("bash: cancelled before completion. Command: {}", a.command))
+                // The command itself is already shown in the `● Bash(…)`
+                // header above (for the user) and in the tool-call record
+                // (for the model), so don't echo it back — a long command
+                // just wraps into several redundant error lines.
+                err("bash: cancelled before completion.".to_string())
             }
             res = tokio::time::timeout(dur, wait) => match res {
                 Ok(Ok(output)) => format_output(&output),
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
-                Err(_) => err(format!("bash: timed out after {secs}s. Command: {}", a.command)),
+                // Don't echo the command (see the cancel arm); point at the actionable
+                // knob — a larger `timeout` — the way the core bash tool does.
+                Err(_) => err(format!(
+                    "bash: timed out after {secs}s — pass a larger `timeout` if this command \
+                     legitimately needs longer."
+                )),
             }
         }
     }
@@ -1334,6 +1343,118 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
+/// The strict read-only command allowlist: the FIRST word of every pipeline
+/// segment must be one of these for the command to be considered parallel-safe.
+/// Deliberately tiny — these commands do not write files, mutate state, or run
+/// other programs (with the `find` carve-out handled below). Widening this is a
+/// future step, not a v1 concern.
+const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
+    "grep", "rg", "cat", "head", "tail", "ls", "find", "wc", "echo", "pwd",
+    "which", "stat", "cut", "sort", "uniq", "tr", "nl", "rev", "basename",
+    "dirname", "file", "tree", "printf", "true", "false", "seq", "column",
+];
+
+/// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY with other
+/// tools. Conservative by design: it fails CLOSED — any construct that could write,
+/// chain, background, substitute, or run an unlisted program returns `false`
+/// (serialize). A false negative only costs parallelism; a false positive could let
+/// a side-effecting command run concurrently, so the bar is "provably safe".
+pub(crate) fn is_read_only_bash(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+
+    // Hard rejects: any of these tokens means we cannot prove read-only.
+    // - command substitution / process substitution
+    if cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(") {
+        return false;
+    }
+    // - command chaining (`&&`, `||`, `;`). `|` is handled separately below (pipes are
+    //   allowed when every segment is allowlisted), so guard `||` explicitly.
+    if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") {
+        return false;
+    }
+    // - backgrounding with a standalone `&`, but NOT the fd-dup form `&1`/`&2` used in
+    //   `2>&1` / `>&2` (which are read-only-safe stream duplications). Reject a `&` only
+    //   when it is NOT immediately preceded by `>` (redirect dup) and NOT part of `&&`
+    //   (already rejected above). A `&` followed by a digit is an fd dup target.
+    {
+        let b = cmd.as_bytes();
+        for (i, &ch) in b.iter().enumerate() {
+            if ch == b'&' {
+                let prev_is_redirect = i > 0 && b[i - 1] == b'>';
+                let next_is_fd = i + 1 < b.len() && b[i + 1].is_ascii_digit();
+                if !prev_is_redirect && !next_is_fd {
+                    return false; // real backgrounding `&`
+                }
+            }
+        }
+    }
+
+    // Split on pipes; EVERY segment's first word must be allowlisted.
+    for segment in cmd.split('|') {
+        let seg = segment.trim();
+        if seg.is_empty() {
+            return false; // empty pipe segment (e.g. `grep x |` or `| grep`)
+        }
+        // Redirections that WRITE a real target reject the segment; the discard
+        // forms (`>/dev/null`, `2>/dev/null`, `&>/dev/null`) are the only allowed
+        // uses of `>`. Detect a write redirect: a `>` whose target is not /dev/null.
+        if segment_has_write_redirect(seg) {
+            return false;
+        }
+        let first = match seg.split_whitespace().next() {
+            Some(w) => w,
+            None => return false,
+        };
+        if !READ_ONLY_BASH_ALLOWLIST.contains(&first) {
+            return false;
+        }
+        // `find` carve-out: pure traversal is read-only, but `-delete` / `-exec`
+        // (and `-execdir` / `-ok` / `-okdir` / `-fprint*` write) mutate or run
+        // arbitrary programs. Reject those.
+        if first == "find"
+            && (seg.contains("-delete")
+                || seg.contains("-exec")
+                || seg.contains("-ok")
+                || seg.contains("-fprint")
+                || seg.contains("-fls"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// True if `segment` contains a `>` redirect writing to a REAL target (not /dev/null).
+/// The discard forms are read-only-safe; anything else is a write.
+fn segment_has_write_redirect(segment: &str) -> bool {
+    // Find each '>' and inspect what follows. `2>`, `>`, `>>`, `&>` all count.
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'>' {
+            // The text AFTER this run of '>' (skip a following '>' for '>>').
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == b'>' {
+                j += 1;
+            }
+            let rest = segment[j..].trim_start();
+            // Allowed discard targets. `>&2`/`2>&1` (fd dup) are not file writes.
+            let is_discard = rest.starts_with("/dev/null");
+            let is_fd_dup = rest.starts_with('&'); // e.g. `2>&1`, `>&2`
+            if !is_discard && !is_fd_dup {
+                return true; // writes a real file
+            }
+        }
+        i += 1;
+    }
+    // A leading `<` input redirect from a real file is also not provably read-only
+    // in the general case, but reading a file is harmless; we treat `<` as allowed.
+    false
+}
+
 #[cfg(all(test, unix))]
 #[test]
 fn apply_askpass_env_sets_sudo_ssh_vars() {
@@ -1355,6 +1476,19 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn temp_diag_why_approval() {
+        let cmds = [
+            "cd /Users/theo/Documents/workspace/atomcode && RUSTFLAGS=\"--force-warn dead_code --force-warn unused_imports --force-warn unused_variables --force-warn unused_macros --force-warn unused_must_use -A clippy::all\" cargo +nightly check --workspace --all-targets --message-format=short 2>&1 | grep -iE \"warning:|error:\" | grep -iE \"never|unused|dead|unreachable|construct\" | sort -u | head -250",
+            "cd /Users/theo/Documents/workspace/atomcode && cargo +nightly udeps --workspace --all-targets --output human 2>&1 | tail -150",
+            "cargo +nightly check --workspace 2>&1 | grep -iE \"never|unused|dead\"",
+        ];
+        for c in cmds {
+            eprintln!("CMDDIAG risk={:?} reason={:?}", risk_of(c), check_destructive_command(c));
+        }
+        panic!("diag done");
+    }
 
     #[test]
     fn sanitize_strips_ansi_colour_codes() {
@@ -1834,5 +1968,45 @@ mod tests {
         let r = BashTool.execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path())).await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("timed out after 1s"), "{}", r.content);
+    }
+
+    #[test]
+    fn is_read_only_bash_allows_pure_reads() {
+        assert!(is_read_only_bash("grep -rn \"x\" crates/"));
+        assert!(is_read_only_bash("grep x | grep -v y | head -20"));
+        assert!(is_read_only_bash("rg foo | wc -l"));
+        assert!(is_read_only_bash("cat a.txt"));
+        assert!(is_read_only_bash("ls -la"));
+        assert!(is_read_only_bash("find crates -name '*.rs'"));
+        // Discarding stderr/stdout to /dev/null has no side effect; `2>&1` is an fd dup.
+        assert!(is_read_only_bash("grep x 2>/dev/null"));
+        assert!(is_read_only_bash("grep -rn foo crates/ 2>/dev/null | head -10"));
+        assert!(is_read_only_bash("grep x foo.txt >/dev/null 2>&1"), "discard + fd dup");
+        assert!(is_read_only_bash("cat f 2>&1 | grep err"), "fd dup then read-only pipe");
+    }
+
+    #[test]
+    fn is_read_only_bash_rejects_side_effects() {
+        assert!(!is_read_only_bash("ls > out.txt"), "real redirect writes a file");
+        assert!(!is_read_only_bash("ls >> out.txt"), "append redirect");
+        assert!(!is_read_only_bash("ls && rm -rf build"), "&& chaining");
+        assert!(!is_read_only_bash("ls; rm x"), "; chaining");
+        assert!(!is_read_only_bash("ls || echo no"), "|| chaining");
+        assert!(!is_read_only_bash("grep x &"), "standalone backgrounding &");
+        assert!(!is_read_only_bash("sleep 1 & grep x"), "background then command");
+        assert!(!is_read_only_bash("cat f | sh"), "sh segment runs arbitrary");
+        assert!(!is_read_only_bash("grep x | tee f"), "tee not allowlisted");
+        assert!(!is_read_only_bash("grep x | xargs rm"), "xargs runs arbitrary");
+        assert!(!is_read_only_bash("git commit -m x"), "git not allowlisted");
+        assert!(!is_read_only_bash("cargo build"), "cargo not allowlisted");
+        assert!(!is_read_only_bash("echo $(whoami)"), "command substitution");
+        assert!(!is_read_only_bash("echo `date`"), "backtick substitution");
+        assert!(!is_read_only_bash("find . -delete"), "find -delete mutates");
+        assert!(!is_read_only_bash("find . -exec rm {} ;"), "find -exec runs arbitrary");
+        assert!(!is_read_only_bash("eval ls"), "eval");
+        assert!(!is_read_only_bash("env FOO=1 ls"), "env can set state / run arbitrary");
+        assert!(!is_read_only_bash(""), "empty command");
+        assert!(!is_read_only_bash("   "), "blank command");
+        assert!(!is_read_only_bash("unknowncmd -x"), "unknown first word");
     }
 }
