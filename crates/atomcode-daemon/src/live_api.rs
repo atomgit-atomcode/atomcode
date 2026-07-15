@@ -969,6 +969,30 @@ impl TurnExecutor for KernelTurnExecutor {
             let ev = match ev {
                 DaemonRuntimeEvent::Legacy(event) => event,
                 DaemonRuntimeEvent::Native(event) => {
+                    let compact_snapshot = match committed_compaction_snapshot(&event) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            emit(TurnEvent::Error(error.into()));
+                            continue;
+                        }
+                    };
+                    if let Some(snapshot) = compact_snapshot {
+                        {
+                            let mut conversation = conv.lock().await;
+                            conversation.messages = snapshot.messages.clone();
+                            conversation.cold_summaries.clear();
+                        }
+                        if let Err(error) = save_live_compaction_json(
+                            &self.working_dir,
+                            &self.session_id,
+                            snapshot.messages,
+                        ) {
+                            emit(TurnEvent::Error(format!(
+                                "compact session save failed: {error}"
+                            )));
+                            continue;
+                        }
+                    }
                     if let Some(event) = coding_runtime_to_turn(event) {
                         emit(event);
                     }
@@ -1328,6 +1352,27 @@ fn save_live_session_json(
     manager.save(&session)
 }
 
+/// Persist a kernel-confirmed compaction snapshot without the generic stale-write
+/// guard: this is the exact candidate accepted by the single live runtime, so a
+/// smaller user-turn count is an intentional compaction rather than stale data.
+fn save_live_compaction_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) -> std::io::Result<()> {
+    use atomcode_core::session::{Session, SessionManager};
+    let manager = SessionManager::new(working_dir);
+    let mut session = manager
+        .load(session_id)
+        .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
+    session.id = session_id.clone();
+    session.messages = messages;
+    session.cold_summaries.clear();
+    session.auto_name_from_messages();
+    session.touch();
+    manager.save(&session)
+}
+
 /// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
 /// the `/live` executor and the `/chat` v2 producer forward). Returns `None` for
 /// events the caller handles specially (approval, turn terminals) or ignores.
@@ -1433,9 +1478,42 @@ pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent
         } => Some(TurnEvent::Warning(
             atomcode_config::i18n::format_compaction_interrupted(),
         )),
+        CodingRuntimeEvent::CompactionFinished {
+            completion:
+                CompactionCompletion::Failed {
+                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                    error,
+                },
+        } => Some(TurnEvent::Error(format!("compact failed: {error}"))),
         CodingRuntimeEvent::CompactionFinished { .. } => None,
         _ => None,
     }
+}
+
+fn committed_compaction_snapshot(
+    event: &CodingRuntimeEvent,
+) -> Result<Option<atomcode_core::conversation::ConversationSnapshot>, &'static str> {
+    let CodingRuntimeEvent::CompactionFinished {
+        completion: CompactionCompletion::Completed(outcome),
+    } = event
+    else {
+        return Ok(None);
+    };
+    if !outcome.committed || !outcome.is_manual() {
+        return Ok(None);
+    }
+    let snapshot = outcome
+        .committed_snapshot
+        .as_deref()
+        .ok_or("compact completed without a resumable session snapshot")?;
+    Ok(Some(atomcode_core::conversation::ConversationSnapshot {
+        messages: snapshot
+            .messages
+            .iter()
+            .map(crate::commands::message_to_core)
+            .collect(),
+        cold_summaries: Vec::new(),
+    }))
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
@@ -1554,6 +1632,18 @@ pub(crate) async fn run_chat_turn_v2(
         let ev = match ev {
             DaemonRuntimeEvent::Legacy(event) => event,
             DaemonRuntimeEvent::Native(event) => {
+                let compact_snapshot = match committed_compaction_snapshot(&event) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = turn_tx.send(TurnEvent::Error(error.into()));
+                        continue;
+                    }
+                };
+                if let Some(snapshot) = compact_snapshot {
+                    let mut conversation = conv.lock().await;
+                    conversation.messages = snapshot.messages;
+                    conversation.cold_summaries.clear();
+                }
                 if let Some(event) = coding_runtime_to_turn(event) {
                     let _ = turn_tx.send(event);
                 }
@@ -2696,6 +2786,7 @@ mod tests {
             committed,
             estimated_tokens_before: 40_000,
             estimated_tokens_after: 10_000,
+            committed_snapshot: None,
         };
 
         assert!(matches!(
@@ -2736,6 +2827,56 @@ mod tests {
             }),
             Some(TurnEvent::Warning(text)) if text.contains("interrupt") || text.contains("中断")
         ));
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                        "disk full",
+                    ),
+                },
+            }),
+            Some(TurnEvent::Error(text)) if text.contains("disk full")
+        ));
+
+        let missing_snapshot = CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome(
+                CompactTrigger::Manual { focus: None },
+                true,
+            )),
+        };
+        assert!(committed_compaction_snapshot(&missing_snapshot).is_err());
+    }
+
+    #[test]
+    fn committed_compaction_event_exposes_exact_core_mirror_messages() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
+
+        let mut kernel_message = Message::user("after compact");
+        kernel_message.synthetic = true;
+        let snapshot = SessionSnapshot::new(vec![kernel_message]);
+        let event = CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(CompactionOutcome {
+                trigger: CompactTrigger::Manual { focus: None },
+                epoch: 1,
+                removed_messages: 2,
+                bytes_before: 100,
+                bytes_after: 50,
+                committed: true,
+                estimated_tokens_before: 25,
+                estimated_tokens_after: 12,
+                committed_snapshot: Some(std::sync::Arc::new(snapshot)),
+            }),
+        };
+
+        let snapshot = committed_compaction_snapshot(&event)
+            .expect("valid completion")
+            .expect("committed snapshot");
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.messages[0].synthetic);
+        assert_eq!(snapshot.messages[0].text(), Some("after compact"));
+        assert!(snapshot.cold_summaries.is_empty());
     }
 
     // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
@@ -3136,5 +3277,37 @@ mod tests {
             "compaction shrink (synthetic summary present) must be allowed"
         );
         assert!(loaded.messages[0].synthetic);
+    }
+
+    #[test]
+    fn trusted_compaction_save_allows_repeated_shrink_with_same_summary_count() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/compact-checkpoint");
+        let id = SessionId::new();
+
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                synthetic_msg("summary 1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+                user_msg("u3"),
+                assistant_msg("a3"),
+            ],
+        )
+        .expect("seed");
+
+        save_live_compaction_json(
+            &dir,
+            &id,
+            vec![synthetic_msg("summary 2"), user_msg("u3"), assistant_msg("a3")],
+        )
+        .expect("trusted compaction save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[0].text(), Some("summary 2"));
     }
 }

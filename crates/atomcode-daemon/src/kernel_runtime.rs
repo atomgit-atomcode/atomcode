@@ -280,13 +280,13 @@ impl KernelToWebui {
                 removed,
                 bytes_before,
                 bytes_after,
-                ..
+                snapshot,
             } => {
                 let observed_tokens_before = self
                     .last_usage
                     .as_ref()
                     .map(|meta| meta.used_tokens as usize);
-                let outcome = CompactionOutcome::from_kernel(
+                let mut outcome = CompactionOutcome::from_kernel(
                     trigger,
                     epoch,
                     removed,
@@ -295,6 +295,7 @@ impl KernelToWebui {
                     committed,
                     observed_tokens_before,
                 );
+                outcome.committed_snapshot = snapshot.map(Arc::new);
 
                 if committed {
                     if let Some(meta) = self.last_usage.as_mut() {
@@ -308,6 +309,11 @@ impl KernelToWebui {
                     },
                 )]
             }
+            KEv::CompactionFailed { trigger, error } => vec![DaemonRuntimeEvent::Native(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Failed { trigger, error },
+                },
+            )],
             other => self
                 .translate(other)
                 .into_iter()
@@ -600,7 +606,9 @@ impl KernelToWebui {
                     vec![]
                 }
             }
-            KEv::CompactionStarted { .. } | KEv::Compacted { .. } => vec![],
+            KEv::CompactionStarted { .. }
+            | KEv::Compacted { .. }
+            | KEv::CompactionFailed { .. } => vec![],
             KEv::Error { message, http_status, .. } => {
                 let error = friendly_provider_error(message, http_status, &self.base_url);
                 vec![CoreEv::Error {
@@ -1637,6 +1645,7 @@ mod kernel_runtime_translate_tests {
             bytes_before: 4000,
             bytes_after: 1000,
             committed: true,
+            snapshot: None,
         });
         match &out[..] {
             [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
@@ -1661,6 +1670,7 @@ mod kernel_runtime_translate_tests {
             bytes_before: 100,
             bytes_after: 100,
             committed: false,
+            snapshot: None,
         });
         assert!(matches!(
             &out[..],
@@ -1668,6 +1678,42 @@ mod kernel_runtime_translate_tests {
                 completion: CompactionCompletion::Completed(outcome),
             })]
                 if !outcome.committed && outcome.is_manual()
+        ));
+    }
+
+    #[test]
+    fn compacted_manual_carries_exact_committed_snapshot() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let snapshot = SessionSnapshot::new(vec![Message::user("after compact")]);
+        let out = t.translate_runtime(KEv::Compacted {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed: 2,
+            bytes_before: 100,
+            bytes_after: 50,
+            committed: true,
+            snapshot: Some(snapshot.clone()),
+        });
+        assert!(matches!(
+            &out[..],
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            })] if outcome.committed_snapshot.as_deref() == Some(&snapshot)
+        ));
+    }
+
+    #[test]
+    fn compaction_checkpoint_failure_maps_to_native_terminal() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate_runtime(KEv::CompactionFailed {
+            trigger: CompactTrigger::Manual { focus: None },
+            error: atomcode_kernel::checkpoint::CompactionCheckpointError::new("disk full"),
+        });
+        assert!(matches!(
+            &out[..],
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed { error, .. },
+            })] if error.message() == "disk full"
         ));
     }
 
@@ -1681,6 +1727,7 @@ mod kernel_runtime_translate_tests {
             bytes_before: 100,
             bytes_after: 100,
             committed: false,
+            snapshot: None,
         });
         assert!(matches!(
             &out[..],

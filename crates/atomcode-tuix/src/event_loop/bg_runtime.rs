@@ -1,10 +1,8 @@
-use atomcode_core::agent::AgentEvent;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
+use atomcode_config::i18n::{t, Msg};
 #[cfg(test)]
 use atomcode_core::agent::AgentClient;
-use atomcode_coding::runtime::CodingRuntimeEvent;
-#[cfg(test)]
-use atomcode_coding::runtime::CompactionCompletion;
-use atomcode_config::i18n::{t, Msg};
+use atomcode_core::agent::AgentEvent;
 use atomcode_core::session::{Session, SessionManager};
 
 use super::RuntimeEndpoint;
@@ -413,8 +411,32 @@ impl BgRuntimeManager {
                 if completion.is_manual() =>
             {
                 if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    let mut failed = matches!(&completion, CompactionCompletion::Failed { .. });
+                    if let CompactionCompletion::Completed(outcome) = &completion {
+                        if outcome.committed {
+                            if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
+                                let core_snapshot =
+                                    atomcode_core::conversation::ConversationSnapshot {
+                                        messages: snapshot
+                                            .messages
+                                            .iter()
+                                            .map(super::kernel_message_to_core)
+                                            .collect(),
+                                        cold_summaries: Vec::new(),
+                                    };
+                                super::apply_session_snapshot(&mut bg.session, core_snapshot);
+                                failed = session_manager.save(&bg.session).is_err();
+                            } else {
+                                failed = true;
+                            }
+                        }
+                    }
                     if matches!(bg.state, RuntimeState::Running) {
-                        bg.state = RuntimeState::Idle;
+                        bg.state = if failed {
+                            RuntimeState::Error
+                        } else {
+                            RuntimeState::Idle
+                        };
                     }
                 }
                 false
@@ -845,12 +867,56 @@ mod tests {
                     committed: false,
                     estimated_tokens_before: 0,
                     estimated_tokens_after: 0,
+                    committed_snapshot: None,
                 }),
             }),
             &SessionManager::new(&project),
         );
 
-        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
+    }
+
+    #[test]
+    fn committed_manual_compaction_updates_background_session_mirror() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
+
+        let project = tempfile::tempdir().unwrap();
+        let project = project.path().to_path_buf();
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+        let snapshot = SessionSnapshot::new(vec![Message::user("after compact")]);
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 2,
+                    bytes_before: 100,
+                    bytes_after: 50,
+                    committed: true,
+                    estimated_tokens_before: 25,
+                    estimated_tokens_after: 12,
+                    committed_snapshot: Some(std::sync::Arc::new(snapshot)),
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        let messages = &manager.backgrounds.slots[0].session.messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), Some("after compact"));
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
     }
 
     #[test]
@@ -878,6 +944,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_manual_compaction_marks_background_runtime_error() {
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    error: atomcode_kernel::checkpoint::CompactionCheckpointError::new("disk full"),
+                },
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Error
+        );
+    }
+
+    #[test]
     fn late_compaction_finish_does_not_downgrade_terminal_background_state() {
         use atomcode_coding::runtime::CompactionOutcome;
         use atomcode_kernel::message::CompactTrigger;
@@ -900,6 +993,7 @@ mod tests {
                     committed: true,
                     estimated_tokens_before: 25,
                     estimated_tokens_after: 12,
+                    committed_snapshot: None,
                 }),
             }),
             &SessionManager::new(&project),

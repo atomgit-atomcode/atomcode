@@ -506,7 +506,7 @@ impl Conversation {
             .unwrap_or((0, 0, 0.0))
     }
 
-    /// Apply a compaction [`CompactionPlan`] as the SOLE non-append history writer
+    /// Prepare a compaction [`CompactionPlan`] without changing this conversation.
     /// (besides `backfill_cancelled_tool_results`). The kernel — not the strategy —
     /// owns and enforces every invariant here, so a buggy strategy cannot corrupt
     /// the conversation:
@@ -528,7 +528,7 @@ impl Conversation {
     ///    a text-light but TOOL-CALL-heavy message (large JSON `arguments`) must register
     ///    as a reduction when dropped, else the strictly-smaller guard would REFUSE a
     ///    genuinely shrinking compaction and a tool-heavy history could never compact.
-    /// 3. On COMMIT: replace `messages` with the candidate and bump
+    /// 3. On a viable candidate: prepare replacement `messages` and bump its
     ///    `cache_epoch += 1` EXACTLY ONCE (decide commit FIRST, bump only after —
     ///    never bump-then-rollback). On REFUSE (not strictly smaller, or noop):
     ///    leave `messages` BYTE-IDENTICAL and do NOT bump `cache_epoch` — a
@@ -537,7 +537,11 @@ impl Conversation {
     /// This is the append-aware cache contract: a COMMITTED compaction is the ONLY
     /// allowed non-append history change and it opens a new epoch; a REFUSED one
     /// leaves the prefix byte-stable and the epoch unchanged.
-    pub fn apply_plan(&mut self, plan: CompactionPlan, sacred_floor: usize) -> CompactReport {
+    pub(crate) fn prepare_plan(
+        &self,
+        plan: CompactionPlan,
+        sacred_floor: usize,
+    ) -> PreparedCompaction {
         // Deterministic size proxy: the bytes that ride the wire for a message — NOT just
         // `text`. Dropping a text-light, TOOL-CALL-heavy message (big JSON arguments) must
         // count as a reduction, else the strictly-smaller net-loss guard below would
@@ -626,12 +630,11 @@ impl Conversation {
 
         let bytes_after: usize = candidate.iter().map(size).sum();
 
-        // 3. Decide commit FIRST; bump epoch only after a real commit.
+        // 3. Decide commit FIRST; prepare the next epoch only for a real commit.
         let committed = bytes_after < bytes_before;
-        let (epoch_after, removed) = if committed {
+        let (epoch_after, removed, candidate) = if committed {
             let removed = len_before.saturating_sub(candidate.len());
-            self.messages = candidate;
-            self.cache_epoch = epoch_before + 1;
+            let mut candidate = candidate;
             // PRESSURE RELIEF (anti re-fire): the auto task-boundary trigger
             // (`should_compact`) reads the LAST assistant's frozen `meta.used_tokens`
             // and recomputes pressure against the live window. `apply_plan` copies
@@ -646,8 +649,7 @@ impl Conversation {
             // on the next turn. Only on commit.
             if bytes_before > 0 {
                 let ratio = bytes_after as f64 / bytes_before as f64;
-                if let Some(meta) = self
-                    .messages
+                if let Some(meta) = candidate
                     .iter_mut()
                     .rev()
                     .find(|m| m.role == Role::Assistant)
@@ -657,20 +659,62 @@ impl Conversation {
                     meta.used_tokens = (meta.used_tokens as f64 * ratio).round() as u32;
                 }
             }
-            (self.cache_epoch, removed)
+            let epoch_after = epoch_before + 1;
+            (
+                epoch_after,
+                removed,
+                Some(Conversation { messages: candidate, cache_epoch: epoch_after }),
+            )
         } else {
             // REFUSE: messages byte-identical, epoch unchanged.
-            (epoch_before, 0)
+            (epoch_before, 0, None)
         };
 
-        CompactReport {
-            epoch_before,
-            epoch_after,
-            removed,
-            bytes_before,
-            bytes_after,
-            committed,
+        PreparedCompaction {
+            candidate,
+            report: CompactReport {
+                epoch_before,
+                epoch_after,
+                removed,
+                bytes_before,
+                bytes_after,
+                committed,
+            },
         }
+    }
+
+    /// Commit a previously prepared candidate with no fallible work.
+    pub(crate) fn commit_prepared(&mut self, prepared: PreparedCompaction) -> CompactReport {
+        if let Some(candidate) = prepared.candidate {
+            *self = candidate;
+        }
+        prepared.report
+    }
+
+    /// Apply a compaction plan immediately.
+    ///
+    /// Agent-driven manual compaction uses [`Self::prepare_plan`] directly so a
+    /// durable checkpoint can be written before this final ownership move. Other
+    /// callers retain the original immediate-apply behavior through this wrapper.
+    pub fn apply_plan(&mut self, plan: CompactionPlan, sacred_floor: usize) -> CompactReport {
+        let prepared = self.prepare_plan(plan, sacred_floor);
+        self.commit_prepared(prepared)
+    }
+}
+
+/// A compaction candidate that passed every kernel invariant but is not live yet.
+pub(crate) struct PreparedCompaction {
+    candidate: Option<Conversation>,
+    report: CompactReport,
+}
+
+impl PreparedCompaction {
+    pub(crate) fn candidate(&self) -> Option<&Conversation> {
+        self.candidate.as_ref()
+    }
+
+    pub(crate) fn report(&self) -> CompactReport {
+        self.report
     }
 }
 

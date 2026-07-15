@@ -35,6 +35,7 @@ use atomcode_capabilities::tools::{
 };
 use atomcode_core::provider::model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
+use atomcode_kernel::checkpoint::CompactionCheckpoint;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
@@ -115,6 +116,9 @@ pub struct CodingParts {
     pub approval: Arc<ApprovalMiddleware>,
     /// Lifecycle hooks in the CANONICAL ORDER (see [`assemble`]).
     hooks: Vec<Arc<dyn LifecycleHooks>>,
+    /// The same session snapshot writer used by `SnapshotHook`, exposed through
+    /// the kernel's manual-compaction checkpoint seam.
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     pub session: Option<SessionBinding>,
     /// Connected MCP servers (None when `opts.mcp` was false or no config exists).
     pub mcp_registry: Option<Arc<McpRegistry>>,
@@ -379,6 +383,7 @@ pub async fn prepare_with_plugin_hooks(
     // 6. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
+    let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
     if opts.memory {
@@ -386,7 +391,9 @@ pub async fn prepare_with_plugin_hooks(
     }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
-        hooks.push(Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd)));
+        let snapshot_hook = Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd));
+        compaction_checkpoint = Some(snapshot_hook.clone());
+        hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
@@ -472,6 +479,7 @@ pub async fn prepare_with_plugin_hooks(
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         hooks,
+        compaction_checkpoint,
         session,
         mcp_registry,
         mcp_events,
@@ -749,6 +757,9 @@ pub fn assemble(
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
+    if let Some(checkpoint) = &parts.compaction_checkpoint {
+        builder = builder.compaction_checkpoint(checkpoint.clone());
+    }
     if let Some(b) = &parts.session {
         builder = builder.session_id(&b.id);
         // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
@@ -926,6 +937,23 @@ mod tests {
             web: false,
             review: false,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_injects_checkpoint_only_for_persistent_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+
+        let mut persistent = io_free_opts();
+        persistent.session = SessionMode::Fresh;
+        let parts = prepare(&cfg, persistent).await.unwrap();
+        assert!(parts.compaction_checkpoint.is_some());
+
+        let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(ephemeral.compaction_checkpoint.is_none());
     }
 
     /// `prepare` loads a project `.hooks.json` and exposes the runner via

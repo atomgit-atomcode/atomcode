@@ -6,6 +6,7 @@
 //! about approval, persona, or code-intelligence.
 
 pub mod clock;
+pub mod checkpoint;
 pub mod message;
 pub mod tool;
 pub mod stream;

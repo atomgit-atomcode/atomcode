@@ -15,6 +15,7 @@
 //!   * a committed compaction opens a NEW cache epoch while preserving the
 //!     byte-identical system prefix.
 
+use atomcode_kernel::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Role, SessionSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
@@ -23,9 +24,24 @@ use atomcode_kernel::testkit::{
     StubToolResultsStrategy, SummarizeOldestStrategy,
 };
 use atomcode_kernel::tool::ToolRegistry;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const PERSONA: &str = "you are a neutral test agent";
+
+struct TestCheckpoint {
+    saved: Arc<Mutex<Vec<SessionSnapshot>>>,
+    failure: Option<CompactionCheckpointError>,
+}
+
+impl CompactionCheckpoint for TestCheckpoint {
+    fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        self.saved.lock().unwrap().push(snapshot.clone());
+        Ok(())
+    }
+}
 
 // A turn that reports HIGH prompt usage against a small context window so the
 // assistant message's recorded `meta.utilization` is high (≈0.9), then stops.
@@ -319,6 +335,101 @@ async fn manual_compact_command_triggers_regardless_of_threshold() {
     // Confirm epoch persisted on the conversation.
     let snap = snapshot(&mut handle).await;
     assert_eq!(snap.cache_epoch, 1, "manual compaction bumped the conversation's cache_epoch");
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+#[tokio::test]
+async fn manual_compaction_success_is_checkpointed_before_event() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let checkpoint = Arc::new(TestCheckpoint { saved: saved.clone(), failure: None });
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .compaction_checkpoint(checkpoint)
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+
+    let committed = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Compacted { committed: true, snapshot: Some(snapshot), .. }) => {
+                break snapshot;
+            }
+            Some(AgentEvent::CompactionFailed { error, .. }) => {
+                panic!("checkpoint unexpectedly failed: {error}")
+            }
+            Some(_) => continue,
+            None => panic!("channel closed before compact completed"),
+        }
+    };
+
+    let persisted = saved.lock().unwrap().clone();
+    assert_eq!(persisted.as_slice(), &[committed.clone()]);
+    assert_eq!(
+        snapshot(&mut handle).await,
+        committed,
+        "the event snapshot, durable checkpoint, and live commit must be identical"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+#[tokio::test]
+async fn manual_compaction_checkpoint_failure_keeps_live_conversation_unchanged() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let checkpoint = Arc::new(TestCheckpoint {
+        saved: Arc::new(Mutex::new(Vec::new())),
+        failure: Some(CompactionCheckpointError::new("disk full")),
+    });
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .compaction_checkpoint(checkpoint)
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+    let before = snapshot(&mut handle).await;
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+
+    loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::CompactionFailed { error, .. }) => {
+                assert_eq!(error.message(), "disk full");
+                break;
+            }
+            Some(AgentEvent::Compacted { .. }) => {
+                panic!("a failed checkpoint must not report compact success")
+            }
+            Some(_) => continue,
+            None => panic!("channel closed before checkpoint failure was reported"),
+        }
+    }
+
+    let after = snapshot(&mut handle).await;
+    assert_eq!(after, before, "checkpoint failure must not change messages, counters, or epoch");
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;

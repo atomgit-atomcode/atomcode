@@ -21,6 +21,9 @@ atomcode-core = { path = "../atomcode-core" }
 # INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
 # coding agent explores the repo and writes AGENTS.md via its tools.
 atomcode-coding = { path = "../atomcode-coding" }
+# Native runtime events carry the exact committed SessionSnapshot so the TUI can
+# keep its transitional core session mirror in sync without depending on bridge.
+atomcode-kernel = { path = "../atomcode-kernel" }
 zeroize = "1"
 atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }

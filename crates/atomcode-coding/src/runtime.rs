@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use atomcode_kernel::agent::AgentHandle;
+use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{
-    CompactionStrategy, CompactionView, Conversation, Message,
+    CompactionStrategy, CompactionView, Conversation, Message, SessionSnapshot,
 };
 pub use atomcode_kernel::message::CompactTrigger;
 use atomcode_kernel::provider::LlmProvider;
@@ -36,6 +37,8 @@ pub enum CodingRuntimeEvent {
 pub enum CompactionCompletion {
     /// The kernel returned a normal compaction result.
     Completed(CompactionOutcome),
+    /// The prepared result could not be durably checkpointed, so it was not committed.
+    Failed { trigger: CompactTrigger, error: CompactionCheckpointError },
     /// The owning runtime was replaced or stopped before the kernel returned a result.
     Interrupted { trigger: CompactTrigger, reason: CompactionInterruption },
 }
@@ -45,6 +48,7 @@ impl CompactionCompletion {
     pub fn trigger(&self) -> &CompactTrigger {
         match self {
             Self::Completed(outcome) => &outcome.trigger,
+            Self::Failed { trigger, .. } => trigger,
             Self::Interrupted { trigger, .. } => trigger,
         }
     }
@@ -77,6 +81,10 @@ pub struct CompactionOutcome {
     pub committed: bool,
     pub estimated_tokens_before: usize,
     pub estimated_tokens_after: usize,
+    /// Exact candidate used for a committed manual compaction. For a session-bound
+    /// runtime its durable checkpoint has already succeeded; ephemeral runtimes may
+    /// also carry it so driver projections can converge on the live state.
+    pub committed_snapshot: Option<Arc<SessionSnapshot>>,
 }
 
 /// Result of compacting an already-persisted conversation without starting an
@@ -198,6 +206,7 @@ impl CompactionOutcome {
             committed,
             estimated_tokens_before,
             estimated_tokens_after,
+            committed_snapshot: None,
         }
     }
 
@@ -688,9 +697,10 @@ fn handle_compaction_event(
             bytes_before,
             bytes_after,
             committed,
+            snapshot,
         } => {
             compactions.finished(&trigger);
-            let outcome = CompactionOutcome::from_kernel(
+            let mut outcome = CompactionOutcome::from_kernel(
                 trigger,
                 epoch,
                 removed,
@@ -699,11 +709,19 @@ fn handle_compaction_event(
                 committed,
                 *observed_tokens,
             );
+            outcome.committed_snapshot = snapshot.map(Arc::new);
             if committed {
                 *observed_tokens = Some(outcome.estimated_tokens_after);
             }
             let _ = runtime_event_tx.send(CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
+            });
+            None
+        }
+        AgentEvent::CompactionFailed { trigger, error } => {
+            compactions.finished(&trigger);
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed { trigger, error },
             });
             None
         }
@@ -777,6 +795,7 @@ pub fn noop_agent_handle() -> AgentHandle {
                         bytes_before: 0,
                         bytes_after: 0,
                         committed: false,
+                        snapshot: None,
                     });
                 }
                 AgentCommand::Shutdown => break,
@@ -838,6 +857,7 @@ mod tests {
                                     bytes_before: 100,
                                     bytes_after: 50,
                                     committed: true,
+                                    snapshot: None,
                                 });
                             }
                         }
@@ -959,6 +979,7 @@ mod tests {
                 trigger: CompactTrigger::Manual { focus: Some("files".into()) },
             })
             .unwrap();
+        let committed_snapshot = SessionSnapshot::new(vec![Message::user("after compact")]);
         kernel_events
             .send(AgentEvent::Compacted {
                 trigger: CompactTrigger::Manual { focus: Some("files".into()) },
@@ -967,6 +988,7 @@ mod tests {
                 bytes_before: 400,
                 bytes_after: 100,
                 committed: true,
+                snapshot: Some(committed_snapshot.clone()),
             })
             .unwrap();
 
@@ -979,7 +1001,38 @@ mod tests {
             Some(CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome)
             })
-                if outcome.committed && outcome.removed_messages == 4
+                if outcome.committed
+                    && outcome.removed_messages == 4
+                    && outcome.committed_snapshot.as_deref() == Some(&committed_snapshot)
+        ));
+        assert!(adapter.events.try_recv().is_err());
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_routes_checkpoint_failure_as_terminal_without_adapter_leak() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
+        let mut adapter = spawn_runtime_owner(agent, controls, runtime_tx, true);
+
+        handle.compact(None).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Compact { focus: None })
+        ));
+        kernel_events
+            .send(AgentEvent::CompactionFailed {
+                trigger: CompactTrigger::Manual { focus: None },
+                error: CompactionCheckpointError::new("read-only filesystem"),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed { error, .. }
+            }) if error.message() == "read-only filesystem"
         ));
         assert!(adapter.events.try_recv().is_err());
         adapter.shutdown().await.unwrap();

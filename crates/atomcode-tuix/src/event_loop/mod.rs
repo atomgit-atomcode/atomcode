@@ -8933,8 +8933,107 @@ fn handle_runtime_event(
             buf,
         ),
         bg_runtime::RuntimeEventPayload::Native(event) => {
-            handle_coding_runtime_event(event, state, think, renderer);
+            let mirror_persisted = persist_native_compaction_snapshot(&event, ctx, renderer);
+            handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
         }
+    }
+}
+
+/// Persist the exact committed kernel working set into the TUI's transitional
+/// core session mirror before the UI reports manual-compaction success.
+fn persist_native_compaction_snapshot(
+    event: &CodingRuntimeEvent,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let CodingRuntimeEvent::CompactionFinished {
+        completion: CompactionCompletion::Completed(outcome),
+    } = event
+    else {
+        return true;
+    };
+    if !outcome.committed || !outcome.is_manual() {
+        return true;
+    }
+    let Some(snapshot) = outcome.committed_snapshot.as_deref() else {
+        renderer.render(UiLine::Error(
+            "compact completed without a resumable session snapshot".into(),
+        ));
+        renderer.flush();
+        return false;
+    };
+
+    let core_snapshot = atomcode_core::conversation::ConversationSnapshot {
+        messages: snapshot
+            .messages
+            .iter()
+            .map(kernel_message_to_core)
+            .collect(),
+        cold_summaries: Vec::new(),
+    };
+    persist_current_session(ctx, core_snapshot, renderer)
+}
+
+fn kernel_message_to_core(
+    message: &atomcode_kernel::message::Message,
+) -> atomcode_core::conversation::message::Message {
+    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+    use atomcode_kernel::message::Role as KernelRole;
+
+    let role = match message.role {
+        KernelRole::System => Role::System,
+        KernelRole::User => Role::User,
+        KernelRole::Assistant => Role::Assistant,
+        KernelRole::Tool => Role::Tool,
+    };
+    let content = if message.role == KernelRole::Tool {
+        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
+            call_id: message.tool_call_id.clone().unwrap_or_default(),
+            output: message.text.clone(),
+            success: !message.is_error,
+        })
+    } else if !message.tool_calls.is_empty() {
+        MessageContent::AssistantWithToolCalls {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            tool_calls: message
+                .tool_calls
+                .iter()
+                .map(|call| atomcode_core::tool::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+            reasoning_content: message.reasoning.clone(),
+            thinking_blocks: message
+                .reasoning_blocks
+                .iter()
+                .map(|block| atomcode_core::conversation::message::ThinkingBlock {
+                    text: block.text.clone(),
+                    signature: block.opaque.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    } else if !message.images.is_empty() {
+        MessageContent::MultiPart {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            images: message
+                .images
+                .iter()
+                .map(|image| ImagePart {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                })
+                .collect(),
+        }
+    } else {
+        MessageContent::Text(message.text.clone())
+    };
+    Message {
+        role,
+        content,
+        synthetic: message.synthetic,
+        internal_origin: message.internal_origin.clone(),
     }
 }
 
@@ -8943,6 +9042,7 @@ fn handle_coding_runtime_event(
     state: &mut UiState,
     think: &mut ThinkStripper,
     renderer: &mut dyn Renderer,
+    mirror_persisted: bool,
 ) {
     state.note_stream_activity();
 
@@ -8960,14 +9060,16 @@ fn handle_coding_runtime_event(
             match completion {
                 CompactionCompletion::Completed(outcome) if outcome.committed => {
                     state.on_compaction_committed(outcome.estimated_tokens_after);
-                    renderer.render(UiLine::CompactionMark(
-                        atomcode_config::i18n::format_compaction_mark(
-                            outcome.removed_messages,
-                            outcome.estimated_tokens_before,
-                            outcome.estimated_tokens_after,
-                        ),
-                    ));
-                    renderer.flush();
+                    if mirror_persisted {
+                        renderer.render(UiLine::CompactionMark(
+                            atomcode_config::i18n::format_compaction_mark(
+                                outcome.removed_messages,
+                                outcome.estimated_tokens_before,
+                                outcome.estimated_tokens_after,
+                            ),
+                        ));
+                        renderer.flush();
+                    }
                 }
                 CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
                     render_assistant_text(
@@ -8992,7 +9094,15 @@ fn handle_coding_runtime_event(
                         renderer,
                     );
                 }
+                CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { .. },
+                    error,
+                } => {
+                    renderer.render(UiLine::Error(format!("compact failed: {error}")));
+                    renderer.flush();
+                }
                 CompactionCompletion::Completed(_)
+                | CompactionCompletion::Failed { .. }
                 | CompactionCompletion::Interrupted { .. } => {}
             }
 
@@ -9043,7 +9153,37 @@ mod coding_runtime_event_tests {
             committed,
             estimated_tokens_before: 10_000,
             estimated_tokens_after: 2_500,
+            committed_snapshot: None,
         }
+    }
+
+    #[test]
+    fn kernel_projection_preserves_reasoning_blocks() {
+        let mut message = atomcode_kernel::message::Message::assistant(
+            "answer",
+            vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        message.reasoning_blocks = vec![atomcode_kernel::message::ReasoningBlock {
+            text: "thought".into(),
+            opaque: Some("sig".into()),
+            provider: Some("anthropic".into()),
+        }];
+
+        let projected = kernel_message_to_core(&message);
+        let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
+            thinking_blocks,
+            ..
+        } = projected.content
+        else {
+            panic!("expected assistant tool-call content");
+        };
+        assert_eq!(thinking_blocks.len(), 1);
+        assert_eq!(thinking_blocks[0].text, "thought");
+        assert_eq!(thinking_blocks[0].signature, "sig");
     }
 
     #[test]
@@ -9060,6 +9200,7 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
             assert!(state.compacting);
             assert!(state.compaction_forced_streaming);
@@ -9075,6 +9216,7 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
         }
 
@@ -9098,6 +9240,7 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
             handle_coding_runtime_event(
                 CodingRuntimeEvent::CompactionFinished {
@@ -9109,6 +9252,7 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
         }
 
@@ -9136,6 +9280,7 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
         }
 
@@ -9163,11 +9308,67 @@ mod coding_runtime_event_tests {
                 &mut state,
                 &mut think,
                 &mut renderer,
+                true,
             );
         }
 
         assert!(matches!(state.phase, UiPhase::Idle));
         assert!(state.turn_rendered_visible_text);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn committed_marker_waits_for_core_mirror_persistence() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                false,
+            );
+        }
+
+        assert!(output.is_empty(), "success marker must wait for the session mirror save");
+    }
+
+    #[test]
+    fn failed_manual_compaction_renders_error_and_restores_idle() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        state.compacting = true;
+        state.compaction_forced_streaming = true;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Failed {
+                        trigger: CompactTrigger::Manual { focus: None },
+                        error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                            "disk full",
+                        ),
+                    },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!state.compacting);
         assert!(!output.is_empty());
     }
 }
@@ -10839,9 +11040,9 @@ fn persist_current_session(
     ctx: &mut LoopCtx,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
-) {
+) -> bool {
     if snapshot.messages.is_empty() {
-        return;
+        return true;
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
@@ -10859,7 +11060,9 @@ fn persist_current_session(
             .into_owned(),
         ));
         renderer.flush();
+        return false;
     }
+    true
 }
 
 pub(crate) fn apply_session_snapshot(
