@@ -476,6 +476,14 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             // where SGR 90 (DarkGrey) collapses to ~3:1 against the bg and
             // the grid goes invisible. Maps to Color::Grey, NOT bright white.
             Some(37) => style.fg = Some(Color::Grey),
+            // SGR 34/35 (standard blue / magenta). Emitted by the LIGHT
+            // theme: `theme::md_heading_open()` → `1;34m` and
+            // `theme::md_inline_code_open()` → `35m` (dark uses bright cyan /
+            // SGR 96). Without these arms both fell through to `_ => {}` and
+            // rendered in the default fg (black) — the "all colours vanish on
+            // the light theme" bug. Mirror `render::cell::apply_sgr`.
+            Some(34) => style.fg = Some(Color::DarkBlue),
+            Some(35) => style.fg = Some(Color::DarkMagenta),
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(91) => style.fg = Some(Color::Red),
             Some(92) => style.fg = Some(Color::Green),
@@ -504,8 +512,8 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
                 // through silently — markdown doesn't emit them.
             }
             _ => {
-                // Other ANSI colours (30-37, 91-96, bg, underline)
-                // silently ignored — markdown doesn't emit them.
+                // Other ANSI colours (30-33, 36, bg, underline) silently
+                // ignored — markdown doesn't emit them.
             }
         }
         i += 1;
@@ -11821,6 +11829,28 @@ mod tests {
         let mut style = CellStyle::default();
         apply_sgr("37", &mut style);
         assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
+    }
+
+    #[test]
+    fn apply_sgr_34_is_blue_for_light_theme_headings() {
+        // SGR 34 is emitted by `theme::md_heading_open()` on LIGHT themes
+        // (dark uses bright cyan / SGR 96). The parser must map it to a
+        // visible blue — dropping it (the old `_ => {}` arm) left light-theme
+        // headings in the default fg (black): the "colours vanished on the
+        // light theme" bug. Mirrors `render::cell::apply_sgr`'s 34→DarkBlue.
+        let mut style = CellStyle::default();
+        apply_sgr("34", &mut style);
+        assert_eq!(style.fg, Some(Color::DarkBlue), "SGR 34 must map to blue");
+    }
+
+    #[test]
+    fn apply_sgr_35_is_magenta_for_light_theme_inline_code() {
+        // SGR 35 is emitted by `theme::md_inline_code_open()` on LIGHT themes
+        // (dark uses bright cyan / SGR 96). Must map to magenta so `code`
+        // spans stay coloured on white; the old parser dropped it → black.
+        let mut style = CellStyle::default();
+        apply_sgr("35", &mut style);
+        assert_eq!(style.fg, Some(Color::DarkMagenta), "SGR 35 must map to magenta");
     }
 
     #[test]
