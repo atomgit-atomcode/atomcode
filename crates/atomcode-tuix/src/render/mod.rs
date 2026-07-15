@@ -454,6 +454,33 @@ pub enum HintSeverity {
 /// don't tell the user whether the next turn is at risk of overflow.
 /// `ctx_used` answers "what does the model see right now"; `ctx_window`
 /// is the cap. Together they answer "how close are we to compaction".
+/// Colour slot for a left-aligned mode badge. Each variant maps to a
+/// concrete `CellStyle` in the renderer, so the badge's colour is decided
+/// at construction time (in `build_status`) rather than hard-coded in the
+/// rendering `if/else if` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BadgeColour {
+    /// AcceptEdits — periwinkle `Role::Mode`.
+    #[default]
+    Mode,
+    /// Plan — orange `Role::Plan`.
+    Plan,
+    /// Build — faint secondary (blends into the status row).
+    Secondary,
+}
+
+/// Left-aligned mode badge: a label string plus the colour slot it
+/// renders in. Replaces the previous trio of `Option<String>` fields
+/// (`mode_indicator` / `plan_indicator` / `build_indicator`) so adding
+/// a new mode only needs a new `BadgeColour` variant + one `match` arm
+/// in `build_status`, not a fresh `StatusLine` field and a parallel
+/// `if/else if` branch in the renderer.
+#[derive(Debug, Clone)]
+pub struct ModeBadge {
+    pub label: String,
+    pub colour: BadgeColour,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
@@ -468,14 +495,11 @@ pub struct StatusLine {
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders
     /// muted (upgrade banner, CodingPlan drift notice). None → no hint.
     pub hint: Option<(String, HintSeverity)>,
-    /// Left-aligned mode indicator, prepended before `model`. Present
-    /// only when the user explicitly switched to a non-default agent
-    /// mode (Plan today; conceivably others later). `None` for the
-    /// default Build mode so the status row doesn't gain noise for
-    /// the common case. Renders in brand color (Role::Brand) to draw
-    /// the eye — switching modes changes whether file edits and shell
-    /// run, so the user wants this prominent.
-    pub mode_indicator: Option<String>,
+    /// Left-aligned mode badge (`ModeBadge`), prepended before `model`.
+    /// `None` for the default Build startup so the status row stays clean.
+    /// The badge carries both its label and its colour slot, so the
+    /// renderer no longer needs a separate field per mode.
+    pub mode_indicator: Option<ModeBadge>,
     /// Right-aligned bypass indicator, appended after `hint` on the
     /// right side of the status row. Shown whenever the execution mode is
     /// `Auto` (auto-approve all tools) — whether entered via
@@ -532,8 +556,8 @@ pub struct ApprovalPanelView {
 
 /// Progress of the active todo list, rendered as the multi-line footer todo
 /// panel. The renderer collapses the list to fit (`todo_panel_rows`) and
-/// width-truncates item content; the `completed`/`total` count shows in the
-/// panel header.
+/// width-truncates item content; the `completed`/`in_progress`/`total` counts
+/// show in the panel header.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TodoProgress {
     /// The description of the task currently `in_progress` (todowrite enforces
@@ -541,11 +565,16 @@ pub struct TodoProgress {
     pub current: Option<String>,
     /// Number of tasks marked `completed`.
     pub completed: usize,
+    /// Number of tasks currently `in_progress` (todowrite enforces at most one,
+    /// so this is 0 or 1). Pre-computed by the caller so the renderer doesn't
+    /// have to scan `items` — keeps the three header counts (`completed`,
+    /// `in_progress`, `total`) single-sourced and in sync.
+    pub in_progress: usize,
     /// Total number of tasks in the list.
     pub total: usize,
     /// The full ordered list (status + content) — drives the multi-line footer
-    /// todo panel. `current`/`completed`/`total` are retained as pre-computed
-    /// conveniences for the header + hide-when-all-done filter.
+    /// todo panel. `current`/`completed`/`in_progress`/`total` are retained as
+    /// pre-computed conveniences for the header + hide-when-all-done filter.
     pub items: Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)>,
 }
 

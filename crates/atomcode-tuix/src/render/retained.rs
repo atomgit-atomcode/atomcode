@@ -212,7 +212,7 @@ enum TodoPanelRow {
     /// A blank spacer row prepended before the Header to add visual breathing
     /// room between the transcript body and the todo panel.
     Spacer,
-    Header { completed: usize, total: usize },
+    Header { completed: usize, in_progress: usize, total: usize },
     Item {
         /// 0-based position in the FULL todo list, rendered as `#{index+1}`.
         index: usize,
@@ -231,6 +231,7 @@ enum TodoPanelRow {
 fn todo_panel_rows(
     items: &[(atomcode_capabilities::tools::todo::TodoStatus, String)],
     completed: usize,
+    in_progress: usize,
     total: usize,
     max_rows: usize,
 ) -> Vec<TodoPanelRow> {
@@ -240,9 +241,9 @@ fn todo_panel_rows(
     // too short to afford the cosmetic row (max_rows < 2) we drop it, so the
     // panel never emits more rows than max_rows.
     let mut rows = if max_rows >= 2 {
-        vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, total }]
+        vec![TodoPanelRow::Spacer, TodoPanelRow::Header { completed, in_progress, total }]
     } else {
-        vec![TodoPanelRow::Header { completed, total }]
+        vec![TodoPanelRow::Header { completed, in_progress, total }]
     };
     // body_budget = whatever's left after the header (+ spacer when present).
     let body_budget = max_rows.saturating_sub(rows.len());
@@ -1926,26 +1927,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let brand = self.style_for(Role::Brand);
 
         // Left mode badge — a single left-aligned badge covers all non-default
-        // modes: Plan / accept-edits → `Role::Mode` purple "PLAN"; Auto →
-        // warning-colored "⏵⏵ auto" (auto-approve-all is a caution state the
-        // user must always see). `mode_indicator` (Plan) and `bypass_indicator`
-        // (Auto) are mutually exclusive, so one slot serves both — there is no
-        // separate right badge.
-        // `!` shell mode takes the slot over plan/auto: a `!` line runs in the
-        // shell (bypassing the agent), so the agent mode is momentarily moot —
-        // the `shell` badge (brand-purple, sibling of PLAN/auto) is what matters.
+        // modes. The badge (`ModeBadge`) carries both its label and its colour
+        // slot (`BadgeColour`), so the renderer just maps the slot to a
+        // `CellStyle` — no per-mode `if/else if` branch needed.
+        // `!` shell mode takes the slot over all mode badges: a `!` line runs
+        // in the shell (bypassing the agent), so the agent mode is momentarily
+        // moot — the `shell` badge (brand-purple, sibling of PLAN/auto) is
+        // what matters.
         let (left_badge, left_badge_style): (Option<String>, CellStyle) = if shell {
             (Some("shell".to_string()), self.style_for(Role::Shell))
-        } else if let Some(m) = status.mode_indicator.as_ref() {
-            (Some(scrub_controls(m)), self.style_for(Role::Mode))
+        } else if let Some(badge) = status.mode_indicator.as_ref() {
+            let style = match badge.colour {
+                crate::render::BadgeColour::Mode => self.style_for(Role::Mode),
+                crate::render::BadgeColour::Plan => self.style_for(Role::Plan),
+                crate::render::BadgeColour::Secondary => secondary.clone(),
+            };
+            (Some(badge.label.clone()), style)
         } else if let Some(b) = status.bypass_indicator.as_ref() {
-            (Some(scrub_controls(b)), self.style_for(Role::Warning))
+            (Some(b.clone()), self.style_for(Role::Warning))
         } else {
             (None, brand.clone())
         };
+        // The badge is followed by " · " (space · middot · space = width 3).
+        // This constant must match the separator emitted in `push_badge` below.
+        const BADGE_SEP_W: usize = 3;
         let mode_badge_w = left_badge
             .as_ref()
-            .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
+            .map(|s| crate::width::display_width(s) + BADGE_SEP_W)
             .unwrap_or(0);
 
         // Hint right-alignment math must reserve space for the mode badge
@@ -2015,7 +2023,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let push_badge = |row: &mut Vec<Cell>| {
             if let Some(badge) = &left_badge {
                 push_str_cells(row, badge, &left_badge_style);
-                push_str_cells(row, " ", &pad);
+                push_str_cells(row, " · ", &secondary);
             }
         };
 
@@ -2101,7 +2109,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Number of rows the todo panel will occupy — mirrors `build_todo_rows`'
     /// row count without building cells (used by the footer height math).
     fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress) -> usize {
-        todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap()).len()
+        todo_panel_rows(&todo.items, todo.completed, todo.in_progress, todo.total, self.todo_panel_cap()).len()
     }
 
     /// Build the multi-line todo panel: a header row (`Tasks (N done, M open)`)
@@ -2116,22 +2124,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ) -> Vec<Vec<Cell>> {
         use atomcode_capabilities::tools::todo::TodoStatus;
         let unicode = self.caps.unicode_symbols;
-        let rows = todo_panel_rows(&todo.items, todo.completed, todo.total, self.todo_panel_cap());
+        let rows = todo_panel_rows(&todo.items, todo.completed, todo.in_progress, todo.total, self.todo_panel_cap());
         // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
         // directly on non-unicode terminals so the cell backstop never has to guess.
         let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
+        // U+25A0 black square (filled) for the in-progress checkbox — the solid
+        // fill with brand colour makes the active task stand out from pending's
+        // empty outline.
+        let filled_glyph = if unicode { "\u{25a0}" } else { "[#]" };
         // U+2713 (light check) not U+2714 (heavy) — the heavy one triggers emoji
         // presentation on many terminals (renders green + width-2, leaking a stray cell).
         let done_glyph = if unicode { "\u{2713}" } else { "[x]" };
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
-        let item_line = |glyph: &str, body: &str, style: &CellStyle| -> Vec<Cell> {
+        let item_line = |glyph: &str, body: &str, glyph_style: &CellStyle, body_style: &CellStyle| -> Vec<Cell> {
             let mut row = Vec::new();
             let gw = crate::width::display_width(glyph);
             let budget = rule_width.saturating_sub(2 + gw + 1); // indent + glyph + space
             let fitted = crate::width::truncate_with_ellipsis(&scrub_controls(body), budget);
-            push_str_cells(&mut row, &format!("  {glyph} {fitted}"), style);
+            push_str_cells(&mut row, "  ", &CellStyle::default());
+            push_str_cells(&mut row, glyph, glyph_style);
+            push_str_cells(&mut row, " ", &CellStyle::default());
+            push_str_cells(&mut row, &fitted, body_style);
             row
         };
 
@@ -2139,32 +2154,48 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|r| match r {
                 // Blank spacer: empty cell list — paint_footer pads it to width.
                 TodoPanelRow::Spacer => Vec::new(),
-                TodoPanelRow::Header { completed, total } => {
-                    // `Tasks (N done, M open)` — bold, no checkbox glyph (the per-item
-                    // boxes already say "checklist"). English regardless of locale.
-                    let open = total.saturating_sub(completed);
+                TodoPanelRow::Header { completed, in_progress, total } => {
+                    // `Tasks` in bold default fg, `(N done, M in progress, K open)` in
+                    // detail colour (default fg, no bold) — the label is the anchor,
+                    // the counts are subordinate metadata. English regardless of locale.
+                    // `open` = pure pending count (total − completed − in_progress).
+                    // Previously this included in-progress (total − completed); the
+                    // semantic changed when the header grew the `in progress` counter,
+                    // so `open` now answers "how many haven't been touched yet".
+                    let open = total.saturating_sub(completed + in_progress);
                     let bold = CellStyle { bold: true, ..CellStyle::default() };
+                    let detail = self.style_for(Role::Secondary);
                     let mut row = Vec::new();
-                    push_str_cells(&mut row, &format!("Tasks ({completed} done, {open} open)"), &bold);
+                    push_str_cells(&mut row, "Tasks ", &bold);
+                    push_str_cells(&mut row, &format!("({completed} done, {in_progress} in progress, {open} open)"), &detail);
                     row
                 }
                 TodoPanelRow::Item { index, status, content } => {
-                    let (glyph, style) = match status {
-                        // Bold for the current task; no color (accent stays off in the footer).
+                    let (glyph, glyph_style, body_style) = match status {
+                        // Brand magenta + bold for the filled checkbox; bold default fg for the text.
                         TodoStatus::InProgress => {
-                            (open_glyph, CellStyle { bold: true, ..CellStyle::default() })
+                            (filled_glyph,
+                             CellStyle { bold: true, ..self.style_for(Role::Brand) },
+                             CellStyle { bold: true, ..CellStyle::default() })
                         }
                         // Completed items are normally folded; render defensively if one slips through.
                         TodoStatus::Completed => {
-                            (done_glyph, CellStyle { faint: true, ..self.style_for(Role::Muted) })
+                            let s = CellStyle { faint: true, ..self.style_for(Role::Muted) };
+                            (done_glyph, s.clone(), s)
                         }
-                        TodoStatus::Pending => (open_glyph, self.style_for(Role::Muted)),
+                        // Pending items use the same colour as tool detail (default fg) so
+                        // three states are visually distinct: muted+faint done, bold accent,
+                        // plain pending.
+                        TodoStatus::Pending => {
+                            let s = self.style_for(Role::Secondary);
+                            (open_glyph, s.clone(), s)
+                        }
                     };
-                    item_line(glyph, &format!("#{}  {}", index + 1, content), &style)
+                    item_line(glyph, &format!("#{}  {}", index + 1, content), &glyph_style, &body_style)
                 }
                 TodoPanelRow::More { hidden } => {
-                    // Fold indicator, not a task — no checkbox, just an indented muted note.
-                    let style = self.style_for(Role::Muted);
+                    // Fold indicator, not a task — no checkbox, just an indented muted+faint note.
+                    let style = CellStyle { faint: true, ..self.style_for(Role::Muted) };
                     let mut row = Vec::new();
                     push_str_cells(&mut row, &format!("  +{hidden} more{ellipsis}"), &style);
                     row
@@ -6381,6 +6412,7 @@ fn spinner_meta_suffix(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::{BadgeColour, ModeBadge};
     use crate::terminal::{EnvView, TerminalCaps};
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -6747,7 +6779,10 @@ mod tests {
             ctx_used: 0,
                 ctx_window: 0,
             hint: None,
-            mode_indicator: Some("PLAN".into()),
+            mode_indicator: Some(ModeBadge {
+                label: "PLAN".into(),
+                colour: BadgeColour::Mode,
+            }),
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
@@ -6758,12 +6793,12 @@ mod tests {
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
-        // spaces, then the badge, then a separator space, then the body.
+        // spaces, then the badge, then " · " separator, then the body.
         let visible: String = row.iter().map(|c| c.ch).collect();
         let trimmed = visible.trim_start();
         assert!(
-            trimmed.starts_with("PLAN "),
-            "badge must precede the model run; got: {:?}",
+            trimmed.starts_with("PLAN · "),
+            "badge + separator must precede the model run; got: {:?}",
             visible
         );
         assert!(
@@ -6791,7 +6826,10 @@ mod tests {
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
-            mode_indicator: Some("PLAN".into()), // plan is active…
+            mode_indicator: Some(ModeBadge {
+                label: "PLAN".into(),
+                colour: BadgeColour::Mode,
+            }),
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
@@ -6849,7 +6887,10 @@ mod tests {
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
-            mode_indicator: Some("PLAN".into()),
+            mode_indicator: Some(ModeBadge {
+                label: "PLAN".into(),
+                colour: BadgeColour::Mode,
+            }),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
             session_name: None,
             reasoning_effort: None,
@@ -6889,7 +6930,10 @@ mod tests {
             ctx_used: 0,
             ctx_window: 0,
             hint: None,
-            mode_indicator: Some("PLAN".into()),
+            mode_indicator: Some(ModeBadge {
+                label: "PLAN".into(),
+                colour: BadgeColour::Mode,
+            }),
             bypass_indicator: None,
             session_name: None,
             reasoning_effort: None,
@@ -6911,6 +6955,90 @@ mod tests {
                 .all(|c| c.style.fg == Some(crossterm::style::Color::AnsiValue(104))),
             "PLAN mode badge must use the mode purple AnsiValue(104); got: {:?}",
             row[idx..idx + 4].iter().map(|c| c.style.fg).collect::<Vec<_>>()
+        );
+    }
+
+    /// `mode_indicator` with `BadgeColour::Plan` takes the left badge slot
+    /// with the dedicated plan colour (orange `Role::Plan`), distinct from
+    /// the AcceptEdits `Role::Mode` periwinkle. Verifies both the glyph
+    /// content and the colour choice.
+    #[test]
+    fn build_status_row_plan_indicator_uses_plan_colour() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let plan_fg = role(r.caps, Role::Plan);
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some(ModeBadge {
+                label: "\u{23f8} plan".into(),
+                colour: BadgeColour::Plan,
+            }),
+            bypass_indicator: None,
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            approval: None,
+        };
+        let row = r.build_status_row(&status, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.trim_start().starts_with("\u{23f8} plan"),
+            "plan_indicator badge must appear first on the left; got: {:?}",
+            visible
+        );
+        // The badge glyphs are painted with the Plan colour (AnsiValue(208)).
+        let badge_cells: Vec<_> = row
+            .iter()
+            .skip_while(|c| c.ch == ' ')
+            .take("\u{23f8} plan".chars().count())
+            .collect();
+        assert!(
+            badge_cells.iter().all(|c| c.style.fg == plan_fg),
+            "plan badge must use Role::Plan colour (AnsiValue(208)); got: {:?}",
+            badge_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>()
+        );
+    }
+
+    /// `mode_indicator` with `BadgeColour::Secondary` (Build mode, faint
+    /// secondary style) takes the left badge slot when set. Guards the new
+    /// field is actually wired into the rendering pipeline and not silently
+    /// dropped.
+    #[test]
+    fn build_status_row_build_indicator_renders_badge() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some(ModeBadge {
+                label: "\u{23f8} build".into(),
+                colour: BadgeColour::Secondary,
+            }),
+            bypass_indicator: None,
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            approval: None,
+        };
+        let row = r.build_status_row(&status, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.trim_start().starts_with("\u{23f8} build"),
+            "build_indicator badge must appear first on the left; got: {:?}",
+            visible
         );
     }
 
@@ -11403,6 +11531,7 @@ mod tests {
         status.todo = Some(crate::render::TodoProgress {
             current: Some("wire it".into()),
             completed: 1,
+            in_progress: 1,
             total: 3,
             items: vec![
                 (TodoStatus::Completed, "done a".into()),
@@ -15102,12 +15231,12 @@ mod todo_panel_rows_tests {
             (TodoStatus::InProgress, "b"),
             (TodoStatus::Pending, "c"),
         ]);
-        let rows = todo_panel_rows(&it, 1, 3, MAX_TODO_PANEL_ROWS);
+        let rows = todo_panel_rows(&it, 1, 1, 3, MAX_TODO_PANEL_ROWS);
         // The whole list fits (3 items ≤ budget) → show EVERY item in order with its
         // real status (no fold): [Spacer, Header, Completed, InProgress, Pending] = 5 rows.
         assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
-        assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, total: 3 }));
+        assert!(matches!(rows[1], TodoPanelRow::Header { completed: 1, in_progress: 1, total: 3 }));
         assert!(matches!(&rows[2], TodoPanelRow::Item { index: 0, status: TodoStatus::Completed, content, .. } if content == "a"));
         assert!(matches!(&rows[3], TodoPanelRow::Item { index: 1, status: TodoStatus::InProgress, content, .. } if content == "b"));
         assert!(matches!(&rows[4], TodoPanelRow::Item { index: 2, status: TodoStatus::Pending, content, .. } if content == "c"));
@@ -15116,7 +15245,7 @@ mod todo_panel_rows_tests {
     #[test]
     fn no_fold_when_none_completed() {
         let it = items(&[(TodoStatus::InProgress, "b"), (TodoStatus::Pending, "c")]);
-        let rows = todo_panel_rows(&it, 0, 2, MAX_TODO_PANEL_ROWS);
+        let rows = todo_panel_rows(&it, 0, 1, 2, MAX_TODO_PANEL_ROWS);
         // Both items fit → shown individually (in-progress + pending), no More.
         assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::InProgress, .. })));
         assert!(rows.iter().any(|r| matches!(r, TodoPanelRow::Item { status: TodoStatus::Pending, .. })));
@@ -15134,7 +15263,7 @@ mod todo_panel_rows_tests {
         ]);
         // max_rows=4: body_budget = 4-2 = 2. ip takes 1, pend_budget=1 → shown=0, hidden=4.
         // Result: [Spacer, Header, ip, More{4}] = 4 rows.
-        let rows = todo_panel_rows(&it, 0, 5, 4);
+        let rows = todo_panel_rows(&it, 0, 1, 5, 4);
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows.last().unwrap(), TodoPanelRow::More { hidden: 4 }));
@@ -15145,7 +15274,7 @@ mod todo_panel_rows_tests {
         // body_budget = max_rows - 2 (Spacer + Header). With max_rows=3: budget=1.
         // in-progress wins the single body slot over the completed fold.
         let it = items(&[(TodoStatus::Completed, "done"), (TodoStatus::InProgress, "ip")]);
-        let rows = todo_panel_rows(&it, 1, 2, 3);
+        let rows = todo_panel_rows(&it, 1, 1, 2, 3);
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows[1], TodoPanelRow::Header { .. }));
@@ -15156,7 +15285,7 @@ mod todo_panel_rows_tests {
     fn never_exceeds_max_rows() {
         let mut it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Completed, "c")]);
         for i in 0..20 { it.push((TodoStatus::Pending, format!("p{i}"))); }
-        let rows = todo_panel_rows(&it, 1, 22, MAX_TODO_PANEL_ROWS);
+        let rows = todo_panel_rows(&it, 1, 1, 22, MAX_TODO_PANEL_ROWS);
         assert!(rows.len() <= MAX_TODO_PANEL_ROWS);
     }
 
@@ -15168,7 +15297,7 @@ mod todo_panel_rows_tests {
         let mut it: Vec<(TodoStatus, String)> =
             (1..=11).map(|i| (TodoStatus::Completed, format!("s{i}"))).collect();
         it.push((TodoStatus::Pending, "final".into()));
-        let rows = todo_panel_rows(&it, 11, 12, MAX_TODO_PANEL_ROWS); // MAX_TODO_PANEL_ROWS = 7
+        let rows = todo_panel_rows(&it, 11, 0, 12, MAX_TODO_PANEL_ROWS); // MAX_TODO_PANEL_ROWS = 7
         assert_eq!(rows.len(), 7, "Spacer + Header + 5 items");
         assert!(!rows.iter().any(|r| matches!(r, TodoPanelRow::More { .. })), "frontier at end → no More");
         // Window is items[7..12] = #8..#12, each shown with its real index + status.
@@ -15182,11 +15311,11 @@ mod todo_panel_rows_tests {
         // Spacer must be dropped so we never emit more rows than max_rows.
         let it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Pending, "p")]);
         // max_rows=1: header only, no spacer, no body.
-        let rows = todo_panel_rows(&it, 0, 2, 1);
+        let rows = todo_panel_rows(&it, 0, 1, 2, 1);
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0], TodoPanelRow::Header { .. }));
         // max_rows=2: spacer + header, no body budget left.
-        let rows = todo_panel_rows(&it, 0, 2, 2);
+        let rows = todo_panel_rows(&it, 0, 1, 2, 2);
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], TodoPanelRow::Spacer));
         assert!(matches!(rows[1], TodoPanelRow::Header { .. }));
@@ -15207,6 +15336,7 @@ mod todo_panel_rows_tests {
         let todo = crate::render::TodoProgress {
             current: Some("wire it".into()),
             completed: 1,
+            in_progress: 1,
             total: 3,
             items: vec![
                 (TodoStatus::Completed, "done a".into()),
@@ -15219,12 +15349,13 @@ mod todo_panel_rows_tests {
         use crate::render::theme::Palette;
         // rows[0] is the blank Spacer row — no cells.
         assert!(rows[0].is_empty(), "first row must be the blank spacer");
-        // rows[1] is the header: `Tasks (N done, M open)`, bold, NO color.
+        // rows[1] is the header: `Tasks` bold + `(N done, M in progress, K open)` detail.
         assert!(
             text(&rows[1]).contains("Tasks (")
                 && text(&rows[1]).contains("1 done")
-                && text(&rows[1]).contains("2 open"),
-            "header must be 'Tasks (1 done, 2 open)', got: {:?}",
+                && text(&rows[1]).contains("1 in progress")
+                && text(&rows[1]).contains("1 open"),
+            "header must be 'Tasks (1 done, 1 in progress, 1 open)', got: {:?}",
             text(&rows[1])
         );
         assert!(rows[1].iter().any(|c| c.style.bold), "header title is bold");
@@ -15232,12 +15363,13 @@ mod todo_panel_rows_tests {
             rows[1].iter().all(|c| c.style.fg != Some(Palette::BRAND)),
             "header must carry no Brand (pink) color"
         );
-        // the in-progress row is bold but NOT pink — the panel is colorless.
+        // the in-progress row: filled checkbox glyph is bold + Brand (pink),
+        // the body text is bold default fg. Both are bold; only the glyph is pink.
         let ip = rows.iter().find(|row| text(row).contains("wire it")).unwrap();
-        assert!(ip.iter().any(|c| c.style.bold));
+        assert!(ip.iter().any(|c| c.style.bold), "in-progress task is bold");
         assert!(
-            ip.iter().all(|c| c.style.fg != Some(Palette::BRAND)),
-            "in-progress task must not be Brand-colored"
+            ip.iter().any(|c| c.style.fg == Some(Palette::BRAND)),
+            "in-progress checkbox glyph must be Brand-coloured (filled square stands out)"
         );
         // Tasks-panel style: every item carries a `#N` positional number.
         assert!(text(ip).contains('#'), "item must show a #N number, got: {:?}", text(ip));

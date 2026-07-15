@@ -7248,6 +7248,12 @@ pub(crate) fn set_agent_mode(
     mode: crate::state::AgentMode,
 ) {
     app.state.agent_mode = mode;
+    // Reveal the Build badge when the user explicitly switches to Build
+    // via Tab/Shift+Tab or `/build`. The default startup state stays
+    // badge-less.
+    if mode == crate::state::AgentMode::Build {
+        app.state.build_badge_visible = true;
+    }
     ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode)).ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
     // The footer persistently shows the current mode, so a scrollback feedback line
@@ -10846,6 +10852,9 @@ fn handle_agent_event(
                 crate::state::AgentMode::Build
             };
             state.agent_mode = mode;
+            if mode == crate::state::AgentMode::Build {
+                state.build_badge_visible = true;
+            }
             let _ = ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode));
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} mode.\n",
@@ -11358,26 +11367,51 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
-    // Mode indicator: only rendered when the user has explicitly
-    // switched away from the default Build mode. Plan disables file
-    // edits + shell, so making it prominent in the status line guards
-    // against the user being confused why the agent refuses to write
-    // files. Default Build = None, no visual noise.
+    // Mode badge (`ModeBadge`): a single left-aligned badge that covers all
+    // non-default modes. The badge carries both its label and its colour slot
+    // (`BadgeColour`), so the renderer just maps the slot to a `CellStyle`.
+    // `None` for the default Build startup so the status row stays clean.
+    use crate::render::{BadgeColour, ModeBadge};
     let mode_indicator = match state.agent_mode {
         crate::state::AgentMode::Plan => {
             // `⏸ plan` — glyph downgrades to `||` on non-unicode terminals.
-            let pause = if ctx.caps.unicode_symbols { "\u{23f8}" } else { "||" };
-            Some(format!("{pause} plan"))
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f8} plan".to_string()
+                } else {
+                    "|| plan".to_string()
+                },
+                colour: BadgeColour::Plan,
+            })
         }
         crate::state::AgentMode::AcceptEdits => {
             // `⏵ accept edits` — single play glyph (U+23F5, renders 1-cell text form),
             // downgrades to `>` on non-unicode terminals.
-            let play = if ctx.caps.unicode_symbols { "\u{23f5}" } else { ">" };
-            Some(format!("{play} accept edits"))
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f5} accept edits".to_string()
+                } else {
+                    "> accept edits".to_string()
+                },
+                colour: BadgeColour::Mode,
+            })
         }
-        crate::state::AgentMode::Build => None,
+        crate::state::AgentMode::Build if state.build_badge_visible => {
+            // `⏸ build` — only shown after the user explicitly switches to
+            // Build via Tab/Shift+Tab or `/build`; the default startup stays
+            // badge-less. Rendered in faint secondary style so it blends
+            // into the status row naturally.
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f8} build".to_string()
+                } else {
+                    "|| build".to_string()
+                },
+                colour: BadgeColour::Secondary,
+            })
+        }
         // Auto's visual is the warning-colored left badge below (via bypass_indicator).
-        crate::state::AgentMode::Auto => None,
+        crate::state::AgentMode::Build | crate::state::AgentMode::Auto => None,
     };
     // Auto mode badge: a single warning-colored LEFT badge `⏵⏵ auto` (rendered
     // in place of the PLAN badge, since Plan and Auto are mutually exclusive).
@@ -11385,12 +11419,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // keying off the mode covers both the startup flag AND the runtime Tab /
     // `/auto` toggle. The `⏵⏵` glyph downgrades to `>>` on non-unicode terminals.
     let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
-        let arrows = if ctx.caps.unicode_symbols {
-            "\u{23f5}\u{23f5}"
+        Some(if ctx.caps.unicode_symbols {
+            "\u{23f5}\u{23f5} auto".to_string()
         } else {
-            ">>"
-        };
-        Some(format!("{arrows} auto"))
+            ">> auto".to_string()
+        })
     } else {
         None
     };
@@ -12497,7 +12530,7 @@ pub(crate) fn todo_progress_from_items(
     todos: &[atomcode_capabilities::tools::todo::TodoItem],
 ) -> crate::render::TodoProgress {
     use atomcode_capabilities::tools::todo::{todo_counts, TodoStatus};
-    let (completed, total) = todo_counts(todos);
+    let (completed, in_progress, total) = todo_counts(todos);
     let current = todos
         .iter()
         .find(|t| t.status == TodoStatus::InProgress)
@@ -12509,6 +12542,7 @@ pub(crate) fn todo_progress_from_items(
     crate::render::TodoProgress {
         current,
         completed,
+        in_progress,
         total,
         items,
     }

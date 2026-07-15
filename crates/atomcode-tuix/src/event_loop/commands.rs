@@ -1291,6 +1291,7 @@ fn execute_slash_command_impl(
         }
         "build" => {
             state.agent_mode = AgentMode::Build;
+            state.build_badge_visible = true;
             ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Build)).ok();
             atomcode_daemon::live_set_mode(AgentMode::Build);
             renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedBuildMode).into_owned()));
