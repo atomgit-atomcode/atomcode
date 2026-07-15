@@ -1174,8 +1174,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             ).into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::ConhostScrollHint =>
-            "提示：当前为经典 Windows 控制台，任务执行中无法上滚查看历史（任务结束后即可正常滚动）。\
-             如需在执行过程中滚动，建议改用 \x1b[1;96mWindows Terminal\x1b[0m。"
+            "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
+             换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"
                 .into(),
     }
 }
