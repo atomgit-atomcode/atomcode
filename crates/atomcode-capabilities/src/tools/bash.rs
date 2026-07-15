@@ -1361,37 +1361,8 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
     "grep", "rg", "cat", "head", "tail", "ls", "find", "wc", "echo", "pwd",
     "which", "stat", "cut", "tr", "nl", "rev", "basename",
     "dirname", "file", "printf", "true", "false", "seq", "column",
+    "cd", // read-only builtin: only changes THIS process's cwd, scoped to this bash call.
 ];
-
-/// If `cmd` is `cd <arg> && <rest>` where `<arg>` is a plain, metacharacter-free
-/// path, return `<rest>` (trimmed); otherwise return `cmd` unchanged. Only ONE
-/// prefix is stripped. The `cd` argument is validated to contain NO shell
-/// metacharacters, so it cannot hide a command substitution, redirect, chaining,
-/// subshell, glob, or background — anything fancier falls through unchanged and is
-/// then rejected by the normal `&&`/metachar guards. `cd` itself is a read-only
-/// builtin (changes only this process's cwd), so stripping a clean `cd … && `
-/// prefix preserves the read-only-ness of the remainder.
-fn strip_leading_cd_prefix(cmd: &str) -> &str {
-    // Must start with `cd` as its own token (space or tab after).
-    let after_cd = match cmd.strip_prefix("cd ").or_else(|| cmd.strip_prefix("cd\t")) {
-        Some(r) => r,
-        None => return cmd,
-    };
-    // Split at the FIRST `&&`; left is the cd-arg, right is the command to classify.
-    let (arg, rest) = match after_cd.split_once("&&") {
-        Some((a, r)) => (a.trim(), r.trim()),
-        None => return cmd, // a bare `cd` (no chaining) isn't a read tool anyway
-    };
-    // The cd-arg must be a plain path: NO shell metacharacter that could hide a
-    // command, redirect, substitution, subshell, glob, background, or chaining.
-    let has_metachar = arg.contains(|c: char| {
-        matches!(c, '&' | '|' | ';' | '$' | '`' | '<' | '>' | '(' | ')' | '\n' | '\r' | '*' | '?')
-    });
-    if arg.is_empty() || has_metachar || rest.is_empty() {
-        return cmd; // not a clean `cd … && rest` — leave unchanged
-    }
-    rest
-}
 
 /// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
 /// completely unparseable input. The caller must still reject trees containing
@@ -1402,88 +1373,99 @@ fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
     parser.parse(command, None)
 }
 
-/// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY with other
-/// tools. Conservative by design: it fails CLOSED — any construct that could write,
-/// chain, background, substitute, or run an unlisted program returns `false`
-/// (serialize). A false negative only costs parallelism; a false positive could let
-/// a side-effecting command run concurrently, so the bar is "provably safe".
+/// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
+/// sandbox. AST-based (tree-sitter-bash): only a fixed set of STRUCTURAL node kinds is
+/// allowed; any other NAMED kind (command substitution, subshell, expansion,
+/// backgrounding, …) means "cannot prove read-only" → false. Each `command` node's
+/// first word must be in [`READ_ONLY_BASH_ALLOWLIST`] (with the `find` write/exec
+/// carve-out); every redirect must target `/dev/null` or be an fd-dup. Fail CLOSED:
+/// parse failure / ERROR node / unknown named kind / non-discard redirect → false.
+///
+/// A false negative only costs parallelism; a false positive would let a
+/// side-effecting command run concurrently — so the bar is "provably safe".
+///
+/// The AST subsumes the old hand-rolled string classifier: quoted metacharacters are
+/// DATA, not operators (`grep 'a\|b'` → true), `cd && grep` parses as a `list` of two
+/// allowlisted commands (true, no `cd`-prefix hack), and — load-bearing — a
+/// single-quoted `'$(rm)'` stays a `raw_string` (SAFE literal) while a double-quoted
+/// `"$(rm)"` contains a `command_substitution` child that the walk rejects.
 pub(crate) fn is_read_only_bash(command: &str) -> bool {
     let cmd = command.trim();
     if cmd.is_empty() {
         return false;
     }
-
-    // Strip a leading `cd <clean-path> && ` prefix (the model's near-universal bash
-    // shape) so a read-only command behind it can still parallelize. See
-    // `strip_leading_cd_prefix` for the strict safety guard. Everything below then
-    // classifies the REMAINDER with the full ruleset — so `cd /a && cargo build`
-    // still rejects (cargo not allowlisted) and `cd /a && grep x && rm` still rejects
-    // (the remainder's `&&`).
-    let cmd = strip_leading_cd_prefix(cmd);
-
-    // Hard rejects: any of these tokens means we cannot prove read-only.
-    // - command substitution / process substitution
-    if cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(") {
-        return false;
+    let tree = match parse_bash(cmd) {
+        Some(t) => t,
+        None => return false,
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false; // partial / ambiguous parse → fail closed
     }
-    // - command chaining (`&&`, `||`, `;`). `|` is handled separately below (pipes are
-    //   allowed when every segment is allowlisted), so guard `||` explicitly.
-    if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") {
-        return false;
-    }
-    // - A raw newline / carriage return is a statement separator (like `;`) that would
-    //   hide a second command from the first-word allowlist check — reject.
-    if cmd.contains('\n') || cmd.contains('\r') {
-        return false;
-    }
-    // - backgrounding with a standalone `&`. The ONLY legitimate `&` in a read-only
-    //   command is the fd-dup form `>&N` (e.g. `2>&1`, `>&2`), which requires the `&`
-    //   to be immediately preceded by `>`. Being followed by a digit is NOT sufficient
-    //   on its own — `grep x &2` is bash backgrounding (`grep x &`) followed by the
-    //   bare token `2`, not an fd dup. `&&` was already rejected above.
-    {
-        let b = cmd.as_bytes();
-        for (i, &ch) in b.iter().enumerate() {
-            if ch == b'&' {
-                // A `&` is a legitimate fd-dup ONLY as `>&` (e.g. `2>&1`, `>&2`),
-                // i.e. immediately preceded by `>`. Any other `&` is backgrounding
-                // (`cmd &`, `cmd &2`) — reject. `&&` was already rejected above.
-                let is_fd_dup = i > 0 && b[i - 1] == b'>';
-                if !is_fd_dup {
-                    return false;
-                }
-            }
-        }
-    }
-
-    // Split on pipes; EVERY segment's first word must be allowlisted.
-    for segment in cmd.split('|') {
-        let seg = segment.trim();
-        if seg.is_empty() {
-            return false; // empty pipe segment (e.g. `grep x |` or `| grep`)
-        }
-        // Redirections that WRITE a real target reject the segment; the discard
-        // forms (`>/dev/null`, `2>/dev/null`, `&>/dev/null`) are the only allowed
-        // uses of `>`. Detect a write redirect: a `>` whose target is not /dev/null.
-        if segment_has_write_redirect(seg) {
+    // Structural node kinds a read-only command may contain — CONFIRMED against
+    // tree-sitter-bash 0.25.1 by the `probe_bash_node_kinds` test. Danger-only kinds
+    // (command_substitution — covers `$()` AND backtick; subshell — `(...)`;
+    // simple_expansion / variable_name — `$HOME`) are DELIBERATELY absent: hitting any
+    // of them fails the walk. `string` IS allowed (a double-quoted literal is safe),
+    // but a double-quoted `"$(...)"` nests a `command_substitution` CHILD → still
+    // rejected; a single-quoted `'$(...)'` is a leaf `raw_string` → safe.
+    const ALLOWED_KINDS: &[&str] = &[
+        "program", "list", "pipeline", "command", "command_name", "word",
+        "raw_string", "string", "string_content", "concatenation", "number",
+        // redirect wrapper + parts — the TARGET is validated in `redirect_is_readonly`:
+        "redirected_statement", "file_redirect", "file_descriptor",
+    ];
+    let src = cmd.as_bytes();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        // Anonymous tokens (`&&`, `|`, `;`, `>`, `"`, `'`, …) are `!is_named()` — their
+        // named parent gates them, so they are not checked here. Any UNKNOWN named kind
+        // is a construct we cannot prove read-only → fail closed.
+        if node.is_named() && !ALLOWED_KINDS.contains(&kind) {
             return false;
         }
-        let first = match seg.split_whitespace().next() {
-            Some(w) => w,
-            None => return false,
-        };
-        if !READ_ONLY_BASH_ALLOWLIST.contains(&first) {
+        if kind == "command" && !command_first_word_allowed(node, src) {
             return false;
         }
-        // `find` carve-out: pure traversal is read-only, but `-delete` / `-exec`
-        // (and `-execdir` / `-ok` / `-okdir` / `-fprint*` write) mutate or run
-        // arbitrary programs. Reject those.
-        if first == "find"
-            && (seg.contains("-delete")
-                || seg.contains("-exec")
-                || seg.contains("-ok")
-                || seg.contains("-fprint")
-                || seg.contains("-fls"))
+        if kind == "file_redirect" && !redirect_is_readonly(node, src) {
+            return false;
+        }
+        for i in 0..node.child_count() as u32 {
+            stack.push(node.child(i).unwrap());
+        }
+    }
+    true
+}
+
+/// The first word (`command_name`) of a `command` node must be in the read-only
+/// allowlist; a `find` command must not carry write/exec actions.
+fn command_first_word_allowed(command_node: tree_sitter::Node, src: &[u8]) -> bool {
+    // `command_name` is the first child of a `command`; its text is the invoked program.
+    let mut name: Option<&str> = None;
+    for i in 0..command_node.child_count() as u32 {
+        let c = command_node.child(i).unwrap();
+        if c.kind() == "command_name" {
+            name = c.utf8_text(src).ok();
+            break;
+        }
+    }
+    let first = match name {
+        Some(n) => n,
+        None => return false, // no command name (e.g. a bare assignment) → not read-only
+    };
+    if !READ_ONLY_BASH_ALLOWLIST.contains(&first) {
+        return false;
+    }
+    // `find` carve-out: pure traversal is read-only, but `-delete` / `-exec` / `-ok` /
+    // `-fprint*` / `-fls` mutate or run arbitrary programs. Scan the command's argv text.
+    if first == "find" {
+        let text = command_node.utf8_text(src).unwrap_or("");
+        if text.contains("-delete")
+            || text.contains("-exec")
+            || text.contains("-ok")
+            || text.contains("-fprint")
+            || text.contains("-fls")
         {
             return false;
         }
@@ -1491,38 +1473,31 @@ pub(crate) fn is_read_only_bash(command: &str) -> bool {
     true
 }
 
-/// True if `segment` contains a `>` redirect writing to a REAL target (not /dev/null).
-/// The discard forms are read-only-safe; anything else is a write.
-fn segment_has_write_redirect(segment: &str) -> bool {
-    // Find each '>' and inspect what follows. `2>`, `>`, `>>`, `&>` all count.
-    let bytes = segment.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'>' {
-            // The text AFTER this run of '>' (skip a following '>' for '>>').
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] == b'>' {
-                j += 1;
+/// A `file_redirect` is read-only iff its target is exactly `/dev/null` or an fd-dup
+/// (`>&1`, `2>&1`, `>&-`). Any other target writes a real file → not read-only.
+///
+/// tree-sitter-bash models a `file_redirect` as an anonymous operator token (`>`,
+/// `>>`, `2>`, `>&`, …), an optional `file_descriptor`, and the target as a `word`
+/// child. An fd-dup like `2>&1` has NO `word` target (the `&1` is absorbed into the
+/// operator/descriptor tokens), so a `file_redirect` with no `word` child is a
+/// dup/close form → safe. When a `word` target IS present it must be exactly
+/// `/dev/null`; anything else (`out.txt`, `/dev/nullX`, `&out.txt`) is a real write.
+fn redirect_is_readonly(redirect_node: tree_sitter::Node, src: &[u8]) -> bool {
+    for i in 0..redirect_node.child_count() as u32 {
+        let c = redirect_node.child(i).unwrap();
+        // Only the target is a NAMED `word`/`raw_string`/`string`/`concatenation`;
+        // the operator (`>`) and any `file_descriptor` are handled elsewhere.
+        match c.kind() {
+            "word" | "raw_string" | "string" | "concatenation" => {
+                let target = c.utf8_text(src).unwrap_or("");
+                if target != "/dev/null" {
+                    return false; // writes a real file (or an unrecognized target)
+                }
             }
-            let rest = segment[j..].trim_start();
-            // Allowed discard targets. `>&2`/`2>&1` (fd dup) and `>&-` (close) are not
-            // file writes; but `>&file` (non-digit, non-`-` after `&`) IS a write redirect
-            // (bash redirects stdout+stderr to that file). Only exempt the fd-dup/close forms.
-            let is_discard = rest.starts_with("/dev/null");
-            let is_fd_dup = rest
-                .strip_prefix('&')
-                .map_or(false, |after| {
-                    after.starts_with(|c: char| c.is_ascii_digit()) || after.starts_with('-')
-                });
-            if !is_discard && !is_fd_dup {
-                return true; // writes a real file
-            }
+            _ => {}
         }
-        i += 1;
     }
-    // A leading `<` input redirect from a real file is also not provably read-only
-    // in the general case, but reading a file is harmless; we treat `<` as allowed.
-    false
+    true
 }
 
 #[cfg(all(test, unix))]
@@ -2110,81 +2085,57 @@ mod tests {
 
     #[test]
     fn is_read_only_bash_allows_pure_reads() {
-        assert!(is_read_only_bash("grep -rn \"x\" crates/"));
+        // Quoted metacharacters are DATA, not operators (the core fix).
+        assert!(is_read_only_bash("grep -rn 'pub mod\\|mod ' --include='*.rs' | head -40"));
+        assert!(is_read_only_bash("grep -E 'warning.*(unused|dead_code)' crates/ | head"));
+        assert!(is_read_only_bash("grep 'reqwest\\|url::' --include='*.rs'"));
+        // Pipes / && / ; between read-only commands.
         assert!(is_read_only_bash("grep x | grep -v y | head -20"));
-        assert!(is_read_only_bash("rg foo | wc -l"));
+        assert!(is_read_only_bash("grep x && grep y"));
+        assert!(is_read_only_bash("cat f; ls"));
+        // cd is read-only; cd && read-only now works via the AST (no hack).
+        assert!(is_read_only_bash("cd /Users/theo/proj && grep -rn foo crates/"));
+        assert!(is_read_only_bash("cd /a && cat f | head"));
+        // /dev/null discard + fd-dup.
+        assert!(is_read_only_bash("grep x 2>/dev/null"));
+        assert!(is_read_only_bash("grep -rn foo crates/ 2>/dev/null | head -10"));
+        assert!(is_read_only_bash("cat f 2>&1 | grep err"));
+        // Single-quoted $(...) is a literal string, not a substitution.
+        assert!(is_read_only_bash("grep '$(rm -rf x)' file.txt"));
+        // Plain reads.
         assert!(is_read_only_bash("cat a.txt"));
         assert!(is_read_only_bash("ls -la"));
         assert!(is_read_only_bash("find crates -name '*.rs'"));
-        // Discarding stderr/stdout to /dev/null has no side effect; `2>&1` is an fd dup.
-        assert!(is_read_only_bash("grep x 2>/dev/null"));
-        assert!(is_read_only_bash("grep -rn foo crates/ 2>/dev/null | head -10"));
-        assert!(is_read_only_bash("grep x foo.txt >/dev/null 2>&1"), "discard + fd dup");
-        assert!(is_read_only_bash("cat f 2>&1 | grep err"), "fd dup then read-only pipe");
     }
 
     #[test]
     fn is_read_only_bash_rejects_side_effects() {
-        assert!(!is_read_only_bash("ls > out.txt"), "real redirect writes a file");
-        assert!(!is_read_only_bash("ls >> out.txt"), "append redirect");
-        assert!(!is_read_only_bash("ls && rm -rf build"), "&& chaining");
-        assert!(!is_read_only_bash("ls; rm x"), "; chaining");
-        assert!(!is_read_only_bash("ls || echo no"), "|| chaining");
-        assert!(!is_read_only_bash("grep x &"), "standalone backgrounding &");
-        assert!(!is_read_only_bash("sleep 1 & grep x"), "background then command");
-        assert!(!is_read_only_bash("cat f | sh"), "sh segment runs arbitrary");
-        assert!(!is_read_only_bash("grep x | tee f"), "tee not allowlisted");
-        assert!(!is_read_only_bash("grep x | xargs rm"), "xargs runs arbitrary");
-        assert!(!is_read_only_bash("git commit -m x"), "git not allowlisted");
-        assert!(!is_read_only_bash("cargo build"), "cargo not allowlisted");
-        assert!(!is_read_only_bash("echo $(whoami)"), "command substitution");
-        assert!(!is_read_only_bash("echo `date`"), "backtick substitution");
-        assert!(!is_read_only_bash("find . -delete"), "find -delete mutates");
-        assert!(!is_read_only_bash("find . -exec rm {} ;"), "find -exec runs arbitrary");
-        assert!(!is_read_only_bash("eval ls"), "eval");
-        assert!(!is_read_only_bash("env FOO=1 ls"), "env can set state / run arbitrary");
-        assert!(!is_read_only_bash(""), "empty command");
-        assert!(!is_read_only_bash("   "), "blank command");
-        assert!(!is_read_only_bash("unknowncmd -x"), "unknown first word");
-        // fd-dup carve-out must require a preceding `>`, not just a following digit
-        assert!(!is_read_only_bash("grep x &2"), "& followed by digit is still backgrounding, not fd-dup");
-        assert!(!is_read_only_bash("cat f &1"), "& followed by digit is backgrounding");
-        // C1 — sort/uniq/tree removed from allowlist (write-via-flag, no `>` needed)
-        assert!(!is_read_only_bash("sort -o out.txt data.txt"), "sort -o writes a file");
-        assert!(!is_read_only_bash("sort --output=out.txt f"), "sort --output writes");
-        assert!(!is_read_only_bash("uniq in.txt out.txt"), "uniq 2nd positional is an output file");
-        assert!(!is_read_only_bash("tree -o out.html ."), "tree -o writes");
-        // M2 — raw newline / carriage return hides a second command
-        assert!(!is_read_only_bash("grep x\nrm -rf y"), "raw newline hides a 2nd command");
-        assert!(!is_read_only_bash("cat a\rrm b"), "carriage return separator");
-        // >&file is a file write — only fd-dup/close forms (>&1, 2>&1, >&-) are safe
-        assert!(!is_read_only_bash("grep x >&out.txt"), ">&file writes a file");
-        assert!(!is_read_only_bash("grep x >& out.txt"), ">& file (spaced) writes");
-        assert!(!is_read_only_bash("grep x 1>&out.txt"), "1>&file writes");
-        assert!(!is_read_only_bash("grep x 2>&err.log"), "2>&file writes");
-    }
-
-    #[test]
-    fn is_read_only_bash_strips_cd_prefix() {
-        // ALLOW: cd <path> && <read-only> → read-only.
-        assert!(is_read_only_bash("cd /Users/theo/proj && grep -rn foo crates/"));
-        assert!(is_read_only_bash("cd /path && grep x | head -20"));
-        assert!(is_read_only_bash("cd /a && cat f"));
-        assert!(is_read_only_bash("cd ~/proj && ls -la"));
-        assert!(is_read_only_bash("cd \"/my dir\" && grep x"), "quoted path");
-        assert!(is_read_only_bash("cd /path&&grep x"), "no spaces around &&");
-
-        // REJECT: the remainder is not read-only, OR the cd-arg is unsafe, OR extra chaining.
-        assert!(!is_read_only_bash("cd /a && cargo check 2>&1 | head"), "cargo not allowlisted");
-        assert!(!is_read_only_bash("cd /a && git commit -m x"), "git not allowlisted");
-        assert!(!is_read_only_bash("cd /a && rm -rf b"), "rm not allowlisted");
-        assert!(!is_read_only_bash("cd /a && grep x && rm b"), "second && in remainder");
-        assert!(!is_read_only_bash("cd /a && grep x > out.txt"), "remainder writes a file");
-        assert!(!is_read_only_bash("cd $(evil) && grep x"), "cd-arg has command subst");
-        assert!(!is_read_only_bash("cd /a; rm && grep x"), "cd-arg has ;");
-        assert!(!is_read_only_bash("cd /a > f && grep x"), "cd-arg has redirect");
-        assert!(!is_read_only_bash("cd /a & grep x"), "single & is backgrounding, no &&");
-        assert!(!is_read_only_bash("cdfoo && grep x"), "cdfoo is not the cd builtin");
-        assert!(!is_read_only_bash("cd /a && grep x | tee f"), "tee in remainder pipe");
+        // Real redirects (non-/dev/null) write files.
+        assert!(!is_read_only_bash("ls > out.txt"));
+        assert!(!is_read_only_bash("ls >> out.txt"));
+        assert!(!is_read_only_bash("grep x >&out.txt"));   // >&file is a write
+        assert!(!is_read_only_bash("grep x >/dev/nullX")); // different file
+        // Non-allowlisted commands.
+        assert!(!is_read_only_bash("rm -rf b"));
+        assert!(!is_read_only_bash("git commit -m x"));
+        assert!(!is_read_only_bash("cargo build"));
+        assert!(!is_read_only_bash("cd /a && cargo check"));
+        assert!(!is_read_only_bash("grep x | tee f"));
+        assert!(!is_read_only_bash("grep x | xargs rm"));
+        // Command / process substitution (DOUBLE-quoted or bare) executes — reject.
+        assert!(!is_read_only_bash("grep \"$(rm -rf x)\""));
+        assert!(!is_read_only_bash("grep `rm x`"));
+        assert!(!is_read_only_bash("echo $(whoami)"));
+        // Subshell / background / variable expansion.
+        assert!(!is_read_only_bash("(rm x)"));
+        assert!(!is_read_only_bash("grep x & rm y"));
+        assert!(!is_read_only_bash("cat $HOME/.ssh/id_rsa"));
+        // find write actions.
+        assert!(!is_read_only_bash("find . -delete"));
+        assert!(!is_read_only_bash("find . -exec rm {} ;"));
+        // Parse junk / empty → fail closed.
+        assert!(!is_read_only_bash(""));
+        assert!(!is_read_only_bash("   "));
+        assert!(!is_read_only_bash("grep x |"));    // trailing pipe (parse error / empty stage)
     }
 }
