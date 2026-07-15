@@ -4288,6 +4288,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows
     }
 
+    /// Render the baked mascot const into cell rows (no leading pad; caller
+    /// positions it). Each cell is `▀` with fg=top-subpixel / bg=bottom-subpixel;
+    /// a fully transparent cell is a blank space.
+    fn build_mascot_rows(&self) -> Vec<Vec<Cell>> {
+        use crate::render::mascot::{mascot_color, MASCOT_ROWS, MASCOT_WIDTH};
+        let mut rows = Vec::with_capacity(MASCOT_ROWS.len());
+        for line in MASCOT_ROWS {
+            let bytes = line.as_bytes();
+            let mut row = Vec::with_capacity(MASCOT_WIDTH);
+            for cell in 0..MASCOT_WIDTH {
+                let top = bytes.get(2 * cell).copied().unwrap_or(b'.');
+                let bot = bytes.get(2 * cell + 1).copied().unwrap_or(b'.');
+                let fg = mascot_color(top);
+                let bg = mascot_color(bot);
+                if fg.is_none() && bg.is_none() {
+                    row.push(Cell::blank());
+                } else {
+                    row.push(Cell {
+                        ch: '▀',
+                        style: CellStyle { fg, bg, ..CellStyle::default() },
+                        width: 1,
+                    });
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
     fn build_welcome_rows(&self, model: &str, working_dir: &str) -> Vec<Vec<Cell>> {
         // Mirror AnsiRenderer::render_welcome, but allow narrow terminals
         // to reflow path/model/tips instead of truncating or colliding.
@@ -6618,6 +6647,21 @@ mod tests {
             todo: None,
             approval: None,
         }
+    }
+
+    #[test]
+    fn build_mascot_rows_shape_and_colors() {
+        let (r, _c) = new_counting(80, 24);
+        let rows = r.build_mascot_rows();
+        assert_eq!(rows.len(), 6);
+        for row in &rows {
+            assert_eq!(row.len(), crate::render::mascot::MASCOT_WIDTH);
+        }
+        // At least one orange half-block cell exists.
+        let has_orange = rows.iter().flatten().any(|c| {
+            c.ch == '▀' && c.style.fg == Some(crossterm::style::Color::AnsiValue(202))
+        });
+        assert!(has_orange, "mascot must contain orange ▀ cells");
     }
 
     /// Shell mode (`!`) paints the input box rules + the prompt chevron + the
