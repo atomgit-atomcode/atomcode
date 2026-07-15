@@ -1008,6 +1008,129 @@ fn format_output(output: &std::process::Output) -> ToolResult {
     ok(s)
 }
 
+/// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
+/// branch/ref/tag. Branch names — even with slashes or version dots (`release/v5.0.0`,
+/// `feature/foo`, `v1.2.3`) — must NOT match, so we key on leading-dot / trailing-slash paths, a
+/// KNOWN source/config file-extension set, and common extensionless project files — NOT on `/` or
+/// any dot (both appear in branch/tag names). Operand is assumed already lowercased.
+///
+/// This is a heuristic: an unknown extension or an unusual extensionless filename that shares no
+/// marker with a path (`git checkout weirdname`) is treated as a branch and slips through — the
+/// residual blind spot the persona RISKY-ACTIONS rule backstops. False NEGATIVES (miss a discard)
+/// are the risk; we bias the markers below toward catching real files.
+fn git_operand_looks_like_pathspec(arg: &str) -> bool {
+    // Operands may arrive quoted (`"src/main.rs"`); strip one layer so the ext check sees the path.
+    let arg = arg.trim_matches(|c| c == '"' || c == '\'');
+    if arg.is_empty() || arg.starts_with('-') {
+        return false; // a flag / ref, not a path operand
+    }
+    // `.`/`..`/`./x`/`../x`, dotfiles (`.gitignore`, `.env`), and directory pathspecs (`src/`).
+    if arg == "."
+        || arg == ".."
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || arg.starts_with('.')
+        || arg.ends_with('/')
+    {
+        return true;
+    }
+    // Extensionless files that are unmistakably working-tree paths, not branch/tag names.
+    const EXTENSIONLESS_FILES: &[&str] = &[
+        "makefile", "gnumakefile", "dockerfile", "containerfile", "gemfile", "rakefile",
+        "procfile", "jenkinsfile", "vagrantfile", "brewfile", "license", "readme", "changelog",
+        "notice", "authors", "copying",
+    ];
+    if EXTENSIONLESS_FILES.contains(&arg) {
+        return true;
+    }
+    const FILE_EXTS: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "c", "cc",
+        "cpp", "cxx", "h", "hh", "hpp", "rb", "php", "cs", "swift", "scala", "clj", "ex", "exs",
+        "erl", "hs", "ml", "dart", "zig", "nim", "toml", "json", "yaml", "yml", "xml", "html",
+        "htm", "css", "scss", "sass", "less", "md", "mdx", "txt", "lock", "sql", "proto",
+        "graphql", "gradle", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "ini", "cfg",
+        "conf", "env", "properties", "tf", "cmake", "vue", "svelte", "astro",
+    ];
+    let ext = arg.rsplit('.').next().unwrap_or("");
+    ext != arg && FILE_EXTS.contains(&ext) // `ext != arg` ⇒ the name actually contained a `.`
+}
+
+/// Detects a git subcommand that DISCARDS uncommitted work — the reported data-loss footgun.
+/// Single, whitespace-robust owner for `checkout <pathspec>` / `switch --force` / `restore <file>`
+/// / `reset --hard` / `clean -f` (so all discard forms are caught consistently regardless of
+/// spacing). Branch/tag operations are left alone. `git stash` is intentionally NOT flagged — it
+/// is recoverable via `git stash list` / `pop`. (`git push --force` / `branch -D` / history
+/// rewrites are a different category, handled by the substring table.)
+fn git_worktree_discard(cmd: &str) -> Option<&'static str> {
+    let mut it = cmd.split_whitespace().peekable();
+    // A compound part may lead with a shell keyword from a for/while/if BODY (`… ; do git
+    // checkout . ; done`) — skip them so the loop body is still inspected.
+    while let Some(&kw) = it.peek() {
+        if matches!(kw, "do" | "then" | "else" | "{") {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    let first = it.next()?;
+    if first.rsplit('/').next().unwrap_or(first) != "git" {
+        return None; // not a git invocation (path-qualified `/usr/bin/git` still matches)
+    }
+    // Skip git's global options to reach the subcommand. Value-taking global flags consume the
+    // FOLLOWING token too (unless glued with `=`). `-C` lowercases to `-c`.
+    const VALUE_FLAGS: &[&str] = &["-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"];
+    let mut sub: Option<&str> = None;
+    let mut args: Vec<&str> = Vec::new();
+    while let Some(t) = it.next() {
+        if sub.is_none() {
+            if t.starts_with('-') {
+                if !t.contains('=') && VALUE_FLAGS.contains(&t) {
+                    it.next(); // skip the flag's separate value token
+                }
+                continue;
+            }
+            sub = Some(t);
+        } else {
+            args.push(t);
+        }
+    }
+    match sub? {
+        // `git restore <file>` discards working-tree changes. `--staged` WITHOUT `--worktree`
+        // only unstages (fully recoverable) → not a discard.
+        "restore" => {
+            let staged = args.iter().any(|a| *a == "--staged" || *a == "-s");
+            let worktree = args.iter().any(|a| *a == "--worktree" || *a == "-w");
+            if staged && !worktree {
+                return None;
+            }
+            Some("git restore (discards uncommitted working-tree changes)")
+        }
+        // A force flag, an explicit pathspec separator / current-dir / glob, or a file-looking
+        // operand ⇒ this overwrites uncommitted files. A bare branch/tag operand (or `-b` create)
+        // has none of these → safe. Checking the markers (not a branch whitelist) means
+        // `checkout --detach -- file` and `checkout -b tmp -- .` are still caught.
+        "checkout" | "switch" => {
+            let discards = args
+                .iter()
+                .any(|a| matches!(*a, "--" | "." | ".." | "*" | "-f" | "--force" | "--discard-changes"))
+                || args.iter().any(|a| git_operand_looks_like_pathspec(a));
+            discards.then_some("git checkout/switch that overwrites uncommitted file changes")
+        }
+        "reset" => args
+            .iter()
+            .any(|a| matches!(*a, "--hard" | "--merge" | "--keep"))
+            .then_some("git reset --hard/--merge/--keep (discards uncommitted changes)"),
+        // `git clean` only deletes with `-f`/`--force` (short flags may bundle: `-fd`, `-xdf`).
+        "clean" => args
+            .iter()
+            .any(|a| {
+                *a == "--force" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+            })
+            .then_some("git clean -f (deletes untracked files)"),
+        _ => None,
+    }
+}
+
 /// Classify a shell command as destructive (returns `Some(reason)`) or not (`None`).
 /// Faithful, condensed port of the production `check_destructive_command`: it
 /// normalizes simple quoting, strips wrappers, and recurses into subshells / eval /
@@ -1135,9 +1258,12 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
             return Some("find -exec rm".to_string());
         }
     }
-    // xargs / parallel rm.
-    if (cmd.contains("xargs") || first_matches(&cmd, &["parallel"])) && cmd.contains("rm") {
-        return Some("rm via xargs/parallel".to_string());
+    // xargs / parallel running a destructive command — `rm`, or a bulk working-tree revert
+    // (`git ls-files -m | xargs git checkout` / `git restore` discards EVERY modified file).
+    if (cmd.contains("xargs") || first_matches(&cmd, &["parallel"]))
+        && (cmd.contains("rm") || cmd.contains("git checkout") || cmd.contains("git restore"))
+    {
+        return Some("destructive command via xargs/parallel".to_string());
     }
     // Subshell recursion: `<shell> -c "..."`.
     for shell in ["bash", "sh", "zsh", "dash", "ash", "ksh", "python", "python3", "perl", "ruby", "node"] {
@@ -1317,6 +1443,12 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     if command.contains("git branch -D") {
         return Some("force delete branch (git branch -D)".to_string());
     }
+    // Working-tree-discarding git — the reported data-loss footgun. Single owner for
+    // checkout/switch/restore/reset --hard/clean (tokenized → space-robust); the substring table
+    // below keeps only the NON-worktree-discard git cases (force push, history rewrite, …).
+    if let Some(reason) = git_worktree_discard(&cmd) {
+        return Some(reason.to_string());
+    }
     // Substring pattern table (matched against the lowercased command).
     let patterns: &[(&str, &str)] = &[
         ("rmdir ", "directory removal"),
@@ -1332,16 +1464,14 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         ("killall ", "kill all matching processes"),
         ("git push --force", "force push"),
         ("git push -f", "force push"),
-        ("git reset --hard", "hard reset (destroys uncommitted changes)"),
-        ("git clean -f", "force clean untracked files"),
+        // NOTE: worktree-discard git (reset --hard / clean -f / checkout|switch force+pathspec /
+        // restore) is owned by `git_worktree_discard` above (tokenized, space-robust) — do not
+        // re-add it here.
         ("--no-verify", "bypassing git hooks"),
         ("git filter-branch", "git history rewrite"),
         ("git filter-repo", "git history rewrite"),
         ("git rebase -i", "interactive rebase"),
         ("git rebase --interactive", "interactive rebase"),
-        ("git checkout -f ", "force checkout (discards working tree)"),
-        ("git checkout --force", "force checkout (discards working tree)"),
-        ("git switch --discard-changes", "switch with discard"),
         ("git branch --delete --force", "force delete branch"),
     ];
     for (pat, reason) in patterns {
@@ -2008,6 +2138,86 @@ mod tests {
             "cargo run -- migrate up", // ORM non-reset verb stays Safe
         ] {
             assert_eq!(risk_of(c), RiskLevel::Safe, "{c} should be Safe");
+        }
+    }
+
+    #[test]
+    fn git_checkout_restore_discarding_worktree_is_destructive() {
+        // The reported data-loss footgun: `git checkout <file>` / `git restore <file>` silently
+        // discard uncommitted work. They MUST classify destructive (→ Risky → approval).
+        for c in [
+            "git checkout src/main.rs",
+            "git checkout .",
+            "git checkout -- src/main.rs",
+            "git checkout -- .",
+            "git checkout HEAD -- src/lib.rs",
+            "git checkout -f",
+            "git checkout Cargo.toml",
+            "git checkout .gitignore",
+            "git restore src/main.rs",
+            "git restore .",
+            "git restore --worktree src/main.rs",
+            "cd sub && git checkout src/main.rs", // compound
+            "/usr/bin/git checkout .",            // path-qualified
+            "git -C /repo checkout .",            // global -C flag before subcommand
+            // review-found gaps (all silently discarded work before the hardening):
+            "git checkout \"src/main.rs\"",       // quoted path
+            "git checkout 'src/main.rs'",         // single-quoted path
+            "git checkout Makefile",              // extensionless file
+            "git checkout Dockerfile",
+            "git checkout LICENSE",
+            "git checkout src/",                  // whole-directory pathspec
+            "git checkout --detach -- src/main.rs", // pathspec despite branch-ish flag
+            "git checkout -b tmp -- .",           // pathspec despite -b
+            "git switch -f other",                // switch --force discards
+            "git switch --discard-changes main",
+            "git reset --hard",                   // now via the tokenized helper
+            "git reset   --hard",                 // extra spaces (substring table missed this)
+            "git reset --merge HEAD~1",
+            "git clean -fd",
+            "git clean --force",
+            "git --work-tree /r checkout .",      // separate-value global flag
+            "git ls-files -m | xargs git checkout", // bulk revert via xargs
+            "git diff --name-only | xargs git restore",
+            "for f in a b; do git checkout .; done", // loop body with literal pathspec
+        ] {
+            assert!(
+                check_destructive_command(c).is_some(),
+                "must flag worktree-discarding git: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_git_is_not_flagged_destructive() {
+        // Read-only git + branch/tag operations must NOT prompt (no false positives — branch
+        // names with slashes/version-dots like `release/v5.0.0` are the tricky case).
+        for c in [
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "git show HEAD",
+            "git branch",
+            "git checkout -b feature/new",
+            "git checkout -B main",
+            "git checkout main",
+            "git checkout release/v5.0.0", // version branch — MUST NOT flag
+            "git checkout feature/foo",
+            "git checkout v1.2.3",              // tag
+            "git restore --staged src/main.rs", // only unstages (recoverable)
+            "git reset --soft HEAD~1",
+            "git reset HEAD",                   // mixed reset (unstage) — recoverable
+            "git switch main",                  // switch branch
+            "git switch -c newbranch",          // create branch
+            "git clean -n",                     // dry run (no -f)
+            "git stash",
+            "git stash pop",
+        ] {
+            assert!(
+                check_destructive_command(c).is_none(),
+                "must NOT flag safe git: {c} -> {:?}",
+                check_destructive_command(c)
+            );
         }
     }
 
