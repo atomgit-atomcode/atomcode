@@ -1,7 +1,14 @@
 # CodingRuntime 渐进迁移设计与首个切片实施计划
 
-> 状态：方案已收敛；首个 `/compact` 命令面垂直切片已实施并验证；第二个
-> compaction 事件面切片已完成详细设计，尚未实施。
+> 状态：方案已收敛；`/compact` 的命令面、事件面和 runtime owner 三个垂直切片均已
+> 实施，并在 `release/v5.0.0@a102ff814bb685c706b346fa9d29e2481c3680cf` 完成生命周期
+> 加固。`/compact` 专属 legacy 接口面已经退役；其他 slash 命令和一般 core/bridge surface
+> 仍保留。
+>
+> 最终实现结论、开发踩坑和后续命令复用清单见
+> [`compact-native-migration-retrospective.md`](compact-native-migration-retrospective.md)。本文
+> 后续章节保留各切片当时的设计基线和中间状态，不应脱离章节时间点引用其中的
+> “尚未完成”结论。
 >
 > 分析起点：`release/v5.0.0@332f8771a51fb5ad1f6f97bcc2bc0016ce7dacd8`。
 >
@@ -61,6 +68,8 @@ kernel AgentHandle
 
 - [target-architecture.md](target-architecture.md)：定义最终依赖方向和北极星；
 - [v5.0.0-retire-bridge-core-progress.md](v5.0.0-retire-bridge-core-progress.md)：记录 bridge/core 退役进度；
+- [compact-native-migration-retrospective.md](compact-native-migration-retrospective.md)：记录
+  `/compact` 最终实现、纠偏结论、开发踩坑和下一条命令的复用清单；
 - 本文：定义 `CodingRuntime` 的近期承载位置、职责边界和小步迁移方法。
 
 ## 2. 术语
