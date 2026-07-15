@@ -30,6 +30,7 @@ pub mod provider_wizard;
 pub mod proxy_picker;
 mod qr;
 pub mod session_picker;
+pub mod usage_render;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
 pub use language_picker::LanguagePicker;
