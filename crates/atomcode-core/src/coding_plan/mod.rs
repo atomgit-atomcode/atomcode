@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod setup;
 pub mod sync_marker;
 pub mod types;
+pub mod usage;
 
 pub use client::{api_base_url, is_auth_expired, AuthExpired, Client};
 pub use crypto::{
