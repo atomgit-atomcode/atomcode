@@ -6664,7 +6664,7 @@ mod tests {
     fn build_mascot_rows_shape_and_colors() {
         let (r, _c) = new_counting(80, 24);
         let rows = r.build_mascot_rows();
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), crate::render::mascot::MASCOT_ROWS.len());
         for row in &rows {
             assert_eq!(row.len(), crate::render::mascot::MASCOT_WIDTH);
         }

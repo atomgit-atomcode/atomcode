@@ -28,9 +28,9 @@ import sys
 from PIL import Image, ImageSequence
 
 # Tunables — these reproduce the committed cat3-13 mascot.
-CELLS_WIDE = 13
+CELLS_WIDE = 11
 EYE_W = 2       # white patch width in px
-EYE_H = 3       # white patch height in px
+EYE_H = 2       # white patch height in px
 ALPHA_THRESHOLD = 128
 
 
