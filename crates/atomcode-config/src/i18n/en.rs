@@ -1196,6 +1196,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::UsageTabModels => "Models".into(),
         Msg::UsageCurrentTitle => "Rate-limit window".into(),
         Msg::UsageResetsIn { hms } => format!("Resets in {hms}").into(),
+        Msg::UsageWindowHours { hours } => format!("{hours}-hour rolling window").into(),
         Msg::UsageWindowUnavailable => "Window data unavailable".into(),
         Msg::UsageStatFavorite => "Favorite model".into(),
         Msg::UsageStatTotal => "Total tokens".into(),

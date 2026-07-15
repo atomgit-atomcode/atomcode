@@ -1174,6 +1174,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::UsageTabModels => "模型".into(),
         Msg::UsageCurrentTitle => "速率限制窗口".into(),
         Msg::UsageResetsIn { hms } => format!("剩余重置时间 {hms}").into(),
+        Msg::UsageWindowHours { hours } => format!("{hours} 小时滚动窗口").into(),
         Msg::UsageWindowUnavailable => "窗口数据不可用".into(),
         Msg::UsageStatFavorite => "最常用模型".into(),
         Msg::UsageStatTotal => "总 Token 数".into(),
