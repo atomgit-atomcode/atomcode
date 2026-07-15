@@ -70,7 +70,7 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).
         .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
-        .hook(Arc::new(VerifyCadenceHook::new()))
+        .hook(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).

@@ -392,7 +392,12 @@ pub async fn prepare_with_plugin_hooks(
     // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
     // StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
-    hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
+    // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
+    // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
+    // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
+    // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
+    hooks.push(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())));
     // Todo hook (bridge/daemon path — the live TUI + webui): per-turn <system-reminder> of the
     // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
     // that nudges once to close out open items when the model tries to stop. Gated on the SAME

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use atomcode_kernel::hook::{Continuation, LifecycleHooks};
 use atomcode_kernel::message::{Conversation, Role};
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 const NUDGE: &str = "You made code edits but have not verified them. Run a fast check \
@@ -26,6 +27,11 @@ before finishing. Do NOT start a long-running process (dev server, watcher, full
 /// interior state so it nudges at most once per unverified edit.
 #[derive(Default)]
 pub struct VerifyCadenceHook {
+    /// The pinned workspace root. An edit whose target resolves OUTSIDE this root (e.g. a
+    /// throwaway `/tmp/notes.txt`) is not project code, so it does not arm the verify cadence
+    /// — see [`path_in_workspace_lexical`]. An empty root (the `Default`) treats every edit as
+    /// in-workspace, preserving the pre-gate behavior for tests / constructions without a cwd.
+    workspace: PathBuf,
     state: Mutex<State>,
 }
 
@@ -44,8 +50,13 @@ struct NudgedEdit {
 }
 
 impl VerifyCadenceHook {
-    pub fn new() -> Self {
-        Self::default()
+    /// `workspace` is the agent's pinned working directory. Edits outside it don't arm the
+    /// cadence (see [`path_in_workspace_lexical`]).
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            state: Mutex::new(State::default()),
+        }
     }
 }
 
@@ -58,6 +69,75 @@ fn bash_command(arguments: &str) -> Option<String> {
                 .and_then(|c| c.as_str())
                 .map(str::to_string)
         })
+}
+
+/// Extract the `file_path` argument from an `edit_file` / `write_file` tool-call's raw JSON.
+fn edit_path(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| {
+            v.get("file_path")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Fold `.` and `..` components lexically (no filesystem access, so it never blocks the async
+/// turn loop on a hung mount and it needs no path to actually exist). A leading `..` with
+/// nothing to pop is kept, so a relative path that escapes its base stays escaped.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether an edit/write target resolves INSIDE the workspace root, decided purely lexically.
+/// Relative targets resolve against `workspace` (the tools' cwd) so they are in-workspace by
+/// construction; a leading `~` expands via `$HOME`; absolute targets are `..`/`.`-folded and
+/// prefix-checked. Deliberately does NOT `canonicalize` (that would block on a stale network
+/// mount — the WriteApprovalGate already owns the authoritative canonical decision at write
+/// time), so a symlinked/differently-cased in-workspace path may read as outside; that only ever
+/// SKIPS a nudge (benign), never produces a false /tmp nudge.
+///
+/// Returns `true` (conservative — keep the cadence, i.e. pre-gate behavior) when we can't
+/// reliably classify: an empty/unparseable target, or a workspace root that isn't absolute
+/// (a relative root can't anchor a prefix test — an absolute edit path would never match it,
+/// which would silently disable the whole cadence).
+fn path_in_workspace_lexical(raw: &str, workspace: &Path) -> bool {
+    let raw = raw.trim();
+    let root = lexical_normalize(workspace);
+    if raw.is_empty() || !root.is_absolute() {
+        return true;
+    }
+    let expanded: PathBuf = if raw == "~" {
+        match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h),
+            None => return true, // can't expand → don't skip the cadence
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(h) => Path::new(&h).join(rest),
+            None => return true,
+        }
+    } else {
+        PathBuf::from(raw)
+    };
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace.join(expanded)
+    };
+    lexical_normalize(&joined).starts_with(&root)
 }
 
 /// Whether a post-edit `bash` command plausibly VERIFIES the edit (runs a build / type-check
@@ -115,13 +195,15 @@ fn current_real_user_start(convo: &Conversation) -> usize {
 /// Scan the conversation: returns the tool_call_id of the most recent successful edit
 /// IF it has no VERIFYING `bash` after it (i.e. unverified), else `None`. A `bash` that is
 /// merely read-only (`ls`/`echo`/…) does not count — see [`bash_verifies`].
-fn unverified_edit(convo: &Conversation) -> Option<NudgedEdit> {
+fn unverified_edit(convo: &Conversation, workspace: &Path) -> Option<NudgedEdit> {
     let start = current_real_user_start(convo);
     // Tool-call ids are assigned by the assistant message that precedes the matching
     // tool-result message, so a single forward pass can resolve a result's tool name.
     let mut names: HashMap<&str, &str> = HashMap::new();
     // bash tool_call id → its command string (to tell a real check from an `ls` dodge).
     let mut bash_cmds: HashMap<&str, String> = HashMap::new();
+    // edit/write tool_call id → its `file_path` (to gate out-of-workspace throwaway writes).
+    let mut edit_paths: HashMap<&str, String> = HashMap::new();
     let mut last_edit_id: Option<String> = None;
     let mut bash_after_edit = false;
 
@@ -134,6 +216,10 @@ fn unverified_edit(convo: &Conversation) -> Option<NudgedEdit> {
                         if let Some(cmd) = bash_command(&tc.arguments) {
                             bash_cmds.insert(tc.id.as_str(), cmd);
                         }
+                    } else if tc.name == "edit_file" || tc.name == "write_file" {
+                        if let Some(p) = edit_path(&tc.arguments) {
+                            edit_paths.insert(tc.id.as_str(), p);
+                        }
                     }
                 }
             }
@@ -145,7 +231,14 @@ fn unverified_edit(convo: &Conversation) -> Option<NudgedEdit> {
                     continue;
                 };
                 match names.get(id).copied() {
-                    Some("edit_file") | Some("write_file") => {
+                    // Only edits WITHIN the workspace arm the cadence — a throwaway write
+                    // outside the project (e.g. /tmp) is not code to compile-check. A missing
+                    // /unparseable path is treated as in-workspace (conservative — keep the nudge).
+                    Some("edit_file") | Some("write_file")
+                        if edit_paths
+                            .get(id)
+                            .is_none_or(|p| path_in_workspace_lexical(p, workspace)) =>
+                    {
                         last_edit_id = Some(id.to_string());
                         bash_after_edit = false;
                     }
@@ -214,7 +307,7 @@ impl LifecycleHooks for VerifyCadenceHook {
     }
 
     async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
-        let edit = unverified_edit(convo)?;
+        let edit = unverified_edit(convo, &self.workspace)?;
         if verify_reminder_already_present(convo, &edit) {
             return None;
         }
@@ -265,10 +358,28 @@ mod tests {
         Message::tool_result(id, "ok", is_error)
     }
 
+    fn assistant_call_path(id: &str, name: &str, path: &str) -> Message {
+        let args = serde_json::json!({ "file_path": path }).to_string();
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args,
+            }],
+        )
+    }
+
+    /// Test hook whose workspace is `/` — every absolute path is in-workspace, so path gating
+    /// never suppresses these path-agnostic cases (they use relative / empty targets).
+    fn hook_any_ws() -> VerifyCadenceHook {
+        VerifyCadenceHook::new("/")
+    }
+
     async fn nudge_of(msgs: Vec<Message>) -> (VerifyCadenceHook, Option<String>) {
         let mut convo = Conversation::new();
         convo.messages = msgs;
-        let hook = VerifyCadenceHook::new();
+        let hook = hook_any_ws();
         let r = hook.offer_continuation(&convo).await;
         (hook, r)
     }
@@ -387,6 +498,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_outside_workspace_does_not_nudge() {
+        // The reported misfire: `write_file` to /tmp is a throwaway file, not project code —
+        // it must NOT arm the "run cargo check" cadence.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("w1", "write_file", "/tmp/test_permission.txt"),
+            tool_result("w1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "writing outside the workspace (/tmp) must not trigger the verify cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_inside_workspace_still_nudges() {
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("w1", "write_file", "/home/proj/src/main.rs"),
+            tool_result("w1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "an absolute in-workspace edit must still nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_edit_is_in_workspace_and_nudges() {
+        // Relative targets resolve against the workspace cwd → in-workspace by construction.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("e1", "edit_file", "src/main.rs"),
+            tool_result("e1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "a relative edit resolves inside the workspace and must nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_parent_escape_out_of_workspace_does_not_nudge() {
+        // `../../tmp/x` lexically escapes the workspace root → outside → no cadence.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![
+            assistant_call_path("w1", "write_file", "../../tmp/x.txt"),
+            tool_result("w1", false),
+        ];
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "a relative path escaping the workspace via `..` must not nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_edit_path_is_conservatively_in_workspace() {
+        // No file_path in the args (can't classify) → keep the cadence rather than skip it.
+        let hook = VerifyCadenceHook::new("/home/proj");
+        let mut convo = Conversation::new();
+        convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "an edit with no parseable path stays in-workspace (conservative) and nudges"
+        );
+    }
+
+    #[test]
+    fn path_in_workspace_lexical_classifies_paths() {
+        let ws = Path::new("/home/proj");
+        // Inside.
+        assert!(path_in_workspace_lexical("/home/proj/src/main.rs", ws));
+        assert!(path_in_workspace_lexical("src/main.rs", ws)); // relative → joined to ws
+        assert!(path_in_workspace_lexical("./a/b.rs", ws));
+        assert!(path_in_workspace_lexical("/home/proj/./sub/../x.rs", ws)); // normalizes inside
+        // Outside.
+        assert!(!path_in_workspace_lexical("/tmp/test.txt", ws));
+        assert!(!path_in_workspace_lexical("/home/other/x.rs", ws));
+        assert!(!path_in_workspace_lexical("../sibling/x.rs", ws)); // escapes via ..
+        assert!(!path_in_workspace_lexical("/home/proj/../evil.rs", ws)); // climbs out
+        // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
+        assert!(!path_in_workspace_lexical("/home/proj2/x.rs", ws));
+        // Empty / unparseable → conservative in-workspace.
+        assert!(path_in_workspace_lexical("", ws));
+    }
+
+    #[test]
+    fn relative_or_empty_workspace_root_disables_gate_conservatively() {
+        // A non-absolute root can't anchor a prefix test — an absolute edit path would never
+        // match it and the cadence would silently vanish. Bail to "in-workspace" (old behavior)
+        // instead, so an absolute /tmp write still nudges rather than being wrongly skipped.
+        for root in ["proj", ".", "", "../proj"] {
+            let ws = Path::new(root);
+            assert!(
+                path_in_workspace_lexical("/tmp/x.txt", ws),
+                "relative/empty workspace root {root:?} must not gate (stay conservative)"
+            );
+            assert!(
+                path_in_workspace_lexical("/home/proj/src/main.rs", ws),
+                "relative/empty workspace root {root:?} must not suppress a real edit"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn no_edits_does_not_nudge() {
         let msgs = vec![assistant_call("r1", "read_file"), tool_result("r1", false)];
         assert!(nudge_of(msgs).await.1.is_none());
@@ -459,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_edit_after_nudge_retriggers() {
-        let hook = VerifyCadenceHook::new();
+        let hook = hook_any_ws();
         let mut convo = Conversation::new();
         convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
         assert!(
@@ -481,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_tool_call_id_in_new_real_user_turn_still_nudges() {
-        let hook = VerifyCadenceHook::new();
+        let hook = hook_any_ws();
         let mut convo = Conversation::new();
         convo.messages = vec![
             user("first edit"),
