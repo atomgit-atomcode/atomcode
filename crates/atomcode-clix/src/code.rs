@@ -278,6 +278,10 @@ fn build_provider(cfg: &CodingAgentConfig) -> Result<Arc<dyn LlmProvider>> {
     use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
     let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     pc.context_window = cfg.context_window;
+    // Byte-idle liveness: follow the config's stream_timeout instead of the adapter's
+    // hardcoded 120s default, else a thinking model's >120s mid-reasoning silence is
+    // misclassified as `[Error: stream idle timeout]` (mirrors build_coding_agent).
+    pc.idle_timeout = cfg.stream_timeout;
     Ok(Arc::new(OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?))
 }
 

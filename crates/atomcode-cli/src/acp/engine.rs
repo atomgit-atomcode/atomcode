@@ -84,6 +84,11 @@ pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProv
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Thread the config's byte-idle liveness knob down to the L1 adapter (kept in
+            // sync with `atomcode-bridge::runtime::build_provider`). Without this the
+            // adapter's hardcoded 120s default kills a thinking model's legitimate >120s
+            // mid-reasoning silence as a spurious `[Error: stream idle timeout]`.
+            ac.idle_timeout = cfg.stream_timeout;
             ac.max_tokens = default_max_tokens(cfg.context_window);
             ac.thinking = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
@@ -94,6 +99,8 @@ pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProv
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Same liveness-threading rationale as the Anthropic branch above.
+            oc.idle_timeout = cfg.stream_timeout;
             oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
             Ok(Arc::new(
@@ -104,6 +111,8 @@ pub fn build_provider(cfg: &CodingAgentConfig) -> anyhow::Result<Arc<dyn LlmProv
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Same liveness-threading rationale as the Anthropic branch above.
+            pc.idle_timeout = cfg.stream_timeout;
             pc.max_tokens = Some(default_max_tokens(cfg.context_window));
             // Honor `reasoning_history` override; unset → None → adapter auto-detects.
             // A typo fails fast (parity with the legacy engine and the bridge).

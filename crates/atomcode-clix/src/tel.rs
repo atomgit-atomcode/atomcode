@@ -109,6 +109,9 @@ pub fn build_review_provider(
     use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
     let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     pc.context_window = cfg.context_window;
+    // Byte-idle liveness follows the review config's stream_timeout (mirrors
+    // `atomcode_review::build_review_agent`), not the adapter's hardcoded 120s.
+    pc.idle_timeout = cfg.stream_timeout;
     OpenAiCompatProvider::new(pc)
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         .map_err(|e| e.message)
