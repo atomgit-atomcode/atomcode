@@ -144,6 +144,56 @@ pub fn calendar_layout(rows: &[(String, u64)]) -> Vec<HeatCell> {
     out
 }
 
+pub fn braille_series_char(dots: u8) -> char {
+    char::from_u32(0x2800 + dots as u32).unwrap_or(' ')
+}
+
+// dot bit index for (sub-column 0/1, sub-row 0..3 top→bottom)
+const BRAILLE_DOT: [[u8; 4]; 2] = [[0, 1, 2, 6], [3, 4, 5, 7]];
+
+/// Plot each series over a `width_cells`×`height_cells` grid of braille cells
+/// (each cell = 2×4 dots). Shared Y-scale = global max across all series.
+/// Returns rows[y][x] = merged dot bitmask (all series OR'd) for a monochrome
+/// plot. For multi-colour, call once per series (pass a single-series slice) and
+/// overlay by cell in the modal.
+pub fn braille_plot(series: &[Vec<u64>], width_cells: usize, height_cells: usize) -> Vec<Vec<u8>> {
+    let mut grid = vec![vec![0u8; width_cells.max(1)]; height_cells.max(1)];
+    if width_cells == 0 || height_cells == 0 {
+        return grid;
+    }
+    let dot_w = width_cells * 2;
+    let dot_h = height_cells * 4;
+    let gmax = series
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    for s in series {
+        if s.is_empty() {
+            continue;
+        }
+        for dx in 0..dot_w {
+            // sample the series at this x (nearest)
+            let idx = if s.len() == 1 {
+                0
+            } else {
+                dx * (s.len() - 1) / (dot_w - 1).max(1)
+            };
+            let v = s[idx];
+            // y in dot space: 0 = top, dot_h-1 = bottom. value 0 → bottom.
+            let filled = ((v as f64 / gmax as f64) * (dot_h - 1) as f64).round() as usize;
+            let dy = (dot_h - 1).saturating_sub(filled); // higher value → smaller dy (up)
+            let cell_x = dx / 2;
+            let cell_y = dy / 4;
+            let sub_col = dx % 2;
+            let sub_row = dy % 4;
+            grid[cell_y][cell_x] |= 1 << BRAILLE_DOT[sub_col][sub_row];
+        }
+    }
+    grid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +242,26 @@ mod tests {
         assert_eq!(cells[2].weekday, 3); // Wed
         assert_eq!(cells[0].week_col, cells[2].week_col); // same week
         assert_eq!(cells[1].level, 0); // zero day
+    }
+
+    #[test]
+    fn braille_plot_rising_series_lands_dots() {
+        // one rising series over a 4-cell-wide, 2-cell-high plot
+        let grid = braille_plot(&[vec![0, 1, 2, 3, 4, 5, 6, 7]], 4, 2);
+        assert_eq!(grid.len(), 2);          // height rows
+        assert_eq!(grid[0].len(), 4);       // width cells
+        // rising series: bottom-left cell has dots, top-right cell has dots
+        assert!(grid[1][0] != 0, "bottom-left should have dots");
+        assert!(grid[0][3] != 0, "top-right should have dots");
+        // flat-zero series → only the bottom row lights up
+        let flat = braille_plot(&[vec![0, 0, 0, 0]], 2, 2);
+        assert!(flat[1].iter().any(|&c| c != 0));
+        assert!(flat[0].iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn braille_char_offsets_from_2800() {
+        assert_eq!(braille_series_char(0), '\u{2800}');
+        assert_eq!(braille_series_char(0xFF), '\u{28FF}');
     }
 }
