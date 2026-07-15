@@ -1363,6 +1363,36 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
     "dirname", "file", "printf", "true", "false", "seq", "column",
 ];
 
+/// If `cmd` is `cd <arg> && <rest>` where `<arg>` is a plain, metacharacter-free
+/// path, return `<rest>` (trimmed); otherwise return `cmd` unchanged. Only ONE
+/// prefix is stripped. The `cd` argument is validated to contain NO shell
+/// metacharacters, so it cannot hide a command substitution, redirect, chaining,
+/// subshell, glob, or background — anything fancier falls through unchanged and is
+/// then rejected by the normal `&&`/metachar guards. `cd` itself is a read-only
+/// builtin (changes only this process's cwd), so stripping a clean `cd … && `
+/// prefix preserves the read-only-ness of the remainder.
+fn strip_leading_cd_prefix(cmd: &str) -> &str {
+    // Must start with `cd` as its own token (space or tab after).
+    let after_cd = match cmd.strip_prefix("cd ").or_else(|| cmd.strip_prefix("cd\t")) {
+        Some(r) => r,
+        None => return cmd,
+    };
+    // Split at the FIRST `&&`; left is the cd-arg, right is the command to classify.
+    let (arg, rest) = match after_cd.split_once("&&") {
+        Some((a, r)) => (a.trim(), r.trim()),
+        None => return cmd, // a bare `cd` (no chaining) isn't a read tool anyway
+    };
+    // The cd-arg must be a plain path: NO shell metacharacter that could hide a
+    // command, redirect, substitution, subshell, glob, background, or chaining.
+    let has_metachar = arg.contains(|c: char| {
+        matches!(c, '&' | '|' | ';' | '$' | '`' | '<' | '>' | '(' | ')' | '\n' | '\r' | '*' | '?')
+    });
+    if arg.is_empty() || has_metachar || rest.is_empty() {
+        return cmd; // not a clean `cd … && rest` — leave unchanged
+    }
+    rest
+}
+
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY with other
 /// tools. Conservative by design: it fails CLOSED — any construct that could write,
 /// chain, background, substitute, or run an unlisted program returns `false`
@@ -1373,6 +1403,14 @@ pub(crate) fn is_read_only_bash(command: &str) -> bool {
     if cmd.is_empty() {
         return false;
     }
+
+    // Strip a leading `cd <clean-path> && ` prefix (the model's near-universal bash
+    // shape) so a read-only command behind it can still parallelize. See
+    // `strip_leading_cd_prefix` for the strict safety guard. Everything below then
+    // classifies the REMAINDER with the full ruleset — so `cd /a && cargo build`
+    // still rejects (cargo not allowlisted) and `cd /a && grep x && rm` still rejects
+    // (the remainder's `&&`).
+    let cmd = strip_leading_cd_prefix(cmd);
 
     // Hard rejects: any of these tokens means we cannot prove read-only.
     // - command substitution / process substitution
@@ -2044,5 +2082,29 @@ mod tests {
         assert!(!is_read_only_bash("grep x >& out.txt"), ">& file (spaced) writes");
         assert!(!is_read_only_bash("grep x 1>&out.txt"), "1>&file writes");
         assert!(!is_read_only_bash("grep x 2>&err.log"), "2>&file writes");
+    }
+
+    #[test]
+    fn is_read_only_bash_strips_cd_prefix() {
+        // ALLOW: cd <path> && <read-only> → read-only.
+        assert!(is_read_only_bash("cd /Users/theo/proj && grep -rn foo crates/"));
+        assert!(is_read_only_bash("cd /path && grep x | head -20"));
+        assert!(is_read_only_bash("cd /a && cat f"));
+        assert!(is_read_only_bash("cd ~/proj && ls -la"));
+        assert!(is_read_only_bash("cd \"/my dir\" && grep x"), "quoted path");
+        assert!(is_read_only_bash("cd /path&&grep x"), "no spaces around &&");
+
+        // REJECT: the remainder is not read-only, OR the cd-arg is unsafe, OR extra chaining.
+        assert!(!is_read_only_bash("cd /a && cargo check 2>&1 | head"), "cargo not allowlisted");
+        assert!(!is_read_only_bash("cd /a && git commit -m x"), "git not allowlisted");
+        assert!(!is_read_only_bash("cd /a && rm -rf b"), "rm not allowlisted");
+        assert!(!is_read_only_bash("cd /a && grep x && rm b"), "second && in remainder");
+        assert!(!is_read_only_bash("cd /a && grep x > out.txt"), "remainder writes a file");
+        assert!(!is_read_only_bash("cd $(evil) && grep x"), "cd-arg has command subst");
+        assert!(!is_read_only_bash("cd /a; rm && grep x"), "cd-arg has ;");
+        assert!(!is_read_only_bash("cd /a > f && grep x"), "cd-arg has redirect");
+        assert!(!is_read_only_bash("cd /a & grep x"), "single & is backgrounding, no &&");
+        assert!(!is_read_only_bash("cdfoo && grep x"), "cdfoo is not the cd builtin");
+        assert!(!is_read_only_bash("cd /a && grep x | tee f"), "tee in remainder pipe");
     }
 }
