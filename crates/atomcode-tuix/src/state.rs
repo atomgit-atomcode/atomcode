@@ -418,6 +418,10 @@ pub struct UiState {
     /// pending indicator, not a cumulative tally). Mirrors codex's pending-steer
     /// list / opencode's draining `N queued`.
     pub steer_pending: usize,
+    /// Whether the user has explicitly switched to Build mode via
+    /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
+    /// the `⏸ build` badge so the default startup state stays clean.
+    pub build_badge_visible: bool,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -543,6 +547,7 @@ impl UiState {
             loop_started_at: None,
             pending_separator: None,
             steer_pending: 0,
+            build_badge_visible: false,
         }
     }
 
@@ -1826,6 +1831,7 @@ mod tests {
         s.active_todos = Some(crate::render::TodoProgress {
             current: Some("x".into()),
             completed: 0,
+            in_progress: 0,
             total: 2,
             items: vec![],
         });

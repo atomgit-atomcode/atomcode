@@ -103,6 +103,13 @@ impl Palette {
     /// Diff remove on **dark** backgrounds — keep bright red for contrast.
     pub const DIFF_REMOVE_DARK: Color = Color::Red; // SGR 91
     pub const CODE: Color = Color::Cyan; // bright cyan (96)
+
+    /// Colour for the **Plan mode badge** (⏸ plan). Orange (`AnsiValue(208)` ≈
+    /// `#ff8700`) — deliberately distinct from the periwinkle MODE color used by
+    /// AcceptEdits, so the two non-default approval modes are visually separable.
+    /// 256-colour (not truecolor) keeps parity with the MODE/SHELL usage and stays
+    /// portable across terminals.
+    pub const PLAN: Color = Color::AnsiValue(208);
 }
 
 /// Resolve the muted shade for the active palette.
@@ -190,6 +197,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     match role {
         Role::Brand => Some(Palette::BRAND),
         Role::Mode => Some(Palette::MODE),
+        Role::Plan => Some(Palette::PLAN),
         Role::Shell => Some(shell_for_current_theme()),
         Role::Muted => Some(muted_for_current_theme()),
         Role::Accent => Some(Palette::ACCENT),
@@ -219,6 +227,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
 pub enum Role {
     Brand,
     Mode,
+    Plan,
     Shell,
     Muted,
     Accent,

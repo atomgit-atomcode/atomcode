@@ -110,14 +110,21 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     Ok(out)
 }
 
-/// `(completed, total)` for a todo list. The footer progress indicator renders
-/// this as `N/M`. `total == 0` ⇒ caller omits the indicator (no todos yet).
-pub fn todo_counts(todos: &[TodoItem]) -> (usize, usize) {
-    let completed = todos
-        .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
-        .count();
-    (completed, todos.len())
+/// `(completed, in_progress, total)` for a todo list. The footer progress
+/// indicator renders the counts in its header. `total == 0` ⇒ caller omits
+/// the indicator (no todos yet). All three counts are derived from a single
+/// pass so callers don't need separate `filter` scans.
+pub fn todo_counts(todos: &[TodoItem]) -> (usize, usize, usize) {
+    let mut completed = 0;
+    let mut in_progress = 0;
+    for t in todos {
+        match t.status {
+            TodoStatus::Completed => completed += 1,
+            TodoStatus::InProgress => in_progress += 1,
+            TodoStatus::Pending => {}
+        }
+    }
+    (completed, in_progress, todos.len())
 }
 
 /// Apply ONE incremental `todo` action call's args to `list`. The item `id` is the
@@ -436,8 +443,8 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        assert_eq!(todo_counts(&todos), (2, 4));
-        assert_eq!(todo_counts(&[]), (0, 0));
+        assert_eq!(todo_counts(&todos), (2, 1, 4));
+        assert_eq!(todo_counts(&[]), (0, 0, 0));
     }
 
     #[test]
