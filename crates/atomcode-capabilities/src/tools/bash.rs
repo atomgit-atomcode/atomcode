@@ -1393,6 +1393,15 @@ fn strip_leading_cd_prefix(cmd: &str) -> &str {
     rest
 }
 
+/// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
+/// completely unparseable input. The caller must still reject trees containing
+/// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
+fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
+    parser.parse(command, None)
+}
+
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY with other
 /// tools. Conservative by design: it fails CLOSED — any construct that could write,
 /// chain, background, substitute, or run an unlisted program returns `false`
@@ -1542,6 +1551,77 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    /// PROBE (kept as a living record): dumps the node kinds tree-sitter-bash produces
+    /// for representative commands, so ALLOWED_KINDS in `is_read_only_bash` is derived
+    /// from the ACTUAL grammar, not guessed. Asserts the kinds we depend on exist.
+    #[test]
+    fn probe_bash_node_kinds() {
+        fn kinds(cmd: &str) -> Vec<String> {
+            let tree = parse_bash(cmd).expect("parse");
+            let mut out = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(n) = stack.pop() {
+                out.push(n.kind().to_string());
+                // tree-sitter 0.26 indexes children by `u32` (child_count is usize).
+                for i in 0..n.child_count() as u32 {
+                    stack.push(n.child(i).unwrap());
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+        // Read-only commands: print their kinds so we can read them in test output.
+        for cmd in [
+            "grep -rn 'pub mod\\|mod ' --include='*.rs' | head -40",
+            "cd /a && grep x | head",
+            "grep -E 'warning.*(unused|dead_code)' crates/ 2>/dev/null",
+            "cat f.txt",
+            "ls -la",
+            "grep x && grep y",
+            "find . -name '*.rs'",
+        ] {
+            eprintln!("SAFE {:?} -> {:?}", cmd, kinds(cmd));
+        }
+        // Dangerous commands: print the kind that flags them (must be OUTSIDE the safe set).
+        for cmd in [
+            "grep \"$(rm -rf x)\"",   // command_substitution
+            "grep `rm x`",             // command_substitution (backtick)
+            "(rm x)",                  // subshell
+            "grep $HOME",              // expansion / variable
+            "ls > out.txt",           // redirect to a real file
+            "grep x | tee f",         // tee (allowlist, not node)
+        ] {
+            eprintln!("DANGER {:?} -> {:?}", cmd, kinds(cmd));
+        }
+        // LOAD-BEARING: single- vs double-quoted $(...). The whole design depends on the
+        // grammar distinguishing a single-quoted literal `'$(rm)'` (raw_string, NO
+        // command_substitution child) from a double-quoted `"$(rm)"` that actually
+        // executes (a command_substitution node appears).
+        eprintln!("QUOTE single {:?} -> {:?}", "grep '$(rm)'", kinds("grep '$(rm)'"));
+        eprintln!("QUOTE double {:?} -> {:?}", "grep \"$(rm)\"", kinds("grep \"$(rm)\""));
+
+        // Assert the kinds we hardcode in Task 2 actually appear (adjust names in Task 2
+        // to whatever THIS prints — codex uses program/list/pipeline/command/command_name/
+        // word/string/raw_string/string_content/concatenation; bash 0.25.1 may differ).
+        let ro = kinds("cd /a && grep x | head");
+        assert!(ro.iter().any(|k| k == "command"), "must have a `command` kind: {ro:?}");
+        assert!(ro.iter().any(|k| k == "command_name"), "must have `command_name`: {ro:?}");
+        let sub = kinds("grep \"$(rm x)\"");
+        assert!(sub.iter().any(|k| k == "command_substitution"), "subst kind: {sub:?}");
+        // The load-bearing distinction, asserted (not merely printed).
+        let single = kinds("grep '$(rm)'");
+        assert!(
+            !single.iter().any(|k| k == "command_substitution"),
+            "single-quoted $(...) must NOT parse as command_substitution: {single:?}"
+        );
+        let double = kinds("grep \"$(rm)\"");
+        assert!(
+            double.iter().any(|k| k == "command_substitution"),
+            "double-quoted $(...) MUST parse as command_substitution: {double:?}"
+        );
+    }
 
     #[test]
     fn sanitize_strips_ansi_colour_codes() {
