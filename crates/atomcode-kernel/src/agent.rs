@@ -440,6 +440,20 @@ fn cap_tool_result(result: &mut ToolResult, max: usize) {
     );
 }
 
+/// A user prompt folded into the CURRENTLY-running turn (steer), rather than
+/// queued to run as a separate turn afterward. Drained at each round boundary
+/// of `run_turn` and appended as a real `user` message before the next request.
+pub(crate) struct SteerInput {
+    pub text: String,
+    pub images: Vec<ImageContent>,
+}
+
+/// Shared, per-turn steer buffer. `process_send_message` pushes; `run_turn`
+/// drains. `Arc<Mutex>` (not a channel) so `run_turn` can both DRAIN it and
+/// PEEK `is_empty()` at the terminal boundary without consuming.
+pub(crate) type SteerBuf =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SteerInput>>>;
+
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
 pub struct AgentHandle {
     pub commands: UnboundedSender<AgentCommand>,
@@ -1066,7 +1080,8 @@ impl RunningAgent {
         let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
-        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len));
+        let steer: SteerBuf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len, steer.clone()));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -1083,12 +1098,20 @@ impl RunningAgent {
                         // request_timeout.
                         turn_token.cancel();
                         self.rt.cancel_pending();
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     }
-                    // QUEUE a mid-turn Snapshot/SendMessage rather than dropping it:
-                    // a Snapshot reply (driver may be blocking on it) and the user's
-                    // next prompt must survive. Drained after the turn completes.
-                    Some(c @ AgentCommand::Snapshot) | Some(c @ AgentCommand::SendMessage { .. }) => {
+                    // QUEUE a mid-turn Snapshot rather than dropping it:
+                    // a Snapshot reply (driver may be blocking on it) must survive.
+                    // Drained after the turn completes.
+                    Some(c @ AgentCommand::Snapshot) => {
                         pending.push_back(c);
+                    }
+                    // Route a mid-turn SendMessage into the per-turn steer buffer
+                    // instead of the pending deque: Task 2 drains it at each round
+                    // boundary to fold the prompt into the CURRENT turn's next request
+                    // (rather than running it as a separate turn afterward).
+                    Some(AgentCommand::SendMessage { text, images }) => {
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput { text, images });
                     }
                     // A Compact mid-turn is QUEUED, not executed: compacting inside a
                     // running turn would reopen the within-turn cache break (and
@@ -1102,6 +1125,12 @@ impl RunningAgent {
                     None => { shutdown = true; break; }
                 }
             }
+        }
+        // Leftover steer buffer: any steer that arrived too late to be drained by
+        // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
+        // back to the pending deque so the user's prompt is NOT silently lost.
+        for s in steer.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            pending.push_back(AgentCommand::SendMessage { text: s.text, images: s.images });
         }
         shutdown
     }
@@ -1189,7 +1218,9 @@ impl RunningAgent {
         convo: &mut Conversation,
         cancel: tokio_util::sync::CancellationToken,
         rollback_len: usize,
+        steer: SteerBuf,
     ) {
+        let _ = &steer; // real drain in Task 2
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
         let defs = self.tools.defs();
@@ -3401,6 +3432,113 @@ mod parallel_tools_cap_clamp_tests {
         assert_eq!(
             raw, clamped,
             "the default cap ({raw}) must already be within [1, {MAX_PARALLEL_TOOLS_CEILING}]"
+        );
+    }
+}
+
+// ── STEER BUFFER TESTS (Task 1: route mid-turn SendMessage into steer buffer) ─
+//
+// Task 1 only ROUTES the steer into the buffer; the DRAIN that makes round 2 see
+// the steered text is Task 2. The full end-to-end test is marked
+// `#[ignore = "drain lands in Task 2"]` so Task 1 stays green. A separate active
+// test asserts the Task-1-visible invariant: a mid-turn SendMessage must NOT open
+// a second TurnStarted (it was routed into the steer buffer, not queued as a new
+// pending turn). Choice: SPLIT — active test for Task 1, ignored full test for Task 2.
+#[cfg(test)]
+mod steer_buffer_tests {
+    use super::*;
+    use crate::stream::StreamEvent;
+    use crate::testkit::{MockProvider, NoopTool};
+    use crate::tool::{ToolCall, ToolRegistry};
+
+    /// Task-1 assertion only: a mid-turn SendMessage is routed into the steer buffer,
+    /// NOT pushed into `pending` — so it does NOT open a second TurnStarted event.
+    /// The full fold (seeing "STEER-ME" in round 2's request) is Task 2.
+    #[tokio::test]
+    async fn midturn_send_does_not_open_a_second_turn() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        ]));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        let mut turn_started = 0u32;
+        let steer_tx = handle.commands.clone();
+        let mut steered = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::ToolResult { .. } if !steered => {
+                    steer_tx.send(AgentCommand::SendMessage { text: "STEER-ME".into(), images: vec![] }).unwrap();
+                    steered = true;
+                }
+                AgentEvent::TurnComplete { .. } => { break; }
+                _ => {}
+            }
+        }
+        assert_eq!(turn_started, 1, "steer must NOT open a second turn");
+    }
+
+    /// Full end-to-end steer test: steered prompt is folded into the same turn's
+    /// next request. Blocked until Task 2 implements the drain.
+    #[tokio::test]
+    #[ignore = "drain lands in Task 2"]
+    async fn midturn_send_steers_into_same_turn_not_a_new_turn() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done { truncated: false }],
+        ]));
+        let received = provider.received.clone();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        handle.commands.send(AgentCommand::SendMessage { text: "start".into(), images: vec![] }).unwrap();
+        let mut turn_started = 0u32;
+        let mut turn_complete = 0u32;
+        let steer_tx = handle.commands.clone();
+        let mut steered = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::ToolResult { .. } if !steered => {
+                    steer_tx.send(AgentCommand::SendMessage { text: "STEER-ME".into(), images: vec![] }).unwrap();
+                    steered = true;
+                }
+                AgentEvent::TurnComplete { .. } => { turn_complete += 1; break; }
+                _ => {}
+            }
+        }
+        assert_eq!(turn_started, 1, "steer must NOT open a second turn");
+        assert_eq!(turn_complete, 1);
+        let calls = received.lock().unwrap();
+        let round2 = calls.last().expect("a second model request happened");
+        assert!(
+            round2.iter().any(|(_, text)| text.contains("STEER-ME")),
+            "the steered prompt must be folded into the same turn's next request; got {round2:?}"
         );
     }
 }

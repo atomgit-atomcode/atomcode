@@ -1137,6 +1137,22 @@ impl LifecycleHooks for ScriptedRateLimitHook {
     }
 }
 
+/// A trivial tool that always succeeds immediately (name `"noop"`, returns Ok).
+/// Used by steer-buffer tests that need a real tool call but don't care about output.
+pub struct NoopTool;
+
+#[async_trait]
+impl Tool for NoopTool {
+    fn name(&self) -> &str { "noop" }
+    fn description(&self) -> &str { "Does nothing and returns Ok" }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        ToolResult { call_id: String::new(), content: "noop".into(), is_error: false, images: vec![] }
+    }
+}
+
 /// A read-only tool that (a) bumps a shared "in-flight" counter on entry and
 /// records the peak, (b) awaits a short tokio sleep so concurrent instances
 /// overlap under `tokio::time`, (c) decrements on exit. Proves real overlap and
