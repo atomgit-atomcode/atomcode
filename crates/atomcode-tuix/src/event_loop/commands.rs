@@ -4226,6 +4226,7 @@ fn open_usage(
         .and_then(|s| {
             s.rate_limit_windows
                 .into_iter()
+                .filter(|w| w.show_enable == 1)
                 .filter(|w| w.window_hours > 0)
                 .min_by_key(|w| w.window_hours)
         });

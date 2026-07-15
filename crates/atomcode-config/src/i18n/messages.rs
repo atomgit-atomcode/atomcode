@@ -1154,6 +1154,8 @@ pub enum Msg<'a> {
     UsageCurrentTitle,
     /// "Resets in HH:MM:SS". `hms` is the pre-formatted countdown string.
     UsageResetsIn { hms: &'a str },
+    /// "{hours}-hour rolling window" hint below the reset countdown.
+    UsageWindowHours { hours: i32 },
     /// Shown on Current tab when window data is unavailable.
     UsageWindowUnavailable,
     /// Label: "Favorite model".

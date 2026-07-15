@@ -121,7 +121,7 @@ impl UsageModal {
             // Window duration hint
             if w.window_hours > 0 {
                 rows.push((
-                    format!("  \x1b[90m({}-hour rolling window)\x1b[39m", w.window_hours),
+                    format!("  \x1b[90m({})\x1b[39m", t(Msg::UsageWindowHours { hours: w.window_hours })),
                     String::new(),
                 ));
             }
@@ -602,7 +602,7 @@ mod tests {
         let bar = m.tab_bar();
         // Active tab "Overview" has \x1b[1m ... \x1b[22m (bold on/off, no ;90)
         // Inactive "Current" has \x1b[1;90m (bold+dim)
-        assert!(bar.contains("\x1b[1mOverview\x1b[22m") || bar.contains("Overview"),
+        assert!(bar.contains("\x1b[1mOverview\x1b[22m"),
             "tab bar should mark active tab bold; got: {bar}");
         // Inactive tabs should be muted (;90)
         assert!(bar.contains("90m"), "inactive tabs should have muted colour; got: {bar}");
