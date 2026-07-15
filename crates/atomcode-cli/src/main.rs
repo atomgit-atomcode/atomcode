@@ -2096,6 +2096,17 @@ async fn run_headless(
                         eprint!("{}", atomcode_config::i18n::format_compaction_interrupted());
                         let _ = io::stderr().flush();
                     }
+                    atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished {
+                        completion:
+                            atomcode_coding::runtime::CompactionCompletion::Failed {
+                                trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                                error,
+                            },
+                    } => {
+                        close_thinking_line(&mut thinking_line_open);
+                        eprintln!("[compact failed] {error}");
+                        exit_code = 1;
+                    }
                     atomcode_coding::runtime::CodingRuntimeEvent::CompactionFinished { .. } => {}
                     _ => {}
                 }

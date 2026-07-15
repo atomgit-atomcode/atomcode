@@ -366,6 +366,9 @@ async fn drive_turn(
             AgentEvent::Compacted { committed, .. } => {
                 eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });
             }
+            AgentEvent::CompactionFailed { error, .. } => {
+                eprintln!("[compact failed] {error}");
+            }
             AgentEvent::TurnComplete { reason } => {
                 if streamed {
                     println!();

@@ -5,6 +5,10 @@
 > 结论：`/compact` 专属的 core command/event variant、bridge handler、事件转换和 fallback
 > 已删除，达到“legacy 接口面已退役”。一般 core/bridge 协议、`/context`、session/provider、
 > goal/loop 以及 daemon 的后续整体架构改造不属于该结论。
+>
+> 后迁移正确性加固：idle `/compact` 的局部 durable checkpoint 和失败语义见
+> [compact-durable-checkpoint-design.md](compact-durable-checkpoint-design.md)。该问题不改变上述
+> legacy 退役结论。
 
 ## 1. 文档目的
 

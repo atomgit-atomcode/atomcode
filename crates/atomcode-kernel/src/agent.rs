@@ -1,4 +1,5 @@
 use crate::clock::{Clock, SystemClock};
+use crate::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
 use crate::hook::{
     Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
@@ -540,6 +541,9 @@ pub struct Agent {
     /// thresholds (5K/13K, coding-mode, etc.) are policy, NOT a kernel default —
     /// the neutral default is OFF.
     compact_threshold: Option<f32>,
+    /// Optional durable writer for committed manual compactions. `None` is an
+    /// explicitly ephemeral agent; session-bound production assembly injects one.
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// LIVENESS: max time to wait for the NEXT stream event (bounds both
     /// first-token and inter-token latency). `None` (default) = unbounded. See
     /// `AgentBuilder::stream_timeout`.
@@ -643,6 +647,7 @@ impl Agent {
             max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
@@ -738,6 +743,7 @@ struct RunningAgent {
     max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
     stream_timeout: Option<std::time::Duration>,
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
@@ -865,7 +871,38 @@ impl RunningAgent {
             }
             self.compaction.plan(&view).await
         };
-        let report = convo.apply_plan(plan, floor);
+        // Prepare the complete next conversation without changing the live state.
+        // A committed MANUAL compaction is checkpointed while this session loop
+        // still has exclusive ownership; only a successful save unlocks the final,
+        // infallible ownership move below. Auto/overflow compaction keeps its
+        // existing turn-owned persistence path.
+        let prepared = convo.prepare_plan(plan, floor);
+        let report = prepared.report();
+        let mut snapshot = None;
+        if report.committed && matches!(trigger_for_event, CompactTrigger::Manual { .. }) {
+            let Some(candidate) = prepared.candidate() else {
+                self.rt.emit(AgentEvent::CompactionFailed {
+                    trigger: trigger_for_event,
+                    error: CompactionCheckpointError::new(
+                        "committed compaction did not produce a candidate",
+                    ),
+                });
+                return;
+            };
+            let candidate_snapshot = self.capture_snapshot(candidate);
+            if let Some(checkpoint) = &self.compaction_checkpoint {
+                if let Err(error) = checkpoint.save(&candidate_snapshot) {
+                    self.rt.emit(AgentEvent::CompactionFailed {
+                        trigger: trigger_for_event,
+                        error,
+                    });
+                    return;
+                }
+            }
+            snapshot = Some(candidate_snapshot);
+        }
+
+        let report = convo.commit_prepared(prepared);
         self.rt.emit(AgentEvent::Compacted {
             trigger: trigger_for_event,
             epoch: report.epoch_after,
@@ -873,6 +910,7 @@ impl RunningAgent {
             bytes_before: report.bytes_before,
             bytes_after: report.bytes_after,
             committed: report.committed,
+            snapshot,
         });
     }
     async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
@@ -2652,6 +2690,7 @@ pub struct AgentBuilder {
     max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     stream_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
     chat_options: ChatOptions,
@@ -2695,6 +2734,7 @@ impl Default for AgentBuilder {
             // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
+            compaction_checkpoint: None,
             // NEUTRAL default: no liveness timeout → the kernel never adds a timer.
             // Production SHOULD set both (see the builder methods) so a turn can
             // never park forever on a stalled provider or a silent driver.
@@ -2823,6 +2863,12 @@ impl AgentBuilder {
     /// default is [`NoCompaction`] (always noop).
     pub fn compaction(mut self, s: Arc<dyn CompactionStrategy>) -> Self {
         self.compaction = s;
+        self
+    }
+    /// Inject the durable writer that gates committed manual compactions.
+    /// Sessionless agents omit it and retain ephemeral in-memory behavior.
+    pub fn compaction_checkpoint(mut self, checkpoint: Arc<dyn CompactionCheckpoint>) -> Self {
+        self.compaction_checkpoint = Some(checkpoint);
         self
     }
     /// Set the AUTO task-boundary compaction threshold: a utilization fraction
@@ -2963,6 +3009,7 @@ impl AgentBuilder {
             max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,

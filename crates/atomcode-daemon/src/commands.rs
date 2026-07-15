@@ -121,7 +121,7 @@ fn message_to_kernel(
     converted
 }
 
-fn message_to_core(
+pub(crate) fn message_to_core(
     message: &atomcode_kernel::message::Message,
 ) -> atomcode_core::conversation::message::Message {
     use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
