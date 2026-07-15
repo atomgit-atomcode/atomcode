@@ -1375,18 +1375,21 @@ pub(crate) fn is_read_only_bash(command: &str) -> bool {
     if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") {
         return false;
     }
-    // - backgrounding with a standalone `&`, but NOT the fd-dup form `&1`/`&2` used in
-    //   `2>&1` / `>&2` (which are read-only-safe stream duplications). Reject a `&` only
-    //   when it is NOT immediately preceded by `>` (redirect dup) and NOT part of `&&`
-    //   (already rejected above). A `&` followed by a digit is an fd dup target.
+    // - backgrounding with a standalone `&`. The ONLY legitimate `&` in a read-only
+    //   command is the fd-dup form `>&N` (e.g. `2>&1`, `>&2`), which requires the `&`
+    //   to be immediately preceded by `>`. Being followed by a digit is NOT sufficient
+    //   on its own — `grep x &2` is bash backgrounding (`grep x &`) followed by the
+    //   bare token `2`, not an fd dup. `&&` was already rejected above.
     {
         let b = cmd.as_bytes();
         for (i, &ch) in b.iter().enumerate() {
             if ch == b'&' {
-                let prev_is_redirect = i > 0 && b[i - 1] == b'>';
-                let next_is_fd = i + 1 < b.len() && b[i + 1].is_ascii_digit();
-                if !prev_is_redirect && !next_is_fd {
-                    return false; // real backgrounding `&`
+                // A `&` is a legitimate fd-dup ONLY as `>&` (e.g. `2>&1`, `>&2`),
+                // i.e. immediately preceded by `>`. Any other `&` is backgrounding
+                // (`cmd &`, `cmd &2`) — reject. `&&` was already rejected above.
+                let is_fd_dup = i > 0 && b[i - 1] == b'>';
+                if !is_fd_dup {
+                    return false;
                 }
             }
         }
@@ -1476,19 +1479,6 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
-
-    #[test]
-    fn temp_diag_why_approval() {
-        let cmds = [
-            "cd /Users/theo/Documents/workspace/atomcode && RUSTFLAGS=\"--force-warn dead_code --force-warn unused_imports --force-warn unused_variables --force-warn unused_macros --force-warn unused_must_use -A clippy::all\" cargo +nightly check --workspace --all-targets --message-format=short 2>&1 | grep -iE \"warning:|error:\" | grep -iE \"never|unused|dead|unreachable|construct\" | sort -u | head -250",
-            "cd /Users/theo/Documents/workspace/atomcode && cargo +nightly udeps --workspace --all-targets --output human 2>&1 | tail -150",
-            "cargo +nightly check --workspace 2>&1 | grep -iE \"never|unused|dead\"",
-        ];
-        for c in cmds {
-            eprintln!("CMDDIAG risk={:?} reason={:?}", risk_of(c), check_destructive_command(c));
-        }
-        panic!("diag done");
-    }
 
     #[test]
     fn sanitize_strips_ansi_colour_codes() {
@@ -2008,5 +1998,8 @@ mod tests {
         assert!(!is_read_only_bash(""), "empty command");
         assert!(!is_read_only_bash("   "), "blank command");
         assert!(!is_read_only_bash("unknowncmd -x"), "unknown first word");
+        // fd-dup carve-out must require a preceding `>`, not just a following digit
+        assert!(!is_read_only_bash("grep x &2"), "& followed by digit is still backgrounding, not fd-dup");
+        assert!(!is_read_only_bash("cat f &1"), "& followed by digit is backgrounding");
     }
 }
