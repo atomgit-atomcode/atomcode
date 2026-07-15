@@ -4691,7 +4691,7 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 }
 
 /// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
-/// Extracted from [`resolve_save`] so unit tests can check the naming scheme
+/// Extracted from [`resolve_save_in`] so unit tests can check the naming scheme
 /// without touching the filesystem (where parallel chdir would race).
 fn default_save_filename() -> String {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -4731,14 +4731,6 @@ fn render_save_markdown(messages: &[atomcode_core::conversation::message::Messag
 /// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the active project directory;
 /// a bare name or relative path resolves against `working_dir`;
 /// an absolute path is used as-is. Existing files are overwritten.
-#[cfg(test)]
-fn resolve_save(
-    messages: &[atomcode_core::conversation::message::Message],
-    arg: &str,
-) -> SaveOutcome {
-    resolve_save_in(messages, arg, std::path::Path::new("."))
-}
-
 fn resolve_save_in(
     messages: &[atomcode_core::conversation::message::Message],
     arg: &str,
@@ -5643,8 +5635,8 @@ mod copy_tests {
 #[cfg(test)]
 mod save_tests {
     use super::{
-        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save,
-        resolve_save_in, SaveOutcome,
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save_in,
+        SaveOutcome,
     };
     use atomcode_core::conversation::message::{Message, Role};
     use std::path::{Path, PathBuf};
@@ -5669,7 +5661,7 @@ mod save_tests {
         let target = dir.path().join("config.py");
         std::fs::write(&target, "SECRET = 1\n").unwrap();
         let msgs = vec![Message::new(Role::User, "hi")];
-        match resolve_save(&msgs, target.to_str().unwrap()) {
+        match resolve_save_in(&msgs, target.to_str().unwrap(), dir.path()) {
             SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
             other => panic!("expected RefuseOverwrite, got {other:?}"),
         }
@@ -5684,11 +5676,11 @@ mod save_tests {
         // Existing .md → overwrite is fine (re-export).
         let md = dir.path().join("report.md");
         std::fs::write(&md, "old").unwrap();
-        assert!(matches!(resolve_save(&msgs, md.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(matches!(resolve_save_in(&msgs, md.to_str().unwrap(), dir.path()), SaveOutcome::Ok(_)));
         assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
         // A NEW non-md file (no clobber) → allowed.
         let fresh = dir.path().join("notes");
-        assert!(matches!(resolve_save(&msgs, fresh.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(matches!(resolve_save_in(&msgs, fresh.to_str().unwrap(), dir.path()), SaveOutcome::Ok(_)));
         assert!(Path::new(&fresh).is_file());
     }
 
@@ -5705,19 +5697,20 @@ mod save_tests {
 
     #[test]
     fn save_empty_history_when_no_messages() {
-        assert!(matches!(resolve_save(&[], ""), SaveOutcome::EmptyHistory));
+        // Empty history short-circuits before any path work, so working_dir is unused.
+        assert!(matches!(resolve_save_in(&[], "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
     fn save_empty_history_when_only_tool_messages() {
         let msgs = vec![Message::new(Role::Tool, "tool output")];
-        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+        assert!(matches!(resolve_save_in(&msgs, "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
     fn save_empty_history_when_only_whitespace() {
         let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
-        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+        assert!(matches!(resolve_save_in(&msgs, "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
@@ -5782,7 +5775,7 @@ mod save_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("report.md");
         let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::Ok(got) => {
                 // canonicalize() may add a platform-specific prefix
                 // (e.g. \\?\ on Windows), so compare by file name + read-back
@@ -5792,7 +5785,7 @@ mod save_tests {
                 assert!(content.contains("## User\nping"));
                 assert!(content.contains("## Assistant\npong"));
             }
-            _ => panic!("expected Ok, got {:?}", resolve_save(&msgs, path.to_str().unwrap())),
+            _ => panic!("expected Ok, got {:?}", resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path())),
         }
     }
 
@@ -5802,7 +5795,7 @@ mod save_tests {
         let path = tmp.path().join("old.md");
         std::fs::write(&path, "OLD CONTENT").expect("seed");
         let msgs = conv(&[("user", "new turn")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::Ok(got) => {
                 assert_eq!(got.file_name(), path.file_name());
                 let content = std::fs::read_to_string(&got).expect("read");
@@ -5818,7 +5811,7 @@ mod save_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("nonexistent_dir").join("out.md");
         let msgs = conv(&[("user", "hi")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
             other => panic!("expected InvalidPath, got {other:?}"),
         }
