@@ -2,6 +2,7 @@
 pub mod cell;
 pub(crate) mod diff;
 pub mod mascot;
+pub mod welcome_tips;
 pub mod plain;
 pub mod qr;
 pub mod retained;
