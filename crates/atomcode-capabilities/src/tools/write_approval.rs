@@ -117,6 +117,31 @@ pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
     false
 }
 
+/// True if `raw` (resolved against `cwd`) lands inside the SYSTEM TEMP DIR — the OS
+/// temp dir (`$TMPDIR`, `/var/folders/...` on macOS) or `/tmp`. Mirrors codex's default
+/// writable roots (`workspace + /tmp + $TMPDIR`): a write to scratch/temp is benign and
+/// needs no approval. Canonicalizes (resolves symlinks like `/tmp`->`/private/tmp` and
+/// `..` traversal) so `/tmp/../etc/passwd` is NOT considered temp.
+pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
+    // Canonical temp roots. Both may resolve to the same place; dedup is unnecessary.
+    let roots: Vec<PathBuf> = [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    if roots.is_empty() {
+        return false;
+    }
+    let target = resolve_path(raw, cwd);
+    let mut cur: Option<&Path> = Some(target.as_path());
+    while let Some(p) = cur {
+        if let Ok(canon) = std::fs::canonicalize(p) {
+            return roots.iter().any(|r| canon.starts_with(r));
+        }
+        cur = p.parent();
+    }
+    false
+}
+
 /// The session-grant key fragment for an out-of-workspace, non-sensitive write:
 /// the canonical PARENT DIRECTORY of the target (codex `grant_root` style). Scoping
 /// to the folder — not the exact file — means approving one write under a directory

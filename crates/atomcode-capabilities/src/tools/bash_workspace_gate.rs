@@ -49,7 +49,7 @@ use super::approval::{
 };
 use super::resolve_path;
 use super::sensitive_path::path_is_sensitive;
-use super::write_approval::{canonical_dir_key, path_in_workspace};
+use super::write_approval::{canonical_dir_key, path_in_temp_dir, path_in_workspace};
 
 /// A token that contains an unexpanded shell expansion (`$var`, `$(...)`, backtick) whose value —
 /// and thus whether it escapes the workspace — cannot be known statically.
@@ -578,7 +578,13 @@ impl ToolMiddleware for BashWorkspaceGate {
             let fallback = (false, "bashdir::".to_string());
             super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
                 // Classify each target once (path_in_workspace canonicalizes — filesystem I/O).
-                let in_ws: Vec<bool> = targets.iter().map(|t| path_in_workspace(t, &cwd)).collect();
+                // Temp-dir targets (codex parity: /tmp + $TMPDIR are default-writable) are treated
+                // as in-workspace: a `cargo build > /tmp/x.json` is benign scratch, not a write to
+                // a user-owned directory outside the workspace.
+                let in_ws: Vec<bool> = targets
+                    .iter()
+                    .map(|t| path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
+                    .collect();
                 let all_in = in_ws.iter().all(|&b| b);
                 let key = match targets.iter().zip(&in_ws).find(|(_, &inws)| !inws) {
                     Some((t, _)) => format!("bashdir::{}", canonical_dir_key(t, &cwd)),
@@ -785,9 +791,9 @@ mod tests {
     #[tokio::test]
     async fn out_of_workspace_rm_prompts() {
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("x.txt");
-        std::fs::write(&target, "x").unwrap();
+        // Use a fabricated non-temp, non-workspace absolute path (need not exist — gate is
+        // path-based, canonicalizes ancestors up to `/`).
+        let target = std::path::PathBuf::from("/atomcode-test-outside-rm/x.txt");
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
         let tool = bash_tool();
         let mut call = bash_call(&format!("rm {}", target.to_str().unwrap()));
@@ -825,18 +831,13 @@ mod tests {
     async fn out_of_workspace_grant_is_per_directory() {
         // Grant ONE out-of-workspace directory; a sibling delete there auto-approves, a delete in
         // a different folder still prompts.
+        // Use fabricated non-temp absolute paths (need not exist — gate is path-based).
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let dir_a = outside.path().join("a");
-        let dir_b = outside.path().join("b");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
+        let dir_a = std::path::PathBuf::from("/atomcode-test-outside-grant/a");
+        let dir_b = std::path::PathBuf::from("/atomcode-test-outside-grant/b");
         let granted = dir_a.join("granted.txt");
         let sibling = dir_a.join("sibling.txt");
         let other = dir_b.join("other.txt");
-        for f in [&granted, &sibling, &other] {
-            std::fs::write(f, "x").unwrap();
-        }
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
         store.grant(&format!("bashdir::{}", canonical_dir_key(granted.to_str().unwrap(), ws.path())));
         let gate = BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
@@ -872,5 +873,38 @@ mod tests {
         let tool = bash_tool();
         let mut call = bash_call("echo hi > out.txt");
         assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    // ---- temp-dir whitelist tests (codex parity) -------------------------------------------
+
+    #[tokio::test]
+    async fn redirect_to_slash_tmp_proceeds() {
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("cargo build > /tmp/build_all.json");
+        // /tmp is a writable temp root (codex parity) → no prompt.
+        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    #[tokio::test]
+    async fn redirect_to_system_tmpdir_proceeds() {
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let target = std::env::temp_dir().join("atomcode_gate_probe.json");
+        let mut call = bash_call(&format!("echo x > {}", target.to_str().unwrap()));
+        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    #[tokio::test]
+    async fn traversal_out_of_tmp_still_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        // /tmp/../atomcode_gate_escape.txt canonicalizes OUT of temp → still out-of-workspace → prompts (fail-closed under silent_rt).
+        let mut call = bash_call("echo x > /tmp/../atomcode_gate_escape.txt");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(out.is_deny(), "a target that escapes /tmp via .. must still prompt, got {out:?}");
     }
 }
