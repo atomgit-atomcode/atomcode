@@ -1458,9 +1458,15 @@ fn segment_has_write_redirect(segment: &str) -> bool {
                 j += 1;
             }
             let rest = segment[j..].trim_start();
-            // Allowed discard targets. `>&2`/`2>&1` (fd dup) are not file writes.
+            // Allowed discard targets. `>&2`/`2>&1` (fd dup) and `>&-` (close) are not
+            // file writes; but `>&file` (non-digit, non-`-` after `&`) IS a write redirect
+            // (bash redirects stdout+stderr to that file). Only exempt the fd-dup/close forms.
             let is_discard = rest.starts_with("/dev/null");
-            let is_fd_dup = rest.starts_with('&'); // e.g. `2>&1`, `>&2`
+            let is_fd_dup = rest
+                .strip_prefix('&')
+                .map_or(false, |after| {
+                    after.starts_with(|c: char| c.is_ascii_digit()) || after.starts_with('-')
+                });
             if !is_discard && !is_fd_dup {
                 return true; // writes a real file
             }
@@ -2033,5 +2039,10 @@ mod tests {
         // M2 — raw newline / carriage return hides a second command
         assert!(!is_read_only_bash("grep x\nrm -rf y"), "raw newline hides a 2nd command");
         assert!(!is_read_only_bash("cat a\rrm b"), "carriage return separator");
+        // >&file is a file write — only fd-dup/close forms (>&1, 2>&1, >&-) are safe
+        assert!(!is_read_only_bash("grep x >&out.txt"), ">&file writes a file");
+        assert!(!is_read_only_bash("grep x >& out.txt"), ">& file (spaced) writes");
+        assert!(!is_read_only_bash("grep x 1>&out.txt"), "1>&file writes");
+        assert!(!is_read_only_bash("grep x 2>&err.log"), "2>&file writes");
     }
 }
