@@ -524,4 +524,23 @@ mod tests {
         assert!(t(Msg::TodoPanelCompleted { n: 3 }).contains('3'));
         assert!(t(Msg::TodoPanelMore { n: 2 }).contains('2'));
     }
+
+    #[test]
+    fn welcome_tip_descriptions_present_both_langs() {
+        // Check a representative subset of the new welcome-tips variants in both locales.
+        macro_rules! check {
+            ($variant:expr) => {{
+                let en = t_with(Locale::En, $variant);
+                assert!(!en.is_empty(), "EN empty for {}", stringify!($variant));
+                let zh = t_with(Locale::ZhCn, $variant);
+                assert!(!zh.is_empty(), "ZH empty for {}", stringify!($variant));
+            }};
+        }
+        check!(Msg::WelcomeTipsHeading);
+        check!(Msg::WelcomeTipLogin);
+        check!(Msg::WelcomeTipGoal);
+        check!(Msg::WelcomeTipLoop);
+        check!(Msg::WelcomeTipSession);
+        check!(Msg::WelcomeTipInit);
+    }
 }

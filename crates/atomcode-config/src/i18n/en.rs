@@ -402,6 +402,24 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IdleHintWebuiFull =>
             "/webui  open a synced session in the browser".into(),
 
+        // ── Welcome screen tips ──
+        Msg::WelcomeTipsHeading => "Tips for getting started".into(),
+        Msg::WelcomeTipLogin => "claim a free token quota".into(),
+        Msg::WelcomeTipProvider => "add a custom model".into(),
+        Msg::WelcomeTipModel => "switch the active model".into(),
+        Msg::WelcomeTipResume => "resume your last session".into(),
+        Msg::WelcomeTipSetup => "one-shot recommended setup".into(),
+        Msg::WelcomeTipSkills => "browse available skills".into(),
+        Msg::WelcomeTipPlugin => "install skill/command plugins".into(),
+        Msg::WelcomeTipWebui => "open a synced session in the browser".into(),
+        Msg::WelcomeTipMcp => "connect MCP tools".into(),
+        Msg::WelcomeTipPlan => "read-only planning mode".into(),
+        Msg::WelcomeTipSession => "manage & switch sessions".into(),
+        Msg::WelcomeTipLoop => "run a prompt on a recurring loop".into(),
+        Msg::WelcomeTipGoal => "set a goal for the session".into(),
+        Msg::WelcomeTipInit => "scan the codebase into AGENTS.md".into(),
+        Msg::WelcomeTipLanguage => "switch the UI language".into(),
+
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
             "  Switched to Plan mode (read-only exploration).\n".into(),
