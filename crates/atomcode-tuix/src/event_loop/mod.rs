@@ -3790,10 +3790,6 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
-    /// Guards the one-shot `/setup` hint so it fires at most once per
-    /// session. Flipped to `true` after the first render; subsequent
-    /// redraws skip the check entirely.
-    pub setup_hint_shown: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -3856,7 +3852,6 @@ impl App {
             esc_undo_last_at: None,
             setup_pending: false,
             reasoning_buffer: String::new(),
-            setup_hint_shown: false,
         }
     }
 }
@@ -4115,14 +4110,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
-        // One-shot /setup hint — only on first boot into this project,
-        // gated by preferences + setup-state presence.
-        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-            ));
-            app.setup_hint_shown = true;
-        }
         // One-shot legacy-conhost scroll hint. The classic Windows console
         // host snaps the viewport back to the bottom on every write, so the
         // live footer repaint during a running task makes scrolling up to
@@ -4420,21 +4407,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
-                        // QR-fast-path onboarding bypasses the regular
-                        // first-boot idle render (see ~line 2506), so
-                        // the one-shot /setup tip never fires for users
-                        // who land through the scan flow. Surface it
-                        // here under the same gates: in-session
-                        // once-only + `should_auto_show_setup` (no
-                        // setup-state.json or missing recommender
-                        // skill).
-                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-                            renderer.render(crate::render::UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-                            ));
-                            renderer.flush();
-                            app.setup_hint_shown = true;
-                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -4889,21 +4861,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
-                        // QR-fast-path onboarding bypasses the regular
-                        // first-boot idle render (see ~line 2506), so
-                        // the one-shot /setup tip never fires for users
-                        // who land through the scan flow. Surface it
-                        // here under the same gates: in-session
-                        // once-only + `should_auto_show_setup` (no
-                        // setup-state.json or missing recommender
-                        // skill).
-                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-                            renderer.render(crate::render::UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-                            ));
-                            renderer.flush();
-                            app.setup_hint_shown = true;
-                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -7314,25 +7271,6 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
         return false;
     }
     ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
-}
-
-/// True iff startup should show the one-shot `/setup` hint in scrollback.
-/// Returns `true` when either:
-///   - `setup-state.json` doesn't exist (never ran `/setup`), OR
-///   - the recommender skill directory is missing (user deleted it after setup).
-fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
-    let state = atomcode_core::setup::state::load_setup_state(&ctx.working_dir);
-    if state.is_none() {
-        return true; // never ran setup → show hint
-    }
-
-    // setup-state.json exists but the skill may have been deleted manually.
-    // Path must match SkillRegistry::reload's scan path: the unified
-    // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
-    let skill_dir = atomcode_config::config::Config::config_dir()
-        .join("skills")
-        .join("atomcode-automation-recommender");
-    !skill_dir.exists()
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error

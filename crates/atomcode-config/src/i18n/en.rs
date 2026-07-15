@@ -1197,9 +1197,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             ).into(),
         Msg::StreamStalled => "esc to cancel".into(),
         Msg::ConhostScrollHint =>
-            "Tip: in the classic Windows console, scrolling up to view history is \
-             unavailable while a task is running (scrolling resumes once it finishes). \
-             To scroll during a task, use \x1b[1;96mWindows Terminal\x1b[0m."
+            "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
+             and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."
                 .into(),
     }
 }
