@@ -2343,6 +2343,13 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
+            AgentEvent::Steered { count } => {
+                // A mid-turn prompt was folded into the running turn. Headless:
+                // only note it under --verbose (it's informational, not output).
+                if verbose {
+                    eprintln!("[steered] {} prompt(s) folded into the current turn", count);
+                }
+            }
             AgentEvent::ToolBatchStarted { batch_id: _, calls } => {
                 if verbose {
                     eprintln!("[tool-batch] {} calls in parallel", calls.len());
