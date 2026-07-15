@@ -34,7 +34,7 @@
 //! [`SensitivePathGate`]: super::sensitive_path::SensitivePathGate
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -97,37 +97,21 @@ fn write_targets(tool: &str, args: &str) -> Vec<String> {
     }
 }
 
-/// True iff `raw` (resolved against `cwd`) lands INSIDE the workspace. Handles a not-yet-created
-/// file by canonicalizing its deepest EXISTING ancestor, and rejects `..` escapes because both
-/// the root and the (existing-prefix of the) target are canonicalized before the prefix check —
-/// a purely lexical `starts_with` would let `ws/../etc` through. CONSERVATIVE: an
-/// un-canonicalizable root returns `false` (→ defer to the prompt).
-pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(cwd) else {
-        return false;
-    };
-    let target = resolve_path(raw, cwd);
-    let mut cur: Option<&Path> = Some(target.as_path());
-    while let Some(p) = cur {
-        if let Ok(canon) = std::fs::canonicalize(p) {
-            return canon.starts_with(&root);
-        }
-        cur = p.parent();
-    }
-    false
-}
-
-/// True if `raw` (resolved against `cwd`) lands inside the SYSTEM TEMP DIR — the OS
-/// temp dir (`$TMPDIR`, `/var/folders/...` on macOS) or `/tmp`. Mirrors codex's default
-/// writable roots (`workspace + /tmp + $TMPDIR`): a write to scratch/temp is benign and
-/// needs no approval. Canonicalizes (resolves symlinks like `/tmp`->`/private/tmp` and
-/// `..` traversal) so `/tmp/../etc/passwd` is NOT considered temp.
-pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
-    // Canonical temp roots. Both may resolve to the same place; dedup is unnecessary.
-    let roots: Vec<PathBuf> = [std::env::temp_dir(), PathBuf::from("/tmp")]
+/// The canonical system temp roots (`$TMPDIR` / `/var/folders/...` on macOS, and `/tmp`).
+/// Process-stable (a mid-run `$TMPDIR` change is intentionally not observed — matches the
+/// codex writable-roots model). Empty if neither canonicalizes (→ nothing is temp → prompt).
+static TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
         .iter()
         .filter_map(|p| std::fs::canonicalize(p).ok())
-        .collect();
+        .collect()
+});
+
+/// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Walks the target's
+/// ancestors, canonicalizing the deepest one that EXISTS (so a not-yet-created leaf is
+/// classified by its parent) — canonicalization resolves `..` traversal and symlinks, so a
+/// path that escapes every root via `..` or a symlink is correctly NOT matched.
+fn path_under_any(raw: &str, cwd: &Path, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return false;
     }
@@ -140,6 +124,26 @@ pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
         cur = p.parent();
     }
     false
+}
+
+/// True iff `raw` (resolved against `cwd`) lands INSIDE the workspace. Handles a not-yet-created
+/// file by canonicalizing its deepest EXISTING ancestor, and rejects `..` escapes because both
+/// the root and the (existing-prefix of the) target are canonicalized before the prefix check —
+/// a purely lexical `starts_with` would let `ws/../etc` through. CONSERVATIVE: an
+/// un-canonicalizable root returns `false` (→ defer to the prompt).
+pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
+    match std::fs::canonicalize(cwd) {
+        Ok(root) => path_under_any(raw, cwd, std::slice::from_ref(&root)),
+        Err(_) => false,
+    }
+}
+
+/// True if `raw` (resolved against `cwd`) lands inside the SYSTEM TEMP DIR (`/tmp` or
+/// `$TMPDIR`). Mirrors codex's default writable roots — scratch/temp writes need no approval.
+/// Sensitive targets are still gated upstream; `/tmp/../etc/x` canonicalizes OUT of temp and
+/// is NOT matched.
+pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
+    path_under_any(raw, cwd, &TEMP_ROOTS)
 }
 
 /// The session-grant key fragment for an out-of-workspace, non-sensitive write:
@@ -312,7 +316,10 @@ impl ToolMiddleware for WriteApprovalGate {
             let fallback = (false, format!("{name}::"));
             super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
                 let in_ws = !targets.is_empty()
-                    && targets.iter().all(|t| !t.trim().is_empty() && path_in_workspace(t, &cwd));
+                    && targets.iter().all(|t| {
+                        !t.trim().is_empty()
+                            && (path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
+                    });
                 (in_ws, grant_key(&name, &targets, &cwd))
             })
             .await
@@ -415,9 +422,9 @@ mod tests {
     #[tokio::test]
     async fn out_of_workspace_edit_prompts() {
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("x.rs");
-        std::fs::write(&target, "x").unwrap();
+        // Use a fabricated non-temp, non-workspace absolute path (need not exist — the gate
+        // canonicalizes ancestors, eventually reaching `/` which is not temp).
+        let target = std::path::PathBuf::from("/atomcode-test-outside-write/x.rs");
         let gate = WriteApprovalGate::pinned(ws.path().to_path_buf());
         let tool = edit_tool();
         let mut call = edit_call(target.to_str().unwrap());
@@ -445,18 +452,13 @@ mod tests {
         // sibling never itself granted, and via the OTHER write tool) auto-approves,
         // while a file in a DIFFERENT folder still prompts. Proves "Always" is
         // per-folder (codex grant_root style) — not per-file, not tool-wide.
+        // Uses fabricated non-temp absolute paths (need not exist — grant key is canonical dir).
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let dir_a = outside.path().join("a");
-        let dir_b = outside.path().join("b");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
+        let dir_a = std::path::PathBuf::from("/atomcode-test-outside-write-grant/a");
+        let dir_b = std::path::PathBuf::from("/atomcode-test-outside-write-grant/b");
         let granted = dir_a.join("granted.rs");
         let sibling = dir_a.join("sibling.rs");
         let other = dir_b.join("other.rs");
-        for f in [&granted, &sibling, &other] {
-            std::fs::write(f, "x").unwrap();
-        }
 
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
         // Grant is keyed by the folder, from the `granted` file's target.
@@ -490,15 +492,15 @@ mod tests {
     async fn accept_edits_auto_approves_nonsensitive_but_not_sensitive() {
         // accept-edits mode: a non-sensitive out-of-workspace edit auto-approves with
         // NO prompt; a sensitive path still prompts every time (never auto-accepted).
+        // Uses fabricated non-temp absolute paths so temp-whitelist doesn't fire.
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(true)); // accept-edits ON
         let gate = WriteApprovalGate::new(Arc::new(RwLock::new(ws.path().to_path_buf())))
             .with_accept_edits(flag.clone());
         let tool = write_tool();
 
-        // Non-sensitive out-of-workspace file: normally prompts; with accept-edits → Allow.
-        let ordinary = outside.path().join("report.md");
+        // Non-sensitive out-of-workspace file (not in temp): normally prompts; with accept-edits → Allow.
+        let ordinary = std::path::PathBuf::from("/atomcode-test-outside-accept-edits/report.md");
         let mut c = write_call(ordinary.to_str().unwrap());
         assert!(
             matches!(gate.before(&mut c, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
@@ -506,8 +508,8 @@ mod tests {
         );
 
         // Sensitive path: accept-edits does NOT apply — silent_rt denies the prompt.
-        let secret = outside.path().join("id_rsa");
-        std::fs::write(&secret, "k").unwrap();
+        // Use a fabricated path; sensitivity is by name, not existence.
+        let secret = std::path::PathBuf::from("/atomcode-test-outside-accept-edits/id_rsa");
         let mut s = write_call(secret.to_str().unwrap());
         assert!(
             gate.before(&mut s, &tool, &silent_rt()).await.is_deny(),
