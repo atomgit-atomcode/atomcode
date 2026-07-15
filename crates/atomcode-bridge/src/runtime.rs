@@ -2461,6 +2461,14 @@ pub fn build_provider(
         "claude" | "anthropic" => {
             let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             ac.context_window = cfg.context_window;
+            // Thread the coding layer's liveness knob down to the L1 adapter's byte-idle
+            // watchdog. Without this, `AnthropicConfig::new`'s hardcoded 120s default
+            // stays in effect even when the user raised `ATOMCODE_STREAM_TIMEOUT_SECS`
+            // (or relied on the 300s default documented in `config.rs`). Thinking models
+            // go quiet for >2min during hidden reasoning after a large prompt; the 120s
+            // ceiling cut them off mid-think and surfaced as a spurious
+            // `[Error: stream idle timeout]` even though the connection was healthy.
+            ac.idle_timeout = cfg.stream_timeout;
             // Fallback output cap (the per-call `chat_options.max_tokens` still wins). Replaces
             // the flat 4096 default so a large context window gets a proportionate cap.
             ac.max_tokens = default_max_tokens(cfg.context_window);
@@ -2477,6 +2485,8 @@ pub fn build_provider(
             let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
             oc.api_key = cfg.api_key.clone();
             oc.context_window = cfg.context_window;
+            // Same liveness-threading rationale as the Anthropic branch above.
+            oc.idle_timeout = cfg.stream_timeout;
             // Fallback `num_predict` cap (the per-call `chat_options.max_tokens` still wins).
             oc.max_tokens = Some(default_max_tokens(cfg.context_window));
             oc.think = cfg.thinking_enabled.unwrap_or(false);
@@ -2490,6 +2500,8 @@ pub fn build_provider(
         _ => {
             let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
             pc.context_window = cfg.context_window;
+            // Same liveness-threading rationale as the Anthropic branch above.
+            pc.idle_timeout = cfg.stream_timeout;
             // Text-only models must NOT receive image content. The live path VL-preprocesses
             // a FRESH image into text (see `maybe_preprocess` above), but a RESUMED
             // conversation's historical image message would still serialize as multimodal and
