@@ -1476,22 +1476,41 @@ fn command_first_word_allowed(command_node: tree_sitter::Node, src: &[u8]) -> bo
 /// A `file_redirect` is read-only iff its target is exactly `/dev/null` or an fd-dup
 /// (`>&1`, `2>&1`, `>&-`). Any other target writes a real file → not read-only.
 ///
-/// tree-sitter-bash models a `file_redirect` as an anonymous operator token (`>`,
-/// `>>`, `2>`, `>&`, …), an optional `file_descriptor`, and the target as a `word`
-/// child. An fd-dup like `2>&1` has NO `word` target (the `&1` is absorbed into the
-/// operator/descriptor tokens), so a `file_redirect` with no `word` child is a
-/// dup/close form → safe. When a `word` target IS present it must be exactly
-/// `/dev/null`; anything else (`out.txt`, `/dev/nullX`, `&out.txt`) is a real write.
+/// ## Numeric target discrimination
+///
+/// A numeric target (`number` node in tree-sitter-bash) is ambiguous:
+/// - `2>&1`  → fd-dup: the `1` is a file DESCRIPTOR, not a filename.  SAFE.
+/// - `> 9`   → plain redirect: the `9` is a real filename.  WRITES A FILE.
+///
+/// The discriminator is the redirect operator text: an fd-dup form contains `>&` or
+/// `<&` (e.g. `>&`, `2>&`, `<&`); a plain write form does not.  We obtain the full
+/// redirect node text and check for those substrings.
+///
+/// ## Other forms
+/// - `word`/`raw_string`/`string`/`concatenation` target → must be exactly `/dev/null`.
+/// - `>&out.txt` → target is a `word` (not `/dev/null`) → rejected.  Correct: writes a file.
+/// - `&>/dev/null` → target is a `word` `/dev/null`; operator `&>` has no `>&` → word arm
+///   accepts it.  Correct: discard-all redirect.
 fn redirect_is_readonly(redirect_node: tree_sitter::Node, src: &[u8]) -> bool {
+    // Detect fd-dup form by inspecting the raw redirect text.  An fd-dup (`>&N`, `2>&1`,
+    // `<&N`, `>&-`) contains `>&` or `<&`; a plain write (`>`, `>>`, `2>`, `&>`) does not.
+    let redir_text = redirect_node.utf8_text(src).unwrap_or("");
+    let is_fd_dup = redir_text.contains(">&") || redir_text.contains("<&");
+
     for i in 0..redirect_node.child_count() as u32 {
         let c = redirect_node.child(i).unwrap();
-        // Only the target is a NAMED `word`/`raw_string`/`string`/`concatenation`;
-        // the operator (`>`) and any `file_descriptor` are handled elsewhere.
         match c.kind() {
+            // A file target: must be exactly /dev/null (word/quoted/concatenated).
             "word" | "raw_string" | "string" | "concatenation" => {
                 let target = c.utf8_text(src).unwrap_or("");
                 if target != "/dev/null" {
-                    return false; // writes a real file (or an unrecognized target)
+                    return false; // writes a real file (out.txt, /dev/nullX, >&file, …)
+                }
+            }
+            // A numeric target: safe ONLY as an fd-dup (`2>&1`); a plain `> 9` writes file "9".
+            "number" => {
+                if !is_fd_dup {
+                    return false;
                 }
             }
             _ => {}
@@ -2100,6 +2119,10 @@ mod tests {
         assert!(is_read_only_bash("grep x 2>/dev/null"));
         assert!(is_read_only_bash("grep -rn foo crates/ 2>/dev/null | head -10"));
         assert!(is_read_only_bash("cat f 2>&1 | grep err"));
+        // fd-dup forms: numeric target is a descriptor, not a filename.
+        assert!(is_read_only_bash("grep x 2>&1 | head"), "2>&1 fd-dup is safe");
+        assert!(is_read_only_bash("cat f 2>&1 | grep err"));
+        assert!(is_read_only_bash("grep x foo.txt >/dev/null 2>&1"));
         // Single-quoted $(...) is a literal string, not a substitution.
         assert!(is_read_only_bash("grep '$(rm -rf x)' file.txt"));
         // Plain reads.
@@ -2133,6 +2156,12 @@ mod tests {
         // find write actions.
         assert!(!is_read_only_bash("find . -delete"));
         assert!(!is_read_only_bash("find . -exec rm {} ;"));
+        // Bare-number redirect target writes a real file (fail-open fixed).
+        assert!(!is_read_only_bash("cat /etc/passwd > 9"), "> 9 writes file '9'");
+        assert!(!is_read_only_bash("grep secret f > 1"), "> 1 truncates file '1'");
+        assert!(!is_read_only_bash("echo pwn >> 5"), ">> 5 appends to file '5'");
+        assert!(!is_read_only_bash("ls >2"), ">2 writes file '2'");
+        assert!(!is_read_only_bash("grep x &>9"), "&>9 writes file '9'");
         // Parse junk / empty → fail closed.
         assert!(!is_read_only_bash(""));
         assert!(!is_read_only_bash("   "));
