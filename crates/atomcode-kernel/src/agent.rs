@@ -1307,10 +1307,6 @@ impl RunningAgent {
             // STEER: fold any prompts the user submitted mid-turn into THIS turn before
             // building the next request. Real user messages (count toward prompt/undo),
             // appended append-only (prefix-cache safe).
-            // Yield once before draining so the outer driver select! has a chance to
-            // move any pending cmd_rx::SendMessage entries into the steer buffer before
-            // we drain it. This is a lightweight cooperative yield — no sleep, no timer.
-            tokio::task::yield_now().await;
             let steered: Vec<SteerInput> = {
                 let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
                 b.drain(..).collect()

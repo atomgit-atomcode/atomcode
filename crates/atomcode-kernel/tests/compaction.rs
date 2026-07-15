@@ -751,7 +751,7 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
 // steer-drain semantics): the second prompt is NOT lost and NOT deferred to a new
 // turn — the kernel responds to it within the SAME turn.
 #[tokio::test]
-async fn mid_turn_send_message_runs_after_current_turn() {
+async fn mid_turn_send_message_is_folded_into_current_turn() {
     use atomcode_kernel::testkit::DeferredCommands;
     use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 
