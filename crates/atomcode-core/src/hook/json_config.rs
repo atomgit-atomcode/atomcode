@@ -39,15 +39,19 @@ fn default_timeout() -> u64 {
     10_000
 }
 
-/// Load and merge hooks from global (`$ATOMCODE_HOME/hooks.json`) and project
-/// (`.hooks.json`) config files.
+/// Load and merge hooks, discarding names.
 ///
-/// Project hooks override global hooks with the same name. Disabled hooks
-/// are filtered out.
-///
-/// Delegates to [`load_hooks_config_with_names`] and discards names so the
-/// two functions never drift out of sync.
+/// Delegates to [`load_hooks_config_with_names`] and discards the names so
+/// the two functions never drift out of sync.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
+    load_hooks_config_with_names(project_dir)
+        .into_iter()
+        .map(|(_, config)| config)
+        .collect()
+}
+
+/// Load and merge hooks, returning each with its name.
+pub fn load_hooks_config_with_names(project_dir: &Path) -> Vec<(String, HookConfig)> {
     let global_path = atomcode_config::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
