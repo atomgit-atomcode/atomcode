@@ -7,14 +7,13 @@
 
 use crossterm::style::Color;
 
-pub const MASCOT_WIDTH: usize = 11;
+pub const MASCOT_WIDTH: usize = 9;
 
-pub const MASCOT_ROWS: [&str; 5] = [
-    "oooo.o.o.o.o.o.o.ooooo",
-    "oooooooooooooooooooooo",
-    "oooowwkwoooooowwkwoooo",
-    "o.ooooooooooooooooooo.",
-    "..o.ooooooooooooo.o...",
+pub const MASCOT_ROWS: [&str; 4] = [
+    "oooo.o.o.o.o.ooooo",
+    "ooooooowokooowokoo",
+    "oooooowowooowowooo",
+    "..o.ooooooooooo...",
 ];
 
 /// Map a legend byte to its 256-color value; `.` (transparent) → None.

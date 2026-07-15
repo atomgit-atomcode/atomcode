@@ -28,7 +28,7 @@ import sys
 from PIL import Image, ImageSequence
 
 # Tunables — these reproduce the committed cat3-13 mascot.
-CELLS_WIDE = 11
+CELLS_WIDE = 9
 EYE_W = 2       # white patch width in px
 EYE_H = 2       # white patch height in px
 ALPHA_THRESHOLD = 128
@@ -57,7 +57,9 @@ def build_grid(mascot):
                 if r > 150 and g > 150 and b > 150:
                     whites.append((x, y))
 
-    # Stamp small symmetric eyes with a top-center pupil.
+    # Stamp small symmetric eyes: an EYE_W-wide white patch anchored at each eye
+    # centroid, with the black pupil in the patch's TOP-RIGHT corner (a slight
+    # up-right glance that reads better than a dead-center dot at this size).
     if whites:
         xs = sorted({x for x, _ in whites})
         midx = xs[len(xs) // 2]
@@ -69,13 +71,14 @@ def build_grid(mascot):
             cx = round(sum(p[0] for p in pts) / len(pts))
             cy = round(sum(p[1] for p in pts) / len(pts))
             top_y = cy - (EYE_H // 2)
-            for dx in range(-(EYE_W // 2), EYE_W - EYE_W // 2):
+            for dx in range(0, EYE_W):
                 for dy in range(0, EYE_H):
                     xx, yy = cx + dx, top_y + dy
                     if 0 <= xx < CELLS_WIDE and 0 <= yy < ph and grid[yy][xx] == "o":
                         grid[yy][xx] = "w"
-            if 0 <= cx < CELLS_WIDE and 0 <= top_y < ph:
-                grid[top_y][cx] = "k"
+            pupil_x = cx + EYE_W - 1  # top-right corner of the white patch
+            if 0 <= pupil_x < CELLS_WIDE and 0 <= top_y < ph:
+                grid[top_y][pupil_x] = "k"
     return grid, ph
 
 
