@@ -7282,15 +7282,10 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
     let mut status = build_status(state, ctx);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
     // footer hint (bare `!` → "! for shell mode"; `!cmd` → "Enter to run…").
-    // `build_status` always fills the slot with at least the lowest-priority
-    // `/webui` fallback, so gate on "slot is free OR only holds that fallback" —
-    // this shows the shell hint over the webui nudge but still yields to a
+    // Fill the slot only when it's free, so the shell hint still yields to any
     // higher-priority hint (no-provider / high token usage / upgrade).
     if let Some((msg, severity)) = shell_mode_hint(&buf.text) {
-        let slot_is_free = match &status.hint {
-            None => true,
-            Some((h, _)) => *h == crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
-        };
+        let slot_is_free = status.hint.is_none();
         if slot_is_free {
             status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
         }
@@ -11154,13 +11149,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         };
         Some((text, crate::render::HintSeverity::Info))
     } else {
-        // Lowest-priority fallback: surface the `/webui` browser-UI entry
-        // point, which is otherwise easy to miss. Yields the slot to every
-        // higher-priority hint above (warnings / usage / upgrade).
-        Some((
-            crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
-            crate::render::HintSeverity::Info,
-        ))
+        // No lowest-priority fallback: the welcome banner now surfaces the
+        // getting-started tips (including /webui), so the footer hint slot stays
+        // empty when idle instead of showing a persistent /webui nudge.
+        None
     };
     // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
     // (empty string or "not-configured") — showing that raw in the status
