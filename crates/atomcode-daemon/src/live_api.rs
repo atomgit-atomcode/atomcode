@@ -174,7 +174,51 @@ impl Drop for ScopedApprovalModeForTest {
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
     // 记录进程级覆盖，供两个执行器下一轮读取（修复 #755：sync 模式下 /cd 后模型
     // 仍报旧目录——执行器的 working_dir 在创建时冻结，仅靠广播无法让引擎切目录）。
+    let dir = crate::normalize_working_dir_case(dir);
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+
+    if let Some(store) = crate::DAEMON_PROJECT.lock().unwrap().as_ref() {
+        let store = store.clone();
+        let dir = dir.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut project = store.write().await;
+                let old_dir = project.working_dir.clone();
+                if old_dir != dir {
+                    project.previous_dir = Some(old_dir);
+                    project.working_dir = dir.clone();
+                    project.name = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "project".to_string());
+                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    project
+                        .recent_dirs
+                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    project.recent_dirs.insert(0, dir.clone());
+                    project.recent_dirs.truncate(5);
+                }
+            });
+        } else {
+            let mut project = store.blocking_write();
+            let old_dir = project.working_dir.clone();
+            if old_dir != dir {
+                project.previous_dir = Some(old_dir);
+                project.working_dir = dir.clone();
+                project.name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string());
+                let new_key = atomcode_core::tool::path_case_key(&dir);
+                project
+                    .recent_dirs
+                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                project.recent_dirs.insert(0, dir.clone());
+                project.recent_dirs.truncate(5);
+            }
+        }
+    }
+
     if let Some(s) = current_live_session() {
         s.notify_working_dir_changed(dir);
     }
@@ -2431,6 +2475,16 @@ mod tests {
         let dir_a = std::path::PathBuf::from("/tmp/atomcode-test-a");
         let dir_b = std::path::PathBuf::from("/tmp/atomcode-test-b");
 
+        // Initialize DAEMON_PROJECT with a test ProjectStateStore.
+        let project_state = crate::ProjectState {
+            working_dir: dir_a.clone(),
+            previous_dir: None,
+            recent_dirs: vec![dir_a.clone()],
+            name: "test-a".to_string(),
+        };
+        let project_store = Arc::new(tokio::sync::RwLock::new(project_state));
+        *crate::DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
+
         // 无覆盖时回退到执行器创建目录。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
         assert_eq!(live_current_working_dir(&dir_a), dir_a);
@@ -2443,12 +2497,22 @@ mod tests {
         );
         assert_eq!(live_current_working_dir(&dir_a), dir_b);
 
+        // 验证 DAEMON_PROJECT 也已被同步更新。
+        {
+            let project = project_store.blocking_read();
+            assert_eq!(project.working_dir, dir_b);
+            assert_eq!(project.previous_dir.as_ref(), Some(&dir_a));
+            assert_eq!(project.name, "atomcode-test-b");
+            assert_eq!(project.recent_dirs, vec![dir_b.clone(), dir_a.clone()]);
+        }
+
         // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
         // → 触发 ChangeDir / 重建 parts。
         assert_ne!(live_current_working_dir(&dir_a), dir_a);
 
         // 清理进程级状态，避免污染同进程其他测试。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
+        *crate::DAEMON_PROJECT.lock().unwrap() = None;
     }
 
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。

@@ -293,6 +293,8 @@ pub(crate) fn atomcode_home_test_lock() -> &'static std::sync::Mutex<()> {
 
 type ProjectStateStore = Arc<RwLock<ProjectState>>;
 
+pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> = std::sync::Mutex::new(None);
+
 /// Active chat tasks (session_id -> cancellation token)
 type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
 
@@ -410,7 +412,7 @@ fn resolve_initial_working_dir(
 /// symlink-resolution surprises and bucket orphaning (`hash_path` does not fold
 /// case off Windows).
 #[cfg(windows)]
-fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+pub(crate) fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     match std::fs::canonicalize(&p) {
         Ok(c) => {
             let c = atomcode_core::tool::strip_verbatim_prefix_path(&c);
@@ -425,7 +427,7 @@ fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+pub(crate) fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     p
 }
 
@@ -4392,9 +4394,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let project_store = Arc::new(RwLock::new(project_state));
+    *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        project: Arc::new(RwLock::new(project_state)),
+        project: project_store,
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
