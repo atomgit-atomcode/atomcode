@@ -1368,9 +1368,19 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
 /// completely unparseable input. The caller must still reject trees containing
 /// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
 fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
-    parser.parse(command, None)
+    use std::cell::RefCell;
+    thread_local! {
+        static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
+    }
+    PARSER.with(|slot| {
+        let mut opt = slot.borrow_mut();
+        if opt.is_none() {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
+            *opt = Some(p);
+        }
+        opt.as_mut().unwrap().parse(command, None)
+    })
 }
 
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
@@ -1504,9 +1514,17 @@ fn command_first_word_allowed(command_node: tree_sitter::Node, src: &[u8]) -> bo
 /// - `&>/dev/null` → target is a `word` `/dev/null`; operator `&>` has no `>&` → word arm
 ///   accepts it.  Correct: discard-all redirect.
 fn redirect_is_readonly(redirect_node: tree_sitter::Node, src: &[u8]) -> bool {
+    let redir_text = redirect_node.utf8_text(src).unwrap_or("");
+    // A PURE input redirect (`< f`, `3< f`) only READS the file — harmless for
+    // concurrency. `<>` (read-write, has `>`) and `<&N` (fd-dup, has `&`) are NOT
+    // pure input and fall through to the normal checks. Heredoc/herestring are
+    // separate node kinds rejected upstream.
+    let is_input_read = redir_text.contains('<') && !redir_text.contains('>') && !redir_text.contains('&');
+    if is_input_read {
+        return true;
+    }
     // Detect fd-dup form by inspecting the raw redirect text.  An fd-dup (`>&N`, `2>&1`,
     // `<&N`, `>&-`) contains `>&` or `<&`; a plain write (`>`, `>>`, `2>`, `&>`) does not.
-    let redir_text = redirect_node.utf8_text(src).unwrap_or("");
     let is_fd_dup = redir_text.contains(">&") || redir_text.contains("<&");
 
     for i in 0..redirect_node.child_count() as u32 {
@@ -2141,6 +2159,9 @@ mod tests {
         assert!(is_read_only_bash("cat a.txt"));
         assert!(is_read_only_bash("ls -la"));
         assert!(is_read_only_bash("find crates -name '*.rs'"));
+        // Input redirects only READ a file — read-only.
+        assert!(is_read_only_bash("wc -l < f.txt"), "input redirect reads, harmless");
+        assert!(is_read_only_bash("grep x < in.txt | head"), "input redirect in a pipe");
     }
 
     #[test]
@@ -2178,6 +2199,10 @@ mod tests {
         assert!(!is_read_only_bash(""));
         assert!(!is_read_only_bash("   "));
         assert!(!is_read_only_bash("grep x |"));    // trailing pipe (parse error / empty stage)
+        // `<>` is read-WRITE (has `>`), must NOT be treated as a pure input redirect.
+        assert!(!is_read_only_bash("wc <> f.txt"), "<> is read-WRITE, not pure input");
+        // Output redirect must still be rejected even when an input redirect is also present.
+        assert!(!is_read_only_bash("grep x < in.txt > out.txt"), "output redirect still writes");
     }
 
     /// Differential fuzz: for every command the classifier calls read-only, execute it in
