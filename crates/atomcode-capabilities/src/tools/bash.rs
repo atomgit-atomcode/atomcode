@@ -1375,11 +1375,18 @@ fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
 
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
 /// sandbox. AST-based (tree-sitter-bash): only a fixed set of STRUCTURAL node kinds is
-/// allowed; any other NAMED kind (command substitution, subshell, expansion,
-/// backgrounding, …) means "cannot prove read-only" → false. Each `command` node's
-/// first word must be in [`READ_ONLY_BASH_ALLOWLIST`] (with the `find` write/exec
-/// carve-out); every redirect must target `/dev/null` or be an fd-dup. Fail CLOSED:
-/// parse failure / ERROR node / unknown named kind / non-discard redirect → false.
+/// allowed; any other NAMED kind (command substitution, subshell, expansion, …) means
+/// "cannot prove read-only" → false. Each `command` node's first word must be in
+/// [`READ_ONLY_BASH_ALLOWLIST`] (with the `find` write/exec carve-out); every redirect
+/// must target `/dev/null` or be an fd-dup. Fail CLOSED: parse failure / ERROR node /
+/// unknown named kind / non-discard redirect → false.
+///
+/// **Backgrounding (`&`):** a bare `&` (background/async operator) is an ANONYMOUS
+/// token in the tree-sitter-bash grammar — it is NOT a named node and therefore does
+/// NOT trigger the unknown-named-kind rejection. A backgrounded command chain is
+/// read-only iff EVERY command in it is allowlisted, exactly like `&&` / `;` / `|`.
+/// For example `grep x PWN & grep y PWN` → true (both greps allowlisted), while
+/// `touch HACKED & grep x PWN` → false (touch is not allowlisted).
 ///
 /// A false negative only costs parallelism; a false positive would let a
 /// side-effecting command run concurrently — so the bar is "provably safe".
@@ -1487,7 +1494,12 @@ fn command_first_word_allowed(command_node: tree_sitter::Node, src: &[u8]) -> bo
 /// redirect node text and check for those substrings.
 ///
 /// ## Other forms
-/// - `word`/`raw_string`/`string`/`concatenation` target → must be exactly `/dev/null`.
+/// - `word`/`raw_string`/`string`/`concatenation` target → must be exactly `/dev/null`,
+///   regardless of the operator direction.  This is **conservative/fail-closed**: a
+///   non-`/dev/null` word target of ANY redirect — output (`> file`, `>> file`) OR input
+///   (`< file`) — is rejected.  Only `/dev/null` and fd-dups pass.  `cat <file` is
+///   therefore rejected (the word `file` ≠ `/dev/null`), even though reading a file via
+///   input redirect does not write anything; we prefer false-negatives over false-positives.
 /// - `>&out.txt` → target is a `word` (not `/dev/null`) → rejected.  Correct: writes a file.
 /// - `&>/dev/null` → target is a `word` `/dev/null`; operator `&>` has no `>&` → word arm
 ///   accepts it.  Correct: discard-all redirect.
@@ -2216,6 +2228,8 @@ mod tests {
             ("wc -l PWN",                                   true),
             ("head -1 PWN",                                 true),
             ("tail -1 PWN",                                 true),
+            // backgrounded (&) chains: read-only iff EVERY command is allowlisted
+            ("grep x PWN & grep y PWN",                    true),  // both sides read-only → safe; when run, writes nothing
 
             // ── SIDE-EFFECTING (expected false) — MUST be classified false; NOT executed ─
             // output redirects that write real files
@@ -2230,6 +2244,7 @@ mod tests {
             ("(touch HACKED)",                              false),
             // non-allowlisted commands
             ("touch HACKED",                                false),
+            ("touch HACKED & grep x PWN",                  false),  // background touch → not read-only (touch not allowlisted)
             ("rm PWN",                                      false),
             ("cargo build",                                 false),
             // piping through tee / xargs writes
