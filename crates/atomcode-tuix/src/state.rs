@@ -83,6 +83,13 @@ pub fn stream_stalled_for(awaiting_model: bool, since_activity: Option<std::time
     awaiting_model && since_activity.is_some_and(|d| d >= STREAM_STALL_HINT)
 }
 
+/// Minimum wall-clock gap between spinner frame advances. Slightly under the
+/// 100ms interval-timer period so a timer tick always advances the glyph (no
+/// visible stall), while the far more frequent per-token post-event redraws
+/// during streaming are collapsed to at most one advance per gap — otherwise
+/// the spinner blurs at token rate. See [`UiState::tick_spinner_at`].
+pub const SPINNER_MIN_ADVANCE: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// Rotating pool of "thinking" labels — CC-style playful verbs.
 /// Advances once per turn so consecutive turns vary.
 pub const THINKING_LABELS: &[&str] = &[
@@ -171,6 +178,13 @@ pub struct UiState {
     pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// When the spinner frame last actually advanced. `tick_spinner` is called
+    /// from BOTH the 100ms interval timer AND an opportunistic post-event
+    /// redraw that fires once per streamed token (to keep the footer's elapsed
+    /// clock fresh). Without a gate the per-token redraws spun the glyph dozens
+    /// of times a second during output — it looked like a blur. We rate-limit
+    /// the advance to [`SPINNER_MIN_ADVANCE`] regardless of call frequency.
+    pub spinner_last_advance: Option<std::time::Instant>,
     /// A compaction's slow LLM summary is currently running — the footer
     /// spinner shows "Compacting…" instead of a thinking label and the stall
     /// hint is compaction-specific. Set by
@@ -468,6 +482,7 @@ impl UiState {
             agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
+            spinner_last_advance: None,
             compacting: false,
             compaction_forced_streaming: false,
             subagent_activity: None,
@@ -1018,6 +1033,15 @@ impl UiState {
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
+        self.tick_spinner_at(std::time::Instant::now())
+    }
+
+    /// Frame-advance core, taking `now` so the rate limit is testable. Advances
+    /// the frame at most once per [`SPINNER_MIN_ADVANCE`], no matter how often
+    /// it's called: the interval timer (every 100ms) always clears the gate, but
+    /// the per-token post-event redraws during streaming do NOT — that's what
+    /// keeps the glyph from blurring while the model emits output.
+    fn tick_spinner_at(&mut self, now: std::time::Instant) -> &'static str {
         // Two frame sets, picked once at construction:
         //   Unicode → braille dot rotation: a true single-cell glyph. The old
         //   half-moon set (◐◓◑◒, Geometric Shapes) is often given emoji
@@ -1034,7 +1058,16 @@ impl UiState {
         } else {
             ASCII_FRAMES
         };
-        self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+        // Rate-limit the advance. `None` (first tick of a stream, or after a
+        // reset) always advances so the spinner never appears frozen on start.
+        let due = match self.spinner_last_advance {
+            Some(prev) => now.duration_since(prev) >= SPINNER_MIN_ADVANCE,
+            None => true,
+        };
+        if due {
+            self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+            self.spinner_last_advance = Some(now);
+        }
         frames[self.spinner_frame]
     }
 }
@@ -1042,6 +1075,47 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_frame_is_rate_limited_across_rapid_redraws() {
+        use std::time::Duration;
+        // Reproduces the "spins too fast during output" report: `tick_spinner`
+        // runs once per streamed token (post-event redraw), which used to
+        // advance the glyph every call. It must now advance at most once per
+        // SPINNER_MIN_ADVANCE regardless of how often it's called.
+        let mut s = UiState::with_unicode(true);
+        let t0 = std::time::Instant::now();
+
+        // First tick of the stream always advances (last_advance is None).
+        let _ = s.tick_spinner_at(t0);
+        let after_first = s.spinner_frame;
+
+        // A flood of per-token redraws inside one gap must NOT advance.
+        for ms in [1, 10, 40, 79] {
+            let _ = s.tick_spinner_at(t0 + Duration::from_millis(ms));
+            assert_eq!(
+                s.spinner_frame, after_first,
+                "redraw at +{ms}ms (< gap) must not advance the spinner",
+            );
+        }
+
+        // Once the gap elapses (the 100ms interval timer), it advances once.
+        let _ = s.tick_spinner_at(t0 + Duration::from_millis(80));
+        assert_ne!(
+            s.spinner_frame, after_first,
+            "spinner must advance once SPINNER_MIN_ADVANCE has elapsed",
+        );
+        let after_second = s.spinner_frame;
+
+        // ...and only once more even if hammered again within the next gap.
+        for ms in [85, 120, 159] {
+            let _ = s.tick_spinner_at(t0 + Duration::from_millis(ms));
+        }
+        assert_eq!(
+            s.spinner_frame, after_second,
+            "a second flood inside the next gap must not advance again",
+        );
+    }
 
     #[test]
     fn spinner_warns_only_when_model_stream_silent_past_threshold() {
@@ -1252,10 +1326,14 @@ mod tests {
     // ASCII fallback gives them readable `|/-\` and `...` instead.
     #[test]
     fn ascii_spinner_uses_pipe_slash_dash_backslash() {
+        use std::time::Duration;
         let mut s = UiState::with_unicode(false);
+        let t0 = std::time::Instant::now();
         let mut seen = Vec::new();
-        for _ in 0..4 {
-            seen.push(s.tick_spinner());
+        // Space the ticks past SPINNER_MIN_ADVANCE so each one actually advances
+        // (the rate limit only collapses redraws inside a single gap).
+        for i in 0..4 {
+            seen.push(s.tick_spinner_at(t0 + Duration::from_millis(i * 100)));
         }
         // Order is implementation detail; the SET must match.
         let mut sorted = seen.clone();
@@ -1265,13 +1343,16 @@ mod tests {
 
     #[test]
     fn unicode_spinner_uses_single_cell_braille() {
+        use std::time::Duration;
         // Braille dots are true single-cell glyphs; the old half-moon set
         // (◐◓◑◒) was often given emoji presentation and rendered oversized.
         let mut s = UiState::with_unicode(true);
+        let t0 = std::time::Instant::now();
         let mut seen = Vec::new();
-        // Walk a full cycle (frame count is an implementation detail).
-        for _ in 0..10 {
-            seen.push(s.tick_spinner());
+        // Walk a full cycle (frame count is an implementation detail), spacing
+        // ticks past the frame-advance rate limit.
+        for i in 0..10 {
+            seen.push(s.tick_spinner_at(t0 + Duration::from_millis(i * 100)));
         }
         // Every frame is a Braille Patterns glyph (U+2800..=U+28FF).
         for f in &seen {
