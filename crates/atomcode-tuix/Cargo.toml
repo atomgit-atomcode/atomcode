@@ -47,6 +47,7 @@ base64 = "0.22"
 urlencoding = "2"
 futures = "0.3"
 sha2 = "0.10"
+rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
