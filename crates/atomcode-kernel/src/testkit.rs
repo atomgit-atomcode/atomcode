@@ -1176,6 +1176,48 @@ impl Tool for ConcurrencyProbeTool {
     }
 }
 
+/// A probe whose `parallel_safe` is decided by its ARGS (mirrors BashTool: the
+/// command string decides). If args contain `"ro":true` it is parallel-safe and
+/// overlaps; else it serializes. Shares inflight/peak counters like
+/// `ConcurrencyProbeTool` so a test can assert overlap vs. barrier.
+///
+/// The `name` field is used in `execute` output so tests can check which tool ran.
+/// Fields are `pub` to allow construction from integration tests.
+pub struct ArgGatedProbeTool {
+    pub name: &'static str,
+    pub inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ArgGatedProbeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn parallel_safe(&self, args: &str) -> bool {
+        args.contains("\"ro\":true")
+    }
+    async fn execute(&self, _args: &str, _c: &ToolContext) -> ToolResult {
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: self.name.into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
