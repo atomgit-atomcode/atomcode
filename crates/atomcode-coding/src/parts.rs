@@ -143,6 +143,9 @@ pub struct CodingParts {
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
     pub mcp_plan_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub write_approval_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub bash_workspace_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub sensitive_path_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -451,6 +454,15 @@ pub async fn prepare_with_plugin_hooks(
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        write_approval_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        bash_workspace_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        sensitive_path_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -658,7 +670,9 @@ pub fn assemble(
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::new()));
+        .middleware(Arc::new(SensitivePathGate::with_store(
+            parts.sensitive_path_grants.clone(),
+        )));
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
@@ -685,8 +699,11 @@ pub fn assemble(
         // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
         // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
         .middleware(Arc::new(
-            WriteApprovalGate::new(parts.shared_cwd.clone())
-                .with_accept_edits(parts.accept_edits.clone()),
+            WriteApprovalGate::with_store(
+                parts.shared_cwd.clone(),
+                parts.write_approval_grants.clone(),
+            )
+            .with_accept_edits(parts.accept_edits.clone()),
         ))
         // Workspace-aware approval for DESTRUCTIVE bash (rm/mv/cp/dd/redirect…) whose target
         // lands OUTSIDE the workspace: prompt with a per-directory "Always", mirroring
@@ -695,7 +712,10 @@ pub fn assemble(
         // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
         // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
         // edits only); full Auto bypasses it via the driver auto-answering.
-        .middleware(Arc::new(BashWorkspaceGate::new(parts.shared_cwd.clone())))
+        .middleware(Arc::new(BashWorkspaceGate::with_store(
+            parts.shared_cwd.clone(),
+            parts.bash_workspace_grants.clone(),
+        )))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.

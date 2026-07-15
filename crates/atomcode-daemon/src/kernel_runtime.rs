@@ -955,6 +955,10 @@ impl KernelDriver {
         // Approval grants + plan mode survive the respawn (same contract as bridge).
         parts.approval = self.parts.approval.clone();
         parts.plan_mode = self.parts.plan_mode.clone();
+        parts.mcp_plan_grants = self.parts.mcp_plan_grants.clone();
+        parts.write_approval_grants = self.parts.write_approval_grants.clone();
+        parts.bash_workspace_grants = self.parts.bash_workspace_grants.clone();
+        parts.sensitive_path_grants = self.parts.sensitive_path_grants.clone();
         parts
             .plan_mode
             .store(plan_mode, std::sync::atomic::Ordering::Relaxed);
