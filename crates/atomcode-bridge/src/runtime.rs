@@ -2013,6 +2013,9 @@ impl Bridge {
                 self.pending_finish = Some(reason);
                 let _ = self.handle.commands.send(KCmd::Snapshot);
             }
+            KEv::Steered { count } => {
+                self.emit(CoreEv::Steered { count });
+            }
             _ => {}
         }
     }

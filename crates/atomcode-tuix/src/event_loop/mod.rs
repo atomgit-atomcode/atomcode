@@ -10863,6 +10863,9 @@ fn handle_agent_event(
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
+        AgentEvent::Steered { count } => {
+            state.on_steered(count);
+        }
     }
 }
 
@@ -11446,6 +11449,10 @@ fn format_spinner_label(
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
+    }
+    if state.steered_folded > 0 {
+        use std::fmt::Write;
+        let _ = write!(out, " · 已并入 {}", state.steered_folded);
     }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall

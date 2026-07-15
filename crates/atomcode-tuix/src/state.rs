@@ -409,6 +409,11 @@ pub struct UiState {
     /// Any other event flushes this buffer with the usual `↻ goal round N`
     /// or `✓ done` label.
     pub pending_separator: Option<PendingSeparator>,
+    /// Running count of mid-turn steers folded into the current turn by the
+    /// kernel (`AgentEvent::Steered { count }`). Accumulates over the turn;
+    /// cleared at turn end and at new turn start. Surfaced in the footer
+    /// spinner label as `· 已并入 N` when non-zero.
+    pub steered_folded: usize,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -533,6 +538,7 @@ impl UiState {
             loop_round: 0,
             loop_started_at: None,
             pending_separator: None,
+            steered_folded: 0,
         }
     }
 
@@ -762,6 +768,9 @@ impl UiState {
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
+        // Belt-and-suspenders: a fresh turn always starts with zero steers, even
+        // if the previous turn ended abnormally and never fired on_turn_complete.
+        self.steered_folded = 0;
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -791,6 +800,7 @@ impl UiState {
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
+        self.steered_folded = 0;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -807,6 +817,12 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.approval_panel = None;
+    }
+
+    /// A mid-turn steer was folded into the running turn (kernel `Steered` event).
+    /// Accumulates over the turn; cleared at turn end.
+    pub fn on_steered(&mut self, count: usize) {
+        self.steered_folded += count;
     }
 
     pub fn on_error(&mut self) {
@@ -1826,5 +1842,18 @@ mod tests {
         assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
         assert_eq!(p.accel_index('n'), Some(2));
         assert_eq!(p.accel_index('z'), None);
+    }
+
+    #[test]
+    fn steered_folded_accumulates_and_clears_per_turn() {
+        let mut st = UiState::new();
+        st.on_steered(1);
+        st.on_steered(2);
+        assert_eq!(st.steered_folded, 3, "folded count accumulates within a turn");
+        st.on_turn_complete();
+        assert_eq!(st.steered_folded, 0, "cleared at turn end");
+        st.on_steered(5);
+        st.on_submit();
+        assert_eq!(st.steered_folded, 0, "a fresh turn starts at 0");
     }
 }

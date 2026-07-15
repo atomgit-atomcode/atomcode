@@ -551,6 +551,10 @@ pub enum AgentEvent {
     SessionSwitched(String),
     /// daemon 给当前活动会话改名。TUI 据此更新会话选择器与头部显示。
     SessionRenamed { name: String },
+    /// One or more user prompts were folded ("steered") into the running turn at
+    /// a round boundary. `count` is the number folded this round. Drivers surface
+    /// a running "folded into current turn" count in the footer while streaming.
+    Steered { count: usize },
 }
 
 /// The current phase of the agent (for UI display).
