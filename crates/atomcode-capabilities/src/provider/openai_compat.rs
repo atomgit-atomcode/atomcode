@@ -779,6 +779,8 @@ fn error_code(err: &serde_json::Value) -> Option<String> {
 // SSE decoding (unit-testable, no network)
 // ---------------------------------------------------------------------------
 
+const MAX_TOOL_CALL_DELTAS: usize = 20000;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -792,6 +794,8 @@ struct SseDecoder {
     done: bool,
     /// True once the provider's response id has been emitted (emit it exactly once).
     response_id_seen: bool,
+    seen_finish: bool,
+    tool_call_delta_count: usize,
 }
 
 impl SseDecoder {
@@ -803,6 +807,8 @@ impl SseDecoder {
             truncated: false,
             done: false,
             response_id_seen: false,
+            seen_finish: false,
+            tool_call_delta_count: 0,
         }
     }
 
@@ -910,7 +916,12 @@ impl SseDecoder {
             }
         }
         if let Some(tcs) = choice.delta.tool_calls {
+            if self.seen_finish || self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
+                out.extend(self.finish());
+                return;
+            }
             for tc in tcs {
+                self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
@@ -952,14 +963,14 @@ impl SseDecoder {
             }
         }
         if let Some(fr) = choice.finish_reason {
-            match fr.as_str() {
-                "tool_calls" => {
-                    for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-                        out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
-                    }
+            self.seen_finish = true;
+            for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+                if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
                 }
-                "length" => self.truncated = true,
-                _ => {}
+            }
+            if fr == "length" {
+                self.truncated = true;
             }
         }
     }
@@ -1754,6 +1765,48 @@ mod tests {
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn sse_degenerate_stream_after_finish_reason() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"ok"}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()));
+        assert!(!d.done);
+
+        // This tool call delta chunk arrives after finish_reason.
+        // It must trigger early termination:
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x"}}]}}]})).as_bytes()));
+        assert!(d.done);
+        assert_eq!(kinds(&ev), vec!["text", "done"]);
+
+        // Any further feed calls should produce nothing because the decoder is done.
+        let further = d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"y"}}]}}]})).as_bytes());
+        assert!(further.is_empty());
+    }
+
+    #[test]
+    fn sse_degenerate_stream_exceeding_hard_limit() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // Send a tool call delta 20000 times.
+        // On the 20001-th time, it should terminate.
+        let delta_chunk = line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}));
+        let delta_bytes = delta_chunk.as_bytes();
+        for _ in 0..20000 {
+            ev.extend(d.feed(delta_bytes));
+            if d.done {
+                break;
+            }
+        }
+        // At this point, tool_call_delta_count should be exactly 20000. It hasn't terminated yet.
+        assert!(!d.done);
+
+        // The 20001-st chunk should trigger early termination.
+        ev.extend(d.feed(delta_bytes));
+        assert!(d.done);
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
     }
 
     // ---- mid-stream re-open (v1 parity: retry a body that dies before any event) ----
