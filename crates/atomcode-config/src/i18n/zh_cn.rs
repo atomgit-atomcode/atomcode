@@ -1161,6 +1161,27 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliAboutHelp => "打印帮助信息".into(),
         Msg::CliHelpMcpCommand => "可执行文件及参数".into(),
 
+        // ── /usage modal ──
+        Msg::UsageTabCurrent => "当前窗口".into(),
+        Msg::UsageTabOverview => "总览".into(),
+        Msg::UsageTabModels => "模型".into(),
+        Msg::UsageCurrentTitle => "速率限制窗口".into(),
+        Msg::UsageResetsIn { hms } => format!("剩余重置时间 {hms}").into(),
+        Msg::UsageWindowUnavailable => "窗口数据不可用".into(),
+        Msg::UsageStatFavorite => "最常用模型".into(),
+        Msg::UsageStatTotal => "总 Token 数".into(),
+        Msg::UsageStatRequests => "请求次数".into(),
+        Msg::UsageStatActiveDays => "活跃天数".into(),
+        Msg::UsageStatMostActive => "最活跃日期".into(),
+        Msg::UsageStatLongestStreak => "最长连续天数".into(),
+        Msg::UsageStatCurrentStreak => "当前连续天数".into(),
+        Msg::UsageHeatLess => "少".into(),
+        Msg::UsageHeatMore => "多".into(),
+        Msg::UsageModelsTitle => "各模型用量".into(),
+        Msg::UsageNoData => "暂无用量数据".into(),
+        Msg::UsageFooterHint => "Tab / 1·2·3 切换 · Esc 关闭".into(),
+        Msg::UsageFetchFailed { error } => format!("加载用量失败：{error}").into(),
+
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
