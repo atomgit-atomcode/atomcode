@@ -4415,11 +4415,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 left.push(row);
             }
         }
-        // cwd + model bullets (reuse the existing wrapped-bullet helper)
+        // cwd + model bullets render BELOW the two-column (mascot | tips) block —
+        // NEVER zipped into it. If they were part of the left column, a tips list
+        // taller than the mascot (e.g. 5 tip rows vs a 4-row mascot) would overflow
+        // its extra rows onto the cwd/model rows (`∙ proj/goal  set a goal…`).
+        let mut below: Vec<Vec<Cell>> = Vec::new();
         for text in [working_dir, model] {
             let mut cells = Vec::new();
             push_str_cells(&mut cells, text, &secondary);
-            left.extend(self.build_prefixed_wrapped_rows(
+            below.extend(self.build_prefixed_wrapped_rows(
                 "∙ ",
                 &bullet,
                 "  ",
@@ -4461,6 +4465,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // wider cwd/model bullet rows would staircase the tips onto them — stack
         // instead.
         if show_mascot && content_w >= tips_col + min_right {
+            // Two columns: mascot | tips. Zip ONLY the mascot with the tips.
             let n = left.len().max(right.len());
             for i in 0..n {
                 let mut row = left.get(i).cloned().unwrap_or_default();
@@ -4473,9 +4478,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
                 rows.push(row);
             }
+            // cwd/model below the whole two-column block.
+            rows.extend(below);
         } else {
-            // stacked: left block, then right block (indented by PAD_COL)
+            // stacked: mascot (if any), then cwd/model, then tips (indented).
             rows.extend(left);
+            rows.extend(below);
             for rrow in right {
                 let mut row = Vec::new();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
@@ -15031,6 +15039,32 @@ mod tests {
         assert!(!text.contains('#'), "mascot must be omitted, not '#'-downgraded");
         assert!(!text.contains('\u{2580}') && !text.contains('\u{2584}'));
         assert!(text.contains("/login"), "tips still present without a mascot");
+    }
+
+    /// When the tips column is TALLER than the mascot (e.g. the 4-row mascot vs
+    /// a 5-row tips block), the overflow tips must NOT land on the cwd/model
+    /// rows. Regression: a `/tip` was merged onto the cwd bullet
+    /// (`∙ proj/goal   set a goal…`). cwd/model must render BELOW the two-column
+    /// block, never zipped into it.
+    #[test]
+    fn welcome_tall_tips_do_not_merge_into_cwd_row() {
+        let (mut r, _c) = new_counting(120, 30);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        // slash-free cwd/model so any '/' on the cwd row can only be a leaked tip
+        r.push_welcome("glm", "proj");
+        let cwd_row: String = r
+            .body_lines
+            .iter()
+            .find(|row| row.iter().map(|c| c.ch).collect::<String>().contains("proj"))
+            .expect("cwd row present")
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            !cwd_row.contains('/'),
+            "a tip leaked onto the cwd row: {cwd_row:?}"
+        );
     }
 
     /// With colours disabled the mascot is omitted, so the welcome must STACK
