@@ -1466,6 +1466,10 @@ impl Bridge {
         // Plan mode survives a respawn (/resume, /clear, model swap).
         parts.plan_mode = self.parts.plan_mode.clone();
         parts.bypass_mode = self.parts.bypass_mode.clone();
+        parts.mcp_plan_grants = self.parts.mcp_plan_grants.clone();
+        parts.write_approval_grants = self.parts.write_approval_grants.clone();
+        parts.bash_workspace_grants = self.parts.bash_workspace_grants.clone();
+        parts.sensitive_path_grants = self.parts.sensitive_path_grants.clone();
         // Re-mount the kernel-side schedule_wakeup tool on the FRESH parts (a respawn
         // rebuilds `parts` from scratch, so the tool registered in `run` is gone). Hand
         // it the bridge's stored sender so the new agent's wakeups still reach THIS

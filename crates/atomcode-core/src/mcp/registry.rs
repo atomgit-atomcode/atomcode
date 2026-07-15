@@ -186,12 +186,12 @@ impl McpRegistry {
                                     servers.insert(name.clone(), Arc::from(client));
                                     drop(servers);
                                     if config.trust {
-                                        trusted_servers.write().unwrap().insert(name.clone());
+                                        trusted_servers.write().unwrap_or_else(|e| e.into_inner()).insert(name.clone());
                                     }
                                     for tool in &config.auto_approve {
                                         auto_approved_tools
                                             .write()
-                                            .unwrap()
+                                            .unwrap_or_else(|e| e.into_inner())
                                             .insert(format!("mcp__{}__{}", name, tool));
                                     }
                                     let mut timeouts = server_timeouts_ms.write().await;
@@ -293,19 +293,19 @@ impl McpRegistry {
 
     /// Mark a server as trusted (its tools auto-approve). Tests + config-load (`trust: true`).
     pub fn mark_trusted(&self, server_name: &str) {
-        self.trusted_servers.write().unwrap().insert(server_name.to_string());
+        self.trusted_servers.write().unwrap_or_else(|e| e.into_inner()).insert(server_name.to_string());
     }
     /// Whether a server's tools should bypass interactive approval.
     pub fn is_server_trusted(&self, server_name: &str) -> bool {
-        self.trusted_servers.read().unwrap().contains(server_name)
+        self.trusted_servers.read().unwrap_or_else(|e| e.into_inner()).contains(server_name)
     }
     /// Permanently auto-approve a single tool (full name `mcp__{server}__{tool}`).
     pub fn mark_tool_auto_approved(&self, full_tool_name: &str) {
-        self.auto_approved_tools.write().unwrap().insert(full_tool_name.to_string());
+        self.auto_approved_tools.write().unwrap_or_else(|e| e.into_inner()).insert(full_tool_name.to_string());
     }
     /// Whether a specific tool is permanently auto-approved.
     pub fn is_tool_auto_approved(&self, full_tool_name: &str) -> bool {
-        self.auto_approved_tools.read().unwrap().contains(full_tool_name)
+        self.auto_approved_tools.read().unwrap_or_else(|e| e.into_inner()).contains(full_tool_name)
     }
     /// Split a full MCP tool name (`mcp__{server}__{tool}`) into (server, tool),
     /// matching known server names so server names containing `__` still resolve.
@@ -362,12 +362,12 @@ impl McpRegistry {
         servers.insert(config.name.clone(), Arc::from(client));
         drop(servers);
         if config.trust {
-            self.trusted_servers.write().unwrap().insert(config.name.clone());
+            self.trusted_servers.write().unwrap_or_else(|e| e.into_inner()).insert(config.name.clone());
         }
         for tool in &config.auto_approve {
             self.auto_approved_tools
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(format!("mcp__{}__{}", config.name, tool));
         }
         let mut timeouts = self.server_timeouts_ms.write().await;
