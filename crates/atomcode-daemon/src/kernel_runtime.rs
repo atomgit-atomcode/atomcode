@@ -872,16 +872,42 @@ impl KernelDriver {
         }
     }
 
-    /// Bounded teardown of the OLD kernel task: send `Shutdown`, then await it up to
-    /// `grace`, aborting on a wedge so a stuck SessionEnd hook can't hang the driver.
-    /// Inlined from bridge's private `await_kernel_or_abort` (runtime.rs:135) — a
-    /// respawn/swap tears the old handle down before installing the new one.
+    /// Bounded teardown of the OLD kernel task: send `Shutdown`, drain its remaining
+    /// events, then await it up to `grace`. Draining preserves an accepted compact's
+    /// terminal before a respawn/reload re-reads the canonical snapshot.
     async fn shutdown_old_handle(&mut self, grace: std::time::Duration) {
         let _ = self.handle.commands.send(KCmd::Shutdown);
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
-        if tokio::time::timeout(grace, &mut task).await.is_err() {
-            task.abort();
+        let timeout = tokio::time::sleep(grace);
+        tokio::pin!(timeout);
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                result = &mut task => {
+                    let _ = result;
+                    break;
+                }
+                event = self.handle.events.recv(), if events_open => match event {
+                    Some(event) => self.on_kernel_event(event),
+                    None => events_open = false,
+                },
+                () = &mut timeout => {
+                    task.abort();
+                    let _ = (&mut task).await;
+                    break;
+                }
+            }
         }
+        while let Ok(event) = self.handle.events.try_recv() {
+            self.on_kernel_event(event);
+        }
+        // A late TurnComplete drained above may have armed a Snapshot request after
+        // the old task had already exited. Close that lifecycle now and clear every
+        // old-handle id/timer before the replacement starts emitting events.
+        for event in self.tx.terminate_pending() {
+            self.emit_legacy(event);
+        }
+        self.tx.reset_turn_state();
     }
 
     /// Re-`prepare` + re-`assemble` the kernel agent against the CURRENT
@@ -1008,49 +1034,53 @@ impl KernelDriver {
     /// SAME `parts` so the conversation + approval grants survive — then swap the
     /// kernel handle. NOT a respawn (no re-prepare). Ported from bridge's
     /// `ReloadConfig` handler (runtime.rs:1031), MINUS `refresh_subagent_tiers` and
-    /// all loop cleanup (deferred). If assemble fails, the OLD handle is KEPT so the
-    /// driver stays alive for another retry.
+    /// all loop cleanup (deferred). The old handle is stopped before `assemble` so the
+    /// replacement always reloads the last checkpoint written by that handle.
     async fn reload_config(&mut self, config: atomcode_config::config::Config) {
-        // A swap tears down the running kernel; settle the translator's per-turn
-        // state so a parked approval / deferred finish isn't stranded on the new
-        // handle. deferred (daemon kernel path): bridge also settles an in-flight
-        // turn snapshot + a sleeping loop here — scoped out (no goal/loop).
         let Some(p) = config.providers.get(&config.default_provider) else {
             return;
         };
-        atomcode_bridge::apply_reload_provider(&mut self.coding_cfg, p);
+        // Validate the replacement provider before disturbing the live runtime.
+        let mut next_cfg = self.coding_cfg.clone();
+        atomcode_bridge::apply_reload_provider(&mut next_cfg, p);
         // deferred (daemon kernel path): `refresh_subagent_tiers` (strong/weak
         // routing re-resolve on a /model swap) is scoped out.
-        match atomcode_bridge::build_provider(&self.coding_cfg) {
-            Ok(provider) => {
-                // Assemble BEFORE tearing down the old handle: if assemble fails, the
-                // old (possibly noop) handle stays intact and the driver keeps running.
-                match assemble(&mut self.parts, &self.coding_cfg, provider) {
-                    Ok(a) => {
-                        let new_handle = a.spawn();
-                        // Close the lifecycle + clear stale translator state, then swap.
-                        for ce in self.tx.terminate_pending() {
-                            self.emit_legacy(ce);
-                        }
-                        self.tx.reset_turn_state();
-                        self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
-                        self.handle = new_handle;
-                        self.degraded = false;
-                    }
-                    Err(e) => {
-                        // KEEP the old handle (may be noop) so the driver stays alive.
-                        self.emit_legacy(CoreEv::Error {
-                            error: format!("provider switch failed: {e}"),
-                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
-                        });
-                    }
-                }
-            }
+        let provider = match atomcode_bridge::build_provider(&next_cfg) {
+            Ok(provider) => provider,
             Err(e) => {
                 self.emit_legacy(CoreEv::Error {
                     error: format!("engine v2 provider init failed: {e}"),
                     snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                 });
+                return;
+            }
+        };
+
+        // A swap tears down the running kernel; settle the translator's per-turn
+        // state so a parked approval / deferred finish isn't stranded on the new
+        // handle. deferred (daemon kernel path): bridge also settles an in-flight
+        // turn snapshot + a sleeping loop here — scoped out (no goal/loop).
+        for ce in self.tx.terminate_pending() {
+            self.emit_legacy(ce);
+        }
+        self.tx.reset_turn_state();
+        self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
+
+        match assemble(&mut self.parts, &next_cfg, provider) {
+            Ok(a) => {
+                self.handle = a.spawn();
+                self.coding_cfg = next_cfg;
+                self.degraded = false;
+            }
+            Err(e) => {
+                self.emit_legacy(CoreEv::Error {
+                    error: format!("provider switch failed: {e}"),
+                    snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                });
+                // The old task is already stopped to satisfy `assemble`'s
+                // single-agent contract. Keep the driver responsive for a retry.
+                self.handle = noop_handle();
+                self.degraded = true;
             }
         }
     }
@@ -2106,6 +2136,8 @@ mod kernel_runtime_translate_tests {
 #[cfg(test)]
 mod kernel_runtime_driver_tests {
     use super::*;
+    use atomcode_config::config::provider::ProviderConfig;
+    use atomcode_config::config::Config;
     use atomcode_core::agent::AgentCommand as CoreCmd;
     use std::path::PathBuf;
 
@@ -2138,6 +2170,19 @@ mod kernel_runtime_driver_tests {
         }
     }
 
+    fn local_reload_config() -> Config {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "openai",
+            "api_key": "sk-reloaded",
+            "model": "gpt-4o-mini",
+            "base_url": "http://localhost:9/v1"
+        }))
+        .expect("valid local provider");
+        let mut config = Config::with_default_provider("local");
+        config.providers.insert("local".into(), provider);
+        config
+    }
+
     #[tokio::test]
     async fn spawn_returns_client_and_rx_then_shutdown_closes_it() {
         let (client, mut rx) = spawn_kernel_runtime(local_openai_cfg());
@@ -2162,5 +2207,35 @@ mod kernel_runtime_driver_tests {
         })
         .await;
         assert!(closed.is_ok(), "driver did not tear down within 5s after Shutdown");
+    }
+
+    #[tokio::test]
+    async fn reload_config_replaces_agent_without_error() {
+        let (client, mut rx) = spawn_kernel_runtime(local_openai_cfg());
+
+        client
+            .cmd_tx
+            .send(CoreCmd::ReloadConfig(local_reload_config()))
+            .expect("reload command channel open");
+        client
+            .cmd_tx
+            .send(CoreCmd::Shutdown)
+            .expect("shutdown command channel open");
+
+        let errors = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut errors = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let DaemonRuntimeEvent::Legacy(CoreEv::Error { error, .. }) = event {
+                    errors.push(error);
+                }
+            }
+            errors
+        })
+        .await
+        .expect("driver did not remain responsive after provider reload");
+        assert!(
+            errors.is_empty(),
+            "provider reload emitted errors: {errors:?}"
+        );
     }
 }

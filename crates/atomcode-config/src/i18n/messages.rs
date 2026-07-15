@@ -903,6 +903,7 @@ pub enum Msg<'a> {
     CompactNothingShort,
     CompactStarting,
     CompactInterrupted,
+    CompactUnavailableDuringSync,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
     /// Footer spinner label while a compaction's LLM summary runs (slow tier).

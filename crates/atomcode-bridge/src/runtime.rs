@@ -1000,6 +1000,18 @@ impl Bridge {
                 // Switch to the (possibly new) default provider, same parts —
                 // approval grants + conversation survive (C1 respawn semantics).
                 if let Some(p) = config.providers.get(&config.default_provider) {
+                    // Validate the replacement provider before disturbing the live
+                    // runtime. Keep `self.coding_cfg` aligned with the installed agent
+                    // until the replacement has actually been installed.
+                    let mut next_cfg = self.coding_cfg.clone();
+                    apply_reload_provider(&mut next_cfg, p);
+                    let provider = match build_provider(&next_cfg) {
+                        Ok(provider) => provider,
+                        Err(e) => {
+                            self.emit(provider_init_event(&e));
+                            return false;
+                        }
+                    };
                     // Freeze native compact delivery before settling the current turn.
                     // Otherwise `/compact` can enter the old kernel during the settle
                     // window and lose its terminal when the provider handle is replaced.
@@ -1023,62 +1035,69 @@ impl Bridge {
                         // Idle instead of stuck Streaming.
                         self.finish_turn(StopReason::Cancelled, messages);
                     }
-                    apply_reload_provider(&mut self.coding_cfg, p);
-                    // Re-resolve the subagent tier cells against the NEW host model so
-                    // strong/weak routing follows a `/model` swap (the cells are shared with
-                    // the already-built TaskTool, so no respawn is needed).
-                    refresh_subagent_tiers(&self.coding_cfg);
-                    match build_provider(&self.coding_cfg) {
-                        Ok(provider) => {
-                            // Assemble BEFORE tearing down the old handle — if
-                            // assemble fails, the old (possibly noop) handle
-                            // stays intact and the bridge keeps running.
-                            match assemble(&mut self.parts, &self.coding_cfg, provider) {
-                                Ok(a) => {
-                                    let new_handle = a.spawn();
-                                    if self.handle.replace_agent(new_handle).await.is_err()
-                                        || self.handle.resume_compaction().await.is_err()
-                                    {
-                                        self.emit(CoreEv::Error {
-                                            error: "provider switch failed: coding runtime is unavailable"
-                                                .into(),
-                                            snapshot: ConversationSnapshot::default(),
-                                        });
-                                        self.degraded = true;
-                                        return false;
-                                    }
-                                    self.degraded = false;
-                                    // Clear any stale state that may have accumulated
-                                    // while the (possibly noop) old handle was active.
-                                    self.turn_running = false;
-                                    self.pending_approval = None;
-                                    self.pending_finish = None;
-                                    self.pending_sync = false;
-                                    self.pending_undo = None;
-                                    self.pending_goal = None;
-                                    // A /model swap starts the new provider on the same
-                                    // conversation but a held-open loop turn is gone; drop
-                                    // the loop and cancel any pending continuation so it
-                                    // can't fire into the swapped session.
-                                    self.loop_cancel.cancel();
-                                    self.loop_state = None;
-                                    self.pending_wakeup = None;
-                                    self.loop_pending_finish = None;
-                                }
-                                Err(e) => {
-                                    let _ = self.handle.resume_compaction().await;
-                                    self.emit(CoreEv::Error {
-                                        error: format!("provider switch failed: {e}"),
-                                        snapshot: ConversationSnapshot::default(),
-                                    });
-                                    // Keep the existing handle (may be noop_handle) so
-                                    // the bridge stays alive for another retry.
-                                }
+                    // `assemble` reloads the canonical snapshot from disk. The old
+                    // agent must finish first so an accepted compact cannot checkpoint
+                    // after the replacement has already captured a stale snapshot.
+                    if self.handle.stop_agent().await.is_err() {
+                        self.emit(CoreEv::Error {
+                            error: "provider switch failed: coding runtime is unavailable".into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                        self.degraded = true;
+                        return false;
+                    }
+                    match assemble(&mut self.parts, &next_cfg, provider) {
+                        Ok(a) => {
+                            if self.handle.replace_agent(a.spawn()).await.is_err() {
+                                self.emit(CoreEv::Error {
+                                    error: "provider switch failed: coding runtime is unavailable"
+                                        .into(),
+                                    snapshot: ConversationSnapshot::default(),
+                                });
+                                self.degraded = true;
+                                return false;
                             }
+                            self.coding_cfg = next_cfg;
+                            // Re-resolve the subagent tier cells against the NEW host model so
+                            // strong/weak routing follows a `/model` swap (the cells are shared
+                            // with the already-built TaskTool, so no respawn is needed).
+                            refresh_subagent_tiers(&self.coding_cfg);
+                            if self.handle.resume_compaction().await.is_err() {
+                                self.emit(CoreEv::Error {
+                                    error: "provider switch failed: coding runtime is unavailable"
+                                        .into(),
+                                    snapshot: ConversationSnapshot::default(),
+                                });
+                                self.degraded = true;
+                                return false;
+                            }
+                            self.degraded = false;
+                            // Clear any stale state that may have accumulated
+                            // while the (possibly noop) old handle was active.
+                            self.turn_running = false;
+                            self.pending_approval = None;
+                            self.pending_finish = None;
+                            self.pending_sync = false;
+                            self.pending_undo = None;
+                            self.pending_goal = None;
+                            // A /model swap starts the new provider on the same
+                            // conversation but a held-open loop turn is gone; drop
+                            // the loop and cancel any pending continuation so it
+                            // can't fire into the swapped session.
+                            self.loop_cancel.cancel();
+                            self.loop_state = None;
+                            self.pending_wakeup = None;
+                            self.loop_pending_finish = None;
                         }
                         Err(e) => {
-                            let _ = self.handle.resume_compaction().await;
-                            self.emit(provider_init_event(&e));
+                            self.emit(CoreEv::Error {
+                                error: format!("provider switch failed: {e}"),
+                                snapshot: ConversationSnapshot::default(),
+                            });
+                            // The old task is already stopped to honor `assemble`'s
+                            // single-agent contract. Keep the inert owner alive so a
+                            // later provider switch can retry without corrupting state.
+                            self.degraded = true;
                         }
                     }
                 }

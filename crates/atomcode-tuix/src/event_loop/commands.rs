@@ -475,6 +475,14 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
+fn compact_sync_guard(sync_active: bool) -> Result<(), Msg<'static>> {
+    if sync_active {
+        Err(Msg::CompactUnavailableDuringSync)
+    } else {
+        Ok(())
+    }
+}
+
 /// Fire one iteration of a fixed-interval `/loop`.
 ///
 /// Bumps the round, clears `due`, and re-arms `next_fire_at` (so the next
@@ -1575,14 +1583,21 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-            // The runtime reports the authoritative outcome asynchronously.
-            // Don't pre-render a placeholder: a committed shrink and a
-            // short-conversation no-op produce different output based on the
-            // current runtime state.
-            if let Err(error) = ctx.runtime.compact(focus) {
-                renderer.render(UiLine::Error(error.to_string()));
+            if let Err(error) = compact_sync_guard(ctx.sync_session.is_some()) {
+                // LiveSession owns the authoritative conversation while attached.
+                // The local runtime is intentionally stale after remote turns.
+                renderer.render(UiLine::Error(t(error).into_owned()));
                 renderer.flush();
+            } else {
+                let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+                // The runtime reports the authoritative outcome asynchronously.
+                // Don't pre-render a placeholder: a committed shrink and a
+                // short-conversation no-op produce different output based on the
+                // current runtime state.
+                if let Err(error) = ctx.runtime.compact(focus) {
+                    renderer.render(UiLine::Error(error.to_string()));
+                    renderer.flush();
+                }
             }
         }
         "remember" => {
@@ -5834,6 +5849,19 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_sync_guard_rejects_stale_local_runtime() {
+        assert_eq!(
+            compact_sync_guard(true),
+            Err(Msg::CompactUnavailableDuringSync)
+        );
+    }
+
+    #[test]
+    fn compact_sync_guard_allows_local_runtime_without_sync() {
+        assert_eq!(compact_sync_guard(false), Ok(()));
+    }
 
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and

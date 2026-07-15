@@ -1119,6 +1119,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_agent_drains_compacted_before_returning() {
+        let first = shutdown_reporting_agent(true, true);
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(first, controls, runtime_tx, true);
+
+        handle.compact(Some("before reload".into())).unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::CompactionStarted { .. })
+        ));
+
+        adapter.stop_agent().await.unwrap();
+
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            }) if outcome.committed && outcome.removed_messages == 2
+        ));
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn replace_interrupts_started_compaction_without_kernel_terminal() {
         let first = shutdown_reporting_agent(true, false);
         let (handle, controls) = coding_runtime_control_channel();

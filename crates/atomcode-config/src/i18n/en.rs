@@ -998,6 +998,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CompactStarting => "(compacting with LLM summary...)\n".into(),
         Msg::CompactInterrupted =>
             "(compaction interrupted — the coding runtime changed or stopped)\n".into(),
+        Msg::CompactUnavailableDuringSync =>
+            "Cannot compact while live sync is active; run /sync off first".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("(nothing to compact — would not save tokens: {} → {})\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } => {

@@ -982,6 +982,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CompactNothingShort => "（无需压缩 — 当前对话较短）\n".into(),
         Msg::CompactStarting => "（正在使用 LLM 摘要进行压缩...）\n".into(),
         Msg::CompactInterrupted => "（压缩已中断 — coding runtime 已变更或停止）\n".into(),
+        Msg::CompactUnavailableDuringSync =>
+            "同步模式下 /compact 暂不可用；请先执行 /sync off".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
