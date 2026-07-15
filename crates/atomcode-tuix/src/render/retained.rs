@@ -960,7 +960,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             + 1;
         let cont_pad = " ".repeat(header_cols.saturating_sub(4));
         let width = (self.screen.width() as usize).saturating_sub(header_cols).max(8);
-        let safe_cmd = crate::glyph::downgrade_glyphs(safe_detail, self.caps.unicode_symbols);
+        // Display-only: shorten `$HOME/…` → `~/…` so long paths are less likely to
+        // overflow the window (like the footer shows `~/…` for the cwd; best-effort —
+        // no-op on Windows backslash/casing paths). The executed command and the
+        // transcript copy keep the real absolute path.
+        let shortened = crate::platform::collapse_home_in_command(safe_detail);
+        let safe_cmd = crate::glyph::downgrade_glyphs(&shortened, self.caps.unicode_symbols);
         let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
         let last = lines.len().saturating_sub(1);
         let mut rows = Vec::with_capacity(lines.len());

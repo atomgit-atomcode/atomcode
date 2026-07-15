@@ -12258,8 +12258,29 @@ pub(crate) fn summarise(output: &str) -> String {
     }
 }
 
+/// 把 `s` 切成 (head, tail):head 是显示宽度 ≤ `max` 列的最长前缀,绝不从**字素簇**
+/// 中间切开(ZWJ emoji/组合字/宽字整体挪到 tail)。按字素簇+`cluster_width` 度量,
+/// 与调用方推进 `line_len` 用的 `display_width` 完全一致,避免宽度对不齐导致产出行
+/// 反而超宽被 paint 层裁掉。保证前进:至少取一个字素簇,故调用方可循环折到穷尽不死循环。
+/// 前置:`max` 应 ≥ 最宽单簇(2 列),否则单簇本身就超 `max`(仅在退化窄宽度下,生产
+/// 调用方已把 width clamp 到 ≥8 故不触发)。
+fn split_head_by_width(s: &str, max: usize) -> (&str, &str) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut w = 0usize;
+    for (i, g) in s.grapheme_indices(true) {
+        let cw = crate::width::cluster_width(g);
+        if i > 0 && w + cw > max {
+            return (&s[..i], &s[i..]);
+        }
+        w += cw;
+    }
+    (s, "")
+}
+
 /// 把一条 shell 命令软折成多行,按续行边界优先断行,续行缩进 4 空格。
-/// 绝不从非空白 token 中间硬断,绝不加省略/截断标记——命令必须可读、看得全。
+/// 优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长路径/长 URL)、
+/// 空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全),让整段可见而不被 paint
+/// 层无省略地硬裁。绝不加省略/截断标记——命令必须看得全。
 pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
     let cmd = cmd.trim_end();
     if cmd.is_empty() {
@@ -12296,7 +12317,7 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
     }
     if !cur.is_empty() { segments.push(cur); }
 
-    // 2) 每段再按 width 软折(只在空格处断,绝不切 token);续行缩进 4 空格。
+    // 2) 每段再按 width 软折(优先空格断);续行缩进 4 空格。
     let indent = "    ";
     let mut out: Vec<String> = Vec::new();
     for (seg_idx, seg) in segments.iter().enumerate() {
@@ -12305,6 +12326,32 @@ pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
         let mut line_len = lead.len();
         for word in seg.split(' ') {
             let wlen = crate::width::display_width(word);
+            // 单个 token 本身就比一个续行(去掉缩进)的可用宽度还宽 → 空格断不开,
+            // 按显示宽度字符级折断,让整段可见而不被 paint 层无省略地硬裁。仅在
+            // token 单独放不下时触发;放得下的 token 永不被切。
+            if wlen > width.saturating_sub(indent.len()).max(1) {
+                // 先把当前行冲掉,让超宽 token 从新行(可能是行 0 的空 lead)起。
+                if line_len > lead.len() {
+                    out.push(std::mem::take(&mut line));
+                    line.push_str(indent);
+                    line_len = indent.len();
+                }
+                let mut rest = word;
+                loop {
+                    let avail = width.saturating_sub(line_len).max(1);
+                    let (head, tail) = split_head_by_width(rest, avail);
+                    line.push_str(head);
+                    line_len += crate::width::display_width(head);
+                    rest = tail;
+                    if rest.is_empty() {
+                        break;
+                    }
+                    out.push(std::mem::take(&mut line));
+                    line.push_str(indent);
+                    line_len = indent.len();
+                }
+                continue;
+            }
             let need = if line_len == lead.len() { wlen } else { wlen + 1 };
             if line_len > lead.len() && line_len + need > width {
                 out.push(std::mem::take(&mut line));
@@ -12877,11 +12924,95 @@ mod format_shell_command_tests {
     }
 
     #[test]
-    fn never_splits_mid_token() {
-        // 一个超宽无空格的 token 必须整体留在一行(不硬断)
+    fn token_that_fits_is_never_split() {
+        // 能装下的 token(width 60 容得下)绝不被切,整体留一行。
         let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
-        let out = format_shell_command(long, 20);
-        assert!(out.iter().any(|l| l.contains(long)), "token stays intact: {:?}", out);
+        let out = format_shell_command(long, 60);
+        assert!(out.iter().any(|l| l.contains(long)), "fitting token stays intact: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_token_hard_breaks_to_fit_width() {
+        // 单个无空格 token 比窗口还宽时,必须按字符折断以保证全貌可见,而不是
+        // 被硬裁。折断后各行都不超宽,拼回去(去掉续行缩进)能还原整个 token。
+        let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
+        let width = 20;
+        let out = format_shell_command(long, width);
+        assert!(out.len() > 1, "over-wide token must wrap across lines: {:?}", out);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width: {:?} ({} cols)",
+                l,
+                crate::width::display_width(l)
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, long, "reassembled token must equal the original: {:?}", out);
+        assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_cjk_token_breaks_without_splitting_a_wide_char() {
+        // 10 个 CJK 字 = 20 列,单 token,width 12 → 必须字符折断,且每行不超宽、
+        // 绝不把某个 2 列宽字从中间劈开(拼回即原串)。
+        let cmd = "一二三四五六七八九十";
+        let width = 12;
+        let out = format_shell_command(cmd, width);
+        assert!(out.len() > 1, "over-wide CJK token must wrap: {:?}", out);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width: {:?}",
+                l
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, cmd, "CJK token must be fully preserved: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_token_with_zwj_emoji_never_splits_a_grapheme_cluster() {
+        // A ZWJ family emoji is ONE grapheme (~2 cols) but many codepoints. A
+        // per-codepoint splitter would (a) cut it mid-cluster into garbled halves
+        // and (b) desync width vs display_width so a produced line silently
+        // overshoots the budget and gets re-clipped at paint. The cluster-aware
+        // break must keep every family intact AND keep every line within width.
+        let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧, one grapheme
+        let token = format!("p{fam}{fam}{fam}{fam}{fam}q");
+        let width = 12;
+        let out = format_shell_command(&token, width);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width (codepoint/cluster width desync): {:?} = {} cols",
+                l,
+                crate::width::display_width(l)
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, token, "emoji token fully preserved: {:?}", out);
+        // Every family emoji stays a single intact cluster (none split across a line).
+        for l in &out {
+            let stripped = l.strip_prefix("    ").unwrap_or(l);
+            assert!(
+                !stripped.starts_with('\u{200D}') && !stripped.ends_with('\u{200D}'),
+                "a ZWJ joiner leaked to a line edge → cluster was split: {:?}",
+                out
+            );
+        }
     }
 
     #[test]
@@ -12912,3 +13043,4 @@ mod format_shell_command_tests {
         }
     }
 }
+

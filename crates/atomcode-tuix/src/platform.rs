@@ -95,6 +95,62 @@ fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
     path.into_owned()
 }
 
+/// Collapse the user's home-dir prefix to `~` everywhere it appears as the
+/// START of a path token inside a shell COMMAND string (display-only, for the
+/// `● Bash(…)` header). Unlike [`collapse_home`] — which only rewrites a path
+/// anchored at position 0 — a command embeds paths mid-string
+/// (`cat /Users/me/f && grep x /Users/me/g`), so every occurrence is scanned.
+///
+/// A match qualifies only as a WHOLE path token: `{home}` must be at string
+/// start or preceded by a shell boundary (whitespace / quote / `=` / `(`),
+/// AND immediately followed by `/`, a boundary, or end — so `/Users/me/x` →
+/// `~/x` and bare `/Users/me` → `~`, but `/Users/metoo` is left intact. `:`
+/// and `,` are deliberately NOT boundaries: a `~` inside a `PATH`-style
+/// colon list or a `host:/path` isn't shell-expanded there, so collapsing it
+/// would read as misleading. Purely cosmetic: the executed command and the
+/// transcript copy keep the real path.
+pub fn collapse_home_in_command(cmd: &str) -> String {
+    // Cache the home lookup: this runs on EVERY bash-row render, including
+    // ~80ms live-spinner ticks. `home_dir()` → `real_home_dir()` can do a
+    // `getpwnam_r` NSS lookup under sudo (potentially LDAP/SSSD), so resolving
+    // it once per process — home never changes mid-run — keeps it off the hot path.
+    use std::sync::OnceLock;
+    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let home = HOME.get_or_init(home_dir);
+    collapse_home_in_command_with(cmd, home.as_deref())
+}
+
+fn collapse_home_in_command_with(cmd: &str, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home else { return cmd.to_string() };
+    let home = home.to_string_lossy();
+    if home.is_empty() || !cmd.contains(&*home) {
+        return cmd.to_string();
+    }
+    let is_boundary = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '=' | '(');
+    let mut out = String::with_capacity(cmd.len());
+    let mut i = 0;
+    while i < cmd.len() {
+        let rest = &cmd[i..];
+        if rest.starts_with(&*home) {
+            let before_ok =
+                i == 0 || cmd[..i].chars().next_back().map(is_boundary).unwrap_or(true);
+            let after = &rest[home.len()..];
+            let after_ok = after.is_empty()
+                || after.starts_with('/')
+                || after.chars().next().map(is_boundary).unwrap_or(true);
+            if before_ok && after_ok {
+                out.push('~');
+                i += home.len();
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Path for the per-user input history file.
 /// Uses ATOMCODE_HOME if set, otherwise falls back to home directory.
 pub fn history_path() -> PathBuf {
@@ -142,6 +198,47 @@ mod tests {
     #[test]
     fn collapse_home_returns_unchanged_for_unrelated_path() {
         assert_eq!(collapse_home("/opt/tool/bar"), "/opt/tool/bar");
+    }
+
+    // ---- collapse_home_in_command (whole-command scan) ------------------------------------
+
+    #[test]
+    fn collapse_home_in_command_rewrites_all_path_tokens() {
+        let home = std::path::Path::new("/Users/me");
+        let cmd = "cat /Users/me/a.txt && grep x /Users/me/dir/b";
+        assert_eq!(
+            collapse_home_in_command_with(cmd, Some(home)),
+            "cat ~/a.txt && grep x ~/dir/b"
+        );
+    }
+
+    #[test]
+    fn collapse_home_in_command_leaves_non_home_prefix_alone() {
+        // `/Users/metoo` shares the `/Users/me` prefix but is a DIFFERENT dir —
+        // must not become `~too`.
+        let home = std::path::Path::new("/Users/me");
+        assert_eq!(
+            collapse_home_in_command_with("ls /Users/metoo/x", Some(home)),
+            "ls /Users/metoo/x"
+        );
+    }
+
+    #[test]
+    fn collapse_home_in_command_bare_home_becomes_tilde() {
+        let home = std::path::Path::new("/Users/me");
+        assert_eq!(collapse_home_in_command_with("cd /Users/me", Some(home)), "cd ~");
+        assert_eq!(
+            collapse_home_in_command_with("cd /Users/me && ls", Some(home)),
+            "cd ~ && ls"
+        );
+    }
+
+    #[test]
+    fn collapse_home_in_command_noop_without_home() {
+        assert_eq!(
+            collapse_home_in_command_with("cat /Users/me/a", None),
+            "cat /Users/me/a"
+        );
     }
 
     #[test]
