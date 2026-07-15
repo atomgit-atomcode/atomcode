@@ -1118,11 +1118,11 @@ fn execute_slash_command_impl(
         "save" => {
             // Export the full current conversation (every real user prompt +
             // assistant reply, in order) to a local markdown file.
-            //   /save            → ./atomcode-session-YYYYMMDD-HHMMSS.md
-            //   /save report.md  → ./report.md (relative to cwd)
+            //   /save            → <working-dir>/atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → <working-dir>/report.md
             //   /save /abs/x.md  → absolute path
             // Existing files are overwritten; missing parent dirs are an error.
-            match resolve_save(&ctx.current_session.messages, arg) {
+            match resolve_save_in(&ctx.current_session.messages, arg, &ctx.working_dir) {
                 SaveOutcome::Ok(path) => {
                     let path_str = path.to_string_lossy();
                     renderer.render(UiLine::CommandOutput(
@@ -4728,12 +4728,21 @@ fn render_save_markdown(messages: &[atomcode_core::conversation::message::Messag
 }
 
 /// Map `/save [filename]` to a written file. `""` → a timestamped default
-/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the current working directory;
-/// a bare name or relative path resolves against the current working dir;
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the active project directory;
+/// a bare name or relative path resolves against `working_dir`;
 /// an absolute path is used as-is. Existing files are overwritten.
+#[cfg(test)]
 fn resolve_save(
     messages: &[atomcode_core::conversation::message::Message],
     arg: &str,
+) -> SaveOutcome {
+    resolve_save_in(messages, arg, std::path::Path::new("."))
+}
+
+fn resolve_save_in(
+    messages: &[atomcode_core::conversation::message::Message],
+    arg: &str,
+    working_dir: &std::path::Path,
 ) -> SaveOutcome {
     let Some(content) = render_save_markdown(messages) else {
         return SaveOutcome::EmptyHistory;
@@ -4747,10 +4756,15 @@ fn resolve_save(
         // works like it does in the shell / other file-taking commands.
         expand_tilde_path(arg, crate::platform::home_dir().as_deref())
     };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        working_dir.join(path)
+    };
 
-    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
-    // so a typo can't silently scatter directories. An empty parent (writing
-    // to the cwd, the common relative-name case) always "exists".
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir,
+    // so a typo can't silently scatter directories. Relative paths are already
+    // rooted at `working_dir`; absolute paths are checked as provided.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
@@ -5629,7 +5643,8 @@ mod copy_tests {
 #[cfg(test)]
 mod save_tests {
     use super::{
-        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save, SaveOutcome,
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save,
+        resolve_save_in, SaveOutcome,
     };
     use atomcode_core::conversation::message::{Message, Role};
     use std::path::{Path, PathBuf};
@@ -5743,6 +5758,23 @@ mod save_tests {
     fn save_render_returns_none_for_empty() {
         assert!(render_save_markdown(&[]).is_none());
         assert!(render_save_markdown(&[Message::new(Role::Tool, "x")]).is_none());
+    }
+
+    #[test]
+    fn save_writes_relative_path_in_active_working_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+
+        match resolve_save_in(&msgs, "session.md", tmp.path()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(
+                    got,
+                    tmp.path().join("session.md").canonicalize().unwrap()
+                );
+                assert!(got.is_file());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 
     #[test]
