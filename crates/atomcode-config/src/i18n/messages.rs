@@ -1140,6 +1140,46 @@ pub enum Msg<'a> {
     /// About for the built-in help subcommand.
     CliAboutHelp,
 
+    // ── /usage modal ──
+    /// Tab label: current rate-limit window.
+    UsageTabCurrent,
+    /// Tab label: 60-day token/request overview.
+    UsageTabOverview,
+    /// Tab label: per-model breakdown.
+    UsageTabModels,
+    /// Title line on the Current tab ("Rate-limit window").
+    UsageCurrentTitle,
+    /// "Resets in HH:MM:SS". `hms` is the pre-formatted countdown string.
+    UsageResetsIn { hms: &'a str },
+    /// Shown on Current tab when window data is unavailable.
+    UsageWindowUnavailable,
+    /// Label: "Favorite model".
+    UsageStatFavorite,
+    /// Label: "Total tokens".
+    UsageStatTotal,
+    /// Label: "Requests".
+    UsageStatRequests,
+    /// Label: "Active days".
+    UsageStatActiveDays,
+    /// Label: "Most active day".
+    UsageStatMostActive,
+    /// Label: "Longest streak".
+    UsageStatLongestStreak,
+    /// Label: "Current streak".
+    UsageStatCurrentStreak,
+    /// Heat-map legend: "Less" (left side of ramp).
+    UsageHeatLess,
+    /// Heat-map legend: "More" (right side of ramp).
+    UsageHeatMore,
+    /// Title line on the Models tab.
+    UsageModelsTitle,
+    /// Shown when usage data is unavailable (Overview / Models tabs).
+    UsageNoData,
+    /// Footer navigation hint inside the /usage modal.
+    UsageFooterHint,
+    /// Shown when the fetch failed and we have an error string.
+    UsageFetchFailed { error: &'a str },
+
     // ── engine v2 provider init (atomcode-bridge) ──
     /// Frame for a provider/engine init failure surfaced to the driver.
     /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).

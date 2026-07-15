@@ -1189,6 +1189,27 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliAboutHelp => "Print this message or the help of the given subcommand(s)".into(),
         Msg::CliHelpMcpCommand => "Executable and arguments".into(),
 
+        // ── /usage modal ──
+        Msg::UsageTabCurrent => "Current".into(),
+        Msg::UsageTabOverview => "Overview".into(),
+        Msg::UsageTabModels => "Models".into(),
+        Msg::UsageCurrentTitle => "Rate-limit window".into(),
+        Msg::UsageResetsIn { hms } => format!("Resets in {hms}").into(),
+        Msg::UsageWindowUnavailable => "Window data unavailable".into(),
+        Msg::UsageStatFavorite => "Favorite model".into(),
+        Msg::UsageStatTotal => "Total tokens".into(),
+        Msg::UsageStatRequests => "Requests".into(),
+        Msg::UsageStatActiveDays => "Active days".into(),
+        Msg::UsageStatMostActive => "Most active day".into(),
+        Msg::UsageStatLongestStreak => "Longest streak".into(),
+        Msg::UsageStatCurrentStreak => "Current streak".into(),
+        Msg::UsageHeatLess => "Less".into(),
+        Msg::UsageHeatMore => "More".into(),
+        Msg::UsageModelsTitle => "Per-model usage".into(),
+        Msg::UsageNoData => "No usage data available".into(),
+        Msg::UsageFooterHint => "Tab / 1·2·3 switch · Esc close".into(),
+        Msg::UsageFetchFailed { error } => format!("Failed to load usage: {error}").into(),
+
         // ── engine v2 provider init (atomcode-bridge) ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
