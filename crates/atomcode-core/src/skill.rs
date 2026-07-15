@@ -461,13 +461,19 @@ impl SkillRegistry {
     ///   1. `{home}/.claude/commands/*.md`          legacy flat, Claude Code compat
     ///   2. `{home}/.atomcode/commands/*.md`         legacy flat, atomcode native
     ///   3. `{home}/.claude/skills/*/SKILL.md`       directory-style, Claude Code compat
-    ///   4. `{home}/.atomcode/skills/*/SKILL.md`     directory-style, atomcode native
+    ///   4. `{home}/.agents/skills/*/SKILL.md`       directory-style, cross-agent shared (opencode)
+    ///   5. `{home}/.atomcode/skills/*/SKILL.md`     directory-style, atomcode native
     ///
     /// Project (working dir):
-    ///   5. `.claude/commands/*.md`
-    ///   6. `.atomcode/commands/*.md`
-    ///   7. `.claude/skills/*/SKILL.md`
-    ///   8. `.atomcode/skills/*/SKILL.md`
+    ///   6. `.claude/commands/*.md`
+    ///   7. `.atomcode/commands/*.md`
+    ///   8. `.claude/skills/*/SKILL.md`
+    ///   9. `.agents/skills/*/SKILL.md`              cross-agent shared (opencode)
+    ///  10. `.atomcode/skills/*/SKILL.md`
+    ///
+    /// `.agents/skills` sits between `.claude` and `.atomcode` at each level, so a
+    /// same-name atomcode-native skill overrides a shared one (files are never
+    /// modified — precedence is just which one the registry keeps).
     ///
     /// Same-name skill from a `skills/` directory beats one from `commands/`
     /// at the same level because it is loaded after.
@@ -504,6 +510,10 @@ impl SkillRegistry {
         if let Some(ref home) = system_home {
             self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
             self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+            // `~/.agents/skills` — cross-agent shared convention (opencode et al.).
+            // Between `.claude` and the `.atomcode` native dir below so an
+            // atomcode-native skill still wins a same-name collision.
+            self.load_skills_dir(&home.join(".agents").join("skills"), LOOSE_NS, &mut warnings);
         }
 
         // Load atomcode native paths from the unified config dir.
@@ -514,6 +524,8 @@ impl SkillRegistry {
         self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
         self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
         self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+        // `.agents/skills` (project) — same shared convention, before `.atomcode` so native wins.
+        self.load_skills_dir(&working_dir.join(".agents").join("skills"), LOOSE_NS, &mut warnings);
         self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
 
         // Plugin layer — installed plugins contribute namespaced skills.
@@ -1118,6 +1130,26 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
         assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
+    }
+
+    #[test]
+    fn reload_picks_up_agents_skills_project_level() {
+        // A project sharing skills with opencode et al. via `.agents/skills/`.
+        // (Unique name so the real ~/.claude|~/.agents|~/.atomcode can't collide.)
+        let working = tempfile::tempdir().unwrap();
+        let skill_dir = working.path().join(".agents").join("skills").join("agents-shared-xyz");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: shared across agents\n---\nDo the shared thing.\n",
+        )
+        .unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.reload(working.path());
+        assert!(
+            reg.get("skills:agents-shared-xyz").is_some() || reg.get("agents-shared-xyz").is_some(),
+            "project-level .agents/skills must be discovered"
+        );
     }
 
     /// Regression test: when `load_skills_dir` is given a directory that

@@ -100,10 +100,14 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
         home.join(".claude/commands"),
         home.join(".atomcode/commands"),
         home.join(".claude/skills"),
+        // `.agents/skills` — cross-agent shared convention (opencode et al.). Between
+        // `.claude` and `.atomcode` so atomcode-native skills win a same-name collision.
+        home.join(".agents/skills"),
         home.join(".atomcode/skills"),
         project.join(".claude/commands"),
         project.join(".atomcode/commands"),
         project.join(".claude/skills"),
+        project.join(".agents/skills"),
         project.join(".atomcode/skills"),
     ]
 }
@@ -146,6 +150,24 @@ mod tests {
     fn missing_dir_is_skipped() {
         let reg = SkillRegistry::load(&[PathBuf::from("/no/such/skills/dir")]);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn standard_dirs_include_agents_skills_between_claude_and_atomcode() {
+        let home = Path::new("/home/u");
+        let project = Path::new("/proj");
+        let dirs = standard_skill_dirs(home, project);
+        // `.agents/skills` is the cross-agent shared convention (opencode et al.) —
+        // scanned at BOTH user and project level so shared skills load directly.
+        assert!(dirs.contains(&home.join(".agents/skills")), "user-level ~/.agents/skills");
+        assert!(dirs.contains(&project.join(".agents/skills")), "project-level .agents/skills");
+        // Precedence (last-wins): .claude < .agents < .atomcode at each level, so a
+        // user's atomcode-native skill still overrides a same-named shared one.
+        let pos = |p: PathBuf| dirs.iter().position(|d| *d == p).expect("dir present");
+        assert!(pos(home.join(".claude/skills")) < pos(home.join(".agents/skills")));
+        assert!(pos(home.join(".agents/skills")) < pos(home.join(".atomcode/skills")));
+        assert!(pos(project.join(".claude/skills")) < pos(project.join(".agents/skills")));
+        assert!(pos(project.join(".agents/skills")) < pos(project.join(".atomcode/skills")));
     }
 
     #[test]
