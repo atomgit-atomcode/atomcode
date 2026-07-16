@@ -1524,6 +1524,15 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_colors_on_dark_theme() {
+        let m = manager(vec![], vec![]);
+        crate::highlight::theme::set_theme_mode(false); // force dark
+        let bar = m.tab_bar();
+        crate::highlight::theme::set_theme_mode(false); // restore
+        assert!(!bar.contains("\x1b[1;90m") && !bar.contains("\x1b[90m"));
+    }
+
+    #[test]
     fn addurl_text_entry_accumulates() {
         let mut m = manager(vec![], vec![]);
         m.goto(Screen::AddUrl);
