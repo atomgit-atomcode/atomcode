@@ -21,6 +21,9 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
     # core engine, which always ran them. Zero overhead when no hooks.json exists
     # (prepare skips registration — see CCExternalHooks::is_empty).
     "cc-hooks",
+    # Wire web_search transport failures into the offline_mode="auto" verdict so the
+    # default (v2) coding engine self-detects and flips offline on a connection failure.
+    "offline",
 ] }
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
