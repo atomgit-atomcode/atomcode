@@ -6,7 +6,7 @@ use atomcode_core::agent::AgentEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// TurnEvent → 0/1 AgentEvent. UserMessage/StateChanged handled separately in the forwarder.
 pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
@@ -111,6 +111,27 @@ pub(crate) fn spawn_live_forwarder(
     runtime_id: RuntimeId,
     fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_live_forwarder_with_receiver(session, runtime_id, fan_tx, None)
+}
+
+/// Resume forwarding from a receiver captured at an idle handoff boundary.
+/// This is used only when detaching fails after the old forwarder was aborted,
+/// so events emitted during the failed handoff are not lost.
+pub(crate) fn spawn_live_forwarder_from_receiver(
+    session: Arc<LiveSession>,
+    runtime_id: RuntimeId,
+    fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    receiver: broadcast::Receiver<LiveEvent>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_live_forwarder_with_receiver(session, runtime_id, fan_tx, Some(receiver))
+}
+
+fn spawn_live_forwarder_with_receiver(
+    session: Arc<LiveSession>,
+    runtime_id: RuntimeId,
+    fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    receiver: Option<broadcast::Receiver<LiveEvent>>,
+) -> tokio::task::JoinHandle<()> {
     let session_ptr = Arc::as_ptr(&session) as usize;
     tokio::spawn(async move {
         // Diagnostics go through `tuix_trace!` (file sink, gated by
@@ -125,13 +146,19 @@ pub(crate) fn spawn_live_forwarder(
             session_ptr,
             runtime_id
         );
-        let (_snapshot, mut rx) = session.join().await;
-        crate::tuix_trace!(
-            "FWD",
-            "JOINED session_ptr={:#x} snapshot_len={}",
-            session_ptr,
-            _snapshot.len()
-        );
+        let mut rx = match receiver {
+            Some(receiver) => receiver,
+            None => {
+                let (snapshot, receiver) = session.join().await;
+                crate::tuix_trace!(
+                    "FWD",
+                    "JOINED session_ptr={:#x} snapshot_len={}",
+                    session_ptr,
+                    snapshot.len()
+                );
+                receiver
+            }
+        };
         loop {
             match rx.recv().await {
                 Ok(LiveEvent::Turn(te)) => {

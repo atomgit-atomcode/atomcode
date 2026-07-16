@@ -14,6 +14,13 @@ use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
 use message::{Message, MessageContent, Role};
 use turn::{TurnStatus, TurnTracker};
 
+/// Reserved synthetic-message origin used when a runtime without a dedicated
+/// cold-summary lane persists a legacy [`ConversationSnapshot`].
+pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
+/// Stable payload prefix paired with [`LEGACY_COLD_SUMMARY_ORIGIN`].
+pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
+    "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
+
 /// Context budget statistics for logging/debugging.
 #[derive(Debug, Clone, Default)]
 pub struct ContextStats {

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use atomcode_bridge::BridgeConfig;
 use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
@@ -119,6 +119,10 @@ type KCmd = atomcode_kernel::event::AgentCommand;
 pub enum DaemonRuntimeEvent {
     Legacy(atomcode_core::agent::AgentEvent),
     Native(CodingRuntimeEvent),
+    /// The old kernel turn was closed during a bounded handoff without an
+    /// authoritative conversation snapshot. This is lifecycle provenance, not
+    /// an empty conversation.
+    TurnCancelledWithoutSnapshot { runtime_terminated: bool },
 }
 
 use atomcode_kernel::event::StopReason;
@@ -254,16 +258,81 @@ impl KernelToWebui {
         self.outbound.clear();
     }
 
-    /// The kernel task ended: if a turn was awaiting its deferred `Snapshot` to
-    /// finalize, no Snapshot will ever arrive — synthesize the terminal from an
-    /// EMPTY snapshot so the driver isn't stranded busy. Mirrors bridge's
-    /// kernel-ended `pending_finish` branch (runtime.rs:489). Returns `vec![]` when
-    /// nothing was pending. (The goal/loop/undo/turn_running hold-open branches
-    /// bridge also handles here are deferred on the daemon kernel path.)
-    pub fn terminate_pending(&mut self) -> Vec<CoreEv> {
-        match self.pending_finish.take() {
-            Some(reason) => self.finish_turn(reason, Vec::new()),
-            None => vec![],
+    /// Whether the current kernel still owns an unfinished driver turn.
+    pub fn has_in_flight_turn(&self) -> bool {
+        self.started.is_some()
+            || self.pending_finish.is_some()
+            || self.pending_approval.is_some()
+    }
+
+    /// Forget an unfinished turn when its old kernel cannot provide a final
+    /// Snapshot. The caller emits a typed lifecycle-only daemon event instead
+    /// of forging a core cancellation with an empty conversation.
+    pub fn abandon_in_flight_turn_without_snapshot(&mut self) -> bool {
+        if !self.has_in_flight_turn() {
+            return false;
+        }
+        self.pending_finish = None;
+        self.pending_approval = None;
+        self.started = None;
+        true
+    }
+
+    fn record_usage(&mut self, meta: atomcode_kernel::message::MessageMeta) -> CoreEv {
+        self.rounds += 1;
+        self.total_tokens += (meta.tokens.prompt + meta.tokens.completion) as usize;
+        let token_usage = CoreEv::TokenUsage(atomcode_bridge::convert::usage_to_core(&meta.tokens));
+        self.last_usage = Some(meta);
+        token_usage
+    }
+
+    /// Translate events while cancelling an old in-flight turn before a runtime
+    /// swap. Only lifecycle data needed to obtain the final Snapshot, usage
+    /// accounting, and native compaction terminals may cross the generation
+    /// boundary. Late requests are denied without surfacing a stale approval UI.
+    pub fn translate_settling_event(&mut self, ev: KEv) -> Vec<DaemonRuntimeEvent> {
+        match ev {
+            KEv::Request { id, .. } => {
+                self.outbound.push(KCmd::Respond {
+                    id,
+                    value: serde_json::Value::Null,
+                });
+                Vec::new()
+            }
+            KEv::Usage(meta) => {
+                let _ = self.record_usage(meta);
+                Vec::new()
+            }
+            event @ KEv::TurnComplete { .. }
+            | event @ KEv::Snapshot { .. }
+            | event @ KEv::CompactionStarted { .. }
+            | event @ KEv::Compacted { .. }
+            | event @ KEv::CompactionFailed { .. } => self.translate_runtime(event),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Translate events after the old turn has settled and Shutdown has begun.
+    /// At this point no display/tool/approval/turn event belongs to the new
+    /// generation. Native compaction terminals remain observable because an
+    /// accepted manual `/compact` must receive exactly one outcome.
+    pub fn translate_teardown_event(&mut self, ev: KEv) -> Vec<DaemonRuntimeEvent> {
+        match ev {
+            KEv::Request { id, .. } => {
+                self.outbound.push(KCmd::Respond {
+                    id,
+                    value: serde_json::Value::Null,
+                });
+                Vec::new()
+            }
+            KEv::Usage(meta) => {
+                self.last_usage = Some(meta);
+                Vec::new()
+            }
+            event @ KEv::CompactionStarted { .. }
+            | event @ KEv::Compacted { .. }
+            | event @ KEv::CompactionFailed { .. } => self.translate_runtime(event),
+            _ => Vec::new(),
         }
     }
 
@@ -385,7 +454,7 @@ impl KernelToWebui {
             // `SetConversation`/`ClearConversation` re-prepare + re-spawn the agent
             // against fresh state; the kernel has no in-place `SetMessages`).
             // `SetSessionId` is a header-binding no-op on this path.
-            CoreCmd::SetConversation(_)
+            CoreCmd::SetConversation { .. }
             | CoreCmd::ClearConversation
             | CoreCmd::ReloadConfig(_)
             | CoreCmd::ChangeDir(_)
@@ -452,17 +521,15 @@ impl KernelToWebui {
     fn finish_turn(
         &mut self,
         reason: StopReason,
-        messages: Vec<atomcode_core::conversation::message::Message>,
+        snapshot: atomcode_core::conversation::ConversationSnapshot,
     ) -> Vec<CoreEv> {
-        use atomcode_core::conversation::ConversationSnapshot;
         let duration = self
             .started
+            .take()
             .map(|s| s.elapsed())
             .unwrap_or(std::time::Duration::ZERO);
         match reason {
-            StopReason::Cancelled => vec![CoreEv::TurnCancelled {
-                snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
-            }],
+            StopReason::Cancelled => vec![CoreEv::TurnCancelled { snapshot }],
             other => {
                 let stop_reason = match other {
                     StopReason::Stopped => atomcode_core::agent::TurnStopReason::Natural,
@@ -481,7 +548,7 @@ impl KernelToWebui {
                     total_tokens: self.total_tokens,
                     turn_count: self.rounds,
                     tool_call_count: self.tool_calls,
-                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                    snapshot,
                     stop_reason,
                 }]
             }
@@ -560,11 +627,7 @@ impl KernelToWebui {
             }
             // ---- usage ----
             KEv::Usage(meta) => {
-                self.rounds += 1;
-                self.total_tokens += (meta.tokens.prompt + meta.tokens.completion) as usize;
-                let token_usage =
-                    CoreEv::TokenUsage(atomcode_bridge::convert::usage_to_core(&meta.tokens));
-                self.last_usage = Some(meta);
+                let token_usage = self.record_usage(meta);
                 // Order matches bridge: TokenUsage THEN the synthesized ContextStats.
                 vec![token_usage, self.context_stats()]
             }
@@ -589,16 +652,14 @@ impl KernelToWebui {
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
-                    let messages: Vec<atomcode_core::conversation::message::Message> = snapshot
-                        .messages
-                        .iter()
-                        .map(atomcode_bridge::convert::message_to_core)
-                        .collect();
                     // deferred (daemon kernel path): bridge's Snapshot arm also runs
                     // the goal hook, the loop hook, and `pending_undo`/undo before
                     // finishing. The webui daemon does not wire goals/loops/undo, so
                     // we go straight to finish_turn.
-                    self.finish_turn(reason, messages)
+                    self.finish_turn(
+                        reason,
+                        atomcode_bridge::convert::snapshot_to_core(&snapshot),
+                    )
                 } else {
                     // deferred (daemon kernel path): bridge emits `MessagesSync` for a
                     // bare snapshot (a `/sync` reply). The daemon does not consume
@@ -682,6 +743,8 @@ use atomcode_coding::parts::{prepare_with_plugin_hooks, CodingParts, SessionMode
 use atomcode_core::agent::AgentClient;
 use tokio::sync::mpsc;
 
+const CONVERSATION_RESTORE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A no-op kernel handle: its task drains commands until `Shutdown`, holding the
 /// event sender open so the driver's `handle.events.recv()` never returns `None`
 /// while degraded. Inlined from `Bridge::noop_handle` (runtime.rs:1528) — a
@@ -735,6 +798,21 @@ struct KernelDriver {
     /// `noop_handle`, so `SendMessage` is answered with a degraded error instead of
     /// being forwarded (mirrors bridge's degraded SendMessage arm).
     degraded: bool,
+    /// A tokened SetConversation request awaiting a Snapshot read-back from the
+    /// replacement kernel.
+    pending_restore: Option<PendingConversationRestore>,
+}
+
+struct PendingConversationRestore {
+    restore_id: u64,
+    deadline: Instant,
+}
+
+async fn wait_for_restore_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 impl KernelDriver {
@@ -744,6 +822,7 @@ impl KernelDriver {
     /// sends `KCmd::Shutdown` and bounded-awaits the kernel task (5s, abort on hang).
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<CoreCmd>) {
         loop {
+            let restore_deadline = self.pending_restore.as_ref().map(|p| p.deadline);
             tokio::select! {
                 biased;
                 cmd = cmd_rx.recv() => match cmd {
@@ -757,21 +836,38 @@ impl KernelDriver {
                 ev = self.handle.events.recv() => match ev {
                     Some(e) => self.on_kernel_event(e),
                     None => {
-                        // Kernel task ended. If a turn was awaiting its deferred
-                        // Snapshot to finalize, synthesize a terminal from an empty
-                        // snapshot so the daemon isn't stranded busy (mirrors bridge's
-                        // pending_finish branch; the goal/loop/undo hold-open branches
-                        // are deferred on this path).
-                        for ce in self.tx.terminate_pending() {
-                            self.emit_legacy(ce);
-                        }
+                        let had_unfinished_turn =
+                            self.tx.abandon_in_flight_turn_without_snapshot();
                         self.emit_legacy(CoreEv::Error {
                             error: "engine v2 agent terminated".into(),
                             snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
                         });
+                        if let Some(pending) = self.pending_restore.take() {
+                            self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                                restore_id: pending.restore_id,
+                                error: "daemon runtime terminated before the restored conversation could be verified"
+                                    .into(),
+                            });
+                        }
+                        if had_unfinished_turn {
+                            let _ = self.ev_tx.send(
+                                DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
+                                    runtime_terminated: true,
+                                },
+                            );
+                        }
                         break;
                     }
                 },
+                _ = wait_for_restore_deadline(restore_deadline) => {
+                    if let Some(pending) = self.pending_restore.take() {
+                        self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                            restore_id: pending.restore_id,
+                            error: "daemon runtime timed out while verifying the restored conversation"
+                                .into(),
+                        });
+                    }
+                }
             }
         }
         let _ = self.handle.commands.send(KCmd::Shutdown);
@@ -789,7 +885,23 @@ impl KernelDriver {
     /// kernel commands the (stateless) translator queued (e.g. the `Snapshot`
     /// request `TurnComplete` pushes, or a displaced-approval deny).
     fn on_kernel_event(&mut self, e: KEv) {
-        for event in self.tx.translate_runtime(e) {
+        if let KEv::Snapshot { snapshot } = &e {
+            if let Some(pending) = self.pending_restore.take() {
+                let _ = self.ev_tx.send(DaemonRuntimeEvent::Legacy(
+                    CoreEv::ConversationRestored {
+                        restore_id: pending.restore_id,
+                        snapshot: atomcode_bridge::convert::snapshot_to_core(snapshot),
+                    },
+                ));
+                return;
+            }
+        }
+        let events = self.tx.translate_runtime(e);
+        self.forward_old_kernel_result(events);
+    }
+
+    fn forward_old_kernel_result(&mut self, events: Vec<DaemonRuntimeEvent>) {
+        for event in events {
             let _ = self.ev_tx.send(event);
         }
         for kc in self.tx.drain_kernel_commands() {
@@ -801,30 +913,168 @@ impl KernelDriver {
         let _ = self.ev_tx.send(DaemonRuntimeEvent::Legacy(event));
     }
 
+    /// Cancel and settle an old active turn before replacing its kernel handle.
+    /// The exact Snapshot-backed terminal is preferred; a bounded empty
+    /// cancellation is emitted only when the old kernel cannot finish in time.
+    async fn settle_in_flight_turn(&mut self, grace: std::time::Duration) {
+        if !self.tx.has_in_flight_turn() {
+            return;
+        }
+
+        let _ = self.tx.to_kernel_command(CoreCmd::Cancel);
+        for command in self.tx.drain_kernel_commands() {
+            let _ = self.handle.commands.send(command);
+        }
+
+        let timeout = tokio::time::sleep(grace);
+        tokio::pin!(timeout);
+        // TurnComplete may already have been translated by the normal event loop,
+        // leaving only its requested Snapshot outstanding when the reload command
+        // wins the next select iteration.
+        let mut saw_complete = self.tx.pending_finish.is_some();
+        let mut settled = false;
+        loop {
+            tokio::select! {
+                event = self.handle.events.recv() => match event {
+                    Some(event) => {
+                        if matches!(&event, KEv::TurnComplete { .. }) {
+                            saw_complete = true;
+                        }
+                        let events = self.tx.translate_settling_event(event);
+                        self.forward_old_kernel_result(events);
+                        if saw_complete && !self.tx.has_in_flight_turn() {
+                            settled = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                () = &mut timeout => break,
+            }
+        }
+
+        if !settled && self.tx.abandon_in_flight_turn_without_snapshot() {
+            let _ = self
+                .ev_tx
+                .send(DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
+                    runtime_terminated: false,
+                });
+        }
+        self.tx.reset_turn_state();
+    }
+
     /// One core command in. Returns `true` iff the driver should stop (`Shutdown`).
     async fn on_command(&mut self, c: CoreCmd) -> bool {
-        match c {
-            CoreCmd::Shutdown => true,
-            // Seed an EXISTING conversation: there is no in-place `SetMessages` on the
-            // kernel, so convert the (legacy) snapshot → kernel messages, persist under
-            // the bridge id, and respawn-Resume. An EMPTY snapshot is a no-op — the
-            // fresh-spawned agent already starts empty (a needless respawn would just
-            // burn a prepare). Ported from bridge's `SetConversation` handler (~1008),
-            // minus the optional `MessagesSync` echo (the daemon ignores it).
-            CoreCmd::SetConversation(snap) => {
-                if snap.messages.is_empty() {
+        if let Some(pending_id) = self.pending_restore.as_ref().map(|p| p.restore_id) {
+            match &c {
+                CoreCmd::Shutdown | CoreCmd::Cancel => {
+                    let shutting_down = matches!(&c, CoreCmd::Shutdown);
+                    self.pending_restore = None;
+                    self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                        restore_id: pending_id,
+                        error: if shutting_down {
+                            "daemon runtime shut down before the restored conversation was verified"
+                        } else {
+                            "daemon runtime conversation restore was cancelled"
+                        }
+                        .into(),
+                    });
+                    return shutting_down;
+                }
+                CoreCmd::SetConversation { .. } => {
+                    // The command-specific branch below rejects only the new
+                    // request and preserves the verification already in flight.
+                }
+                _ => {
+                    self.emit_legacy(CoreEv::Warning(
+                        "daemon runtime is verifying a conversation restore; the concurrent command was ignored"
+                            .into(),
+                    ));
                     return false;
                 }
-                let kmsgs: Vec<_> = snap
-                    .messages
-                    .iter()
-                    .map(atomcode_bridge::convert::message_to_kernel)
-                    .collect();
-                let ksnap = atomcode_kernel::message::SessionSnapshot::new(kmsgs);
-                if let Some(b) = self.parts.session.as_ref() {
-                    let _ = b.manager.save_snapshot(&self.bridge_session, &ksnap);
+            }
+        }
+        match c {
+            CoreCmd::Shutdown => true,
+            // Seed an EXISTING conversation: persist the complete legacy snapshot,
+            // respawn-Resume, then read it back when the caller supplied a token.
+            // Empty snapshots are authoritative too: they must clear a stale local
+            // runtime rather than being treated as a no-op.
+            CoreCmd::SetConversation {
+                snapshot,
+                restore_id,
+            } => {
+                if self.pending_restore.is_some() {
+                    if let Some(id) = restore_id {
+                        self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                            restore_id: id,
+                            error: "daemon runtime is still verifying an earlier conversation restore"
+                                .into(),
+                        });
+                    } else {
+                        self.emit_legacy(CoreEv::Error {
+                            error: "daemon runtime is still verifying an earlier conversation restore"
+                                .into(),
+                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                        });
+                    }
+                    return false;
                 }
-                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
+                let kernel_snapshot = atomcode_bridge::convert::snapshot_to_kernel(&snapshot);
+                let save_result = self
+                    .parts
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| "session persistence is unavailable".to_string())
+                    .and_then(|binding| {
+                        binding
+                            .manager
+                            .save_snapshot(&self.bridge_session, &kernel_snapshot)
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = save_result {
+                    if let Some(id) = restore_id {
+                        self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                            restore_id: id,
+                            error: format!(
+                                "daemon runtime could not persist the conversation before restore: {error}"
+                            ),
+                        });
+                    } else {
+                        self.emit_legacy(CoreEv::Error {
+                            error: format!(
+                                "daemon runtime could not persist the conversation before restore: {error}"
+                            ),
+                            snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                        });
+                    }
+                    return false;
+                }
+
+                let restored = self
+                    .respawn(SessionMode::Resume(self.bridge_session.clone()))
+                    .await;
+                if let Some(id) = restore_id {
+                    if restored {
+                        self.pending_restore = Some(PendingConversationRestore {
+                            restore_id: id,
+                            deadline: Instant::now() + CONVERSATION_RESTORE_TIMEOUT,
+                        });
+                        if self.handle.commands.send(KCmd::Snapshot).is_err() {
+                            self.pending_restore = None;
+                            self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                                restore_id: id,
+                                error: "daemon runtime restored the conversation but could not verify its snapshot"
+                                    .into(),
+                            });
+                        }
+                    } else {
+                        self.emit_legacy(CoreEv::ConversationRestoreFailed {
+                            restore_id: id,
+                            error: "daemon runtime did not restore the requested conversation".into(),
+                        });
+                    }
+                }
                 false
             }
             // Model switch: assemble a NEW provider on the SAME `parts` (conversation +
@@ -872,9 +1122,10 @@ impl KernelDriver {
         }
     }
 
-    /// Bounded teardown of the OLD kernel task: send `Shutdown`, drain its remaining
-    /// events, then await it up to `grace`. Draining preserves an accepted compact's
-    /// terminal before a respawn/reload re-reads the canonical snapshot.
+    /// Bounded teardown of the OLD kernel task after its active turn has settled:
+    /// send `Shutdown`, drain only native compaction lifecycle events, then await
+    /// it up to `grace`. Old display/tool/approval/turn events are generation-stale
+    /// and must not leak into the replacement runtime.
     async fn shutdown_old_handle(&mut self, grace: std::time::Duration) {
         let _ = self.handle.commands.send(KCmd::Shutdown);
         let mut task = std::mem::replace(&mut self.handle.task, tokio::spawn(async {}));
@@ -888,7 +1139,10 @@ impl KernelDriver {
                     break;
                 }
                 event = self.handle.events.recv(), if events_open => match event {
-                    Some(event) => self.on_kernel_event(event),
+                    Some(event) => {
+                        let events = self.tx.translate_teardown_event(event);
+                        self.forward_old_kernel_result(events);
+                    }
                     None => events_open = false,
                 },
                 () = &mut timeout => {
@@ -899,14 +1153,10 @@ impl KernelDriver {
             }
         }
         while let Ok(event) = self.handle.events.try_recv() {
-            self.on_kernel_event(event);
+            let events = self.tx.translate_teardown_event(event);
+            self.forward_old_kernel_result(events);
         }
-        // A late TurnComplete drained above may have armed a Snapshot request after
-        // the old task had already exited. Close that lifecycle now and clear every
-        // old-handle id/timer before the replacement starts emitting events.
-        for event in self.tx.terminate_pending() {
-            self.emit_legacy(event);
-        }
+        // Clear every old-handle id/timer before the replacement starts emitting.
         self.tx.reset_turn_state();
     }
 
@@ -921,18 +1171,9 @@ impl KernelDriver {
     /// (a broken snapshot must not wedge the whole driver). On total failure it emits
     /// a `CoreEv::Error`, installs a `noop_handle`, and marks `degraded` so the event
     /// loop stays alive and `SendMessage` is answered with an actionable error.
-    async fn respawn(&mut self, session: SessionMode) {
-        // A live turn / parked approval would be stranded when the kernel is torn
-        // down: clear the translator's per-turn state and synthesize a Cancelled
-        // terminal so the daemon returns to Idle (mirrors bridge closing the
-        // lifecycle FIRST). PRESERVES `last_usage` (context size survives).
-        // deferred (daemon kernel path): the loop_pending_finish hold-open branch
-        // bridge also settles here is scoped out (no loop on this path).
-        for ce in self.tx.terminate_pending() {
-            self.emit_legacy(ce);
-        }
-        self.tx.reset_turn_state();
-
+    async fn respawn(&mut self, session: SessionMode) -> bool {
+        self.settle_in_flight_turn(std::time::Duration::from_secs(5))
+            .await;
         self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
 
         let mut opts = self.opts_template.clone();
@@ -941,6 +1182,7 @@ impl KernelDriver {
         // /plan survives /cd, /clear, /resume. Mirrors bridge preserving plan_mode.
         let plan_mode = self.tx.plan_mode();
         opts.session = session;
+        let mut requested_mode_applied = true;
 
         // Try the requested mode; if Resume fails (missing/broken snapshot), fall
         // back to Fresh before giving up entirely (bridge parity).
@@ -960,8 +1202,9 @@ impl KernelDriver {
                     });
                     self.handle = noop_handle();
                     self.degraded = true;
-                    return;
+                    return false;
                 }
+                requested_mode_applied = false;
                 opts.session = SessionMode::Fresh;
                 match prepare_with_plugin_hooks(
                     &self.coding_cfg,
@@ -980,7 +1223,7 @@ impl KernelDriver {
                         });
                         self.handle = noop_handle();
                         self.degraded = true;
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1016,6 +1259,7 @@ impl KernelDriver {
                 self.degraded = false;
                 // deferred (daemon kernel path): bridge's AI-naming re-arm and loop
                 // cancellation on a fresh respawn are scoped out.
+                requested_mode_applied
             }
             Err(e) => {
                 self.emit_legacy(CoreEv::Error {
@@ -1025,6 +1269,7 @@ impl KernelDriver {
                 // Install a live handle so the event loop's recv() never returns None.
                 self.handle = noop_handle();
                 self.degraded = true;
+                false
             }
         }
     }
@@ -1056,14 +1301,8 @@ impl KernelDriver {
             }
         };
 
-        // A swap tears down the running kernel; settle the translator's per-turn
-        // state so a parked approval / deferred finish isn't stranded on the new
-        // handle. deferred (daemon kernel path): bridge also settles an in-flight
-        // turn snapshot + a sleeping loop here — scoped out (no goal/loop).
-        for ce in self.tx.terminate_pending() {
-            self.emit_legacy(ce);
-        }
-        self.tx.reset_turn_state();
+        self.settle_in_flight_turn(std::time::Duration::from_secs(5))
+            .await;
         self.shutdown_old_handle(std::time::Duration::from_secs(5)).await;
 
         match assemble(&mut self.parts, &next_cfg, provider) {
@@ -1229,6 +1468,7 @@ pub fn spawn_kernel_runtime(
             bridge_session,
             tx,
             degraded,
+            pending_restore: None,
         };
         driver.run(cmd_rx).await;
     });
@@ -1809,7 +2049,15 @@ mod kernel_runtime_translate_tests {
         assert!(t.drain_kernel_commands().is_empty());
 
         // Now the kernel replies with the snapshot → finish_turn synthesis.
-        let snap = SessionSnapshot::new(vec![Message::user("hi")]);
+        let snap = atomcode_bridge::convert::snapshot_to_kernel(
+            &atomcode_core::conversation::ConversationSnapshot {
+                messages: vec![atomcode_core::conversation::message::Message::new(
+                    atomcode_core::conversation::message::Role::User,
+                    "hi",
+                )],
+                cold_summaries: vec!["older compressed context".into()],
+            },
+        );
         let out = t.translate(KEv::Snapshot { snapshot: snap });
         match &out[..] {
             [CoreEv::TurnComplete {
@@ -1825,6 +2073,7 @@ mod kernel_runtime_translate_tests {
                 assert_eq!(*tool_call_count, 1);
                 assert_eq!(snapshot.messages.len(), 1);
                 assert_eq!(snapshot.messages[0].text(), Some("hi"));
+                assert_eq!(snapshot.cold_summaries, vec!["older compressed context"]);
                 assert_eq!(*stop_reason, atomcode_core::agent::TurnStopReason::Natural);
             }
             _ => panic!("expected TurnComplete, got {out:?}"),
@@ -1869,6 +2118,67 @@ mod kernel_runtime_translate_tests {
             args: args.into(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn settling_request_is_denied_without_emitting_an_approval() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        let out = t.translate_settling_event(KEv::Request {
+            id: 71,
+            kind: APPROVAL_KIND.into(),
+            payload: approval_payload("late-call", "bash", "{}"),
+        });
+
+        assert!(out.is_empty());
+        assert!(t.pending_approval.is_none());
+        let commands = t.drain_kernel_commands();
+        assert!(matches!(
+            &commands[..],
+            [KCmd::Respond { id: 71, value }] if value.is_null()
+        ));
+    }
+
+    #[test]
+    fn abandoning_a_turn_without_snapshot_only_clears_lifecycle_state() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+        assert!(t.translate_runtime(KEv::TurnStarted).is_empty());
+        assert!(t.has_in_flight_turn());
+
+        assert!(t.abandon_in_flight_turn_without_snapshot());
+        assert!(!t.has_in_flight_turn());
+        assert!(!t.abandon_in_flight_turn_without_snapshot());
+    }
+
+    #[test]
+    fn teardown_discards_old_display_events() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+
+        let out = t.translate_teardown_event(KEv::TextDelta("stale text".into()));
+
+        assert!(out.is_empty());
+        assert!(t.drain_kernel_commands().is_empty());
+    }
+
+    #[test]
+    fn teardown_preserves_manual_compaction_terminal() {
+        let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
+
+        let out = t.translate_teardown_event(KEv::Compacted {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 2,
+            removed: 1,
+            bytes_before: 200,
+            bytes_after: 100,
+            committed: true,
+            snapshot: Some(SessionSnapshot::new(vec![Message::user("kept")])),
+        });
+
+        assert!(matches!(
+            &out[..],
+            [DaemonRuntimeEvent::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            })] if outcome.committed && outcome.is_manual()
+        ));
     }
 
     fn decision(cmd: &KCmd) -> String {
@@ -2112,9 +2422,10 @@ mod kernel_runtime_translate_tests {
     fn respawn_and_noop_commands_return_none() {
         let mut t = KernelToWebui::new(64_000, "https://api.example.com".into());
         assert!(t
-            .to_kernel_command(CoreCmd::SetConversation(
-                atomcode_core::conversation::ConversationSnapshot::default()
-            ))
+            .to_kernel_command(CoreCmd::SetConversation {
+                snapshot: atomcode_core::conversation::ConversationSnapshot::default(),
+                restore_id: None,
+            })
             .is_none());
         assert!(t.to_kernel_command(CoreCmd::ClearConversation).is_none());
         assert!(t.to_kernel_command(CoreCmd::ChangeDir("/tmp".into())).is_none());

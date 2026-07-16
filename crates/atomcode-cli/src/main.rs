@@ -2445,7 +2445,9 @@ async fn run_headless(
             }
             AgentEvent::ConversationTruncated { .. }
             | AgentEvent::UndoFailed { .. }
-            | AgentEvent::MessagesSync { .. } => {
+            | AgentEvent::MessagesSync { .. }
+            | AgentEvent::ConversationRestored { .. }
+            | AgentEvent::ConversationRestoreFailed { .. } => {
                 // Only used by TUI for /bg or /undo; ignore in headless CLI.
             }
             AgentEvent::UserEcho(_)
