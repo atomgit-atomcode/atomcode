@@ -73,9 +73,11 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a web page over http(s) and return its content (HTML is converted to clean \
          text, or to Markdown with `format:\"markdown\"` to keep headings/links/code). Use \
-         after `web_search` to read a specific page (docs, README, API reference). Only \
-         http/https URLs are allowed; requests to localhost / private / cloud-metadata \
-         addresses are blocked. Returns the full page by default; pass `max_chars` to cap."
+         after `web_search` to read a specific page (docs, README, API reference). Do NOT \
+         call this tool if a more specific, dedicated skill (listed under AVAILABLE SKILLS in the system prompt) \
+         matches the URL or domain of the page you want to fetch (e.g., platform-specific issue trackers or document sites); \
+         instead, you MUST use the use_skill tool. Only http/https URLs are allowed; requests to localhost / private / \
+         cloud-metadata addresses are blocked. Returns the full page by default; pass `max_chars` to cap."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -94,6 +96,7 @@ impl Tool for WebFetchTool {
             Ok(a) => a,
             Err(e) => return err(format!("web_fetch: invalid arguments: {e}. Expected {{\"url\":\"https://...\"}}.")),
         };
+
         let max = a.max_chars.map(|m| m.min(MAX_CHARS_CAP));
         let fmt = OutputFormat::from_arg(a.format.as_deref());
 
@@ -227,7 +230,11 @@ fn render_body(
 
     let output = apply_char_cap(text, max);
     if output.trim().is_empty() {
-        return err(format!("web_fetch: page fetched but no readable text at {final_url}"));
+        return err(format!(
+            "web_fetch: page fetched but no readable text at {final_url}.\n\n\
+             Hint: If this page belongs to a specific platform (e.g. GitCode/GitHub issues, documentation databases, API specs), \
+             check if there is a dedicated skill listed under AVAILABLE SKILLS in the system prompt that can fetch it via API."
+        ));
     }
     let cap_note = if hit_cap {
         format!("\n\n[Response exceeded {MAX_RESPONSE_BYTES} bytes — truncated before text extraction]")
