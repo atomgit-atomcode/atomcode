@@ -827,6 +827,8 @@ impl UiState {
         self.subagent_activity = None;
         self.approval_panel = None;
         self.steer_pending = 0;
+        self.active_todos = None;
+        self.todo_titles.clear();
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -856,6 +858,8 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
         self.steer_pending = 0;
+        self.active_todos = None;
+        self.todo_titles.clear();
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -1837,6 +1841,36 @@ mod tests {
         });
         s.on_turn_complete();
         assert!(s.active_todos.is_some(), "panel must survive turn end");
+    }
+
+    #[test]
+    fn active_todos_cleared_on_cancel_and_error() {
+        let mut s = UiState::new();
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("Task".to_string()),
+            completed: 2,
+            in_progress: 1,
+            total: 3,
+            items: vec![],
+        });
+        s.todo_titles.insert(1, "Todo".to_string());
+        
+        s.on_turn_cancelled();
+        assert!(s.active_todos.is_none(), "todos must clear on cancellation");
+        assert!(s.todo_titles.is_empty());
+
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("Task2".to_string()),
+            completed: 1,
+            in_progress: 1,
+            total: 2,
+            items: vec![],
+        });
+        s.todo_titles.insert(2, "Todo2".to_string());
+
+        s.on_error();
+        assert!(s.active_todos.is_none(), "todos must clear on error");
+        assert!(s.todo_titles.is_empty());
     }
 
     #[test]

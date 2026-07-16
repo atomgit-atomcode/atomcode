@@ -557,6 +557,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
     assistant_line_buf: String,
+    /// Line-buffer for streaming reasoning text.
+    reasoning_line_buf: String,
     /// Markdown parser state (code-block tracking, table row
     /// buffering) passed to `crate::markdown::render_line` on each
     /// completed assistant line.
@@ -823,6 +825,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             suppress_auto_copy: false,
             auto_copy_enabled: false,
             assistant_line_buf: String::new(),
+            reasoning_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
             last_painted_footer_rows: 0,
@@ -4127,6 +4130,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    fn flush_reasoning_lines(&mut self) {
+        if !self.reasoning_line_buf.contains('\n') {
+            return;
+        }
+        let mut completed: Vec<String> = Vec::new();
+        while let Some(nl) = self.reasoning_line_buf.find('\n') {
+            let line: String = self.reasoning_line_buf.drain(..=nl).collect();
+            let content = line[..line.len() - 1].to_string();
+            completed.push(content);
+        }
+        let style = CellStyle {
+            faint: true,
+            ..CellStyle::default()
+        };
+        for content in completed {
+            self.push_body_text(&content, &style);
+        }
+    }
+
+    fn flush_reasoning_remainder(&mut self) {
+        if !self.reasoning_line_buf.is_empty() {
+            let line = std::mem::take(&mut self.reasoning_line_buf);
+            let style = CellStyle {
+                faint: true,
+                ..CellStyle::default()
+            };
+            self.push_body_text(&line, &style);
+        }
+    }
+
     /// If the markdown parser just finished a code block, copy its raw
     /// source to the system clipboard and return a muted hint line for
     /// display. Returns `None` when no block was finished or auto-copy
@@ -4580,6 +4613,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 prev.push_str(next);
                 return;
             }
+            (Some(UiLine::CommandOutput(prev)), UiLine::CommandOutput(next)) => {
+                prev.push_str(next);
+                return;
+            }
             _ => {}
         }
         self.body_log.push(line.clone());
@@ -4611,6 +4648,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.welcome_banner = None;
         self.message_marks.clear();
         self.assistant_line_buf.clear();
+        self.reasoning_line_buf.clear();
         self.md_state.reset();
         self.live_group = None;
         self.inflight_tool = None;
@@ -4861,41 +4899,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::ReasoningText(text) => {
-                // Display reasoning in faint style with word wrapping.
-                //
-                // Why CellStyle.faint instead of embedding `\x1b[2m...\x1b[0m`
-                // in the text: `push_body_text` calls `push_str_cells`, which
-                // treats every visible char as a width-1 cell — including
-                // the SGR escape bytes ESC, `[`, `2`, `m` if they're in the
-                // string. Cells get pushed at indices 0..N matching the
-                // string's char positions, but when serialized back to
-                // stdout the terminal swallows the SGR sequence without
-                // advancing the cursor, so the cell-index ⇄ terminal-column
-                // invariant breaks by exactly 4 (= len("\x1b[2m")) columns.
-                // Subsequent cell-diff patches CUP to the model-column,
-                // which on screen is 4 cells to the right of the visual
-                // position — producing the "characters scattered into
-                // word boundaries" corruption (e.g. "Now let me start"
-                // rendered as "Now let letsmerstart" because the second
-                // flush's diff patches landed at offset 4, overwriting
-                // the spaces with letters from the new text).
-                // Trace `BPUSH content="  \u{1b}[2m step by step."` showed
-                // the ESC bytes embedded in cells; this fix routes the
-                // faint attribute through `CellStyle` instead, where
-                // `serialize_row` emits SGR around the run without
-                // claiming cell-column space for the bytes.
-                let text = scrub_controls(&text);
-                let style = CellStyle {
-                    faint: true,
-                    ..CellStyle::default()
-                };
-                self.push_body_text(&text, &style);
+                self.reasoning_line_buf.push_str(&scrub_controls(&text));
+                self.flush_reasoning_lines();
             }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
+                self.flush_reasoning_remainder();
             }
             UiLine::TurnComplete => {
                 self.flush_assistant_remainder();
+                self.flush_reasoning_remainder();
                 // Defense in depth: a turn that ended without a
                 // matching ToolCallCommit (interrupted, forced stop,
                 // protocol bug) would otherwise leave inflight_tool
@@ -4906,6 +4919,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
+                self.flush_reasoning_remainder();
                 self.commit_inflight_tool();
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
@@ -5760,6 +5774,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.welcome_tip_indices = None;
         self.message_marks.clear();
         self.assistant_line_buf.clear();
+        self.reasoning_line_buf.clear();
         self.md_state.reset();
         self.last_painted_footer_rows = 0;
         // Drop the reflow log too: the body it described is gone, so a
@@ -14544,6 +14559,46 @@ mod tests {
             "no faint reasoning cells found — the dim style was lost \
              when the SGR string approach was removed"
         );
+    }
+
+    #[test]
+    fn retained_reasoning_text_line_buffering() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, _buf) = new_capturing(w, h);
+
+        // 1. Send text without a newline, it should be buffered and not render as a row yet.
+        r.render(UiLine::ReasoningText("Step 1: thinking".into()));
+        assert_eq!(r.body_lines.len(), 0, "should buffer reasoning without newline");
+
+        // 2. Send a newline, it should flush the complete line.
+        r.render(UiLine::ReasoningText("\n".into()));
+        assert_eq!(r.body_lines.len(), 1, "should flush complete line on newline");
+        assert!(r.body_lines[0].iter().any(|c| c.style.faint && c.ch == 'S'));
+
+        // 3. Send more text, and then a TurnComplete. The remainder should flush.
+        r.render(UiLine::ReasoningText("Step 2: almost done".into()));
+        assert_eq!(r.body_lines.len(), 1, "remainder should stay buffered");
+        r.render(UiLine::TurnComplete);
+        assert_eq!(r.body_lines.len(), 2, "remainder should flush on TurnComplete");
+    }
+
+    #[test]
+    fn retained_command_output_coalescing() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, _buf) = new_capturing(w, h);
+
+        r.render(UiLine::CommandOutput("hello ".into()));
+        r.render(UiLine::CommandOutput("world\n".into()));
+
+        // check body log
+        assert_eq!(r.body_log.len(), 1, "consecutive command outputs must be coalesced");
+        if let UiLine::CommandOutput(text) = &r.body_log[0] {
+            assert_eq!(text, "hello world\n");
+        } else {
+            panic!("expected CommandOutput line in body log");
+        }
     }
 
     /// Repro of the real-world `/whoami after big turn` corruption:
