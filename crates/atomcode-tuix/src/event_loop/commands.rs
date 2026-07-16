@@ -3223,16 +3223,38 @@ fn execute_slash_command_impl(
             }
         }
         "todo" => {
-            // Derive the current todo list from the session transcript and
-            // print it.  Stateless: finds the last `todowrite` tool call in
-            // `ctx.current_session.messages` and re-renders its payload.
-            // No args used; any extra text is silently ignored.
-            let out = format_todo_command(
-                &ctx.current_session.messages,
-                ctx.caps.unicode_symbols,
-            );
-            renderer.render(UiLine::CommandOutput(out));
-            renderer.flush();
+            // `/todo` derives + prints the current list. `/todo clear` (first
+            // word "clear", extra words ignored) deterministically wipes it
+            // (reseeds the kernel with an empty `todowrite`) so cancelled/stale
+            // tasks stop reappearing — then the print shows the now-empty "no
+            // list" as confirmation.
+            let want_clear = arg
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("clear"));
+            if want_clear && ctx.sync_session.is_some() {
+                // Sync mode: the conversation is owned by the daemon. A local
+                // reseed would target the idle local runtime AND clobber the
+                // daemon's authoritative session snapshot — refuse instead.
+                renderer.render(UiLine::CommandOutput(
+                    "同步模式下暂不支持 /todo clear（会话由服务端维护）——退出同步后再清空。"
+                        .to_string(),
+                ));
+                renderer.flush();
+            } else {
+                // Only reseed when there's actually something to clear, so a
+                // no-op `/todo clear` doesn't pollute the transcript with an
+                // empty-todowrite pair.
+                if want_clear && state.active_todos.is_some() {
+                    clear_todos(ctx, state);
+                }
+                let out = format_todo_command(
+                    &ctx.current_session.messages,
+                    ctx.caps.unicode_symbols,
+                );
+                renderer.render(UiLine::CommandOutput(out));
+                renderer.flush();
+            }
         }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
@@ -5623,6 +5645,68 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     Ok(())
 }
 
+/// The synthetic `todowrite`-empty call + its tool result. Appended to the
+/// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
+/// `[]` (the empty list is the last plan), while keeping the transcript's
+/// call/result pairing valid for the next request. Core (session) message model.
+fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::Message> {
+    use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::tool::{ToolCall, ToolResult};
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "todowrite".to_string(),
+                    arguments: r#"{"todos":[]}"#.to_string(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+            internal_origin: Some("todo_clear".to_string()),
+        },
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: id,
+                output: "0 tasks".to_string(),
+                success: true,
+            }),
+            synthetic: false,
+            internal_origin: Some("todo_clear".to_string()),
+        },
+    ]
+}
+
+/// `/todo clear` — deterministically wipe the task list without waiting on the
+/// model. Appends the synthetic empty-`todowrite` pair and reseeds the kernel
+/// conversation (the proven `/resume` `SetConversation` path), so the next turn's
+/// TodoHook derives an empty list and injects nothing; then clears the live panel
+/// + local mirror and persists.
+fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
+    // Unique tool_call id per invocation (the message count grows by 2 each
+    // clear) — a constant id would collide if `/todo clear` ran twice, which a
+    // strict gateway can reject as duplicate `tool_call_id`.
+    let id = format!("todo-clear-{}", ctx.current_session.messages.len());
+    let mut snapshot = ctx.current_session.to_conversation_snapshot();
+    snapshot.messages.extend(todo_clear_messages(id));
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetConversation {
+            snapshot: snapshot.clone(),
+            restore_id: None,
+        })
+        .ok();
+    ctx.current_session.update_from_conversation_snapshot(snapshot);
+    ctx.current_session.touch();
+    let _ = ctx.session_manager.save(&ctx.current_session);
+    state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state);
+}
+
 /// Build the `/todo` output from the session message history.
 ///
 /// Scans the transcript backwards for the most recent `todowrite` tool call,
@@ -6550,6 +6634,36 @@ mod todo_command_tests {
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
+    }
+
+    #[test]
+    fn todo_clear_pair_folds_the_list_to_empty() {
+        // A live plan, then the `/todo clear` synthetic pair appended, must
+        // derive to an empty list → `/todo` shows the "no list" message. This
+        // is what makes cancelled/stale tasks stop reappearing.
+        let mut msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        }];
+        assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
+        msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
+        let no_list = t(Msg::TodoNoList).into_owned();
+        assert!(
+            format_todo_command(&msgs, false).contains(&no_list),
+            "after the clear pair, /todo must show the no-list message; got:\n{}",
+            format_todo_command(&msgs, false)
+        );
     }
 
     #[test]
