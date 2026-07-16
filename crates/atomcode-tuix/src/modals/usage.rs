@@ -97,6 +97,7 @@ impl UsageModal {
 
     /// Build rows for the Current tab.
     fn current_rows(&self) -> Vec<(String, String)> {
+        let m = muted_open();
         let mut rows: Vec<(String, String)> = Vec::new();
         rows.push((String::new(), String::new())); // blank separator
         if let Some(w) = &self.data.window {
@@ -117,20 +118,20 @@ impl UsageModal {
             // Reset countdown
             let hms = Self::hms(w.seconds_until_reset);
             rows.push((
-                format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageResetsIn { hms: &hms })),
+                format!("  {m}{}\x1b[39m", t(Msg::UsageResetsIn { hms: &hms })),
                 String::new(),
             ));
 
             // Window duration hint
             if w.window_hours > 0 {
                 rows.push((
-                    format!("  \x1b[90m({})\x1b[39m", t(Msg::UsageWindowHours { hours: w.window_hours })),
+                    format!("  {m}({})\x1b[39m", t(Msg::UsageWindowHours { hours: w.window_hours })),
                     String::new(),
                 ));
             }
         } else {
             rows.push((
-                format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageWindowUnavailable)),
+                format!("  {m}{}\x1b[39m", t(Msg::UsageWindowUnavailable)),
                 String::new(),
             ));
         }
@@ -152,7 +153,7 @@ impl UsageModal {
             if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
                 rows.push((
                     format!(
-                        "  \x1b[90m{}\x1b[39m",
+                        "  {m}{}\x1b[39m",
                         t(Msg::UsagePlanClaimedExpires {
                             claimed: &plan.claimed_at,
                             expires: &plan.expires_at,
@@ -165,7 +166,7 @@ impl UsageModal {
             if plan.total_days > 0 {
                 rows.push((
                     format!(
-                        "  \x1b[90m{}\x1b[39m",
+                        "  {m}{}\x1b[39m",
                         t(Msg::UsagePlanRemaining {
                             remaining: plan.remaining_days,
                             total: plan.total_days,
@@ -192,8 +193,9 @@ impl UsageModal {
 
     /// Build Overview tab rows — calendar heatmap + stats block.
     pub fn overview_lines(&self) -> Vec<String> {
+        let m = muted_open();
         let Some(u) = &self.data.usage else {
-            return vec![format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageNoData))];
+            return vec![format!("  {m}{}\x1b[39m", t(Msg::UsageNoData))];
         };
 
         let mut lines: Vec<String> = Vec::new();
@@ -251,7 +253,7 @@ impl UsageModal {
             }
             let month_header_str: String = header_buf.into_iter().collect();
             lines.push(format!(
-                "\x1b[90m  {:pad$}{}\x1b[39m",
+                "{m}  {:pad$}{}\x1b[39m",
                 "",
                 month_header_str.trim_end(),
                 pad = WD_LABEL_W
@@ -264,13 +266,23 @@ impl UsageModal {
             // days OUTSIDE the window (leading/trailing padding) render blank.
             // Cells are CELL_W wide so the 60-day grid reads at a comfortable size,
             // and adjacent cells connect.
-            const HEAT_RAMP: [(u8, u8, u8); 6] = [
-                (56, 52, 54),   // 0 — in-range, no activity (neutral dark)
-                (74, 47, 38),   // 1 — least
-                (110, 63, 49),  // 2
-                (146, 79, 60),  // 3
-                (182, 99, 73),  // 4
-                (217, 119, 87), // 5 — most (#d97757, Claude brand coral)
+            // 256-colour (AnsiValue), NOT truecolor: tmux and many terminals
+            // drop `38;2;r;g;b`, leaving the block at the default fg (a flat
+            // grey). A dark→bright coral/salmon ramp from the xterm-256 cube
+            // renders correctly everywhere. Index 0 = in-range-but-zero (neutral
+            // dark square so the grid stays solid); 1..5 = least→most.
+            // Index 0 = a neutral dark-grey "empty" square (in-range but zero
+            // activity); indexes 1..5 = the activity ramp, LIGHT → DEEP RED so
+            // more activity reads as a richer/darker red (Less = pale, More =
+            // deep red, à la GitHub's "more = darker"). The 1..5 red family is
+            // monotonically darkening.
+            const HEAT_RAMP: [u8; 6] = [
+                236, // 0 — no activity (neutral dark grey #303030)
+                217, // 1 — least (#ffafaf pale pink)
+                210, // 2 — (#ff8787 salmon pink)
+                174, // 3 — (#d78787 dusty rose)
+                131, // 4 — (#af5f5f muted brick)
+                88,  // 5 — most (#870000 deep red)
             ];
             let full_block: String = "█".repeat(CELL_W);
             let blank_cell: String = " ".repeat(CELL_W);
@@ -283,7 +295,7 @@ impl UsageModal {
             }
             let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
             for wd in 0u8..7 {
-                let mut row = format!("\x1b[90m{}\x1b[39m ", weekdays[wd as usize]);
+                let mut row = format!("{m}{}\x1b[39m ", weekdays[wd as usize]);
                 for col in 0..=max_week {
                     match grid.get(&(wd, col)).copied() {
                         // Outside the data window (padding) → blank, clean edges.
@@ -291,8 +303,8 @@ impl UsageModal {
                         // In-range day → square (level 0 neutral … 5 coral); no
                         // trailing gap so adjacent cells connect into a solid grid.
                         Some(level) => {
-                            let (r, g, b) = HEAT_RAMP[(level as usize).min(5)];
-                            row.push_str(&format!("\x1b[38;2;{r};{g};{b}m{full_block}\x1b[39m"));
+                            let c = HEAT_RAMP[(level as usize).min(5)];
+                            row.push_str(&format!("\x1b[38;5;{c}m{full_block}\x1b[39m"));
                         }
                     }
                 }
@@ -301,11 +313,11 @@ impl UsageModal {
 
             // Legend: Less ██████ More (coral activity swatches, skip the neutral 0)
             let legend = {
-                let mut s = format!("  \x1b[90m{} \x1b[39m", t(Msg::UsageHeatLess));
-                for &(r, g, b) in &HEAT_RAMP[1..] {
-                    s.push_str(&format!("\x1b[38;2;{r};{g};{b}m██\x1b[39m"));
+                let mut s = format!("  {m}{} \x1b[39m", t(Msg::UsageHeatLess));
+                for &c in &HEAT_RAMP[1..] {
+                    s.push_str(&format!("\x1b[38;5;{c}m██\x1b[39m"));
                 }
-                s.push_str(&format!("\x1b[90m {}\x1b[39m", t(Msg::UsageHeatMore)));
+                s.push_str(&format!("{m} {}\x1b[39m", t(Msg::UsageHeatMore)));
                 s
             };
             lines.push(String::new());
@@ -317,7 +329,7 @@ impl UsageModal {
         let overview = self.data.overview.as_ref().cloned().unwrap_or_else(|| compute_overview(u));
 
         let stat = |label: &str, value: &str| -> String {
-            format!("  \x1b[90m{label:<20}\x1b[39m \x1b[1m{value}\x1b[22m")
+            format!("  {m}{label:<20}\x1b[39m \x1b[1m{value}\x1b[22m")
         };
 
         if let Some(fav) = &overview.favorite_model {
@@ -361,12 +373,13 @@ impl UsageModal {
 
     /// Build Models tab rows.
     fn models_rows(&self, caps_colors: bool, caps_unicode: bool) -> Vec<(String, String)> {
+        let m = muted_open();
         let mut rows: Vec<(String, String)> = Vec::new();
         rows.push((String::new(), String::new()));
 
         let Some(u) = &self.data.usage else {
             rows.push((
-                format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageNoData)),
+                format!("  {m}{}\x1b[39m", t(Msg::UsageNoData)),
                 String::new(),
             ));
             return rows;
@@ -380,7 +393,7 @@ impl UsageModal {
 
         if u.models.is_empty() {
             rows.push((
-                format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageNoData)),
+                format!("  {m}{}\x1b[39m", t(Msg::UsageNoData)),
                 String::new(),
             ));
             return rows;
@@ -478,11 +491,11 @@ impl UsageModal {
                 // are 8 visible columns wide (7-wide value + space) so the braille
                 // plot never jitters between labelled and blank rows.
                 let y_label = if ri == chart_h - 1 {
-                    format!("\x1b[90m{:>7}\x1b[39m ", "0")
+                    format!("{m}{:>7}\x1b[39m ", "0")
                 } else if ri % 2 == 0 {
                     let frac = (chart_h - 1 - ri) as f64 / (chart_h - 1) as f64;
                     let val = (global_max as f64 * frac).round() as u64;
-                    format!("\x1b[90m{:>7}\x1b[39m ", humanize_tokens(val))
+                    format!("{m}{:>7}\x1b[39m ", humanize_tokens(val))
                 } else {
                     "        ".to_string()
                 };
@@ -516,7 +529,7 @@ impl UsageModal {
                 let n = u.rows.len();
                 let indent = "        "; // matches y-label width (8 chars)
                 let x_label_line = if n == 1 {
-                    format!("  {indent}\x1b[90m{}\x1b[39m", u.rows[0].date.as_str())
+                    format!("  {indent}{m}{}\x1b[39m", u.rows[0].date.as_str())
                 } else {
                     let ticks = n.min(5).max(2);
                     let mut buf: Vec<char> = vec![' '; chart_w];
@@ -554,7 +567,7 @@ impl UsageModal {
                         used_end = (start + len + 1).min(chart_w);
                     }
                     let label_str: String = buf.into_iter().collect();
-                    format!("  {indent}\x1b[90m{}\x1b[39m", label_str.trim_end())
+                    format!("  {indent}{m}{}\x1b[39m", label_str.trim_end())
                 };
                 rows.push((x_label_line, String::new()));
             }
@@ -565,7 +578,7 @@ impl UsageModal {
             // Columns: ● Model | Tokens | Requests | Share (aligned).
             rows.push((
                 format!(
-                    "  \x1b[90m  {:<26}{:>10}{:>9}{:>7}\x1b[39m",
+                    "  {m}  {:<26}{:>10}{:>9}{:>7}\x1b[39m",
                     "Model", "Tokens", "Requests", "Share"
                 ),
                 String::new(),
@@ -580,7 +593,7 @@ impl UsageModal {
                 let share = format!("{pct}%");
                 rows.push((
                     format!(
-                        "  \x1b[38;5;{color}m●\x1b[39m {model:<26}\x1b[90m{:>10}{:>9}{:>7}\x1b[39m",
+                        "  \x1b[38;5;{color}m●\x1b[39m {model:<26}{m}{:>10}{:>9}{:>7}\x1b[39m",
                         humanize_tokens(*tok),
                         req,
                         share
@@ -611,7 +624,7 @@ impl UsageModal {
                 ));
                 rows.push((
                     format!(
-                        "    \x1b[90m{pct}%  ·  {req} reqs  ·  {}\x1b[39m",
+                        "    {m}{pct}%  ·  {req} reqs  ·  {}\x1b[39m",
                         humanize_tokens(*tok)
                     ),
                     String::new(),
@@ -775,6 +788,20 @@ impl Modal for UsageModal {
     }
 }
 
+/// SGR opener for muted / label text that stays visible on both palettes.
+///
+/// Dark themes use SGR 37 (light gray): SGR 90 (bright-black) is a palette
+/// colour many dark terminal themes (e.g. iTerm2) map to ≈ the background, so
+/// `\x1b[90m` labels rendered invisible. Light themes keep SGR 90 (dark gray on
+/// white). Close with `\x1b[39m` as before. Mirrors `theme::muted_for_current_theme`.
+fn muted_open() -> &'static str {
+    if crate::highlight::theme::is_light_for_render() {
+        "\x1b[90m"
+    } else {
+        "\x1b[37m"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +899,33 @@ mod tests {
         assert!(
             all.contains("24"),
             "expected request count 24 in overview lines; got:\n{all}"
+        );
+    }
+
+    #[test]
+    fn overview_lines_are_terminal_compatible() {
+        // Compatibility guards (default test theme = dark):
+        //  1. Muted labels use SGR 37, NOT SGR 90 — SGR 90 (bright-black) is
+        //     invisible on some dark themes (iTerm2). Regression fence for that.
+        //  2. The heatmap uses 256-colour (38;5), NOT truecolor (38;2) — tmux
+        //     drops truecolor, leaving the grid a flat grey.
+        let m = sample_modal();
+        let all = m.overview_lines().join("\n");
+        assert!(
+            all.contains("\x1b[37m"),
+            "muted labels must route to SGR 37 on dark; got:\n{all}"
+        );
+        assert!(
+            !all.contains("\x1b[90m"),
+            "muted labels must NOT emit SGR 90 (invisible on dark iTerm2); got:\n{all}"
+        );
+        assert!(
+            all.contains("\x1b[38;5;"),
+            "heatmap must use 256-colour; got:\n{all}"
+        );
+        assert!(
+            !all.contains("\x1b[38;2;"),
+            "heatmap must NOT use truecolor (tmux drops it); got:\n{all}"
         );
     }
 
