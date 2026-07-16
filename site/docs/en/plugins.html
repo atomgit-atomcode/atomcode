@@ -193,7 +193,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>Only when your layout deviates from these defaults (e.g. a custom subdirectory name) do you need explicit <code>"skills"</code> / <code>"commands"</code> / <code>"hooks"</code> fields in <code>plugin.json</code>.</p>
 
-      <h3>Hook trust flow</h3>
+      <h3 id="hook-trust-flow">Hook trust flow</h3>
       <p>To prevent a malicious plugin from silently running arbitrary commands, plugin hooks are protected by a trust gate:</p>
       <ol>
         <li><strong>On install</strong> (<code>/plugin install</code> / <code>atomcode plugin install</code>) — AtomCode prints a notice of the hook commands found. Hooks are <strong>not run yet</strong>.</li>

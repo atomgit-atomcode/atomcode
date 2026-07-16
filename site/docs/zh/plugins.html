@@ -135,7 +135,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       <ul>
         <li>plugin 贡献的 skill 出现在 <code>/</code> 菜单,带 <code>&lt;plugin-name&gt;:</code> 前缀。例如 <code>/ascend-model-agent-plugin:ascend-model-verification</code>。</li>
         <li>模型也能通过 <code>UseSkill</code> 工具自动调用这些 skill。</li>
-        <li>Hook 需信任后才激活 —— 运行 <code>atomcode plugin trust &lt;name&gt;</code> 授权,下次 session 启动时生效。详见<a href="#hook-trust">Hook 信任流程</a>。</li>
+        <li>Hook 需信任后才激活 —— 安装时会打印该插件贡献的 hook 告知(但不运行),运行 <code>atomcode plugin trust &lt;name&gt;</code> 授权后,下次 session 启动时生效。详见<a href="#hook-trust">Hook 信任流程</a>。</li>
       </ul>
 
       <h2>目录布局</h2>
@@ -193,7 +193,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>只有当路径不符合默认约定时(如自定义子目录名),才需要在 <code>plugin.json</code> 中显式声明 <code>"skills"</code>/<code>"commands"</code>/<code>"hooks"</code> 字段。</p>
 
-      <h3>Hook 信任流程</h3>
+      <h3 id="hook-trust">Hook 信任流程</h3>
       <p>为防止恶意插件静默执行任意命令,plugin hook 受信任门控保护:</p>
       <ol>
         <li><strong>安装时</strong>(<code>/plugin install</code> / <code>atomcode plugin install</code>)——打印 hook 内容告知,<strong>不立即运行</strong> hook。</li>
