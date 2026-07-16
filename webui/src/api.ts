@@ -605,6 +605,9 @@ export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
   signal?: AbortSignal,
   sessionId?: string | null,
+  // Called on every chunk received (events AND the 15s keepalive ping) so the
+  // caller can run a staleness watchdog that reconnects a silently-dead stream.
+  onActivity?: () => void,
 ): Promise<void> {
   const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
   const resp = await fetch(`/live${params}`, { headers: authHeaders(), signal });
@@ -615,6 +618,7 @@ export async function streamLive(
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    onActivity?.();
     buffer += decoder.decode(value, { stream: true });
     const parts = buffer.split('\n\n');
     buffer = parts.pop() ?? '';

@@ -450,6 +450,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
+  // Wall-clock of the last byte received on the /live stream (any event OR the
+  // 15s keepalive ping). A watchdog reconnects when this goes stale, catching
+  // silently-dead half-open connections after long idle.
+  const lastLiveActivityRef = useRef<number>(Date.now());
+  // Pending reconnect backoff timer, so teardown can cancel it.
+  const reconnectTimerRef = useRef<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
@@ -586,8 +592,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages, tokens]);
 
-  // Abort the live (/live) stream if the component unmounts while sync is on.
-  useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+  // Abort the live (/live) stream + cancel any pending reconnect timer if the
+  // component unmounts while sync is on.
+  useEffect(() => () => {
+    liveAbortRef.current?.abort();
+    if (reconnectTimerRef.current !== null) clearTimeout(reconnectTimerRef.current);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -675,22 +685,70 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // token counts). startLiveStream is reachable from mount, toggleSync, and
     // session_switched — without this, those overlap into N concurrent streams.
     liveAbortRef.current?.abort();
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     const controller = new AbortController();
     liveAbortRef.current = controller;
-    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
-      // Stream ended or errored; turn sync back off — but NOT when the
-      // stream was deliberately aborted (session switch / manual toggle),
-      // because a new stream is already being (re)started and setting
-      // sync=false here would cause the next user message to go through
-      // /chat instead of /live/message, breaking TUI sync output.
+    lastLiveActivityRef.current = Date.now();
+
+    // /live can silently die after a long idle (proxy / OS TCP timeout), and
+    // the daemon stays alive — so a prompt sent afterwards reaches the daemon
+    // (the synced TUI shows it) but its `user` echo never arrives here and the
+    // message is missing in the webui. On stream death we RECONNECT instead of
+    // dropping sync: the fresh snapshot re-renders the whole conversation,
+    // recovering anything sent while the stream was down, and resumes live
+    // events. Backoff caps the retry rate; after a run of failures (daemon
+    // genuinely gone) we fall back to non-sync so the user isn't stuck.
+    let attempt = 0;
+    const scheduleReconnect = (startedAt: number) => {
+      // Superseded by a newer stream (session switch / manual toggle / watchdog)
+      // — that one owns reconnection now.
       if (controller.signal.aborted) return;
-      setSync(false);
-    });
+      // A connection that stayed up a while was healthy → reset the backoff so a
+      // later idle-death starts fresh. A connect that dies immediately keeps
+      // escalating, so a broken/flapping daemon backs off and eventually falls
+      // to non-sync instead of hammering ~1s reconnects (each re-snapshots the
+      // whole conversation). NB: do NOT reset on every byte — the snapshot's
+      // first byte would pin backoff at 1s forever.
+      if (Date.now() - startedAt >= 30000) attempt = 0;
+      attempt += 1;
+      if (attempt > 6) {
+        stopLiveStream();
+        setSync(false);
+        return;
+      }
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (!controller.signal.aborted) run();
+      }, delay);
+    };
+    const run = () => {
+      const startedAt = Date.now();
+      streamLive(
+        onLiveEvent,
+        controller.signal,
+        activeIdRef.current,
+        () => {
+          // Heartbeat for the staleness watchdog (any byte incl. keepalive ping).
+          lastLiveActivityRef.current = Date.now();
+        },
+      )
+        .then(() => scheduleReconnect(startedAt)) // clean server close → reconnect
+        .catch(() => scheduleReconnect(startedAt)); // error → reconnect
+    };
+    run();
   }
 
   function stopLiveStream() {
     liveAbortRef.current?.abort();
     liveAbortRef.current = null;
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
   }
 
   // 若 sync 初始值为 true（URL 带 sync=1），在挂载时自动连接实时流。
@@ -702,6 +760,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 仅在挂载时执行一次；后续由 toggleSync 控制。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 实时流保活看门狗：daemon 每 15s 发一次 keepalive ping，健康连接至少每
+  // 15s 有字节。若 45s（约 3 个 ping）无任何字节，说明连接已「静默半开」
+  // （长时间空闲后被代理/OS 掐断却没有 FIN，reader.read() 会一直挂着，既不
+  // 报错也收不到消息 —— 正是「隔很久后发消息 webui 不显示、TUI 却有」的成因）。
+  // 此时主动重连：abort 会解开挂起的 read，新连接的 snapshot 重绘整段对话，
+  // 找回期间漏收的消息并恢复实时事件。
+  useEffect(() => {
+    if (!sync) return;
+    const id = setInterval(() => {
+      if (Date.now() - lastLiveActivityRef.current > 45000) {
+        // startLiveStream 会先 abort 旧流再重连（内部已处理重入）。
+        startLiveStream();
+      }
+    }, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sync]);
 
   // 把 sync 状态写回 URL 的 ?sync 参数，使刷新后能保持当前开/关状态
   // （否则关掉同步后 URL 仍带 sync=1，刷新一下又被重新开启 —— issue #816）。
@@ -800,7 +876,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
-      setMessages(loaded.length > 0 ? loaded : []);
+      // The daemon commits the user message into the snapshot at turn START, so
+      // a snapshot ending in a `user` message means a turn is in progress and
+      // its assistant reply is still streaming via the replay/live events that
+      // follow. Append the empty assistant placeholder those events append into
+      // (the live `user` event that normally creates it isn't replayed), and
+      // mark busy — otherwise a mid-turn reconnect drops the in-flight reply,
+      // and a reconnect after the turn finished during a dead window would
+      // otherwise leave `busy` stuck true. Idle snapshots clear busy.
+      const inProgress = loaded.length > 0 && loaded[loaded.length - 1].role === 'user';
+      if (inProgress) {
+        setMessages([...loaded, { role: 'assistant', parts: [], ts: Date.now() }]);
+        setBusy(true);
+      } else {
+        setMessages(loaded.length > 0 ? loaded : []);
+        setBusy(false);
+      }
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) setProvider(e.provider);
