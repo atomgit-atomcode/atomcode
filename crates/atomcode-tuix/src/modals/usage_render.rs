@@ -67,17 +67,19 @@ pub fn sparkline(values: &[u64], width: usize) -> String {
 pub struct HeatCell {
     pub weekday: u8,     // 0=Sun .. 6=Sat
     pub week_col: usize, // 0-based column (week index from the first date)
-    pub level: u8,       // 0..=4 intensity
+    pub level: u8,       // 0..=5 intensity
     pub month_start: bool,
     pub month: u8,       // 1..=12
 }
 
-/// 0..=4 intensity per day. Level 0 = zero.
+/// 0..=5 intensity per day. Level 0 = zero activity.
 ///
 /// Level by fraction of the window MAX (not quantiles): quantiles degenerate
 /// when there are only a few active days (a lone active day would land in the
 /// lowest bucket instead of the highest). Ratio-to-max keeps the busiest day
 /// darkest and low days light, monotonically.
+///
+/// Returns levels in 0..=5; 0 = no activity, 5 = max activity.
 pub fn heatmap_buckets(daily: &[u64]) -> Vec<u8> {
     let max = daily.iter().copied().max().unwrap_or(0);
     if max == 0 {
@@ -89,7 +91,7 @@ pub fn heatmap_buckets(daily: &[u64]) -> Vec<u8> {
             if v == 0 {
                 0
             } else {
-                (((v as f64 / max as f64) * 4.0).ceil() as u8).clamp(1, 4)
+                (((v as f64 / max as f64) * 5.0).ceil() as u8).clamp(1, 5)
             }
         })
         .collect()
@@ -201,6 +203,73 @@ pub fn braille_plot(series: &[Vec<u64>], width_cells: usize, height_cells: usize
     grid
 }
 
+/// Like `braille_plot` but draws a CONNECTED line: for each dot-column, fill the
+/// vertical span of dots between the previous column's y and this column's y, so
+/// consecutive samples join into a continuous line (pixel-level line chart).
+///
+/// Each series is plotted independently (single-series call for per-model colouring)
+/// or merged (multi-series call). Y-scale is shared across all series via gmax.
+pub fn braille_line_plot(series: &[Vec<u64>], width_cells: usize, height_cells: usize) -> Vec<Vec<u8>> {
+    let mut grid = vec![vec![0u8; width_cells.max(1)]; height_cells.max(1)];
+    if width_cells == 0 || height_cells == 0 {
+        return grid;
+    }
+    let dot_w = width_cells * 2;
+    let dot_h = height_cells * 4;
+    let gmax = series
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+
+    for s in series {
+        if s.is_empty() {
+            continue;
+        }
+        let sample = |dx: usize| -> usize {
+            let idx = if s.len() == 1 {
+                0
+            } else {
+                dx * (s.len() - 1) / (dot_w - 1).max(1)
+            };
+            let v = s[idx];
+            let filled = ((v as f64 / gmax as f64) * (dot_h - 1) as f64).round() as usize;
+            (dot_h - 1).saturating_sub(filled)
+        };
+
+        let mut dy_prev = sample(0);
+        // Plot the first dot
+        {
+            let cell_x = 0 / 2;
+            let cell_y = dy_prev / 4;
+            let sub_col = 0 % 2;
+            let sub_row = dy_prev % 4;
+            if cell_y < height_cells && cell_x < width_cells {
+                grid[cell_y][cell_x] |= 1 << BRAILLE_DOT[sub_col][sub_row];
+            }
+        }
+
+        for dx in 1..dot_w {
+            let dy_cur = sample(dx);
+            // Fill vertical span from min to max between prev and cur
+            let dy_lo = dy_prev.min(dy_cur);
+            let dy_hi = dy_prev.max(dy_cur);
+            for dy in dy_lo..=dy_hi {
+                let cell_x = dx / 2;
+                let cell_y = dy / 4;
+                let sub_col = dx % 2;
+                let sub_row = dy % 4;
+                if cell_y < height_cells && cell_x < width_cells {
+                    grid[cell_y][cell_x] |= 1 << BRAILLE_DOT[sub_col][sub_row];
+                }
+            }
+            dy_prev = dy_cur;
+        }
+    }
+    grid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,8 +303,51 @@ mod tests {
         assert_eq!(heatmap_buckets(&[0, 0, 0]), vec![0, 0, 0]);
         let b = heatmap_buckets(&[0, 1, 50, 100, 1000]);
         assert_eq!(b[0], 0); // zero → level 0
-        assert!(b[4] >= b[1] && b[4] <= 4); // monotone, capped at 4
-        assert!(b.iter().all(|&l| l <= 4));
+        assert!(b[4] >= b[1] && b[4] <= 5); // monotone, capped at 5
+        assert!(b.iter().all(|&l| l <= 5));
+    }
+
+    #[test]
+    fn heatmap_buckets_five_levels() {
+        // All-zero → all 0
+        assert_eq!(heatmap_buckets(&[0, 0, 0]), vec![0, 0, 0]);
+        // Single active day → max level 5
+        assert_eq!(heatmap_buckets(&[0, 0, 717016, 0]), vec![0, 0, 5, 0]);
+        // Monotone: levels must be non-decreasing for non-decreasing values
+        let vals = vec![0u64, 100, 300, 600, 1000];
+        let levels = heatmap_buckets(&vals);
+        assert_eq!(levels[0], 0, "zero must be level 0");
+        assert_eq!(levels[4], 5, "max value must be level 5");
+        for w in levels.windows(2) {
+            assert!(w[0] <= w[1], "levels must be non-decreasing; got {:?}", levels);
+        }
+    }
+
+    #[test]
+    fn braille_line_plot_connected_diagonal() {
+        // Strictly rising single series should produce a connected diagonal:
+        // every dot-column must have ≥1 dot set.
+        let series = vec![vec![0u64, 1, 2, 3, 4, 5, 6, 7]];
+        let grid = braille_line_plot(&series, 4, 2);
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0].len(), 4);
+        // Verify every dot-column (dx) has at least one bit set in the grid
+        let dot_w = 4 * 2;
+        for dx in 0..dot_w {
+            let cell_x = dx / 2;
+            let has_dot = grid.iter().any(|row| row[cell_x] != 0);
+            assert!(has_dot, "dot column {dx} has no dots — line has a gap");
+        }
+        // Rising series: bottom-left cell has dots, top-right cell has dots
+        assert!(grid[1][0] != 0, "bottom-left cell should have dots for rising series");
+        assert!(grid[0][3] != 0, "top-right cell should have dots for rising series");
+    }
+
+    #[test]
+    fn braille_line_plot_flat_zero_stays_bottom() {
+        let flat = braille_line_plot(&[vec![0, 0, 0, 0]], 2, 2);
+        assert!(flat[1].iter().any(|&c| c != 0), "flat-zero series should land in bottom row");
+        assert!(flat[0].iter().all(|&c| c == 0), "flat-zero series should not touch top row");
     }
 
     #[test]
@@ -294,8 +406,8 @@ mod tests {
 
     #[test]
     fn heatmap_buckets_single_active_day_is_max_level() {
-        // The lone active day must render darkest (4), not palest (1).
-        assert_eq!(heatmap_buckets(&[0, 0, 717016, 0]), vec![0, 0, 4, 0]);
+        // The lone active day must render darkest (5), not palest (1).
+        assert_eq!(heatmap_buckets(&[0, 0, 717016, 0]), vec![0, 0, 5, 0]);
     }
 
     #[test]
