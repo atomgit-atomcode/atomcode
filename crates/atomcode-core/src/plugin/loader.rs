@@ -117,18 +117,72 @@ fn dedup_hooks(hooks: Vec<PluginCcHook>) -> Vec<PluginCcHook> {
         .collect()
 }
 
-/// Flatten every installed plugin's INLINE CC hooks (`plugin.json` `hooks` blocks) into
-/// neutral [`PluginCcHook`] specs. Only `type: "command"` specs are returned. Plugins
-/// that ship a legacy hooks.json file (rather than inline hooks) are NOT included here —
-/// the legacy engine handles those separately. Empty when no plugin contributes inline
-/// hooks, so the caller can skip wiring entirely.
+/// All CC hooks a plugin contributes: inline (`plugin.json` hooks) + file-based
+/// (`hooks/hooks.json` / `hooks.json`), deduped by `(event, matcher, command)`.
+fn plugin_all_cc_hooks(assets: &InstalledPluginAssets) -> Vec<PluginCcHook> {
+    let mut hooks = Vec::new();
+    if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
+        hooks.extend(expand_cc_hooks(cc_map, &assets.plugin_dir));
+    }
+    hooks.extend(plugin_file_cc_hooks(&assets.plugin_dir));
+    dedup_hooks(hooks)
+}
+
+/// Flatten every installed plugin's CC hooks (inline + file) — but ONLY for
+/// plugins whose current hook-set hash the user has trusted. Untrusted plugins'
+/// hooks are withheld (see `installed_plugin_hook_trust_status` for surfacing).
 pub fn installed_plugin_cc_hooks() -> Vec<PluginCcHook> {
+    let trust = crate::plugin::hook_trust::load_trust();
     let mut out = Vec::new();
     for assets in iter_installed_plugin_assets() {
-        let Some(cc_map) = assets.manifest.inline_cc_hooks() else {
+        let hooks = plugin_all_cc_hooks(&assets);
+        if hooks.is_empty() {
             continue;
-        };
-        out.extend(expand_cc_hooks(cc_map, &assets.plugin_dir));
+        }
+        let hash = crate::plugin::hook_trust::plugin_hook_set_hash(&hooks);
+        let id = crate::plugin::hook_trust::plugin_id(&assets.plugin, &assets.marketplace);
+        if crate::plugin::hook_trust::is_trusted(&trust, &id, &hash) {
+            out.extend(hooks);
+        }
+    }
+    out
+}
+
+/// Per-plugin hook trust status for surfacing (install notice / `hooks list` /
+/// `plugin trust`). Only plugins that actually ship hooks appear.
+#[derive(Debug, Clone)]
+pub struct PluginHookTrust {
+    pub plugin: String,
+    pub marketplace: String,
+    pub plugin_id: String,
+    pub hook_count: usize,
+    pub events: Vec<String>,
+    pub hash: String,
+    pub trusted: bool,
+}
+
+pub fn installed_plugin_hook_trust_status() -> Vec<PluginHookTrust> {
+    let trust = crate::plugin::hook_trust::load_trust();
+    let mut out = Vec::new();
+    for assets in iter_installed_plugin_assets() {
+        let hooks = plugin_all_cc_hooks(&assets);
+        if hooks.is_empty() {
+            continue;
+        }
+        let hash = crate::plugin::hook_trust::plugin_hook_set_hash(&hooks);
+        let id = crate::plugin::hook_trust::plugin_id(&assets.plugin, &assets.marketplace);
+        let mut events: Vec<String> = hooks.iter().map(|h| h.event.clone()).collect();
+        events.sort();
+        events.dedup();
+        out.push(PluginHookTrust {
+            trusted: crate::plugin::hook_trust::is_trusted(&trust, &id, &hash),
+            plugin: assets.plugin,
+            marketplace: assets.marketplace,
+            plugin_id: id,
+            hook_count: hooks.len(),
+            events,
+            hash,
+        });
     }
     out
 }
@@ -290,6 +344,37 @@ mod tests {
         assert_eq!(assets[0].plugin, "p");
         assert!(assets[0].skills_dir().exists());
         assert_eq!(assets[0].scope, InstallScope::User);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cc_hooks_filtered_by_trust() {
+        let _home = crate::plugin::test_support::isolated_home();
+        // repo with a CC file-based SessionStart hook
+        let work = tempfile::tempdir().unwrap().keep();
+        let repo = work.join("hp");
+        std::fs::create_dir_all(repo.join("hooks")).unwrap();
+        std::fs::write(repo.join("hooks/hooks.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#).unwrap();
+        for a in [["init","-q"].as_slice()] { std::process::Command::new("git").args(a).current_dir(&repo).status().unwrap(); }
+        std::process::Command::new("git").args(["config","user.email","t@t"]).current_dir(&repo).status().unwrap();
+        std::process::Command::new("git").args(["config","user.name","t"]).current_dir(&repo).status().unwrap();
+        std::process::Command::new("git").args(["add","-A"]).current_dir(&repo).status().unwrap();
+        std::process::Command::new("git").args(["commit","-q","-m","i"]).current_dir(&repo).status().unwrap();
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo.display())).unwrap();
+        crate::plugin::installer::install("hp", "hp", InstallScope::User).unwrap();
+
+        // Untrusted by default → no hooks loaded, but status reports it.
+        assert!(installed_plugin_cc_hooks().is_empty());
+        let status = installed_plugin_hook_trust_status();
+        let e = status.iter().find(|s| s.plugin == "hp").expect("status entry");
+        assert_eq!(e.hook_count, 1);
+        assert!(!e.trusted);
+        assert_eq!(e.events, vec!["SessionStart".to_string()]);
+
+        // Trust → hooks load.
+        crate::plugin::hook_trust::trust(&e.plugin_id, &e.hash).unwrap();
+        assert_eq!(installed_plugin_cc_hooks().len(), 1);
     }
 
     /// Debug test: dump the real-world installed plugins + skill loading.

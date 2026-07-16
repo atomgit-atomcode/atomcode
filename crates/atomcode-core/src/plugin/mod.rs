@@ -21,6 +21,7 @@ pub(crate) mod url;
 pub use state::InstallScope;
 pub use manifest::{load_marketplace_manifest, load_plugin_manifest, MarketplaceManifest, PluginEntry, PluginManifest, PluginSource};
 pub use paths::{marketplaces_root, plugins_root, project_plugins_root};
+pub use loader::{installed_plugin_cc_hooks, installed_plugin_hook_trust_status, PluginHookTrust};
 
 #[cfg(test)]
 pub(crate) mod test_support;
