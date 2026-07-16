@@ -371,6 +371,17 @@ fn should_try_sync_upgrade() -> bool {
         return false;
     }
 
+    // Env forces offline (works even with no config file, e.g. air-gapped container):
+    // offline On disables binary self-update. Auto/Off do not skip here.
+    if matches!(
+        atomcode_config::config::offline::offline_from_env(
+            std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
+        ),
+        Some(atomcode_config::config::offline::OfflineMode::On)
+    ) {
+        return false;
+    }
+
     // Load just enough of the config to honor `auto_update = false`.
     // Failure to load = assume default (true) — fresh installs benefit.
     let path = atomcode_config::config::Config::default_path();
