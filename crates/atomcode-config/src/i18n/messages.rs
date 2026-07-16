@@ -582,6 +582,11 @@ pub enum Msg<'a> {
     PluginMgrInstalling { plugin: &'a str },
     PluginMgrUpdating { plugin: &'a str },
     PluginMgrEscToCancel,
+    PluginMgrRemoveMarketplaceTitle,
+    PluginMgrRemoveMarketplacePrompt { name: &'a str },
+    PluginMgrRemoveMarketplaceYes,
+    PluginMgrRemoveMarketplaceNo,
+    PluginMgrRemoveMarketplaceHint,
     // Scope selection screen.
     PluginScopeUser,
     PluginScopeUserDesc,

@@ -44,6 +44,7 @@ enum Screen {
     InstalledDetails { plugin: String, mp: String, scope: InstallScope },
     Marketplaces,
     MarketplaceDetails { mp: String },
+    RemoveMarketplaceConfirm { mp: String, from_details: bool },
 }
 
 #[derive(Clone)]
@@ -187,7 +188,8 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. }
+            | Screen::RemoveMarketplaceConfirm { .. } => 2,
         };
         let installed_count = self.installed.len();
         let t0 = if current_tab == 0 {
@@ -214,7 +216,8 @@ impl PluginManager {
             | Screen::ScopeSelect { .. }
             | Screen::Installing { .. } => 0,
             Screen::Installed | Screen::InstalledDetails { .. } => 1,
-            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. } => 2,
+            Screen::Marketplaces | Screen::AddUrl | Screen::MarketplaceDetails { .. }
+            | Screen::RemoveMarketplaceConfirm { .. } => 2,
         };
         let next_tab = if forward {
             (current_tab + 1) % 3
@@ -265,6 +268,7 @@ impl PluginManager {
                     0
                 }
             }
+            Screen::RemoveMarketplaceConfirm { .. } => 2,
         }
     }
 
@@ -388,7 +392,7 @@ impl PluginManager {
         }
     }
 
-    fn enter_marketplace_details(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    fn enter_marketplace_details(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
         if let Screen::MarketplaceDetails { mp } = &self.screen {
             let mp_name = mp.clone();
             let is_official = self.marketplaces.iter()
@@ -402,23 +406,44 @@ impl PluginManager {
                     self.goto(Screen::Browse);
                 }
                 1 => {
-                    self.dispatch_update_marketplace(mp_name, ctx);
+                    self.dispatch_update_marketplace(mp_name, _ctx);
                 }
                 2 if !is_official => {
-                    self.dispatch_remove_marketplace(mp_name, ctx, renderer);
+                    self.goto(Screen::RemoveMarketplaceConfirm { mp: mp_name, from_details: true });
                 }
                 _ => {}
             }
         }
     }
 
-    fn remove_selected_marketplace(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    fn confirm_remove_selected_marketplace(&mut self) {
         if self.selected == 0 {
             return;
         }
         if let Some(m) = self.marketplaces.get(self.selected - 1) {
             let name = m.name.clone();
-            self.dispatch_remove_marketplace(name, ctx, renderer);
+            self.goto(Screen::RemoveMarketplaceConfirm { mp: name, from_details: false });
+        }
+    }
+
+    fn enter_remove_marketplace_confirm(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        let Screen::RemoveMarketplaceConfirm { mp, from_details } = &self.screen else { return };
+        let mp_name = mp.clone();
+        let from_details = *from_details;
+        match self.selected {
+            0 => {
+                // Yes, remove.
+                self.dispatch_remove_marketplace(mp_name, ctx, renderer);
+            }
+            1 => {
+                // No, keep.
+                if from_details {
+                    self.goto(Screen::MarketplaceDetails { mp: mp_name });
+                } else {
+                    self.goto(Screen::Marketplaces);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -777,6 +802,13 @@ impl PluginManager {
                 }
                 (rows, t(Msg::PluginMgrHintNav).into_owned())
             }
+            Screen::RemoveMarketplaceConfirm { .. } => {
+                let rows = vec![
+                    (t(Msg::PluginMgrRemoveMarketplaceYes).into_owned(), String::new()),
+                    (t(Msg::PluginMgrRemoveMarketplaceNo).into_owned(), String::new()),
+                ];
+                (rows, t(Msg::PluginMgrRemoveMarketplaceHint).into_owned())
+            }
         }
     }
 }
@@ -897,14 +929,14 @@ impl Modal for PluginManager {
                 } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
                 } else if matches!(self.screen, Screen::Marketplaces) {
-                    self.remove_selected_marketplace(ctx, renderer);
+                    self.confirm_remove_selected_marketplace();
                 }
             }
             KeyCode::Delete => {
                 if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
                 } else if matches!(self.screen, Screen::Marketplaces) {
-                    self.remove_selected_marketplace(ctx, renderer);
+                    self.confirm_remove_selected_marketplace();
                 }
             }
             KeyCode::Esc => {
@@ -944,6 +976,13 @@ impl Modal for PluginManager {
                         Screen::MarketplaceDetails { .. } => {
                             self.goto(Screen::Marketplaces);
                         }
+                        Screen::RemoveMarketplaceConfirm { mp, from_details } => {
+                            if *from_details {
+                                self.goto(Screen::MarketplaceDetails { mp: mp.clone() });
+                            } else {
+                                self.goto(Screen::Marketplaces);
+                            }
+                        }
                         _ => {
                             return Ok(ModalAction::Close);
                         }
@@ -967,6 +1006,7 @@ impl Modal for PluginManager {
                         Screen::AddUrl => {}
                         Screen::Marketplaces => self.enter_marketplaces(ctx, renderer),
                         Screen::MarketplaceDetails { .. } => self.enter_marketplace_details(ctx, renderer),
+                        Screen::RemoveMarketplaceConfirm { .. } => self.enter_remove_marketplace_confirm(ctx, renderer),
                     }
                 }
             }
@@ -1006,6 +1046,15 @@ impl Modal for PluginManager {
             final_items.push((self.search_query.clone(), String::new()));
             final_items.push((String::new(), String::new()));
             selected_offset += 2;
+        }
+
+        if let Screen::RemoveMarketplaceConfirm { mp, .. } = &self.screen {
+            final_items.push((t(Msg::PluginMgrRemoveMarketplaceTitle).into_owned(), String::new()));
+            final_items.push((format!("  Marketplace: \x1b[90m{}\x1b[39m", mp), String::new()));
+            final_items.push((String::new(), String::new()));
+            final_items.push((t(Msg::PluginMgrRemoveMarketplacePrompt { name: mp }).into_owned(), String::new()));
+            final_items.push((String::new(), String::new()));
+            selected_offset += 5;
         }
 
         let details_opt = match &self.screen {
@@ -1119,6 +1168,7 @@ impl Modal for PluginManager {
                 Screen::InstalledDetails { .. }
                     | Screen::ScopeSelect { .. }
                     | Screen::MarketplaceDetails { .. }
+                    | Screen::RemoveMarketplaceConfirm { .. }
             ) {
                 final_items.push((String::new(), String::new()));
             } else if matches!(self.screen, Screen::AddUrl) {
@@ -1152,7 +1202,8 @@ impl Modal for PluginManager {
             Screen::ScopeSelect { .. }
             | Screen::Installing { .. }
             | Screen::InstalledDetails { .. }
-            | Screen::MarketplaceDetails { .. } => MenuKind::PluginInfo,
+            | Screen::MarketplaceDetails { .. }
+            | Screen::RemoveMarketplaceConfirm { .. } => MenuKind::PluginInfo,
         };
         let payload = MenuPayload {
             items: final_items,
