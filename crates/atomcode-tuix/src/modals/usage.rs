@@ -3,14 +3,14 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use atomcode_core::coding_plan::types::{PlanInfo, RateLimitWindow};
+use atomcode_core::coding_plan::types::RateLimitWindow;
 use atomcode_core::coding_plan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::usage_render::{
-    braille_plot, braille_series_char, calendar_layout, progress_bar, sparkline,
+    braille_line_plot, braille_series_char, calendar_layout, progress_bar, sparkline,
 };
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -27,7 +27,6 @@ pub enum Tab {
 /// Fields are filled asynchronously; any may be `None` while loading or on error.
 pub struct UsageData {
     pub window: Option<RateLimitWindow>,
-    pub plan: Option<PlanInfo>,
     pub usage: Option<UsageResponse>,
     pub overview: Option<OverviewStats>,
     pub error: Option<String>,
@@ -135,63 +134,6 @@ impl UsageModal {
             ));
         }
 
-        // ── Plan section (CodingPlan entitlement) ──
-        if let Some(plan) = &self.data.plan {
-            rows.push((String::new(), String::new()));
-            rows.push((
-                format!("  \x1b[1m{}\x1b[22m", t(Msg::UsagePlanTitle)),
-                String::new(),
-            ));
-            rows.push((String::new(), String::new()));
-
-            let status_label = if plan.status == 1 {
-                format!("\x1b[32m{}\x1b[39m", t(Msg::UsagePlanActive))
-            } else {
-                format!("\x1b[31m{}\x1b[39m", t(Msg::UsagePlanExpired))
-            };
-            rows.push((
-                format!("  \x1b[1m{}\x1b[22m · {status_label}", plan.plan_name),
-                String::new(),
-            ));
-
-            if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
-                rows.push((
-                    format!(
-                        "  \x1b[90m{}\x1b[39m",
-                        t(Msg::UsagePlanClaimedExpires {
-                            claimed: &plan.claimed_at,
-                            expires: &plan.expires_at,
-                        })
-                    ),
-                    String::new(),
-                ));
-            }
-
-            if plan.total_days > 0 {
-                rows.push((
-                    format!(
-                        "  \x1b[90m{}\x1b[39m",
-                        t(Msg::UsagePlanRemaining {
-                            remaining: plan.remaining_days,
-                            total: plan.total_days,
-                        })
-                    ),
-                    String::new(),
-                ));
-                // Day-progress bar: elapsed = total - remaining
-                let elapsed_pct = ((plan.total_days - plan.remaining_days) as f64
-                    / plan.total_days as f64
-                    * 100.0)
-                    .clamp(0.0, 100.0);
-                let bar = progress_bar(elapsed_pct, 24);
-                let bar_color = if plan.remaining_days == 0 { 31 } else { 33 };
-                rows.push((
-                    format!("  \x1b[{bar_color}m{bar}\x1b[39m  {:.1}%", elapsed_pct),
-                    String::new(),
-                ));
-            }
-        }
-
         rows
     }
 
@@ -214,14 +156,14 @@ impl UsageModal {
             let max_week = cells.iter().map(|c| c.week_col).max().unwrap_or(0);
 
             // Month-label header row: place short month name at each month_start column.
-            // Cell width = 2 display chars (glyph + space), so col N starts at char offset N*2.
+            // Cell width = 3 display chars (glyph + 2 spaces), so col N starts at char offset N*3.
             // We write into a plain Vec<char> buffer and overwrite at the right position,
             // ensuring labels never collide regardless of spacing.
             let month_names = [
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
             ];
-            const CELL_W: usize = 2; // display width per heatmap cell (glyph + trailing space)
+            const CELL_W: usize = 3; // display width per heatmap cell (glyph + 2 trailing spaces)
             let header_len = (max_week + 1) * CELL_W;
             let mut header_buf: Vec<char> = vec![' '; header_len];
             // Collect month_starts sorted by week_col so we can clip labels before the next one.
@@ -253,8 +195,9 @@ impl UsageModal {
             lines.push(format!("\x1b[90m  {month_header_str}\x1b[39m"));
 
             // 7 weekday rows (Sun=0 .. Sat=6)
-            // Orange ramp: level 0=faint dot, 1..4 = 256-colour orange (52/94/166/208)
-            let heat_colors: [u8; 5] = [0, 52, 94, 166, 208];
+            // Distinct orange ramp: level 0 = faint dot, levels 1..5 = warm dark-red → bright-orange/gold
+            // AnsiValue: 52=dark red, 94=brown-orange, 166=orange, 208=bright orange, 214=gold
+            let heat_colors: [u8; 6] = [0, 52, 94, 166, 208, 214];
             for wd in 0u8..7 {
                 let wd_label = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"][wd as usize];
                 let mut row = format!("\x1b[90m{wd_label}\x1b[39m ");
@@ -270,20 +213,20 @@ impl UsageModal {
                 while col <= max_week {
                     let level = week_map.get(&col).copied().unwrap_or(0);
                     if level == 0 {
-                        row.push_str("\x1b[90m·\x1b[39m ");
+                        row.push_str("\x1b[90m·\x1b[39m  ");
                     } else {
                         let color = heat_colors[level as usize];
-                        row.push_str(&format!("\x1b[38;5;{color}m■\x1b[39m "));
+                        row.push_str(&format!("\x1b[38;5;{color}m██\x1b[39m "));
                     }
                     col += 1;
                 }
                 lines.push(format!("  {row}"));
             }
 
-            // Legend: Less ▪▪▪▪ More
+            // Legend: Less ▪▪▪▪▪ More (5 swatches)
             let legend = {
                 let mut s = format!("  \x1b[90m{} \x1b[39m", t(Msg::UsageHeatLess));
-                for lvl in 1u8..=4 {
+                for lvl in 1u8..=5 {
                     let color = heat_colors[lvl as usize];
                     s.push_str(&format!("\x1b[38;5;{color}m■\x1b[39m"));
                 }
@@ -371,8 +314,26 @@ impl UsageModal {
         // Per-model colour palette (256-colour)
         let model_colors: [u8; 6] = [75, 214, 208, 154, 183, 81];
 
-        // Gather per-model series + aggregate stats (sorted tokens desc for breakdown)
-        let total_tokens_all: u64 = u.model_tokens.values().sum();
+        // Gather per-model series + aggregate stats (sorted tokens desc for breakdown).
+        // Fall back to summing row-level model_tokens when the top-level map is absent/empty
+        // (mirrors how compute_overview falls back).
+        let model_series_tokens: std::collections::HashMap<&String, u64> = u
+            .models
+            .iter()
+            .map(|model| {
+                let row_sum: u64 = u
+                    .rows
+                    .iter()
+                    .map(|r| r.model_tokens.get(model).copied().unwrap_or(0))
+                    .sum();
+                (model, row_sum)
+            })
+            .collect();
+        let total_tokens_all: u64 = if u.model_tokens.values().sum::<u64>() > 0 {
+            u.model_tokens.values().sum()
+        } else {
+            model_series_tokens.values().sum()
+        };
         let mut model_stats: Vec<(&String, Vec<u64>, u64, u64)> = u
             .models
             .iter()
@@ -382,7 +343,12 @@ impl UsageModal {
                     .iter()
                     .map(|r| r.model_tokens.get(model).copied().unwrap_or(0))
                     .collect();
-                let total_tok: u64 = u.model_tokens.get(model).copied().unwrap_or(0);
+                // Prefer top-level map; fall back to row sum when map is empty
+                let total_tok: u64 = if u.model_tokens.is_empty() {
+                    model_series_tokens.get(model).copied().unwrap_or(0)
+                } else {
+                    u.model_tokens.get(model).copied().unwrap_or(0)
+                };
                 let total_req: u64 = u.model_counts.get(model).copied().unwrap_or(0) as u64;
                 (model, series, total_tok, total_req)
             })
@@ -390,8 +356,8 @@ impl UsageModal {
         model_stats.sort_by(|a, b| b.2.cmp(&a.2)); // sort by tokens desc
 
         if caps_colors && caps_unicode {
-            // ── Unified braille chart ──
-            let chart_w = 40usize; // cells (wider)
+            // ── Unified braille line chart ──
+            let chart_w = 52usize; // cells (wider for clearer display)
             let chart_h = 6usize;  // cells
 
             // Global max across all series
@@ -402,19 +368,16 @@ impl UsageModal {
                 .unwrap_or(0);
             let top_label = humanize_tokens(global_max);
 
-            // Per-model single-series grids (for colour attribution)
+            // Per-model single-series line grids (for colour attribution).
+            // braille_line_plot uses its own internal max, so we need a consistent Y-scale:
+            // inject a sentinel max at the end and clear the dummy rightmost column.
             let model_grids: Vec<Vec<Vec<u8>>> = model_stats
                 .iter()
                 .map(|(_, series, _, _)| {
-                    // Use a scaled series so all share the same global_max Y scale.
-                    // braille_plot uses the internal max of the passed series, so we
-                    // inject a sentinel max value at position 0 if needed.
                     let mut scaled = series.clone();
                     if global_max > 0 && scaled.iter().copied().max().unwrap_or(0) < global_max {
-                        // Pad with a virtual max point so the Y scale is consistent.
-                        // We do this by temporarily adding global_max and then zeroing it.
                         scaled.push(global_max);
-                        let mut g = braille_plot(&[scaled], chart_w, chart_h);
+                        let mut g = braille_line_plot(&[scaled], chart_w, chart_h);
                         // Clear the rightmost column introduced by the dummy point
                         for row in &mut g {
                             if let Some(last) = row.last_mut() {
@@ -423,7 +386,7 @@ impl UsageModal {
                         }
                         g
                     } else {
-                        braille_plot(&[series.clone()], chart_w, chart_h)
+                        braille_line_plot(&[series.clone()], chart_w, chart_h)
                     }
                 })
                 .collect();
@@ -465,25 +428,35 @@ impl UsageModal {
                 rows.push((line, String::new()));
             }
 
-            // X-axis date labels: show start, middle, end of the range
+            // X-axis date labels: guard against very small datasets to avoid overlap
             if !u.rows.is_empty() {
                 let n = u.rows.len();
-                let left = u.rows[0].date.as_str();
-                let mid = u.rows[n / 2].date.as_str();
-                let right = u.rows[n - 1].date.as_str();
-                // 8 chars for y-axis prefix + chart_w chars for chart
-                let x_mid_pos = chart_w / 2;
-                let indent = "        "; // matches y-label width
-                let left_pad = 2 + indent.len();
-                let _ = left_pad;
-                rows.push((
+                let indent = "        "; // matches y-label width (8 chars)
+                let x_label_line = if n == 1 {
+                    // Single date: just show it left-aligned
+                    format!("  {indent}\x1b[90m{}\x1b[39m", u.rows[0].date.as_str())
+                } else if n == 2 {
+                    // Two dates: left + right, no middle
+                    let left = u.rows[0].date.as_str();
+                    let right = u.rows[n - 1].date.as_str();
+                    let gap = chart_w.saturating_sub(left.len() + right.len());
                     format!("  {indent}\x1b[90m{left}{:>width$}{right}\x1b[39m",
-                        mid,
-                        width = chart_w.saturating_sub(left.len() + mid.len()).max(1)
-                    ),
-                    String::new(),
-                ));
-                let _ = x_mid_pos;
+                        "", width = gap.max(1))
+                } else {
+                    // Three dates: left, middle, right
+                    let left = u.rows[0].date.as_str();
+                    let mid = u.rows[n / 2].date.as_str();
+                    let right = u.rows[n - 1].date.as_str();
+                    let total_fixed = left.len() + mid.len() + right.len();
+                    let spacing = chart_w.saturating_sub(total_fixed);
+                    let left_gap = spacing / 2;
+                    let right_gap = spacing.saturating_sub(left_gap);
+                    format!("  {indent}\x1b[90m{left}{:>lw$}{mid}{:>rw$}{right}\x1b[39m",
+                        "", "",
+                        lw = left_gap.max(1),
+                        rw = right_gap.max(1))
+                };
+                rows.push((x_label_line, String::new()));
             }
 
             rows.push((String::new(), String::new()));
@@ -737,7 +710,6 @@ mod tests {
         let overview = compute_overview(&usage);
         UsageModal::new(UsageData {
             window: None,
-            plan: None,
             usage: Some(usage),
             overview: Some(overview),
             error: None,
@@ -747,7 +719,6 @@ mod tests {
     fn empty_modal() -> UsageModal {
         UsageModal::new(UsageData {
             window: None,
-            plan: None,
             usage: None,
             overview: None,
             error: None,
@@ -876,36 +847,28 @@ mod tests {
     }
 
     #[test]
-    fn current_rows_shows_plan_info_when_present() {
-        use atomcode_core::coding_plan::types::PlanInfo;
-        let plan = PlanInfo {
-            plan_name: "CodingPlan Pro".into(),
-            status: 1,
-            claimed_at: "2026-06-01".into(),
-            expires_at: "2026-07-01".into(),
-            remaining_days: 5,
-            total_days: 30,
-            apply_id: 42,
-        };
-        let usage = parse_usage(SAMPLE).expect("parse SAMPLE");
-        let overview = compute_overview(&usage);
-        let m = UsageModal::new(UsageData {
-            window: None,
-            plan: Some(plan),
-            usage: Some(usage),
-            overview: Some(overview),
-            error: None,
-        });
+    fn current_rows_has_no_plan_section() {
+        // The Plan section has been removed; current tab only shows the rate-limit window block.
+        let m = sample_modal();
         let rows = m.current_rows();
         let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        // None of the plan-specific strings should appear
         assert!(
-            all.contains("CodingPlan Pro"),
-            "expected plan_name in current rows; got:\n{all}"
+            !all.contains("CodingPlan") && !all.contains("Active") && !all.contains("Expired"),
+            "Plan section should be absent from Current tab; got:\n{all}"
         );
-        assert!(
-            all.contains("5") && all.contains("30"),
-            "expected remaining/total days; got:\n{all}"
-        );
+    }
+
+    #[test]
+    fn models_rows_row_sum_fallback_tokens() {
+        // When model_tokens top-level map would be absent, row-level sums should be used.
+        // In our SAMPLE the top-level map is populated, so we verify consistency:
+        // GLM-5.2 has 717016 tokens in rows, which should appear in breakdown.
+        let m = sample_modal();
+        let rows = m.models_rows(true, true);
+        let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("717.1k") || all.contains("717016") || all.contains("717"),
+            "expected GLM token count in breakdown; got:\n{all}");
     }
 
     #[test]

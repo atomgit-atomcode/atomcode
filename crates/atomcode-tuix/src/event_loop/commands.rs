@@ -4340,7 +4340,6 @@ fn open_usage(
             .min_by_key(|w| w.window_hours)
             .cloned()
     });
-    let plan = status.and_then(|s| s.codingplan_free);
     let (usage, error) = match client.usage() {
         Ok(u) => (Some(u), None),
         Err(e) => (None, Some(format!("{e}"))),
@@ -4350,7 +4349,6 @@ fn open_usage(
         .map(atomcode_core::coding_plan::usage::compute_overview);
     *active_modal = Some(Box::new(UsageModal::new(UsageData {
         window,
-        plan,
         usage,
         overview,
         error,
