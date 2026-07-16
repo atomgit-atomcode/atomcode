@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-auth"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "atomcode-config",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-bridge"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-capabilities"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-clix"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-coding"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -489,7 +489,7 @@ version = "0.1.0"
 
 [[package]]
 name = "atomcode-config"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "atomcode-telemetry",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-kernel"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-review"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-telemetry"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-updater"
-version = "4.26.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "atomcode-config",
