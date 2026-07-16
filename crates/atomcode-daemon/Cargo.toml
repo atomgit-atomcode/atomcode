@@ -60,6 +60,10 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 # #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the
 # developer's real ~/.atomcode.
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+# test-util unlocks reset_offline_verdict_for_test / seed_offline_verdict for
+# the daemon parity test (offline block in build_api_system_prompt).
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
+serial_test = "3"
 ctor = "0.2"
 tempfile = "3"
 

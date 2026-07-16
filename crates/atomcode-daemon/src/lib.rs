@@ -3288,6 +3288,10 @@ pub(crate) fn build_api_system_prompt(
         prompt.push('\n');
     }
 
+    if atomcode_config::config::offline::is_offline_active() {
+        prompt.push_str(&atomcode_coding::persona::offline_environment_block());
+    }
+
     prompt
 }
 
@@ -5306,5 +5310,65 @@ mod channel_mode_tests {
             effective_chat_approval_mode(None),
             crate::approval_mode::ApprovalMode::Auto
         );
+    }
+
+    // ---- Offline parity: build_api_system_prompt must emit OFFLINE ENVIRONMENT ----
+
+    fn minimal_build_api_system_prompt_fixture() -> (PathBuf, atomcode_config::config::Config, atomcode_config::config::provider::ProviderConfig, Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>) {
+        let working_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = atomcode_config::config::Config::default();
+        let provider_config = atomcode_config::config::provider::ProviderConfig {
+            provider_type: "openai".to_string(),
+            api_key: None,
+            model: "test-model".to_string(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        };
+        let mut registry = atomcode_core::skill::SkillRegistry::new();
+        registry.reload(&working_dir);
+        let skill_registry = Arc::new(std::sync::RwLock::new(registry));
+        (working_dir, config, provider_config, skill_registry)
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn build_api_system_prompt_emits_offline_block_when_offline() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
+        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
+        assert!(
+            prompt.contains("## OFFLINE ENVIRONMENT:"),
+            "daemon prompt must carry the offline block when offline: {prompt}"
+        );
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn build_api_system_prompt_omits_offline_block_when_online() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+        let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
+        let prompt = build_api_system_prompt(&wd, &cfg, &pcfg, &sr);
+        assert!(
+            !prompt.contains("## OFFLINE ENVIRONMENT:"),
+            "daemon prompt must NOT carry the offline block when online: {prompt}"
+        );
+        reset_offline_verdict_for_test();
     }
 }

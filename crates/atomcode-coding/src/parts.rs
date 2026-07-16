@@ -895,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(offline_verdict)]
     fn model_switch_replaces_persona_without_duplication() {
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(coding_persona("old-model", crate::persona::todo_switch_enabled())),
@@ -915,6 +916,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(offline_verdict)]
     fn current_persona_keeps_snapshot_byte_stable() {
         let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![

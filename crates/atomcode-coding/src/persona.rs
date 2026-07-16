@@ -35,6 +35,26 @@ pub(crate) fn memory_tool_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Injected only when `is_offline_active()`. States the ONE certain fact (no public
+/// internet) and defers dependency availability to configured internal mirrors — it does
+/// NOT ban package managers. `offline_note()` (from config) is appended at the call site.
+pub const OFFLINE_ENVIRONMENT: &str = "\n\n## OFFLINE ENVIRONMENT:\n\
+No public internet access. External CDNs and public registries (npm/PyPI/Maven Central \
+official sources, etc.) are unreachable. Use ONLY dependencies obtainable via the \
+configured internal mirrors/registries, or assets already vendored in the repo; do NOT \
+reference external CDNs in generated pages. When unsure whether a package or mirror is \
+reachable, prefer a dependency-free approach or ask first.";
+
+/// The OFFLINE ENVIRONMENT block with the env-level `offline_note` appended (if set).
+pub fn offline_environment_block() -> String {
+    let mut s = OFFLINE_ENVIRONMENT.to_string();
+    if let Some(note) = atomcode_config::config::offline::offline_note() {
+        s.push_str("\nThis environment provides: ");
+        s.push_str(&note);
+    }
+    s
+}
+
 pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
@@ -86,6 +106,9 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     }
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
+    }
+    if atomcode_config::config::offline::is_offline_active() {
+        p.push_str(&offline_environment_block());
     }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
@@ -799,6 +822,41 @@ mod tests {
         assert!(model_needs_firm_tool_steering("deepseek-chat"));
         assert!(!model_needs_firm_tool_steering("claude-opus-4-8"));
         assert!(!model_needs_firm_tool_steering("gpt-5"));
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_block_present_when_offline() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block must appear when offline: {p}");
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_block_absent_when_online() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(!p.contains("## OFFLINE ENVIRONMENT:"), "offline block must NOT appear when online: {p}");
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_note_appended_to_block() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, set_offline_note, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+        set_offline_note(Some("npm via nexus.internal".to_string()));
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block header must appear: {p}");
+        assert!(p.contains("npm via nexus.internal"), "offline note must be appended: {p}");
+        reset_offline_verdict_for_test();
     }
 
     #[test]
