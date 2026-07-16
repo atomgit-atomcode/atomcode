@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 
 use crate::convert;
 
+const CONVERSATION_RESTORE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// What the bridge needs to build the new-stack agent. Resolved by the CALLER
 /// (the cli already has a loaded `Config`) so the bridge stays config-format-agnostic.
 #[derive(Clone)]
@@ -212,6 +214,9 @@ struct Bridge {
     pending_finish: Option<StopReason>,
     /// Driver asked for SyncMessages: the next Snapshot answers it.
     pending_sync: bool,
+    /// A SetConversation restore has respawned and is waiting for the new
+    /// runtime to read its installed snapshot back.
+    pending_restore: Option<PendingConversationRestore>,
     /// A plan-mode toggle note to prepend to the next user message (v1 parity:
     /// communicated via history, NOT the system prompt, to keep the prefix cache).
     pending_plan_note: Option<String>,
@@ -247,7 +252,7 @@ struct Bridge {
     /// Set while a goal evaluation runs OFF the select loop: holds the deferred
     /// turn (reason + conversation) until the eval result comes back. `Some` ⇒
     /// an eval is in flight and the driver-facing turn is held open.
-    pending_goal: Option<(StopReason, Vec<atomcode_core::conversation::message::Message>)>,
+    pending_goal: Option<(StopReason, ConversationSnapshot)>,
     /// The spawned eval task reports its outcome here; drained by the main loop
     /// as a third event source so commands (Cancel) stay responsive during eval.
     goal_eval_tx: mpsc::UnboundedSender<EvalOutcome>,
@@ -271,7 +276,7 @@ struct Bridge {
     /// round-limit) `take()` it and `finish_turn` so the UI leaves Streaming. Without it,
     /// stopping a SLEEPING loop strands the driver in Streaming forever (the kernel turn
     /// already completed, so the forwarded KCmd::Cancel is a no-op).
-    loop_pending_finish: Option<Vec<atomcode_core::conversation::message::Message>>,
+    loop_pending_finish: Option<ConversationSnapshot>,
     /// The bridge end of the channel the kernel-side [`ScheduleWakeupTool`] sends on.
     /// Drained by the select loop (a wakeup arriving mid-turn is recorded into
     /// `pending_wakeup`). The matching sender is mounted into the kernel via the tool.
@@ -287,6 +292,18 @@ struct Bridge {
     /// during the wait — the same discipline as `goal_eval_tx`.
     loop_fire_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_fire_rx: mpsc::UnboundedReceiver<WakeupRequest>,
+}
+
+struct PendingConversationRestore {
+    restore_id: u64,
+    deadline: Instant,
+}
+
+async fn wait_for_restore_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 impl Bridge {
@@ -448,6 +465,7 @@ impl Bridge {
             turn_running: false,
             pending_finish: None,
             pending_sync: false,
+            pending_restore: None,
             pending_plan_note: None,
             pending_undo: None,
             pending_local_shell: Vec::new(),
@@ -470,6 +488,7 @@ impl Bridge {
         };
 
         loop {
+            let restore_deadline = bridge.pending_restore.as_ref().map(|p| p.deadline);
             tokio::select! {
                 // Deterministic branch order: a loop wakeup/fire that's ready in the
                 // SAME poll as a kernel event MUST be processed first, so `pending_wakeup`
@@ -508,9 +527,12 @@ impl Bridge {
                         // Snapshot to finalize, close its lifecycle (no Snapshot will
                         // ever come) so the driver isn't stranded in a busy phase.
                         if let Some(reason) = bridge.pending_finish.take() {
-                            bridge.finish_turn(reason, Vec::new());
+                            bridge.finish_turn(reason, ConversationSnapshot::default());
                         } else if bridge.turn_running {
-                            bridge.finish_turn(StopReason::Cancelled, Vec::new());
+                            bridge.finish_turn(
+                                StopReason::Cancelled,
+                                ConversationSnapshot::default(),
+                            );
                         } else if let Some(messages) = bridge.loop_pending_finish.take() {
                             // A /loop sleeping between rounds holds its turn OPEN
                             // (pending_finish already consumed, turn_running=false). Without
@@ -525,9 +547,25 @@ impl Bridge {
                             error: "engine v2 agent terminated".into(),
                             snapshot: ConversationSnapshot::default(),
                         });
+                        if let Some(pending) = bridge.pending_restore.take() {
+                            bridge.emit(CoreEv::ConversationRestoreFailed {
+                                restore_id: pending.restore_id,
+                                error: "engine v2 terminated before the restored conversation could be verified"
+                                    .into(),
+                            });
+                        }
                         break;
                     }
                 },
+                _ = wait_for_restore_deadline(restore_deadline) => {
+                    if let Some(pending) = bridge.pending_restore.take() {
+                        bridge.emit(CoreEv::ConversationRestoreFailed {
+                            restore_id: pending.restore_id,
+                            error: "engine v2 timed out while verifying the restored conversation"
+                                .into(),
+                        });
+                    }
+                }
             }
         }
         let _ = bridge.handle.shutdown().await;
@@ -535,6 +573,22 @@ impl Bridge {
 
     fn emit(&self, ev: CoreEv) {
         let _ = self.ev_tx.send(ev);
+    }
+
+    fn fail_conversation_restore(&mut self, restore_id: Option<u64>, error: impl Into<String>) {
+        self.pending_restore = None;
+        let error = error.into();
+        if let Some(restore_id) = restore_id {
+            self.emit(CoreEv::ConversationRestoreFailed {
+                restore_id,
+                error,
+            });
+        } else {
+            self.emit(CoreEv::Error {
+                error,
+                snapshot: ConversationSnapshot::default(),
+            });
+        }
     }
 
     /// Goal-mode turn-end hook: spawn the evaluator OFF the select loop and hold
@@ -545,13 +599,13 @@ impl Bridge {
     fn spawn_goal_eval(
         &mut self,
         reason: StopReason,
-        messages: Vec<atomcode_core::conversation::message::Message>,
+        snapshot: ConversationSnapshot,
     ) {
         let (Some(provider), Some(condition)) = (
             self.goal_provider.clone(),
             self.goal.as_ref().filter(|g| g.active).map(|g| g.condition.clone()),
         ) else {
-            self.finish_turn(reason, messages);
+            self.finish_turn(reason, snapshot);
             return;
         };
         // `goal_provider` is cached across turns and survives respawn, where
@@ -562,8 +616,8 @@ impl Bridge {
             provider.set_session_id(&self.bridge_session);
         }
         let prev = self.goal.as_ref().and_then(|g| g.last_eval_reason.clone());
-        let summary = summarize_for_goal(&messages, prev.as_deref());
-        self.pending_goal = Some((reason, messages));
+        let summary = summarize_for_goal(&snapshot.messages, prev.as_deref());
+        self.pending_goal = Some((reason, snapshot));
         let cancel = self.goal_cancel.clone();
         let tx = self.goal_eval_tx.clone();
         tokio::spawn(async move {
@@ -579,7 +633,7 @@ impl Bridge {
     /// open. A `None` `pending_goal` means the goal was cleared/cancelled while the
     /// eval ran — ignore the stale outcome.
     async fn on_goal_eval_result(&mut self, outcome: EvalOutcome) {
-        let Some((reason, messages)) = self.pending_goal.take() else {
+        let Some((reason, snapshot)) = self.pending_goal.take() else {
             return;
         };
         if let Some(u) = outcome.usage.as_ref() {
@@ -597,7 +651,7 @@ impl Bridge {
                     let ev = goal_update_ev(&g);
                     self.emit(ev);
                 }
-                self.finish_turn(reason, messages);
+                self.finish_turn(reason, snapshot);
             }
             GoalResult::NotMet { reason: verdict } => {
                 let cond = match self.goal.as_mut() {
@@ -608,7 +662,7 @@ impl Bridge {
                         g.condition.clone()
                     }
                     None => {
-                        self.finish_turn(reason, messages);
+                        self.finish_turn(reason, snapshot);
                         return;
                     }
                 };
@@ -625,7 +679,7 @@ impl Bridge {
                         g.is_evaluator_exhausted()
                     }
                     None => {
-                        self.finish_turn(reason, messages);
+                        self.finish_turn(reason, snapshot);
                         return;
                     }
                 };
@@ -638,7 +692,7 @@ impl Bridge {
                         let ev = goal_update_ev(&g);
                         self.emit(ev);
                     }
-                    self.finish_turn(reason, messages);
+                    self.finish_turn(reason, snapshot);
                 } else {
                     let cond = self.goal.as_ref().unwrap().condition.clone();
                     if let Some(g) = self.goal.as_mut() {
@@ -751,6 +805,35 @@ impl Bridge {
 
     /// Returns `true` to shut the bridge down.
     async fn on_command(&mut self, cmd: CoreCmd) -> bool {
+        if let Some(pending_id) = self.pending_restore.as_ref().map(|p| p.restore_id) {
+            match &cmd {
+                CoreCmd::Shutdown | CoreCmd::Cancel => {
+                    let shutting_down = matches!(&cmd, CoreCmd::Shutdown);
+                    self.pending_restore = None;
+                    self.emit(CoreEv::ConversationRestoreFailed {
+                        restore_id: pending_id,
+                        error: if shutting_down {
+                            "engine v2 shut down before the restored conversation was verified"
+                        } else {
+                            "engine v2 conversation restore was cancelled"
+                        }
+                        .into(),
+                    });
+                    return shutting_down;
+                }
+                CoreCmd::SetConversation { .. } => {
+                    // The command-specific branch below rejects only the new
+                    // request and leaves the in-flight verification intact.
+                }
+                _ => {
+                    self.emit(CoreEv::Warning(
+                        "engine v2 is verifying a conversation restore; the concurrent command was ignored"
+                            .into(),
+                    ));
+                    return false;
+                }
+            }
+        }
         match cmd {
             CoreCmd::SendMessage { text, images, image_markers } => {
                 // NO UserEcho here: in non-sync mode every driver echoes the typed
@@ -974,20 +1057,70 @@ impl Bridge {
                     _ => self.emit(CoreEv::Warning(format!("no such directory: {dir}"))),
                 }
             }
-            CoreCmd::SetConversation(snap) => {
-                // The driver resumes a (legacy-format) session: convert, persist
-                // under the bridge id, respawn resumed — the engine continues the
-                // conversation with monotonic ids. cold_summaries is a v1
-                // compression concept the bridge doesn't model, so it's dropped.
-                let kmsgs: Vec<_> = snap.messages.iter().map(convert::message_to_kernel).collect();
-                let ksnap = SessionSnapshot::new(kmsgs);
-                if let Some(b) = self.parts.session.as_ref() {
-                    let _ = b.manager.save_snapshot(&self.bridge_session, &ksnap);
+            CoreCmd::SetConversation {
+                snapshot,
+                restore_id,
+            } => {
+                if self.pending_restore.is_some() {
+                    if let Some(restore_id) = restore_id {
+                        self.emit(CoreEv::ConversationRestoreFailed {
+                            restore_id,
+                            error: "engine v2 is still verifying an earlier conversation restore"
+                                .into(),
+                        });
+                    } else {
+                        self.emit(CoreEv::Error {
+                            error: "engine v2 is still verifying an earlier conversation restore"
+                                .into(),
+                            snapshot: ConversationSnapshot::default(),
+                        });
+                    }
+                    return false;
                 }
-                self.respawn(SessionMode::Resume(self.bridge_session.clone())).await;
-                // Confirm the engine's view back to the driver (webui sync relies
-                // on MessagesSync echoes).
-                self.emit(CoreEv::MessagesSync { snapshot: snap });
+                // Persist the complete legacy snapshot under the bridge id. Legacy
+                // cold summaries become tagged synthetic kernel messages so their
+                // context survives the migration instead of being dropped.
+                let ksnap = convert::snapshot_to_kernel(&snapshot);
+                let Some(binding) = self.parts.session.as_ref() else {
+                    self.fail_conversation_restore(
+                        restore_id,
+                        "engine v2 cannot restore the synced conversation: session persistence is unavailable",
+                    );
+                    return false;
+                };
+                if let Err(error) = binding.manager.save_snapshot(&self.bridge_session, &ksnap) {
+                    self.fail_conversation_restore(
+                        restore_id,
+                        format!(
+                            "engine v2 cannot persist the synced conversation before restore: {error}"
+                        ),
+                    );
+                    return false;
+                }
+                if self
+                    .respawn(SessionMode::Resume(self.bridge_session.clone()))
+                    .await
+                {
+                    if let Some(restore_id) = restore_id {
+                        // A successful respawn is not enough for a tokened
+                        // handoff: acknowledge only the NEW runtime's read-back.
+                        self.pending_restore = Some(PendingConversationRestore {
+                            restore_id,
+                            deadline: Instant::now() + CONVERSATION_RESTORE_TIMEOUT,
+                        });
+                        if self.handle.commands.send(KCmd::Snapshot).is_err() {
+                            self.fail_conversation_restore(
+                                Some(restore_id),
+                                "engine v2 restored the conversation but could not verify its snapshot",
+                            );
+                        }
+                    }
+                } else {
+                    self.fail_conversation_restore(
+                        restore_id,
+                        "engine v2 did not restore the synced conversation",
+                    );
+                }
             }
             CoreCmd::ClearConversation => {
                 self.respawn(SessionMode::Fresh).await;
@@ -1393,21 +1526,24 @@ impl Bridge {
         }
     }
 
-    async fn respawn(&mut self, session: SessionMode) {
+    async fn respawn(&mut self, session: SessionMode) -> bool {
         if self.handle.suspend_compaction().await.is_err() {
             self.emit(CoreEv::Error {
                 error: "engine v2 respawn failed: coding runtime is unavailable".into(),
                 snapshot: ConversationSnapshot::default(),
             });
             self.degraded = true;
-            return;
+            return false;
         }
         // If a turn (or an approval) was still live, tearing the kernel down would
         // drop its in-flight events and strand the driver in a busy/waiting phase.
         // Close the lifecycle FIRST so the driver returns to Idle.
         if self.turn_running || self.pending_approval.is_some() {
             self.pending_approval = None;
-            self.finish_turn(StopReason::Cancelled, Vec::new());
+            self.finish_turn(
+                StopReason::Cancelled,
+                ConversationSnapshot::default(),
+            );
         } else if let Some(messages) = self.loop_pending_finish.take() {
             // A loop sleeping between rounds holds the driver turn open with
             // turn_running=false, so the branch above misses it — finish it here or the
@@ -1420,7 +1556,7 @@ impl Bridge {
                 snapshot: ConversationSnapshot::default(),
             });
             self.degraded = true;
-            return;
+            return false;
         }
         let mut opts = self.opts_template.clone();
         // Whether this respawn starts a genuinely NEW conversation. `Fresh` =
@@ -1430,6 +1566,7 @@ impl Bridge {
         // namer would just burn an LLM call whose result the host guard discards.
         let want_fresh = matches!(session, SessionMode::Fresh);
         opts.session = session;
+        let mut requested_mode_applied = true;
 
         // Try the requested session mode first; if that fails (e.g. Resume could
         // not find the snapshot), fall back to Fresh before giving up entirely.
@@ -1451,8 +1588,9 @@ impl Bridge {
                         snapshot: ConversationSnapshot::default(),
                     });
                     self.degraded = true;
-                    return;
+                    return false;
                 }
+                requested_mode_applied = false;
                 opts.session = SessionMode::Fresh;
                 match prepare_with_plugin_hooks(
                     &self.coding_cfg,
@@ -1474,7 +1612,7 @@ impl Bridge {
                         self.loop_cancel.cancel();
                         self.loop_state = None;
                         self.pending_wakeup = None;
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1510,7 +1648,7 @@ impl Bridge {
                         snapshot: ConversationSnapshot::default(),
                     });
                     self.degraded = true;
-                    return;
+                    return false;
                 }
                 self.bridge_session = parts
                     .session
@@ -1535,6 +1673,7 @@ impl Bridge {
                 self.loop_cancel.cancel();
                 self.loop_state = None;
                 self.pending_wakeup = None;
+                requested_mode_applied
             }
             Err(e) => {
                 self.emit(CoreEv::Error {
@@ -1548,6 +1687,7 @@ impl Bridge {
                 self.loop_cancel.cancel();
                 self.loop_state = None;
                 self.pending_wakeup = None;
+                false
             }
         }
     }
@@ -1600,7 +1740,7 @@ impl Bridge {
         _keep.abort();
     }
 
-    fn finish_turn(&mut self, reason: StopReason, messages: Vec<atomcode_core::conversation::message::Message>) {
+    fn finish_turn(&mut self, reason: StopReason, snapshot: ConversationSnapshot) {
         // Idempotent terminal: also reached from respawn / channel-close, where a turn
         // may still be marked running.
         self.turn_running = false;
@@ -1618,9 +1758,7 @@ impl Bridge {
         let duration = self.stats.started.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         match reason {
             StopReason::Cancelled => {
-                self.emit(CoreEv::TurnCancelled {
-                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
-                });
+                self.emit(CoreEv::TurnCancelled { snapshot });
             }
             other => {
                 let stop_reason = match other {
@@ -1637,16 +1775,16 @@ impl Bridge {
                 // dropped the structured code. `stop_reason` on TurnComplete carries
                 // the terminal classification.
                 //
-                // Capture first-exchange text before `messages` is moved into the
-                // snapshot (used for AI session naming below).
+                // Capture first-exchange text before the snapshot is moved into
+                // the terminal event (used for AI session naming below).
                 let ai_convo_text =
-                    atomcode_core::agent::session_title::first_exchange_text(&messages);
+                    atomcode_core::agent::session_title::first_exchange_text(&snapshot.messages);
                 self.emit(CoreEv::TurnComplete {
                     duration,
                     total_tokens: self.stats.total_tokens,
                     turn_count: self.stats.rounds,
                     tool_call_count: self.stats.tool_calls,
-                    snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                    snapshot,
                     stop_reason,
                 });
                 // Fire-and-forget AI session naming, once per session, after the first
@@ -1878,8 +2016,7 @@ impl Bridge {
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {
-                    let messages: Vec<atomcode_core::conversation::message::Message> =
-                        snapshot.messages.iter().map(convert::message_to_core).collect();
+                    let conversation_snapshot = convert::snapshot_to_core(&snapshot);
                     // Goal hook: a natural stop with an active goal isn't the end.
                     // Spawn the evaluator OFF this loop (so Cancel stays responsive);
                     // the turn is held open until `on_goal_eval_result` decides to
@@ -1904,7 +2041,7 @@ impl Bridge {
                                         g.note_unproductive();
                                     }
                                 }
-                                self.spawn_goal_eval(reason, messages);
+                                self.spawn_goal_eval(reason, conversation_snapshot);
                                 return;
                             }
                             GoalDisposition::ReinjectNoEval => {
@@ -1939,7 +2076,7 @@ impl Bridge {
                                 self.emit(CoreEv::Warning(format!(
                                     "goal stopped: {why} — goal not met; run /goal again to continue"
                                 )));
-                                self.finish_turn(reason, messages);
+                                self.finish_turn(reason, conversation_snapshot);
                                 return;
                             }
                             GoalDisposition::EndTurn => {
@@ -1992,7 +2129,7 @@ impl Bridge {
                                 // (ClearLoop / Cancel / round-limit) can finish_turn and
                                 // return the UI to Idle — otherwise stopping a sleeping loop
                                 // strands the driver in Streaming forever.
-                                self.loop_pending_finish = Some(messages);
+                                self.loop_pending_finish = Some(conversation_snapshot);
                                 return;
                             }
                             None => {
@@ -2008,14 +2145,19 @@ impl Bridge {
                             }
                         }
                     }
-                    self.finish_turn(reason, messages);
+                    self.finish_turn(reason, conversation_snapshot);
                 } else if let Some(nth) = self.pending_undo.take() {
                     self.do_undo(snapshot.messages, nth).await;
-                } else {
+                } else if let Some(pending) = self.pending_restore.take() {
                     self.pending_sync = false;
-                    let messages = snapshot.messages.iter().map(convert::message_to_core).collect();
+                    self.emit(CoreEv::ConversationRestored {
+                        restore_id: pending.restore_id,
+                        snapshot: convert::snapshot_to_core(&snapshot),
+                    });
+                } else if self.pending_sync {
+                    self.pending_sync = false;
                     self.emit(CoreEv::MessagesSync {
-                        snapshot: ConversationSnapshot { messages, cold_summaries: vec![] },
+                        snapshot: convert::snapshot_to_core(&snapshot),
                     });
                 }
             }

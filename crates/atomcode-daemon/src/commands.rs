@@ -166,6 +166,93 @@ pub(crate) fn message_to_core(
     Message { role, content, synthetic: message.synthetic, internal_origin: message.internal_origin.clone() }
 }
 
+fn legacy_cold_summary_message(
+    summary: &str,
+) -> atomcode_core::conversation::message::Message {
+    use atomcode_core::conversation::{
+        message::{Message, Role},
+        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+    };
+
+    let mut message = Message::new(
+        Role::User,
+        format!("{LEGACY_COLD_SUMMARY_PREFIX}{summary}"),
+    );
+    message.synthetic = true;
+    message.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
+    message
+}
+
+fn split_legacy_cold_summary_messages(
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) -> ConversationSnapshot {
+    use atomcode_core::conversation::{
+        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+    };
+
+    let mut recent = Vec::with_capacity(messages.len());
+    let mut cold_summaries = Vec::new();
+    for message in messages {
+        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
+            if let Some(summary) = message
+                .text()
+                .and_then(|text| text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX))
+            {
+                cold_summaries.push(summary.to_string());
+                continue;
+            }
+        }
+        recent.push(message);
+    }
+    ConversationSnapshot {
+        messages: recent,
+        cold_summaries,
+    }
+}
+
+fn is_legacy_cold_summary_message(message: &atomcode_kernel::message::Message) -> bool {
+    use atomcode_core::conversation::{
+        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+    };
+
+    message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
+        && message.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX)
+}
+
+fn adjust_compaction_mutation_for_cold_summaries(
+    mutation: atomcode_coding::runtime::SnapshotCompactionMutation,
+    before: &[atomcode_kernel::message::Message],
+    after: &[atomcode_kernel::message::Message],
+) -> atomcode_coding::runtime::SnapshotCompactionMutation {
+    use atomcode_coding::runtime::SnapshotCompactionMutation;
+
+    let SnapshotCompactionMutation::Replace {
+        old_start,
+        old_end,
+        new_end,
+    } = mutation
+    else {
+        return mutation;
+    };
+    let visible_before = |end: usize| {
+        before
+            .iter()
+            .take(end)
+            .filter(|message| !is_legacy_cold_summary_message(message))
+            .count()
+    };
+    let visible_after = after
+        .iter()
+        .take(new_end)
+        .filter(|message| !is_legacy_cold_summary_message(message))
+        .count();
+    SnapshotCompactionMutation::Replace {
+        old_start: visible_before(old_start),
+        old_end: visible_before(old_end),
+        new_end: visible_after,
+    }
+}
+
 fn update_core_message_text(
     message: &mut atomcode_core::conversation::message::Message,
     compacted: &atomcode_kernel::message::Message,
@@ -543,7 +630,11 @@ async fn exec_compact(
         inner: parts.provider,
         context_window,
     });
-    let original_messages = std::mem::take(&mut session.messages);
+    let mut original_messages: Vec<_> = std::mem::take(&mut session.cold_summaries)
+        .into_iter()
+        .map(|summary| legacy_cold_summary_message(&summary))
+        .collect();
+    original_messages.append(&mut session.messages);
     let messages: Vec<_> = original_messages
         .iter()
         .map(message_to_kernel)
@@ -555,15 +646,21 @@ async fn exec_compact(
         (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
     )
     .await;
-    session.messages = merge_compacted_messages(
+    let adjusted_mutation = adjust_compaction_mutation_for_cold_summaries(
+        compacted.mutation,
+        &before_messages,
+        &compacted.messages,
+    );
+    let merged = merge_compacted_messages(
         original_messages,
         &before_messages,
         &compacted.messages,
         compacted.mutation,
     );
+    let snapshot = split_legacy_cold_summary_messages(merged);
+    session.update_from_conversation_snapshot(snapshot);
     if compacted.outcome.committed {
-        reindex_after_snapshot_compaction(&mut session, compacted.mutation);
-        session.cold_summaries.clear();
+        reindex_after_snapshot_compaction(&mut session, adjusted_mutation);
         save_command_session(&mut session, project_hash)?;
     }
 
@@ -859,6 +956,47 @@ mod tests {
             }
             _ => panic!("tool result shape was not preserved"),
         }
+    }
+
+    #[test]
+    fn cold_summaries_survive_conversion_and_do_not_shift_ui_anchor_indexes() {
+        use atomcode_coding::runtime::SnapshotCompactionMutation;
+
+        let mut core_before = vec![
+            legacy_cold_summary_message("cold one"),
+            legacy_cold_summary_message("cold two"),
+        ];
+        core_before.extend([
+            Message::new(Role::User, "u1"),
+            Message::new(Role::Assistant, "a1"),
+            Message::new(Role::User, "u2"),
+            Message::new(Role::Assistant, "a2"),
+        ]);
+        let before: Vec<_> = core_before.iter().map(message_to_kernel).collect();
+        let mut after = vec![atomcode_kernel::message::Message::user("summary")];
+        after.extend(before[4..].iter().cloned());
+
+        let adjusted = adjust_compaction_mutation_for_cold_summaries(
+            SnapshotCompactionMutation::Replace {
+                old_start: 0,
+                old_end: 4,
+                new_end: 1,
+            },
+            &before,
+            &after,
+        );
+        assert_eq!(
+            adjusted,
+            SnapshotCompactionMutation::Replace {
+                old_start: 0,
+                old_end: 2,
+                new_end: 1,
+            }
+        );
+
+        let split = split_legacy_cold_summary_messages(core_before);
+        assert_eq!(split.cold_summaries, vec!["cold one", "cold two"]);
+        assert_eq!(split.messages.len(), 4);
     }
 
     #[test]

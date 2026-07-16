@@ -984,6 +984,12 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CompactInterrupted => "（压缩已中断 — coding runtime 已变更或停止）\n".into(),
         Msg::CompactUnavailableDuringSync =>
             "同步模式下 /compact 暂不可用；请先执行 /sync off".into(),
+        Msg::CompactUnavailableDuringResync =>
+            "本地 runtime 尚未恢复最新同步会话，暂不能执行 /compact".into(),
+        Msg::LocalRuntimeRestorePending =>
+            "本地 runtime 正在恢复同步会话，请稍候".into(),
+        Msg::LocalRuntimeRestoreTimedOut =>
+            "本地 runtime 恢复超时，已重新接回 Live 同步".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>

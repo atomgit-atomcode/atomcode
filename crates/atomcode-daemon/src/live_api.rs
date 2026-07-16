@@ -115,6 +115,11 @@ fn send_agent_command(
     })
 }
 
+struct AuthoritativeTerminal {
+    snapshot: ConversationSnapshot,
+    cancelled: bool,
+}
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -294,20 +299,20 @@ pub(crate) async fn live_serving_mcp_registry() -> Option<Arc<McpRegistry>> {
 ///
 /// `session_id`：若提供，则复用此 session_id（而非生成新的），使 LiveSession 与
 /// TUI/WebUI 的当前会话落到同一个文件，修复 #561（三端历史分离）。
-/// `initial_messages`：若提供，则作为 LiveSession 的初始对话历史导入。
+/// `initial_snapshot`：作为 LiveSession 的完整初始对话状态导入。
 pub fn ensure_live_session(
     working_dir: std::path::PathBuf,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
-    initial_messages: Vec<atomcode_core::conversation::message::Message>,
+    initial_snapshot: ConversationSnapshot,
 ) -> Arc<atomcode_core::live::LiveSession> {
-    // TUI 调用方传入的是已在内存里的 ctx.current_session.messages，直接用闭包包一层即可。
+    // TUI 调用方传入的是已在内存里的完整 conversation snapshot。
     ensure_live_session_global(
         working_dir,
         live_mcp_cache(),
         telemetry,
         session_id,
-        move || (initial_messages, Vec::new()),
+        move || (initial_snapshot.messages, initial_snapshot.cold_summaries),
     )
 }
 
@@ -846,7 +851,15 @@ impl TurnExecutor for KernelTurnExecutor {
             let mut msgs = c.messages.clone();
             let last = msgs.pop();
             let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-            (msgs, text, images, turn_base)
+            (
+                ConversationSnapshot {
+                    messages: msgs,
+                    cold_summaries: c.cold_summaries.clone(),
+                },
+                text,
+                images,
+                turn_base,
+            )
         };
 
         // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
@@ -876,10 +889,10 @@ impl TurnExecutor for KernelTurnExecutor {
         if should_seed {
             if let Err(event) = send_agent_command(
                 &client,
-                AgentCommand::SetConversation(ConversationSnapshot {
-                    messages: prefix,
-                    cold_summaries: vec![],
-                }),
+                AgentCommand::SetConversation {
+                    snapshot: prefix,
+                    restore_id: None,
+                },
                 "初始化桥接会话",
             ) {
                 *guard = None;
@@ -968,6 +981,12 @@ impl TurnExecutor for KernelTurnExecutor {
             };
             let ev = match ev {
                 DaemonRuntimeEvent::Legacy(event) => event,
+                DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
+                    runtime_terminated,
+                } => {
+                    bridge_dead |= runtime_terminated;
+                    break None;
+                }
                 DaemonRuntimeEvent::Native(event) => {
                     let compact_snapshot = match committed_compaction_snapshot(&event) {
                         Ok(snapshot) => snapshot,
@@ -979,13 +998,12 @@ impl TurnExecutor for KernelTurnExecutor {
                     if let Some(snapshot) = compact_snapshot {
                         {
                             let mut conversation = conv.lock().await;
-                            conversation.messages = snapshot.messages.clone();
-                            conversation.cold_summaries.clear();
+                            *conversation = Conversation::from_snapshot(snapshot.clone());
                         }
                         if let Err(error) = save_live_compaction_json(
                             &self.working_dir,
                             &self.session_id,
-                            snapshot.messages,
+                            snapshot,
                         ) {
                             emit(TurnEvent::Error(format!(
                                 "compact session save failed: {error}"
@@ -1142,8 +1160,18 @@ impl TurnExecutor for KernelTurnExecutor {
                     secs_until_reset,
                     auto_resuming,
                 }),
-                AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
-                AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+                AgentEvent::TurnCancelled { snapshot } => {
+                    break Some(AuthoritativeTerminal {
+                        snapshot,
+                        cancelled: true,
+                    })
+                }
+                AgentEvent::TurnComplete { snapshot, .. } => {
+                    break Some(AuthoritativeTerminal {
+                        snapshot,
+                        cancelled: false,
+                    })
+                }
                 AgentEvent::SessionRenamed { name } => {
                     // Persist on the daemon side (AI rename: sets name + ai_named,
                     // never user_renamed). Broadcast to browser tabs ONLY when the
@@ -1183,15 +1211,25 @@ impl TurnExecutor for KernelTurnExecutor {
         // bridge died mid-turn (`final_messages == None`), `conv` was never updated this
         // turn, so persisting it would CLOBBER the richer in-progress save (fix A/B) with
         // a staler `[.., user]` list — losing the partial turn the user should still see.
-        // (Empty/None never reaches here for a real terminal — Error is non-terminal and
-        // channel-close breaks with None.)
-        if let Some(msgs) = final_messages {
-            let messages = {
+        // A typed lifecycle-only cancellation also becomes None here: unlike a real
+        // terminal snapshot (which may legitimately be empty), it carries no history.
+        if let Some(terminal) = final_messages {
+            let snapshot = {
                 let mut c = conv.lock().await;
-                c.messages = restore_images_from_turn_base(msgs, &turn_base);
-                c.messages.clone()
+                install_authoritative_terminal_snapshot(
+                    &mut c,
+                    terminal.snapshot,
+                    &turn_base,
+                );
+                c.snapshot()
             };
-            if let Err(e) = save_live_session_json(&self.working_dir, &self.session_id, messages) {
+            let cancelled_turn_base = terminal.cancelled.then_some(turn_base.as_slice());
+            if let Err(e) = save_live_terminal_snapshot_json(
+                &self.working_dir,
+                &self.session_id,
+                snapshot,
+                cancelled_turn_base,
+            ) {
                 atomcode_core::ctrace!("LIVE", "failed to save live session (v2): {e}");
             }
         }
@@ -1270,6 +1308,15 @@ fn restore_images_from_turn_base(
     messages
 }
 
+fn install_authoritative_terminal_snapshot(
+    conversation: &mut Conversation,
+    mut snapshot: ConversationSnapshot,
+    turn_base: &[atomcode_core::conversation::message::Message],
+) {
+    snapshot.messages = restore_images_from_turn_base(snapshot.messages, turn_base);
+    *conversation = Conversation::from_snapshot(snapshot);
+}
+
 /// Persist the live conversation to the stable `<session_id>.json` (LOAD-MERGE-SAVE so
 /// `user_renamed` and other accumulated fields survive — not a blind overwrite). Called at
 /// THREE points across a v2 live turn: (1) turn START — so an interrupted / hard-killed
@@ -1325,6 +1372,31 @@ fn save_live_session_json(
     session_id: &atomcode_core::session::SessionId,
     messages: Vec<atomcode_core::conversation::message::Message>,
 ) -> std::io::Result<()> {
+    save_live_session_state_json(working_dir, session_id, messages, None, None)
+}
+
+fn save_live_terminal_snapshot_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    snapshot: ConversationSnapshot,
+    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
+) -> std::io::Result<()> {
+    save_live_session_state_json(
+        working_dir,
+        session_id,
+        snapshot.messages,
+        Some(snapshot.cold_summaries),
+        cancelled_turn_base,
+    )
+}
+
+fn save_live_session_state_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+    cold_summaries: Option<Vec<String>>,
+    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
+) -> std::io::Result<()> {
     use atomcode_core::session::{Session, SessionManager};
     let manager = SessionManager::new(working_dir);
     let mut session = manager
@@ -1335,7 +1407,12 @@ fn save_live_session_json(
     // reducing the `.json` to just the first turn AND bumping `updated_at` (re-sorting it
     // to the sidebar top). Refuse such a write: keep disk untouched, don't `touch()`.
     // See `save_would_lose_persisted_turns` (webui refresh-mid-turn bug).
-    if save_would_lose_persisted_turns(&session.messages, &messages) {
+    let current_turn_was_rolled_back = cancelled_turn_base.is_some_and(|turn_base| {
+        cancelled_turn_rollback_matches(&session.messages, &messages, turn_base)
+    });
+    if save_would_lose_persisted_turns(&session.messages, &messages)
+        && !current_turn_was_rolled_back
+    {
         atomcode_core::ctrace!(
             "LIVE",
             "save REFUSED net-loss write for {}: disk has {} msgs, incoming {} — keeping disk",
@@ -1347,9 +1424,38 @@ fn save_live_session_json(
     }
     session.id = session_id.clone();
     session.messages = messages;
+    if let Some(cold_summaries) = cold_summaries {
+        session.cold_summaries = cold_summaries;
+    }
     session.auto_name_from_messages();
     session.touch();
     manager.save(&session)
+}
+
+fn cancelled_turn_rollback_matches(
+    disk: &[atomcode_core::conversation::message::Message],
+    incoming: &[atomcode_core::conversation::message::Message],
+    turn_base: &[atomcode_core::conversation::message::Message],
+) -> bool {
+    use atomcode_core::conversation::message::Role;
+
+    let real_users = |messages: &[atomcode_core::conversation::message::Message]| {
+        messages
+            .iter()
+            .filter(|message| message.role == Role::User && !message.synthetic)
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let (Ok(disk_users), Ok(incoming_users), Ok(turn_users)) =
+        (real_users(disk), real_users(incoming), real_users(turn_base))
+    else {
+        return false;
+    };
+    let Some((_cancelled, prior_turn_users)) = turn_users.split_last() else {
+        return false;
+    };
+
+    disk_users == turn_users && incoming_users == prior_turn_users
 }
 
 /// Persist a kernel-confirmed compaction snapshot without the generic stale-write
@@ -1358,7 +1464,7 @@ fn save_live_session_json(
 fn save_live_compaction_json(
     working_dir: &std::path::Path,
     session_id: &atomcode_core::session::SessionId,
-    messages: Vec<atomcode_core::conversation::message::Message>,
+    snapshot: ConversationSnapshot,
 ) -> std::io::Result<()> {
     use atomcode_core::session::{Session, SessionManager};
     let manager = SessionManager::new(working_dir);
@@ -1366,8 +1472,7 @@ fn save_live_compaction_json(
         .load(session_id)
         .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
     session.id = session_id.clone();
-    session.messages = messages;
-    session.cold_summaries.clear();
+    session.update_from_conversation_snapshot(snapshot);
     session.auto_name_from_messages();
     session.touch();
     manager.save(&session)
@@ -1506,14 +1611,7 @@ fn committed_compaction_snapshot(
         .committed_snapshot
         .as_deref()
         .ok_or("compact completed without a resumable session snapshot")?;
-    Ok(Some(atomcode_core::conversation::ConversationSnapshot {
-        messages: snapshot
-            .messages
-            .iter()
-            .map(crate::commands::message_to_core)
-            .collect(),
-        cold_summaries: Vec::new(),
-    }))
+    Ok(Some(atomcode_bridge::convert::snapshot_to_core(snapshot)))
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
@@ -1576,7 +1674,15 @@ pub(crate) async fn run_chat_turn_v2(
         let mut msgs = c.messages.clone();
         let last = msgs.pop();
         let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-        (msgs, text, images, turn_base)
+        (
+            ConversationSnapshot {
+                messages: msgs,
+                cold_summaries: c.cold_summaries.clone(),
+            },
+            text,
+            images,
+            turn_base,
+        )
     };
     // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
     // （非视觉模型的 provider adapter 会因原图而报 400 错误）
@@ -1588,10 +1694,10 @@ pub(crate) async fn run_chat_turn_v2(
     };
     if let Err(event) = send_agent_command(
         &client,
-        AgentCommand::SetConversation(ConversationSnapshot {
-            messages: prefix,
-            cold_summaries: vec![],
-        }),
+        AgentCommand::SetConversation {
+            snapshot: prefix,
+            restore_id: None,
+        },
         "初始化桥接会话",
     ) {
         let _ = turn_tx.send(event);
@@ -1631,6 +1737,7 @@ pub(crate) async fn run_chat_turn_v2(
         let Some(ev) = ev else { break None };
         let ev = match ev {
             DaemonRuntimeEvent::Legacy(event) => event,
+            DaemonRuntimeEvent::TurnCancelledWithoutSnapshot { .. } => break None,
             DaemonRuntimeEvent::Native(event) => {
                 let compact_snapshot = match committed_compaction_snapshot(&event) {
                     Ok(snapshot) => snapshot,
@@ -1685,8 +1792,18 @@ pub(crate) async fn run_chat_turn_v2(
                 // Non-terminal: forward, keep draining to the real terminal.
                 let _ = turn_tx.send(TurnEvent::Error(error));
             }
-            AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
-            AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+            AgentEvent::TurnCancelled { snapshot } => {
+                break Some(AuthoritativeTerminal {
+                    snapshot,
+                    cancelled: true,
+                })
+            }
+            AgentEvent::TurnComplete { snapshot, .. } => {
+                break Some(AuthoritativeTerminal {
+                    snapshot,
+                    cancelled: false,
+                })
+            }
             other => {
                 if let Some(te) = agent_to_turn(other) {
                     let _ = turn_tx.send(te);
@@ -1694,9 +1811,9 @@ pub(crate) async fn run_chat_turn_v2(
             }
         }
     };
-    if let Some(msgs) = final_messages {
+    if let Some(terminal) = final_messages {
         let mut c = conv.lock().await;
-        c.messages = restore_images_from_turn_base(msgs, &turn_base);
+        install_authoritative_terminal_snapshot(&mut c, terminal.snapshot, &turn_base);
     }
     // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
     // None), which then persists conv and sends Done.
@@ -2253,7 +2370,12 @@ pub(crate) async fn live_provider(
     }
     // 确保有 live 会话可供广播（与 /live/message 一致的幂等 ensure）。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    ensure_live_session(
+        working_dir,
+        state.telemetry.clone(),
+        None,
+        ConversationSnapshot::default(),
+    );
     live_set_provider(req.provider);
     Json(serde_json::json!({ "ok": true }))
 }
@@ -2348,7 +2470,12 @@ pub(crate) async fn live_reasoning_effort(
     }
     // 与 /live/provider 一致的幂等 ensure，保证有 live 会话存在。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    ensure_live_session(
+        working_dir,
+        state.telemetry.clone(),
+        None,
+        ConversationSnapshot::default(),
+    );
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -2395,7 +2522,12 @@ pub(crate) async fn live_permission(
         None => {
             // No live session — try to ensure one exists (idempotent) but there's nothing
             // waiting; return accepted: false so the caller knows.
-            ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+            ensure_live_session(
+                working_dir,
+                state.telemetry.clone(),
+                None,
+                ConversationSnapshot::default(),
+            );
             false
         }
     };
@@ -2439,6 +2571,27 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_core::conversation::message::Message;
+
+    #[test]
+    fn real_empty_terminal_snapshot_clears_the_conversation() {
+        let mut conversation = Conversation::from_messages_and_cold_summaries(
+            vec![Message::new(
+                atomcode_core::conversation::message::Role::User,
+                "cancelled prompt",
+            )],
+            vec!["stale summary".into()],
+        );
+
+        install_authoritative_terminal_snapshot(
+            &mut conversation,
+            ConversationSnapshot::default(),
+            &[],
+        );
+
+        assert!(conversation.messages.is_empty());
+        assert!(conversation.cold_summaries.is_empty());
+    }
 
     /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
     /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
@@ -3236,6 +3389,28 @@ mod tests {
         assert_eq!(loaded.messages[2].text(), Some("u2"));
     }
 
+    #[test]
+    fn cancelled_first_turn_empty_snapshot_removes_provisional_prompt() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/cancel-empty");
+        let id = SessionId::new();
+        let turn_base = vec![user_msg("cancel me")];
+
+        save_live_session_json(&dir, &id, turn_base.clone()).expect("provisional save");
+        save_live_terminal_snapshot_json(
+            &dir,
+            &id,
+            ConversationSnapshot::default(),
+            Some(&turn_base),
+        )
+        .expect("authoritative cancellation save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert!(loaded.messages.is_empty());
+        assert!(loaded.cold_summaries.is_empty());
+    }
+
     // Compaction legitimately SHRINKS the message list (drops old turns, injects a
     // synthetic summary). The guard keys off the synthetic count so it must NOT mistake a
     // real compaction for a stale clobber.
@@ -3302,7 +3477,14 @@ mod tests {
         save_live_compaction_json(
             &dir,
             &id,
-            vec![synthetic_msg("summary 2"), user_msg("u3"), assistant_msg("a3")],
+            ConversationSnapshot {
+                messages: vec![
+                    synthetic_msg("summary 2"),
+                    user_msg("u3"),
+                    assistant_msg("a3"),
+                ],
+                cold_summaries: Vec::new(),
+            },
         )
         .expect("trusted compaction save");
 

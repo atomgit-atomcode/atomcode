@@ -415,15 +415,7 @@ impl BgRuntimeManager {
                     if let CompactionCompletion::Completed(outcome) = &completion {
                         if outcome.committed {
                             if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
-                                let core_snapshot =
-                                    atomcode_core::conversation::ConversationSnapshot {
-                                        messages: snapshot
-                                            .messages
-                                            .iter()
-                                            .map(super::kernel_message_to_core)
-                                            .collect(),
-                                        cold_summaries: Vec::new(),
-                                    };
+                                let core_snapshot = super::kernel_snapshot_to_core(snapshot);
                                 super::apply_session_snapshot(&mut bg.session, core_snapshot);
                                 failed = session_manager.save(&bg.session).is_err();
                             } else {

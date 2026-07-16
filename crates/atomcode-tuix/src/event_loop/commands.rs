@@ -309,6 +309,98 @@ pub(crate) fn attach_live_session(
     ));
 }
 
+fn restore_live_forwarder(
+    ctx: &mut LoopCtx,
+    session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    receiver: tokio::sync::broadcast::Receiver<atomcode_core::live::LiveEvent>,
+) {
+    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
+        session,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+        receiver,
+    ));
+}
+
+pub(crate) fn rollback_pending_local_runtime_sync(ctx: &mut LoopCtx) -> bool {
+    let Some(pending) = ctx.pending_local_runtime_sync.take() else {
+        return false;
+    };
+    if pending.runtime_id != ctx.foreground_runtime_id
+        || pending.session_id != ctx.current_session.id
+    {
+        return false;
+    }
+    let live_session = pending.live_session;
+    let receiver = pending.handoff.resume_receiver();
+    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
+        live_session.clone(),
+        pending.runtime_id,
+        ctx.runtime_event_tx.clone(),
+        receiver,
+    ));
+    ctx.sync_session = Some(live_session);
+    true
+}
+
+/// Leave sync mode only after handing its authoritative idle snapshot back to
+/// the local runtime. If any step fails, resume the old event forwarder from a
+/// receiver captured at the same boundary so the TUI remains safely attached.
+fn detach_live_session(ctx: &mut LoopCtx) -> Result<bool, String> {
+    if ctx.pending_local_runtime_sync.is_some() {
+        return Err(t(Msg::LocalRuntimeRestorePending).into_owned());
+    }
+    let Some(session) = ctx.sync_session.clone() else {
+        return Ok(false);
+    };
+
+    let handoff = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(session.begin_idle_handoff(|| {
+            if let Some(handle) = ctx.sync_forwarder.as_ref() {
+                handle.abort();
+            }
+        }))
+    });
+    let Some(handoff) = handoff else {
+        return Err("同步会话仍在处理消息，请等当前回复结束后再退出同步".to_string());
+    };
+    let snapshot = handoff.snapshot().clone();
+    // The boundary callback already aborted it. Dropping the handle here makes
+    // ownership explicit before either committing the handoff or restoring it.
+    ctx.sync_forwarder.take();
+
+    let mut next_session = ctx.current_session.clone();
+    next_session.update_from_conversation_snapshot(snapshot.clone());
+    next_session.touch();
+    if let Err(error) = ctx.session_manager.save(&next_session) {
+        restore_live_forwarder(ctx, session, handoff.resume_receiver());
+        return Err(format!("无法保存同步会话快照：{error}"));
+    }
+    let restore_id = ctx.next_local_runtime_restore_id;
+    ctx.next_local_runtime_restore_id = ctx.next_local_runtime_restore_id.wrapping_add(1).max(1);
+    if let Err(error) = ctx.agent.cmd_tx.send(AgentCommand::SetConversation {
+        snapshot,
+        restore_id: Some(restore_id),
+    }) {
+        restore_live_forwarder(ctx, session, handoff.resume_receiver());
+        return Err(format!("无法把同步会话交给本地 runtime：{error}"));
+    }
+
+    ctx.current_session = next_session;
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    ctx.pending_local_runtime_sync = Some(super::PendingLocalRuntimeSync {
+        restore_id,
+        runtime_id: ctx.foreground_runtime_id,
+        session_id: ctx.current_session.id.clone(),
+        live_session: session,
+        handoff,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    ctx.sync_session = None;
+    Ok(true)
+}
+
 fn render_live_snapshot_messages(
     renderer: &mut dyn Renderer,
     snapshot: &[atomcode_core::conversation::message::Message],
@@ -439,7 +531,7 @@ pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Re
         ctx.working_dir.clone(),
         ctx.telemetry.clone(),
         Some(ctx.current_session.id.clone()),
-        ctx.current_session.messages.clone(),
+        ctx.current_session.to_conversation_snapshot(),
     );
     attach_live_session(ctx, renderer, session, false);
     renderer.flush();
@@ -475,9 +567,14 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
-fn compact_sync_guard(sync_active: bool) -> Result<(), Msg<'static>> {
+fn compact_sync_guard(
+    sync_active: bool,
+    local_resync_pending: bool,
+) -> Result<(), Msg<'static>> {
     if sync_active {
         Err(Msg::CompactUnavailableDuringSync)
+    } else if local_resync_pending {
+        Err(Msg::CompactUnavailableDuringResync)
     } else {
         Ok(())
     }
@@ -507,6 +604,9 @@ pub(crate) fn fire_interval_payload(
     active_modal: &mut Option<Box<dyn Modal>>,
     setup_pending: &mut bool,
 ) {
+    if ctx.pending_local_runtime_sync.is_some() {
+        return;
+    }
     let payload = match ctx.loop_ctrl.as_mut() {
         Some(c) => {
             c.round += 1;
@@ -624,6 +724,15 @@ pub(super) fn execute_slash_command(
     active_modal: &mut Option<Box<dyn Modal>>,
     setup_pending: &mut bool,
 ) -> Result<()> {
+    if ctx.pending_local_runtime_sync.is_some()
+        && !matches!(cmd.to_ascii_lowercase().as_str(), "quit" | "exit")
+    {
+        renderer.render(UiLine::Error(
+            t(Msg::LocalRuntimeRestorePending).into_owned(),
+        ));
+        renderer.flush();
+        return Ok(());
+    }
     // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
     // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
     let mirror = ctx
@@ -1584,7 +1693,10 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            if let Err(error) = compact_sync_guard(ctx.sync_session.is_some()) {
+            if let Err(error) = compact_sync_guard(
+                ctx.sync_session.is_some(),
+                ctx.pending_local_runtime_sync.is_some(),
+            ) {
                 // LiveSession owns the authoritative conversation while attached.
                 // The local runtime is intentionally stale after remote turns.
                 renderer.render(UiLine::Error(t(error).into_owned()));
@@ -1687,7 +1799,7 @@ fn execute_slash_command_impl(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
@@ -1708,13 +1820,15 @@ fn execute_slash_command_impl(
         }
         "sync" => {
             if arg.trim() == "off" {
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
+                match detach_live_session(ctx) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput(
+                        "已退出同步，正在把最新会话交给本地 runtime".to_string(),
+                    )),
+                    Ok(false) => renderer.render(UiLine::CommandOutput(
+                        "当前未处于同步模式".to_string(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
-                ctx.sync_session = None;
-                renderer.render(UiLine::CommandOutput(
-                    "已退出同步，回到独立会话".to_string(),
-                ));
             } else {
                 // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
                 // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
@@ -1723,7 +1837,7 @@ fn execute_slash_command_impl(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 attach_live_session(ctx, renderer, session, true);
             }
@@ -1791,6 +1905,10 @@ fn execute_slash_command_impl(
 
             let a = arg.trim();
             let msg = if a == "stop" {
+                // Remote access must stop immediately even when the live session
+                // is busy. A failed handoff keeps only the TUI attached so it can
+                // continue receiving the in-flight turn safely.
+                let detach_error = detach_live_session(ctx).err();
                 let killed = ctx
                     .app_relay_child
                     .take()
@@ -1798,16 +1916,16 @@ fn execute_slash_command_impl(
                         let _ = c.start_kill();
                     })
                     .is_some();
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
-                }
-                ctx.sync_session = None;
                 let server_stopped = atomcode_daemon::stop_app_server();
-                if killed || server_stopped {
+                let mut output = if killed || server_stopped {
                     "已停止 App 远程访问".to_string()
                 } else {
                     "App 远程访问未在运行".to_string()
+                };
+                if let Some(error) = detach_error {
+                    output.push_str(&format!("\n{error}；TUI 暂时保持同步"));
                 }
+                output
             } else {
                 // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
                 // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
@@ -1827,14 +1945,10 @@ fn execute_slash_command_impl(
                         .to_string(),
                     Some(relay) => {
                         // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
-                        let (initial, sid) = if ctx.current_session.messages.is_empty() {
-                            (Vec::new(), None)
-                        } else {
-                            (
-                                ctx.current_session.messages.clone(),
-                                Some(ctx.current_session.id.clone()),
-                            )
-                        };
+                        let initial = ctx.current_session.to_conversation_snapshot();
+                        let sid = (!initial.messages.is_empty()
+                            || !initial.cold_summaries.is_empty())
+                        .then(|| ctx.current_session.id.clone());
                         // 合并 main 后函数更名为 ensure_live_session,且 session_id
                         // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
                         let session = atomcode_daemon::ensure_live_session(
@@ -1853,11 +1967,8 @@ fn execute_slash_command_impl(
                         }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
-                        //    清理旧的 sync 状态，避免旧 forwarder task 残留。
-                        if let Some(h) = ctx.sync_forwarder.take() {
-                            h.abort();
-                        }
-                        ctx.sync_session = None;
+                        //    Keep any current sync attachment until startup succeeds;
+                        //    attach_live_session replaces it atomically on the success path.
                         atomcode_daemon::stop_app_server();
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
@@ -5879,14 +5990,22 @@ mod tests {
     #[test]
     fn compact_sync_guard_rejects_stale_local_runtime() {
         assert_eq!(
-            compact_sync_guard(true),
+            compact_sync_guard(true, false),
             Err(Msg::CompactUnavailableDuringSync)
         );
     }
 
     #[test]
-    fn compact_sync_guard_allows_local_runtime_without_sync() {
-        assert_eq!(compact_sync_guard(false), Ok(()));
+    fn compact_sync_guard_waits_for_local_runtime_restore() {
+        assert_eq!(
+            compact_sync_guard(false, true),
+            Err(Msg::CompactUnavailableDuringResync)
+        );
+    }
+
+    #[test]
+    fn compact_sync_guard_allows_restored_local_runtime() {
+        assert_eq!(compact_sync_guard(false, false), Ok(()));
     }
 
     /// Create a subdir inside a tempdir and return both. Paths are

@@ -175,7 +175,15 @@ pub enum AgentCommand {
     /// Clear conversation history.
     ClearConversation,
     /// Set conversation state from a resumed session.
-    SetConversation(ConversationSnapshot),
+    ///
+    /// `restore_id` identifies callers that need an exact, asynchronous
+    /// acknowledgement. The runtime answers those requests with either
+    /// [`AgentEvent::ConversationRestored`] or
+    /// [`AgentEvent::ConversationRestoreFailed`] carrying the same id.
+    SetConversation {
+        snapshot: ConversationSnapshot,
+        restore_id: Option<u64>,
+    },
     /// Bind the per-conversation session id (the session file's id) so the
     /// `x-atomcode-session-id` header tracks the persistent conversation
     /// identity. Sent by the UI whenever the current session is established
@@ -384,6 +392,18 @@ pub enum AgentEvent {
     /// Used by the TUI to sync session state before backgrounding a session
     /// that is mid-turn (e.g. waiting for tool approval).
     MessagesSync { snapshot: ConversationSnapshot },
+    /// The runtime has restored a requested conversation and then read the
+    /// installed state back from its own conversation owner. `snapshot` is the
+    /// read-back value, not an echo of the command payload.
+    ConversationRestored {
+        restore_id: u64,
+        snapshot: ConversationSnapshot,
+    },
+    /// A requested conversation restore could not be installed or verified.
+    ConversationRestoreFailed {
+        restore_id: u64,
+        error: String,
+    },
     /// An error occurred. Carries a snapshot of `conversation.messages`
     /// so the TUI can persist mid-turn state even when the turn dies
     /// before TurnComplete/TurnCancelled fire — without this, a

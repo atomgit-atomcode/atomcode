@@ -732,6 +732,94 @@ pub type RuntimeSpawnOverride = std::sync::Arc<
     dyn Fn(&Config, &std::path::Path) -> SpawnedRuntime + Send + Sync,
 >;
 
+/// Runtime-owned handoff state while leaving Live sync mode. Keeping the
+/// fallback receiver and LiveSession here makes rollback an ownership transfer,
+/// not an attempt to reconstruct state after an asynchronous failure.
+pub(crate) struct PendingLocalRuntimeSync {
+    pub(crate) restore_id: u64,
+    pub(crate) runtime_id: bg_runtime::RuntimeId,
+    pub(crate) session_id: atomcode_core::session::SessionId,
+    pub(crate) live_session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    pub(crate) handoff: atomcode_core::live::IdleHandoff,
+    pub(crate) deadline: std::time::Instant,
+}
+
+impl PendingLocalRuntimeSync {
+    fn matches_current(&self, restore_id: u64, ctx: &LoopCtx) -> bool {
+        local_restore_scope_matches(
+            self.restore_id,
+            self.runtime_id,
+            &self.session_id,
+            restore_id,
+            ctx.foreground_runtime_id,
+            &ctx.current_session.id,
+        )
+    }
+
+    fn timed_out(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+}
+
+fn local_restore_scope_matches(
+    expected_restore_id: u64,
+    expected_runtime_id: bg_runtime::RuntimeId,
+    expected_session_id: &atomcode_core::session::SessionId,
+    restore_id: u64,
+    runtime_id: bg_runtime::RuntimeId,
+    session_id: &atomcode_core::session::SessionId,
+) -> bool {
+    expected_restore_id == restore_id
+        && expected_runtime_id == runtime_id
+        && expected_session_id == session_id
+}
+
+#[cfg(test)]
+mod local_restore_scope_tests {
+    use super::{bg_runtime::RuntimeId, local_restore_scope_matches};
+    use atomcode_core::session::SessionId;
+
+    #[test]
+    fn acknowledgement_requires_restore_runtime_and_session_identity() {
+        let expected_session = SessionId::from_string("session-a".into());
+        let other_session = SessionId::from_string("session-b".into());
+        let runtime = RuntimeId::new(3);
+
+        assert!(local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            runtime,
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            8,
+            runtime,
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            RuntimeId::new(4),
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            runtime,
+            &other_session,
+        ));
+    }
+}
+
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
@@ -920,6 +1008,10 @@ pub struct LoopCtx {
     pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
     /// live 转发任务句柄（分离同步时 abort）。
     pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// Live → local runtime handoff awaiting a tokened runtime read-back.
+    pub(crate) pending_local_runtime_sync: Option<PendingLocalRuntimeSync>,
+    /// Monotonic correlation id for Live → local conversation restores.
+    pub(crate) next_local_runtime_restore_id: u64,
     /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
     /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
     pub app_relay_child: Option<tokio::process::Child>,
@@ -4059,9 +4151,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetConversation(
-                    session.to_conversation_snapshot(),
-                ))
+                .send(AgentCommand::SetConversation {
+                    snapshot: session.to_conversation_snapshot(),
+                    restore_id: None,
+                })
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
@@ -4619,7 +4712,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && ctx.pending_local_runtime_sync.is_none()
+                    {
                         // Turn just ended — drain the type-ahead queue.
                         // Pop the oldest queued message, echo as a User
                         // line, dispatch to the agent, and transition
@@ -5071,7 +5166,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && ctx.pending_local_runtime_sync.is_none()
+                    {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if let Some(live) = &ctx.sync_session {
@@ -5101,6 +5198,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     );
                 }
             }
+        }
+
+        if ctx
+            .pending_local_runtime_sync
+            .as_ref()
+            .is_some_and(PendingLocalRuntimeSync::timed_out)
+        {
+            let restored_live = commands::rollback_pending_local_runtime_sync(&mut ctx);
+            let message = if restored_live {
+                crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestoreTimedOut).into_owned()
+            } else {
+                "本地 runtime 恢复超时，且当前会话已变化，无法自动接回旧 Live 会话"
+                    .to_string()
+            };
+            renderer.render(UiLine::Error(message));
+            renderer.flush();
         }
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
@@ -6130,6 +6243,21 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    let restore_blocks_key = ctx.pending_local_runtime_sync.is_some()
+        && pending_restore_blocks_idle_action(
+            code,
+            modifiers,
+            &app.buf.text,
+            menu_for_display(&app.buf, ctx).is_some(),
+            app.state.goal_condition.is_some(),
+        );
+    if restore_blocks_key {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestorePending).into_owned(),
+        ));
+        renderer.flush();
+        return Ok(());
+    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -7018,6 +7146,81 @@ fn handle_idle_key(
         }
     }
     Ok(())
+}
+
+fn pending_restore_blocks_idle_action(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    input: &str,
+    menu_active: bool,
+    goal_active: bool,
+) -> bool {
+    use crossterm::event::KeyModifiers;
+
+    if code == KeyCode::Enter && !modifiers.contains(KeyModifiers::SHIFT) {
+        let safe_exit = parse_slash_line(input).is_some_and(|(command, argument)| {
+            matches!(command.to_ascii_lowercase().as_str(), "quit" | "exit")
+                && argument.trim().is_empty()
+        });
+        return !safe_exit;
+    }
+    if matches!(code, KeyCode::Tab | KeyCode::BackTab) && !menu_active {
+        return true;
+    }
+    if code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
+    let bare_escape = code == KeyCode::Esc && modifiers.is_empty() && input.is_empty();
+    let goal_cancel = goal_active
+        && (bare_escape
+            || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL)));
+    goal_cancel || (bare_escape && !menu_active)
+}
+
+#[cfg(test)]
+mod pending_restore_key_tests {
+    use super::{pending_restore_blocks_idle_action, KeyCode};
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn restore_gate_blocks_runtime_actions_but_keeps_explicit_exit() {
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "hello",
+            false,
+            false,
+        ));
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            "",
+            false,
+            false,
+        ));
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            "",
+            false,
+            false,
+        ));
+        assert!(!pending_restore_blocks_idle_action(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "/quit",
+            false,
+            false,
+        ));
+        assert!(!pending_restore_blocks_idle_action(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            "/qu",
+            true,
+            false,
+        ));
+    }
 }
 
 fn redraw_with_menu(
@@ -8971,15 +9174,32 @@ fn persist_native_compaction_snapshot(
         return false;
     };
 
-    let core_snapshot = atomcode_core::conversation::ConversationSnapshot {
-        messages: snapshot
-            .messages
-            .iter()
-            .map(kernel_message_to_core)
-            .collect(),
-        cold_summaries: Vec::new(),
-    };
+    let core_snapshot = kernel_snapshot_to_core(snapshot);
     persist_current_session(ctx, core_snapshot, renderer)
+}
+
+fn kernel_snapshot_to_core(
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+) -> atomcode_core::conversation::ConversationSnapshot {
+    use atomcode_core::conversation::{
+        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+    };
+
+    let mut messages = Vec::with_capacity(snapshot.messages.len());
+    let mut cold_summaries = Vec::new();
+    for message in &snapshot.messages {
+        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
+            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
+                cold_summaries.push(summary.to_string());
+                continue;
+            }
+        }
+        messages.push(kernel_message_to_core(message));
+    }
+    atomcode_core::conversation::ConversationSnapshot {
+        messages,
+        cold_summaries,
+    }
 }
 
 fn kernel_message_to_core(
@@ -9192,6 +9412,28 @@ mod coding_runtime_event_tests {
         assert_eq!(thinking_blocks.len(), 1);
         assert_eq!(thinking_blocks[0].text, "thought");
         assert_eq!(thinking_blocks[0].signature, "sig");
+    }
+
+    #[test]
+    fn kernel_projection_restores_legacy_cold_summaries() {
+        use atomcode_core::conversation::{
+            LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+        };
+        let mut summary = atomcode_kernel::message::Message::user(format!(
+            "{LEGACY_COLD_SUMMARY_PREFIX}older context"
+        ));
+        summary.synthetic = true;
+        summary.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            summary,
+            atomcode_kernel::message::Message::user("recent"),
+        ]);
+
+        let projected = kernel_snapshot_to_core(&snapshot);
+
+        assert_eq!(projected.cold_summaries, vec!["older context"]);
+        assert_eq!(projected.messages.len(), 1);
+        assert_eq!(projected.messages[0].text(), Some("recent"));
     }
 
     #[test]
@@ -10781,11 +11023,79 @@ fn handle_agent_event(
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
-            if !snapshot.messages.is_empty() {
+            // A tokened SetConversation has its own response variants; ignore a
+            // stale generic sync while that handoff owns the session boundary.
+            if ctx.pending_local_runtime_sync.is_none()
+                && (!snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty())
+            {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
+        }
+        AgentEvent::ConversationRestored {
+            restore_id,
+            snapshot,
+        } => {
+            let matches = ctx
+                .pending_local_runtime_sync
+                .as_ref()
+                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
+            if !matches {
+                crate::tuix_trace!(
+                    "SYNC",
+                    "ignored stale conversation restore id={}",
+                    restore_id
+                );
+                return;
+            }
+
+            let _completed = ctx.pending_local_runtime_sync.take();
+            ctx.current_session
+                .update_from_conversation_snapshot(snapshot);
+            ctx.current_session.touch();
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+            }
+            renderer.render(UiLine::CommandOutput(
+                "本地会话已接管 runtime 实际快照".to_string(),
+            ));
+            renderer.flush();
+        }
+        AgentEvent::ConversationRestoreFailed {
+            restore_id,
+            error,
+        } => {
+            let matches = ctx
+                .pending_local_runtime_sync
+                .as_ref()
+                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
+            if !matches {
+                crate::tuix_trace!(
+                    "SYNC",
+                    "ignored stale conversation restore failure id={}: {}",
+                    restore_id,
+                    error
+                );
+                return;
+            }
+            let restored_live = commands::rollback_pending_local_runtime_sync(ctx);
+            let suffix = if restored_live {
+                "；已恢复 Live 同步"
+            } else {
+                "；原 Live 会话上下文已变化，无法自动恢复"
+            };
+            renderer.render(UiLine::Error(format!(
+                "本地 runtime 接管失败：{error}{suffix}"
+            )));
+            renderer.flush();
         }
         AgentEvent::UserEcho(text) => {
             let markers = image_markers_in_order(&text);
@@ -10932,9 +11242,10 @@ fn handle_agent_event(
             // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetConversation(
-                    target_session.to_conversation_snapshot(),
-                ))
+                .send(AgentCommand::SetConversation {
+                    snapshot: target_session.to_conversation_snapshot(),
+                    restore_id: None,
+                })
                 .ok();
             commands::bind_telemetry_to_session(ctx, &target_session);
             ctx.current_session = target_session;
@@ -10973,7 +11284,7 @@ fn handle_agent_event(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 crate::tuix_trace!(
                     "TUI",
@@ -11045,14 +11356,14 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
 /// Copy the latest conversation into `ctx.current_session`, auto-name
 /// the session from the first real user message, and write the session
 /// file to disk. Called on every TurnComplete and TurnCancelled so
-/// `/resume` can find the conversation after a quit. No-op when the
-/// conversation is empty (don't save a blank session).
+/// `/resume` can find the conversation after a quit. No-op only when both
+/// the recent working set and compressed history are empty.
 fn persist_current_session(
     ctx: &mut LoopCtx,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
 ) -> bool {
-    if snapshot.messages.is_empty() {
+    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
         return true;
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
@@ -11080,7 +11391,7 @@ pub(crate) fn apply_session_snapshot(
     session: &mut atomcode_core::session::Session,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
-    if snapshot.messages.is_empty() {
+    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
         return;
     }
     session.update_from_conversation_snapshot(snapshot);
@@ -11197,6 +11508,29 @@ mod session_naming_tests {
         );
 
         assert_eq!(session.cold_summaries, vec!["compressed context"]);
+    }
+
+    #[test]
+    fn apply_session_snapshot_accepts_a_cold_only_working_set() {
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        session.messages = vec![Message::new(Role::User, "stale recent turn")];
+
+        apply_session_snapshot(
+            &mut session,
+            ConversationSnapshot {
+                messages: Vec::new(),
+                cold_summaries: vec!["all retained context".to_string()],
+            },
+        );
+
+        assert!(session.messages.is_empty());
+        assert_eq!(session.cold_summaries, vec!["all retained context"]);
     }
 
     #[test]

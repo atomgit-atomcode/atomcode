@@ -764,6 +764,8 @@ pub async fn run(
         pending_guide_topic: None,
         sync_session: None,
         sync_forwarder: None,
+        pending_local_runtime_sync: None,
+        next_local_runtime_restore_id: 1,
         app_relay_child: None,
         reasoning_effort: None,
         transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),

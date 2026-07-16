@@ -289,9 +289,10 @@ impl Modal for SessionPicker {
                         replay_session(renderer, state, &session, true);
                         ctx.agent
                             .cmd_tx
-                            .send(AgentCommand::SetConversation(
-                                session.to_conversation_snapshot(),
-                            ))
+                            .send(AgentCommand::SetConversation {
+                                snapshot: session.to_conversation_snapshot(),
+                                restore_id: None,
+                            })
                             .ok();
                         // Continue accumulating into the same session file —
                         // future TurnComplete saves overwrite it. Bind

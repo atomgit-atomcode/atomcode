@@ -1000,6 +1000,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "(compaction interrupted — the coding runtime changed or stopped)\n".into(),
         Msg::CompactUnavailableDuringSync =>
             "Cannot compact while live sync is active; run /sync off first".into(),
+        Msg::CompactUnavailableDuringResync =>
+            "Cannot compact until the local runtime has restored the latest synced conversation".into(),
+        Msg::LocalRuntimeRestorePending =>
+            "The local runtime is restoring the synced conversation; please wait".into(),
+        Msg::LocalRuntimeRestoreTimedOut =>
+            "The local runtime restore timed out; Live sync has been restored".into(),
         Msg::CompactNothingNoSavings { before, after } =>
             format!("(nothing to compact — would not save tokens: {} → {})\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } => {
