@@ -772,3 +772,29 @@
   color: var(--app-secondary-foreground);
   font-size: 10px;
 }
+
+/* === Search Bar === */
+.search-nav-btn {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--app-secondary-foreground);
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.search-nav-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+
+.search-nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

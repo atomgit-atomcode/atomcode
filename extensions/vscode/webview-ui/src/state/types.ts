@@ -140,6 +140,28 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+/** A single keyword match inside a text body. */
+export interface SearchMatchRange {
+  /** Start offset (inclusive). */
+  start: number;
+  /** Length of the match in characters. */
+  length: number;
+}
+
+/** A logical search hit: a message id + the list of keyword ranges inside it. */
+export interface SearchMatch {
+  messageId: string;
+  ranges: SearchMatchRange[];
+}
+
+/** Flat list of keyword matches, computed from the current query. */
+export interface SearchState {
+  /** All matches in display order; one entry per message that contains hits. */
+  matches: SearchMatch[];
+  /** Index into `matches` for the currently focused match (-1 when empty). */
+  currentMatchIndex: number;
+}
+
 /** Root chat state */
 export interface ChatState {
   messages: ChatMessage[];
@@ -165,6 +187,8 @@ export interface ChatState {
   settingsOpen: boolean;
   searchQuery: string;
   searchOpen: boolean;
+  /** Derived from `messages` + `searchQuery` so the UI can navigate hits. */
+  search: SearchState;
   locale?: string;
   approvalMode: ApprovalMode;
   approvalModePending: boolean;
@@ -216,6 +240,9 @@ export type ChatAction =
   | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; success: boolean; message?: string }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
+  | { type: 'SEARCH_NEXT' }
+  | { type: 'SEARCH_PREV' }
+  | { type: 'SEARCH_SET_INDEX'; index: number }
   | { type: 'RESUME_STREAMING' }
   | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
 

@@ -78,6 +78,11 @@ const zh = {
 
   'search.placeholder': '搜索消息…',
   'search.found': '找到 {count} 条',
+  'search.position': '{current}/{total}',
+  'search.noResults': '无结果',
+  'search.prev': '上一个',
+  'search.next': '下一个',
+  'search.close': '关闭搜索',
   'search.scrollLatest': '滚动到最新',
 
   'model.effortTitle': '推理强度',
@@ -238,6 +243,11 @@ const en: Record<MsgKey, string> = {
 
   'search.placeholder': 'Search messages...',
   'search.found': '{count} found',
+  'search.position': '{current}/{total}',
+  'search.noResults': 'No results',
+  'search.prev': 'Previous match',
+  'search.next': 'Next match',
+  'search.close': 'Close search',
   'search.scrollLatest': 'Scroll to latest',
 
   'model.effortTitle': 'Reasoning effort',
