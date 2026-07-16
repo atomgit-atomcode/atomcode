@@ -9825,6 +9825,18 @@ fn handle_agent_event(
                 patch_live_todos_from_action(state, &arguments);
             }
 
+            // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
+            // ABOVE the batch / approval early-returns below. When the model packs the
+            // todowrite into a BATCH (a group of calls submitted together — batch
+            // MEMBERSHIP, not parallel execution: the kernel may run them serially) or
+            // it's approval-gated, those paths early-return before the plan-assignment
+            // block, so setting `active_todos` only there left a batched plan's panel
+            // permanently empty. Mirrors the incremental-action patch above.
+            if let Some(progress) = todo_plan.as_ref() {
+                state.active_todos = Some(progress.clone());
+                sync_todo_titles(state); // titles follow the new plan (id = position)
+            }
+
             // If this call is part of an active batch, the
             // ToolBatchStarted handler already rendered the group header
             // + child rows — skip the standalone ▸ ToolCallInFlight
@@ -9854,13 +9866,11 @@ fn handle_agent_event(
                 return;
             }
 
-            // todowrite: the persistent footer PANEL is the sole view. Capture the
-            // full list into `active_todos` (the transcript won't carry it until
-            // turn end), and suppress the tool CALL + RESULT rows. On a parse
-            // failure fall through to the normal tool row so the error surfaces.
-            if let Some(progress) = todo_plan {
-                state.active_todos = Some(progress);
-                sync_todo_titles(state); // titles follow the new plan (id = position)
+            // todowrite (non-batch, non-approval): the persistent footer PANEL is the
+            // sole view — `active_todos` was already set above; here we only SUPPRESS
+            // the tool CALL + RESULT rows. On a parse failure (`todo_plan` is None) fall
+            // through to the normal tool row so the error surfaces.
+            if todo_plan.is_some() {
                 // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                 pending_tools.insert(id, (display.clone(), detail, true));
                 state.on_tool_call_started(&display);
