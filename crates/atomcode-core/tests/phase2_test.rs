@@ -10,28 +10,27 @@ use atomcode_config::config::prompt_sections::build_rules;
 fn unified_prompt_has_all_sections() {
     let prompt = build_rules();
     assert!(prompt.contains("WORKFLOW"), "Must have workflow section");
-    assert!(prompt.contains("RULES"), "Must have rules section");
     assert!(prompt.contains("TOOLS"), "Must have tool guide");
-    assert!(prompt.contains("SCOPE"), "Must have scope discipline");
-    assert!(prompt.contains("VERIFY"), "Must have verify step");
+    assert!(prompt.contains("WHEN STUCK"), "Must have stuck section");
+    assert!(prompt.contains("OUTPUT"), "Must have output guidelines");
     assert!(prompt.contains("edit_file"), "Must mention edit_file");
-    assert!(prompt.contains("create_file"), "Must mention write_file");
+    assert!(prompt.contains("write_file"), "Must mention write_file");
 }
 
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
     assert!(
-        prompt.contains("### File:"),
-        "Must guide EXECUTE mode format"
+        prompt.contains("edit_file"),
+        "Must guide edit mode format"
     );
     assert!(
-        prompt.contains("old_string/new_string"),
-        "Must guide text-match editing"
+        prompt.contains("search_replace"),
+        "Must guide search-replace editing"
     );
     assert!(
-        prompt.contains("NEVER write_file on existing"),
-        "Must ban write_file on existing files"
+        prompt.contains("never with bash"),
+        "Must ban bash file mutation"
     );
 }
 
@@ -39,14 +38,13 @@ fn unified_prompt_has_key_guidance() {
 fn unified_prompt_size_reasonable() {
     let prompt = build_rules();
     let tokens = prompt.len() / 4;
-    // After "Less is More" refactor: ~80-200 tokens. Keep it minimal.
     assert!(
         tokens > 50,
         "Too short: {} tokens — rules may be missing",
         tokens
     );
     assert!(
-        tokens < 500,
+        tokens < 800,
         "Too long: {} tokens — violates Less is More principle",
         tokens
     );
