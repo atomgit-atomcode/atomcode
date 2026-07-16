@@ -1,9 +1,9 @@
 //! Helpers for downstream registries (skill / commands / hooks) to discover
 //! every installed plugin's asset directories in one pass.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::manifest::{load_plugin_manifest, PluginManifest};
+use super::manifest::{load_plugin_manifest, CCHooksMap, PluginManifest};
 use super::paths;
 use super::state::{load_installed_plugins_file, InstallScope};
 
@@ -64,6 +64,59 @@ pub struct PluginCcHook {
     pub plugin_root: PathBuf,
 }
 
+/// Expand a CC hooks map (`{Event: [{matcher?, hooks:[{type,command,timeout}]}]}`)
+/// into neutral `PluginCcHook` specs. Only `type: "command"` specs are kept.
+fn expand_cc_hooks(cc_map: &CCHooksMap, plugin_root: &Path) -> Vec<PluginCcHook> {
+    let mut out = Vec::new();
+    for (event, groups) in cc_map {
+        for group in groups {
+            for spec in &group.hooks {
+                if spec.kind != "command" {
+                    continue;
+                }
+                out.push(PluginCcHook {
+                    event: event.clone(),
+                    matcher: group.matcher.clone(),
+                    command: spec.command.clone(),
+                    timeout_secs: spec.timeout,
+                    plugin_root: plugin_root.to_path_buf(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Parse a CC-format hooks file. `None` on missing/malformed (skip, never wedge).
+fn load_cc_hooks_file(path: &Path) -> Option<CCHooksMap> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<CCHooksMap>(&raw).ok()
+}
+
+/// File-based plugin hooks, drilling the CC default layout: `hooks/hooks.json`
+/// (CC convention) then `hooks.json` (legacy flat). First existing+parseable wins.
+pub fn plugin_file_cc_hooks(plugin_dir: &Path) -> Vec<PluginCcHook> {
+    for rel in ["hooks/hooks.json", "hooks.json"] {
+        let path = plugin_dir.join(rel);
+        if path.exists() {
+            if let Some(map) = load_cc_hooks_file(&path) {
+                return expand_cc_hooks(&map, plugin_dir);
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Drop duplicate hooks by `(event, matcher, command)`, keeping first occurrence —
+/// so a plugin declaring the same hook both inline and in a file never double-fires.
+fn dedup_hooks(hooks: Vec<PluginCcHook>) -> Vec<PluginCcHook> {
+    let mut seen = std::collections::HashSet::new();
+    hooks
+        .into_iter()
+        .filter(|h| seen.insert((h.event.clone(), h.matcher.clone(), h.command.clone())))
+        .collect()
+}
+
 /// Flatten every installed plugin's INLINE CC hooks (`plugin.json` `hooks` blocks) into
 /// neutral [`PluginCcHook`] specs. Only `type: "command"` specs are returned. Plugins
 /// that ship a legacy hooks.json file (rather than inline hooks) are NOT included here —
@@ -75,22 +128,7 @@ pub fn installed_plugin_cc_hooks() -> Vec<PluginCcHook> {
         let Some(cc_map) = assets.manifest.inline_cc_hooks() else {
             continue;
         };
-        for (event, groups) in cc_map {
-            for group in groups {
-                for spec in &group.hooks {
-                    if spec.kind != "command" {
-                        continue;
-                    }
-                    out.push(PluginCcHook {
-                        event: event.clone(),
-                        matcher: group.matcher.clone(),
-                        command: spec.command.clone(),
-                        timeout_secs: spec.timeout,
-                        plugin_root: assets.plugin_dir.clone(),
-                    });
-                }
-            }
-        }
+        out.extend(expand_cc_hooks(cc_map, &assets.plugin_dir));
     }
     out
 }
@@ -173,6 +211,54 @@ mod tests {
     use crate::plugin::test_support::isolated_home;
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn file_cc_hooks_parses_cc_schema_from_hooks_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        std::fs::write(
+            dir.join("hooks/hooks.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
+        ).unwrap();
+        let hooks = plugin_file_cc_hooks(dir);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].event, "SessionStart");
+        assert_eq!(hooks[0].command, "echo hi");
+        assert_eq!(hooks[0].plugin_root, dir);
+    }
+
+    #[test]
+    fn file_cc_hooks_falls_back_to_root_hooks_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("hooks.json"),
+            r#"{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"c"}]}]}"#,
+        ).unwrap();
+        let hooks = plugin_file_cc_hooks(tmp.path());
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].event, "PreToolUse");
+        assert_eq!(hooks[0].matcher.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn file_cc_hooks_none_when_absent_or_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(plugin_file_cc_hooks(tmp.path()).is_empty());
+        std::fs::create_dir_all(tmp.path().join("hooks")).unwrap();
+        std::fs::write(tmp.path().join("hooks/hooks.json"), "{ not json").unwrap();
+        assert!(plugin_file_cc_hooks(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn dedup_hooks_drops_identical_event_matcher_command() {
+        let mk = |c: &str| PluginCcHook { event: "SessionStart".into(), matcher: None,
+            command: c.into(), timeout_secs: None, plugin_root: PathBuf::from("/x") };
+        let out = dedup_hooks(vec![mk("a"), mk("a"), mk("b")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].command, "a");
+        assert_eq!(out[1].command, "b");
+    }
 
     fn make_repo(name: &str) -> PathBuf {
         let work = tempfile::tempdir().unwrap().keep();
