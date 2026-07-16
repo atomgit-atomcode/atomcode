@@ -271,13 +271,14 @@ impl UsageModal {
             // grey). A dark→bright coral/salmon ramp from the xterm-256 cube
             // renders correctly everywhere. Index 0 = in-range-but-zero (neutral
             // dark square so the grid stays solid); 1..5 = least→most.
-            // Index 0 = a neutral dark-grey "empty" square (in-range but zero
-            // activity); indexes 1..5 = the activity ramp, LIGHT → DEEP RED so
-            // more activity reads as a richer/darker red (Less = pale, More =
-            // deep red, à la GitHub's "more = darker"). The 1..5 red family is
-            // monotonically darkening.
+            // Index 0 = a near-white "empty" square (in-range but zero activity)
+            // — reads as blank and, against the light-pink ramp, is far less
+            // jarring than a dark hole. Indexes 1..5 = the activity ramp, LIGHT
+            // → DEEP RED so more activity reads as a richer/darker red (à la
+            // GitHub's "more = darker"). The whole 0..5 sequence darkens
+            // monotonically: empty (lightest) → most (deep red, darkest).
             const HEAT_RAMP: [u8; 6] = [
-                236, // 0 — no activity (neutral dark grey #303030)
+                231, // 0 — no activity (white #ffffff)
                 217, // 1 — least (#ffafaf pale pink)
                 210, // 2 — (#ff8787 salmon pink)
                 174, // 3 — (#d78787 dusty rose)
