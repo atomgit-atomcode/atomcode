@@ -2363,7 +2363,10 @@ mod menu_tests {
     }
 
     #[test]
-    fn top_level_includes_individual_skills() {
+    fn top_level_hides_individual_skills() {
+        // Regression for the two-level palette: typing /bra or any
+        // bare-name prefix must NOT surface skills. They live behind
+        // the `/skills` gateway so the top palette stays uncluttered.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         let mut skills = atomcode_core::skill::SkillRegistry::new();
@@ -2371,16 +2374,25 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        // /bra should match the bare suffix of skills:brainstorming
-        let items = build_menu_items("/bra", 0, &reg, &custom, Some(&lock), None)
-            .expect("should find skill matching prefix");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
+        // /bra — no skill should appear; /bra falls through to "no
+        // matches" since no built-in starts with bra either.
+        assert!(
+            build_menu_items("/bra", 0, &reg, &custom, Some(&lock), None).is_none(),
+            "individual skills must not leak into the top-level menu"
+        );
 
-        // /skills should include matching namespaced skills
+        // /skills — only the built-in gateway entry, never the
+        // individual skills.
         let items = build_menu_items("/skills", 0, &reg, &custom, Some(&lock), None)
-            .expect("should find skills");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+            .expect("/skills must include the built-in gateway");
+        assert!(items.iter().any(|(n, _)| n == "skills"));
+        for (n, _) in &items {
+            assert!(
+                !n.contains(':'),
+                "namespaced skill leaked into top-level: {}",
+                n
+            );
+        }
     }
 
     #[test]
@@ -6255,24 +6267,7 @@ fn build_menu_items(
             matches.push((name, desc));
         }
     }
-    if let Some(reg) = skill_registry {
-        if let Ok(reg) = reg.read() {
-            for skill in reg.user_invocable() {
-                let name_lower = skill.name.to_ascii_lowercase();
-                let bare_suffix = name_lower
-                    .split_once(':')
-                    .map(|(_, s)| s)
-                    .unwrap_or(name_lower.as_str());
-                let matches_full = name_lower.starts_with(&prefix_lower);
-                let matches_bare = bare_suffix.starts_with(&prefix_lower);
-                if (matches_full || matches_bare)
-                    && !matches.iter().any(|(n, _)| n.eq_ignore_ascii_case(&skill.name))
-                {
-                    matches.push((skill.name.clone(), skill.description.clone()));
-                }
-            }
-        }
-    }
+    let _ = skill_registry; // referenced only inside the sub-mode branch above
     if matches.is_empty() {
         None
     } else {
@@ -10724,8 +10719,16 @@ fn handle_agent_event(
             // and print partial data). Clears the flag on fire so a
             // single dispatch yields a single render even when multiple
             // rich emissions follow (e.g. inside a long multi-round turn).
-            // ContextStats rich emission updates the state snapshot but no longer
-            // triggers asynchronous report renders since /context is synchronous now.
+            if ctx_window > 0 {
+                if let Some(show_prompt) = state.pending_context_render.take() {
+                    renderer.render(UiLine::CommandOutput(commands::render_context_report(
+                        state,
+                        ctx,
+                        show_prompt,
+                    )));
+                    renderer.flush();
+                }
+            }
         }
         AgentEvent::ToolBatchStarted { batch_id, calls } => {
             // Header label: "Reading 4 files in parallel" when all calls
@@ -11298,6 +11301,7 @@ fn handle_agent_event(
             state.completion_tokens = 0;
             state.cached_tokens = 0;
             state.last_context = None;
+            state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
             state.active_todos = None;

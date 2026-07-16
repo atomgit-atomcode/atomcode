@@ -1285,6 +1285,7 @@ impl Bridge {
                     );
                 }
             }
+            CoreCmd::RefreshContextStats => self.emit_context_stats(),
             CoreCmd::AppendInput(text) => {
                 // Legacy streaming-append: the kernel queues mid-turn sends as a
                 // full follow-up turn — closest faithful behavior.
@@ -1868,6 +1869,28 @@ impl Bridge {
         }
     }
 
+    fn emit_context_stats(&self) {
+        let sent = self.last_usage.as_ref().map(|m| m.used_tokens as usize).unwrap_or(0);
+        let ctx_window = self
+            .last_usage
+            .as_ref()
+            .map(|m| m.ctx_window as usize)
+            .filter(|w| *w > 0)
+            .unwrap_or(self.coding_cfg.context_window as usize);
+        self.emit(CoreEv::ContextStats {
+            system_tokens: 0,
+            sent_tokens: sent,
+            dropped_tokens: 0,
+            working_set_tokens: sent,
+            total_messages: 0,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            ctx_window,
+            ctx_name: "engine-v2".into(),
+            system_prompt: String::new(),
+        });
+    }
+
     // ---------------- kernel events → legacy ----------------
 
     async fn on_kernel_event(&mut self, ev: KEv) {
@@ -1988,25 +2011,8 @@ impl Bridge {
                 self.stats.total_tokens +=
                     (meta.tokens.prompt + meta.tokens.completion) as usize;
                 self.emit(CoreEv::TokenUsage(convert::usage_to_core(&meta.tokens)));
-                let sent = meta.used_tokens as usize;
-                let ctx_window = if meta.ctx_window > 0 {
-                    meta.ctx_window as usize
-                } else {
-                    self.coding_cfg.context_window as usize
-                };
-                self.emit(CoreEv::ContextStats {
-                    system_tokens: 0,
-                    sent_tokens: sent,
-                    dropped_tokens: 0,
-                    working_set_tokens: sent,
-                    total_messages: 0,
-                    tool_defs_tokens: 0,
-                    cold_zone_tokens: 0,
-                    ctx_window,
-                    ctx_name: "engine-v2".into(),
-                    system_prompt: String::new(),
-                });
                 self.last_usage = Some(meta);
+                self.emit_context_stats();
             }
             KEv::Snapshot { snapshot } => {
                 if let Some(reason) = self.pending_finish.take() {

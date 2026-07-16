@@ -1669,37 +1669,28 @@ fn execute_slash_command_impl(
             open_usage(renderer, active_modal);
         }
         "context" => {
+            // `/context` = breakdown only.
+            // `/context prompt` = breakdown + full assembled system prompt
+            // (the exact bytes the most recent turn sent). Useful when
+            // the model is misbehaving and you want to verify what's
+            // actually in the prompt.
+            //
+            // The cached ContextSnapshot only refreshes on LLM round-trips.
+            // Between turns — or after out-of-turn mutations like
+            // `inject_post_compress_state` — the cache lags the actual
+            // conversation. Dispatch a refresh and render when the
+            // resulting rich stats event lands (see `handle_agent_event`
+            // → `AgentEvent::ContextStats`). `pending_context_render =
+            // Some(show_prompt)` marks the pending request; cleared after
+            // the event handler fires the report. If the agent is busy
+            // in a turn, the next rich emission (at the next LLM call)
+            // serves the render — still fresh, just a tick later.
             let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
-            
-            let system_prompt = atomcode_daemon::get_current_system_prompt().unwrap_or_default();
-            let system_tokens = system_prompt.len() / 4;
-            
-            let mut sent_tokens = 0;
-            let mut total_messages = 0;
-            for msg in &ctx.current_session.messages {
-                sent_tokens += msg.text().map_or(0, |t| t.len()) / 4;
-                total_messages += 1;
-            }
-            
-            let provider_name = &ctx.config.default_provider;
-            let ctx_window = ctx.config.providers.get(provider_name)
-                .map(|p| p.context_window)
-                .unwrap_or(64000);
-            
-            let snap = crate::state::ContextSnapshot {
-                system_tokens,
-                sent_tokens,
-                tool_defs_tokens: 0,
-                cold_zone_tokens: 0,
-                total_messages,
-                ctx_window,
-                ctx_name: "kernel-v2".into(),
-                system_prompt,
-            };
-            
-            let report = format_context_report(Some(&snap), &ctx.model_name, show_prompt);
-            renderer.render(UiLine::CommandOutput(report));
-            renderer.flush();
+            state.pending_context_render = Some(show_prompt);
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::RefreshContextStats)
+                .ok();
         }
         "compact" => {
             if let Err(error) = compact_sync_guard(
@@ -3932,6 +3923,14 @@ fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 /// Build the `/context` report — horizontal bar + category breakdown,
 /// optionally followed by the full system prompt when `show_prompt`.
+///
+/// Thin wrapper around `format_context_report` that pulls the inputs
+/// (snapshot + model name + flag) out of state/ctx. Split for
+/// unit-testability: the inner function takes plain values and can be
+/// asserted on directly.
+pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
+    format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
+}
 
 /// `/status` login line: the signed-in identity (already formatted, e.g.
 /// `昵称(用户名)`), or a not-signed-in prompt. Pure over the resolved string.
@@ -4395,6 +4394,7 @@ pub(crate) fn reset_to_new_session(
     state.completion_tokens = 0;
     state.cached_tokens = 0;
     state.last_context = None;
+    state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
     state.active_todos = None;

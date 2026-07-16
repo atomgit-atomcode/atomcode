@@ -421,11 +421,7 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
 /// `ssh-dev-suite-long-task`. This avoids ambiguity with the namespace
 /// separator `:` and keeps the key filesystem-safe.
 fn normalize_skill_name(name: &str) -> String {
-    name.trim_start_matches('/')
-        .trim_start_matches('\\')
-        .trim_start_matches('-')
-        .to_ascii_lowercase()
-        .replace('/', "-")
+    name.to_ascii_lowercase().replace('/', "-")
 }
 
 fn make_name(base: &str, namespace: Option<&str>) -> String {
@@ -736,14 +732,6 @@ mod tests {
             skill_dir: PathBuf::new(),
             source_path: PathBuf::new(),
         }
-    }
-
-    #[test]
-    fn test_normalize_skill_name_trimming() {
-        assert_eq!(normalize_skill_name("/skills:gitcode-issue"), "skills:gitcode-issue");
-        assert_eq!(normalize_skill_name("-skills:gitcode-issue"), "skills:gitcode-issue");
-        assert_eq!(normalize_skill_name("\\skills:gitcode-issue"), "skills:gitcode-issue");
-        assert_eq!(normalize_skill_name("gitcode-issue"), "gitcode-issue");
     }
 
     // --- expand: $ARGUMENTS ---

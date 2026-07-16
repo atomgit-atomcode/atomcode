@@ -287,7 +287,14 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
-
+    /// `/context` dispatched a `RefreshContextStats` command and is
+    /// waiting for the resulting rich ContextStats event to render the
+    /// report. `Some(show_prompt)` until the next rich emission lands;
+    /// cleared after the render fires. Prevents stale-cache renders
+    /// without forcing /context to block synchronously on the agent
+    /// loop. The bool is the `prompt` sub-arg (include full system
+    /// prompt body).
+    pub pending_context_render: Option<bool>,
     /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
     /// the next user message. Drained on submit.
     pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
@@ -514,6 +521,7 @@ impl UiState {
             last_context: None,
             post_compaction_used_tokens: None,
             last_submitted_message: None,
+            pending_context_render: None,
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),
             pending_image_markers: Vec::new(),

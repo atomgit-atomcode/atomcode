@@ -156,14 +156,19 @@ async fn test_write_empty_args_returns_friendly_error() {
     let result = tool.execute("{}", &ctx).await.unwrap();
     assert!(!result.success, "empty args should fail gracefully");
     assert!(
-        result.output.contains("empty arguments"),
-        "should warn about empty arguments: {}",
+        result.output.contains("missing field"),
+        "keep serde detail: {}",
         result.output
     );
     assert!(
-        result.output.contains("max_tokens"),
-        "should hint at max_tokens: {}",
+        result.output.contains("truncated") || result.output.contains("max_tokens"),
+        "should hint at root cause: {}",
         result.output,
+    );
+    assert!(
+        result.output.contains("edit_file"),
+        "should suggest edit_file: {}",
+        result.output
     );
 }
 
