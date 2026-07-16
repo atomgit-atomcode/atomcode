@@ -482,6 +482,19 @@ impl PluginManager {
     }
 
     fn dispatch_remove_marketplace(&mut self, name: String, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        let installed_from_mp: Vec<_> = self.installed.iter()
+            .filter(|i| i.marketplace == name)
+            .cloned()
+            .collect();
+        for i in installed_from_mp {
+            if let Err(e) = atomcode_core::plugin::installer::uninstall(&i.plugin, &i.marketplace, i.scope) {
+                renderer.render(crate::render::UiLine::Error(format!(
+                    "Failed to auto-uninstall plugin '{}': {:#}",
+                    i.plugin, e
+                )));
+            }
+        }
+
         match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
                 reload_plugins(ctx);
@@ -1088,7 +1101,27 @@ impl Modal for PluginManager {
             final_items.push((String::new(), String::new()));
             final_items.push((t(Msg::PluginMgrRemoveMarketplacePrompt { name: mp }).into_owned(), String::new()));
             final_items.push((String::new(), String::new()));
-            selected_offset += 5;
+            let mut added_lines = 5;
+
+            let installed_from_mp: Vec<_> = self.installed.iter()
+                .filter(|i| i.marketplace == *mp)
+                .collect();
+            if !installed_from_mp.is_empty() {
+                let warning_text = if crate::i18n::current_locale() == crate::i18n::Locale::ZhCn {
+                    format!("  此操作将同时卸载该市场下的 {} 个插件：", installed_from_mp.len())
+                } else {
+                    format!("  This will also uninstall {} plugins from this marketplace:", installed_from_mp.len())
+                };
+                final_items.push((format!("\x1b[33m{}\x1b[39m", warning_text), String::new()));
+                added_lines += 1;
+                for i in &installed_from_mp {
+                    final_items.push((format!("    • {}{}\x1b[39m", muted_esc(), i.plugin), String::new()));
+                    added_lines += 1;
+                }
+                final_items.push((String::new(), String::new()));
+                added_lines += 1;
+            }
+            selected_offset += added_lines;
         }
 
         let details_opt = match &self.screen {
