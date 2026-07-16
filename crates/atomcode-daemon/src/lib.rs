@@ -4348,14 +4348,17 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default.
     // Also seed the offline verdict + note ONCE from config + env here, before
     // telemetry init and any tool/provider assembly (Step 4).
-    let startup_config = Config::load(&Config::default_path()).ok();
+    let startup_config = match Config::load(&Config::default_path()) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(?e, "Failed to load config, using defaults");
+            None
+        }
+    };
     let cfg_telemetry = startup_config
         .as_ref()
         .map(|c| c.telemetry.clone())
-        .unwrap_or_else(|| {
-            tracing::warn!("Failed to load config, using defaults");
-            atomcode_telemetry::TelemetryConfig::default()
-        });
+        .unwrap_or_default();
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
     atomcode_config::config::offline::seed_offline_verdict(
