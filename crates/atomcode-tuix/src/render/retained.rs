@@ -2346,79 +2346,80 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
             } else if matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo) {
-                if len < 2 {
+                let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
+                if len < header_h {
                     let sel = if m.selected < len { Some(m.selected) } else { None };
                     (m.items.clone(), sel, 0)
                 } else {
-                    let has_hint = len > 2 && m.items[len - 1].0.starts_with('—') && m.items[len - 1].0.ends_with('—');
-                let hint_h = if has_hint { 1 } else { 0 };
-                let header_h = 2;
-                let budget = max_menu.saturating_sub(header_h + hint_h);
-                let mut offset = 2;
-                let mut end = offset;
-                let mut height_sum = 0;
-                while end < len - hint_h {
-                    let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len - hint_h {
-                        2
-                    } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
-                        let orig_idx = end;
-                        if orig_idx >= 3 && orig_idx < len - hint_h {
-                            if orig_idx % 2 == 0 { 3 } else { 1 }
-                        } else {
-                            1
-                        }
-                    } else {
-                        1
-                    };
-                    if height_sum + item_h > budget {
-                        break;
-                    }
-                    height_sum += item_h;
-                    end += 1;
-                }
-
-                if m.selected >= 2 && m.selected < len - hint_h && m.selected >= end {
-                    while offset < len - hint_h && m.selected >= end {
-                        offset += 1;
-                        let mut h_sum = 0;
-                        end = offset;
-                        while end < len - hint_h {
-                            let item_h = if menu_kind == super::MenuKind::Plugin && end >= 2 && end < len - hint_h {
-                                2
-                            } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
-                                let orig_idx = end;
-                                if orig_idx >= 3 && orig_idx < len - hint_h {
-                                    if orig_idx % 2 == 0 { 3 } else { 1 }
-                                } else {
-                                    1
-                                }
+                    let has_hint = len > header_h && m.items[len - 1].0.starts_with('—') && m.items[len - 1].0.ends_with('—');
+                    let hint_h = if has_hint { 1 } else { 0 };
+                    let header_row_h = if menu_kind == super::MenuKind::Plugin { 6 } else { header_h };
+                    let budget = max_menu.saturating_sub(header_row_h + hint_h);
+                    let mut offset = header_h;
+                    let mut end = offset;
+                    let mut height_sum = 0;
+                    while end < len - hint_h {
+                        let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
+                            2
+                        } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                            let orig_idx = end;
+                            if orig_idx >= 3 && orig_idx < len - hint_h {
+                                if orig_idx % 2 == 0 { 3 } else { 1 }
                             } else {
                                 1
-                            };
-                            if h_sum + item_h > budget {
-                                break;
                             }
-                            h_sum += item_h;
-                            end += 1;
+                        } else {
+                            1
+                        };
+                        if height_sum + item_h > budget {
+                            break;
+                        }
+                        height_sum += item_h;
+                        end += 1;
+                    }
+
+                    if m.selected >= header_h && m.selected < len - hint_h && m.selected >= end {
+                        while offset < len - hint_h && m.selected >= end {
+                            offset += 1;
+                            let mut h_sum = 0;
+                            end = offset;
+                            while end < len - hint_h {
+                                let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
+                                    2
+                                } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
+                                    let orig_idx = end;
+                                    if orig_idx >= 3 && orig_idx < len - hint_h {
+                                        if orig_idx % 2 == 0 { 3 } else { 1 }
+                                    } else {
+                                        1
+                                    }
+                                } else {
+                                    1
+                                };
+                                if h_sum + item_h > budget {
+                                    break;
+                                }
+                                h_sum += item_h;
+                                end += 1;
+                            }
                         }
                     }
-                }
 
-                let mut items = Vec::new();
-                items.extend_from_slice(&m.items[0..2]);
-                items.extend_from_slice(&m.items[offset..end]);
-                if has_hint {
-                    items.push(m.items[len - 1].clone());
-                }
+                    let mut items = Vec::new();
+                    items.extend_from_slice(&m.items[0..header_h]);
+                    items.extend_from_slice(&m.items[offset..end]);
+                    if has_hint {
+                        items.push(m.items[len - 1].clone());
+                    }
 
-                let sel = if m.selected < 2 {
-                    Some(m.selected)
-                } else if m.selected >= offset && m.selected < end {
-                    Some(2 + (m.selected - offset))
-                } else {
-                    None
-                };
-                (items, sel, offset)
+                    let sel = if m.selected < header_h {
+                        Some(m.selected)
+                    } else if m.selected >= offset && m.selected < end {
+                        Some(header_h + (m.selected - offset))
+                    } else {
+                        None
+                    };
+                    (items, sel, offset)
                 }
             } else {
                 let mut offset = 0;
@@ -2477,12 +2478,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
             let mut sum = menu_items.iter().enumerate().map(|(i, _)| {
                 let orig_idx = if is_sticky {
-                    if i < 2 {
+                    let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
+                    if i < header_h {
                         i
                     } else if has_hint_at_end && i == menu_items.len() - 1 {
                         m.items.len() - 1
                     } else {
-                        actual_offset + (i - 2)
+                        actual_offset + (i - header_h)
                     }
                 } else {
                     actual_offset + i
@@ -2493,7 +2495,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         1
                     }
-                } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < m.items.len().saturating_sub(1) {
+                } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+                    3
+                } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 4 && orig_idx < m.items.len().saturating_sub(1) {
                     2
                 } else {
                     1
@@ -2646,12 +2650,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let is_sticky = matches!(menu_kind, super::MenuKind::Plugin | super::MenuKind::Marketplace | super::MenuKind::PluginInfo);
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = if is_sticky {
-                if i < 2 {
+                let header_h = if menu_kind == super::MenuKind::Plugin { 4 } else { 2 };
+                if i < header_h {
                     i
                 } else if has_hint_at_end && i == menu_items.len() - 1 {
                     final_len - 1
                 } else {
-                    actual_offset + (i - 2)
+                    actual_offset + (i - header_h)
                 }
             } else {
                 actual_offset + i
@@ -2672,7 +2677,109 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     menu_cells.push(Vec::new());
                 }
-            } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 2 && orig_idx < final_len.saturating_sub(1) {
+            } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
+                let border_style = if selected {
+                    self.style_bold(Role::Brand)
+                } else {
+                    self.style_for(Role::Muted)
+                };
+                let pad = CellStyle::default();
+
+                // 1. Top border
+                let mut top_border = Vec::with_capacity(rule_width + PAD_COL);
+                push_str_cells(&mut top_border, &" ".repeat(PAD_COL), &pad);
+                top_border.push(Cell {
+                    ch: '╭',
+                    style: border_style.clone(),
+                    width: 1,
+                });
+                for _ in 0..(rule_width.saturating_sub(2)) {
+                    top_border.push(Cell {
+                        ch: '─',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                }
+                if rule_width >= 2 {
+                    top_border.push(Cell {
+                        ch: '╮',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                }
+                menu_cells.push(top_border);
+
+                // 2. Content row
+                let mut content_row = Vec::new();
+                push_str_cells(&mut content_row, &" ".repeat(PAD_COL), &pad);
+                content_row.push(Cell {
+                    ch: '│',
+                    style: border_style.clone(),
+                    width: 1,
+                });
+                content_row.push(Cell {
+                    ch: ' ',
+                    style: CellStyle::default(),
+                    width: 1,
+                });
+                if name.is_empty() {
+                    let muted = self.style_for(Role::Muted);
+                    push_str_cells(&mut content_row, "Search plugins...", &muted);
+                } else {
+                    push_str_cells(&mut content_row, name, &CellStyle::default());
+                }
+                let target_w = rule_width + PAD_COL;
+                let mut current_w = 0;
+                for cell in &content_row {
+                    current_w += cell.width as usize;
+                }
+                let pad_w = (target_w.saturating_sub(1)).saturating_sub(current_w);
+                for _ in 0..pad_w {
+                    content_row.push(Cell {
+                        ch: ' ',
+                        style: CellStyle::default(),
+                        width: 1,
+                    });
+                }
+                if content_row.len() < target_w {
+                    content_row.push(Cell {
+                        ch: '│',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                } else {
+                    content_row[target_w - 1] = Cell {
+                        ch: '│',
+                        style: border_style.clone(),
+                        width: 1,
+                    };
+                }
+                menu_cells.push(content_row);
+
+                // 3. Bottom border
+                let mut bot_border = Vec::with_capacity(rule_width + PAD_COL);
+                push_str_cells(&mut bot_border, &" ".repeat(PAD_COL), &pad);
+                bot_border.push(Cell {
+                    ch: '╰',
+                    style: border_style.clone(),
+                    width: 1,
+                });
+                for _ in 0..(rule_width.saturating_sub(2)) {
+                    bot_border.push(Cell {
+                        ch: '─',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                }
+                if rule_width >= 2 {
+                    bot_border.push(Cell {
+                        ch: '╯',
+                        style: border_style.clone(),
+                        width: 1,
+                    });
+                }
+                menu_cells.push(bot_border);
+            } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 4 && orig_idx < final_len.saturating_sub(1) {
                 menu_cells.extend(self.build_plugin_menu_rows(name, desc, selected, rule_width));
             } else {
                 let row = self.build_menu_row(name, desc, selected, rule_width, menu_kind);
@@ -2877,6 +2984,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
+        let is_search_box_focused = menu_kind == super::MenuKind::Plugin
+            && self.menu.as_ref().map(|m| m.selected == 2 && m.items.len() >= 3).unwrap_or(false);
         if is_add_url {
             let input_row_idx = menu_cells.iter().position(|row| {
                 let text: String = row.iter().map(|c| c.ch).collect();
@@ -2890,6 +2999,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             };
             let prefix_w = crate::width::display_width(prefix);
             let cursor_abs_col = (4 + prefix_w + 1) as u16;
+            self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+        } else if is_search_box_focused {
+            let cursor_abs_row = (menu_top + 3 + 1) as u16;
+            let query = self.menu.as_ref()
+                .and_then(|m| m.items.get(2))
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default();
+            let query_w = crate::width::display_width(&query);
+            let cursor_abs_col = (4 + query_w + 1) as u16;
             self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
         }
         // Invalidate prev_cells for the menu rows so the next render_diff
@@ -2947,7 +3065,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // hide the caret (user navigates with ↑↓/Enter/Tab).
         let suppress_cursor = self.inflight_tool.is_some()
             || approval_active
-            || (hide_input_box && !is_add_url);
+            || (hide_input_box && !is_add_url && !is_search_box_focused);
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 

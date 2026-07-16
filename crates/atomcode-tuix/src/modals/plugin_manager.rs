@@ -247,8 +247,8 @@ impl PluginManager {
     /// Number of selectable rows on the current screen (for nav clamping).
     fn current_len(&self) -> usize {
         match &self.screen {
-            Screen::Browse => self.filtered_browse_plugins().len(),
-            Screen::Installed => self.filtered_installed().len(),
+            Screen::Browse => self.filtered_browse_plugins().len() + 1,
+            Screen::Installed => self.filtered_installed().len() + 1,
             Screen::AddUrl => 0,
             Screen::ScopeSelect { .. } => 3, // user / project / local
             Screen::Installing { .. } => 0, // No selectable rows — just status text
@@ -454,8 +454,15 @@ impl PluginManager {
 
 
     fn enter_browse(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            let max = self.current_len().saturating_sub(1);
+            if max > 0 {
+                self.selected = 1;
+            }
+            return;
+        }
         let plugins = self.filtered_browse_plugins();
-        let Some(item) = plugins.get(self.selected) else { return };
+        let Some(item) = plugins.get(self.selected - 1) else { return };
         let (plugin, mp) = (item.name.clone(), item.marketplace.clone());
         if self.is_installed(&plugin, &mp) {
             let key = sanitize(&plugin);
@@ -486,8 +493,11 @@ impl PluginManager {
     }
 
     fn enter_remove(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            return;
+        }
         let plugins = self.filtered_browse_plugins();
-        let Some(item) = plugins.get(self.selected) else { return };
+        let Some(item) = plugins.get(self.selected - 1) else { return };
         let name = item.marketplace.clone();
         match atomcode_core::plugin::marketplace::remove_marketplace(&name) {
             Ok(()) => {
@@ -503,8 +513,15 @@ impl PluginManager {
     }
 
     fn enter_installed(&mut self, _ctx: &mut LoopCtx, _renderer: &mut dyn Renderer) {
+        if self.selected == 0 {
+            let max = self.current_len().saturating_sub(1);
+            if max > 0 {
+                self.selected = 1;
+            }
+            return;
+        }
         let inst = self.filtered_installed();
-        let Some(i) = inst.get(self.selected) else { return };
+        let Some(i) = inst.get(self.selected - 1) else { return };
         let (plugin, mp, scope) = (i.plugin.clone(), i.marketplace.clone(), i.scope.clone());
         self.goto(Screen::InstalledDetails { plugin, mp, scope });
     }
@@ -985,6 +1002,12 @@ impl Modal for PluginManager {
 
         let mut selected_offset = 2;
 
+        if matches!(self.screen, Screen::Browse | Screen::Installed) {
+            final_items.push((self.search_query.clone(), String::new()));
+            final_items.push((String::new(), String::new()));
+            selected_offset += 2;
+        }
+
         let details_opt = match &self.screen {
             Screen::ScopeSelect { plugin, mp } | Screen::Installing { plugin, mp } => {
                 let (version, description) = self.get_plugin_details(plugin, mp);
@@ -1113,6 +1136,12 @@ impl Modal for PluginManager {
                 2
             } else {
                 4 + (self.selected - 1) * 2
+            }
+        } else if matches!(self.screen, Screen::Browse | Screen::Installed) {
+            if self.selected == 0 {
+                2
+            } else {
+                (self.selected + 3).min(final_items.len().saturating_sub(2))
             }
         } else {
             (self.selected + selected_offset).min(final_items.len().saturating_sub(2))
@@ -1323,7 +1352,7 @@ mod tests {
         // Starts at Browse screen
         assert!(matches!(m.screen, Screen::Browse));
         assert_eq!(m.selected, 0);
-        assert_eq!(m.current_len(), 4);
+        assert_eq!(m.current_len(), 5);
         
         let plugins = m.all_browse_plugins();
         assert_eq!(plugins.len(), 4);

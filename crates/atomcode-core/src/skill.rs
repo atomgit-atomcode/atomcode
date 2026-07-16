@@ -420,7 +420,7 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
 /// replace `/` with `-` so that names like `ssh-dev-suite/long-task` become
 /// `ssh-dev-suite-long-task`. This avoids ambiguity with the namespace
 /// separator `:` and keeps the key filesystem-safe.
-fn normalize_skill_name(name: &str) -> String {
+pub(crate) fn normalize_skill_name(name: &str) -> String {
     name.trim_start_matches('/')
         .trim_start_matches('\\')
         .trim_start_matches('-')
