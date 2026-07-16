@@ -487,6 +487,9 @@ export class DaemonClient {
       case 'tool_start':
         callbacks.onToolStart(event.id, event.name, event.arguments);
         break;
+      case 'tool_progress':
+        callbacks.onToolProgress(event.id, event.progress);
+        break;
       case 'tool_result':
         callbacks.onToolResult(event.id, event.name, event.output, event.success, event.duration_ms);
         break;

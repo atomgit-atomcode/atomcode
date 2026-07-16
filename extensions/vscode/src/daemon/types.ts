@@ -30,6 +30,7 @@ export type ChatEvent =
   | { type: 'text'; content: string }
   | { type: 'tool_batch'; calls: Array<{ id: string; name: string; arguments: string }> }
   | { type: 'tool_start'; id?: string; name: string; arguments: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id?: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
@@ -294,6 +295,7 @@ export interface ChatStreamCallbacks {
   onText: (content: string) => void;
   onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
+  onToolProgress: (id: string, progress: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
   onPermissionRequest: (request: { sessionId: string; toolName: string; reason: string; callId: string; args: string }) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;

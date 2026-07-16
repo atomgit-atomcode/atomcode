@@ -37,6 +37,19 @@ class SseParserTest {
     }
 
     @Test
+    fun parsesToolProgressEvent() {
+        val parser = SseParser()
+        val events = parser.feed(
+            """data: {"type":"tool_progress","id":"call-1","progress":"review · round 2 · thinking"}${"\n\n"}""",
+        )
+
+        assertEquals(
+            listOf(ChatEvent.ToolProgress("call-1", "review · round 2 · thinking")),
+            events,
+        )
+    }
+
+    @Test
     fun parsesPermissionRequest() {
         val parser = SseParser()
         val events = parser.feed(

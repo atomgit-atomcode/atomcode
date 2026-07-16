@@ -68,6 +68,16 @@ and suggest improvements."""
     }
 
     @Test
+    fun `toolResultStatus distinguishes incomplete review`() {
+        assertEquals(
+            "incomplete",
+            toolResultStatus(false, "Code review incomplete (MaxRounds)"),
+        )
+        assertEquals("failed", toolResultStatus(false, "command failed"))
+        assertEquals("done (42ms)", toolResultStatus(true, "ok", 42))
+    }
+
+    @Test
     fun `extractLastCodeBlock handles longer fence with inner backticks`() {
         val markdown = fencedArtifactMarkdown("kotlin", "val fence = \"```\"")
         assertEquals("val fence = \"```\"", extractLastCodeBlock(markdown))

@@ -530,14 +530,35 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: msgs };
     }
 
+    case 'TOOL_PROGRESS': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant?.toolCalls) {
+        const tools = assistant.toolCalls.map((tool) =>
+          tool.id === action.id ? { ...tool, progress: action.progress } : tool,
+        );
+        const updatedTool = tools.find((tool) => tool.id === action.id);
+        msgs[assistantIndex] = updatedTool
+          ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
+          : { ...assistant, toolCalls: tools };
+      }
+      return { ...state, messages: msgs };
+    }
+
     case 'TOOL_RESULT': {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant?.toolCalls) {
+        const status = action.success
+          ? 'done' as const
+          : action.output.startsWith('Code review incomplete')
+            ? 'incomplete' as const
+            : 'error' as const;
         const tools = assistant.toolCalls.map((t) =>
           t.id === action.id
-            ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, status: 'done' as const }
+            ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, progress: undefined, status }
             : t,
         );
         const updatedTool = tools.find((tool) => tool.id === action.id);

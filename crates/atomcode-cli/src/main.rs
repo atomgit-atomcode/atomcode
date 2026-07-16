@@ -159,6 +159,13 @@ fn format_thinking_chunk(out: &mut String, open: &mut bool, chunk: &str) {
     }
 }
 
+fn format_verbose_tool_chunk(chunk: &str) -> std::borrow::Cow<'_, str> {
+    match chunk.strip_prefix('\u{1e}') {
+        Some(progress) => std::borrow::Cow::Owned(format!("[progress] {}\n", progress.trim_end())),
+        None => std::borrow::Cow::Borrowed(chunk),
+    }
+}
+
 /// Close any in-flight `[thinking]` line by writing a newline if one is open.
 /// Mirrors the inline `close_thinking_line` used inside `run_headless`, but
 /// writes to a buffer so it can be unit-tested.
@@ -2181,7 +2188,7 @@ async fn run_headless(
             AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
                 if verbose {
                     close_thinking_line(&mut thinking_line_open);
-                    eprint!("{}", chunk);
+                    eprint!("{}", format_verbose_tool_chunk(&chunk));
                     let _ = io::stderr().flush();
                 }
             }
@@ -3716,10 +3723,18 @@ fn is_auth_gap_error(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_config_from, close_thinking_chunk, format_thinking_chunk, is_auth_gap_error,
-        resolve_working_dir, truncate_log_line,
+        bridge_config_from, close_thinking_chunk, format_thinking_chunk, format_verbose_tool_chunk,
+        is_auth_gap_error, resolve_working_dir, truncate_log_line,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn verbose_tool_chunk_strips_ephemeral_activity_marker() {
+        assert_eq!(
+            format_verbose_tool_chunk("\u{1e}review · round 2 · read_file"),
+            "[progress] review · round 2 · read_file\n"
+        );
+    }
 
     #[test]
     fn bridge_config_honors_provider_override() {

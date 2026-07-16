@@ -683,6 +683,16 @@ body {
 .tool-header:hover { background: var(--app-list-hover-background); }
 .tool-header:active { opacity: 0.65; }
 
+.tool-progress {
+  margin: -1px 8px 4px 28px;
+  color: var(--app-secondary-foreground);
+  font-family: var(--app-monospace-font-family);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Leading tool-type icon (file / search / edit / terminal …). */
 .tool-type-icon {
   flex-shrink: 0;
@@ -730,6 +740,7 @@ body {
 
 .tool-annotation.success { color: var(--app-success-foreground); }
 .tool-annotation.error { color: var(--app-error-foreground); }
+.tool-annotation.warning { color: var(--app-warning-accent); }
 .tool-annotation.pending { color: var(--app-secondary-foreground); }
 .tool-annotation.waiting { color: var(--app-warning-accent); }
 

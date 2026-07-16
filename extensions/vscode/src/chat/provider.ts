@@ -95,7 +95,7 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
 }
@@ -900,6 +900,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'toolStart', data: { id, name, args } });
         this._postMessageToPanel(streamSessionId, { type: 'toolStart', id, name, args });
       },
+      onToolProgress: (id, progress) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'toolProgress', data: { id, progress } });
+        this._postMessageToPanel(streamSessionId, { type: 'toolProgress', id, progress });
+      },
       onToolResult: (id, name, output, success, durationMs) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
@@ -1584,6 +1590,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'toolStart':
           post({ type: 'toolStart', id: evt.data.id, name: evt.data.name, args: evt.data.args });
+          break;
+        case 'toolProgress':
+          post({ type: 'toolProgress', id: evt.data.id, progress: evt.data.progress });
           break;
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });

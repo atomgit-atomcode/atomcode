@@ -13,13 +13,17 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_kernel::agent::AutoRespond;
+use atomcode_kernel::event::StopReason;
+use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
+use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::LlmProvider;
-use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
+use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -28,6 +32,78 @@ use crate::diff::annotate_diff_line_numbers;
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
 use crate::{build_review_agent_with, Finding};
+
+/// Prefix for ephemeral review activity. It deliberately matches the existing sub-agent
+/// activity convention so terminal drivers can update one latest-wins line instead of adding
+/// every child round/tool to scrollback.
+pub const REVIEW_ACTIVITY_MARKER: char = '\u{1e}';
+
+pub(crate) struct ReviewProgressHook {
+    progress: ProgressSink,
+    round: AtomicU32,
+    max_rounds: AtomicU32,
+}
+
+impl ReviewProgressHook {
+    pub(crate) fn new(progress: ProgressSink) -> Self {
+        Self {
+            progress,
+            round: AtomicU32::new(0),
+            max_rounds: AtomicU32::new(0),
+        }
+    }
+
+    fn round_label(&self) -> Option<String> {
+        let round = self.round.load(Ordering::Relaxed);
+        if round == 0 {
+            return None;
+        }
+        let max = self.max_rounds.load(Ordering::Relaxed);
+        Some(if max == 0 {
+            format!("round {round}")
+        } else {
+            format!("round {round}/{max}")
+        })
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for ReviewProgressHook {
+    async fn pre_request(&self, _messages: &mut Vec<Message>, ctx: &TurnCtx) {
+        self.round.store(ctx.round, Ordering::Relaxed);
+        self.max_rounds
+            .store(ctx.max_rounds.unwrap_or(0), Ordering::Relaxed);
+        let round = self.round_label().unwrap_or_else(|| "round".to_string());
+        self.progress.emit(format!(
+            "{REVIEW_ACTIVITY_MARKER}review · {round} · thinking"
+        ));
+    }
+
+    async fn on_model_response(&self, response: &mut Message) {
+        let Some(call) = response.tool_calls.first() else {
+            return;
+        };
+        let activity = summarize_review_tool_call(&call.name, &call.arguments);
+        let detail = self
+            .round_label()
+            .map_or(activity.clone(), |round| format!("{round} · {activity}"));
+        self.progress
+            .emit(format!("{REVIEW_ACTIVITY_MARKER}review · {detail}"));
+    }
+}
+
+fn summarize_review_tool_call(name: &str, arguments: &str) -> String {
+    let args = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+    let detail = ["file_path", "path", "pattern", "symbol"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(|value| value.as_str()))
+        .map(|value| value.lines().next().unwrap_or_default().trim())
+        .filter(|value| !value.is_empty());
+    match detail {
+        Some(detail) => format!("{name} · {}", detail.chars().take(100).collect::<String>()),
+        None => name.to_string(),
+    }
+}
 
 /// Shared slot for the host agent's provider. The tool is built at PREPARE time (before the
 /// provider exists), so the host fills this at ASSEMBLE time and the tool reads it per call.
@@ -43,6 +119,11 @@ pub struct ReviewToolConfig {
     pub context_window: u32,
     pub stream_timeout: Duration,
     pub request_timeout: Duration,
+    /// Preflight guardrails. Crossing any one requires an explicit scope confirmation.
+    pub max_commits_without_confirmation: usize,
+    pub max_files_without_confirmation: usize,
+    pub max_changed_lines_without_confirmation: usize,
+    pub max_diff_bytes_without_confirmation: usize,
     /// Optional per-language review-rules dir; `None` ⇒ built-in language rules only.
     pub rules_dir: Option<std::path::PathBuf>,
 }
@@ -54,6 +135,10 @@ impl Default for ReviewToolConfig {
             context_window: 128_000,
             stream_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
+            max_commits_without_confirmation: 20,
+            max_files_without_confirmation: 40,
+            max_changed_lines_without_confirmation: 4_000,
+            max_diff_bytes_without_confirmation: 256 * 1024,
             rules_dir: None,
         }
     }
@@ -81,6 +166,139 @@ struct Args {
     /// Review only STAGED changes (`git diff --cached`). Ignored when `base` is set.
     #[serde(default)]
     staged: bool,
+    /// Explicit scope form. The legacy top-level `base` / `staged` fields remain accepted so
+    /// resumed sessions and older `/review` prompts do not break.
+    #[serde(default)]
+    scope: Option<ScopeArg>,
+    /// Optional pathspec filter, applied after `--` so it cannot become a git option.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// Opaque digest returned by a large-scope preflight. The caller must only echo it after
+    /// the user explicitly accepts the displayed scope.
+    #[serde(default)]
+    confirm_scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ScopeArg {
+    WorkingTree,
+    Staged,
+    Range {
+        base: String,
+        #[serde(default = "default_head")]
+        head: String,
+    },
+    Commit {
+        rev: String,
+    },
+}
+
+fn default_head() -> String {
+    "HEAD".to_string()
+}
+
+enum ReviewScope {
+    WorkingTree,
+    Staged,
+    Range { base: String, head: String },
+    Commit { rev: String },
+    LegacyBase { base: String },
+}
+
+impl Args {
+    fn review_scope(&self) -> Result<ReviewScope, String> {
+        if self.scope.is_some() && (self.base.is_some() || self.staged) {
+            return Err("`scope` cannot be combined with legacy `base` or `staged`".into());
+        }
+        if self.base.is_some() && self.staged {
+            return Err("`base` and `staged` are mutually exclusive".into());
+        }
+        Ok(match &self.scope {
+            Some(ScopeArg::WorkingTree) => ReviewScope::WorkingTree,
+            Some(ScopeArg::Staged) => ReviewScope::Staged,
+            Some(ScopeArg::Range { base, head }) => ReviewScope::Range {
+                base: base.clone(),
+                head: head.clone(),
+            },
+            Some(ScopeArg::Commit { rev }) => ReviewScope::Commit { rev: rev.clone() },
+            None if self.staged => ReviewScope::Staged,
+            None if self.base.is_some() => ReviewScope::LegacyBase {
+                base: self.base.clone().unwrap_or_default(),
+            },
+            None => ReviewScope::WorkingTree,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScopeLimits {
+    max_commits: usize,
+    max_files: usize,
+    max_changed_lines: usize,
+    max_diff_bytes: usize,
+}
+
+struct ScopeManifest {
+    label: String,
+    files: usize,
+    additions: usize,
+    deletions: usize,
+    diff_bytes: usize,
+    commit_count: Option<usize>,
+    confirmation_token: String,
+}
+
+impl ScopeManifest {
+    fn from_diff(label: impl Into<String>, diff: &str, commit_count: Option<usize>) -> Self {
+        let label = label.into();
+        let (additions, deletions) = changed_line_counts(diff);
+        let confirmation_token =
+            format!("review-{:016x}", fnv1a64(label.as_bytes(), diff.as_bytes()));
+        Self {
+            label,
+            files: diff
+                .lines()
+                .filter(|line| line.starts_with("diff --git "))
+                .count(),
+            additions,
+            deletions,
+            diff_bytes: diff.len(),
+            commit_count,
+            confirmation_token,
+        }
+    }
+
+    fn changed_lines(&self) -> usize {
+        self.additions + self.deletions
+    }
+
+    fn exceeds(&self, limits: &ScopeLimits) -> bool {
+        self.commit_count
+            .is_some_and(|count| count > limits.max_commits)
+            || self.files > limits.max_files
+            || self.changed_lines() > limits.max_changed_lines
+            || self.diff_bytes > limits.max_diff_bytes
+    }
+
+    fn render_confirmation(&self) -> String {
+        let commits = self
+            .commit_count
+            .map_or_else(|| "n/a".to_string(), |n| n.to_string());
+        format!(
+            "code_review: scope confirmation required; reviewer was NOT started.\n\
+             Scope: {}\nCommits: {}\nFiles: {}\nChanges: +{} / -{}\nDiff bytes: {}\n\
+             Ask the user to confirm this exact scope, then call `code_review` again with \
+             `\"confirm_scope\":\"{}\"`. Do not confirm on the user's behalf.",
+            self.label,
+            commits,
+            self.files,
+            self.additions,
+            self.deletions,
+            self.diff_bytes,
+            self.confirmation_token
+        )
+    }
 }
 
 /// Cap rendered findings so a huge diff can't blow up one tool result; the host model still
@@ -94,17 +312,26 @@ impl Tool for ReviewTool {
     }
     fn description(&self) -> &str {
         "Run a rigorous READ-ONLY code review of the current changes and return prioritized \
-         findings (correctness > security > reliability). Reviews the working-tree changes \
-         (git diff HEAD) by default; pass `staged` for staged-only, or `base` to review \
-         commits since a ref. Use when the user asks to review changes / a diff / their work \
-         (e.g. before committing). Runs a separate reviewer agent — it does not modify files."
+         findings (correctness > security > reliability). Resolve only the requested scope, \
+         then invoke this tool without pre-reviewing the diff. Large scopes return a preflight \
+         instead of starting; only echo `confirm_scope` after the user explicitly accepts that \
+         exact scope. Runs a separate reviewer agent and never modifies files."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "base": { "type": "string", "description": "Review commits since this ref (git diff <base>). Omit for working-tree changes." },
-                "staged": { "type": "boolean", "description": "Review only staged changes (git diff --cached)." }
+                "scope": {
+                    "oneOf": [
+                        { "type": "object", "properties": { "kind": { "const": "working_tree" } }, "required": ["kind"] },
+                        { "type": "object", "properties": { "kind": { "const": "staged" } }, "required": ["kind"] },
+                        { "type": "object", "properties": { "kind": { "const": "range" }, "base": { "type": "string" }, "head": { "type": "string", "default": "HEAD" } }, "required": ["kind", "base"] },
+                        { "type": "object", "properties": { "kind": { "const": "commit" }, "rev": { "type": "string" } }, "required": ["kind", "rev"] }
+                    ],
+                    "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
+                },
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
+                "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." }
             }
         })
     }
@@ -120,14 +347,41 @@ impl Tool for ReviewTool {
             }
         };
 
-        // 1. Compute the diff in the LIVE working dir (follows /cd).
-        let diff = match git_diff(&ctx.working_dir, a.base.as_deref(), a.staged) {
+        let scope = match a.review_scope() {
+            Ok(scope) => scope,
+            Err(e) => return err(format!("code_review: invalid scope: {e}")),
+        };
+
+        // 1. Compute the exact diff in the LIVE working dir (follows /cd), then stop before
+        // launching the child when the deterministic preflight says the scope is large.
+        ctx.progress
+            .emit(format!("{REVIEW_ACTIVITY_MARKER}review · preparing diff"));
+        let scoped = match git_diff(&ctx.working_dir, &scope, &a.paths) {
             Ok(d) => d,
             Err(e) => return err(format!("code_review: {e}")),
         };
+        let diff = scoped.diff;
         if diff.trim().is_empty() {
-            return ok("code_review: no changes to review for the requested scope (working tree clean).");
+            return ok(
+                "code_review: no changes to review for the requested scope (working tree clean).",
+            );
         }
+        let manifest = ScopeManifest::from_diff(scoped.label, &diff, scoped.commit_count);
+        let limits = ScopeLimits {
+            max_commits: self.cfg.max_commits_without_confirmation,
+            max_files: self.cfg.max_files_without_confirmation,
+            max_changed_lines: self.cfg.max_changed_lines_without_confirmation,
+            max_diff_bytes: self.cfg.max_diff_bytes_without_confirmation,
+        };
+        if manifest.exceeds(&limits)
+            && a.confirm_scope.as_deref() != Some(manifest.confirmation_token.as_str())
+        {
+            return ok(manifest.render_confirmation());
+        }
+        ctx.progress.emit(format!(
+            "{REVIEW_ACTIVITY_MARKER}review · analyzing {} file(s)",
+            manifest.files
+        ));
 
         // 2. Build the review task: annotated diff + per-language rules for changed files.
         let annotated = annotate_diff_line_numbers(&diff);
@@ -149,28 +403,32 @@ impl Tool for ReviewTool {
         cfg.context_window = self.cfg.context_window;
         cfg.stream_timeout = self.cfg.stream_timeout;
         cfg.request_timeout = self.cfg.request_timeout;
+        cfg.progress = Some(ctx.progress.clone());
         let (agent, report) = build_review_agent_with(&cfg, provider);
 
         // 4. Run the reviewer to completion, honoring the host turn's cancellation. Dropping
         //    the run future (on cancel) cancels the spawned child agent.
-        tokio::select! {
-            _ = ctx.cancel.cancelled() => return err("code_review: cancelled"),
+        let (stop, run_error) = tokio::select! {
+            _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
             outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                if let Some(e) = outcome.error {
-                    // A hard failure with NO findings collected is a real error; otherwise
-                    // surface what was gathered before the error.
-                    if report.findings().is_empty() {
-                        return err(format!("code_review: review run failed: {e}"));
-                    }
-                }
+                (outcome.stop, outcome.error)
             }
-        }
+        };
 
         // 5. Scope-filter to changed files, sort (priority then confidence), render.
         let mut findings = report.findings();
         findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
         sort_findings(&mut findings);
-        ok(render_findings(&findings, files.len()))
+        if stop == StopReason::Stopped && run_error.is_none() {
+            ok(render_findings(&findings, files.len()))
+        } else {
+            err(render_incomplete_review(
+                &findings,
+                files.len(),
+                stop,
+                run_error.as_deref(),
+            ))
+        }
     }
 }
 
@@ -179,34 +437,138 @@ impl Tool for ReviewTool {
 // ---------------------------------------------------------------------------
 
 fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: false,
+        images: vec![],
+    }
 }
 fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: true,
+        images: vec![],
+    }
 }
 
-/// `git diff` for the requested scope, run in `dir`. `base` wins over `staged`; with neither
-/// it diffs the working tree against `HEAD`.
-fn git_diff(dir: &Path, base: Option<&str>, staged: bool) -> Result<String, String> {
+struct ScopedDiff {
+    diff: String,
+    label: String,
+    commit_count: Option<usize>,
+}
+
+fn git_diff(dir: &Path, scope: &ReviewScope, paths: &[String]) -> Result<ScopedDiff, String> {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir).arg("diff").arg("--no-color");
-    match base.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(b) => {
-            cmd.arg(b);
-        }
-        None if staged => {
-            cmd.arg("--cached");
-        }
-        None => {
+    let (label, commit_count) = match scope {
+        ReviewScope::WorkingTree => {
             cmd.arg("HEAD");
+            ("working tree vs HEAD".to_string(), None)
         }
+        ReviewScope::Staged => {
+            cmd.arg("--cached");
+            ("staged changes".to_string(), None)
+        }
+        ReviewScope::Range { base, head } => {
+            let base_oid = resolve_commit(dir, base)?;
+            let head_oid = resolve_commit(dir, head)?;
+            cmd.arg(&base_oid).arg(&head_oid);
+            let count = rev_count(dir, &base_oid, &head_oid)?;
+            (format!("{base}..{head}"), Some(count))
+        }
+        ReviewScope::Commit { rev } => {
+            let oid = resolve_commit(dir, rev)?;
+            cmd.arg(format!("{oid}^!"));
+            (format!("commit {rev}"), Some(1))
+        }
+        ReviewScope::LegacyBase { base } => {
+            let base_oid = resolve_commit(dir, base)?;
+            let head_oid = resolve_commit(dir, "HEAD")?;
+            cmd.arg(&base_oid);
+            let count = rev_count(dir, &base_oid, &head_oid)?;
+            (format!("{base}..working tree"), Some(count))
+        }
+    };
+    if !paths.is_empty() {
+        cmd.arg("--").args(paths);
     }
-    let out = cmd.output().map_err(|e| format!("failed to run git: {e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git diff failed: {}", stderr.trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(ScopedDiff {
+        diff: String::from_utf8_lossy(&out.stdout).to_string(),
+        label,
+        commit_count,
+    })
+}
+
+fn resolve_commit(dir: &Path, rev: &str) -> Result<String, String> {
+    let rev = rev.trim();
+    if rev.is_empty() {
+        return Err("git ref cannot be empty".into());
+    }
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "invalid git ref `{rev}`: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn rev_count(dir: &Path, base: &str, head: &str) -> Result<usize, String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-list", "--count", &format!("{base}..{head}")])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid git rev-list count: {e}"))
+}
+
+fn changed_line_counts(diff: &str) -> (usize, usize) {
+    diff.lines().fold((0, 0), |(adds, dels), line| {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            (adds + 1, dels)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            (adds, dels + 1)
+        } else {
+            (adds, dels)
+        }
+    })
+}
+
+fn fnv1a64(first: &[u8], second: &[u8]) -> u64 {
+    first
+        .iter()
+        .chain(second)
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 /// Loose path match between a diff's changed-file path and a finding's `file_path` (which a
@@ -221,9 +583,11 @@ fn paths_match(changed: &str, finding: &str) -> bool {
 /// sort lexically in severity order, so a plain string compare is correct.
 fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        a.priority.cmp(&b.priority).then(
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 }
 
@@ -253,7 +617,10 @@ fn render_findings(findings: &[Finding], changed_files: usize) -> String {
             out.push_str(&format!("   {}\n", f.body.trim().replace('\n', "\n   ")));
         }
         if !f.suggestion.trim().is_empty() {
-            out.push_str(&format!("   ↳ fix: {}\n", f.suggestion.trim().replace('\n', "\n   ")));
+            out.push_str(&format!(
+                "   ↳ fix: {}\n",
+                f.suggestion.trim().replace('\n', "\n   ")
+            ));
         }
     }
     if findings.len() > MAX_FINDINGS_RENDER {
@@ -262,6 +629,27 @@ fn render_findings(findings: &[Finding], changed_files: usize) -> String {
             findings.len() - MAX_FINDINGS_RENDER,
             MAX_FINDINGS_RENDER
         ));
+    }
+    out
+}
+
+fn render_incomplete_review(
+    findings: &[Finding],
+    changed_files: usize,
+    stop: StopReason,
+    error: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "Code review incomplete ({stop:?}) — coverage is partial, not a clean review. \
+         {} confirmed finding(s) across {changed_files} changed file(s).",
+        findings.len()
+    );
+    if let Some(error) = error.filter(|e| !e.trim().is_empty()) {
+        out.push_str(&format!("\nReason: {}", error.trim()));
+    }
+    if !findings.is_empty() {
+        out.push('\n');
+        out.push_str(&render_findings(findings, changed_files));
     }
     out
 }
@@ -276,6 +664,7 @@ mod tests {
     use atomcode_kernel::tool::{ToolCall, ToolDef};
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
+    use std::sync::Mutex;
 
     fn finding(priority: &str, conf: f32, file: &str, title: &str) -> Finding {
         Finding {
@@ -332,6 +721,136 @@ mod tests {
         assert_eq!(b.base.as_deref(), Some("main"));
     }
 
+    #[test]
+    fn scope_manifest_requires_confirmation_when_changed_lines_exceed_limit() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,3 @@\n-old\n+new\n+more\n+again\n";
+        let limits = ScopeLimits {
+            max_commits: 10,
+            max_files: 10,
+            max_changed_lines: 3,
+            max_diff_bytes: 10_000,
+        };
+
+        let manifest = ScopeManifest::from_diff("working tree", diff, None);
+
+        assert!(
+            manifest.exceeds(&limits),
+            "four changed lines must require confirmation"
+        );
+    }
+
+    #[test]
+    fn scope_manifest_requires_confirmation_when_commit_count_exceeds_limit() {
+        let limits = ScopeLimits {
+            max_commits: 20,
+            max_files: 100,
+            max_changed_lines: 10_000,
+            max_diff_bytes: 1_000_000,
+        };
+        let manifest = ScopeManifest::from_diff("main..HEAD", "+one\n", Some(26));
+
+        assert!(
+            manifest.exceeds(&limits),
+            "26 commits must require confirmation"
+        );
+    }
+
+    #[test]
+    fn scope_confirmation_token_changes_when_diff_changes() {
+        let first = ScopeManifest::from_diff("working tree", "+one\n", None);
+        let second = ScopeManifest::from_diff("working tree", "+two\n", None);
+
+        assert_ne!(first.confirmation_token, second.confirmation_token);
+    }
+
+    #[test]
+    fn scope_manifest_counts_deleted_files() {
+        let diff =
+            "diff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
+
+        let manifest = ScopeManifest::from_diff("working tree", diff, None);
+
+        assert_eq!(manifest.files, 1);
+    }
+
+    #[test]
+    fn incomplete_review_never_claims_no_issues() {
+        let rendered = render_incomplete_review(
+            &[],
+            3,
+            atomcode_kernel::event::StopReason::MaxRounds,
+            Some("max rounds (12) reached"),
+        );
+
+        assert!(
+            rendered.contains("incomplete") && !rendered.contains("no issues found"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_progress_hook_emits_round_activity() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let hook = ReviewProgressHook::new(atomcode_kernel::tool::ProgressSink::new(Arc::new(
+            move |message| {
+                capture.lock().unwrap().push(message);
+            },
+        )));
+
+        atomcode_kernel::hook::LifecycleHooks::pre_request(
+            &hook,
+            &mut Vec::new(),
+            &atomcode_kernel::hook::TurnCtx {
+                round: 3,
+                max_rounds: None,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[format!(
+                "{REVIEW_ACTIVITY_MARKER}review · round 3 · thinking"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_progress_tool_activity_keeps_current_round() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let hook = ReviewProgressHook::new(ProgressSink::new(Arc::new(move |message| {
+            capture.lock().unwrap().push(message);
+        })));
+        LifecycleHooks::pre_request(
+            &hook,
+            &mut Vec::new(),
+            &TurnCtx {
+                round: 4,
+                max_rounds: None,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut response = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"src/compaction.rs"}"#.into(),
+            }],
+        );
+
+        LifecycleHooks::on_model_response(&hook, &mut response).await;
+
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some("\u{1e}review · round 4 · read_file · src/compaction.rs")
+        );
+    }
+
     /// Scripted reviewer: round 1 emits a `report_finding`, round 2 a final text.
     struct ScriptedReviewProvider;
     #[async_trait]
@@ -365,6 +884,66 @@ mod tests {
         }
     }
 
+    struct FinishesAfterThirteenRounds {
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FinishesAfterThirteenRounds {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let events = if call <= 13 {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("read-{call}"),
+                        name: "read_file".into(),
+                        arguments: r#"{"file_path":"a.rs"}"#.into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ]
+            } else {
+                vec![
+                    StreamEvent::TextDelta("Review complete.".into()),
+                    StreamEvent::Done { truncated: false },
+                ]
+            };
+            Ok(stream::iter(events).boxed())
+        }
+    }
+
+    struct FinishesAfterTenMinutes;
+
+    #[async_trait]
+    impl LlmProvider for FinishesAfterTenMinutes {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let delayed = stream::once(async {
+                tokio::time::sleep(Duration::from_secs(601)).await;
+                StreamEvent::TextDelta("Review complete.".into())
+            });
+            Ok(delayed
+                .chain(stream::iter(vec![StreamEvent::Done { truncated: false }]))
+                .boxed())
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .current_dir(root)
@@ -373,6 +952,144 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         assert!(ok, "git {args:?} failed");
+    }
+
+    fn repo_with_working_tree_change() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("a.rs"), "fn main() { changed(); }\n").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn large_scope_preflight_does_not_start_reviewer() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let tool = ReviewTool::new(
+            Arc::new(RwLock::new(None)),
+            ReviewToolConfig {
+                max_changed_lines_without_confirmation: 0,
+                ..Default::default()
+            },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+        };
+
+        let result = tool.execute("{}", &ctx).await;
+
+        assert!(
+            !result.is_error && result.content.contains("reviewer was NOT started"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn legacy_base_scope_keeps_working_tree_changes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let args: Args = serde_json::from_str(r#"{"base":"HEAD"}"#).unwrap();
+        let scope = args.review_scope().unwrap();
+
+        let scoped = git_diff(dir.path(), &scope, &[]).unwrap();
+
+        assert!(
+            !scoped.diff.trim().is_empty(),
+            "legacy `base` must still include working tree"
+        );
+    }
+
+    #[test]
+    fn commit_scope_supports_root_commit() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let scope = ReviewScope::Commit { rev: "HEAD".into() };
+
+        let scoped = git_diff(dir.path(), &scope, &[]).unwrap();
+
+        assert!(
+            scoped.diff.contains("a.rs"),
+            "root commit diff must be reviewable"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_review_can_complete_after_more_than_twelve_rounds() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(FinishesAfterThirteenRounds {
+                calls: AtomicU32::new(0),
+            }))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+        };
+
+        let result = tool.execute("{}", &ctx).await;
+
+        assert!(
+            !result.is_error && result.content.contains("no issues found"),
+            "a legitimate long review must finish instead of hitting a round fuse: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_review_can_complete_after_more_than_ten_minutes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(FinishesAfterTenMinutes))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                stream_timeout: Duration::from_secs(700),
+                request_timeout: Duration::from_secs(700),
+                ..Default::default()
+            },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+        };
+
+        let result = tool.execute("{}", &ctx).await;
+
+        assert!(
+            !result.is_error && result.content.contains("no issues found"),
+            "a responsive review must not be cut off by a total-duration budget: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -390,23 +1107,53 @@ mod tests {
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "init"]);
         // A working-tree change → `git diff HEAD` is non-empty.
-        std::fs::write(root.join("a.rs"), "fn main() { let x: Option<i32> = None; x.unwrap(); }\n").unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn main() { let x: Option<i32> = None; x.unwrap(); }\n",
+        )
+        .unwrap();
 
         let provider: SharedReviewProvider =
             Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_capture = progress.clone();
         let tool = ReviewTool::new(
             provider,
-            ReviewToolConfig { model: "mock-model".into(), ..Default::default() },
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
         );
         let ctx = ToolContext {
             working_dir: root.to_path_buf(),
             cancel: Default::default(),
-            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            progress: ProgressSink::new(Arc::new(move |message| {
+                progress_capture.lock().unwrap().push(message);
+            })),
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "review should succeed: {}", res.content);
-        assert!(res.content.contains("finding(s)"), "renders findings: {}", res.content);
-        assert!(res.content.contains("unchecked unwrap"), "includes the reported finding: {}", res.content);
+        assert!(
+            res.content.contains("finding(s)"),
+            "renders findings: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("unchecked unwrap"),
+            "includes the reported finding: {}",
+            res.content
+        );
+        let progress = progress.lock().unwrap();
+        assert_eq!(
+            progress.first().map(String::as_str),
+            Some("\u{1e}review · preparing diff")
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|message| message == "\u{1e}review · analyzing 1 file(s)"),
+            "progress must expose the pre-review phase: {progress:?}"
+        );
     }
 
     #[tokio::test]
@@ -433,6 +1180,10 @@ mod tests {
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "clean tree is not an error: {}", res.content);
-        assert!(res.content.contains("no changes to review"), "{}", res.content);
+        assert!(
+            res.content.contains("no changes to review"),
+            "{}",
+            res.content
+        );
     }
 }

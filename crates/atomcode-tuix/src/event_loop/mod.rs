@@ -1715,6 +1715,37 @@ mod buffer_tests {
     }
 
     #[test]
+    fn review_activity_marker_is_ephemeral_for_code_review() {
+        let chunk = "\u{1e}review · round 3 · read_file · compaction.rs";
+
+        let activity = ephemeral_tool_activity(Some("CodeReview"), chunk);
+
+        assert_eq!(
+            activity,
+            Some("review · round 3 · read_file · compaction.rs")
+        );
+    }
+
+    #[test]
+    fn code_review_detail_renders_explicit_range_scope() {
+        let detail = format_tool_detail(
+            "code_review",
+            r#"{"scope":{"kind":"range","base":"main","head":"HEAD"}}"#,
+        );
+
+        assert_eq!(detail, "main..HEAD");
+    }
+
+    #[test]
+    fn partial_code_review_result_is_a_warning() {
+        assert!(is_incomplete_review_result(
+            "code_review",
+            "Code review incomplete (MaxRounds)",
+            false,
+        ));
+    }
+
+    #[test]
     fn spinner_label_maps_tool_names_to_thinking_word() {
         // Tool-execution labels must not flash tool names in the footer spinner;
         // they map back to the turn's thinking word. The body ▸ rows carry the
@@ -9082,6 +9113,19 @@ fn streams_tool_output_by_default(
         || tool_display.is_some_and(|d| d == display_tool_name("task"))
 }
 
+fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Option<&'a str> {
+    let activity =
+        chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)?;
+    let supported = tool_display.is_some_and(|display| {
+        display == display_tool_name("task") || display == display_tool_name("code_review")
+    });
+    supported.then_some(activity)
+}
+
+fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool {
+    !success && name == "code_review" && output.starts_with("Code review incomplete")
+}
+
 #[cfg(test)]
 mod tool_output_stream_gate_tests {
     use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
@@ -9848,23 +9892,13 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
             let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
-            // EPHEMERAL subagent activity: a `task` child's live "current action" line is
-            // marked with SUBAGENT_ACTIVITY_MARKER (single source of truth in the capabilities
-            // crate, emitted by `SubtaskProgressHook`). It does NOT belong in scrollback — it
-            // updates the spinner in-place (latest-wins) so a fan-out shows what it's doing
-            // without spamming a line per tool call. Cheap marker check FIRST (every bash
-            // chunk hits this arm); the `display_tool_name("task")` allocation only runs for
-            // the rare marker-prefixed chunk, and scopes it to the `task` tool so a non-task
-            // tool that happens to stream a leading U+001E byte can't be hijacked.
-            if let Some(activity) =
-                chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
-            {
-                if tool_display.is_some_and(|d| d == display_tool_name("task")) {
-                    state.subagent_activity = Some(activity.to_string());
-                    // Repaint so the spinner picks up the new activity immediately.
-                    renderer.flush();
-                    return;
-                }
+            // Marker-prefixed child activity is EPHEMERAL: latest wins in the footer spinner,
+            // never append it to scrollback. Scope the convention to known sub-agent tools so
+            // an unrelated command that emits U+001E cannot hijack the UI.
+            if let Some(activity) = ephemeral_tool_activity(tool_display, &chunk) {
+                state.subagent_activity = Some(activity.to_string());
+                renderer.flush();
+                return;
             }
             // Display real-time tool output (e.g., bash stdout/stderr). Normally
             // gated behind Ctrl+O verbose mode, but user-invoked `!` shell commands
@@ -9891,7 +9925,7 @@ fn handle_agent_event(
             // The `task` fan-out finished — drop its live spinner activity so a
             // completed subtask's last action doesn't linger while the parent
             // agent keeps working the rest of the turn.
-            if name == "task" {
+            if name == "task" || name == "code_review" {
                 state.subagent_activity = None;
             }
             // Title cache (id → content, for `todo update #N` row names) is maintained by
@@ -10032,7 +10066,9 @@ fn handle_agent_event(
                 // A plan-mode interception isn't a failure — render it as a calm `○`
                 // hint (with the gate's reason) instead of a ✗ error, so the user
                 // sees WHY the tool didn't run and that they should review the plan.
-                if let Some(reason) = plan_mode_block_reason(&output, success) {
+                if is_incomplete_review_result(&name, &output, success) {
+                    renderer.render(UiLine::Warning(summarise(&output)));
+                } else if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
                 } else if let Some(label) = approval_denial_label(&output, success) {
                     // A denial is the user's choice, not an error — render a calm `○ denied`
@@ -12214,6 +12250,22 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "code_review" => {
+            if let Some(scope) = v.get("scope") {
+                return match scope.get("kind").and_then(|kind| kind.as_str()) {
+                    Some("working_tree") => "working tree".to_string(),
+                    Some("staged") => "staged changes".to_string(),
+                    Some("range") => {
+                        let base = scope.get("base").and_then(|value| value.as_str()).unwrap_or("");
+                        let head = scope.get("head").and_then(|value| value.as_str()).unwrap_or("HEAD");
+                        format!("{base}..{head}")
+                    }
+                    Some("commit") => scope
+                        .get("rev")
+                        .and_then(|value| value.as_str())
+                        .map_or_else(String::new, |rev| format!("commit {rev}")),
+                    _ => String::new(),
+                };
+            }
             let base = get_str("base");
             let staged = v.get("staged").and_then(|x| x.as_bool()).unwrap_or(false);
             match (base, staged) {
@@ -13467,4 +13519,3 @@ mod format_shell_command_tests {
         }
     }
 }
-

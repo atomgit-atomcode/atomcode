@@ -1879,6 +1879,8 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "tool_output")]
     ToolOutput { chunk: String },
+    #[serde(rename = "tool_progress")]
+    ToolProgress { id: String, progress: String },
     #[serde(rename = "tool_result")]
     ToolResult {
         id: String,
@@ -1984,16 +1986,15 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 name,
                 arguments,
             },
-            TE::ToolOutputChunk { call_id: _, chunk } => {
-                // A leading U+001E marks a `task` subagent's EPHEMERAL live-activity line
-                // (TUI-only, shown in-place on the spinner — see SUBAGENT_ACTIVITY_MARKER in
-                // atomcode-capabilities `SubtaskProgressHook`). The webui has no such surface,
-                // so drop it rather than leak a raw control char + a per-round flood into the
-                // browser transcript.
-                if chunk.starts_with('\u{1e}') {
-                    return None;
+            TE::ToolOutputChunk { call_id, chunk } => {
+                if let Some(progress) = chunk.strip_prefix('\u{1e}') {
+                    LiveWireEvent::ToolProgress {
+                        id: call_id,
+                        progress: progress.to_string(),
+                    }
+                } else {
+                    LiveWireEvent::ToolOutput { chunk }
                 }
-                LiveWireEvent::ToolOutput { chunk }
             }
             TE::ToolCallResult {
                 call_id,
@@ -3083,20 +3084,26 @@ mod tests {
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
     }
 
-    // 回归：`task` 子代理的实时活性行（U+001E 前缀）是 TUI 专属的原地 spinner 更新，
-    // webui 没有对应展示面，必须在 to_wire 丢弃 —— 否则浏览器转录里会漏进裸控制符
-    // 和每轮一条的活性刷屏。普通工具输出仍照常下发。
+    // U+001E 前缀是子代理的 latest-wins 活性行。WebUI 必须收到独立 progress 事件，
+    // 不能把它丢掉，也不能当普通 output 累积进转录。
     #[test]
-    fn subagent_activity_marker_chunk_dropped_normal_output_kept() {
-        // Marker-prefixed → dropped (None).
-        let dropped = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+    fn subagent_activity_marker_maps_to_tool_progress() {
+        let progress = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
             call_id: "c1".into(),
             chunk: "\u{1e}explore#4 · grep unwrap".into(),
-        }));
+        }))
+        .expect("marker-prefixed activity must reach webui as progress");
+        let json = serde_json::to_string(&progress).unwrap();
         assert!(
-            dropped.is_none(),
-            "marker-prefixed subagent activity must be dropped"
+            json.contains(r#""type":"tool_progress""#)
+                && json.contains(r#""id":"c1""#)
+                && json.contains("explore#4 · grep unwrap"),
+            "{json}"
         );
+    }
+
+    #[test]
+    fn normal_tool_output_is_still_forwarded() {
         // Ordinary tool output → forwarded.
         let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
             call_id: "c2".into(),

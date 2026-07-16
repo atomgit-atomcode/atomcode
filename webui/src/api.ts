@@ -21,6 +21,7 @@ export type SSEEvent =
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
   | { type: 'tool_output'; chunk: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
@@ -590,6 +591,7 @@ export type LiveWireEvent =
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: string }
   | { type: 'tool_output'; chunk: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }

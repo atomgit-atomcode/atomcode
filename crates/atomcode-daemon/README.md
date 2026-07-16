@@ -290,6 +290,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 | `reasoning` | LLM 推理/思考内容 |
 | `tool_start` | 工具调用开始（含 `name`、`arguments`） |
 | `tool_output` | 工具实时输出片段 |
+| `tool_progress` | 长时间工具的临时进度（含 `id`、`progress`，客户端应原位替换） |
 | `tool_result` | 工具调用完成（含 `name`、`output`、`success`、`duration_ms`） |
 | `tokens` | Token 用量更新（含 `prompt`、`completion`、`total`） |
 | `artifact_start` | 检测到代码/HTML/SVG 等制品开始 |

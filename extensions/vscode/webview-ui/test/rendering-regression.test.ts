@@ -103,6 +103,30 @@ function testErrorMarksRunningToolsError() {
   assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'error');
 }
 
+function testToolProgressReplacesLatestActivity() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'review-1', name: 'code_review', args: '{}' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'round 1 · thinking' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'round 2 · read_file' });
+
+  assert.equal(state.messages[0].toolCalls?.[0]?.progress, 'round 2 · read_file');
+}
+
+function testPartialReviewResultIsMarkedIncomplete() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'review-1', name: 'code_review', args: '{}' });
+  state = chatReducer(state, {
+    type: 'TOOL_RESULT',
+    id: 'review-1',
+    name: 'code_review',
+    output: 'Code review incomplete (MaxRounds)',
+    success: false,
+    durationMs: 600_000,
+  });
+
+  assert.equal(state.messages[0].toolCalls?.[0]?.status, 'incomplete');
+}
+
 function testIdleNoticeAddsSingleStatusBlock() {
   let state = startAssistantState();
   state = chatReducer(state, { type: 'STREAM_IDLE_NOTICE', message: 'still waiting' });
@@ -1040,5 +1064,7 @@ testWarningAddsStatusBlockToStreamingAssistantMessage();
 testRateLimitedStatusBlockIsUpdatedInPlace();
 testDoneMarksRunningToolsIncompleteWithoutResult();
 testErrorMarksRunningToolsError();
+testToolProgressReplacesLatestActivity();
+testPartialReviewResultIsMarkedIncomplete();
 testIdleNoticeAddsSingleStatusBlock();
 testIdleNoticePredicateRequiresGeneratingAndThreshold();

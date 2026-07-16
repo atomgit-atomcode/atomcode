@@ -232,9 +232,11 @@ pub async fn prepare_with_plugin_hooks(
                 model: cfg.model.clone(),
                 context_window: cfg.context_window,
                 stream_timeout: cfg.stream_timeout,
-                // The review sub-agent isn't the interactive approval surface; keep a
-                // concrete fail-closed bound even when the main agent parks (None).
                 request_timeout: cfg.request_timeout.unwrap_or_else(|| std::time::Duration::from_secs(300)),
+                max_commits_without_confirmation: 20,
+                max_files_without_confirmation: 40,
+                max_changed_lines_without_confirmation: 4_000,
+                max_diff_bytes_without_confirmation: 256 * 1024,
                 rules_dir: None,
             },
         )));

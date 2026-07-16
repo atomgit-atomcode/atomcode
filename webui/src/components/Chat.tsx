@@ -52,7 +52,7 @@ import {
   ensureActiveDescendantVisible,
   splitAtToken,
 } from '../lib/atMention';
-import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
@@ -830,7 +830,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           for (const p of m.parts) {
             if (p.kind === 'tool' && p.tool.id === result.call_id) {
               p.tool.output = result.summary;
-              p.tool.status = result.success ? 'done' : 'error';
+              p.tool.status = toolResultStatus(result.success, result.summary);
               break outer;
             }
           }
@@ -848,6 +848,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'reasoning': return { type: 'reasoning', content: e.content };
       case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
       case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
+      case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
@@ -1357,11 +1358,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         appendToolOutput(event.chunk);
         break;
 
+      case 'tool_progress':
+        setMessages((prev) => {
+          if (prev.length === 0) return prev;
+          const last = prev[prev.length - 1];
+          if (last.role !== 'assistant') return prev;
+          return [
+            ...prev.slice(0, -1),
+            { ...last, parts: updateToolProgress(last.parts, event.id, event.progress) },
+          ];
+        });
+        break;
+
       case 'tool_result':
         updateToolInLastAssistant(event.id, {
-          status: event.success ? 'done' : 'error',
+          status: toolResultStatus(event.success, event.output),
           duration_ms: event.duration_ms,
           output: event.output,
+          progress: undefined,
         });
         // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
         onPermissionResolved?.(event.id);
@@ -2767,6 +2781,8 @@ function ToolStatusIcon({ cls }: { cls: string }) {
         <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
       ) : cls === 'error' ? (
         <path d="M4 4l8 8M12 4l-8 8" />
+      ) : cls === 'warning' ? (
+        <path d="M8 2.5 14 13H2L8 2.5ZM8 6v3.5M8 11.5h.01" />
       ) : (
         <path d="M8 2.5a5.5 5.5 0 1 1-5.18 3.65" />
       )}
@@ -2789,6 +2805,8 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
     annotation = { cls: 'success', label: t('tool.done') };
   } else if (tool.status === 'error') {
     annotation = { cls: 'error', label: t('tool.failed') };
+  } else if (tool.status === 'incomplete') {
+    annotation = { cls: 'warning', label: t('tool.incomplete') };
   }
 
   const hasDetail = !!(tool.args || tool.output);
@@ -2809,6 +2827,9 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
           <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>
         )}
       </div>
+      {tool.status === 'pending' && tool.progress && (
+        <div class="tool-progress" title={tool.progress}>{tool.progress}</div>
+      )}
       {expanded && hasDetail && (
         <div class="tool-body-grid">
           {tool.args && (

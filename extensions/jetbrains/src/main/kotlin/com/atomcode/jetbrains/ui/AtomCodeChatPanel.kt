@@ -1074,6 +1074,7 @@ class AtomCodeChatPanel(
             is ChatEvent.ToolBatch -> streamHandler.onToolBatch()
             is ChatEvent.ToolStart -> streamHandler.onToolStart(event.name, event.arguments)
             is ChatEvent.ToolOutput -> streamHandler.onToolOutput(event.chunk)
+            is ChatEvent.ToolProgress -> streamHandler.onToolProgress(event.progress)
             is ChatEvent.ToolResult -> streamHandler.onToolResult(event.name, event.output, event.success, event.durationMs)
             is ChatEvent.ArtifactStart -> streamHandler.onArtifactStart(
                 event.id,

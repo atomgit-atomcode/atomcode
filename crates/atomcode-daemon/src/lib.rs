@@ -2245,6 +2245,9 @@ pub enum ChatEvent {
     /// Real-time tool output chunk
     #[serde(rename = "tool_output")]
     ToolOutputChunk { chunk: String },
+    /// Ephemeral latest-wins tool activity; never persisted as output.
+    #[serde(rename = "tool_progress")]
+    ToolProgress { id: String, progress: String },
     /// Tool call completed
     #[serde(rename = "tool_result")]
     ToolCallResult {
@@ -2994,9 +2997,15 @@ async fn process_chat_request(
                     }
                 }
             }
-            TurnEvent::ToolOutputChunk { call_id: _, chunk } => {
-                // Send real-time tool output to client
-                let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
+            TurnEvent::ToolOutputChunk { call_id, chunk } => {
+                if let Some(progress) = chunk.strip_prefix('\u{1e}') {
+                    let _ = event_tx.send(ChatEvent::ToolProgress {
+                        id: call_id,
+                        progress: progress.to_string(),
+                    });
+                } else {
+                    let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
+                }
             }
             TurnEvent::ToolCallResult {
                 call_id,
