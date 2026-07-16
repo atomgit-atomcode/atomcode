@@ -202,10 +202,10 @@ tools live under `Scripts\\` (not `bin/`).";
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
 When a task spans three or more distinct steps (count steps, not tool calls), touches \
-multiple files, or bundles several user requests, call `todowrite` FIRST to lay out the \
-steps. Then keep it current with the `todo` tool — one item at a time, NOT by resending the \
-whole list: `todo {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you start item \
-#N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
+multiple files, or bundles several user requests, call `todowrite` FIRST with the full list to \
+lay out the steps. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
+resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
+when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
 in_progress at a time (this is enforced for you) and \
 mark an item done only after that step is actually verified (never on intent) — in the same \
 turn you finish it, before moving on, and never \

@@ -772,29 +772,23 @@ fn exec_todo(
         &SessionId::from_string(sid.to_string()),
     )?;
 
-    // session.messages uses atomcode_core::conversation::message::Message (not
-    // atomcode_kernel::message::Message), so we inline the derivation logic here
-    // rather than calling atomcode_capabilities::tools::todo::derive_current_todos
-    // directly (the two Message types are incompatible across crate boundaries).
-    use atomcode_capabilities::tools::todo::{parse_todos, TodoStatus};
+    // `derive_current_todos` takes kernel messages, but `reduce_todos` folds a message-agnostic
+    // `(tool_name, args)` stream — so we map core messages to that and fold via the CANONICAL
+    // reducer (baseline = last full-list plan, then apply every `{action}` update after it).
+    // This shows CURRENT statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
+    use atomcode_capabilities::tools::todo::{reduce_todos, TodoStatus};
     use atomcode_core::conversation::message::MessageContent;
 
-    let todos = session
+    let calls: Vec<(&str, &str)> = session
         .messages
         .iter()
-        .rev()
-        .find_map(|m| {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                tool_calls
-                    .iter()
-                    .rev()
-                    .filter(|c| c.name == "todowrite")
-                    .find_map(|c| parse_todos(&c.arguments).ok())
-            } else {
-                None
-            }
+        .filter_map(|m| match &m.content {
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
+            _ => None,
         })
-        .unwrap_or_default();
+        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
+        .collect();
+    let todos = reduce_todos(calls);
 
     let items = todos
         .into_iter()

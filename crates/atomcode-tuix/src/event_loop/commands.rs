@@ -5635,21 +5635,18 @@ pub(crate) fn format_todo_command(
     unicode: bool,
 ) -> String {
     use atomcode_core::conversation::message::MessageContent;
-    // Walk backwards to find the last VALID `todowrite` tool-call, skipping
-    // calls whose args fail validation so an invalid final call never wipes
-    // an earlier valid list (mirrors derive_current_todos in capabilities).
-    let todos = 'found: {
-        for m in messages.iter().rev() {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
-                    if let Ok(parsed) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
-                        break 'found parsed;
-                    }
-                }
-            }
-        }
-        Vec::new()
-    };
+    // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
+    // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
+    // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
+    let calls: Vec<(&str, &str)> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
+        .collect();
+    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
         return t(Msg::TodoNoList).into_owned();
     }
@@ -6553,6 +6550,40 @@ mod todo_command_tests {
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
+    }
+
+    #[test]
+    fn todo_command_applies_incremental_updates_after_the_plan() {
+        // Merge regression: `/todo` folds via `reduce_todos`, so a `{action:update}` after the
+        // plan is reflected — not just the initial (pending) plan.
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "1".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                    },
+                    ToolCall {
+                        id: "2".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+                    },
+                ],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        }];
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("do x"), "task shown: {out}");
+        assert!(
+            !out.contains("[ ] do x"),
+            "must reflect the completed update, not the pending plan: {out}"
+        );
     }
 
     #[test]

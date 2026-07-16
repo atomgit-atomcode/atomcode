@@ -15,7 +15,7 @@ use atomcode_kernel::message::{Conversation, Message, Role};
 /// `VerifyCadenceHook`'s `offer_continuation` cadence; nudges at most ONCE per real-user turn
 /// (and the kernel `max_continuations` fuse bounds it), so it can never spin.
 const TODO_COMPLETION_NUDGE: &str = "Before you finish: the task list still has open items. \
-If you have actually completed them, mark each one done now with `todo` \
+If you have actually completed them, mark each one done now with `todowrite` \
 (`{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}`). If some are NOT done, keep working \
 through them. Only stop with open items if you genuinely need approval/input, are stuck, or the \
 request is ambiguous — in that case say so briefly.";
@@ -101,9 +101,9 @@ impl LifecycleHooks for TodoHook {
             .unwrap_or_default();
         let body = format!(
             "{anchor}Current task list (each line is `#<id> <task>`) — keep it accurate and finish it:\n\
-- The MOMENT you START an item: `todo` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}}`.\n\
-- The MOMENT you FINISH an item: `todo` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}}` (do not leave a done item showing incomplete).\n\
-- Update ONE item at a time with `todo` — do NOT resend the whole list with `todowrite` (that is only for the initial plan or a full re-plan).\n\
+- The MOMENT you START an item: `todowrite` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}}`.\n\
+- The MOMENT you FINISH an item: `todowrite` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}}` (do not leave a done item showing incomplete).\n\
+- Update ONE item at a time (the `{{\"action\":...}}` shape) — do NOT resend the whole `todos` list for a single status change (the full list is only for the initial plan or a full re-plan).\n\
 - Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.\n\
 {}",
             render_todos_numbered(&todos, false)

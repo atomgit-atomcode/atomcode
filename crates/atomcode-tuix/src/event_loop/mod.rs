@@ -9707,12 +9707,23 @@ fn handle_agent_event(
             let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
 
-            // Incremental `todo` action (add / update id=N status): fold it into the live footer
-            // panel + title cache HERE — ABOVE the batch / approval early-returns below — so
-            // batched and approval-gated `todo` calls update the panel too (they return before
-            // the generic tool path). Mirrors the canonical `reduce_todos`. Unlike todowrite we
-            // do NOT suppress the row; the compact `todo #N → status` line is a useful marker.
-            if name == "todo" {
+            // The merged `todowrite` carries EITHER the full-list PLAN shape (`{todos:[…]}`) or
+            // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
+            // calls. Distinguish by ARG SHAPE, not tool name.
+            let is_todo_call = name == "todowrite" || name == "todo";
+            let todo_plan = if is_todo_call { todo_progress_from_args(&arguments) } else { None };
+            let is_todo_action = is_todo_call
+                && todo_plan.is_none()
+                && serde_json::from_str::<serde_json::Value>(&arguments)
+                    .ok()
+                    .is_some_and(|v| v.get("action").and_then(|a| a.as_str()).is_some());
+
+            // Incremental action (add / update id=N status): fold it into the live footer panel
+            // + title cache HERE — ABOVE the batch / approval early-returns below — so batched
+            // and approval-gated action calls update the panel too (they return before the
+            // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
+            // `#N → status` line is a useful marker.
+            if is_todo_action {
                 patch_live_todos_from_action(state, &arguments);
             }
 
@@ -9749,15 +9760,13 @@ fn handle_agent_event(
             // full list into `active_todos` (the transcript won't carry it until
             // turn end), and suppress the tool CALL + RESULT rows. On a parse
             // failure fall through to the normal tool row so the error surfaces.
-            if name == "todowrite" {
-                if let Some(progress) = todo_progress_from_args(&arguments) {
-                    state.active_todos = Some(progress);
-                    sync_todo_titles(state); // titles follow the new plan (id = position)
-                    // call_rendered=true ⇒ ToolCallResult suppresses the result row.
-                    pending_tools.insert(id, (display.clone(), detail, true));
-                    state.on_tool_call_started(&display);
-                    return;
-                }
+            if let Some(progress) = todo_plan {
+                state.active_todos = Some(progress);
+                sync_todo_titles(state); // titles follow the new plan (id = position)
+                // call_rendered=true ⇒ ToolCallResult suppresses the result row.
+                pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
             }
 
 
@@ -9841,7 +9850,7 @@ fn handle_agent_event(
             // stays as a harmless backstop: it only INSERTS from a full-list-shaped result and
             // never clears, so it can't clobber the derived titles (a delta result yields no
             // matching lines and is a no-op).
-            if name == "todo" {
+            if name == "todo" || name == "todowrite" {
                 parse_todo_titles_into(&mut state.todo_titles, &output);
             }
             // If this call belongs to an active batch, the group header
@@ -10734,7 +10743,8 @@ fn handle_agent_event(
                 .iter()
                 .zip(disambiguated.iter())
                 .map(|(c, detail)| {
-                    if c.name == "todo" {
+                    // Merged `todowrite` carries `{action}` too (legacy `todo` still recognized).
+                    if c.name == "todo" || c.name == "todowrite" {
                         // Parse the action from arguments JSON rather than
                         // string-matching, because model-generated JSON may
                         // contain whitespace around colons/commas.
@@ -12084,7 +12094,8 @@ pub(crate) fn enrich_todo_detail(
     base: &str,
     titles: &std::collections::HashMap<u64, String>,
 ) -> String {
-    if name != "todo" {
+    // Merged `todowrite` carries update actions too; legacy `todo` name still recognized.
+    if name != "todo" && name != "todowrite" {
         return base.to_string();
     }
     let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
@@ -12238,37 +12249,35 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 String::new()
             }
         }
-        "todowrite" => {
-            // Show the number of tasks in the full-replace list so the
-            // in-flight row has useful detail even before the glyph block lands.
-            let n = v.get("todos").and_then(|t| t.as_array()).map(|a| a.len());
-            match n {
-                Some(0) => "0 tasks".to_string(),
-                Some(1) => "1 task".to_string(),
-                Some(n) => format!("{} tasks", n),
-                None => String::new(),
-            }
-        }
-        "todo" => {
-            // Show the task description (add) or id+status (update) so the
-            // user can see WHAT the agent is tracking without expanding the row.
-            let action = get_str("action").unwrap_or_default();
-            match action.as_str() {
-                "add" => get_str("content")
-                    .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
-                    .unwrap_or_default(),
-                "update" => {
-                    let id = v.get("id").and_then(|x| x.as_u64());
-                    let status = get_str("status").unwrap_or_default();
-                    match (id, status.as_str()) {
-                        (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
-                        (Some(i), _) => format!("#{}", i),
-                        (None, s) if !s.is_empty() => s.to_string(),
-                        _ => String::new(),
-                    }
+        // Merged `todowrite` (legacy `todo` still recognized for resumed sessions): the shape
+        // decides the detail — a full-list plan shows the count, an `{action}` shows what changed.
+        "todowrite" | "todo" => {
+            if let Some(arr) = v.get("todos").and_then(|t| t.as_array()) {
+                match arr.len() {
+                    0 => "0 tasks".to_string(),
+                    1 => "1 task".to_string(),
+                    n => format!("{} tasks", n),
                 }
-                "list" => "list all".to_string(),
-                _ => String::new(),
+            } else {
+                // Incremental action: show the description (add) or id+status (update).
+                let action = get_str("action").unwrap_or_default();
+                match action.as_str() {
+                    "add" => get_str("content")
+                        .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
+                        .unwrap_or_default(),
+                    "update" => {
+                        let id = v.get("id").and_then(|x| x.as_u64());
+                        let status = get_str("status").unwrap_or_default();
+                        match (id, status.as_str()) {
+                            (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
+                            (Some(i), _) => format!("#{}", i),
+                            (None, s) if !s.is_empty() => s.to_string(),
+                            _ => String::new(),
+                        }
+                    }
+                    "list" => "list all".to_string(),
+                    _ => String::new(),
+                }
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),

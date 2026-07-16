@@ -169,29 +169,35 @@ pub fn apply_todo_action(list: &mut Vec<TodoItem>, args: &str) {
     }
 }
 
+/// Whether a todo call's args are the FULL-LIST (re)plan shape (`{"todos":[…]}`) vs the
+/// incremental `{"action":…}` shape. `todowrite` accepts BOTH — the two are distinguished by
+/// shape, NOT by tool name, so the fold and the renderers agree with the merged tool.
+pub fn is_todo_plan(args: &str) -> bool {
+    parse_todos(args).is_ok()
+}
+
 /// Fold an ORDERED stream of `(tool_name, args)` todo-affecting calls into the current list.
-/// Baseline = the LAST VALID `todowrite` (full-list replace; positions become the stable
-/// 1-based ids); then every `todo` action call AFTER that baseline is applied in order. An
-/// invalid `todowrite` never wipes an earlier valid list; `todo` events before the baseline
-/// are void (a re-plan resets the ids). THE single source of truth for the fold — both the
-/// kernel-message reducer below and the TUI's core-message panel derivation call this, so
-/// live / replay / injected views never diverge.
+/// Baseline = the LAST call carrying a valid full LIST (`{"todos":[…]}`; positions become the
+/// stable 1-based ids); then every incremental `{"action":…}` call AFTER that baseline is
+/// applied in order. Decided by ARG SHAPE, not tool name, so the merged `todowrite` (which
+/// sends the list shape to plan and the action shape to patch) folds correctly — and a resumed
+/// session's legacy `todo`-named calls fold identically. An invalid list never wipes an earlier
+/// valid one; action events before the baseline are void (a re-plan resets the ids). THE single
+/// source of truth for the fold — both the kernel-message reducer and the TUI panel derivation
+/// use this shape rule, so live / replay / injected views never diverge.
 pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<TodoItem> {
+    // Keep both names so a resumed transcript (legacy `todo` + `todowrite`) folds the same.
     let calls: Vec<(&str, &str)> = calls
         .into_iter()
         .filter(|(n, _)| *n == "todowrite" || *n == "todo")
         .collect();
-    let baseline = calls
-        .iter()
-        .rposition(|(n, a)| *n == "todowrite" && parse_todos(a).is_ok());
+    let baseline = calls.iter().rposition(|(_, a)| is_todo_plan(a));
     let (mut list, start) = match baseline {
         Some(i) => (parse_todos(calls[i].1).unwrap_or_default(), i + 1),
         None => (Vec::new(), 0),
     };
-    for (n, a) in &calls[start..] {
-        if *n == "todo" {
-            apply_todo_action(&mut list, a);
-        }
+    for (_, a) in &calls[start..] {
+        apply_todo_action(&mut list, a); // no-op unless the args carry an `action`
     }
     list
 }
@@ -219,16 +225,18 @@ impl TodoTool {
 }
 
 const TODOWRITE_DESCRIPTION: &str = "Create and maintain a structured task list for the current coding session. \
-Send the ENTIRE updated list every call (full replace). \
-When to use: the work spans three or more DISTINCT steps (count real steps, not tool calls — several edits for one \
-conceptual change is still one step), the user gives multiple tasks, or you are planning a non-trivial refactor. \
-USE it for e.g. `add a --retry flag and cover it with a test`, or `rename resolve_path across the crate` (grep shows \
-many hits). SKIP it for e.g. `add a doc comment to parse_args` (single edit), `what does this function do?` \
-(informational), or `run cargo test and show the output` (one command). \
-Each task is ONE specific, verifiable action — write `add error handling to load_config`, not `handle errors` or \
-`make it work`; break large work into small steps, no filler. \
-Rules: update statuses in real time; keep EXACTLY ONE task in_progress at a time; mark a task completed ONLY after the \
-work is actually done (including any required verification), never on intent.";
+Call it in one of TWO ways:\n\
+• PLAN / RE-PLAN — send the FULL list: `{\"todos\":[{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}]}` \
+(REPLACES the previous list). Use when the work spans three or more DISTINCT steps (count real steps, not tool calls), \
+the user gives multiple tasks, or you are planning a non-trivial refactor. SKIP for a single edit, an informational \
+question, or a one-command ask.\n\
+• UPDATE ONE ITEM (preferred after the initial plan — do NOT resend the whole list): \
+`{\"action\":\"update\",\"id\":N,\"status\":\"in_progress|completed|pending\"}` changes ONE task (`id` is its number in \
+the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task. The MOMENT you START a task \
+set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
+Each task is ONE specific, verifiable action — write `add error handling to load_config`, not `handle errors`. Keep \
+EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
+actually done, never on intent.";
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -239,12 +247,14 @@ impl Tool for TodoTool {
         TODOWRITE_DESCRIPTION
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        // Flat union (NOT `oneOf`, which weaker models handle poorly): send `todos` to (re)plan,
+        // OR `action`(+`id`/`status`/`content`) to change one item. `execute` picks by shape.
         json!({
             "type": "object",
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "The full, updated task list (replaces the previous list).",
+                    "description": "PLAN/RE-PLAN: the full task list — REPLACES the previous list.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -253,9 +263,12 @@ impl Tool for TodoTool {
                         },
                         "required": ["content", "status"]
                     }
-                }
-            },
-            "required": ["todos"]
+                },
+                "action": { "type": "string", "enum": ["add", "update"], "description": "UPDATE ONE ITEM (do NOT resend the whole list): `add` a task, or `update` one task's status." },
+                "id": { "type": "integer", "description": "For action=update: the 1-based task number to change (as shown, e.g. #3)." },
+                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "For action=update: the new status." },
+                "content": { "type": "string", "description": "For action=add: the new task description." }
+            }
         })
     }
     // Never touches the filesystem → risk() defaults to Safe.
@@ -264,89 +277,44 @@ impl Tool for TodoTool {
         String::new()
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        match parse_todos(args) {
-            // Echo an ASCII-safe NUMBERED list as the tool result (goes into the transcript;
-            // the renderer draws the pretty version separately). The `<glyph> <id>. <content>`
-            // shape seeds the TUI title cache so later `todo update id=N` rows show task names.
-            Ok(todos) => ok(render_todos_numbered(&todos, false)),
-            Err(e) => err(e),
-        }
-    }
-}
-
-/// Description for the incremental [`TodoActionTool`].
-const TODO_DESCRIPTION: &str = "Incrementally update the task list WITHOUT resending the whole list. \
-Use this for EVERY status change after the initial plan. \
-`{\"action\":\"update\",\"id\":N,\"status\":\"in_progress|completed|pending\"}` changes ONE task — `id` is its number in the list (as shown, e.g. `#3`). \
-The MOMENT you START a task, set it `in_progress`; the MOMENT it is actually done (verified), set it `completed`. \
-Exactly ONE task is `in_progress` at a time — this is enforced automatically, so you never need to clear the previous one. \
-`{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task. \
-Prefer this over `todowrite` for updates: `todowrite` is only for the INITIAL plan or a full re-plan.";
-
-/// Incremental, single-item task-list updates (`todo`). Sibling to [`TodoTool`] (`todowrite`,
-/// full replace). Stateless: the reducer [`derive_current_todos`] folds these action calls over
-/// the transcript. Non-destructive ⇒ always `Safe`.
-#[derive(Clone, Default)]
-pub struct TodoActionTool;
-
-impl TodoActionTool {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl Tool for TodoActionTool {
-    fn name(&self) -> &str {
-        "todo"
-    }
-    fn description(&self) -> &str {
-        TODO_DESCRIPTION
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": { "type": "string", "enum": ["add", "update"], "description": "`add` a new task, or `update` one task's status." },
-                "content": { "type": "string", "description": "For `add`: the new task description." },
-                "id": { "type": "integer", "description": "For `update`: the 1-based task number to change." },
-                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "For `update`: the new status." }
-            },
-            "required": ["action"]
-        })
-    }
-    // Never touches the filesystem → risk() defaults to Safe.
-    fn always_grant_scope(&self, _args: &str) -> String {
-        String::new()
-    }
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        // Validate + echo a short confirmation. State is derived transcript-side by
-        // `derive_current_todos` (which folds this call's args), so execute holds no state.
         let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
-            return err("todo: invalid JSON arguments.".to_string());
+            return err("todowrite: invalid JSON arguments.".to_string());
         };
-        match v.get("action").and_then(|a| a.as_str()) {
-            Some("add") => match v.get("content").and_then(|c| c.as_str()) {
-                Some(c) if !c.trim().is_empty() => ok(format!("Added task: {}", c.trim())),
-                _ => err("todo: `add` needs non-empty `content`.".to_string()),
-            },
-            Some("update") => {
-                let id = v.get("id").and_then(|x| x.as_u64());
-                let status = v.get("status").and_then(|x| x.as_str());
-                match (id, status.and_then(TodoStatus::parse)) {
-                    (Some(id), Some(_)) if id >= 1 => {
+        // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
+        // into the transcript; the renderer draws the pretty version separately). The
+        // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
+        // id=N` rows show task names.
+        if v.get("todos").is_some() {
+            return match parse_todos(args) {
+                Ok(todos) => ok(render_todos_numbered(&todos, false)),
+                Err(e) => err(e),
+            };
+        }
+        // Incremental single-item shape. State is derived transcript-side by
+        // `derive_current_todos` (which folds this call's args), so execute holds no state.
+        if let Some(action) = v.get("action").and_then(|a| a.as_str()) {
+            return match action {
+                "add" => match v.get("content").and_then(|c| c.as_str()) {
+                    Some(c) if !c.trim().is_empty() => ok(format!("Added task: {}", c.trim())),
+                    _ => err("todowrite: `add` needs non-empty `content`.".to_string()),
+                },
+                "update" => {
+                    let id = v.get("id").and_then(|x| x.as_u64());
+                    let status = v.get("status").and_then(|x| x.as_str());
+                    match (id, status.and_then(TodoStatus::parse)) {
                         // `#<id> → <status>` is the base the TUI `enrich_todo_detail` splices a
                         // title into; keep this exact shape.
-                        ok(format!("#{} \u{2192} {}", id, status.unwrap()))
-                    }
-                    (None, _) => err("todo: `update` needs an `id` (the task number).".to_string()),
-                    (Some(_), _) => {
-                        err("todo: `update` needs a `status` of pending|in_progress|completed.".to_string())
+                        (Some(id), Some(_)) if id >= 1 => ok(format!("#{} \u{2192} {}", id, status.unwrap())),
+                        (None, _) => err("todowrite: `update` needs an `id` (the task number).".to_string()),
+                        (Some(_), _) => {
+                            err("todowrite: `update` needs a `status` of pending|in_progress|completed.".to_string())
+                        }
                     }
                 }
-            }
-            _ => err("todo: `action` must be `add` or `update`.".to_string()),
+                _ => err("todowrite: `action` must be `add` or `update`.".to_string()),
+            };
         }
+        err("todowrite: provide either `todos` (full list to plan) or `action` (add|update one item).".to_string())
     }
 }
 
@@ -594,42 +562,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_action_tool_name_and_add() {
-        let t = TodoActionTool::new();
-        assert_eq!(t.name(), "todo");
-        let r = t.execute(r#"{"action":"add","content":"write tests"}"#, &ctx()).await;
+    async fn todowrite_accepts_full_list_shape() {
+        let t = TodoTool::new();
+        assert_eq!(t.name(), "todowrite");
+        let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("write tests"), "{}", r.content);
+        assert!(r.content.contains("1. a"), "numbered list echoed: {}", r.content);
     }
 
     #[tokio::test]
-    async fn todo_action_update_result_is_enrich_base_shape() {
+    async fn todowrite_accepts_incremental_action_shape() {
+        // The reported confusion is gone: the SAME `todowrite` tool takes the {action} shape too,
+        // so a model that sends `{action}` no longer hits `action must be add or update`.
+        let t = TodoTool::new();
+        let add = t.execute(r#"{"action":"add","content":"write tests"}"#, &ctx()).await;
+        assert!(!add.is_error && add.content.contains("write tests"), "{}", add.content);
         // `#<id> → <status>` is the exact base the TUI enrich step splices a title into.
-        let t = TodoActionTool::new();
-        let r = t.execute(r#"{"action":"update","id":2,"status":"completed"}"#, &ctx()).await;
-        assert!(!r.is_error, "{}", r.content);
-        assert_eq!(r.content, "#2 \u{2192} completed");
+        let upd = t.execute(r#"{"action":"update","id":2,"status":"completed"}"#, &ctx()).await;
+        assert!(!upd.is_error, "{}", upd.content);
+        assert_eq!(upd.content, "#2 \u{2192} completed");
     }
 
     #[tokio::test]
-    async fn todo_action_rejects_bad_args() {
-        let t = TodoActionTool::new();
+    async fn todowrite_rejects_bad_args() {
+        let t = TodoTool::new();
         assert!(t.execute(r#"{"action":"add","content":"  "}"#, &ctx()).await.is_error, "empty add");
         assert!(t.execute(r#"{"action":"update","status":"completed"}"#, &ctx()).await.is_error, "no id");
         assert!(t.execute(r#"{"action":"update","id":2}"#, &ctx()).await.is_error, "no status");
         assert!(t.execute(r#"{"action":"update","id":2,"status":"nope"}"#, &ctx()).await.is_error, "bad status");
         assert!(t.execute(r#"{"action":"frobnicate"}"#, &ctx()).await.is_error, "bad action");
+        assert!(t.execute(r#"{}"#, &ctx()).await.is_error, "neither todos nor action");
     }
 
     #[test]
-    fn description_calibrates_when_to_use() {
+    fn reducer_folds_action_shape_under_todowrite_name() {
+        // Merge regression: an incremental {action} carried by the `todowrite` tool name (not the
+        // legacy `todo` name) must still fold — the baseline/patch decision is by SHAPE, not name.
+        let list = reduce_todos([
+            ("todowrite", r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#),
+            ("todowrite", r#"{"action":"update","id":1,"status":"completed"}"#),
+            ("todowrite", r#"{"action":"add","content":"c"}"#),
+        ]);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].status, TodoStatus::Completed);
+        assert_eq!(list[2].content, "c");
+        // Legacy `todo`-named action still folds too (resume compatibility).
+        let legacy = reduce_todos([
+            ("todowrite", r#"{"todos":[{"content":"a","status":"pending"}]}"#),
+            ("todo", r#"{"action":"update","id":1,"status":"in_progress"}"#),
+        ]);
+        assert_eq!(legacy[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn description_covers_both_plan_and_update_modes() {
         let t = TodoTool::new();
         let d = t.description();
-        // Disambiguates steps from tool calls (the key precision fix).
-        assert!(d.contains("not tool calls"), "must clarify steps ≠ tool calls: {d}");
-        // Shows both use and skip examples, not just tells.
-        assert!(d.contains("USE it for") && d.contains("SKIP it for"), "must give use/skip examples: {d}");
-        // Sets an item-quality bar with a good/bad contrast.
-        assert!(d.contains("specific, verifiable action"), "must set item quality bar: {d}");
+        assert!(d.contains("not tool calls"), "clarifies steps ≠ tool calls: {d}");
+        assert!(d.contains("PLAN") && d.contains("UPDATE ONE ITEM"), "covers both modes: {d}");
+        assert!(d.contains("specific, verifiable action"), "sets item-quality bar: {d}");
     }
 }
