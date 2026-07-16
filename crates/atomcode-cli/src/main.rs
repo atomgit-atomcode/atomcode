@@ -788,6 +788,16 @@ enum PluginCli {
         /// e.g. `ascend-model-agent-plugin@ascend-model-agent-plugin`
         spec: String,
     },
+    /// Trust an installed plugin's hooks so they run (records the current hook-set hash).
+    Trust {
+        /// Plugin name (as installed), or `plugin@marketplace` for disambiguation.
+        name: String,
+    },
+    /// Untrust an installed plugin's hooks (they stop running).
+    Untrust {
+        /// Plugin name (as installed), or `plugin@marketplace` for disambiguation.
+        name: String,
+    },
     /// List installed plugins.
     List,
 }
@@ -2838,6 +2848,25 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
             }
 
             println!();
+
+            let untrusted: Vec<_> = atomcode_core::plugin::installed_plugin_hook_trust_status()
+                .into_iter()
+                .filter(|s| !s.trusted)
+                .collect();
+            if !untrusted.is_empty() {
+                println!("Untrusted plugin hooks (not loaded):");
+                for s in &untrusted {
+                    println!(
+                        "  {} — {} hook(s) [{}] · run: atomcode plugin trust {}",
+                        s.plugin,
+                        s.hook_count,
+                        s.events.join(", "),
+                        s.plugin
+                    );
+                }
+                println!();
+            }
+
             Ok(())
         }
         HookCommands::Test { name } => {
@@ -3312,6 +3341,16 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     }
                 }
             }
+            // Surface any untrusted hooks the freshly-installed plugin ships — they
+            // will NOT run until the user trusts them (loaded-code trust gate).
+            for s in atomcode_core::plugin::installed_plugin_hook_trust_status() {
+                if !s.trusted {
+                    println!(
+                        "Plugin `{}` ships {} hook(s) on [{}]. They will NOT run until trusted:\n  atomcode plugin trust {}",
+                        s.plugin, s.hook_count, s.events.join(", "), s.plugin
+                    );
+                }
+            }
             Ok(())
         }
         PluginCli::Uninstall { spec } => {
@@ -3356,6 +3395,65 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             anyhow::bail!(msg.trim().to_string());
                         }
                     }
+                }
+            }
+            Ok(())
+        }
+        PluginCli::Trust { name } => {
+            let status = atomcode_core::plugin::installed_plugin_hook_trust_status();
+            let matches: Vec<_> = if name.contains('@') {
+                status.iter().filter(|s| s.plugin_id == name).collect()
+            } else {
+                status.iter().filter(|s| s.plugin == name).collect()
+            };
+            match matches.as_slice() {
+                [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
+                [s] => {
+                    atomcode_core::plugin::hook_trust::trust(&s.plugin_id, &s.hash)?;
+                    println!(
+                        "Trusted {} hook(s) from `{}` [{}].",
+                        s.hook_count,
+                        name,
+                        s.events.join(", ")
+                    );
+                }
+                many => {
+                    let mut msg =
+                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                    for s in many {
+                        msg.push_str(&format!(
+                            "  atomcode plugin trust {}@{}\n",
+                            s.plugin, s.marketplace
+                        ));
+                    }
+                    anyhow::bail!(msg);
+                }
+            }
+            Ok(())
+        }
+        PluginCli::Untrust { name } => {
+            let status = atomcode_core::plugin::installed_plugin_hook_trust_status();
+            let matches: Vec<_> = if name.contains('@') {
+                status.iter().filter(|s| s.plugin_id == name).collect()
+            } else {
+                status.iter().filter(|s| s.plugin == name).collect()
+            };
+            match matches.as_slice() {
+                [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
+                [s] => {
+                    atomcode_core::plugin::hook_trust::untrust(&s.plugin_id)?;
+                    println!("Untrusted hooks from `{name}`.");
+                }
+                many => {
+                    let mut msg =
+                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                    for s in many {
+                        msg.push_str(&format!(
+                            "  atomcode plugin untrust {}@{}\n",
+                            s.plugin, s.marketplace
+                        ));
+                    }
+                    anyhow::bail!(msg);
                 }
             }
             Ok(())
