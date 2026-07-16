@@ -73,6 +73,7 @@ pub fn offline_note() -> Option<String> {
     NOTE.lock().unwrap().clone()
 }
 
+#[cfg(any(test, feature = "test-util"))]
 pub fn reset_offline_verdict_for_test() {
     VERDICT.store(V_UNSEEDED, Ordering::Relaxed);
     *NOTE.lock().unwrap() = None;
