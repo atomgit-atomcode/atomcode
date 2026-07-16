@@ -29,7 +29,6 @@ pub mod live;
 // `locale` fully lives in `atomcode-config` now (re-export shim removed).
 pub mod lsp;
 pub mod mcp;
-pub mod notify;
 pub mod proxy;
 pub mod provider;
 pub mod semantic;

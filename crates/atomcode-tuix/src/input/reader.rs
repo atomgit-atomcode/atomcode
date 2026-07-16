@@ -200,7 +200,7 @@ impl Drop for ReaderHandle {
         let _ = self.cmd_tx.send((ReaderCommand::Shutdown, None));
         if self.focus_tracking_enabled {
             let _ = execute!(std::io::stdout(), DisableFocusChange);
-            atomcode_core::notify::set_terminal_focus_state(None);
+            atomcode_capabilities::notify::set_terminal_focus_state(None);
         }
         // Let the thread finish on its own — we don't join here because
         // the reader may be blocked inside `event::poll` for up to 100ms
@@ -221,7 +221,7 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
     let focus_tracking_enabled = terminal_supports_focus_tracking();
     if focus_tracking_enabled {
         let _ = execute!(std::io::stdout(), EnableFocusChange);
-        atomcode_core::notify::set_terminal_focus_state(Some(true));
+        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
     }
     let (cmd_tx, cmd_rx) = stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
@@ -488,11 +488,11 @@ fn run(
                         None => continue,
                     },
                     Event::FocusGained => {
-                        atomcode_core::notify::set_terminal_focus_state(Some(true));
+                        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
                         continue;
                     }
                     Event::FocusLost => {
-                        atomcode_core::notify::set_terminal_focus_state(Some(false));
+                        atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
                         continue;
                     }
                 };
@@ -566,11 +566,11 @@ fn run(
                 None => continue,
             },
             Event::FocusGained => {
-                atomcode_core::notify::set_terminal_focus_state(Some(true));
+                atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
                 continue;
             }
             Event::FocusLost => {
-                atomcode_core::notify::set_terminal_focus_state(Some(false));
+                atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
                 continue;
             }
         };
@@ -611,11 +611,11 @@ fn to_input_event(ev: Event) -> Option<InputEvent> {
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
         Event::Mouse(m) => mouse_input_event(m),
         Event::FocusGained => {
-            atomcode_core::notify::set_terminal_focus_state(Some(true));
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
             None
         }
         Event::FocusLost => {
-            atomcode_core::notify::set_terminal_focus_state(Some(false));
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
             None
         }
     }

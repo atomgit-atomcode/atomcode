@@ -92,6 +92,15 @@ pub mod provider;
 #[cfg(unix)]
 pub mod askpass;
 
+/// Desktop / terminal notifications: fires an OS-native or terminal-protocol notification
+/// (kitty OSC 99, OSC 777, iTerm2 OSC 9, `notify-send`, `terminal-notifier`/`osascript`)
+/// when a turn finishes or an approval is pending. A host (TUI/cli) feeds terminal-focus
+/// state via [`notify::set_terminal_focus_state`] and maps its engine's turn-stop reason
+/// into [`notify::NotifyStopReason`] before calling [`notify::notify`]. Reads
+/// `NotificationConfig` from the config leaf; carries no dependency on any engine crate.
+#[cfg(feature = "notify")]
+pub mod notify;
+
 /// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
 /// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic
 /// [`ApprovalMiddleware`](tools::ApprovalMiddleware). Each runs against the kernel's

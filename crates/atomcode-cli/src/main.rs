@@ -66,6 +66,23 @@ static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 /// post-crash keypress as a literal `[27u` / `[99;5u` CSI-u report. We
 /// therefore emit the full panic-safe restore sequence (idempotent on
 /// the graceful path) before dropping raw mode.
+/// Map the v1 engine's turn-stop reason onto the notification layer's own
+/// `NotifyStopReason` (the `notify` capability is L0 and cannot see
+/// `core::agent`). Total 1:1 mapping — the enums mirror each other.
+fn notify_stop_reason(
+    reason: atomcode_core::agent::TurnStopReason,
+) -> atomcode_capabilities::notify::NotifyStopReason {
+    use atomcode_capabilities::notify::NotifyStopReason as N;
+    use atomcode_core::agent::TurnStopReason as T;
+    match reason {
+        T::Natural => N::Natural,
+        T::Cancelled => N::Cancelled,
+        T::Error => N::Error,
+        T::TurnLimit => N::TurnLimit,
+        T::StepLimit => N::StepLimit,
+    }
+}
+
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
@@ -2251,14 +2268,14 @@ async fn run_headless(
                 ..
             } => {
                 close_thinking_line(&mut thinking_line_open);
-                atomcode_core::notify::notify_turn_finished(
+                atomcode_capabilities::notify::notify_turn_finished(
                     &notifications,
-                    atomcode_core::notify::TurnNotification {
+                    atomcode_capabilities::notify::TurnNotification {
                         duration,
                         turn_count,
                         tool_call_count,
                         total_tokens: Some(total_tokens),
-                        stop_reason,
+                        stop_reason: notify_stop_reason(stop_reason),
                         working_dir: Some(&working_dir),
                     },
                 );
