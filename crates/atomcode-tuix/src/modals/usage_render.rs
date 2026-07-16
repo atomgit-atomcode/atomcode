@@ -21,7 +21,7 @@ pub fn progress_bar(percent: f64, width: usize) -> String {
         used += 1;
     }
     for _ in used..width {
-        s.push(' ');
+        s.push('░');
     }
     s
 }
@@ -207,12 +207,15 @@ mod tests {
 
     #[test]
     fn progress_bar_fills_proportionally() {
-        assert_eq!(progress_bar(0.0, 10).chars().filter(|c| *c == '█').count(), 0);
+        // 0% → no filled blocks, entire track is ░
+        let zero = progress_bar(0.0, 10);
+        assert_eq!(zero.chars().filter(|c| *c == '█').count(), 0);
+        assert!(zero.chars().all(|c| c == '░'), "0% bar should be all ░, got: {zero}");
         assert_eq!(progress_bar(100.0, 10), "██████████");
         // 9% of 10 cells ≈ 0.9 cell → at least one partial/edge cell, not full
         let b = progress_bar(9.0, 10);
         assert_eq!(b.chars().count(), 10);
-        assert!(b.chars().next().unwrap() != ' ');
+        assert!(b.chars().next().unwrap() != '░' || b.chars().any(|c| c != '░'));
     }
 
     #[test]

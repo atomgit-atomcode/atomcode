@@ -1181,8 +1181,16 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::UsageHeatMore => "多".into(),
         Msg::UsageModelsTitle => "各模型用量".into(),
         Msg::UsageNoData => "暂无用量数据".into(),
-        Msg::UsageFooterHint => "Tab / 1·2·3 切换 · Esc 关闭".into(),
+        Msg::UsageFooterHint => "← / → 或 Tab 切换 · Ctrl+S 复制 · Esc 关闭".into(),
         Msg::UsageFetchFailed { error } => format!("加载用量失败：{error}").into(),
+        Msg::UsagePlanTitle => "计划".into(),
+        Msg::UsagePlanActive => "生效中".into(),
+        Msg::UsagePlanExpired => "已过期".into(),
+        Msg::UsagePlanClaimedExpires { claimed, expires } =>
+            format!("领取 {claimed} · 到期 {expires}").into(),
+        Msg::UsagePlanRemaining { remaining, total } =>
+            format!("剩余 {remaining}/{total} 天").into(),
+        Msg::UsageCopied => "已复制到剪贴板".into(),
         Msg::UsageCodingPlanOnly =>
             "使用情况仅 CodingPlan 可用 — 请先 /login。".into(),
 

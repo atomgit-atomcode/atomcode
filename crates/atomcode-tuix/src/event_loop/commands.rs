@@ -4220,16 +4220,16 @@ fn open_usage(
             return;
         }
     };
-    let window = client
-        .status_v2()
-        .ok()
-        .and_then(|s| {
-            s.rate_limit_windows
-                .into_iter()
-                .filter(|w| w.show_enable == 1)
-                .filter(|w| w.window_hours > 0)
-                .min_by_key(|w| w.window_hours)
-        });
+    let status = client.status_v2().ok();
+    let window = status.as_ref().and_then(|s| {
+        s.rate_limit_windows
+            .iter()
+            .filter(|w| w.show_enable == 1)
+            .filter(|w| w.window_hours > 0)
+            .min_by_key(|w| w.window_hours)
+            .cloned()
+    });
+    let plan = status.and_then(|s| s.codingplan_free);
     let (usage, error) = match client.usage() {
         Ok(u) => (Some(u), None),
         Err(e) => (None, Some(format!("{e}"))),
@@ -4239,6 +4239,7 @@ fn open_usage(
         .map(atomcode_core::coding_plan::usage::compute_overview);
     *active_modal = Some(Box::new(UsageModal::new(UsageData {
         window,
+        plan,
         usage,
         overview,
         error,
