@@ -99,10 +99,12 @@ pub fn compute_overview(resp: &UsageResponse) -> OverviewStats {
             }
         }
     }
+    // Tie-break by model name (smallest wins) so a token-count tie resolves
+    // deterministically instead of following HashMap iteration order.
     let favorite_model = model_tokens
         .iter()
         .filter(|(_, t)| **t > 0)
-        .max_by_key(|(_, t)| **t)
+        .max_by_key(|(m, t)| (**t, std::cmp::Reverse((*m).clone())))
         .map(|(m, _)| m.clone());
 
     let total_tokens = if resp.total_tokens > 0 {
@@ -196,5 +198,16 @@ mod tests {
         assert_eq!(s.most_active_day.as_deref(), Some("2026-07-16"));
         assert_eq!(s.current_streak, 2);
         assert_eq!(s.longest_streak, 2);
+    }
+
+    #[test]
+    fn favorite_model_tie_break_is_deterministic() {
+        // Equal token counts must resolve deterministically (smallest name),
+        // never depend on HashMap iteration order.
+        let json = r#"{"models":["b","a"],"rows":[],
+            "model_tokens":{"a":100,"b":100},"model_counts":{},
+            "total_tokens":200,"total_counts":0}"#;
+        let s = compute_overview(&parse_usage(json).unwrap());
+        assert_eq!(s.favorite_model.as_deref(), Some("a"));
     }
 }

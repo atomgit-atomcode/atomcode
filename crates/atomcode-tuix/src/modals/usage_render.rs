@@ -50,7 +50,11 @@ pub fn sparkline(values: &[u64], width: usize) -> String {
         .iter()
         .map(|&v| {
             let level = if max == min {
-                4 // flat → mid
+                if max == 0 {
+                    0 // all-zero → blank (no phantom activity)
+                } else {
+                    4 // flat non-zero → mid
+                }
             } else {
                 1 + ((v - min) as f64 / (max - min) as f64 * 7.0).round() as usize
             };
@@ -68,29 +72,24 @@ pub struct HeatCell {
     pub month: u8,       // 1..=12
 }
 
-/// 0..=4 intensity per day. Level 0 = zero. Non-zero split into 4 quartiles of
-/// the non-zero values.
+/// 0..=4 intensity per day. Level 0 = zero.
+///
+/// Level by fraction of the window MAX (not quantiles): quantiles degenerate
+/// when there are only a few active days (a lone active day would land in the
+/// lowest bucket instead of the highest). Ratio-to-max keeps the busiest day
+/// darkest and low days light, monotonically.
 pub fn heatmap_buckets(daily: &[u64]) -> Vec<u8> {
-    let mut nz: Vec<u64> = daily.iter().copied().filter(|v| *v > 0).collect();
-    if nz.is_empty() {
+    let max = daily.iter().copied().max().unwrap_or(0);
+    if max == 0 {
         return daily.iter().map(|_| 0u8).collect();
     }
-    nz.sort_unstable();
-    let q = |frac: f64| nz[((nz.len() as f64 - 1.0) * frac).round() as usize];
-    let (t1, t2, t3) = (q(0.25), q(0.50), q(0.75));
     daily
         .iter()
         .map(|&v| {
             if v == 0 {
                 0
-            } else if v <= t1 {
-                1
-            } else if v <= t2 {
-                2
-            } else if v <= t3 {
-                3
             } else {
-                4
+                (((v as f64 / max as f64) * 4.0).ceil() as u8).clamp(1, 4)
             }
         })
         .collect()
@@ -119,14 +118,22 @@ pub fn calendar_layout(rows: &[(String, u64)]) -> Vec<HeatCell> {
     let daily: Vec<u64> = rows.iter().map(|(_, t)| *t).collect();
     let levels = heatmap_buckets(&daily);
     // Week column = (epoch_day - first_week_start_epoch_day) / 7, where the
-    // first week starts on the Sunday on/before the first date.
-    let first_epoch = match rows.first().and_then(|(d, _)| parse_ymd(d)) {
-        Some((y, m, d)) => days_from_civil(y, m, d),
-        None => return Vec::new(),
-    };
+    // first week starts on the Sunday on/before the EARLIEST date. Anchor on the
+    // MIN epoch across all rows (not `rows.first()`): the API is not guaranteed
+    // sorted, and a row older than the first would yield a negative delta whose
+    // `as usize` cast wraps to a huge index → OOM when the caller allocates by
+    // max week_col.
     // weekday of epoch day: 1970-01-01 was a Thursday → (epoch + 4) % 7 gives 0=Sun.
     let weekday_of = |epoch: i64| (((epoch % 7) + 4).rem_euclid(7)) as u8;
-    let first_week_start = first_epoch - weekday_of(first_epoch) as i64;
+    let min_epoch = rows
+        .iter()
+        .filter_map(|(d, _)| parse_ymd(d))
+        .map(|(y, m, d)| days_from_civil(y, m, d))
+        .min();
+    let Some(min_epoch) = min_epoch else {
+        return Vec::new();
+    };
+    let first_week_start = min_epoch - weekday_of(min_epoch) as i64;
     let mut out = Vec::with_capacity(rows.len());
     let mut prev_month = 0u32;
     for (i, (date, _)) in rows.iter().enumerate() {
@@ -263,5 +270,33 @@ mod tests {
     fn braille_char_offsets_from_2800() {
         assert_eq!(braille_series_char(0), '\u{2800}');
         assert_eq!(braille_series_char(0xFF), '\u{28FF}');
+    }
+
+    #[test]
+    fn calendar_layout_handles_unsorted_rows_without_overflow() {
+        // Rows newest-first: the older date must not produce a wrapped (huge)
+        // week_col from a negative epoch delta.
+        let rows = vec![
+            ("2026-07-16".to_string(), 5u64),
+            ("2026-05-18".to_string(), 9u64),
+        ];
+        let cells = calendar_layout(&rows);
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells.iter().all(|c| c.week_col < 60),
+            "week_col wrapped: {:?}",
+            cells.iter().map(|c| c.week_col).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn heatmap_buckets_single_active_day_is_max_level() {
+        // The lone active day must render darkest (4), not palest (1).
+        assert_eq!(heatmap_buckets(&[0, 0, 717016, 0]), vec![0, 0, 4, 0]);
+    }
+
+    #[test]
+    fn sparkline_all_zero_is_blank() {
+        assert_eq!(sparkline(&[0, 0, 0, 0], 4), "    ");
     }
 }
