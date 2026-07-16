@@ -73,11 +73,16 @@ impl UsageModal {
 
     /// Build the tab bar string (active = bold, inactive = dim/muted).
     fn tab_bar(&self) -> String {
+        // Inactive tabs: bold + theme-aware muted (SGR 37 on dark) instead of
+        // SGR 90 — bright-black is ≈background on many dark themes (iTerm2), so
+        // the inactive tabs were invisible and users couldn't see the other
+        // tabs existed. Active tab stays bold default-fg (brightest).
+        let m = muted_open();
         let tab_label = |tab: Tab, label: &str| -> String {
             if self.tab == tab {
                 format!("  \x1b[1m{label}\x1b[22m  ")
             } else {
-                format!("  \x1b[1;90m{label}\x1b[22;39m  ")
+                format!("  \x1b[1m{m}{label}\x1b[22;39m  ")
             }
         };
         let t0 = tab_label(Tab::Current, &t(Msg::UsageTabCurrent));
@@ -946,12 +951,16 @@ mod tests {
         let mut m = sample_modal();
         m.tab = Tab::Overview;
         let bar = m.tab_bar();
-        // Active tab "Overview" has \x1b[1m ... \x1b[22m (bold on/off, no ;90)
-        // Inactive "Current" has \x1b[1;90m (bold+dim)
+        // Active tab "Overview": bold on/off, no muted colour.
         assert!(bar.contains("\x1b[1mOverview\x1b[22m"),
             "tab bar should mark active tab bold; got: {bar}");
-        // Inactive tabs should be muted (;90)
-        assert!(bar.contains("90m"), "inactive tabs should have muted colour; got: {bar}");
+        // Inactive tabs muted via the theme-aware opener — SGR 37 (light gray)
+        // on the default (dark) test theme, NOT SGR 90 which is invisible on
+        // dark iTerm2 (the reason the inactive tabs vanished).
+        assert!(bar.contains("\x1b[37m"),
+            "inactive tabs should use SGR 37 muted on dark; got: {bar}");
+        assert!(!bar.contains("\x1b[1;90m") && !bar.contains("\x1b[90m"),
+            "inactive tabs must NOT emit SGR 90 (invisible on dark); got: {bar}");
     }
 
     #[test]
