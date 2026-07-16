@@ -498,8 +498,9 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             // survives terminal palette remapping (bright-XX colours
             // get re-tinted by themes; truecolor RGB does not).
             // Consume 4 extra tokens (`2`, R, G, B) on success.
-            Some(38) => {
-                if parts.get(i + 1).copied() == Some("2") {
+            Some(38) => match parts.get(i + 1).copied() {
+                // 38;2;R;G;B — truecolor foreground.
+                Some("2") => {
                     if let (Some(r), Some(g), Some(b)) = (
                         parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
                         parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
@@ -509,9 +510,37 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
                         i += 4;
                     }
                 }
-                // 38;5;N (256-colour) and other 38 sub-formats fall
-                // through silently — markdown doesn't emit them.
-            }
+                // 38;5;N — 256-colour indexed foreground (used by the `/usage`
+                // modal's heatmap + per-model line chart).
+                Some("5") => {
+                    if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+                        style.fg = Some(Color::AnsiValue(n));
+                        i += 2;
+                    }
+                }
+                _ => {}
+            },
+            // Background counterparts: 48;5;N (256-colour) / 48;2;R;G;B (truecolor).
+            Some(48) => match parts.get(i + 1).copied() {
+                Some("2") => {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
+                    ) {
+                        style.bg = Some(Color::Rgb { r, g, b });
+                        i += 4;
+                    }
+                }
+                Some("5") => {
+                    if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+                        style.bg = Some(Color::AnsiValue(n));
+                        i += 2;
+                    }
+                }
+                _ => {}
+            },
+            Some(49) => style.bg = None,
             _ => {
                 // Other ANSI colours (30-33, 36, bg, underline) silently
                 // ignored — markdown doesn't emit them.
@@ -12185,6 +12214,20 @@ mod tests {
         let mut style = CellStyle::default();
         apply_sgr("37", &mut style);
         assert_eq!(style.fg, Some(Color::Grey), "SGR 37 must map to Color::Grey");
+    }
+
+    #[test]
+    fn apply_sgr_handles_256_colour_fg_and_bg() {
+        // 38;5;N / 48;5;N — 256-colour indexed. The `/usage` modal (heatmap,
+        // per-model line chart) emits these; without a handler they fell through
+        // and every coloured cell rendered in the default fg (the "all colours
+        // white" bug).
+        let mut fg = CellStyle::default();
+        apply_sgr("38;5;40", &mut fg);
+        assert_eq!(fg.fg, Some(Color::AnsiValue(40)));
+        let mut bg = CellStyle::default();
+        apply_sgr("48;5;22", &mut bg);
+        assert_eq!(bg.bg, Some(Color::AnsiValue(22)));
     }
 
     #[test]
