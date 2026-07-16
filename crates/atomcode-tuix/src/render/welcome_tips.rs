@@ -15,7 +15,7 @@ pub struct Tip {
 /// Always shown first.
 pub const PINNED: Tip = Tip { cmd: "/login", desc: Msg::WelcomeTipLogin };
 
-/// Random pool (14). Filtered to onboarding-relevant commands; excludes
+/// Random pool (15). Filtered to onboarding-relevant commands; excludes
 /// exit/clear/destructive and pure-utility commands. Edit + recompile to refresh.
 pub const POOL: &[Tip] = &[
     Tip { cmd: "/provider", desc: Msg::WelcomeTipProvider },
@@ -32,6 +32,7 @@ pub const POOL: &[Tip] = &[
     Tip { cmd: "/goal",     desc: Msg::WelcomeTipGoal },
     Tip { cmd: "/init",     desc: Msg::WelcomeTipInit },
     Tip { cmd: "/language", desc: Msg::WelcomeTipLanguage },
+    Tip { cmd: "/usage",    desc: Msg::WelcomeTipUsage },
 ];
 
 /// How many random tips to show below the pinned one.

@@ -405,6 +405,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipGoal => "为本次会话设定目标".into(),
         Msg::WelcomeTipInit => "扫描代码库生成 AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "切换界面语言".into(),
+        Msg::WelcomeTipUsage => "查看用量与额度".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>

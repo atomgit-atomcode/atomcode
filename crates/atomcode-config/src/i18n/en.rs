@@ -419,6 +419,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipGoal => "set a goal for the session".into(),
         Msg::WelcomeTipInit => "scan the codebase into AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "switch the UI language".into(),
+        Msg::WelcomeTipUsage => "view token usage & quota".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>

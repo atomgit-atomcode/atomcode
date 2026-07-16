@@ -344,6 +344,8 @@ pub enum Msg<'a> {
     WelcomeTipInit,
     /// Welcome tip: /language command description.
     WelcomeTipLanguage,
+    /// Welcome tip: /usage command description.
+    WelcomeTipUsage,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
