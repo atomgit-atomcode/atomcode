@@ -43,7 +43,7 @@ No public internet access. External CDNs and public registries (npm/PyPI/Maven C
 official sources, etc.) are unreachable. Use ONLY dependencies obtainable via the \
 configured internal mirrors/registries, or assets already vendored in the repo; do NOT \
 reference external CDNs in generated pages. When unsure whether a package or mirror is \
-reachable, prefer a dependency-free approach or ask first.";
+reachable, prefer the configured internal mirror, or ask first.";
 
 /// The OFFLINE ENVIRONMENT block with the env-level `offline_note` appended (if set).
 pub fn offline_environment_block() -> String {

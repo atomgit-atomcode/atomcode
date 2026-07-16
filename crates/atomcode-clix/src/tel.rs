@@ -66,11 +66,14 @@ fn load_telemetry_config(config_override: Option<&Path>) -> TelemetryConfig {
     toml::from_str::<TelFile>(&text).map(|f| f.telemetry).unwrap_or_default()
 }
 
-/// Build the telemetry sink: resolve the 4-level opt-out, then init the queue. ALWAYS returns
-/// a sink — a DISABLED one when opted out (every `track` is then a hard no-op), so callers
-/// wire it unconditionally and the sink itself enforces the opt-out.
+/// Build the telemetry sink: resolve the 5-level opt-out (offline + env×2 + cli + config),
+/// then init the queue. ALWAYS returns a sink — a DISABLED one when opted out (every `track`
+/// is then a hard no-op), so callers wire it unconditionally and the sink itself enforces the
+/// opt-out.
 pub fn build_sink(config_override: Option<&Path>, no_telemetry: bool) -> Arc<Telemetry> {
     let cfg = load_telemetry_config(config_override);
+    // clix does not participate in offline_mode (it never seeds the offline verdict),
+    // so telemetry is not offline-gated here — pass false explicitly, not a bug.
     let resolved = resolve(&cfg, &CliOverride { disabled: no_telemetry }, atomcode_dir(), &ProcessEnv, false);
     Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into())
 }

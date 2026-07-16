@@ -41,6 +41,12 @@ impl TelemetryState {
     }
 }
 
+/// Resolve the 5-level telemetry opt-out: offline → env×2 → cli → config.
+///
+/// `offline` is resolved ONCE at startup. Under `offline_mode="auto"` the verdict is
+/// optimistic-online at telemetry-init time; a later network-failure flip does NOT
+/// re-resolve telemetry, so `auto` does NOT disable telemetry — only a forced `on` /
+/// `ATOMCODE_OFFLINE=on` does.
 pub fn resolve(
     cfg: &TelemetryConfig,
     cli: &CliOverride,
