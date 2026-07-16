@@ -5,6 +5,7 @@
 // the TUI dispatcher and downstream registries.
 pub mod bootstrap;
 pub mod installer;
+pub mod hook_trust;
 pub mod loader;
 pub mod marketplace;
 
