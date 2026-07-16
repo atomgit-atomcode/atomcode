@@ -28,6 +28,28 @@ const V_AUTO_OFFLINE: u8 = 4;
 static VERDICT: AtomicU8 = AtomicU8::new(V_UNSEEDED);
 static NOTE: Mutex<Option<String>> = Mutex::new(None);
 
+/// Env var that overrides the config `offline_mode` (highest priority).
+pub const ATOMCODE_OFFLINE_ENV: &str = "ATOMCODE_OFFLINE";
+
+/// Resolve whether offline is FORCED active from a config mode + env, WITHOUT touching
+/// the process verdict. Env wins over `mode`; only forced `On` is offline (`Auto` is
+/// optimistic-online here, `Off` is online). Used by pre-seed consumers (e.g. the binary
+/// self-update gate) that run before `seed_offline_verdict`. Post-seed code uses
+/// `is_offline_active()` instead.
+pub fn offline_resolved(mode: OfflineMode, env_raw: Option<&str>) -> bool {
+    matches!(offline_from_env(env_raw).unwrap_or(mode), OfflineMode::On)
+}
+
+/// Seed the process verdict + note from an optional loaded `Config`, reading the
+/// `ATOMCODE_OFFLINE` env override internally. Missing config → defaults (Off / no note).
+/// Call once at startup, before any consumer of `is_offline_active()`.
+pub fn seed_offline_from_config(cfg: Option<&super::Config>) {
+    let mode = cfg.map(|c| c.offline_mode).unwrap_or_default();
+    let note = cfg.and_then(|c| c.offline_note.clone());
+    seed_offline_verdict(mode, std::env::var(ATOMCODE_OFFLINE_ENV).ok().as_deref());
+    set_offline_note(note);
+}
+
 pub fn offline_from_env(raw: Option<&str>) -> Option<OfflineMode> {
     match raw?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" => Some(OfflineMode::On),
@@ -143,6 +165,18 @@ mod tests {
         seed_offline_verdict(OfflineMode::Off, None);
         mark_network_unreachable();
         assert!(!is_offline_active(), "explicit off is never flipped by detection");
+    }
+
+    #[test]
+    fn offline_resolved_truth_table() {
+        // env None → follows mode
+        assert!(offline_resolved(OfflineMode::On, None));
+        assert!(!offline_resolved(OfflineMode::Off, None));
+        assert!(!offline_resolved(OfflineMode::Auto, None), "auto is optimistic-online for pre-seed decisions");
+        // env wins over mode
+        assert!(offline_resolved(OfflineMode::Off, Some("on")));
+        assert!(!offline_resolved(OfflineMode::On, Some("off")));
+        assert!(!offline_resolved(OfflineMode::On, Some("auto")), "env auto overrides config on, and auto is optimistic here");
     }
 
     #[test]

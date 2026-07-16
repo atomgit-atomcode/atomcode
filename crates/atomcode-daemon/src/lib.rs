@@ -4365,16 +4365,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
-    atomcode_config::config::offline::seed_offline_verdict(
-        startup_config
-            .as_ref()
-            .map(|c| c.offline_mode)
-            .unwrap_or_default(),
-        std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
-    );
-    atomcode_config::config::offline::set_offline_note(
-        startup_config.as_ref().and_then(|c| c.offline_note.clone()),
-    );
+    atomcode_config::config::offline::seed_offline_from_config(startup_config.as_ref());
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(

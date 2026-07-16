@@ -371,40 +371,32 @@ fn should_try_sync_upgrade() -> bool {
         return false;
     }
 
-    // Env forces offline (works even with no config file, e.g. air-gapped container):
-    // offline On disables binary self-update. Auto/Off do not skip here.
-    if matches!(
-        atomcode_config::config::offline::offline_from_env(
-            std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
-        ),
-        Some(atomcode_config::config::offline::OfflineMode::On)
-    ) {
-        return false;
-    }
-
-    // Load just enough of the config to honor `auto_update = false`.
-    // Failure to load = assume default (true) — fresh installs benefit.
+    // Load config once to honor both `auto_update = false` and `offline_mode`.
+    // Runs pre-seed, so offline is resolved directly rather than via the process
+    // verdict. Env wins over config; only forced On skips. Failure to load = assume
+    // defaults (auto_update true, offline Off) — fresh installs benefit.
     let path = atomcode_config::config::Config::default_path();
-    if path.exists() {
+    let offline_mode = if path.exists() {
         if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
             if !cfg.auto_update {
                 return false;
             }
-            // Offline mode (forced On, env wins over config) disables binary self-update,
-            // same as auto_update=false. Auto/Off do not skip (Auto is optimistic-online).
-            let offline_on = match atomcode_config::config::offline::offline_from_env(
-                std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
-            ) {
-                Some(m) => matches!(m, atomcode_config::config::offline::OfflineMode::On),
-                None => matches!(
-                    cfg.offline_mode,
-                    atomcode_config::config::offline::OfflineMode::On
-                ),
-            };
-            if offline_on {
-                return false;
-            }
+            cfg.offline_mode
+        } else {
+            atomcode_config::config::offline::OfflineMode::Off
         }
+    } else {
+        atomcode_config::config::offline::OfflineMode::Off
+    };
+    // Offline (env wins over config; only forced On skips) disables binary self-update,
+    // same as auto_update=false. Works even with no config file (e.g. air-gapped container).
+    if atomcode_config::config::offline::offline_resolved(
+        offline_mode,
+        std::env::var(atomcode_config::config::offline::ATOMCODE_OFFLINE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        return false;
     }
     true
 }
@@ -1145,16 +1137,7 @@ async fn run() -> Result<i32> {
         .unwrap_or_default();
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
-    atomcode_config::config::offline::seed_offline_verdict(
-        early_config
-            .as_ref()
-            .map(|c| c.offline_mode)
-            .unwrap_or_default(),
-        std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
-    );
-    atomcode_config::config::offline::set_offline_note(
-        early_config.as_ref().and_then(|c| c.offline_note.clone()),
-    );
+    atomcode_config::config::offline::seed_offline_from_config(early_config.as_ref());
     let atomcode_dir = Config::config_dir();
     let cli_override = CliOverride {
         disabled: cli.no_telemetry,
