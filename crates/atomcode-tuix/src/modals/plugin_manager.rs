@@ -192,22 +192,12 @@ impl PluginManager {
             | Screen::RemoveMarketplaceConfirm { .. } => 2,
         };
         let installed_count = self.installed.len();
-        let t0 = if current_tab == 0 {
-            "  \x1b[1mAll Plugins\x1b[22m  "
-        } else {
-            &format!("  {}All Plugins\x1b[22;39m  ", muted_bold_esc())
-        };
-        let t1 = if current_tab == 1 {
-            format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
-        } else {
-            format!("  {}Installed ({})\x1b[22;39m  ", muted_bold_esc(), installed_count)
-        };
-        let t2 = if current_tab == 2 {
-            "  \x1b[1mMarketplaces\x1b[22m  "
-        } else {
-            &format!("  {}Marketplaces\x1b[22;39m  ", muted_bold_esc())
-        };
-        format!("{}   {}   {}", t0, t1, t2)
+        // Palette-independent active/inactive contrast — see modals::tab_chip
+        // (fixed 256-colours, correct on Solarized Dark and every theme).
+        let t0 = crate::modals::tab_chip("All Plugins", current_tab == 0);
+        let t1 = crate::modals::tab_chip(&format!("Installed ({installed_count})"), current_tab == 1);
+        let t2 = crate::modals::tab_chip("Marketplaces", current_tab == 2);
+        format!("{t0}   {t1}   {t2}")
     }
 
     fn switch_tab(&mut self, forward: bool) {
@@ -1392,13 +1382,6 @@ fn muted_esc() -> &'static str {
     }
 }
 
-fn muted_bold_esc() -> &'static str {
-    if crate::highlight::theme::is_light_for_render() {
-        "\x1b[1;90m"
-    } else {
-        "\x1b[1;37m"
-    }
-}
 
 
 
@@ -1529,7 +1512,15 @@ mod tests {
         crate::highlight::theme::set_theme_mode(false); // force dark
         let bar = m.tab_bar();
         crate::highlight::theme::set_theme_mode(false); // restore
-        assert!(!bar.contains("\x1b[1;90m") && !bar.contains("\x1b[90m"));
+        // Palette-independent chips (shared modals::tab_chip): active = fixed
+        // near-white 231, inactive = fixed grey 245. No SGR 90/37/1;39 — all
+        // broke on Solarized Dark.
+        assert!(bar.contains("\x1b[1;38;5;231mAll Plugins\x1b[22;39m"),
+            "active tab should be bold + fixed near-white 231; got: {bar}");
+        assert!(bar.contains("\x1b[38;5;245m"),
+            "inactive tabs should use fixed grey 245; got: {bar}");
+        assert!(!bar.contains("\x1b[1;90m") && !bar.contains("\x1b[90m") && !bar.contains("\x1b[37m"),
+            "tabs must not use palette-dependent SGR 90/37; got: {bar}");
     }
 
     #[test]

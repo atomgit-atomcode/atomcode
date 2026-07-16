@@ -73,21 +73,12 @@ impl UsageModal {
 
     /// Build the tab bar string (active = bold, inactive = dim/muted).
     fn tab_bar(&self) -> String {
-        // Inactive tabs: bold + theme-aware muted (SGR 37 on dark) instead of
-        // SGR 90 — bright-black is ≈background on many dark themes (iTerm2), so
-        // the inactive tabs were invisible and users couldn't see the other
-        // tabs existed. Active tab stays bold default-fg (brightest).
-        let m = muted_open();
-        let tab_label = |tab: Tab, label: &str| -> String {
-            if self.tab == tab {
-                format!("  \x1b[1m{label}\x1b[22m  ")
-            } else {
-                format!("  \x1b[1m{m}{label}\x1b[22;39m  ")
-            }
-        };
-        let t0 = tab_label(Tab::Current, &t(Msg::UsageTabCurrent));
-        let t1 = tab_label(Tab::Overview, &t(Msg::UsageTabOverview));
-        let t2 = tab_label(Tab::Models, &t(Msg::UsageTabModels));
+        // Palette-independent active/inactive contrast — see modals::tab_chip
+        // (fixed 256-colours, correct on Solarized Dark and every theme).
+        let chip = |tab: Tab, label: &str| crate::modals::tab_chip(label, self.tab == tab);
+        let t0 = chip(Tab::Current, &t(Msg::UsageTabCurrent));
+        let t1 = chip(Tab::Overview, &t(Msg::UsageTabOverview));
+        let t2 = chip(Tab::Models, &t(Msg::UsageTabModels));
         format!("{t0}   {t1}   {t2}")
     }
 
@@ -951,16 +942,17 @@ mod tests {
         let mut m = sample_modal();
         m.tab = Tab::Overview;
         let bar = m.tab_bar();
-        // Active tab "Overview": bold on/off, no muted colour.
-        assert!(bar.contains("\x1b[1mOverview\x1b[22m"),
-            "tab bar should mark active tab bold; got: {bar}");
-        // Inactive tabs muted via the theme-aware opener — SGR 37 (light gray)
-        // on the default (dark) test theme, NOT SGR 90 which is invisible on
-        // dark iTerm2 (the reason the inactive tabs vanished).
-        assert!(bar.contains("\x1b[37m"),
-            "inactive tabs should use SGR 37 muted on dark; got: {bar}");
-        assert!(!bar.contains("\x1b[1;90m") && !bar.contains("\x1b[90m"),
-            "inactive tabs must NOT emit SGR 90 (invisible on dark); got: {bar}");
+        // Active tab "Overview" on the default (dark) test theme: bold + fixed
+        // near-white 256-colour (231), the brightest/most prominent.
+        assert!(bar.contains("\x1b[1;38;5;231mOverview\x1b[22;39m"),
+            "active tab should be bold + fixed near-white 231 on dark; got: {bar}");
+        // Inactive tabs: fixed mid-grey (245), dimmer than active and
+        // palette-independent. Must NOT use SGR 90/37/39 — all broke on
+        // Solarized Dark (90≈bg, 37 brighter than default, 39=grey default fg).
+        assert!(bar.contains("\x1b[38;5;245m"),
+            "inactive tabs should use fixed 256-colour grey 245; got: {bar}");
+        assert!(!bar.contains("\x1b[90m") && !bar.contains("\x1b[37m") && !bar.contains("\x1b[1;39m"),
+            "tabs must not rely on palette-dependent SGR 90/37/39; got: {bar}");
     }
 
     #[test]
