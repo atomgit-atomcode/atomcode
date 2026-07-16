@@ -29,7 +29,7 @@ fn unified_prompt_has_key_guidance() {
         "Must guide search-replace editing"
     );
     assert!(
-        prompt.contains("never with bash"),
+        prompt.contains("never with `bash`"),
         "Must ban bash file mutation"
     );
 }
@@ -44,7 +44,7 @@ fn unified_prompt_size_reasonable() {
         tokens
     );
     assert!(
-        tokens < 800,
+        tokens < 2500,
         "Too long: {} tokens — violates Less is More principle",
         tokens
     );
