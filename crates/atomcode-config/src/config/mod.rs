@@ -1,5 +1,6 @@
 pub mod instructions;
 pub mod memory;
+pub mod offline;
 pub mod prompt_sections;
 pub mod provider;
 
@@ -190,6 +191,15 @@ pub struct Config {
     /// to restore the legacy undo-on-cancel behaviour.
     #[serde(default = "default_true")]
     pub keep_interrupted_context: bool,
+    /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
+    #[serde(default)]
+    pub offline_mode: offline::OfflineMode,
+
+    /// Environment-level note appended to the OFFLINE ENVIRONMENT persona block:
+    /// declares which internal mirrors/registries ARE available (e.g. npm private
+    /// registry, Maven internal repo) so the model doesn't over-restrict itself.
+    #[serde(default)]
+    pub offline_note: Option<String>,
 }
 
 /// Web search backend configuration. Persisted as the `[web_search]` table.
@@ -384,6 +394,8 @@ impl Default for Config {
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
             keep_interrupted_context: true,
+            offline_mode: offline::OfflineMode::default(),
+            offline_note: None,
         }
     }
 }
@@ -1370,6 +1382,8 @@ mod tests {
             plugin: Default::default(),
             web_search: Default::default(),
             keep_interrupted_context: false,
+            offline_mode: Default::default(),
+            offline_note: None,
         };
         cfg.providers.insert(
             "p".to_string(),
