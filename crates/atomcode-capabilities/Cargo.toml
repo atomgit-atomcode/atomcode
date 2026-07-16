@@ -8,6 +8,12 @@ publish = false
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+# Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
+# the config crate is explicitly designed so every stack layer can read config without an
+# atomcode-core dep. Optional + behind the `notify` feature so a provider-only / lean
+# embedder that never wants desktop notifications does not drag config→telemetry (and its
+# reqwest/rustls/flate2 stack) into the build — same optionality discipline as reqwest above.
+atomcode-config = { path = "../atomcode-config", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
@@ -108,6 +114,10 @@ codeintel = [
 lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
 # Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
 lsp-e2e = ["lsp"]
+# Desktop / terminal notifications (turn-finished + approval-needed). Reads NotificationConfig
+# from the config leaf, so it pulls `atomcode-config`. Opt-in (NOT default) — a provider-only
+# embedder skips config→telemetry. Hosts that surface notifications (TUI/CLI) enable it.
+notify = ["dep:atomcode-config"]
 # Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
 skills = []
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel

@@ -8944,6 +8944,23 @@ mod approval_retract_tests {
     }
 }
 
+/// Map the v1 engine's turn-stop reason onto the notification layer's own
+/// `NotifyStopReason` (capabilities is L0 and cannot see `core::agent`). Total
+/// 1:1 mapping — the two enums mirror each other variant-for-variant.
+fn notify_stop_reason(
+    reason: atomcode_core::agent::TurnStopReason,
+) -> atomcode_capabilities::notify::NotifyStopReason {
+    use atomcode_capabilities::notify::NotifyStopReason as N;
+    use atomcode_core::agent::TurnStopReason as T;
+    match reason {
+        T::Natural => N::Natural,
+        T::Cancelled => N::Cancelled,
+        T::Error => N::Error,
+        T::TurnLimit => N::TurnLimit,
+        T::StepLimit => N::StepLimit,
+    }
+}
+
 /// Decide the notice to surface when a turn completes having produced NO
 /// user-visible answer. Returns `Some(message)` when the turn ended NATURALLY
 /// (finish_reason=stop), made no tool calls, and rendered no visible text —
@@ -10147,10 +10164,10 @@ fn handle_agent_event(
                 selected: 0,
             });
             renderer.flush();
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::ApprovalNeeded(
-                    atomcode_core::notify::ApprovalNotification {
+                atomcode_capabilities::notify::NotificationEvent::ApprovalNeeded(
+                    atomcode_capabilities::notify::ApprovalNotification {
                         tool_name: &display_tool_name(&tool_name),
                         detail: Some(&format_tool_detail(&tool_name, &call.arguments)),
                         working_dir: Some(&ctx.working_dir),
@@ -10189,15 +10206,15 @@ fn handle_agent_event(
             // Seal the assistant-reply buffer so `/copy` reads this completed
             // reply until the next turn's first delta starts a fresh one.
             state.response_finalized = true;
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::TurnFinished(
-                    atomcode_core::notify::TurnNotification {
+                atomcode_capabilities::notify::NotificationEvent::TurnFinished(
+                    atomcode_capabilities::notify::TurnNotification {
                         duration,
                         turn_count,
                         tool_call_count,
                         total_tokens: Some(total_tokens),
-                        stop_reason,
+                        stop_reason: notify_stop_reason(stop_reason),
                         working_dir: Some(&ctx.working_dir),
                     },
                 ),
@@ -10361,15 +10378,15 @@ fn handle_agent_event(
         AgentEvent::TurnCancelled { snapshot } => {
             // Seal the reply buffer (partial reply still copyable via `/copy`).
             state.response_finalized = true;
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::TurnFinished(
-                    atomcode_core::notify::TurnNotification {
+                atomcode_capabilities::notify::NotificationEvent::TurnFinished(
+                    atomcode_capabilities::notify::TurnNotification {
                         duration: state.turn_elapsed().unwrap_or_default(),
                         turn_count: 0,
                         tool_call_count: pending_tools.len(),
                         total_tokens: None,
-                        stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                        stop_reason: atomcode_capabilities::notify::NotifyStopReason::Cancelled,
                         working_dir: Some(&ctx.working_dir),
                     },
                 ),

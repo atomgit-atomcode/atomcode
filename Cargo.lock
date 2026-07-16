@@ -397,6 +397,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "atomcode-config",
  "atomcode-kernel",
  "base64",
  "bytes",

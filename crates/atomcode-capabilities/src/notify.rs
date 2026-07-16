@@ -5,8 +5,21 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use crate::agent::TurnStopReason;
 use atomcode_config::config::NotificationConfig;
+
+/// Why a turn stopped, decoupled from any engine's stop-reason enum so this
+/// module (L0) needs no dependency on the v1 core `agent::TurnStopReason` (nor
+/// the v2 `kernel::event::StopReason`). Hosts map their engine's reason into
+/// this before calling [`notify`]. Variants mirror `core::agent::TurnStopReason`
+/// one-to-one so the mapping is total and byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyStopReason {
+    Natural,
+    Cancelled,
+    Error,
+    TurnLimit,
+    StepLimit,
+}
 
 #[derive(Debug, Clone)]
 pub struct TurnNotification<'a> {
@@ -14,7 +27,7 @@ pub struct TurnNotification<'a> {
     pub turn_count: usize,
     pub tool_call_count: usize,
     pub total_tokens: Option<usize>,
-    pub stop_reason: TurnStopReason,
+    pub stop_reason: NotifyStopReason,
     pub working_dir: Option<&'a Path>,
 }
 
@@ -223,18 +236,18 @@ fn build_turn_terminal_notification_text(
 
 fn build_turn_system_notification_text(turn: &TurnNotification<'_>) -> (Cow<'static, str>, String) {
     let title = match turn.stop_reason {
-        TurnStopReason::Natural => Cow::Borrowed("AtomCode done"),
-        TurnStopReason::Cancelled => Cow::Borrowed("AtomCode cancelled"),
-        TurnStopReason::Error => Cow::Borrowed("AtomCode failed"),
-        TurnStopReason::TurnLimit => Cow::Borrowed("AtomCode stopped"),
-        TurnStopReason::StepLimit => Cow::Borrowed("AtomCode stopped"),
+        NotifyStopReason::Natural => Cow::Borrowed("AtomCode done"),
+        NotifyStopReason::Cancelled => Cow::Borrowed("AtomCode cancelled"),
+        NotifyStopReason::Error => Cow::Borrowed("AtomCode failed"),
+        NotifyStopReason::TurnLimit => Cow::Borrowed("AtomCode stopped"),
+        NotifyStopReason::StepLimit => Cow::Borrowed("AtomCode stopped"),
     };
     let status = match turn.stop_reason {
-        TurnStopReason::Natural => "Done",
-        TurnStopReason::Cancelled => "Cancelled",
-        TurnStopReason::Error => "Failed",
-        TurnStopReason::TurnLimit => "Stopped",
-        TurnStopReason::StepLimit => "Stopped",
+        NotifyStopReason::Natural => "Done",
+        NotifyStopReason::Cancelled => "Cancelled",
+        NotifyStopReason::Error => "Failed",
+        NotifyStopReason::TurnLimit => "Stopped",
+        NotifyStopReason::StepLimit => "Stopped",
     };
     let mut body = format!("{} · {}", status, fmt_duration(turn.duration));
     if turn.turn_count > 0 {
@@ -542,7 +555,7 @@ mod tests {
             turn_count: 3,
             tool_call_count: 5,
             total_tokens: Some(4321),
-            stop_reason: TurnStopReason::Natural,
+            stop_reason: NotifyStopReason::Natural,
             working_dir: Some(Path::new("/tmp/demo")),
         });
         assert_eq!(title, "AtomCode done");
@@ -558,7 +571,7 @@ mod tests {
                 turn_count: 4,
                 tool_call_count: 9,
                 total_tokens: Some(1209),
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/atomcode")),
             },
         );
@@ -575,7 +588,7 @@ mod tests {
                 turn_count: 3,
                 tool_call_count: 5,
                 total_tokens: None,
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/demo")),
             },
         );
@@ -658,7 +671,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 1,
                 total_tokens: None,
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/demo")),
             }),
         );
@@ -710,7 +723,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 1,
                 total_tokens: None,
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/demo")),
             }),
         )
@@ -733,7 +746,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 1,
                 total_tokens: None,
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/demo")),
             }),
         )
@@ -756,7 +769,7 @@ mod tests {
                 turn_count: 1,
                 tool_call_count: 1,
                 total_tokens: None,
-                stop_reason: TurnStopReason::Natural,
+                stop_reason: NotifyStopReason::Natural,
                 working_dir: Some(Path::new("/tmp/demo")),
             }),
         )
