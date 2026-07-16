@@ -98,6 +98,7 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_Window
 tempfile = "3"
 wiremock = "0.6"
 serial_test = "3"
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
 # Redirects ATOMCODE_HOME to a temp dir at test startup so tests don't pollute
 # the real ~/.atomcode (see the `#[ctor]` in lib.rs / the crate docs).
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
