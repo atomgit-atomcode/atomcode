@@ -10724,16 +10724,8 @@ fn handle_agent_event(
             // and print partial data). Clears the flag on fire so a
             // single dispatch yields a single render even when multiple
             // rich emissions follow (e.g. inside a long multi-round turn).
-            if ctx_window > 0 {
-                if let Some(show_prompt) = state.pending_context_render.take() {
-                    renderer.render(UiLine::CommandOutput(commands::render_context_report(
-                        state,
-                        ctx,
-                        show_prompt,
-                    )));
-                    renderer.flush();
-                }
-            }
+            // ContextStats rich emission updates the state snapshot but no longer
+            // triggers asynchronous report renders since /context is synchronous now.
         }
         AgentEvent::ToolBatchStarted { batch_id, calls } => {
             // Header label: "Reading 4 files in parallel" when all calls
@@ -11306,7 +11298,6 @@ fn handle_agent_event(
             state.completion_tokens = 0;
             state.cached_tokens = 0;
             state.last_context = None;
-            state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
             state.active_todos = None;

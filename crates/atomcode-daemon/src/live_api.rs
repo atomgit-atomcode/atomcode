@@ -2569,6 +2569,28 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
+/// 同步构建并获取当前活动会话的最新 system prompt。供本地 TUI / context 展示使用。
+pub fn get_current_system_prompt() -> Option<String> {
+    let working_dir_buf = LIVE_WORKING_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let config = atomcode_config::config::Config::load(&working_dir_buf).unwrap_or_default();
+    let provider_name = config.default_provider.clone();
+    let default_provider = config.providers.get(&provider_name).cloned()?;
+    
+    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+    skill_registry.reload(&working_dir_buf);
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    
+    Some(crate::build_api_system_prompt(
+        &working_dir_buf,
+        &config,
+        &default_provider,
+        &skill_registry,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -39,6 +39,7 @@ pub use live_api::live_set_mode;
 pub use live_api::live_set_provider;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
+pub use live_api::get_current_system_prompt;
 pub mod auth_token;
 pub mod permission_bridge;
 mod telemetry_scope;

@@ -197,11 +197,6 @@ pub enum AgentCommand {
     /// removed in a later task once all producers migrate).
     SetMode(crate::agent::Mode),
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
-    /// this before rendering so the user never sees a stale cache — the
-    /// cache is only refreshed on LLM round-trips, so between turns (or
-    /// after out-of-turn mutations like `inject_post_compress_state`) the
-    /// snapshot can lag the actual conversation state.
-    RefreshContextStats,
     /// Rebuild the hook executor from disk after a `/plugin install|uninstall`
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
