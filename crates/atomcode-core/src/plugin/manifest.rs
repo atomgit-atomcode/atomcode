@@ -20,6 +20,8 @@ pub struct PluginEntry {
     pub source: PluginSource,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// Plugin source spec. Mirrors Claude Code's marketplace schema.

@@ -195,17 +195,17 @@ impl PluginManager {
         let t0 = if current_tab == 0 {
             "  \x1b[1mBrowse Marketplaces\x1b[22m  "
         } else {
-            "  \x1b[1;90mBrowse Marketplaces\x1b[22;39m  "
+            &format!("  {}Browse Marketplaces\x1b[22;39m  ", muted_bold_esc())
         };
         let t1 = if current_tab == 1 {
             format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
         } else {
-            format!("  \x1b[1;90mInstalled ({})\x1b[22;39m  ", installed_count)
+            format!("  {}Installed ({})\x1b[22;39m  ", muted_bold_esc(), installed_count)
         };
         let t2 = if current_tab == 2 {
             "  \x1b[1mMarketplaces\x1b[22m  "
         } else {
-            "  \x1b[1;90mMarketplaces\x1b[22;39m  "
+            &format!("  {}Marketplaces\x1b[22;39m  ", muted_bold_esc())
         };
         format!("{}   {}   {}", t0, t1, t2)
     }
@@ -287,17 +287,47 @@ impl PluginManager {
         if let Some(root) = atomcode_core::plugin::marketplaces_root() {
             let mp_dir = root.join(mp);
 
-            // Try loading from mp_dir/plugin first
-            let mut manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir.join(plugin)).ok();
+            // 1. Try to get details from the marketplace manifest first (as it contains details for both inline and external plugins)
+            if let Ok(Some(mp_manifest)) = atomcode_core::plugin::load_marketplace_manifest(&mp_dir) {
+                if let Some(p) = mp_manifest.plugins.iter().find(|p| p.name == plugin || sanitize(&p.name) == plugin) {
+                    version = p.version.clone();
+                    description = p.description.clone();
 
-            // Fall back to mp_dir root
-            if manifest_opt.is_none() {
-                manifest_opt = atomcode_core::plugin::load_plugin_manifest(&mp_dir).ok();
+                    // If it is an inline plugin, we can try to read its actual plugin.json for more accurate / updated details
+                    if let atomcode_core::plugin::PluginSource::Inline(ref path) = p.source {
+                        let normalized = path.trim_start_matches("./");
+                        let dir = if normalized.is_empty() {
+                            mp_dir.clone()
+                        } else {
+                            mp_dir.join(normalized)
+                        };
+                        if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&dir) {
+                            if manifest.version.is_some() {
+                                version = manifest.version;
+                            }
+                            if manifest.description.is_some() {
+                                description = manifest.description;
+                            }
+                        }
+                    }
+                }
             }
 
-            if let Some(manifest) = manifest_opt {
-                version = manifest.version;
-                description = manifest.description;
+            // 2. Fall back to loading from mp_dir/plugin (or mp_dir itself) if not found in marketplace manifest
+            if version.is_none() && description.is_none() {
+                let plugin_dir = mp_dir.join(plugin);
+                if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
+                    if manifest.version.is_some() || manifest.description.is_some() {
+                        version = manifest.version;
+                        description = manifest.description;
+                    }
+                }
+                if version.is_none() && description.is_none() {
+                    if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&mp_dir) {
+                        version = manifest.version;
+                        description = manifest.description;
+                    }
+                }
             }
         }
         (version, description)
@@ -320,7 +350,11 @@ impl PluginManager {
             if let Some(info) = self.installed.iter().find(|i| i.plugin == plugin && i.marketplace == mp && i.scope == *scope) {
                 let plugin_dir = root.join(&info.plugin_dir);
                 if let Ok(manifest) = atomcode_core::plugin::load_plugin_manifest(&plugin_dir) {
-                    return (manifest.version, manifest.description);
+                    let version = manifest.version;
+                    let description = manifest.description;
+                    if version.is_some() || description.is_some() {
+                        return (version, description);
+                    }
                 }
             }
         }
@@ -1050,7 +1084,7 @@ impl Modal for PluginManager {
 
         if let Screen::RemoveMarketplaceConfirm { mp, .. } = &self.screen {
             final_items.push((t(Msg::PluginMgrRemoveMarketplaceTitle).into_owned(), String::new()));
-            final_items.push((format!("  Marketplace: \x1b[90m{}\x1b[39m", mp), String::new()));
+            final_items.push((format!("  Marketplace: {}{}\x1b[39m", muted_esc(), mp), String::new()));
             final_items.push((String::new(), String::new()));
             final_items.push((t(Msg::PluginMgrRemoveMarketplacePrompt { name: mp }).into_owned(), String::new()));
             final_items.push((String::new(), String::new()));
@@ -1072,8 +1106,8 @@ impl Modal for PluginManager {
         if let Some((plugin, mp, version, description, scope_opt)) = details_opt {
             final_items.push(("  ◆ Plugin Info".to_string(), String::new()));
             final_items.push((format!("  Name:        {}", plugin), String::new()));
-            final_items.push((format!("  Marketplace: \x1b[90m@{}\x1b[39m", mp), String::new()));
-            final_items.push((format!("  Version:     \x1b[90m{}\x1b[39m", version.unwrap_or_else(|| "unknown".to_string())), String::new()));
+            final_items.push((format!("  Marketplace: {}@{}\x1b[39m", muted_esc(), mp), String::new()));
+            final_items.push((format!("  Version:     {}{}\x1b[39m", muted_esc(), version.unwrap_or_else(|| "unknown".to_string())), String::new()));
             selected_offset += 4;
             if let Some(scope) = scope_opt {
                 let scope_label = match scope {
@@ -1081,7 +1115,7 @@ impl Modal for PluginManager {
                     InstallScope::Project => t(Msg::PluginScopeProjectShort).into_owned(),
                     InstallScope::Local => t(Msg::PluginScopeLocalShort).into_owned(),
                 };
-                final_items.push((format!("  Scope:       \x1b[90m{}\x1b[39m", scope_label), String::new()));
+                final_items.push((format!("  Scope:       {}{}\x1b[39m", muted_esc(), scope_label), String::new()));
                 selected_offset += 1;
             }
             if let Some(desc) = description {
@@ -1092,7 +1126,7 @@ impl Modal for PluginManager {
                     } else {
                         trimmed.to_string()
                     };
-                    final_items.push((format!("  Description: \x1b[90m{}\x1b[39m", truncated), String::new()));
+                    final_items.push((format!("  Description: {}{}\x1b[39m", muted_esc(), truncated), String::new()));
                     selected_offset += 1;
                 }
             }
@@ -1122,17 +1156,17 @@ impl Modal for PluginManager {
                 let installed_count = installed_plugins.len();
 
                 final_items.push((format!("  \x1b[1m{}\x1b[22m", m.name), String::new()));
-                final_items.push((format!("  \x1b[90m{}\x1b[39m", m.source), String::new()));
+                final_items.push((format!("  {}{}\x1b[39m", muted_esc(), m.source), String::new()));
                 final_items.push((String::new(), String::new()));
                 final_items.push((format!("  {} available plugins", m.plugins.len()), String::new()));
                 final_items.push((String::new(), String::new()));
                 final_items.push((format!("  \x1b[1mInstalled plugins ({}):\x1b[22m", installed_count), String::new()));
 
                 if installed_count == 0 {
-                    final_items.push(("  \x1b[90mNo plugins installed from this marketplace.\x1b[39m".to_string(), String::new()));
+                    final_items.push((format!("  {}No plugins installed from this marketplace.\x1b[39m", muted_esc()), String::new()));
                 } else {
                     for inst in installed_plugins {
-                        final_items.push((format!("  \x1b[90m● {}\x1b[39m", inst.plugin), String::new()));
+                        final_items.push((format!("  {}● {}\x1b[39m", muted_esc(), inst.plugin), String::new()));
                         let (_, description) = self.get_installed_plugin_details(&inst.plugin, &inst.marketplace, &inst.scope);
                         if let Some(desc) = description {
                             let trimmed = desc.trim();
@@ -1142,7 +1176,7 @@ impl Modal for PluginManager {
                                 } else {
                                     trimmed.to_string()
                                 };
-                                final_items.push((format!("    \x1b[90m{}\x1b[39m", truncated), String::new()));
+                                final_items.push((format!("    {}{}\x1b[39m", muted_esc(), truncated), String::new()));
                             }
                         }
                     }
@@ -1315,6 +1349,22 @@ fn get_directory_modified_date(name: &str) -> String {
 fn is_official_marketplace(source: &str) -> bool {
     source == "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git"
         || source == "git@atomgit.com:atomgit_atomcode/atomcode-plugins-official.git"
+}
+
+fn muted_esc() -> &'static str {
+    if crate::highlight::theme::is_light_for_render() {
+        "\x1b[90m"
+    } else {
+        "\x1b[37m"
+    }
+}
+
+fn muted_bold_esc() -> &'static str {
+    if crate::highlight::theme::is_light_for_render() {
+        "\x1b[1;90m"
+    } else {
+        "\x1b[1;37m"
+    }
 }
 
 

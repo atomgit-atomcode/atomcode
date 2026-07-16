@@ -465,6 +465,7 @@ pub fn install(plugin: &str, marketplace: &str, scope: InstallScope) -> Result<I
             name: plugin.to_string(),
             source: PluginSource::Inline("./".into()),
             description: None,
+            version: None,
         },
     };
 

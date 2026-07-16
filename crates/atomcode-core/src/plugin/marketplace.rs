@@ -225,6 +225,7 @@ pub(super) fn resolve_marketplace_identity(
                 name: dir_name.to_string(),
                 source: PluginSource::Inline("./".into()),
                 description: None,
+                version: None,
             }],
         ),
     }
