@@ -4135,6 +4135,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             crate::i18n::t(crate::i18n::Msg::OfflineModeActive).into_owned(),
         ));
     }
+    // One-line notice when installed plugins ship hooks the user has not yet
+    // trusted. Shown once at startup so the user knows why those hooks are
+    // inactive and how to enable them. Mirrors the offline advisory above:
+    // UiLine::Warning (yellow) rather than Error — informational, not a failure.
+    {
+        let untrusted: Vec<_> = atomcode_core::plugin::installed_plugin_hook_trust_status()
+            .into_iter()
+            .filter(|s| !s.trusted)
+            .collect();
+        if !untrusted.is_empty() {
+            let names: Vec<String> = untrusted.iter().map(|s| s.plugin.clone()).collect();
+            renderer.render(UiLine::Warning(format!(
+                "{} plugin(s) ship untrusted hooks ({}) — they won't run. Trust: atomcode plugin trust <name>",
+                untrusted.len(),
+                names.join(", ")
+            )));
+        }
+    }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
     // printing to stdout, so the user sees the ✓/✗ lines in the chat
