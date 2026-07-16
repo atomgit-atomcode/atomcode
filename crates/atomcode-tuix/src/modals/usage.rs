@@ -248,9 +248,9 @@ impl UsageModal {
             lines.push(format!("\x1b[90m  {month_header_str}\x1b[39m"));
 
             // 7 weekday rows (Sun=0 .. Sat=6)
-            // Distinct orange ramp: level 0 = faint dot, levels 1..5 = warm dark-red → bright-orange/gold
-            // AnsiValue: 52=dark red, 94=brown-orange, 166=orange, 208=bright orange, 214=gold
-            let heat_colors: [u8; 6] = [0, 52, 94, 166, 208, 214];
+            // GitHub-style green ramp (dark→bright, readable on a dark bg): level 0
+            // = faint dot, levels 1..5 = 256-colour greens 22→28→34→40→46.
+            let heat_colors: [u8; 6] = [0, 22, 28, 34, 40, 46];
             for wd in 0u8..7 {
                 let wd_label = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"][wd as usize];
                 let mut row = format!("\x1b[90m{wd_label}\x1b[39m ");
@@ -514,23 +514,15 @@ impl UsageModal {
 
             rows.push((String::new(), String::new()));
 
-            // Coloured legend: ● model  pct%
-            for (mi, (model, _, tok, _)) in model_stats.iter().enumerate() {
-                let color = model_colors[mi % model_colors.len()];
-                let pct = if total_tokens_all > 0 {
-                    (*tok as f64 / total_tokens_all as f64 * 100.0).round() as u64
-                } else {
-                    0
-                };
-                rows.push((
-                    format!("  \x1b[38;5;{color}m●\x1b[39m {model:<30} \x1b[90m{pct}%\x1b[39m"),
-                    String::new(),
-                ));
-            }
-
-            rows.push((String::new(), String::new()));
-
-            // Per-model breakdown lines
+            // Per-model table — the coloured ● also serves as the chart legend.
+            // Columns: ● Model | Tokens | Requests | Share (aligned).
+            rows.push((
+                format!(
+                    "  \x1b[90m  {:<26}{:>10}{:>9}{:>7}\x1b[39m",
+                    "Model", "Tokens", "Requests", "Share"
+                ),
+                String::new(),
+            ));
             for (mi, (model, _, tok, req)) in model_stats.iter().enumerate() {
                 let color = model_colors[mi % model_colors.len()];
                 let pct = if total_tokens_all > 0 {
@@ -538,11 +530,13 @@ impl UsageModal {
                 } else {
                     0
                 };
+                let share = format!("{pct}%");
                 rows.push((
                     format!(
-                        "  \x1b[38;5;{color}m●\x1b[39m \x1b[1m{model}\x1b[22m  \
-                         \x1b[90m{pct}%  ·  {req} reqs  ·  {}\x1b[39m",
-                        humanize_tokens(*tok)
+                        "  \x1b[38;5;{color}m●\x1b[39m {model:<26}\x1b[90m{:>10}{:>9}{:>7}\x1b[39m",
+                        humanize_tokens(*tok),
+                        req,
+                        share
                     ),
                     String::new(),
                 ));
@@ -885,8 +879,8 @@ mod tests {
         let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
         // GLM-5.2 has 717016/717116 ≈ 100% of tokens
         assert!(all.contains('%'), "expected percent breakdown; got:\n{all}");
-        // "reqs" should appear in breakdown
-        assert!(all.contains("reqs"), "expected 'reqs' in breakdown; got:\n{all}");
+        // The per-model TABLE has a "Requests" column header.
+        assert!(all.contains("Requests"), "expected 'Requests' table column; got:\n{all}");
         // Title should appear
         assert!(all.contains("Tokens per Day"), "expected chart title; got:\n{all}");
     }
