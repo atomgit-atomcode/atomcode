@@ -257,20 +257,23 @@ impl UsageModal {
                 pad = WD_LABEL_W
             ));
 
-            // Claude-Code-style calendar. Dark→bright coral ramp for activity
-            // (level 1 = least … 5 = most, ending at the #d97757 brand coral);
-            // faint dots for days with no activity (in-range zero or outside the
-            // window). Cells are CELL_W wide so the 60-day grid reads at a
-            // comfortable size, and adjacent active days connect.
-            const HEAT_RAMP: [(u8, u8, u8); 5] = [
-                (74, 47, 38),   // darkest muted coral
-                (110, 63, 49),
-                (146, 79, 60),
-                (182, 99, 73),
-                (217, 119, 87), // #d97757 — Claude brand coral
+            // Claude-Code-style calendar. Index 0 = a day in-range with zero
+            // activity (a neutral dark square so the grid stays solid — NOT a
+            // dot, which floated as a "hole" between active days); indexes 1..5 =
+            // a dark→bright coral ramp ending at the #d97757 brand coral. Only
+            // days OUTSIDE the window (leading/trailing padding) render blank.
+            // Cells are CELL_W wide so the 60-day grid reads at a comfortable size,
+            // and adjacent cells connect.
+            const HEAT_RAMP: [(u8, u8, u8); 6] = [
+                (56, 52, 54),   // 0 — in-range, no activity (neutral dark)
+                (74, 47, 38),   // 1 — least
+                (110, 63, 49),  // 2
+                (146, 79, 60),  // 3
+                (182, 99, 73),  // 4
+                (217, 119, 87), // 5 — most (#d97757, Claude brand coral)
             ];
             let full_block: String = "█".repeat(CELL_W);
-            let empty_cell: String = format!("·{}", " ".repeat(CELL_W - 1));
+            let blank_cell: String = " ".repeat(CELL_W);
             // Index level by (weekday, week_col) in one pass rather than rebuilding
             // a map for each of the 7 weekday rows.
             let mut grid: std::collections::HashMap<(u8, usize), u8> =
@@ -283,13 +286,12 @@ impl UsageModal {
                 let mut row = format!("\x1b[90m{}\x1b[39m ", weekdays[wd as usize]);
                 for col in 0..=max_week {
                     match grid.get(&(wd, col)).copied() {
-                        // No activity (in-range zero) or outside window → faint dot.
-                        None | Some(0) => {
-                            row.push_str(&format!("\x1b[38;5;238m{empty_cell}\x1b[39m"));
-                        }
-                        // Activity → coral block; no trailing gap so weeks connect.
+                        // Outside the data window (padding) → blank, clean edges.
+                        None => row.push_str(&blank_cell),
+                        // In-range day → square (level 0 neutral … 5 coral); no
+                        // trailing gap so adjacent cells connect into a solid grid.
                         Some(level) => {
-                            let (r, g, b) = HEAT_RAMP[(level as usize - 1).min(4)];
+                            let (r, g, b) = HEAT_RAMP[(level as usize).min(5)];
                             row.push_str(&format!("\x1b[38;2;{r};{g};{b}m{full_block}\x1b[39m"));
                         }
                     }
@@ -297,10 +299,10 @@ impl UsageModal {
                 lines.push(format!("  {row}"));
             }
 
-            // Legend: Less ██████ More (coral ramp swatches)
+            // Legend: Less ██████ More (coral activity swatches, skip the neutral 0)
             let legend = {
                 let mut s = format!("  \x1b[90m{} \x1b[39m", t(Msg::UsageHeatLess));
-                for &(r, g, b) in &HEAT_RAMP {
+                for &(r, g, b) in &HEAT_RAMP[1..] {
                     s.push_str(&format!("\x1b[38;2;{r};{g};{b}m██\x1b[39m"));
                 }
                 s.push_str(&format!("\x1b[90m {}\x1b[39m", t(Msg::UsageHeatMore)));
