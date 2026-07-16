@@ -470,8 +470,10 @@ pub(crate) async fn build_turn_parts(
     tool_registry.register_sync(Box::new(GrepTool));
     tool_registry.register_sync(Box::new(GlobTool));
     tool_registry.register_sync(Box::new(ListDirTool));
-    tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    tool_registry.register_sync(Box::new(WebFetchTool));
+    if !atomcode_config::config::offline::is_offline_active() {
+        tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
+        tool_registry.register_sync(Box::new(WebFetchTool));
+    }
     tool_registry.register_sync(Box::new(SearchReplaceTool));
     tool_registry.register_sync(Box::new(TodoTool::new()));
 

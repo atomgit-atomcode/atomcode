@@ -46,6 +46,8 @@ serde_json = "1"
 [dev-dependencies]
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+# Enable reset_offline_verdict_for_test() for offline-gate tests.
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
 # atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"

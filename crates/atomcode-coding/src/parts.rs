@@ -202,7 +202,7 @@ pub async fn prepare_with_plugin_hooks(
         atomcode_capabilities::codeintel::codeintel_tool_names().iter().map(|s| s.to_string()),
     );
 
-    if opts.web {
+    if opts.web && !atomcode_config::config::offline::is_offline_active() {
         registry.register(Arc::new(WebFetchTool));
         // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`
         // env knob (the zero-core path for legacy drivers, whose config types we can't
@@ -1109,5 +1109,64 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
+    }
+
+    /// Helper: run `prepare` with `opts.web = web_enabled` (all other optional capabilities
+    /// OFF so the call is I/O-free) and return the registered tool names.
+    async fn tool_names_for_test(web_enabled: bool) -> Vec<String> {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.web = web_enabled;
+        let parts = prepare(&cfg, opts).await.unwrap();
+        parts.tool_names.clone()
+    }
+
+    /// Offline mode must drop `web_fetch` and `web_search` from the coding-path tool
+    /// registry even when `opts.web` is `true` (the normal production setting).
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn offline_removes_web_tools_from_coding_registry() {
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+
+        let names = tool_names_for_test(true).await;
+        assert!(
+            !names.contains(&"web_fetch".to_string()),
+            "web_fetch must be absent when offline; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"web_search".to_string()),
+            "web_search must be absent when offline; got: {names:?}"
+        );
+
+        reset_offline_verdict_for_test();
+    }
+
+    /// When online (the default), `opts.web = true` must still register both web tools
+    /// (0-intrusion: behaviour is byte-identical to before this feature).
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn online_keeps_web_tools() {
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+
+        let names = tool_names_for_test(true).await;
+        assert!(
+            names.contains(&"web_fetch".to_string()),
+            "web_fetch must be present when online; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"web_search".to_string()),
+            "web_search must be present when online; got: {names:?}"
+        );
+
+        reset_offline_verdict_for_test();
     }
 }
