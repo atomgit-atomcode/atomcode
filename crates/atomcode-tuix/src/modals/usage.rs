@@ -208,18 +208,19 @@ impl UsageModal {
             // Determine number of week columns
             let max_week = cells.iter().map(|c| c.week_col).max().unwrap_or(0);
 
-            // Month-label header row: place short month name at each month_start column.
-            // Cell width = 3 display chars (glyph + 2 spaces), so col N starts at char offset N*3.
-            // We write into a plain Vec<char> buffer and overwrite at the right position,
-            // ensuring labels never collide regardless of spacing.
+            // Month-label header: a 3-letter month name at the first column of
+            // each month present in the data, aligned above that month's cells
+            // (indented past the weekday-label column). A label is skipped if it
+            // can't fit before the next month, so a sliver month at the edge
+            // doesn't show a cramped/clipped name.
             let month_names = [
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
             ];
-            const CELL_W: usize = 3; // display width per heatmap cell (glyph + 2 trailing spaces)
+            const CELL_W: usize = 4; // display width per week-column cell (bigger grid)
+            const WD_LABEL_W: usize = 4; // "Sun " weekday-label column width
             let header_len = (max_week + 1) * CELL_W;
             let mut header_buf: Vec<char> = vec![' '; header_len];
-            // Collect month_starts sorted by week_col so we can clip labels before the next one.
             let mut month_starts: Vec<(usize, &str)> = cells
                 .iter()
                 .filter(|c| c.month_start)
@@ -231,57 +232,76 @@ impl UsageModal {
             month_starts.sort_by_key(|&(col, _)| col);
             for (i, &(col, label)) in month_starts.iter().enumerate() {
                 let start = col * CELL_W;
-                // End = next label's start (or end of buffer), minus 1-char gap
+                // End = next month's column (minus a 1-col gap), or the buffer end.
                 let end = if i + 1 < month_starts.len() {
                     (month_starts[i + 1].0 * CELL_W).saturating_sub(1)
                 } else {
                     header_len
                 };
-                let avail = end.saturating_sub(start);
-                for (j, ch) in label.chars().take(avail).enumerate() {
+                // Skip the label if its full name can't fit — avoids a truncated
+                // month name at a narrow edge column.
+                if end.saturating_sub(start) < label.chars().count() {
+                    continue;
+                }
+                for (j, ch) in label.chars().enumerate() {
                     if start + j < header_buf.len() {
                         header_buf[start + j] = ch;
                     }
                 }
             }
             let month_header_str: String = header_buf.into_iter().collect();
-            lines.push(format!("\x1b[90m  {month_header_str}\x1b[39m"));
+            lines.push(format!(
+                "\x1b[90m  {:pad$}{}\x1b[39m",
+                "",
+                month_header_str.trim_end(),
+                pad = WD_LABEL_W
+            ));
 
-            // 7 weekday rows (Sun=0 .. Sat=6)
-            // GitHub-style green ramp (dark→bright, readable on a dark bg): level 0
-            // = faint dot, levels 1..5 = 256-colour greens 22→28→34→40→46.
-            let heat_colors: [u8; 6] = [0, 22, 28, 34, 40, 46];
+            // Claude-Code-style calendar. Dark→bright coral ramp for activity
+            // (level 1 = least … 5 = most, ending at the #d97757 brand coral);
+            // faint dots for days with no activity (in-range zero or outside the
+            // window). Cells are CELL_W wide so the 60-day grid reads at a
+            // comfortable size, and adjacent active days connect.
+            const HEAT_RAMP: [(u8, u8, u8); 5] = [
+                (74, 47, 38),   // darkest muted coral
+                (110, 63, 49),
+                (146, 79, 60),
+                (182, 99, 73),
+                (217, 119, 87), // #d97757 — Claude brand coral
+            ];
+            let full_block: String = "█".repeat(CELL_W);
+            let empty_cell: String = format!("·{}", " ".repeat(CELL_W - 1));
+            // Index level by (weekday, week_col) in one pass rather than rebuilding
+            // a map for each of the 7 weekday rows.
+            let mut grid: std::collections::HashMap<(u8, usize), u8> =
+                std::collections::HashMap::with_capacity(cells.len());
+            for c in &cells {
+                grid.insert((c.weekday, c.week_col), c.level);
+            }
+            let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
             for wd in 0u8..7 {
-                let wd_label = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"][wd as usize];
-                let mut row = format!("\x1b[90m{wd_label}\x1b[39m ");
-                let mut col = 0usize;
-                // gather cells for this weekday, indexed by week_col
-                let mut week_map: std::collections::HashMap<usize, u8> =
-                    std::collections::HashMap::new();
-                for c in &cells {
-                    if c.weekday == wd {
-                        week_map.insert(c.week_col, c.level);
+                let mut row = format!("\x1b[90m{}\x1b[39m ", weekdays[wd as usize]);
+                for col in 0..=max_week {
+                    match grid.get(&(wd, col)).copied() {
+                        // No activity (in-range zero) or outside window → faint dot.
+                        None | Some(0) => {
+                            row.push_str(&format!("\x1b[38;5;238m{empty_cell}\x1b[39m"));
+                        }
+                        // Activity → coral block; no trailing gap so weeks connect.
+                        Some(level) => {
+                            let (r, g, b) = HEAT_RAMP[(level as usize - 1).min(4)];
+                            row.push_str(&format!("\x1b[38;2;{r};{g};{b}m{full_block}\x1b[39m"));
+                        }
                     }
-                }
-                while col <= max_week {
-                    let level = week_map.get(&col).copied().unwrap_or(0);
-                    if level == 0 {
-                        row.push_str("\x1b[90m·\x1b[39m  ");
-                    } else {
-                        let color = heat_colors[level as usize];
-                        row.push_str(&format!("\x1b[38;5;{color}m██\x1b[39m "));
-                    }
-                    col += 1;
                 }
                 lines.push(format!("  {row}"));
             }
 
-            // Legend: Less ▪▪▪▪▪ More (5 swatches)
+            // Legend: Less ██████ More (coral ramp swatches)
             let legend = {
                 let mut s = format!("  \x1b[90m{} \x1b[39m", t(Msg::UsageHeatLess));
-                for lvl in 1u8..=5 {
-                    let color = heat_colors[lvl as usize];
-                    s.push_str(&format!("\x1b[38;5;{color}m■\x1b[39m"));
+                for &(r, g, b) in &HEAT_RAMP {
+                    s.push_str(&format!("\x1b[38;2;{r};{g};{b}m██\x1b[39m"));
                 }
                 s.push_str(&format!("\x1b[90m {}\x1b[39m", t(Msg::UsageHeatMore)));
                 s
@@ -419,7 +439,6 @@ impl UsageModal {
                 .flat_map(|(_, s, _, _)| s.iter().copied())
                 .max()
                 .unwrap_or(0);
-            let top_label = humanize_tokens(global_max);
 
             // Per-model single-series line grids (for colour attribution).
             // braille_line_plot uses its own internal max, so we need a consistent Y-scale:
@@ -452,10 +471,16 @@ impl UsageModal {
 
             // Render rows: merge grids, colour by first model with a dot
             for ri in 0..chart_h {
-                let y_label = if ri == 0 {
-                    format!("\x1b[90m{:>6}\x1b[39m ", top_label)
-                } else if ri == chart_h - 1 {
-                    format!("\x1b[90m{:>6}\x1b[39m ", "0")
+                // Y-axis gridline labels. Bottom row = 0 baseline; every other row
+                // gets its interpolated value (max at the top down to ~0). All arms
+                // are 8 visible columns wide (7-wide value + space) so the braille
+                // plot never jitters between labelled and blank rows.
+                let y_label = if ri == chart_h - 1 {
+                    format!("\x1b[90m{:>7}\x1b[39m ", "0")
+                } else if ri % 2 == 0 {
+                    let frac = (chart_h - 1 - ri) as f64 / (chart_h - 1) as f64;
+                    let val = (global_max as f64 * frac).round() as u64;
+                    format!("\x1b[90m{:>7}\x1b[39m ", humanize_tokens(val))
                 } else {
                     "        ".to_string()
                 };
@@ -481,33 +506,53 @@ impl UsageModal {
                 rows.push((line, String::new()));
             }
 
-            // X-axis date labels: guard against very small datasets to avoid overlap
+            // X-axis date labels: up to 5 evenly-spaced ticks placed into a fixed
+            // char buffer (like the month header) so they align under the chart and
+            // never overlap. Endpoints show the full YYYY-MM-DD (year context);
+            // inner ticks show MM-DD to fit the width.
             if !u.rows.is_empty() {
                 let n = u.rows.len();
                 let indent = "        "; // matches y-label width (8 chars)
                 let x_label_line = if n == 1 {
-                    // Single date: just show it left-aligned
                     format!("  {indent}\x1b[90m{}\x1b[39m", u.rows[0].date.as_str())
-                } else if n == 2 {
-                    // Two dates: left + right, no middle
-                    let left = u.rows[0].date.as_str();
-                    let right = u.rows[n - 1].date.as_str();
-                    let gap = chart_w.saturating_sub(left.len() + right.len());
-                    format!("  {indent}\x1b[90m{left}{:>width$}{right}\x1b[39m",
-                        "", width = gap.max(1))
                 } else {
-                    // Three dates: left, middle, right
-                    let left = u.rows[0].date.as_str();
-                    let mid = u.rows[n / 2].date.as_str();
-                    let right = u.rows[n - 1].date.as_str();
-                    let total_fixed = left.len() + mid.len() + right.len();
-                    let spacing = chart_w.saturating_sub(total_fixed);
-                    let left_gap = spacing / 2;
-                    let right_gap = spacing.saturating_sub(left_gap);
-                    format!("  {indent}\x1b[90m{left}{:>lw$}{mid}{:>rw$}{right}\x1b[39m",
-                        "", "",
-                        lw = left_gap.max(1),
-                        rw = right_gap.max(1))
+                    let ticks = n.min(5).max(2);
+                    let mut buf: Vec<char> = vec![' '; chart_w];
+                    let mut used_end = 0usize; // rightmost filled col + gap, prevents overlap
+                    for k in 0..ticks {
+                        let idx = k * (n - 1) / (ticks - 1);
+                        let date = u.rows[idx].date.as_str();
+                        let is_endpoint = k == 0 || k == ticks - 1;
+                        let label: String = if is_endpoint {
+                            date.to_string()
+                        } else {
+                            date.get(5..).unwrap_or(date).to_string() // MM-DD
+                        };
+                        let len = label.chars().count();
+                        // Endpoints anchor to the axis edges and always render in
+                        // full (year context matters most); inner ticks centre on
+                        // their column and shove right of the previous label if
+                        // they'd collide.
+                        let start = if k == 0 {
+                            0
+                        } else if k == ticks - 1 {
+                            chart_w.saturating_sub(len)
+                        } else {
+                            let center = idx * chart_w.saturating_sub(1) / (n - 1);
+                            center
+                                .saturating_sub(len / 2)
+                                .min(chart_w.saturating_sub(len))
+                                .max(used_end)
+                        };
+                        for (j, ch) in label.chars().enumerate() {
+                            if start + j < chart_w {
+                                buf[start + j] = ch;
+                            }
+                        }
+                        used_end = (start + len + 1).min(chart_w);
+                    }
+                    let label_str: String = buf.into_iter().collect();
+                    format!("  {indent}\x1b[90m{}\x1b[39m", label_str.trim_end())
                 };
                 rows.push((x_label_line, String::new()));
             }
