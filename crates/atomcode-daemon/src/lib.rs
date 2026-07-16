@@ -3244,13 +3244,17 @@ pub(crate) fn build_api_system_prompt(
                     .as_ref()
                     .map(|h| format!(" {}", h))
                     .unwrap_or_default();
-                format!("- /{}{}: {}", s.name, hint, s.description)
+                format!("- {}{}: {}", s.name, hint, s.description)
             })
             .collect();
         if !skills.is_empty() {
             prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
             prompt.push_str(
-                "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+                "Use the `use_skill` tool to invoke a skill when relevant to the task.\n\
+                 If user input matches a specific skill's description or trigger conditions \
+                 (e.g., sharing a URL matching a skill description, like a GitCode issue URL), \
+                 you MUST call `use_skill` with that skill (e.g., 'skills:gitcode-issue') instead of using generic tools \
+                 like `web_fetch`, `web_search`, or generic commands.\n",
             );
             prompt.push_str(&skills.join("\n"));
             prompt.push('\n');
