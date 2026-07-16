@@ -1699,6 +1699,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    fn plugin_item_height(&self, desc: &str, rule_width: usize) -> usize {
+        let (_status, description) = if let Some(idx) = desc.find("  ·  ") {
+            (&desc[..idx], &desc[idx + 5..])
+        } else {
+            (desc, "")
+        };
+        if description.is_empty() {
+            2
+        } else {
+            let avail_w = rule_width.saturating_sub(4).max(1);
+            let chunks = crate::width::wrap_line_to_width(description, avail_w);
+            1 + chunks.len().max(1)
+        }
+    }
+
     fn build_plugin_menu_rows(
         &self,
         name: &str,
@@ -1804,25 +1819,37 @@ impl<W: Write + Send> RetainedRenderer<W> {
             style2
         };
 
-        let line2_str = if description.is_empty() {
-            String::new()
+        let avail_w = rule_width.saturating_sub(4).max(1);
+        let chunks = if description.is_empty() {
+            vec![String::new()]
         } else {
-            format!("    {}", description)
+            crate::width::wrap_line_to_width(description, avail_w)
         };
 
-        let mut row2 = Vec::new();
-        push_str_cells_sgr(&mut row2, &line2_str, style2.clone());
-        let content_w2 = crate::width::display_width(&line2_str);
-        let right_pad2 = rule_width.saturating_sub(content_w2);
-        for _ in 0..right_pad2 {
-            row2.push(Cell {
-                ch: ' ',
-                width: 1,
-                style: if selected { style2.clone() } else { CellStyle::default() },
-            });
+        let mut rows = Vec::new();
+        rows.push(row1);
+
+        for chunk in chunks {
+            let line_str = if chunk.is_empty() {
+                String::new()
+            } else {
+                format!("    {}", chunk)
+            };
+            let mut row = Vec::new();
+            push_str_cells_sgr(&mut row, &line_str, style2.clone());
+            let content_w = crate::width::display_width(&line_str);
+            let right_pad = rule_width.saturating_sub(content_w);
+            for _ in 0..right_pad {
+                row.push(Cell {
+                    ch: ' ',
+                    width: 1,
+                    style: if selected { style2.clone() } else { CellStyle::default() },
+                });
+            }
+            rows.push(row);
         }
 
-        vec![row1, row2]
+        rows
     }
 
     fn build_marketplace_menu_rows(
@@ -2360,7 +2387,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let mut height_sum = 0;
                     while end < len - hint_h {
                         let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
-                            2
+                            self.plugin_item_height(&m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
                             let orig_idx = end;
                             if orig_idx >= 3 && orig_idx < len - hint_h {
@@ -2385,7 +2412,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             end = offset;
                             while end < len - hint_h {
                                 let item_h = if menu_kind == super::MenuKind::Plugin && end >= 4 && end < len - hint_h {
-                                    2
+                                    self.plugin_item_height(&m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Marketplace && end >= 2 && end < len - hint_h {
                                     let orig_idx = end;
                                     if orig_idx >= 3 && orig_idx < len - hint_h {
@@ -2498,7 +2525,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else if menu_kind == super::MenuKind::Plugin && orig_idx == 2 {
                     3
                 } else if menu_kind == super::MenuKind::Plugin && orig_idx >= 4 && orig_idx < m.items.len().saturating_sub(1) {
-                    2
+                    self.plugin_item_height(&m.items[orig_idx].1, rule_width)
                 } else {
                     1
                 }
