@@ -1139,6 +1139,7 @@ async fn run() -> Result<i32> {
         &cli_override,
         atomcode_dir.clone(),
         &ProcessEnv,
+        atomcode_config::config::offline::is_offline_active(),
     );
 
     // First-run notice: only show when telemetry would be active.

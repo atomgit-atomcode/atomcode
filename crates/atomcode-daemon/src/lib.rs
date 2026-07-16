@@ -4382,6 +4382,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         &cli_override,
         Config::config_dir(),
         &ProcessEnv,
+        atomcode_config::config::offline::is_offline_active(),
     );
 
     // Step 3: Print telemetry status line (R2.6) — suppressed in quiet (TUI) mode.

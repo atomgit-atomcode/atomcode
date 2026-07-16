@@ -71,7 +71,7 @@ fn load_telemetry_config(config_override: Option<&Path>) -> TelemetryConfig {
 /// wire it unconditionally and the sink itself enforces the opt-out.
 pub fn build_sink(config_override: Option<&Path>, no_telemetry: bool) -> Arc<Telemetry> {
     let cfg = load_telemetry_config(config_override);
-    let resolved = resolve(&cfg, &CliOverride { disabled: no_telemetry }, atomcode_dir(), &ProcessEnv);
+    let resolved = resolve(&cfg, &CliOverride { disabled: no_telemetry }, atomcode_dir(), &ProcessEnv, false);
     Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into())
 }
 

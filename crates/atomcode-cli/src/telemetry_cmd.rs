@@ -17,6 +17,7 @@ pub fn status(atomcode_dir: &std::path::Path, cfg: &TelemetryConfig) -> Result<(
         &CliOverride::default(),
         atomcode_dir.to_path_buf(),
         &ProcessEnv,
+        atomcode_config::config::offline::is_offline_active(),
     );
     match &resolved.state {
         TelemetryState::Enabled => println!("Telemetry: enabled"),
