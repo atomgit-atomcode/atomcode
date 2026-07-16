@@ -212,6 +212,27 @@ impl Modal for ModelPicker {
         }
     }
 
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        // Paste goes into the query, not the main buffer
+        for c in text.chars() {
+            if c.is_control() {
+                continue; // skip newlines/control characters
+            }
+            self.query.push(c);
+        }
+        self.update_filter(&ctx.config);
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self, ctx);
         // Show the typed filter query as the editable input line (not the main

@@ -336,6 +336,29 @@ impl Modal for SessionPicker {
         }
     }
 
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        // Paste goes into the query filter, not the main buffer
+        for c in text.chars() {
+            if c.is_control() {
+                continue; // skip newlines/control characters
+            }
+            self.query.push(c);
+        }
+        self.update_filter();
+        self.confirm_delete = None;
+        self.delete_status = None;
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
         let mut status = build_status(state, ctx);
