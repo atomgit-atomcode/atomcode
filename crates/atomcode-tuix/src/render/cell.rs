@@ -273,25 +273,36 @@ pub fn push_str_cells_sgr(
 /// to `\x1b[31m…` on output, and the terminal's theme palette gets to
 /// pick the actual shade rather than us hard-coding RGB.
 ///
-/// Unknown / unsupported codes (256-colour `38;5;N`, RGB `38;2;R;G;B`,
-/// background colours, italic, underline) are silently skipped —
-/// they're outside the cosmetic surface `CellStyle` currently
-/// represents, so picking up an LLM-emitted underline would just be
-/// lost on the retained path. Adding fields to `CellStyle` is the
-/// trigger for extending this match.
+/// Extended colour codes are decoded into crossterm colour variants:
+/// 256-colour `38;5;N` / `48;5;N` → `AnsiValue(N)`, and truecolor
+/// `38;2;R;G;B` / `48;2;R;G;B` → `Rgb`. These reach the retained path
+/// from the modal menu overlay (the `/usage` heatmap and per-model
+/// chart paint cells with `\x1b[38;5;Nm█`), so dropping them rendered
+/// those cells at the terminal default (white).
+///
+/// Italic / underline and other codes outside `CellStyle`'s cosmetic
+/// surface are still silently skipped — adding a field to `CellStyle`
+/// is the trigger for extending this match.
 fn apply_sgr_params(params: &str, style: &mut CellStyle) {
     // `\x1b[m` (empty params) means "reset" — same as `\x1b[0m`.
     if params.is_empty() {
         *style = CellStyle::default();
         return;
     }
-    for code in params.split(';') {
+    let parts: Vec<&str> = params.split(';').collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let code = parts[i];
         // `\x1b[;31m` (leading empty) also resets before applying.
         if code.is_empty() {
             *style = CellStyle::default();
+            i += 1;
             continue;
         }
-        let Ok(n) = code.parse::<u16>() else { continue };
+        let Ok(n) = code.parse::<u16>() else {
+            i += 1;
+            continue;
+        };
         match n {
             0 => *style = CellStyle::default(),
             1 => style.bold = true,
@@ -311,7 +322,20 @@ fn apply_sgr_params(params: &str, style: &mut CellStyle) {
             35 => style.fg = Some(Color::DarkMagenta),
             36 => style.fg = Some(Color::DarkCyan),
             37 => style.fg = Some(Color::Grey),
+            38 => {
+                if let Some((c, consumed)) = parse_extended_colour(&parts[i + 1..]) {
+                    style.fg = Some(c);
+                    i += consumed;
+                }
+            }
             39 => style.fg = None,
+            48 => {
+                if let Some((c, consumed)) = parse_extended_colour(&parts[i + 1..]) {
+                    style.bg = Some(c);
+                    i += consumed;
+                }
+            }
+            49 => style.bg = None,
             90 => style.fg = Some(Color::DarkGrey),
             91 => style.fg = Some(Color::Red),
             92 => style.fg = Some(Color::Green),
@@ -322,6 +346,28 @@ fn apply_sgr_params(params: &str, style: &mut CellStyle) {
             97 => style.fg = Some(Color::White),
             _ => {}
         }
+        i += 1;
+    }
+}
+
+/// Decode the sub-parameters that follow an SGR `38` / `48` introducer.
+/// `rest` is the slice of params after the introducer. Returns the
+/// resolved colour and how many of those sub-parameters were consumed
+/// (so the caller can advance past them): `5;N` → 2, `2;R;G;B` → 4.
+/// Malformed sequences consume nothing and yield `None`.
+fn parse_extended_colour(rest: &[&str]) -> Option<(Color, usize)> {
+    match rest.first().copied() {
+        Some("5") => {
+            let n = rest.get(1)?.parse::<u8>().ok()?;
+            Some((Color::AnsiValue(n), 2))
+        }
+        Some("2") => {
+            let r = rest.get(1)?.parse::<u8>().ok()?;
+            let g = rest.get(2)?.parse::<u8>().ok()?;
+            let b = rest.get(3)?.parse::<u8>().ok()?;
+            Some((Color::Rgb { r, g, b }, 4))
+        }
+        _ => None,
     }
 }
 
@@ -686,6 +732,36 @@ mod tests {
             faint: false,
             bg: None,
         }
+    }
+
+    #[test]
+    fn push_str_cells_sgr_handles_256_colour_fg_and_bg() {
+        // The modal menu overlay (heatmap, per-model chart) emits
+        // `\x1b[38;5;Nm█\x1b[39m`. The parser must decode the extended
+        // `38;5;N` / `48;5;N` forms into AnsiValue, not drop them (which
+        // left heatmap cells rendering as default-white).
+        let mut row: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(&mut row, "\x1b[38;5;40m█\x1b[39m", CellStyle::default());
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].style.fg, Some(Color::AnsiValue(40)));
+
+        let mut row2: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(&mut row2, "\x1b[48;5;22mX\x1b[49m", CellStyle::default());
+        assert_eq!(row2.len(), 1);
+        assert_eq!(row2[0].style.bg, Some(Color::AnsiValue(22)));
+
+        // Truecolor `38;2;R;G;B` should also resolve to Rgb.
+        let mut row3: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(&mut row3, "\x1b[38;2;10;20;30mY\x1b[0m", CellStyle::default());
+        assert_eq!(row3.len(), 1);
+        assert_eq!(
+            row3[0].style.fg,
+            Some(Color::Rgb {
+                r: 10,
+                g: 20,
+                b: 30
+            })
+        );
     }
 
     #[test]
