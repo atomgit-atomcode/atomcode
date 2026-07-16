@@ -3,7 +3,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use atomcode_core::coding_plan::types::RateLimitWindow;
+use atomcode_core::coding_plan::types::{PlanInfo, RateLimitWindow};
 use atomcode_core::coding_plan::usage::{compute_overview, humanize_tokens, OverviewStats, UsageResponse};
 
 use super::{Modal, ModalAction};
@@ -27,6 +27,7 @@ pub enum Tab {
 /// Fields are filled asynchronously; any may be `None` while loading or on error.
 pub struct UsageData {
     pub window: Option<RateLimitWindow>,
+    pub plan: Option<PlanInfo>,
     pub usage: Option<UsageResponse>,
     pub overview: Option<OverviewStats>,
     pub error: Option<String>,
@@ -132,6 +133,58 @@ impl UsageModal {
                 format!("  \x1b[90m{}\x1b[39m", t(Msg::UsageWindowUnavailable)),
                 String::new(),
             ));
+        }
+
+        // ── Plan section (CodingPlan entitlement) ──
+        if let Some(plan) = &self.data.plan {
+            rows.push((String::new(), String::new()));
+
+            let status_label = if plan.status == 1 {
+                format!("\x1b[32m{}\x1b[39m", t(Msg::UsagePlanActive))
+            } else {
+                format!("\x1b[31m{}\x1b[39m", t(Msg::UsagePlanExpired))
+            };
+            rows.push((
+                format!("  \x1b[1m{}\x1b[22m · {status_label}", plan.plan_name),
+                String::new(),
+            ));
+
+            if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
+                rows.push((
+                    format!(
+                        "  \x1b[90m{}\x1b[39m",
+                        t(Msg::UsagePlanClaimedExpires {
+                            claimed: &plan.claimed_at,
+                            expires: &plan.expires_at,
+                        })
+                    ),
+                    String::new(),
+                ));
+            }
+
+            if plan.total_days > 0 {
+                rows.push((
+                    format!(
+                        "  \x1b[90m{}\x1b[39m",
+                        t(Msg::UsagePlanRemaining {
+                            remaining: plan.remaining_days,
+                            total: plan.total_days,
+                        })
+                    ),
+                    String::new(),
+                ));
+                // Day-progress bar: elapsed = total - remaining
+                let elapsed_pct = ((plan.total_days - plan.remaining_days) as f64
+                    / plan.total_days as f64
+                    * 100.0)
+                    .clamp(0.0, 100.0);
+                let bar = progress_bar(elapsed_pct, 24);
+                let bar_color = if plan.remaining_days <= 0 { 31 } else { 33 };
+                rows.push((
+                    format!("  \x1b[{bar_color}m{bar}\x1b[39m  {:.1}%", elapsed_pct),
+                    String::new(),
+                ));
+            }
         }
 
         rows
@@ -710,6 +763,7 @@ mod tests {
         let overview = compute_overview(&usage);
         UsageModal::new(UsageData {
             window: None,
+            plan: None,
             usage: Some(usage),
             overview: Some(overview),
             error: None,
@@ -719,6 +773,7 @@ mod tests {
     fn empty_modal() -> UsageModal {
         UsageModal::new(UsageData {
             window: None,
+            plan: None,
             usage: None,
             overview: None,
             error: None,
@@ -847,15 +902,45 @@ mod tests {
     }
 
     #[test]
-    fn current_rows_has_no_plan_section() {
-        // The Plan section has been removed; current tab only shows the rate-limit window block.
-        let m = sample_modal();
+    fn current_rows_shows_plan_info_when_present() {
+        use atomcode_core::coding_plan::types::PlanInfo;
+        let plan = PlanInfo {
+            plan_name: "CodingPlan Pro".into(),
+            status: 1,
+            claimed_at: "2026-06-18".into(),
+            expires_at: "2026-07-18".into(),
+            remaining_days: 2,
+            total_days: 30,
+            apply_id: 42,
+        };
+        let usage = parse_usage(SAMPLE).expect("parse SAMPLE");
+        let overview = compute_overview(&usage);
+        let m = UsageModal::new(UsageData {
+            window: None,
+            plan: Some(plan),
+            usage: Some(usage),
+            overview: Some(overview),
+            error: None,
+        });
         let rows = m.current_rows();
         let all: String = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
-        // None of the plan-specific strings should appear
+        // plan_name should appear
         assert!(
-            !all.contains("CodingPlan") && !all.contains("Active") && !all.contains("Expired"),
-            "Plan section should be absent from Current tab; got:\n{all}"
+            all.contains("CodingPlan Pro"),
+            "expected plan_name in current rows; got:\n{all}"
+        );
+        // remaining/total days should appear
+        assert!(
+            all.contains("2") && all.contains("30"),
+            "expected remaining/total days; got:\n{all}"
+        );
+        // The standalone "Plan" title heading should NOT be its own line
+        // (we omit the UsagePlanTitle push intentionally)
+        let stripped: String = rows.iter().map(|(l, _)| UsageModal::strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        // The plan section starts directly at "CodingPlan Pro · Active", no bare "Plan" heading line
+        assert!(
+            !stripped.lines().any(|line| line.trim() == t(Msg::UsagePlanTitle).as_ref()),
+            "standalone Plan title heading should be absent; got:\n{stripped}"
         );
     }
 
