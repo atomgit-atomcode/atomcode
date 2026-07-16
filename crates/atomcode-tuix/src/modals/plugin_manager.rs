@@ -193,9 +193,9 @@ impl PluginManager {
         };
         let installed_count = self.installed.len();
         let t0 = if current_tab == 0 {
-            "  \x1b[1mBrowse Marketplaces\x1b[22m  "
+            "  \x1b[1mAll Plugins\x1b[22m  "
         } else {
-            &format!("  {}Browse Marketplaces\x1b[22;39m  ", muted_bold_esc())
+            &format!("  {}All Plugins\x1b[22;39m  ", muted_bold_esc())
         };
         let t1 = if current_tab == 1 {
             format!("  \x1b[1mInstalled ({})\x1b[22m  ", installed_count)
