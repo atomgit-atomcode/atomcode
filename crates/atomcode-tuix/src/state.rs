@@ -827,8 +827,13 @@ impl UiState {
         self.subagent_activity = None;
         self.approval_panel = None;
         self.steer_pending = 0;
-        self.active_todos = None;
-        self.todo_titles.clear();
+        // The todo panel is per-session, not per-turn: it survives turn
+        // termination (mirrors on_turn_complete). Clearing it here nuked the
+        // plan, and a "继续" turn only sends incremental todowrite updates that
+        // fold against the existing panel (a no-op on an empty base), so the
+        // panel could never rebuild — it stayed gone while the model kept
+        // executing. Only a session switch / new session / explicit clear drops
+        // `active_todos` + `todo_titles`.
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -858,8 +863,13 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
         self.steer_pending = 0;
-        self.active_todos = None;
-        self.todo_titles.clear();
+        // The todo panel is per-session, not per-turn: it survives turn
+        // termination (mirrors on_turn_complete). Clearing it here nuked the
+        // plan, and a "继续" turn only sends incremental todowrite updates that
+        // fold against the existing panel (a no-op on an empty base), so the
+        // panel could never rebuild — it stayed gone while the model kept
+        // executing. Only a session switch / new session / explicit clear drops
+        // `active_todos` + `todo_titles`.
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -1844,7 +1854,17 @@ mod tests {
     }
 
     #[test]
-    fn active_todos_cleared_on_cancel_and_error() {
+    fn active_todos_persist_across_cancel_and_error() {
+        // The todo panel is PER-SESSION state (see reset_to_new_session /
+        // SessionSwitched, which drop it), NOT per-turn — it already survives
+        // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
+        // error are just turn terminations too, so they must preserve it as
+        // well. Regression: clearing on cancel/error nuked the plan, and since
+        // a "继续" turn sends only INCREMENTAL todowrite updates (which fold
+        // against the existing panel via apply_todo_action — a no-op on an
+        // empty base), the panel could never rebuild. It stayed gone on screen
+        // while the model kept executing the plan from its own context. Only an
+        // explicit clear or a session switch may drop the panel.
         let mut s = UiState::new();
         s.active_todos = Some(crate::render::TodoProgress {
             current: Some("Task".to_string()),
@@ -1854,23 +1874,14 @@ mod tests {
             items: vec![],
         });
         s.todo_titles.insert(1, "Todo".to_string());
-        
-        s.on_turn_cancelled();
-        assert!(s.active_todos.is_none(), "todos must clear on cancellation");
-        assert!(s.todo_titles.is_empty());
 
-        s.active_todos = Some(crate::render::TodoProgress {
-            current: Some("Task2".to_string()),
-            completed: 1,
-            in_progress: 1,
-            total: 2,
-            items: vec![],
-        });
-        s.todo_titles.insert(2, "Todo2".to_string());
+        s.on_turn_cancelled();
+        assert!(s.active_todos.is_some(), "panel must survive cancellation");
+        assert!(!s.todo_titles.is_empty(), "titles must survive cancellation");
 
         s.on_error();
-        assert!(s.active_todos.is_none(), "todos must clear on error");
-        assert!(s.todo_titles.is_empty());
+        assert!(s.active_todos.is_some(), "panel must survive error");
+        assert!(!s.todo_titles.is_empty(), "titles must survive error");
     }
 
     #[test]
