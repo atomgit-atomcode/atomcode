@@ -173,6 +173,7 @@ struct TurnStats {
 /// an `atomcode_coding::cc_hooks::HookConfig`. Gathered once per bridge (it reads installed
 /// plugin manifests from disk) and reused across respawns.
 pub fn gather_plugin_cc_hooks() -> Vec<atomcode_coding::cc_hooks::HookConfig> {
+    atomcode_core::plugin::hook_trust::ensure_migrated();
     atomcode_core::plugin::loader::installed_plugin_cc_hooks()
         .into_iter()
         .filter_map(|h| {

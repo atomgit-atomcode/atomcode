@@ -377,6 +377,43 @@ mod tests {
         assert_eq!(installed_plugin_cc_hooks().len(), 1);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn grandfather_blesses_existing_then_new_installs_stay_untrusted() {
+        use crate::plugin::hook_trust::ensure_migrated;
+        let _home = crate::plugin::test_support::isolated_home();
+        // helper: a git repo shipping a file-based SessionStart hook
+        let mk_hook_repo = |name: &str, cmd: &str| {
+            let work = tempfile::tempdir().unwrap().keep();
+            let repo = work.join(name);
+            std::fs::create_dir_all(repo.join("hooks")).unwrap();
+            std::fs::write(repo.join("hooks/hooks.json"),
+                format!(r#"{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]}}"#)).unwrap();
+            for args in [["init","-q"].as_slice(), &["config","user.email","t@t"], &["config","user.name","t"], &["add","-A"], &["commit","-q","-m","i"]] {
+                std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap();
+            }
+            repo
+        };
+        // Existing plugin installed BEFORE migration.
+        let repo1 = mk_hook_repo("hp1", "echo one");
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo1.display())).unwrap();
+        crate::plugin::installer::install("hp1", "hp1", InstallScope::User).unwrap();
+        assert!(installed_plugin_cc_hooks().is_empty(), "untrusted before migration");
+
+        // Upgrade boundary → grandfather blesses the existing plugin.
+        ensure_migrated();
+        assert_eq!(installed_plugin_cc_hooks().len(), 1, "existing plugin grandfathered");
+
+        // A NEW plugin installed AFTER migration stays untrusted (marker set).
+        let repo2 = mk_hook_repo("hp2", "echo two");
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo2.display())).unwrap();
+        crate::plugin::installer::install("hp2", "hp2", InstallScope::User).unwrap();
+        ensure_migrated(); // idempotent no-op (marker exists)
+        let loaded = installed_plugin_cc_hooks();
+        assert_eq!(loaded.len(), 1, "new post-migration plugin NOT auto-trusted");
+        assert!(loaded.iter().all(|h| h.command == "echo one"));
+    }
+
     /// Debug test: dump the real-world installed plugins + skill loading.
     #[test]
     fn debug_real_world_plugins() {

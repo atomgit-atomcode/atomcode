@@ -75,6 +75,34 @@ pub fn untrust(plugin_id: &str) -> Result<()> {
     save_trust(&map)
 }
 
+fn migration_marker_path() -> Option<PathBuf> {
+    Some(super::paths::plugins_root()?.join(".hook_trust_migrated"))
+}
+
+/// One-time upgrade migration. The FIRST time this runs in a given home, trust
+/// the CURRENT hook-set hash of every already-installed plugin — so upgrading
+/// users whose plugin hooks auto-ran before the trust gate existed keep working.
+/// After the marker is written, new installs / changed hooks require explicit
+/// `plugin trust`. Idempotent (marker-guarded). Best-effort: IO errors are
+/// swallowed (worst case a plugin stays untrusted and the user re-trusts).
+pub fn ensure_migrated() {
+    let Some(marker) = migration_marker_path() else {
+        return;
+    };
+    if marker.exists() {
+        return;
+    }
+    for s in super::loader::installed_plugin_hook_trust_status() {
+        if !s.trusted {
+            let _ = trust(&s.plugin_id, &s.hash);
+        }
+    }
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let _ = std::fs::write(&marker, b"1");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
