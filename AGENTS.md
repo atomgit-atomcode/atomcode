@@ -79,7 +79,9 @@
 
 ## 验证与交付
 
-- 先运行受影响 crate 的针对性测试，再运行实际可行的最广 workspace 检查。
+- 修改过程中只运行最小相关测试；交付前运行受影响 crate 的完整测试。
+- 仅当改动跨 crate，或涉及公共协议、workspace 依赖、构建配置时，运行相关 workspace 检查。
+- 不要在没有代码或环境变化时重复运行相同测试命令。
 - 协议迁移必须覆盖 CLI、TUI、daemon、headless、session resume、approval、cancel 和 provider reload 中受影响的路径。
 - 最终说明必须包含：验证基线、达到的迁移状态、实际删除项、仍可达的 legacy surface、测试结果和唯一下一步。
 - 未删除旧 variant、handler 或依赖时，必须明确写“尚未退役”，不得以功能可用代替完成声明。
