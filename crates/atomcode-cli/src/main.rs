@@ -1105,16 +1105,31 @@ async fn run() -> Result<i32> {
 
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
-    // [telemetry] section. Failure to load config is non-fatal; telemetry
-    // will operate on defaults (enabled, built-in endpoint).
+    // [telemetry] section AND seed the offline verdict + note before any
+    // tool/persona/provider assembly. Failure to load config is non-fatal;
+    // telemetry will operate on defaults (enabled, built-in endpoint).
     let config_path_for_tel = cli.config.clone().unwrap_or_else(Config::default_path);
-    let telemetry_cfg = if config_path_for_tel.exists() {
-        Config::load(&config_path_for_tel)
-            .map(|c| c.telemetry)
-            .unwrap_or_default()
+    let early_config = if config_path_for_tel.exists() {
+        Config::load(&config_path_for_tel).ok()
     } else {
-        Default::default()
+        None
     };
+    let telemetry_cfg = early_config
+        .as_ref()
+        .map(|c| c.telemetry.clone())
+        .unwrap_or_default();
+
+    // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
+    atomcode_config::config::offline::seed_offline_verdict(
+        early_config
+            .as_ref()
+            .map(|c| c.offline_mode)
+            .unwrap_or_default(),
+        std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
+    );
+    atomcode_config::config::offline::set_offline_note(
+        early_config.as_ref().and_then(|c| c.offline_note.clone()),
+    );
     let atomcode_dir = Config::config_dir();
     let cli_override = CliOverride {
         disabled: cli.no_telemetry,

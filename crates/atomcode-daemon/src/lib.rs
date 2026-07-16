@@ -4345,14 +4345,29 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         ..
     } = opts;
 
-    // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
-    let cfg_telemetry = match Config::load(&Config::default_path()) {
-        Ok(c) => c.telemetry,
-        Err(e) => {
-            tracing::warn!(?e, "Failed to load config, using defaults");
+    // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default.
+    // Also seed the offline verdict + note ONCE from config + env here, before
+    // telemetry init and any tool/provider assembly (Step 4).
+    let startup_config = Config::load(&Config::default_path()).ok();
+    let cfg_telemetry = startup_config
+        .as_ref()
+        .map(|c| c.telemetry.clone())
+        .unwrap_or_else(|| {
+            tracing::warn!("Failed to load config, using defaults");
             atomcode_telemetry::TelemetryConfig::default()
-        }
-    };
+        });
+
+    // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
+    atomcode_config::config::offline::seed_offline_verdict(
+        startup_config
+            .as_ref()
+            .map(|c| c.offline_mode)
+            .unwrap_or_default(),
+        std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
+    );
+    atomcode_config::config::offline::set_offline_note(
+        startup_config.as_ref().and_then(|c| c.offline_note.clone()),
+    );
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(
