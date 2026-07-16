@@ -573,5 +573,11 @@ mod tests {
         check!(Msg::UsageNoData);
         check!(Msg::UsageFooterHint);
         check!(Msg::UsageFetchFailed { error: "timeout" });
+        check!(Msg::UsagePlanTitle);
+        check!(Msg::UsagePlanActive);
+        check!(Msg::UsagePlanExpired);
+        check!(Msg::UsagePlanClaimedExpires { claimed: "2026-06-01", expires: "2026-07-01" });
+        check!(Msg::UsagePlanRemaining { remaining: 5, total: 30 });
+        check!(Msg::UsageCopied);
     }
 }

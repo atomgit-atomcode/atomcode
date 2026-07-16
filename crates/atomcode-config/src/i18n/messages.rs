@@ -1185,6 +1185,18 @@ pub enum Msg<'a> {
     UsageFooterHint,
     /// Shown when the fetch failed and we have an error string.
     UsageFetchFailed { error: &'a str },
+    /// Plan section title on the Current tab.
+    UsagePlanTitle,
+    /// Plan status label when active (status == 1).
+    UsagePlanActive,
+    /// Plan status label when expired (status != 1).
+    UsagePlanExpired,
+    /// "Claimed {claimed} · Expires {expires}" line.
+    UsagePlanClaimedExpires { claimed: &'a str, expires: &'a str },
+    /// "Remaining {remaining}/{total} days" line.
+    UsagePlanRemaining { remaining: i32, total: i32 },
+    /// Brief confirmation shown after Ctrl+S copy.
+    UsageCopied,
 
     // ── engine v2 provider init (atomcode-bridge) ──
     /// Frame for a provider/engine init failure surfaced to the driver.

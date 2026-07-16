@@ -1208,8 +1208,16 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::UsageHeatMore => "More".into(),
         Msg::UsageModelsTitle => "Per-model usage".into(),
         Msg::UsageNoData => "No usage data available".into(),
-        Msg::UsageFooterHint => "Tab / 1·2·3 switch · Esc close".into(),
+        Msg::UsageFooterHint => "← / → or Tab switch · Ctrl+S copy · Esc close".into(),
         Msg::UsageFetchFailed { error } => format!("Failed to load usage: {error}").into(),
+        Msg::UsagePlanTitle => "Plan".into(),
+        Msg::UsagePlanActive => "Active".into(),
+        Msg::UsagePlanExpired => "Expired".into(),
+        Msg::UsagePlanClaimedExpires { claimed, expires } =>
+            format!("Claimed {claimed} · Expires {expires}").into(),
+        Msg::UsagePlanRemaining { remaining, total } =>
+            format!("Remaining {remaining}/{total} days").into(),
+        Msg::UsageCopied => "Copied to clipboard".into(),
         Msg::UsageCodingPlanOnly =>
             "Usage is only available on CodingPlan — run /login.".into(),
 
