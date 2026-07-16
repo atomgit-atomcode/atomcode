@@ -135,7 +135,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       <ul>
         <li>Skills contributed by the plugin appear in the <code>/</code> menu with a <code>&lt;plugin-name&gt;:</code> prefix, e.g. <code>/ascend-model-agent-plugin:ascend-model-verification</code>.</li>
         <li>The model can also invoke these skills through the <code>UseSkill</code> tool.</li>
-        <li>Hooks activate immediately — since v4.21.1, <code>/plugin install</code> rebuilds the hook executor automatically; no need to <code>/cd</code> or restart.</li>
+        <li>Hooks require explicit trust before they activate — run <code>atomcode plugin trust &lt;name&gt;</code> after reviewing the printed notice; hooks load on the next session. See <a href="#hook-trust-flow">Hook trust flow</a> below.</li>
       </ul>
 
       <h2>Directory layout</h2>
@@ -169,7 +169,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 }</code></pre>
 
       <h2>Hook events</h2>
-      <p>Plugins can hook the following events (matching CC):</p>
+      <p>Plugins can hook the following events (matching CC). Event names are case/style-insensitive — the loader accepts both PascalCase (<code>PreToolUse</code>, <code>SessionStart</code>) and snake_case (<code>pre_tool_use</code>, <code>session_start</code>); the two spellings are equivalent.</p>
       <table>
         <thead>
           <tr><th>Event</th><th>When it fires</th><th>Typical use</th></tr>
@@ -183,6 +183,28 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>Notification</code></td><td>System notification</td><td>Forward to external alert channels</td></tr>
         </tbody>
       </table>
+
+      <h3>Default-directory auto-discovery</h3>
+      <p>A plugin's assets are discovered from default directories automatically — no need to declare them in <code>plugin.json</code>:</p>
+      <ul>
+        <li><strong>Hooks</strong> — loaded from <code>hooks/hooks.json</code> first (CC layout), falling back to a root-level <code>hooks.json</code>.</li>
+        <li><strong>Skills</strong> — auto-scanned from the <code>skills/</code> directory.</li>
+        <li><strong>Commands</strong> — auto-scanned from the <code>commands/</code> directory.</li>
+      </ul>
+      <p>Only when your layout deviates from these defaults (e.g. a custom subdirectory name) do you need explicit <code>"skills"</code> / <code>"commands"</code> / <code>"hooks"</code> fields in <code>plugin.json</code>.</p>
+
+      <h3>Hook trust flow</h3>
+      <p>To prevent a malicious plugin from silently running arbitrary commands, plugin hooks are protected by a trust gate:</p>
+      <ol>
+        <li><strong>On install</strong> (<code>/plugin install</code> / <code>atomcode plugin install</code>) — AtomCode prints a notice of the hook commands found. Hooks are <strong>not run yet</strong>.</li>
+        <li><strong>Grant trust</strong> — after reviewing the notice, run:
+          <pre><code>atomcode plugin trust &lt;plugin-name&gt;</code></pre>
+          AtomCode records a hash of the current hook command set.</li>
+        <li><strong>Takes effect next session</strong> — trusted hooks are loaded and activated on the next startup.</li>
+        <li><strong>Re-trust after updates</strong> — if a plugin update changes its hook commands, the stored hash is invalidated automatically; run <code>trust</code> again to approve the new version.</li>
+      </ol>
+      <p>To revoke trust:</p>
+      <pre><code>atomcode plugin untrust &lt;plugin-name&gt;</code></pre>
 
       <h3>UserPromptSubmit IO protocol</h3>
       <p>The hook receives JSON on stdin and decides what to do via stdout:</p>
