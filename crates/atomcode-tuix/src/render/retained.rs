@@ -5590,20 +5590,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &err_style);
             }
             UiLine::Warning(msg) => {
-                // Yellow advisory — distinct from Error (red) so users
-                // can tell "noticed something" from "turn died". Renders
-                // with a `!` glyph + bold yellow body. Always-visible:
-                // we deliberately don't dim it because the whole point
-                // is to put a truncating-proxy or similar provider
-                // pathology in front of the user immediately. Colour is
-                // theme-aware (bright yellow is near-invisible on light
-                // backgrounds — see `warning_for_current_theme`).
+                // Amber advisory — distinct from Error (red) so users can tell
+                // "noticed something" from "turn died". A `⚠` glyph + amber
+                // (non-bold) body: visible without the loud bold-yellow full
+                // line (matches codex's warning style). Colour is theme-aware
+                // (bright yellow is near-invisible on light backgrounds — see
+                // `warning_for_current_theme`); the `⚠` downgrades to `!` on
+                // non-unicode terminals via the cell-level glyph backstop.
                 let warn_style = CellStyle {
                     fg: Some(crate::render::theme::warning_for_current_theme()),
-                    bold: true,
                     ..CellStyle::default()
                 };
-                let body = format!("! {}", scrub_controls(&msg));
+                let body = format!("⚠ {}", scrub_controls(&msg));
                 self.push_body_text(&body, &warn_style);
             }
             UiLine::Muted(msg) => {
