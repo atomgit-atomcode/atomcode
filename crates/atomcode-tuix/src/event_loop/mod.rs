@@ -4125,6 +4125,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             crate::i18n::t(crate::i18n::Msg::AdminWarningBanner).into_owned(),
         ));
     }
+    // Calm one-line offline advisory: shown once at startup so users know
+    // why web tools, telemetry, and auto-update are inactive. Uses UiLine::Warning
+    // (yellow) rather than Error (red) — it's informational, not a failure.
+    // The verdict is seeded before the event loop starts, so is_offline_active()
+    // is reliable here.
+    if atomcode_config::config::offline::is_offline_active() {
+        renderer.render(UiLine::Warning(
+            crate::i18n::t(crate::i18n::Msg::OfflineModeActive).into_owned(),
+        ));
+    }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
     // printing to stdout, so the user sees the ✓/✗ lines in the chat

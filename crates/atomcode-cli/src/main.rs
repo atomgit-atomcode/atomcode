@@ -379,6 +379,20 @@ fn should_try_sync_upgrade() -> bool {
             if !cfg.auto_update {
                 return false;
             }
+            // Offline mode (forced On, env wins over config) disables binary self-update,
+            // same as auto_update=false. Auto/Off do not skip (Auto is optimistic-online).
+            let offline_on = match atomcode_config::config::offline::offline_from_env(
+                std::env::var("ATOMCODE_OFFLINE").ok().as_deref(),
+            ) {
+                Some(m) => matches!(m, atomcode_config::config::offline::OfflineMode::On),
+                None => matches!(
+                    cfg.offline_mode,
+                    atomcode_config::config::offline::OfflineMode::On
+                ),
+            };
+            if offline_on {
+                return false;
+            }
         }
     }
     true

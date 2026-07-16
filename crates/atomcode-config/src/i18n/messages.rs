@@ -554,6 +554,9 @@ pub enum Msg<'a> {
     /// auto-update failure. `detail` is the first line of the underlying error.
     /// Replaces the red multi-line git-stderr dump that reads like a crash.
     PluginAutoUpdateSkipped { detail: &'a str },
+    /// Calm one-line advisory shown once at startup when offline mode is active.
+    /// Informs the user that web tools, telemetry, and auto-update are disabled.
+    OfflineModeActive,
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
     PluginInstallingByName { plugin: &'a str },
     PluginAlreadyInstalled { id: &'a str },

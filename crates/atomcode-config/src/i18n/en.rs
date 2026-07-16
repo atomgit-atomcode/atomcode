@@ -742,6 +742,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list marketplaces: {error}").into(),
         Msg::PluginAutoUpdateSkipped { detail } =>
             format!("Marketplace auto-update skipped (chat unaffected): {detail}").into(),
+        Msg::OfflineModeActive =>
+            "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>

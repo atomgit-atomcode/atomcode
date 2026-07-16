@@ -123,7 +123,9 @@ pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     if config.plugin.auto_install_default_skills {
         events.extend(maybe_install_default_skills());
     }
-    if config.plugin.auto_update_marketplaces {
+    if config.plugin.auto_update_marketplaces
+        && !atomcode_config::config::offline::is_offline_active()
+    {
         events.extend(refresh_installed_marketplaces());
     }
     events

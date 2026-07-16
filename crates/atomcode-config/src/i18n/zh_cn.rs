@@ -727,6 +727,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginAutoUpdateSkipped { detail } =>
             format!("插件市场自动更新已跳过（不影响对话）：{detail}").into(),
+        Msg::OfflineModeActive =>
+            "离线模式：已停用联网工具、遥测与自动更新。".into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginInstallingByName { plugin } =>
