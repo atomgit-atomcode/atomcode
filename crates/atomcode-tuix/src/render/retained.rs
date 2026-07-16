@@ -7530,11 +7530,18 @@ mod tests {
             "[RETAINED BYTE] coalesce: 40 renders + 1 tick = {} B total",
             burst_bytes
         );
-        // Upper bound: cold start (first paint after session init)
-        // re-emits every non-blank cell + UTF-8 CJK + rule + cursor
-        // moves. Budget 1200 B; typical observed ~700 B.
+        // Upper bound: cold start (first paint after session init) re-emits
+        // every non-blank cell + UTF-8 CJK + rule + cursor moves. The 13×"你是谁"
+        // burst is 39 CJK × 2 = 78 cols = EXACTLY text_budget (80 − 2), so the
+        // final coalesced frame also soft-wraps the end-of-buffer caret onto a
+        // fresh row (the Windows-caret fix in wrap_with_cursor) — which grows
+        // the input box by a row and shifts the bottom rule + status down,
+        // adding a one-time re-emit of those rows. Still ONE emit (the pre-flush
+        // zero-byte assertion above proves coalescing held); budget 3500 B,
+        // observed ~3072 B — far below the ~6 KB a broken per-frame re-emit
+        // (40 frames) or double-emit would cost.
         assert!(
-            burst_bytes > 0 && burst_bytes < 2500,
+            burst_bytes > 0 && burst_bytes < 3500,
             "coalesce should produce exactly one modest emit: {} B",
             burst_bytes
         );
