@@ -5363,6 +5363,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let muted = self.style_for(Role::Muted);
                 let add_style = self.style_for(Role::DiffAdd);
                 let del_style = self.style_for(Role::DiffRemove);
+                let secondary = self.style_for(Role::Secondary);
 
                 // Summary header `+N −M` (codex/opencode style): a glance shows
                 // the size of the change without reading every row.
@@ -5403,7 +5404,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     let style = match entry.kind {
                         DiffKind::Add => &add_style,
                         DiffKind::Del => &del_style,
-                        _ => &muted,
+                        _ => &secondary,
                     };
                     let body = crate::render::diff::diff_row_text(entry, gutter);
                     self.push_body_text(&scrub_controls(&body), style);
