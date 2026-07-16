@@ -103,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn trust_roundtrip() {
         let _home = crate::plugin::test_support::isolated_home();
         let id = plugin_id("superpowers", "superpowers-dev");
