@@ -3651,6 +3651,33 @@ mod tool_format_tests {
         assert!(out.contains("(3 lines)"));
     }
 
+    #[test]
+    fn summarise_read_result_collapses_line_number_and_indent() {
+        // read_file emits `{n:>6}\t{indented source line}`; the preview should
+        // show `{n}  {trimmed content}` with no big left gap.
+        let out = "   873\t                    images: core_images,\n   874\t    other: 1,";
+        assert_eq!(
+            summarise_read_result(out),
+            "873  images: core_images, (2 lines)"
+        );
+    }
+
+    #[test]
+    fn summarise_read_result_single_line_has_no_count() {
+        let out = "     5\t        let x = 1;";
+        assert_eq!(summarise_read_result(out), "5  let x = 1;");
+    }
+
+    #[test]
+    fn summarise_read_result_falls_back_when_not_line_numbered() {
+        // Directory listing / skeleton header / error have no `<digits>\t` prefix.
+        let out = "[File skeleton: foo.rs (10 lines)]\n\nbody";
+        assert_eq!(
+            summarise_read_result(out),
+            "[File skeleton: foo.rs (10 lines)] (3 lines)"
+        );
+    }
+
     /// Batch child text: bash children get `  └ Bash <cmd>` (name + command);
     /// non-bash children keep `  └ Name(args)`.
     ///
@@ -10002,6 +10029,10 @@ fn handle_agent_event(
                         // Clean per-subtask lines (id · model · status) instead of the
                         // raw <task ...> block.
                         summarise_task_result(&output)
+                    } else if name == "read_file" && success {
+                        // Collapse the `{line}\t{indented content}` preview so a
+                        // deeply-indented line doesn't render as a big left gap.
+                        summarise_read_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -12594,6 +12625,34 @@ pub(crate) fn summarise(output: &str) -> String {
     // `truncate_with_ellipsis` (not bare `truncate_to_width`) so that if
     // the safety bound ever does bite, the cut is visibly marked.
     let trimmed = crate::width::truncate_with_ellipsis(first, 512);
+    if n > 1 {
+        format!("{} ({} lines)", trimmed, n)
+    } else {
+        trimmed
+    }
+}
+
+/// Collapse a `read_file` first-line preview into a tidy `{n}  {content}`.
+///
+/// `read_file` formats each line as `{n:>6}\t{source line}` — the line number
+/// right-padded to 6 columns, a tab, then the source line WITH its own
+/// indentation. For a deeply-indented line the tab plus that indentation renders
+/// as a big empty gap between the number and the text. Recognise the
+/// `<digits>\t` prefix and collapse the tab + the content's leading whitespace to
+/// two spaces; fall back to the raw first line for anything else (directory
+/// listing, `[File skeleton…]` header, error message).
+pub(crate) fn summarise_read_result(output: &str) -> String {
+    let first = output.lines().next().unwrap_or("(no output)");
+    let n = output.lines().count();
+    let cleaned = match first.split_once('\t') {
+        Some((lead, content))
+            if !lead.trim().is_empty() && lead.trim().chars().all(|c| c.is_ascii_digit()) =>
+        {
+            format!("{}  {}", lead.trim(), content.trim_start())
+        }
+        _ => first.to_string(),
+    };
+    let trimmed = crate::width::truncate_with_ellipsis(&cleaned, 512);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {
