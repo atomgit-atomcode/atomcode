@@ -470,7 +470,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// the canonical form through `starts_with` so a pure target like
 /// `~/.atomcode/memory.md` (no symlink) also matches.
 fn is_under_atomcode_home(raw_path: &str, canonical_path: &Path) -> bool {
-    let home = crate::config::Config::config_dir();
+    let home = atomcode_config::config::Config::config_dir();
     // Canonicalise the config dir so the `starts_with` comparison
     // works even when `~/.atomcode` itself contains intermediate
     // symlinks (macOS `/var → /private/var` is the common case).
@@ -668,8 +668,8 @@ fn is_atomcode_owned_path(path: &Path) -> bool {
     let trusted_roots: &[PathBuf] = &[
         home.join(".atomcode").join("plugins"),
         home.join(".atomcode").join("skills"),
-        crate::config::Config::config_dir().join("plugins"),
-        crate::config::Config::config_dir().join("skills"),
+        atomcode_config::config::Config::config_dir().join("plugins"),
+        atomcode_config::config::Config::config_dir().join("skills"),
     ];
     trusted_roots
         .iter()

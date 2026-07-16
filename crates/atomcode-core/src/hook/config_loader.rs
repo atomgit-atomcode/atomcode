@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -182,6 +183,65 @@ impl HooksConfig {
         // Note: "message" / "user_prompt_submit" webhook support requires an
         // OnMessageReceivedHook slot in HookEngine (TODO: follow-up PR).
     }
+}
+
+/// Load all enabled script hooks from TOML configs (global + project),
+/// preserving their names. Project hooks override global hooks by name.
+///
+/// This is the TOML counterpart of [`json_config::load_hooks_config_with_names`],
+/// used by `hook test <name>` to support testing TOML-configured hooks.
+pub fn load_script_hooks_with_names(project_dir: &Path) -> Vec<(String, ScriptHookConfig)> {
+    let mut merged: BTreeMap<String, ScriptHookConfig> = BTreeMap::new();
+
+    // Global hooks: ~/.atomcode/hooks/hooks.toml
+    if let Some(home) = dirs::home_dir() {
+        let global_dir = home.join(".atomcode").join("hooks");
+        match HooksConfig::from_dir(&global_dir) {
+            Ok(config) => {
+                for mut hook in config.hooks {
+                    if hook.enabled {
+                        if !hook.script.is_absolute() {
+                            hook.script = global_dir.join(&hook.script);
+                        }
+                        merged.insert(hook.name.clone(), hook);
+                    }
+                }
+            }
+            Err(e) => {
+                if global_dir.exists() {
+                    tracing::warn!(
+                        "[Hook] Failed to load global TOML hook config from {}: {}",
+                        global_dir.display(), e
+                    );
+                }
+            }
+        }
+    }
+
+    // Project hooks: <cwd>/.atomcode/hooks/hooks.toml — override global by name
+    let project_hooks_dir = project_dir.join(".atomcode").join("hooks");
+    match HooksConfig::from_dir(&project_hooks_dir) {
+        Ok(config) => {
+            for mut hook in config.hooks {
+                if hook.enabled {
+                    if !hook.script.is_absolute() {
+                        hook.script = project_hooks_dir.join(&hook.script);
+                    }
+                    merged.insert(hook.name.clone(), hook);
+                }
+            }
+        }
+        Err(e) => {
+            if project_hooks_dir.exists() {
+                tracing::warn!(
+                    "[Hook] Failed to load project TOML hook config from {}: {}",
+                    project_hooks_dir.display(), e
+                );
+            }
+        }
+    }
+
+    merged.into_iter().collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -469,34 +529,60 @@ script = "report.sh"
 
     #[test]
     fn test_hook_engine_load_all_from_dir() {
-        let dir = std::env::temp_dir().join(format!("hook_engine_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(dir.join(".atomcode").join("hooks"));
-        fs::write(dir.join(".atomcode").join("hooks").join("hooks.toml"), r#"
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_dir = dir.path().join(".atomcode").join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create project hooks dir");
+        fs::write(hooks_dir.join("project-hook.sh"), "").expect("create hook script");
+        fs::write(hooks_dir.join("hooks.toml"), r#"
 [[hooks]]
 name = "test-hook"
 trigger = "pre_tool"
-script = "/bin/echo"
+script = "project-hook.sh"
 enabled = true
 "#).expect("Should write test file");
 
         let mut engine = HookEngine::new();
-        engine.load_all(&dir);
+        engine.load_all(dir.path());
         assert!(engine.has_any(), "load_all should register hooks from dir");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_hook_engine_load_all_empty_dir() {
-        let dir = std::env::temp_dir().join(format!("hook_engine_empty_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _home = crate::plugin::test_support::isolated_home();
+        let dir = tempfile::tempdir().expect("tempdir");
 
         let mut engine = HookEngine::new();
-        engine.load_all(&dir);
-        // built-ins are always registered, so has_any() may be true
-        // This test just verifies load_all doesn't panic on empty dir
-        assert!(engine.has_any());
+        engine.load_all(dir.path());
+        assert!(!engine.has_any(), "empty dir must register no hooks");
+    }
 
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    #[serial_test::serial]
+    fn test_hook_engine_load_all_uses_atomcode_home_for_global_toml() {
+        let home = crate::plugin::test_support::isolated_home();
+        let hooks_dir = home.path().join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create global hooks dir");
+        fs::write(hooks_dir.join("global-hook.sh"), "").expect("create hook script");
+        fs::write(
+            hooks_dir.join("hooks.toml"),
+            r#"
+[[hooks]]
+name = "global-test-hook"
+trigger = "pre_tool"
+script = "global-hook.sh"
+enabled = true
+"#,
+        )
+        .expect("write global hooks config");
+
+        let project = tempfile::tempdir().expect("tempdir");
+        let mut engine = HookEngine::new();
+        engine.load_all(project.path());
+
+        assert!(
+            engine.has_any(),
+            "global TOML hooks must resolve from ATOMCODE_HOME"
+        );
     }
 }

@@ -825,9 +825,7 @@ pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -
 /// Build a `call_id -> tool_name` lookup from a slice of messages. The
 /// `MessageContent::AssistantWithToolCalls` variant carries the model's
 /// own tool name; this is what we surface in stubs.
-fn build_call_id_to_tool_map(
-    msgs: &[Message],
-) -> std::collections::HashMap<String, String> {
+fn build_call_id_to_tool_map(msgs: &[Message]) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for msg in msgs {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
@@ -901,7 +899,10 @@ pub(crate) fn compact_old_tool_results_in_place(
 /// (`keep_recent_turns = 1` → keeps everything after the last `Role::User`,
 /// i.e. the active turn). Because it commits, the stubbed prefix never
 /// changes again across turns — the property `microcompact` violated.
-pub(crate) fn collapse_committed(conv: &mut crate::conversation::Conversation, token_budget: usize) {
+pub(crate) fn collapse_committed(
+    conv: &mut crate::conversation::Conversation,
+    token_budget: usize,
+) {
     let threshold_chars = (token_budget as u64 * 4 * 70 / 100) as usize;
     let total_chars: usize = conv
         .messages
@@ -915,7 +916,9 @@ pub(crate) fn collapse_committed(conv: &mut crate::conversation::Conversation, t
     if total_chars < threshold_chars {
         return;
     }
-    compact_old_tool_results_in_place(conv, /* keep_recent_turns */ 1, /* exempt_read_file */ true);
+    compact_old_tool_results_in_place(
+        conv, /* keep_recent_turns */ 1, /* exempt_read_file */ true,
+    );
 }
 
 // `replace_stale_reads` was removed: it mutated historical `read_file`
@@ -1167,8 +1170,10 @@ mod tests {
         // consecutive User msgs, which would collapse 15 calls into 1).
         let mut conv = Conversation::new();
         for i in 0..8 {
-            conv.messages.push(Message::new(Role::User, format!("u{}", i)));
-            conv.messages.push(Message::new(Role::Assistant, format!("a{}", i)));
+            conv.messages
+                .push(Message::new(Role::User, format!("u{}", i)));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("a{}", i)));
         }
         assert_eq!(conv.messages.len(), 16);
         assert!(!needs_compression(&conv, 0, 131_072));
@@ -1240,7 +1245,8 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::ToolResultRef(big_ref),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         };
         // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
         assert!(
@@ -1650,7 +1656,6 @@ mod tests {
         );
     }
 
-
     /// 5-7 atomgr datalog (build 942b615): 1704/1704 bash stubs surfaced
     /// `first: [elapsed: Xs, exit: N]` — framework metadata, zero signal.
     /// Stub now skips that line and shows line 2 (the real output / real
@@ -1658,7 +1663,8 @@ mod tests {
     /// origin" to "actual error: ...".
     #[test]
     fn build_compact_stub_skips_bash_elapsed_metadata() {
-        let bash_failure = "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
+        let bash_failure =
+            "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
         let stub = build_compact_stub("bash", bash_failure, false);
         assert!(
             stub.contains("error: cannot find type"),
@@ -1810,8 +1816,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn test_cold_zone_compression() {
         use crate::tool::{ToolCall, ToolResult};
@@ -1908,7 +1912,8 @@ mod tests {
         );
         let summary_in_user = msgs.iter().any(|m| {
             matches!(m.role, Role::User)
-                && m.text().map_or(false, |t| t.contains("Earlier conversation history"))
+                && m.text()
+                    .map_or(false, |t| t.contains("Earlier conversation history"))
         });
         assert!(
             summary_in_user,
@@ -2038,7 +2043,8 @@ mod tests {
                     output: "some output".to_string(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message::new(Role::User, "hello"),
         ];
@@ -2067,7 +2073,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2076,7 +2083,8 @@ mod tests {
                     output: "ok".to_string(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2120,7 +2128,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2129,7 +2138,8 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2138,7 +2148,8 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             // c3 result MISSING — the source of the 400.
             Message::new(Role::User, "second"),
@@ -2178,7 +2189,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2187,7 +2199,8 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             // a2 missing.
             Message {
@@ -2202,7 +2215,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2211,7 +2225,8 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2253,7 +2268,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2262,7 +2278,8 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             // c2 missing, conversation ends here.
         ];
@@ -2300,7 +2317,8 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2309,7 +2327,8 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message {
                 role: Role::Tool,
@@ -2318,7 +2337,8 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             },
             Message::new(Role::Assistant, "done"),
             Message::new(Role::User, "second"),
@@ -2346,9 +2366,21 @@ mod tests {
         conv.add_assistant_tool_calls(
             None,
             vec![
-                ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
-                ToolCall { id: "c2".into(), name: "bash".into(), arguments: "{}".into() },
-                ToolCall { id: "c3".into(), name: "bash".into(), arguments: "{}".into() },
+                ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
             ],
             None,
         );
@@ -2418,7 +2450,6 @@ mod tests {
             }
         }
     }
-
 
     /// Regression: `build_compression_content` must not cut between an
     /// `AssistantWithToolCalls` and its trailing `ToolResult`(s). Cutting
@@ -2830,7 +2861,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "r".into(), name: "read_file".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "r".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2840,7 +2875,11 @@ mod tests {
         });
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2853,13 +2892,22 @@ mod tests {
         compact_old_tool_results_in_place(&mut conv, 1, true);
 
         let get = |cid: &str, conv: &Conversation| {
-            conv.messages.iter().find_map(|m| match &m.content {
-                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
-                _ => None,
-            }).unwrap()
+            conv.messages
+                .iter()
+                .find_map(|m| match &m.content {
+                    MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                    _ => None,
+                })
+                .unwrap()
         };
-        assert!(!get("r", &conv).starts_with('['), "read_file must stay full when exempt");
-        assert!(get("b", &conv).starts_with("[bash "), "bash must be stubbed");
+        assert!(
+            !get("r", &conv).starts_with('['),
+            "read_file must stay full when exempt"
+        );
+        assert!(
+            get("b", &conv).starts_with("[bash "),
+            "bash must be stubbed"
+        );
     }
 
     #[test]
@@ -2869,7 +2917,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "r".into(), name: "read_file".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "r".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2881,11 +2933,18 @@ mod tests {
 
         compact_old_tool_results_in_place(&mut conv, 1, false);
 
-        let out = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "r" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
-        assert!(out.starts_with("[read_file "), "emergency path must still stub read_file");
+        let out = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "r" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            out.starts_with("[read_file "),
+            "emergency path must still stub read_file"
+        );
     }
 
     #[test]
@@ -2895,7 +2954,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2908,13 +2971,20 @@ mod tests {
         // budget 1_000_000 → threshold 2.8M chars; ~1K payload → no-op.
         collapse_committed(&mut conv, 1_000_000);
 
-        let out = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
+        let out = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
         // The original bash output starts with "[elapsed:..." — a stub would start with "[bash ".
         // Below threshold nothing should be stubbed.
-        assert!(!out.starts_with("[bash "), "below threshold must stay full (append-only)");
+        assert!(
+            !out.starts_with("[bash "),
+            "below threshold must stay full (append-only)"
+        );
     }
 
     #[test]
@@ -2927,7 +2997,11 @@ mod tests {
             let r = format!("r{n}");
             conv.add_assistant_tool_calls(
                 None,
-                vec![ToolCall { id: r.clone(), name: "read_file".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: r.clone(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
                 None,
             );
             conv.add_tool_result(ToolResult {
@@ -2938,7 +3012,11 @@ mod tests {
             let b = format!("b{n}");
             conv.add_assistant_tool_calls(
                 None,
-                vec![ToolCall { id: b.clone(), name: "bash".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: b.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
                 None,
             );
             conv.add_tool_result(ToolResult {
@@ -2951,7 +3029,11 @@ mod tests {
         conv.add_user_message("active");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "ba".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "ba".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2964,16 +3046,28 @@ mod tests {
         collapse_committed(&mut conv, 8_000);
 
         let get = |cid: &str, conv: &Conversation| {
-            conv.messages.iter().find_map(|m| match &m.content {
-                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
-                _ => None,
-            }).unwrap()
+            conv.messages
+                .iter()
+                .find_map(|m| match &m.content {
+                    MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                    _ => None,
+                })
+                .unwrap()
         };
-        assert!(get("b0", &conv).starts_with("[bash "), "old bash must be stubbed");
+        assert!(
+            get("b0", &conv).starts_with("[bash "),
+            "old bash must be stubbed"
+        );
         // read_file output starts with "L1\n..." — check it was not replaced with a stub.
-        assert!(!get("r0", &conv).starts_with('['), "old read_file must stay full (exempt)");
+        assert!(
+            !get("r0", &conv).starts_with('['),
+            "old read_file must stay full (exempt)"
+        );
         // Active-turn bash output starts with "[elapsed:..." — a stub would start with "[bash ".
-        assert!(!get("ba", &conv).starts_with("[bash "), "active-turn bash must stay full");
+        assert!(
+            !get("ba", &conv).starts_with("[bash "),
+            "active-turn bash must stay full"
+        );
     }
 
     #[test]
@@ -2983,7 +3077,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -2994,16 +3092,27 @@ mod tests {
         conv.add_user_message("t1");
 
         collapse_committed(&mut conv, 8_000);
-        let after_first = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
+        let after_first = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
         collapse_committed(&mut conv, 8_000);
-        let after_second = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
-        assert_eq!(after_first, after_second, "re-running must not re-stub (idempotent)");
+        let after_second = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "re-running must not re-stub (idempotent)"
+        );
     }
 
     #[test]
@@ -3013,7 +3122,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -3024,7 +3137,11 @@ mod tests {
         // Only 1 turn, keep_recent_turns=1 → early return, no modification.
         let before_count = conv.messages.len();
         compact_old_tool_results_in_place(&mut conv, 1, false);
-        assert_eq!(conv.messages.len(), before_count, "must be noop when turns <= keep_recent_turns");
+        assert_eq!(
+            conv.messages.len(),
+            before_count,
+            "must be noop when turns <= keep_recent_turns"
+        );
     }
 
     #[test]
@@ -3034,7 +3151,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         // Output smaller than MIN_COLLAPSE_SIZE (500) — must not be stubbed.
@@ -3047,11 +3168,18 @@ mod tests {
 
         compact_old_tool_results_in_place(&mut conv, 1, false);
 
-        let out = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
-        assert_eq!(out, "tiny output", "output below MIN_COLLAPSE_SIZE must stay intact");
+        let out = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "b" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            out, "tiny output",
+            "output below MIN_COLLAPSE_SIZE must stay intact"
+        );
     }
 
     #[test]
@@ -3061,7 +3189,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "x".into(), name: "mystery_tool".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "x".into(),
+                name: "mystery_tool".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -3073,11 +3205,18 @@ mod tests {
 
         compact_old_tool_results_in_place(&mut conv, 1, true);
 
-        let out = conv.messages.iter().find_map(|m| match &m.content {
-            MessageContent::ToolResult(r) if r.call_id == "x" => Some(r.output.clone()),
-            _ => None,
-        }).unwrap();
-        assert!(out.starts_with("[mystery_tool "), "unknown tool must still be stubbed with its name");
+        let out = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.call_id == "x" => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            out.starts_with("[mystery_tool "),
+            "unknown tool must still be stubbed with its name"
+        );
     }
 
     #[test]
@@ -3095,7 +3234,11 @@ mod tests {
         conv.add_user_message("t0");
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -3109,7 +3252,11 @@ mod tests {
         // (< 500) won't shrink → no-op. This tests the MIN_COLLAPSE_SIZE guard.
         let snapshot_len = conv.messages.len();
         collapse_committed(&mut conv, 0);
-        assert_eq!(conv.messages.len(), snapshot_len, "zero budget, but conv unchanged");
+        assert_eq!(
+            conv.messages.len(),
+            snapshot_len,
+            "zero budget, but conv unchanged"
+        );
     }
 
     #[test]
@@ -3121,8 +3268,16 @@ mod tests {
         conv.add_assistant_tool_calls(
             None,
             vec![
-                ToolCall { id: "r1".into(), name: "read_file".into(), arguments: "{}".into() },
-                ToolCall { id: "r2".into(), name: "read_file".into(), arguments: "{}".into() },
+                ToolCall {
+                    id: "r1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "r2".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
             ],
             None,
         );
@@ -3139,7 +3294,11 @@ mod tests {
         // Followed by a bash that should be stubbed.
         conv.add_assistant_tool_calls(
             None,
-            vec![ToolCall { id: "b".into(), name: "bash".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
             None,
         );
         conv.add_tool_result(ToolResult {
@@ -3152,13 +3311,22 @@ mod tests {
         compact_old_tool_results_in_place(&mut conv, 1, true);
 
         let get = |cid: &str| -> String {
-            conv.messages.iter().find_map(|m| match &m.content {
-                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
-                _ => None,
-            }).unwrap()
+            conv.messages
+                .iter()
+                .find_map(|m| match &m.content {
+                    MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                    _ => None,
+                })
+                .unwrap()
         };
-        assert!(!get("r1").starts_with('['), "first read_file must be exempt");
-        assert!(!get("r2").starts_with('['), "second read_file must also be exempt");
+        assert!(
+            !get("r1").starts_with('['),
+            "first read_file must be exempt"
+        );
+        assert!(
+            !get("r2").starts_with('['),
+            "second read_file must also be exempt"
+        );
         assert!(get("b").starts_with("[bash "), "bash must still be stubbed");
     }
 
@@ -3172,7 +3340,11 @@ mod tests {
             let id = format!("b{n}");
             conv.add_assistant_tool_calls(
                 None,
-                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
                 None,
             );
             conv.add_tool_result(ToolResult {
@@ -3184,14 +3356,20 @@ mod tests {
 
         compact_old_tool_results_in_place(&mut conv, 1, false);
         let get = |cid: &str| -> String {
-            conv.messages.iter().find_map(|m| match &m.content {
-                MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
-                _ => None,
-            }).unwrap()
+            conv.messages
+                .iter()
+                .find_map(|m| match &m.content {
+                    MessageContent::ToolResult(r) if r.call_id == cid => Some(r.output.clone()),
+                    _ => None,
+                })
+                .unwrap()
         };
         assert!(get("b0").starts_with("[bash "), "b0 must be stubbed");
         assert!(get("b1").starts_with("[bash "), "b1 must be stubbed");
-        assert!(!get("b2").starts_with("[bash "), "b2 (last turn) must stay full");
+        assert!(
+            !get("b2").starts_with("[bash "),
+            "b2 (last turn) must stay full"
+        );
     }
 
     #[test]
@@ -3204,7 +3382,11 @@ mod tests {
             let id = format!("b{n}");
             conv.add_assistant_tool_calls(
                 None,
-                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
                 None,
             );
             conv.add_tool_result(ToolResult {
@@ -3215,10 +3397,13 @@ mod tests {
         }
 
         compact_old_tool_results_in_place(&mut conv, 0, false);
-        assert!(conv.messages.iter().any(|m| match &m.content {
-            MessageContent::ToolResult(r) => r.output.starts_with("[bash "),
-            _ => false,
-        }), "all bash results must be stubbed when keep_recent_turns=0");
+        assert!(
+            conv.messages.iter().any(|m| match &m.content {
+                MessageContent::ToolResult(r) => r.output.starts_with("[bash "),
+                _ => false,
+            }),
+            "all bash results must be stubbed when keep_recent_turns=0"
+        );
     }
 
     #[test]
@@ -3235,7 +3420,11 @@ mod tests {
             let id = format!("c{n}");
             conv.add_assistant_tool_calls(
                 None,
-                vec![ToolCall { id: id.clone(), name: "bash".into(), arguments: "{}".into() }],
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
                 None,
             );
             conv.add_tool_result(ToolResult {
@@ -3266,7 +3455,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!stubbed_before.is_empty(), "expected stubs after first collapse");
+        assert!(
+            !stubbed_before.is_empty(),
+            "expected stubs after first collapse"
+        );
 
         // A new turn arrives; collapse again (the just-aged turn now stubs).
         add_turn(&mut conv, 5);

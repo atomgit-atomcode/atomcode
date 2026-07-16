@@ -14,6 +14,19 @@ default_provider = "deepseek"
 auto_update = true
 auto_commit = false
 
+# ---- 离线 / 内网无公网环境开关（顶层键）----
+# offline_mode: 离线 / 内网无公网环境开关。
+#   "off"  (默认) — 正常联网行为，一切不变。
+#   "on"   — 移除 web_fetch/web_search，停用遥测与自动更新，并告知模型处于离线环境
+#            （优先离线友好写法：不引外部 CDN、不做联网安装）。
+#   "auto" — 乐观联网；观察到一次联网失败后自动转为离线。
+# 环境变量 ATOMCODE_OFFLINE=1|0|auto 覆盖此项（优先级更高）。
+offline_mode = "off"
+
+# offline_note (可选): 声明本机内网可用的镜像/私服，会拼接进离线系统提示，
+# 让模型知道哪些私服可用（如 npm 私服），避免过度保守。留空则不拼接。
+# offline_note = "npm 私服 registry=http://nexus.internal:8081（可正常 npm install）；Maven 走内部仓库；pip index 已配"
+
 # =============================================================================
 # Provider 示例
 # =============================================================================

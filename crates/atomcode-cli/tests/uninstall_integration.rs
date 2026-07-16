@@ -7,7 +7,7 @@ use tempfile::TempDir;
 // no-op when the var is already set.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 /// Build a fake atomcode data dir so the CLI sees something to scan.

@@ -55,8 +55,6 @@ enum RenderCmd {
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
     Resize(u16, u16),
-    /// Remove the tail ApprovalPrompt body row (fire-and-forget).
-    PopApprovalPrompt,
     /// Scroll the body viewport by `delta` rows. Negative = up,
     /// positive = down. RetainedRenderer's append-only path leaves
     /// scrollback to the host terminal, so this is effectively a
@@ -225,10 +223,6 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
     }
 
-    fn pop_approval_prompt(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
-    }
-
     fn scroll_body(&mut self, delta: i32) {
         let _ = self.cmd_tx.send(RenderCmd::ScrollBody(delta));
     }
@@ -319,9 +313,6 @@ fn run_worker(
                     rows,
                     t0.elapsed().as_micros()
                 );
-            }
-            RenderCmd::PopApprovalPrompt => {
-                inner.pop_approval_prompt();
             }
             RenderCmd::ScrollBody(delta) => {
                 inner.scroll_body(delta);
@@ -420,7 +411,6 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
-        UiLine::ApprovalPrompt { .. } => "ApprovalPrompt",
         UiLine::Error(_) => "Error",
         UiLine::Warning(_) => "Warning",
         UiLine::Muted(_) => "Muted",

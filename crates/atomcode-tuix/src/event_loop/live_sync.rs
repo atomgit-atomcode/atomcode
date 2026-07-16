@@ -1,12 +1,12 @@
 //! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 AgentEvent，
 //! 投进现有 runtime_event_tx，复用 handle_agent_event 渲染。
 
-use super::bg_runtime::{RuntimeEvent, RuntimeId};
+use super::bg_runtime::{RuntimeEvent, RuntimeEventPayload, RuntimeId};
 use atomcode_core::agent::AgentEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// TurnEvent → 0/1 AgentEvent. UserMessage/StateChanged handled separately in the forwarder.
 pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
@@ -111,6 +111,27 @@ pub(crate) fn spawn_live_forwarder(
     runtime_id: RuntimeId,
     fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_live_forwarder_with_receiver(session, runtime_id, fan_tx, None)
+}
+
+/// Resume forwarding from a receiver captured at an idle handoff boundary.
+/// This is used only when detaching fails after the old forwarder was aborted,
+/// so events emitted during the failed handoff are not lost.
+pub(crate) fn spawn_live_forwarder_from_receiver(
+    session: Arc<LiveSession>,
+    runtime_id: RuntimeId,
+    fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    receiver: broadcast::Receiver<LiveEvent>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_live_forwarder_with_receiver(session, runtime_id, fan_tx, Some(receiver))
+}
+
+fn spawn_live_forwarder_with_receiver(
+    session: Arc<LiveSession>,
+    runtime_id: RuntimeId,
+    fan_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    receiver: Option<broadcast::Receiver<LiveEvent>>,
+) -> tokio::task::JoinHandle<()> {
     let session_ptr = Arc::as_ptr(&session) as usize;
     tokio::spawn(async move {
         // Diagnostics go through `tuix_trace!` (file sink, gated by
@@ -125,13 +146,19 @@ pub(crate) fn spawn_live_forwarder(
             session_ptr,
             runtime_id
         );
-        let (_snapshot, mut rx) = session.join().await;
-        crate::tuix_trace!(
-            "FWD",
-            "JOINED session_ptr={:#x} snapshot_len={}",
-            session_ptr,
-            _snapshot.len()
-        );
+        let mut rx = match receiver {
+            Some(receiver) => receiver,
+            None => {
+                let (snapshot, receiver) = session.join().await;
+                crate::tuix_trace!(
+                    "FWD",
+                    "JOINED session_ptr={:#x} snapshot_len={}",
+                    session_ptr,
+                    snapshot.len()
+                );
+                receiver
+            }
+        };
         loop {
             match rx.recv().await {
                 Ok(LiveEvent::Turn(te)) => {
@@ -140,7 +167,7 @@ pub(crate) fn spawn_live_forwarder(
                         if fan_tx
                             .send(RuntimeEvent {
                                 runtime_id,
-                                event: ae,
+                                event: RuntimeEventPayload::Legacy(ae),
                             })
                             .is_err()
                         {
@@ -154,7 +181,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::UserEcho(text),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::UserEcho(text)),
                         })
                         .is_err()
                     {
@@ -167,7 +194,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::PeerBusy(running),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::PeerBusy(running)),
                         })
                         .is_err()
                     {
@@ -179,7 +206,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::ProviderChanged(provider),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::ProviderChanged(provider)),
                         })
                         .is_err()
                     {
@@ -194,7 +221,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::ProjectSwitched(dir),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::ProjectSwitched(dir)),
                         })
                         .is_err()
                     {
@@ -207,7 +234,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::SessionSwitched(session_id),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionSwitched(session_id)),
                         })
                         .is_err()
                     {
@@ -224,7 +251,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::SessionRenamed { name },
+                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionRenamed { name }),
                         })
                         .is_err()
                     {
@@ -238,7 +265,7 @@ pub(crate) fn spawn_live_forwarder(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: AgentEvent::RemoteSlashCommand(line),
+                            event: RuntimeEventPayload::Legacy(AgentEvent::RemoteSlashCommand(line)),
                         })
                         .is_err()
                     {
@@ -251,7 +278,13 @@ pub(crate) fn spawn_live_forwarder(
                 Ok(LiveEvent::ModeChanged(mode)) => {
                     crate::tuix_trace!("FWD", "ModeChanged: {}", mode);
                     if let Some(event) = mode_to_agent_event(&mode) {
-                        if fan_tx.send(RuntimeEvent { runtime_id, event }).is_err() {
+                        if fan_tx
+                            .send(RuntimeEvent {
+                                runtime_id,
+                                event: RuntimeEventPayload::Legacy(event),
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }

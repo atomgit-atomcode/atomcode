@@ -8,7 +8,7 @@
 // Renders as a MenuPayload above the input box.
 
 use anyhow::Result;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -212,11 +212,36 @@ impl Modal for ModelPicker {
         }
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        // Paste goes into the query, not the main buffer
+        for c in text.chars() {
+            if c.is_control() {
+                continue; // skip newlines/control characters
+            }
+            self.query.push(c);
+        }
+        self.update_filter(&ctx.config);
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self, ctx);
+        // Show the typed filter query as the editable input line (not the main
+        // buffer, which stays untouched while the modal is open). Typing routes
+        // into `self.query`; rendering `buf.text` here would leave the input box
+        // blank even though filtering works. Mirrors `dir_picker`.
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -270,8 +295,8 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::config::provider::ProviderConfig;
-    use atomcode_core::config::Config;
+    use atomcode_config::config::provider::ProviderConfig;
+    use atomcode_config::config::Config;
     fn make_config(providers: Vec<(&str, &str, &str)>, default: &str) -> Config {
         use std::collections::HashMap;
         let mut map: HashMap<String, ProviderConfig> = HashMap::new();

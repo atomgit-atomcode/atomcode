@@ -13,8 +13,8 @@ use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use atomcode_core::config::provider::ProviderConfig;
-use atomcode_core::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::message::Message;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::ctx::default::DefaultCtx;

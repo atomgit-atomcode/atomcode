@@ -105,6 +105,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             args: msg.args,
           });
           break;
+        case 'toolProgress':
+          markStreamActivity();
+          dispatch({ type: 'TOOL_PROGRESS', id: msg.id, progress: msg.progress });
+          break;
         case 'toolResult':
           markStreamActivity();
           // Match tool by ID if provided, otherwise find the latest running tool

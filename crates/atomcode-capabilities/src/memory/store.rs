@@ -76,6 +76,20 @@ impl MemoryStore {
         writeln!(file, "- {}", content.trim())
     }
 
+    /// Append `content` only if no existing entry equals it (trimmed, ASCII-case-insensitive;
+    /// non-ASCII compares exactly). Returns `Ok(true)` if written, `Ok(false)` if skipped as a
+    /// duplicate. Near-duplicates are NOT detected — only exact repeats are skipped, so a
+    /// genuinely new fact is never silently swallowed.
+    pub fn append_deduped(&self, content: &str) -> io::Result<bool> {
+        let trimmed = content.trim();
+        let dup = self.load().iter().any(|e| e.trim().eq_ignore_ascii_case(trimmed));
+        if dup {
+            return Ok(false);
+        }
+        self.append(trimmed)?;
+        Ok(true)
+    }
+
     pub fn remove_matching(&self, keyword: &str) -> io::Result<Vec<String>> {
         let content = fs::read_to_string(&self.path).unwrap_or_default();
         let keyword_lower = keyword.to_lowercase();
@@ -119,7 +133,7 @@ impl MemoryStore {
         }
 
         let mut result = String::from(
-            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n",
+            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences. They take PRECEDENCE over default system prompt rules on conflict:\n",
         );
 
         if !global_entries.is_empty() {
@@ -213,6 +227,16 @@ mod tests {
         let removed = store.remove_matching("nonexistent").unwrap();
         assert!(removed.is_empty());
         assert_eq!(fs::read_to_string(&path).unwrap(), "- keep this\n");
+    }
+
+    #[test]
+    fn append_deduped_skips_exact_case_insensitive_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(tmp.path().join("memory.md"));
+        assert_eq!(store.append_deduped("Uses tabs").unwrap(), true);
+        assert_eq!(store.append_deduped("uses tabs").unwrap(), false); // 大小写不敏感完全重复 → 跳
+        assert_eq!(store.append_deduped("uses spaces").unwrap(), true); // 不同内容 → 写
+        assert_eq!(store.load().len(), 2);
     }
 
     #[test]

@@ -804,20 +804,13 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + bright cyan (SGR 1;96). Earlier iterations
-                    // used bold-only (`\x1b[1m`), bright-white
-                    // (`\x1b[1;97m`), and truecolor blue-500
-                    // (`\x1b[1;38;2;59;130;246m`). Bold-only was too
-                    // subtle — in long mixed output, inline code
-                    // `path/to/foo.rs` was visually indistinguishable
-                    // from **bold** prose. Bright cyan (96) matches the
-                    // heading and code-block accent colour; it's a 16-colour
-                    // SGR interpreted by the terminal's own theme palette,
-                    // so it adapts to both light and dark backgrounds
-                    // (same reason `Palette::CODE` uses SGR 96). The
-                    // close sequence `\x1b[22;39m` resets both bold
-                    // (SGR 22) and fg (SGR 39) so neither bleeds into
-                    // the next span.
+                    // Bright cyan, NOT bold (SGR 96 — see `md_inline_code_open`).
+                    // Bold + bright cyan made every span flare in dense prose and
+                    // rendered harshly on terminals that don't soften bright cyan;
+                    // color alone marks it as code, weight is reserved for **bold**
+                    // prose. It's a 16-colour SGR interpreted by the terminal's own
+                    // palette, so it adapts to light/dark. The close `\x1b[22;39m`
+                    // resets bold (a no-op now) + fg (SGR 39) so nothing bleeds.
                     out.push_str(theme::md_inline_code_open());
                     out.push_str(&inner);
                     out.push_str(theme::MD_INLINE_CODE_CLOSE);
@@ -1186,9 +1179,8 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses bold + bright cyan. This matches
-        // the heading and code-block accent colour. The close sequence
-        // resets both bold and fg.
+        // Inline code is colour-only (NOT bold) so it doesn't flare in dense
+        // prose; weight is reserved for **bold**. The close sequence resets fg.
         let rendered = render_inline_line("`x`", caps());
         assert!(
             rendered.contains(theme::md_inline_code_open()),
@@ -1198,6 +1190,12 @@ mod tests {
         assert!(
             rendered.contains(theme::MD_INLINE_CODE_CLOSE),
             "inline code must close with MD_INLINE_CODE_CLOSE: {}",
+            rendered
+        );
+        // Must NOT be bold — the flare fix. (Bold bright cyan was `\x1b[1;96m`.)
+        assert!(
+            !rendered.contains("\x1b[1;96m") && !rendered.contains("\x1b[1;35m"),
+            "inline code must NOT be bold: {}",
             rendered
         );
         assert!(

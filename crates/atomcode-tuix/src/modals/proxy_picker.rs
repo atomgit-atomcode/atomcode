@@ -12,7 +12,7 @@ pub struct ProxyPicker {
 }
 
 impl ProxyPicker {
-    pub fn open(config: &atomcode_core::config::Config) -> Self {
+    pub fn open(config: &atomcode_config::config::Config) -> Self {
         let selected = match config.network.proxy.mode {
             ProxyMode::FollowSystem => 0,
             ProxyMode::DefaultProxy => 1,

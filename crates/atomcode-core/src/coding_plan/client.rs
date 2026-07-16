@@ -235,6 +235,34 @@ impl Client {
             )
         })
     }
+
+    /// GET the 60-day CodingPlan usage (no date params — server defaults to
+    /// 60 days). Mirrors `status_v2`'s blocking client + bearer auth +
+    /// timeout + retry + auth-error promotion.
+    pub fn usage(&self) -> Result<crate::coding_plan::usage::UsageResponse> {
+        let url = format!("{}/coding-plan/usage", api_base_url());
+        let resp = with_retries(&CODING_PLAN_RETRY_BACKOFFS, is_transient_send_error, || {
+            self.http.get(&url).bearer_auth(&self.token).send()
+        })
+        .with_context(|| format!("GET {} failed", url))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(anyhow::Error::new(AuthExpired {
+                status: status.as_u16(),
+            }));
+        }
+        let body = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("{}", format_api_error("usage", status, &body)));
+        }
+        crate::coding_plan::usage::parse_usage(&body).with_context(|| {
+            format!(
+                "parse usage response (body: {})",
+                truncate_for_error(&body, 200)
+            )
+        })
+    }
 }
 
 fn truncate_for_error(s: &str, max_chars: usize) -> String {

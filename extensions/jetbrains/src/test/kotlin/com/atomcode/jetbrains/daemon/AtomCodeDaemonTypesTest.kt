@@ -76,4 +76,15 @@ class AtomCodeDaemonTypesTest {
         val meta = SessionMeta(id = "abcdefghij", name = "", projectHash = "hash1", updatedAt = 1000L, messageCount = 3)
         assertEquals("abcdefgh (3)", meta.toString())
     }
+
+    @Test
+    fun `MessageInfo preserves internal origin`() {
+        val info = MessageInfo(
+            role = "assistant",
+            content = "No verification is needed.",
+            internalOrigin = "verify_cadence",
+        )
+
+        assertEquals("verify_cadence", info.internalOrigin)
+    }
 }

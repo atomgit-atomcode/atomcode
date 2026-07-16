@@ -70,6 +70,9 @@ export function ToolCall({ tool }: ToolCallProps) {
         )}
         <span className={`tool-chevron${expanded ? ' expanded' : ''}`}>▾</span>
       </div>
+      {tool.status === 'running' && tool.progress && (
+        <div className="tool-progress" title={tool.progress}>{tool.progress}</div>
+      )}
       {expanded && (
         <div className="tool-body-grid">
           <div className="tool-body-row">

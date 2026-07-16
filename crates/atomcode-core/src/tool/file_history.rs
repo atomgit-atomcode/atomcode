@@ -35,7 +35,7 @@ const MAX_VERSIONS_PER_FILE: usize = 50;
 
 impl FileHistory {
     pub fn new(session_id: &str) -> Self {
-        let config_dir = crate::config::Config::config_dir();
+        let config_dir = atomcode_config::config::Config::config_dir();
         let backup_dir = config_dir.join("file-history").join(session_id);
         Self {
             backup_dir,

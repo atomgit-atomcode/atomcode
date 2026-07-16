@@ -227,6 +227,7 @@ impl Tool for WebFetchTool {
                 Use after web_search to read a specific page (documentation, README, source file, API reference).\n\
                 HTML is converted to Markdown by default — fenced code blocks, links and tables are preserved; \
                 pass \"format\":\"text\" for plain text, or \"format\":\"html\" for the raw HTML source.\n\
+                Do NOT call this tool if a more specific, dedicated skill (listed under AVAILABLE SKILLS in the system prompt) matches the URL or domain of the page you want to fetch (e.g., platform-specific issue trackers or document sites); instead, you MUST use the use_skill tool.\n\
                 Note: code-hosting sites (GitHub, GitLab, atomgit, …) are JavaScript apps whose /raw/ URLs often \
                 return an empty shell — fetch the file's normal page (its source is server-rendered into the HTML), \
                 or read it from a local checkout with git.\n\
@@ -407,7 +408,9 @@ impl Tool for WebFetchTool {
 
         if output.trim().is_empty() {
             return Ok(err_result(format!(
-                "Page fetched but no readable text content found at {}",
+                "Page fetched but no readable text content found at {}.\n\n\
+                 Hint: If this page belongs to a specific platform (e.g. GitCode/GitHub issues, documentation databases, API specs), \
+                 check if there is a dedicated skill listed under AVAILABLE SKILLS in the system prompt that can fetch it via API.",
                 final_url
             )));
         }

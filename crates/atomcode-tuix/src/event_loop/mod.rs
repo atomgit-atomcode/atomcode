@@ -22,6 +22,7 @@ pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
+pub(crate) mod desktop;
 use commands::{
     attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
 };
@@ -32,10 +33,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{
-    AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
-};
-use atomcode_core::config::Config;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
+use atomcode_coding::CodingRuntimeHandle;
+use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent, AgentPhase};
+use atomcode_config::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
@@ -710,23 +711,121 @@ pub struct McpReloadProgress {
     pub started_at: std::time::Instant,
 }
 
-/// Optional override for spawning agent runtimes. `None` ⇒ use
-/// `runtime_factory.spawn_runtime` (the v1 engine). When set, in-TUI session
-/// switches (`/session`, `/bg`, disk `/resume`) spawn through it instead — the
-/// cli injects the engine-v2 bridge here. It receives the CURRENT config +
-/// working dir (so it tracks `/model` / `/provider` / `/cd`) and returns the same
-/// `(client, event_rx)` pair the factory does.
+/// The two command planes that must move together when the TUI switches runtime.
+#[derive(Clone)]
+pub struct RuntimeEndpoint {
+    pub legacy: AgentClient,
+    pub native: CodingRuntimeHandle,
+}
+
+/// A newly spawned runtime endpoint and its single-consumer ordered event stream.
+pub struct SpawnedRuntime {
+    pub endpoint: RuntimeEndpoint,
+    pub event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEventPayload>,
+}
+
+/// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
+/// `/resume`). The cli injects the engine-v2 bridge here. It receives the
+/// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
+/// and returns both command planes with the event receiver.
 pub type RuntimeSpawnOverride = std::sync::Arc<
-    dyn Fn(&Config, &std::path::Path) -> (AgentClient, mpsc::UnboundedReceiver<AgentEvent>)
-        + Send
-        + Sync,
+    dyn Fn(&Config, &std::path::Path) -> SpawnedRuntime + Send + Sync,
 >;
+
+/// Runtime-owned handoff state while leaving Live sync mode. Keeping the
+/// fallback receiver and LiveSession here makes rollback an ownership transfer,
+/// not an attempt to reconstruct state after an asynchronous failure.
+pub(crate) struct PendingLocalRuntimeSync {
+    pub(crate) restore_id: u64,
+    pub(crate) runtime_id: bg_runtime::RuntimeId,
+    pub(crate) session_id: atomcode_core::session::SessionId,
+    pub(crate) live_session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    pub(crate) handoff: atomcode_core::live::IdleHandoff,
+    pub(crate) deadline: std::time::Instant,
+}
+
+impl PendingLocalRuntimeSync {
+    fn matches_current(&self, restore_id: u64, ctx: &LoopCtx) -> bool {
+        local_restore_scope_matches(
+            self.restore_id,
+            self.runtime_id,
+            &self.session_id,
+            restore_id,
+            ctx.foreground_runtime_id,
+            &ctx.current_session.id,
+        )
+    }
+
+    fn timed_out(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+}
+
+fn local_restore_scope_matches(
+    expected_restore_id: u64,
+    expected_runtime_id: bg_runtime::RuntimeId,
+    expected_session_id: &atomcode_core::session::SessionId,
+    restore_id: u64,
+    runtime_id: bg_runtime::RuntimeId,
+    session_id: &atomcode_core::session::SessionId,
+) -> bool {
+    expected_restore_id == restore_id
+        && expected_runtime_id == runtime_id
+        && expected_session_id == session_id
+}
+
+#[cfg(test)]
+mod local_restore_scope_tests {
+    use super::{bg_runtime::RuntimeId, local_restore_scope_matches};
+    use atomcode_core::session::SessionId;
+
+    #[test]
+    fn acknowledgement_requires_restore_runtime_and_session_identity() {
+        let expected_session = SessionId::from_string("session-a".into());
+        let other_session = SessionId::from_string("session-b".into());
+        let runtime = RuntimeId::new(3);
+
+        assert!(local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            runtime,
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            8,
+            runtime,
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            RuntimeId::new(4),
+            &expected_session,
+        ));
+        assert!(!local_restore_scope_matches(
+            7,
+            runtime,
+            &expected_session,
+            7,
+            runtime,
+            &other_session,
+        ));
+    }
+}
 
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
     pub agent: AgentClient,
+    pub runtime: CodingRuntimeHandle,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
     /// normal exit is the graceful break (Idle + `cmd_tx` closed); this is the
@@ -735,10 +834,8 @@ pub struct LoopCtx {
     /// restart path deliberately does NOT arm this — it needs the normal
     /// `ExitReason::UpgradeRestart` return to re-exec the new binary.
     pub shutdown_deadline: Option<std::time::Instant>,
-    pub runtime_factory: AgentRuntimeFactory,
-    /// Optional engine-v2 spawner; `None` ⇒ the v1 `runtime_factory`. See
-    /// [`RuntimeSpawnOverride`].
-    pub runtime_spawn_override: Option<RuntimeSpawnOverride>,
+    /// Engine-v2 spawner for in-TUI session switches. See [`RuntimeSpawnOverride`].
+    pub runtime_spawn_override: RuntimeSpawnOverride,
     pub bg_manager: bg_runtime::BgRuntimeManager,
     pub foreground_runtime_id: bg_runtime::RuntimeId,
     pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -830,10 +927,10 @@ pub struct LoopCtx {
     /// events from the detached upgrade task. Cloned into the task at
     /// spawn time; kept here so the receiver in the loop outlives any
     /// number of upgrades (no reconstructing on each invocation).
-    pub upgrade_tx: mpsc::UnboundedSender<atomcode_core::self_update::UpgradeEvent>,
+    pub upgrade_tx: mpsc::UnboundedSender<atomcode_updater::UpgradeEvent>,
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
-    pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_updater::UpgradeEvent>,
     /// Long-lived channel for /plugin marketplace add|update and /plugin
     /// install. Each invocation spawns a blocking task that does the git
     /// clone/pull and pushes a `PluginJobEvent` here when done. Mirrors the
@@ -841,19 +938,11 @@ pub struct LoopCtx {
     /// `select!` arm. Unbounded — events are tiny terminal results.
     pub plugin_job_tx: mpsc::UnboundedSender<atomcode_core::plugin::PluginJobEvent>,
     pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_core::plugin::PluginJobEvent>,
-    /// Signal channel from the `/issue` wizard modal back to the event
-    /// loop. The wizard's Enter handler can't touch `App` directly
-    /// (modals only see `LoopCtx`), so it stores the collected title +
-    /// body here, returns `Close`, and the event loop's post-close
-    /// branch POSTs the issue to AtomGit and echoes the URL of the
-    /// newly-created issue back into the conversation.
-    pub pending_new_issue: Option<NewIssueDraft>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
     /// modal close and runs the full `/login` flow (OAuth if needed →
     /// claim → fetch models → register providers). Needs raw-mode
-    /// suspend/resume, something modals can't drive themselves. Same
-    /// pattern as `pending_new_issue`.
+    /// suspend/resume, something modals can't drive themselves.
     pub pending_run_login_setup: bool,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 1 (Configure manually). The event loop drains this on
@@ -919,6 +1008,10 @@ pub struct LoopCtx {
     pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
     /// live 转发任务句柄（分离同步时 abort）。
     pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
+    /// Live → local runtime handoff awaiting a tokened runtime read-back.
+    pub(crate) pending_local_runtime_sync: Option<PendingLocalRuntimeSync>,
+    /// Monotonic correlation id for Live → local conversation restores.
+    pub(crate) next_local_runtime_restore_id: u64,
     /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
     /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
     pub app_relay_child: Option<tokio::process::Child>,
@@ -948,7 +1041,7 @@ pub struct LoopCtx {
     /// the real value); `None` means the arm is inert. Unix-only — sudo/SSH
     /// askpass is not supported on Windows.
     #[cfg(unix)]
-    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_askpass::server::AskpassPrompt>>,
+    pub askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>,
     /// Active fixed-interval loop controller. `None` when no `/loop N …` is
     /// running. Task 12 wires the timer that flips `due` and fires the payload.
     pub loop_ctrl: Option<loop_ctrl::LoopController>,
@@ -989,17 +1082,6 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     let tail_start = bytes.len().saturating_sub(1024);
     bytes[tail_start..].hash(&mut hasher);
     hasher.finish()
-}
-
-/// What the `/issue` wizard hands back to the event loop after the user
-/// finishes step 2. The event loop turns this into a `POST /repos/.../issues`
-/// API call and echoes the resulting issue URL into scrollback.
-#[derive(Debug, Clone)]
-pub struct NewIssueDraft {
-    pub owner: String,
-    pub repo: String,
-    pub title: String,
-    pub body: String,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -1630,6 +1712,37 @@ mod buffer_tests {
         s.on_submit();
         let after = format_spinner_label(&s, 0, None);
         assert!(!after.contains("explore#4"), "activity must not leak past turn end: {after:?}");
+    }
+
+    #[test]
+    fn review_activity_marker_is_ephemeral_for_code_review() {
+        let chunk = "\u{1e}review · round 3 · read_file · compaction.rs";
+
+        let activity = ephemeral_tool_activity(Some("CodeReview"), chunk);
+
+        assert_eq!(
+            activity,
+            Some("review · round 3 · read_file · compaction.rs")
+        );
+    }
+
+    #[test]
+    fn code_review_detail_renders_explicit_range_scope() {
+        let detail = format_tool_detail(
+            "code_review",
+            r#"{"scope":{"kind":"range","base":"main","head":"HEAD"}}"#,
+        );
+
+        assert_eq!(detail, "main..HEAD");
+    }
+
+    #[test]
+    fn partial_code_review_result_is_a_warning() {
+        assert!(is_incomplete_review_result(
+            "code_review",
+            "Code review incomplete (MaxRounds)",
+            false,
+        ));
     }
 
     #[test]
@@ -3484,6 +3597,28 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn approval_denial_label_detects_denials() {
+        // Policy denial → calm label (non-empty).
+        let label = approval_denial_label(
+            "blocked: denied by approval policy: mcp__x__y {\"a\":1}",
+            false,
+        );
+        assert!(label.is_some());
+        assert!(!label.unwrap().is_empty());
+
+        // User-interactive denial → calm label.
+        let label2 = approval_denial_label("Tool 'bash' was denied by the user.", false);
+        assert!(label2.is_some());
+        assert!(!label2.unwrap().is_empty());
+
+        // Success → None.
+        assert_eq!(approval_denial_label("ok", true), None);
+
+        // Non-denial failure → None (keeps normal ✗ render).
+        assert_eq!(approval_denial_label("Error: file not found", false), None);
+    }
+
+    #[test]
     fn summarise_multi_line_adds_line_count() {
         let out = summarise("first line\nsecond line\nthird line");
         assert!(out.starts_with("first line"));
@@ -3545,6 +3680,186 @@ mod tool_format_tests {
         let out = summarise(err);
         assert!(out.starts_with("Error: foo"));
         assert!(out.contains("(3 lines)"));
+    }
+
+    #[test]
+    fn summarise_read_result_collapses_line_number_and_indent() {
+        // read_file emits `{n:>6}\t{indented source line}`; the preview should
+        // show `{n}  {trimmed content}` with no big left gap.
+        let out = "   873\t                    images: core_images,\n   874\t    other: 1,";
+        assert_eq!(
+            summarise_read_result(out),
+            "873  images: core_images, (2 lines)"
+        );
+    }
+
+    #[test]
+    fn summarise_read_result_single_line_has_no_count() {
+        let out = "     5\t        let x = 1;";
+        assert_eq!(summarise_read_result(out), "5  let x = 1;");
+    }
+
+    #[test]
+    fn summarise_read_result_falls_back_when_not_line_numbered() {
+        // Directory listing / skeleton header / error have no `<digits>\t` prefix.
+        let out = "[File skeleton: foo.rs (10 lines)]\n\nbody";
+        assert_eq!(
+            summarise_read_result(out),
+            "[File skeleton: foo.rs (10 lines)] (3 lines)"
+        );
+    }
+
+    /// Batch child text: bash children get `  └ Bash <cmd>` (name + command);
+    /// non-bash children keep `  └ Name(args)`.
+    ///
+    /// This is a unit test on the text-format logic that event_loop emits —
+    /// mirrors what ToolBatchStarted builds for children.
+    #[test]
+    fn batch_child_bash_uses_name_prefix_non_bash_keeps_name_args() {
+        let child_glyph = "\u{2514}";
+
+        // Bash child: name == "bash" (raw snake name)
+        let bash_name = "bash";
+        let bash_detail = "cd /tmp && ls";
+        let bash_text = if bash_name.eq_ignore_ascii_case("bash") {
+            format!("  {} {} {}", child_glyph, display_tool_name_short(bash_name), bash_detail)
+        } else {
+            format!("  {} {}({})", child_glyph, display_tool_name_short(bash_name), bash_detail)
+        };
+        assert!(
+            bash_text.contains("Bash cd /tmp"),
+            "bash child text must contain `Bash cd /tmp`, got: {}",
+            bash_text
+        );
+        assert!(
+            !bash_text.contains("Bash("),
+            "bash child must NOT use Bash(...) wrapper, got: {}",
+            bash_text
+        );
+
+        // Non-bash child: name == "grep"
+        let grep_name = "grep";
+        let grep_detail = "foo";
+        let grep_text = if grep_name.eq_ignore_ascii_case("bash") {
+            format!("  {} {} {}", child_glyph, display_tool_name_short(grep_name), grep_detail)
+        } else {
+            format!("  {} {}({})", child_glyph, display_tool_name_short(grep_name), grep_detail)
+        };
+        assert!(
+            grep_text.contains("Grep(foo)"),
+            "non-bash child must keep Name(args), got: {}",
+            grep_text
+        );
+        assert!(
+            !grep_text.contains("$ "),
+            "non-bash child must NOT use $ prefix, got: {}",
+            grep_text
+        );
+
+        // Update path: bash update text uses `Bash ` prefix (no `Bash(` wrapper).
+        let update_base = if bash_name.eq_ignore_ascii_case("bash") {
+            format!("{} {}", display_tool_name_short(bash_name), bash_detail)
+        } else {
+            format!("{}({})", display_tool_name_short(bash_name), bash_detail)
+        };
+        let suffix = " \u{2192} 3 lines";
+        let update_text = format!("  {} {}{}", child_glyph, update_base, suffix);
+        assert!(
+            update_text.contains("Bash cd /tmp"),
+            "update text must have `Bash ` prefix, got: {}",
+            update_text
+        );
+        assert!(
+            !update_text.contains("Bash("),
+            "update text must NOT have Bash(, got: {}",
+            update_text
+        );
+    }
+
+    /// Batch label logic: a 2-call batch where both are NOT parallel_safe (e.g.
+    /// bash) must NOT say "in parallel" — they run serially behind the write-lock.
+    #[test]
+    fn tool_batch_label_serial_calls_omit_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        // Simulate two bash calls — parallel_safe:false (write-lock, serial)
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            !label.contains("in parallel"),
+            "serial (write-lock) bash batch must NOT say 'in parallel', got: {label}"
+        );
+        assert!(
+            label.contains("bash"),
+            "same-name batch should show tool name, got: {label}"
+        );
+    }
+
+    /// Batch label logic: a 2-call batch where ≥2 are parallel_safe (e.g.
+    /// read_file) MUST say "in parallel" — they run concurrently.
+    #[test]
+    fn tool_batch_label_parallel_safe_calls_include_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        // Simulate two read_file calls — parallel_safe:true (read-lock, concurrent)
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+            ToolBatchCall { id: "2".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            label.contains("in parallel"),
+            "read-only (parallel_safe) batch MUST say 'in parallel', got: {label}"
+        );
+        assert!(
+            label.contains("read_file"),
+            "same-name batch should show tool name, got: {label}"
+        );
+    }
+
+    /// Mixed batch: 1 read_file (parallel_safe) + 1 bash (not parallel_safe) →
+    /// fewer than 2 concurrent, so NO "in parallel" even though one is read-only.
+    #[test]
+    fn tool_batch_label_mixed_one_safe_one_not_omits_in_parallel() {
+        use atomcode_core::turn::event::ToolBatchCall;
+        let calls: Vec<ToolBatchCall> = vec![
+            ToolBatchCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into(), parallel_safe: true },
+            ToolBatchCall { id: "2".into(), name: "bash".into(), arguments: "{}".into(), parallel_safe: false },
+        ];
+        let count = calls.len();
+        let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
+        let unique_names: std::collections::HashSet<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        let label = match (unique_names.len() == 1, concurrent) {
+            (true, true) => format!("Running {} {} calls in parallel", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (true, false) => format!("Running {} {} calls", count, unique_names.iter().next().copied().unwrap_or("tool")),
+            (false, true) => format!("Running {} tools in parallel", count),
+            (false, false) => format!("Running {} tools", count),
+        };
+        assert!(
+            !label.contains("in parallel"),
+            "mixed batch with only 1 parallel_safe call must NOT say 'in parallel', got: {label}"
+        );
+        assert_eq!(
+            label, "Running 2 tools",
+            "mixed-name serial batch must be generic, got: {label}"
+        );
     }
 }
 
@@ -3617,16 +3932,6 @@ pub struct App {
     /// of this, a bare Esc neither arms nor triggers undo — so a rapid Esc mash
     /// undoes at most once per burst.
     pub esc_undo_last_at: Option<std::time::Instant>,
-    /// Set by `/fixissue <url>` while the agent is resolving that issue.
-    /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
-    /// back as an issue comment + the `fixed` label is applied. Cleared
-    /// on TurnComplete / TurnCancelled / Error so a subsequent normal
-    /// message doesn't accidentally trigger a post-back.
-    pub fixissue_pending: Option<atomcode_core::atomgit::IssueRef>,
-    /// Accumulates every visible `AssistantText` delta produced during a
-    /// fixissue turn, verbatim. Sent as the AtomGit comment body on
-    /// successful completion.
-    pub fixissue_buffer: String,
     /// True while a setup skill turn is in flight. On `TurnComplete`,
     /// skill/command registries are reloaded so newly-created skills
     /// become visible to the LLM immediately. Cleared on
@@ -3635,10 +3940,6 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
-    /// Guards the one-shot `/setup` hint so it fires at most once per
-    /// session. Flipped to `true` after the first render; subsequent
-    /// redraws skip the check entirely.
-    pub setup_hint_shown: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -3699,11 +4000,8 @@ impl App {
             exit_pending: None,
             esc_undo_pending: None,
             esc_undo_last_at: None,
-            fixissue_pending: None,
-            fixissue_buffer: String::new(),
             setup_pending: false,
             reasoning_buffer: String::new(),
-            setup_hint_shown: false,
         }
     }
 }
@@ -3744,14 +4042,11 @@ pub enum ExitReason {
 ///
 /// `idle` is derived from `UiPhase::Idle` so "the agent finished its turn"
 /// and "safe to fire" are the same gate.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_loop_decision(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let idle = matches!(state.phase, UiPhase::Idle);
@@ -3765,8 +4060,6 @@ pub(crate) fn handle_loop_decision(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         ),
         crate::event_loop::loop_ctrl::LoopAction::Skip => {}
@@ -3785,6 +4078,9 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
+    if ctx.dangerously_skip_permissions {
+        app.state.agent_mode = crate::state::AgentMode::Auto;
+    }
 
     crate::tuix_trace!(
         "SES",
@@ -3827,6 +4123,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     if ctx.is_admin {
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::AdminWarningBanner).into_owned(),
+        ));
+    }
+    // Calm one-line offline advisory: shown once at startup so users know
+    // why web tools, telemetry, and auto-update are inactive. Uses UiLine::Warning
+    // (yellow) rather than Error (red) — it's informational, not a failure.
+    // The verdict is seeded before the event loop starts, so is_offline_active()
+    // is reliable here.
+    if atomcode_config::config::offline::is_offline_active() {
+        renderer.render(UiLine::Warning(
+            crate::i18n::t(crate::i18n::Msg::OfflineModeActive).into_owned(),
         ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
@@ -3913,9 +4219,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Sync messages into the agent loop so the LLM has full context.
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetConversation(
-                    session.to_conversation_snapshot(),
-                ))
+                .send(AgentCommand::SetConversation {
+                    snapshot: session.to_conversation_snapshot(),
+                    restore_id: None,
+                })
                 .ok();
             // Continue accumulating into the same session file — future
             // TurnComplete saves overwrite it instead of creating a new one.
@@ -3964,14 +4271,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
-        // One-shot /setup hint — only on first boot into this project,
-        // gated by preferences + setup-state presence.
-        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-            ));
-            app.setup_hint_shown = true;
-        }
         // One-shot legacy-conhost scroll hint. The classic Windows console
         // host snaps the viewport back to the bottom on every write, so the
         // live footer repaint during a running task makes scrolling up to
@@ -4269,21 +4568,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
-                        // QR-fast-path onboarding bypasses the regular
-                        // first-boot idle render (see ~line 2506), so
-                        // the one-shot /setup tip never fires for users
-                        // who land through the scan flow. Surface it
-                        // here under the same gates: in-session
-                        // once-only + `should_auto_show_setup` (no
-                        // setup-state.json or missing recommender
-                        // skill).
-                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-                            renderer.render(crate::render::UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-                            ));
-                            renderer.flush();
-                            app.setup_hint_shown = true;
-                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -4309,9 +4593,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
-                        ));
+                        // Silent on success (parity with codex/opencode: they never
+                        // print a per-server "connected" line in scrollback). Failures
+                        // and warnings below are still surfaced; `/mcp` shows the full
+                        // inventory on demand.
                         // Register tools from this newly connected server.
                         // Important: do this in a background task so a slow `tools/list`
                         // can't block the TUI event loop and freeze input.
@@ -4447,17 +4732,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                        closed = true;
+                    }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -4473,7 +4768,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -4485,7 +4780,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && ctx.pending_local_runtime_sync.is_none()
+                    {
                         // Turn just ended — drain the type-ahead queue.
                         // Pop the oldest queued message, echo as a User
                         // line, dispatch to the agent, and transition
@@ -4728,21 +5025,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
-                        // QR-fast-path onboarding bypasses the regular
-                        // first-boot idle render (see ~line 2506), so
-                        // the one-shot /setup tip never fires for users
-                        // who land through the scan flow. Surface it
-                        // here under the same gates: in-session
-                        // once-only + `should_auto_show_setup` (no
-                        // setup-state.json or missing recommender
-                        // skill).
-                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
-                            renderer.render(crate::render::UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
-                            ));
-                            renderer.flush();
-                            app.setup_hint_shown = true;
-                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -4904,17 +5186,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             Some(ev) = ctx.plugin_job_rx.recv() => {
                 // Let an open modal (the interactive /plugin manager) refresh
                 // its cached lists from this job's result first.
+                let mut closed = false;
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
+                    if m.close_requested() {
+                        app.active_modal = None;
+                        closed = true;
+                    }
+                }
+                if closed {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
                 handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
-                if let Some(m) = app.active_modal.as_ref() {
-                    m.draw(&app.buf, &app.state, &ctx, renderer);
-                } else if matches!(app.state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                if !closed {
+                    if let Some(m) = app.active_modal.as_ref() {
+                        m.draw(&app.buf, &app.state, &ctx, renderer);
+                    } else if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -4930,7 +5222,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
+                    handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
                     // that asked for it finished or timed out); dismiss it so `Password:`
                     // doesn't linger in the input box.
@@ -4942,7 +5234,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && ctx.pending_local_runtime_sync.is_none()
+                    {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                             if let Some(live) = &ctx.sync_session {
@@ -4974,6 +5268,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
         }
 
+        if ctx
+            .pending_local_runtime_sync
+            .as_ref()
+            .is_some_and(PendingLocalRuntimeSync::timed_out)
+        {
+            let restored_live = commands::rollback_pending_local_runtime_sync(&mut ctx);
+            let message = if restored_live {
+                crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestoreTimedOut).into_owned()
+            } else {
+                "本地 runtime 恢复超时，且当前会话已变化，无法自动接回旧 Live 会话"
+                    .to_string()
+            };
+            renderer.render(UiLine::Error(message));
+            renderer.flush();
+        }
+
         // ── Fixed-interval /loop decision (turn-completion driven) ──
         // Runs after EVERY select! wakeup, so it sees both edges that matter:
         //   • the deadline arm just latched `due = true` → fire now if idle;
@@ -4988,8 +5298,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &mut ctx,
                 renderer,
                 &mut app.active_modal,
-                &mut app.fixissue_pending,
-                &mut app.fixissue_buffer,
                 &mut app.setup_pending,
             );
         }
@@ -5071,10 +5379,9 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     // Hot-reload the config file. Fail silently: if the other process
     // wrote a malformed config (shouldn't happen — it would have
     // rejected its own reload), leave our in-memory snapshot alone.
-    let path = atomcode_core::config::Config::default_path();
-    if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
+    let path = atomcode_config::config::Config::default_path();
+    if let Ok(fresh) = atomcode_config::config::Config::load(&path) {
         ctx.config = fresh;
-        ctx.runtime_factory.set_config(ctx.config.clone());
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
@@ -5554,43 +5861,6 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
-                        // IssueWizard signals a staged title+body via
-                        // `ctx.pending_new_issue`. Drain + POST to the
-                        // AtomGit API here and echo the created-issue
-                        // URL into scrollback. Blocking call — the
-                        // wizard is modal so UI freezing briefly is
-                        // expected / acceptable.
-                        if let Some(draft) = ctx.pending_new_issue.take() {
-                            match atomcode_core::atomgit::Client::from_stored_auth().and_then(|c| {
-                                c.create_issue(&draft.owner, &draft.repo, &draft.title, &draft.body)
-                            }) {
-                                Ok(created) => {
-                                    let shown_url = created.html_url.clone().unwrap_or_else(|| {
-                                        format!(
-                                            "https://atomgit.com/{}/{}/issues/{}",
-                                            draft.owner, draft.repo, created.number
-                                        )
-                                    });
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::IssueCreated {
-                                            number: created.number,
-                                            title: &created.title,
-                                            url: &shown_url,
-                                        })
-                                        .into_owned(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    renderer.render(UiLine::CommandOutput(
-                                        crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
-                                            error: &format!("{:#}", e),
-                                        })
-                                        .into_owned(),
-                                    ));
-                                }
-                            }
-                            renderer.flush();
-                        }
                         // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
@@ -6041,6 +6311,21 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    let restore_blocks_key = ctx.pending_local_runtime_sync.is_some()
+        && pending_restore_blocks_idle_action(
+            code,
+            modifiers,
+            &app.buf.text,
+            menu_for_display(&app.buf, ctx).is_some(),
+            app.state.goal_condition.is_some(),
+        );
+    if restore_blocks_key {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestorePending).into_owned(),
+        ));
+        renderer.flush();
+        return Ok(());
+    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -6199,8 +6484,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                     if matches!(app.state.phase, UiPhase::Idle) {
@@ -6328,8 +6611,6 @@ fn handle_idle_key(
                             ctx,
                             renderer,
                             &mut app.active_modal,
-                            &mut app.fixissue_pending,
-                            &mut app.fixissue_buffer,
                             &mut app.setup_pending,
                         )?;
                         if matches!(app.state.phase, UiPhase::Idle) {
@@ -6398,8 +6679,6 @@ fn handle_idle_key(
                             ctx,
                             renderer,
                             &mut app.active_modal,
-                            &mut app.fixissue_pending,
-                            &mut app.fixissue_buffer,
                             &mut app.setup_pending,
                         )?;
                     }
@@ -6421,28 +6700,14 @@ fn handle_idle_key(
         }
     }
 
-    // Tab toggles Plan/Build mode when no completion menu is visible —
-    // there is nothing to complete, so the key is repurposed for mode
-    // switching instead.
-    if code == KeyCode::Tab && menu_items.is_none() {
-        app.state.agent_mode = app.state.agent_mode.toggle();
-        let is_plan = matches!(app.state.agent_mode, crate::state::AgentMode::Plan);
-        ctx.agent
-            .cmd_tx
-            .send(AgentCommand::SetPlanMode(is_plan))
-            .ok();
-        // 同步 daemon 的 LIVE_APPROVAL_MODE，使 App 端扫码/重连时拿到正确的模式。
-        if is_plan {
-            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Plan);
+    // Tab / Shift+Tab cycle execution mode when no completion menu is up.
+    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
+        let next = if code == KeyCode::BackTab {
+            app.state.agent_mode.prev()
         } else {
-            atomcode_daemon::live_set_mode(atomcode_daemon::approval_mode::ApprovalMode::Build);
-        }
-        renderer.render(UiLine::CommandOutput(format!(
-            "  Switched to {} mode.\n",
-            app.state.agent_mode.label()
-        )));
-        renderer.flush();
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            app.state.agent_mode.next()
+        };
+        set_agent_mode(app, ctx, renderer, next);
         return Ok(());
     }
 
@@ -6675,8 +6940,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                     if matches!(app.state.phase, UiPhase::Idle) {
@@ -6774,8 +7037,6 @@ fn handle_idle_key(
                         ctx,
                         renderer,
                         &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
                         &mut app.setup_pending,
                     )?;
                 }
@@ -6955,6 +7216,81 @@ fn handle_idle_key(
     Ok(())
 }
 
+fn pending_restore_blocks_idle_action(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    input: &str,
+    menu_active: bool,
+    goal_active: bool,
+) -> bool {
+    use crossterm::event::KeyModifiers;
+
+    if code == KeyCode::Enter && !modifiers.contains(KeyModifiers::SHIFT) {
+        let safe_exit = parse_slash_line(input).is_some_and(|(command, argument)| {
+            matches!(command.to_ascii_lowercase().as_str(), "quit" | "exit")
+                && argument.trim().is_empty()
+        });
+        return !safe_exit;
+    }
+    if matches!(code, KeyCode::Tab | KeyCode::BackTab) && !menu_active {
+        return true;
+    }
+    if code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
+    let bare_escape = code == KeyCode::Esc && modifiers.is_empty() && input.is_empty();
+    let goal_cancel = goal_active
+        && (bare_escape
+            || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL)));
+    goal_cancel || (bare_escape && !menu_active)
+}
+
+#[cfg(test)]
+mod pending_restore_key_tests {
+    use super::{pending_restore_blocks_idle_action, KeyCode};
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn restore_gate_blocks_runtime_actions_but_keeps_explicit_exit() {
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "hello",
+            false,
+            false,
+        ));
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            "",
+            false,
+            false,
+        ));
+        assert!(pending_restore_blocks_idle_action(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            "",
+            false,
+            false,
+        ));
+        assert!(!pending_restore_blocks_idle_action(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "/quit",
+            false,
+            false,
+        ));
+        assert!(!pending_restore_blocks_idle_action(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            "/qu",
+            true,
+            false,
+        ));
+    }
+}
+
 fn redraw_with_menu(
     buf: &Buffer,
     items: &[(String, String)],
@@ -7079,9 +7415,51 @@ fn bash_input_hint(buf: &str) -> bool {
         .is_some_and(|rest| !rest.trim().is_empty())
 }
 
+/// The shell-mode footer hint for the current buffer, or `None` when not in
+/// shell mode. Bare `!` → the `ShellModeHint` affordance ("! for shell mode");
+/// a runnable `!cmd` → the actionable `BashInputHint` ("Enter to run…"). Always
+/// `HintSeverity::Shell` (brand purple), matching the shell-mode box + badge.
+/// Derived purely from the buffer, so it arms/reverts with the leading `!`.
+fn shell_mode_hint(buf: &str) -> Option<(crate::i18n::Msg<'static>, crate::render::HintSeverity)> {
+    if !crate::render::input_shell_mode(buf) {
+        return None;
+    }
+    let msg = if bash_input_hint(buf) {
+        crate::i18n::Msg::BashInputHint
+    } else {
+        crate::i18n::Msg::ShellModeHint
+    };
+    Some((msg, crate::render::HintSeverity::Shell))
+}
+
 #[cfg(test)]
 mod bash_input_hint_tests {
-    use super::bash_input_hint;
+    use super::{bash_input_hint, shell_mode_hint};
+    use crate::render::HintSeverity;
+
+    // Resolve to (text, severity) — `Msg` has no PartialEq/Debug, so compare the
+    // observable output instead (locale-agnostic: we assert bare ≠ runnable, not
+    // exact strings).
+    fn resolved(buf: &str) -> Option<(String, HintSeverity)> {
+        shell_mode_hint(buf).map(|(m, s)| (crate::i18n::t(m).into_owned(), s))
+    }
+
+    #[test]
+    fn shell_hint_is_purple_and_switches_bare_vs_runnable() {
+        let bare = resolved("!").expect("bare ! arms shell mode");
+        let cmd = resolved("!ls -la").expect("runnable !cmd is shell mode");
+        // Both brand-purple (Shell severity), matching the box + badge.
+        assert_eq!(bare.1, HintSeverity::Shell, "bare ! hint is brand purple");
+        assert_eq!(cmd.1, HintSeverity::Shell, "!cmd hint is brand purple");
+        // Distinct affordance vs actionable text (bare "! for shell mode" vs
+        // "Enter to run…") without pinning the active locale's exact strings.
+        assert_ne!(bare.0, cmd.0, "bare ! and runnable !cmd show different text");
+        assert_eq!(resolved("  !git status").map(|(_, s)| s), Some(HintSeverity::Shell));
+        // Not shell mode → no hint (so a normal `/webui` etc. keeps the slot).
+        assert!(resolved("ls").is_none());
+        assert!(resolved("").is_none());
+        assert!(resolved("echo !x").is_none(), "bang not at start");
+    }
 
     #[test]
     fn shows_only_for_a_nonempty_bang_command() {
@@ -7099,24 +7477,83 @@ mod bash_input_hint_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitRoute {
+    SendIdle,
+    SteerNow,
+    Queue,
+}
+
+/// Where a submitted prompt goes. On the ASYNC kernel path, a submit DURING a
+/// running turn steers (sent to the kernel immediately, folded into the turn).
+/// On the SYNC/LiveSession path, keep the local-queue behavior. Idle → normal send.
+fn midturn_submit_route(streaming: bool, sync: bool) -> SubmitRoute {
+    match (streaming, sync) {
+        (true, false) => SubmitRoute::SteerNow,
+        (true, true) => SubmitRoute::Queue,
+        (false, _) => SubmitRoute::SendIdle,
+    }
+}
+
+#[cfg(test)]
+mod midturn_submit_route_tests {
+    use super::{midturn_submit_route, SubmitRoute};
+
+    #[test]
+    fn midturn_submit_steers_on_async_queues_on_sync() {
+        assert_eq!(midturn_submit_route(true, false), SubmitRoute::SteerNow);
+        assert_eq!(midturn_submit_route(true, true), SubmitRoute::Queue);
+        assert_eq!(midturn_submit_route(false, false), SubmitRoute::SendIdle);
+        assert_eq!(midturn_submit_route(false, true), SubmitRoute::SendIdle);
+    }
+}
+
+/// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
+/// /build /auto /plan commands. Sends the unified SetMode to the bridge, mirrors
+/// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
+/// repaints the footer.
+pub(crate) fn set_agent_mode(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    mode: crate::state::AgentMode,
+) {
+    app.state.agent_mode = mode;
+    // Reveal the Build badge when the user explicitly switches to Build
+    // via Tab/Shift+Tab or `/build`. The default startup state stays
+    // badge-less.
+    if mode == crate::state::AgentMode::Build {
+        app.state.build_badge_visible = true;
+    }
+    ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode)).ok();
+    atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
+    // The footer persistently shows the current mode, so a scrollback feedback line
+    // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+    // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
+    if ctx.is_plain_renderer {
+        let msg = match mode {
+            crate::state::AgentMode::Auto => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAutoMode).into_owned(),
+            crate::state::AgentMode::AcceptEdits => crate::i18n::t(crate::i18n::Msg::CmdSwitchedAcceptEditsMode).into_owned(),
+            crate::state::AgentMode::Plan => crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
+            crate::state::AgentMode::Build => crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
+        };
+        renderer.render(UiLine::CommandOutput(msg));
+        renderer.flush();
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+}
+
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_status(state, ctx);
-    // Discoverability: while composing a `!bash` command, surface a footer hint.
-    // `build_status` always fills the slot with at least the lowest-priority
-    // `/webui` fallback, so gate on "slot is free OR only holds that fallback" —
-    // this shows the bash hint over the webui nudge but still yields to a
+    // Discoverability: while composing a `!` shell command, surface a brand-purple
+    // footer hint (bare `!` → "! for shell mode"; `!cmd` → "Enter to run…").
+    // Fill the slot only when it's free, so the shell hint still yields to any
     // higher-priority hint (no-provider / high token usage / upgrade).
-    if bash_input_hint(&buf.text) {
-        let slot_is_free = match &status.hint {
-            None => true,
-            Some((h, _)) => *h == crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
-        };
+    if let Some((msg, severity)) = shell_mode_hint(&buf.text) {
+        let slot_is_free = status.hint.is_none();
         if slot_is_free {
-            status.hint = Some((
-                crate::i18n::t(crate::i18n::Msg::BashInputHint).into_owned(),
-                crate::render::HintSeverity::Info,
-            ));
+            status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
         }
     }
     renderer.render(UiLine::InputPrompt {
@@ -7143,25 +7580,6 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
         return false;
     }
     ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
-}
-
-/// True iff startup should show the one-shot `/setup` hint in scrollback.
-/// Returns `true` when either:
-///   - `setup-state.json` doesn't exist (never ran `/setup`), OR
-///   - the recommender skill directory is missing (user deleted it after setup).
-fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
-    let state = atomcode_core::setup::state::load_setup_state(&ctx.working_dir);
-    if state.is_none() {
-        return true; // never ran setup → show hint
-    }
-
-    // setup-state.json exists but the skill may have been deleted manually.
-    // Path must match SkillRegistry::reload's scan path: the unified
-    // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
-    let skill_dir = atomcode_core::config::Config::config_dir()
-        .join("skills")
-        .join("atomcode-automation-recommender");
-    !skill_dir.exists()
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error
@@ -7337,7 +7755,6 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     match ctx.config.save(&path) {
         Ok(()) => {
             atomcode_core::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
-            ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
                 .cmd_tx
@@ -7513,6 +7930,31 @@ fn handle_streaming_key(
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
     let menu_items = menu_for_display(&app.buf, ctx);
+
+    // Tab / Shift+Tab cycle execution mode MID-TURN (when no completion menu is
+    // up), mirroring the idle handler. `SetMode` flips atomic flags the agent loop
+    // reads on each subsequent tool call, so the switch applies LIVE to the rest of
+    // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
+    // approvals are not retroactively changed — only later tool calls see the new
+    // mode. Repaint the spinner footer so the mode badge updates immediately.
+    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
+        let next = if code == KeyCode::BackTab {
+            app.state.agent_mode.prev()
+        } else {
+            app.state.agent_mode.next()
+        };
+        set_agent_mode(app, ctx, renderer, next);
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -7646,8 +8088,6 @@ fn handle_streaming_key(
                     ctx,
                     renderer,
                     &mut app.active_modal,
-                    &mut app.fixissue_pending,
-                    &mut app.fixissue_buffer,
                     &mut app.setup_pending,
                 )?;
                 app.message_queue.clear();
@@ -7735,17 +8175,36 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            app.message_queue.push_back(crate::state::QueuedMessage {
-                text: expanded,
-                images: q_images,
-                image_markers: q_markers,
-            });
-            crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
+            match midturn_submit_route(true, ctx.sync_session.is_some()) {
+                SubmitRoute::SteerNow => {
+                    // Steer into the running turn: the kernel folds this at the next
+                    // round boundary (see AgentEvent::Steered). No local queue. Count
+                    // it as PENDING now; the Steered event drains it once folded.
+                    ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                        text: expanded,
+                        images: q_images,
+                        image_markers: q_markers,
+                    }).ok();
+                    app.state.on_steer_sent();
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  ↳ {}: {}\n",
+                        crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
+                        line
+                    )));
+                }
+                _ => {
+                    app.message_queue.push_back(crate::state::QueuedMessage {
+                        text: expanded,
+                        images: q_images,
+                        image_markers: q_markers,
+                    });
+                    crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
+                    renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
+                }
+            }
             app.buf.text.clear();
             app.buf.cursor = 0;
             app.buf.clear_pastes();
-            // Echo as a queued entry so the user sees it landed.
-            renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
             renderer.flush();
             draw_spinner_now(
                 &mut app.state,
@@ -7874,15 +8333,47 @@ fn approval_command_to_decision(cmd: &AgentCommand) -> atomcode_core::tool::Perm
     }
 }
 
-/// Whether an incoming `ApprovalNeeded` should be auto-approved (true) instead
-/// of surfaced as a prompt (false), given the TUI's bypass flag.
-///
-/// In LOCAL mode the core decider short-circuits and never emits the event, so
-/// this only bites in SYNC mode, where the daemon's LiveSession always asks.
-/// Honoring bypass here is what keeps `--dangerously-skip-permissions` working
-/// for daemon-backed turns (e.g. a `/skills` expansion that drives tool calls).
-fn approval_needed_is_auto_bypassed(dangerously_skip_permissions: bool) -> bool {
-    dangerously_skip_permissions
+/// The three approval options for `tool`, in display order (Allow once is the
+/// default selection). The "Always allow" label carries the tool name because
+/// `AgentEvent::ApprovalNeeded` does not carry the grant scope — except for the
+/// single-file write tools (`WriteFile`/`EditFile`), whose grant `WriteApprovalGate`
+/// scopes to the target's DIRECTORY, so their label names the folder instead.
+pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
+    use crate::state::{ApprovalKind, ApprovalOption};
+    // Display names (snake→Pascal) of the directory-scoped write tools.
+    let always_label = if matches!(tool, "WriteFile" | "EditFile") {
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
+    } else {
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
+    };
+    vec![
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
+            kind: ApprovalKind::AllowOnce,
+            accel: 'y',
+        },
+        ApprovalOption {
+            label: always_label,
+            kind: ApprovalKind::AlwaysAllow,
+            accel: 'a',
+        },
+        ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+            kind: ApprovalKind::Deny,
+            accel: 'n',
+        },
+    ]
+}
+
+/// The `AgentCommand` for a chosen approval option kind. Pure seam so the
+/// key handler's decision mapping is unit-testable.
+pub(crate) fn approval_kind_to_command(kind: crate::state::ApprovalKind) -> AgentCommand {
+    use crate::state::ApprovalKind;
+    match kind {
+        ApprovalKind::AllowOnce => AgentCommand::ApproveTool,
+        ApprovalKind::AlwaysAllow => AgentCommand::ApproveToolAlways,
+        ApprovalKind::Deny => AgentCommand::DenyTool,
+    }
 }
 
 /// The approval command a BYPASS-mode TUI issues for an `ApprovalNeeded` it
@@ -7894,27 +8385,12 @@ fn bypass_approval_command() -> AgentCommand {
 
 #[cfg(test)]
 mod bypass_approval_tests {
-    use super::{
-        approval_command_to_decision, approval_needed_is_auto_bypassed, bypass_approval_command,
-        AgentCommand,
-    };
+    use super::{approval_command_to_decision, bypass_approval_command, AgentCommand};
     use atomcode_core::tool::PermissionDecision;
 
-    // The fix's core invariant: with `--dangerously-skip-permissions` on, an
-    // incoming `ApprovalNeeded` is auto-approved rather than prompted. This is
-    // what was broken in SYNC mode — the daemon always asks, and the TUI used
-    // to show the prompt regardless of bypass (e.g. on `/skills` tool calls).
-    #[test]
-    fn bypass_on_auto_approves() {
-        assert!(approval_needed_is_auto_bypassed(true));
-    }
-
-    // Without bypass, the event must NOT be short-circuited — the normal
-    // prompt path runs. Guards against an accidental inversion of the flag.
-    #[test]
-    fn bypass_off_still_prompts() {
-        assert!(!approval_needed_is_auto_bypassed(false));
-    }
+    // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
+    // (see `auto_mode_bypasses_approval`); the old `dangerously_skip_permissions`
+    // predicate was removed when `--skip` was folded into `AgentMode::Auto`.
 
     // End-to-end on the pure seam: the command BYPASS issues must resolve to a
     // genuine `Allow`. If either the issued command or the mapping drifts so
@@ -7945,6 +8421,42 @@ mod bypass_approval_tests {
             PermissionDecision::Deny
         ));
     }
+
+    #[test]
+    fn build_approval_options_shape() {
+        use crate::state::ApprovalKind;
+        let opts = super::build_approval_options("bash");
+        assert_eq!(opts.len(), 3);
+        assert_eq!((opts[0].kind, opts[0].accel), (ApprovalKind::AllowOnce, 'y'));
+        assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
+        assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
+        assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+    }
+
+    #[test]
+    fn build_approval_options_write_tools_use_folder_label() {
+        // WriteFile/EditFile grants are directory-scoped, so their "always" label
+        // must name the folder — NOT the tool (which would mislead as tool-wide).
+        for tool in ["WriteFile", "EditFile"] {
+            let opts = super::build_approval_options(tool);
+            let label = &opts[1].label;
+            assert!(
+                !label.contains(tool),
+                "{tool} always-allow must not name the tool (folder-scoped): {label}"
+            );
+        }
+        // A tool-wide write tool (no single target) keeps the tool-named label.
+        let opts = super::build_approval_options("SearchReplace");
+        assert!(opts[1].label.contains("SearchReplace"), "{}", opts[1].label);
+    }
+
+    #[test]
+    fn approval_kind_command_mapping() {
+        use crate::state::ApprovalKind;
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AllowOnce), AgentCommand::ApproveTool));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::AlwaysAllow), AgentCommand::ApproveToolAlways));
+        assert!(matches!(super::approval_kind_to_command(ApprovalKind::Deny), AgentCommand::DenyTool));
+    }
 }
 
 fn handle_approval_key(
@@ -7968,7 +8480,6 @@ fn handle_approval_key(
             // The goal (if any) continues; Claude Code's /goal works the same way.
             // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
-            renderer.pop_approval_prompt();
             deliver_approval(ctx, AgentCommand::DenyTool);
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
@@ -7982,23 +8493,60 @@ fn handle_approval_key(
     // Any other key resets the exit confirmation
     app.exit_pending = None;
 
-    let cmd = match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
-        KeyCode::Char('a') | KeyCode::Char('A') => AgentCommand::ApproveToolAlways,
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => AgentCommand::DenyTool,
-        _ => return Ok(()),
+    // Navigation: move the selection and repaint the footer, no decision yet.
+    match code {
+        KeyCode::Up => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_up();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        KeyCode::Down => {
+            if let Some(p) = app.state.approval_panel.as_mut() {
+                p.move_down();
+            }
+            redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Resolve to a decision: Enter = the selected option; y/a/n = accelerators;
+    // Esc = Deny (safe default). Any other key is ignored.
+    let kind = match code {
+        KeyCode::Enter => app
+            .state
+            .approval_panel
+            .as_ref()
+            .and_then(|p| p.options.get(p.selected).map(|o| o.kind)),
+        KeyCode::Esc => Some(crate::state::ApprovalKind::Deny),
+        KeyCode::Char(c) => app.state.approval_panel.as_ref().and_then(|p| {
+            // Digit shortcut: '1'..'9' selects by positional index.
+            if c.is_ascii_digit() && c != '0' {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < p.options.len() {
+                    return p.options.get(idx).map(|o| o.kind);
+                }
+            }
+            // Letter accelerator fallback (y/a/n).
+            p.accel_index(c).and_then(|i| p.options.get(i).map(|o| o.kind))
+        }),
+        _ => None,
     };
-    // Retract the "Waiting for approval" body row now that the user
-    // responded — without this, the prompt stays in scrollback next to
-    // the tool result, creating visual noise.
-    renderer.pop_approval_prompt();
-    // Per Claude Code semantics, denying a tool does NOT stop the active
-    // /goal — the evaluator will see the user's refusal on the next round
-    // and either change tactics or judge the goal complete. The user can
-    // explicitly halt with `/goal clear` or by pressing Esc outside this
-    // approval prompt (inside the prompt, Esc denies the tool instead).
+    let Some(kind) = kind else {
+        return Ok(());
+    };
+    let cmd = approval_kind_to_command(kind);
     deliver_approval(ctx, cmd);
-    app.state.on_approval_resolved();
+    app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
+    // Repaint the footer NOW so the approval panel disappears immediately, the
+    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+    // this, the retained renderer keeps painting its cached `self.status`
+    // (approval still `Some`) until the next event that carries a fresh
+    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+    // issue #455's "输入框没了" — here the panel lingers after a decision).
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
 
@@ -8101,6 +8649,25 @@ pub(super) fn handle_plugin_job_event(
                 }
             }
         }
+        PluginJobEvent::PluginUpdated(info) => {
+            let (loaded, warnings) = reload_plugins(ctx);
+            if state.show_tool_output {
+                for w in &warnings {
+                    renderer.render(UiLine::CommandOutput(format!("  {}", w)));
+                }
+            }
+            let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginUpdateDone {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                    loaded,
+                    skipped: warnings.len(),
+                    show_details_hint,
+                })
+                .into_owned(),
+            ));
+        }
         PluginJobEvent::Failed { op, msg } => {
             // Clean up pending guide topic so future /guide commands work.
             if ctx.pending_guide_topic.take().is_some() {
@@ -8157,13 +8724,13 @@ pub(super) fn handle_plugin_job_event(
 }
 
 pub(super) fn handle_upgrade_event(
-    ev: atomcode_core::self_update::UpgradeEvent,
+    ev: atomcode_updater::UpgradeEvent,
     last_pct: &mut i32,
     done: &mut Option<std::path::PathBuf>,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
-    use atomcode_core::self_update::UpgradeEvent;
+    use atomcode_updater::UpgradeEvent;
     match ev {
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
@@ -8226,13 +8793,13 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            if msg.contains(atomcode_core::self_update::PACKAGE_MANAGED) {
+            if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 // HarmonyBrew-managed build: self-update is intentionally
                 // disabled. Not an error — render as command output.
                 renderer.render(UiLine::CommandOutput(
                     crate::i18n::t(crate::i18n::Msg::UpgradePackageManaged).into_owned(),
                 ));
-            } else if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+            } else if msg.contains(atomcode_updater::ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
                 // self_update.rs's anyhow!() error is fixed-format
                 // English: "already on {current} (latest is {latest}).
@@ -8241,7 +8808,7 @@ pub(super) fn handle_upgrade_event(
                 // itself instead of pasting English into a translated
                 // wrapper.
                 let friendly = msg.replace(
-                    &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
+                    &format!("{}: ", atomcode_updater::ALREADY_LATEST),
                     "",
                 );
                 let (current, latest) =
@@ -8376,13 +8943,14 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
 
 /// If an approval prompt is still showing when the agent moves on (a tool result arrives,
 /// the turn ends), the approval was resolved WITHOUT a user keypress — a headless timeout
-/// fail-close, a displaced second approval, or a cancel. Retract the orphaned "Waiting for
-/// approval" body row with the SAME cleanup the Y/A/N keypath does (`pop_approval_prompt` +
-/// `on_approval_resolved`), so it can't linger above the result. Returns false (no-op) when
-/// no approval is pending — the normal path, where the keypress already cleared it.
-fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> bool {
+/// fail-close, a displaced second approval, or a cancel. Call `on_approval_resolved` to
+/// clear the footer panel and leave the Approval phase, so the panel doesn't linger above
+/// the result. Returns false (no-op) when no approval is pending — the normal path, where
+/// the keypress already cleared it.
+fn retract_stale_approval(state: &mut UiState) -> bool {
     if matches!(state.phase, UiPhase::Approval) {
-        renderer.pop_approval_prompt();
+        // The footer approval panel clears via `on_approval_resolved` (which nulls
+        // `state.approval_panel`); there is no body row to erase anymore.
         state.on_approval_resolved();
         true
     } else {
@@ -8393,40 +8961,16 @@ fn retract_stale_approval(state: &mut UiState, renderer: &mut dyn Renderer) -> b
 #[cfg(test)]
 mod approval_retract_tests {
     use super::retract_stale_approval;
-    use crate::render::{Renderer, UiLine};
     use crate::state::{UiPhase, UiState};
-
-    #[derive(Default)]
-    struct CountingRenderer {
-        pops: usize,
-    }
-    impl Renderer for CountingRenderer {
-        fn render(&mut self, _line: UiLine) {}
-        fn flush(&mut self) {}
-        fn shutdown(&mut self) {}
-        fn reset(&mut self) {}
-        fn clear_screen(&mut self) {}
-        fn suspend_for_external(&mut self) {}
-        fn resume_from_external(&mut self) {}
-        fn flush_deferred(&mut self) {}
-        fn pop_approval_prompt(&mut self) {
-            self.pops += 1;
-        }
-    }
 
     #[test]
     fn retracts_orphaned_approval_when_resolved_without_keypress() {
         let mut state = UiState::new();
         state.on_approval_needed("EditFile");
         assert!(matches!(state.phase, UiPhase::Approval));
-        let mut r = CountingRenderer::default();
         // A result/cancel arriving while the prompt is still up = resolved without a keypress.
-        let retracted = retract_stale_approval(&mut state, &mut r);
+        let retracted = retract_stale_approval(&mut state);
         assert!(retracted, "a still-pending approval must be retracted");
-        assert_eq!(
-            r.pops, 1,
-            "the orphaned 'Waiting for approval' body row must be popped"
-        );
         assert!(
             !matches!(state.phase, UiPhase::Approval),
             "phase must leave Approval"
@@ -8436,10 +8980,25 @@ mod approval_retract_tests {
     #[test]
     fn noop_when_no_approval_pending() {
         let mut state = UiState::new(); // not in Approval phase
-        let mut r = CountingRenderer::default();
-        let retracted = retract_stale_approval(&mut state, &mut r);
+        let retracted = retract_stale_approval(&mut state);
         assert!(!retracted, "nothing to retract when no prompt is up");
-        assert_eq!(r.pops, 0, "must not pop when no approval prompt is showing");
+    }
+}
+
+/// Map the v1 engine's turn-stop reason onto the notification layer's own
+/// `NotifyStopReason` (capabilities is L0 and cannot see `core::agent`). Total
+/// 1:1 mapping — the two enums mirror each other variant-for-variant.
+fn notify_stop_reason(
+    reason: atomcode_core::agent::TurnStopReason,
+) -> atomcode_capabilities::notify::NotifyStopReason {
+    use atomcode_capabilities::notify::NotifyStopReason as N;
+    use atomcode_core::agent::TurnStopReason as T;
+    match reason {
+        T::Natural => N::Natural,
+        T::Cancelled => N::Cancelled,
+        T::Error => N::Error,
+        T::TurnLimit => N::TurnLimit,
+        T::StepLimit => N::StepLimit,
     }
 }
 
@@ -8559,6 +9118,19 @@ fn streams_tool_output_by_default(
         || tool_display.is_some_and(|d| d == display_tool_name("task"))
 }
 
+fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Option<&'a str> {
+    let activity =
+        chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)?;
+    let supported = tool_display.is_some_and(|display| {
+        display == display_tool_name("task") || display == display_tool_name("code_review")
+    });
+    supported.then_some(activity)
+}
+
+fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool {
+    !success && name == "code_review" && output.starts_with("Code review incomplete")
+}
+
 #[cfg(test)]
 mod tool_output_stream_gate_tests {
     use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
@@ -8646,6 +9218,509 @@ mod ctrl_o_hint_gating_tests {
     }
 }
 
+fn handle_runtime_event(
+    event: bg_runtime::RuntimeEventPayload,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+    pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
+    ctx: &mut LoopCtx,
+    setup_pending: &mut bool,
+    reasoning_buffer: &mut String,
+    buf: &mut Buffer,
+) {
+    match event {
+        bg_runtime::RuntimeEventPayload::Legacy(event) => handle_agent_event(
+            event,
+            state,
+            think,
+            renderer,
+            pending_tools,
+            ctx,
+            setup_pending,
+            reasoning_buffer,
+            buf,
+        ),
+        bg_runtime::RuntimeEventPayload::Native(event) => {
+            let mirror_persisted = persist_native_compaction_snapshot(&event, ctx, renderer);
+            handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
+        }
+    }
+}
+
+/// Persist the exact committed kernel working set into the TUI's transitional
+/// core session mirror before the UI reports manual-compaction success.
+fn persist_native_compaction_snapshot(
+    event: &CodingRuntimeEvent,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let CodingRuntimeEvent::CompactionFinished {
+        completion: CompactionCompletion::Completed(outcome),
+    } = event
+    else {
+        return true;
+    };
+    if !outcome.committed || !outcome.is_manual() {
+        return true;
+    }
+    let Some(snapshot) = outcome.committed_snapshot.as_deref() else {
+        renderer.render(UiLine::Error(
+            "compact completed without a resumable session snapshot".into(),
+        ));
+        renderer.flush();
+        return false;
+    };
+
+    let core_snapshot = kernel_snapshot_to_core(snapshot);
+    persist_current_session(ctx, core_snapshot, renderer)
+}
+
+fn kernel_snapshot_to_core(
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+) -> atomcode_core::conversation::ConversationSnapshot {
+    use atomcode_core::conversation::{
+        LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+    };
+
+    let mut messages = Vec::with_capacity(snapshot.messages.len());
+    let mut cold_summaries = Vec::new();
+    for message in &snapshot.messages {
+        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
+            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
+                cold_summaries.push(summary.to_string());
+                continue;
+            }
+        }
+        messages.push(kernel_message_to_core(message));
+    }
+    atomcode_core::conversation::ConversationSnapshot {
+        messages,
+        cold_summaries,
+    }
+}
+
+fn kernel_message_to_core(
+    message: &atomcode_kernel::message::Message,
+) -> atomcode_core::conversation::message::Message {
+    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
+    use atomcode_kernel::message::Role as KernelRole;
+
+    let role = match message.role {
+        KernelRole::System => Role::System,
+        KernelRole::User => Role::User,
+        KernelRole::Assistant => Role::Assistant,
+        KernelRole::Tool => Role::Tool,
+    };
+    let content = if message.role == KernelRole::Tool {
+        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
+            call_id: message.tool_call_id.clone().unwrap_or_default(),
+            output: message.text.clone(),
+            success: !message.is_error,
+        })
+    } else if !message.tool_calls.is_empty() {
+        MessageContent::AssistantWithToolCalls {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            tool_calls: message
+                .tool_calls
+                .iter()
+                .map(|call| atomcode_core::tool::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+            reasoning_content: message.reasoning.clone(),
+            thinking_blocks: message
+                .reasoning_blocks
+                .iter()
+                .map(|block| atomcode_core::conversation::message::ThinkingBlock {
+                    text: block.text.clone(),
+                    signature: block.opaque.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    } else if !message.images.is_empty() {
+        MessageContent::MultiPart {
+            text: (!message.text.is_empty()).then(|| message.text.clone()),
+            images: message
+                .images
+                .iter()
+                .map(|image| ImagePart {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                })
+                .collect(),
+        }
+    } else {
+        MessageContent::Text(message.text.clone())
+    };
+    Message {
+        role,
+        content,
+        synthetic: message.synthetic,
+        internal_origin: message.internal_origin.clone(),
+    }
+}
+
+fn handle_coding_runtime_event(
+    event: CodingRuntimeEvent,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+    mirror_persisted: bool,
+) {
+    state.note_stream_activity();
+
+    match event {
+        CodingRuntimeEvent::CompactionStarted { .. } => {
+            state.compacting = true;
+            if !matches!(state.phase, UiPhase::Streaming) {
+                state.compaction_forced_streaming = true;
+                state.phase = UiPhase::Streaming;
+                state.phase_started_at = Some(std::time::Instant::now());
+            }
+        }
+        CodingRuntimeEvent::CompactionFinished { completion } => {
+            state.compacting = false;
+            match completion {
+                CompactionCompletion::Completed(outcome) if outcome.committed => {
+                    state.on_compaction_committed(outcome.estimated_tokens_after);
+                    if mirror_persisted {
+                        renderer.render(UiLine::CompactionMark(
+                            atomcode_config::i18n::format_compaction_mark(
+                                outcome.removed_messages,
+                                outcome.estimated_tokens_before,
+                                outcome.estimated_tokens_after,
+                            ),
+                        ));
+                        renderer.flush();
+                    }
+                }
+                CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
+                    render_assistant_text(
+                        atomcode_config::i18n::format_compaction_noop(
+                            outcome.estimated_tokens_before,
+                            outcome.estimated_tokens_after,
+                            outcome.summary_would_grow(),
+                        ),
+                        state,
+                        think,
+                        renderer,
+                    );
+                }
+                CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { .. },
+                    ..
+                } => {
+                    render_assistant_text(
+                        atomcode_config::i18n::format_compaction_interrupted(),
+                        state,
+                        think,
+                        renderer,
+                    );
+                }
+                CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { .. },
+                    error,
+                } => {
+                    renderer.render(UiLine::Error(format!("compact failed: {error}")));
+                    renderer.flush();
+                }
+                CompactionCompletion::Completed(_)
+                | CompactionCompletion::Failed { .. }
+                | CompactionCompletion::Interrupted { .. } => {}
+            }
+
+            if state.compaction_forced_streaming {
+                state.compaction_forced_streaming = false;
+                state.phase = UiPhase::Idle;
+                state.spinner_label.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_assistant_text(
+    text: String,
+    state: &mut UiState,
+    think: &mut ThinkStripper,
+    renderer: &mut dyn Renderer,
+) {
+    let visible = think.feed(&text);
+    if visible.is_empty() {
+        return;
+    }
+
+    state.turn_rendered_visible_text = true;
+    if state.response_finalized {
+        state.last_assistant_response.clear();
+        state.response_finalized = false;
+    }
+    state.last_assistant_response.push_str(&visible);
+    renderer.render(UiLine::AssistantText(visible));
+    renderer.flush();
+}
+
+#[cfg(test)]
+mod coding_runtime_event_tests {
+    use super::*;
+    use atomcode_coding::runtime::CompactionOutcome;
+    use atomcode_kernel::message::CompactTrigger;
+
+    fn outcome(trigger: CompactTrigger, committed: bool) -> CompactionOutcome {
+        CompactionOutcome {
+            trigger,
+            epoch: 1,
+            removed_messages: 3,
+            bytes_before: 40_000,
+            bytes_after: 10_000,
+            committed,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 2_500,
+            committed_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn kernel_projection_preserves_reasoning_blocks() {
+        let mut message = atomcode_kernel::message::Message::assistant(
+            "answer",
+            vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        message.reasoning_blocks = vec![atomcode_kernel::message::ReasoningBlock {
+            text: "thought".into(),
+            opaque: Some("sig".into()),
+            provider: Some("anthropic".into()),
+        }];
+
+        let projected = kernel_message_to_core(&message);
+        let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
+            thinking_blocks,
+            ..
+        } = projected.content
+        else {
+            panic!("expected assistant tool-call content");
+        };
+        assert_eq!(thinking_blocks.len(), 1);
+        assert_eq!(thinking_blocks[0].text, "thought");
+        assert_eq!(thinking_blocks[0].signature, "sig");
+    }
+
+    #[test]
+    fn kernel_projection_restores_legacy_cold_summaries() {
+        use atomcode_core::conversation::{
+            LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX,
+        };
+        let mut summary = atomcode_kernel::message::Message::user(format!(
+            "{LEGACY_COLD_SUMMARY_PREFIX}older context"
+        ));
+        summary.synthetic = true;
+        summary.internal_origin = Some(LEGACY_COLD_SUMMARY_ORIGIN.into());
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            summary,
+            atomcode_kernel::message::Message::user("recent"),
+        ]);
+
+        let projected = kernel_snapshot_to_core(&snapshot);
+
+        assert_eq!(projected.cold_summaries, vec!["older context"]);
+        assert_eq!(projected.messages.len(), 1);
+        assert_eq!(projected.messages[0].text(), Some("recent"));
+    }
+
+    #[test]
+    fn manual_compaction_drives_spinner_then_committed_marker() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+            assert!(state.compacting);
+            assert!(state.compaction_forced_streaming);
+            assert!(matches!(state.phase, UiPhase::Streaming));
+
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(!state.compaction_forced_streaming);
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn interrupted_manual_compaction_clears_spinner_and_restores_idle() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Interrupted {
+                        trigger: CompactTrigger::Manual { focus: None },
+                        reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                    },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(!state.compacting);
+        assert!(!state.compaction_forced_streaming);
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn automatic_noop_is_silent_and_keeps_streaming() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Auto { utilization: 0.8 },
+                        false,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Streaming));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn manual_noop_renders_acknowledgement_and_restores_idle() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        state.compacting = true;
+        state.compaction_forced_streaming = true;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        false,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(state.turn_rendered_visible_text);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn committed_marker_waits_for_core_mirror_persistence() {
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                false,
+            );
+        }
+
+        assert!(output.is_empty(), "success marker must wait for the session mirror save");
+    }
+
+    #[test]
+    fn failed_manual_compaction_renders_error_and_restores_idle() {
+        let mut state = UiState::default();
+        state.phase = UiPhase::Streaming;
+        state.compacting = true;
+        state.compaction_forced_streaming = true;
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Failed {
+                        trigger: CompactTrigger::Manual { focus: None },
+                        error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                            "disk full",
+                        ),
+                    },
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+
+        assert!(matches!(state.phase, UiPhase::Idle));
+        assert!(!state.compacting);
+        assert!(!output.is_empty());
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -8653,8 +9728,6 @@ fn handle_agent_event(
     renderer: &mut dyn Renderer,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     ctx: &mut LoopCtx,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
     reasoning_buffer: &mut String,
     buf: &mut Buffer,
@@ -8700,25 +9773,7 @@ fn handle_agent_event(
 
     match ev {
         AgentEvent::TextDelta(text) => {
-            let visible = think.feed(&text);
-            if !visible.is_empty() {
-                // Mark that this turn produced a real visible answer, so the
-                // TurnComplete handler does not surface a "blank turn" notice.
-                state.turn_rendered_visible_text = true;
-                // Keep the raw reply markdown for `/copy`. Clear-on-finalize:
-                // the first delta of a new turn wipes the sealed prior reply,
-                // so between turns the buffer still holds the last reply.
-                if state.response_finalized {
-                    state.last_assistant_response.clear();
-                    state.response_finalized = false;
-                }
-                state.last_assistant_response.push_str(&visible);
-                if fixissue_pending.is_some() {
-                    fixissue_buffer.push_str(&visible);
-                }
-                renderer.render(UiLine::AssistantText(visible));
-                renderer.flush();
-            }
+            render_assistant_text(text, state, think, renderer);
         }
         AgentEvent::ReasoningDelta(text) => {
             // Record that reasoning was produced this turn REGARDLESS of
@@ -8750,6 +9805,38 @@ fn handle_agent_event(
             let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
 
+            // The merged `todowrite` carries EITHER the full-list PLAN shape (`{todos:[…]}`) or
+            // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
+            // calls. Distinguish by ARG SHAPE, not tool name.
+            let is_todo_call = name == "todowrite" || name == "todo";
+            let todo_plan = if is_todo_call { todo_progress_from_args(&arguments) } else { None };
+            let is_todo_action = is_todo_call
+                && todo_plan.is_none()
+                && serde_json::from_str::<serde_json::Value>(&arguments)
+                    .ok()
+                    .is_some_and(|v| v.get("action").and_then(|a| a.as_str()).is_some());
+
+            // Incremental action (add / update id=N status): fold it into the live footer panel
+            // + title cache HERE — ABOVE the batch / approval early-returns below — so batched
+            // and approval-gated action calls update the panel too (they return before the
+            // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
+            // `#N → status` line is a useful marker.
+            if is_todo_action {
+                patch_live_todos_from_action(state, &arguments);
+            }
+
+            // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
+            // ABOVE the batch / approval early-returns below. When the model packs the
+            // todowrite into a BATCH (a group of calls submitted together — batch
+            // MEMBERSHIP, not parallel execution: the kernel may run them serially) or
+            // it's approval-gated, those paths early-return before the plan-assignment
+            // block, so setting `active_todos` only there left a batched plan's panel
+            // permanently empty. Mirrors the incremental-action patch above.
+            if let Some(progress) = todo_plan.as_ref() {
+                state.active_todos = Some(progress.clone());
+                sync_todo_titles(state); // titles follow the new plan (id = position)
+            }
+
             // If this call is part of an active batch, the
             // ToolBatchStarted handler already rendered the group header
             // + child rows — skip the standalone ▸ ToolCallInFlight
@@ -8779,31 +9866,17 @@ fn handle_agent_event(
                 return;
             }
 
-            // todowrite: render a compact glyph list block instead of the animated
-            // ToolCallInFlight spinner row. Each item line is styled by status:
-            // completed → Muted (dim), in_progress → Warning (yellow), pending → Muted.
-            // Falls through to the normal ToolCallInFlight path when parse fails.
-            if name == "todowrite" {
-                // Capture live footer progress from this in-flight call — the
-                // transcript won't carry it until turn end (persist_current_session),
-                // so the footer would otherwise not move mid-turn.
-                state.live_turn_todo = todo_progress_from_args(&arguments);
-                // SHARED with the /resume replay (session_picker) via
-                // `todo_block_styled_lines` so live and replay stay identical.
-                let block = todo_block_styled_lines(&arguments, ctx.caps.unicode_symbols);
-                if !block.is_empty() {
-                    renderer.render(UiLine::AssistantLineBreak);
-                    for styled in block {
-                        renderer.render(UiLine::CommandOutput(styled));
-                    }
-                    renderer.flush();
-                    // Mark as rendered (call_rendered=true) so ToolCallResult
-                    // suppresses the normal ToolCall + ToolResult lines.
-                    pending_tools.insert(id, (display.clone(), detail, true));
-                    state.on_tool_call_started(&display);
-                    return;
-                }
+            // todowrite (non-batch, non-approval): the persistent footer PANEL is the
+            // sole view — `active_todos` was already set above; here we only SUPPRESS
+            // the tool CALL + RESULT rows. On a parse failure (`todo_plan` is None) fall
+            // through to the normal tool row so the error surfaces.
+            if todo_plan.is_some() {
+                // call_rendered=true ⇒ ToolCallResult suppresses the result row.
+                pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
             }
+
 
             // Emit the ▸ line immediately so users can see what command
             // is running, especially for long-running bash commands.
@@ -8834,23 +9907,13 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id, chunk } => {
             let tool_display = pending_tools.get(&call_id).map(|(d, ..)| d.as_str());
-            // EPHEMERAL subagent activity: a `task` child's live "current action" line is
-            // marked with SUBAGENT_ACTIVITY_MARKER (single source of truth in the capabilities
-            // crate, emitted by `SubtaskProgressHook`). It does NOT belong in scrollback — it
-            // updates the spinner in-place (latest-wins) so a fan-out shows what it's doing
-            // without spamming a line per tool call. Cheap marker check FIRST (every bash
-            // chunk hits this arm); the `display_tool_name("task")` allocation only runs for
-            // the rare marker-prefixed chunk, and scopes it to the `task` tool so a non-task
-            // tool that happens to stream a leading U+001E byte can't be hijacked.
-            if let Some(activity) =
-                chunk.strip_prefix(atomcode_capabilities::tools::task::SUBAGENT_ACTIVITY_MARKER)
-            {
-                if tool_display.is_some_and(|d| d == display_tool_name("task")) {
-                    state.subagent_activity = Some(activity.to_string());
-                    // Repaint so the spinner picks up the new activity immediately.
-                    renderer.flush();
-                    return;
-                }
+            // Marker-prefixed child activity is EPHEMERAL: latest wins in the footer spinner,
+            // never append it to scrollback. Scope the convention to known sub-agent tools so
+            // an unrelated command that emits U+001E cannot hijack the UI.
+            if let Some(activity) = ephemeral_tool_activity(tool_display, &chunk) {
+                state.subagent_activity = Some(activity.to_string());
+                renderer.flush();
+                return;
             }
             // Display real-time tool output (e.g., bash stdout/stderr). Normally
             // gated behind Ctrl+O verbose mode, but user-invoked `!` shell commands
@@ -8873,19 +9936,19 @@ fn handle_agent_event(
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
             // approval" row first so it doesn't linger above the result.
-            retract_stale_approval(state, renderer);
+            retract_stale_approval(state);
             // The `task` fan-out finished — drop its live spinner activity so a
             // completed subtask's last action doesn't linger while the parent
             // agent keeps working the rest of the turn.
-            if name == "task" {
+            if name == "task" || name == "code_review" {
                 state.subagent_activity = None;
             }
-            // Learn task id → content from every todo result (each action
-            // returns the full list). This is what later `todo update`
-            // rows look up to show the task NAME instead of a bare id.
-            // Parsed before the batch early-return below so both batched
-            // and single todo results feed the map.
-            if name == "todo" {
+            // Title cache (id → content, for `todo update #N` row names) is maintained by
+            // `sync_todo_titles` from `active_todos` at every panel mutation. This legacy parse
+            // stays as a harmless backstop: it only INSERTS from a full-list-shaped result and
+            // never clears, so it can't clobber the derived titles (a delta result yields no
+            // matching lines and is a no-op).
+            if name == "todo" || name == "todowrite" {
                 parse_todo_titles_into(&mut state.todo_titles, &output);
             }
             // If this call belongs to an active batch, the group header
@@ -8940,7 +10003,13 @@ fn handle_agent_event(
                 // visual consistency with the initial child row.
                 let prefix = pending_tools
                     .remove(&call_id)
-                    .map(|(_, det, _)| format!("{}({})", display_tool_name_short(&name), det))
+                    .map(|(_, det, _)| {
+                        if name.eq_ignore_ascii_case("bash") {
+                            format!("{} {}", display_tool_name_short(&name), det)
+                        } else {
+                            format!("{}({})", display_tool_name_short(&name), det)
+                        }
+                    })
                     .unwrap_or_else(|| display_tool_name_short(&name));
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
@@ -9012,8 +10081,14 @@ fn handle_agent_event(
                 // A plan-mode interception isn't a failure — render it as a calm `○`
                 // hint (with the gate's reason) instead of a ✗ error, so the user
                 // sees WHY the tool didn't run and that they should review the plan.
-                if let Some(reason) = plan_mode_block_reason(&output, success) {
+                if is_incomplete_review_result(&name, &output, success) {
+                    renderer.render(UiLine::Warning(summarise(&output)));
+                } else if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
+                } else if let Some(label) = approval_denial_label(&output, success) {
+                    // A denial is the user's choice, not an error — render a calm `○ denied`
+                    // (muted, like plan-mode blocks), dropping the verbose tool+args repeat.
+                    renderer.render(UiLine::CommandOutput(format!("  ○ {label}\n")));
                 } else {
                     // A single web_search call gets the same source-domain
                     // summary as the parallel child rows (`sources: eol.cn,
@@ -9027,6 +10102,10 @@ fn handle_agent_event(
                         // Clean per-subtask lines (id · model · status) instead of the
                         // raw <task ...> block.
                         summarise_task_result(&output)
+                    } else if name == "read_file" && success {
+                        // Collapse the `{line}\t{indented content}` preview so a
+                        // deeply-indented line doesn't render as a big left gap.
+                        summarise_read_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -9053,25 +10132,7 @@ fn handle_agent_event(
                 "edit_file" | "write_file" | "create_file" | "search_replace"
             );
             if emits_diff {
-                let diff_entries: Vec<crate::render::DiffEntry> = output
-                    .lines()
-                    .take(120)
-                    .filter_map(|line| {
-                        if let Some(rest) = line.strip_prefix("+ ") {
-                            Some(crate::render::DiffEntry {
-                                added: true,
-                                text: rest.to_string(),
-                            })
-                        } else if let Some(rest) = line.strip_prefix("- ") {
-                            Some(crate::render::DiffEntry {
-                                added: false,
-                                text: rest.to_string(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let diff_entries = crate::render::diff::parse_unified_diff(&output, 120);
                 if !diff_entries.is_empty() {
                     renderer.render(UiLine::DiffBlock(diff_entries));
                 }
@@ -9098,7 +10159,7 @@ fn handle_agent_event(
             // bypass to webui peers attached to the same LiveSession).
             // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
             // and to the local agent otherwise.
-            if approval_needed_is_auto_bypassed(ctx.dangerously_skip_permissions) {
+            if state.agent_mode.is_auto() {
                 deliver_approval(ctx, bypass_approval_command());
                 return;
             }
@@ -9152,15 +10213,17 @@ fn handle_agent_event(
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
 
-            renderer.render(UiLine::ApprovalPrompt {
+            state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
+                options: build_approval_options(&display),
+                selected: 0,
             });
             renderer.flush();
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::ApprovalNeeded(
-                    atomcode_core::notify::ApprovalNotification {
+                atomcode_capabilities::notify::NotificationEvent::ApprovalNeeded(
+                    atomcode_capabilities::notify::ApprovalNotification {
                         tool_name: &display_tool_name(&tool_name),
                         detail: Some(&format_tool_detail(&tool_name, &call.arguments)),
                         working_dir: Some(&ctx.working_dir),
@@ -9199,15 +10262,15 @@ fn handle_agent_event(
             // Seal the assistant-reply buffer so `/copy` reads this completed
             // reply until the next turn's first delta starts a fresh one.
             state.response_finalized = true;
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::TurnFinished(
-                    atomcode_core::notify::TurnNotification {
+                atomcode_capabilities::notify::NotificationEvent::TurnFinished(
+                    atomcode_capabilities::notify::TurnNotification {
                         duration,
                         turn_count,
                         tool_call_count,
                         total_tokens: Some(total_tokens),
-                        stop_reason,
+                        stop_reason: notify_stop_reason(stop_reason),
                         working_dir: Some(&ctx.working_dir),
                     },
                 ),
@@ -9347,32 +10410,6 @@ fn handle_agent_event(
                 }
             }
 
-            // fixissue post-run side effects — only on successful TurnComplete
-            // (TurnCancelled / Error arms below clear `fixissue_pending`
-            // without posting). Takes the IssueRef out so only this turn's
-            // completion triggers the post-back.
-            if let Some(issue_ref) = fixissue_pending.take() {
-                let body = std::mem::take(fixissue_buffer);
-                if body.trim().is_empty() {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  [fixissue] agent produced no text; skipping comment + label on issue #{}\n",
-                        issue_ref.number
-                    )));
-                } else {
-                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
-                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
-                            issue_ref.number
-                        ))),
-                        Err(e) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✗ post-back failed (local fix still saved): {:#}\n",
-                            e
-                        ))),
-                    }
-                }
-                renderer.flush();
-            }
-
             // setup post-run side effects — only on successful TurnComplete.
             // Reload skills/commands so newly-created skills become visible
             // to the LLM immediately.
@@ -9397,15 +10434,15 @@ fn handle_agent_event(
         AgentEvent::TurnCancelled { snapshot } => {
             // Seal the reply buffer (partial reply still copyable via `/copy`).
             state.response_finalized = true;
-            atomcode_core::notify::notify(
+            atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::NotificationEvent::TurnFinished(
-                    atomcode_core::notify::TurnNotification {
+                atomcode_capabilities::notify::NotificationEvent::TurnFinished(
+                    atomcode_capabilities::notify::TurnNotification {
                         duration: state.turn_elapsed().unwrap_or_default(),
                         turn_count: 0,
                         tool_call_count: pending_tools.len(),
                         total_tokens: None,
-                        stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                        stop_reason: atomcode_capabilities::notify::NotifyStopReason::Cancelled,
                         working_dir: Some(&ctx.working_dir),
                     },
                 ),
@@ -9432,10 +10469,6 @@ fn handle_agent_event(
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
             state.on_turn_cancelled();
-            // Cancellation = agent didn't finish; don't post a comment
-            // against an incomplete "fix".
-            fixissue_pending.take();
-            fixissue_buffer.clear();
             *setup_pending = false;
             // Same reset rationale as TurnComplete: a cancelled turn is the
             // single most common way for `<think>` to go unclosed, so this
@@ -9521,8 +10554,6 @@ fn handle_agent_event(
             state.response_finalized = true;
             renderer.render(UiLine::Error(error));
             renderer.flush();
-            fixissue_pending.take();
-            fixissue_buffer.clear();
             *setup_pending = false;
             state.on_error();
             // Same reset rationale as TurnComplete / TurnCancelled — an
@@ -9546,40 +10577,6 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
-        AgentEvent::CompactionUi(kind) => match kind {
-            atomcode_core::agent::CompactionUiKind::Begin => {
-                state.compacting = true;
-                // A standalone manual `/compact` runs from Idle (its command
-                // handler does NOT call on_submit), so the spinner wouldn't
-                // animate. Force Streaming so "Compacting…" shows, and record
-                // it so completion restores Idle. An auto-compaction is already
-                // mid-turn (Streaming) — leave its phase to the turn lifecycle.
-                if !matches!(state.phase, UiPhase::Streaming) {
-                    state.compaction_forced_streaming = true;
-                    state.phase = UiPhase::Streaming;
-                    state.phase_started_at = Some(std::time::Instant::now());
-                }
-                state.note_stream_activity();
-            }
-            atomcode_core::agent::CompactionUiKind::End => {
-                state.compacting = false;
-                if state.compaction_forced_streaming {
-                    state.compaction_forced_streaming = false;
-                    state.phase = UiPhase::Idle;
-                    state.spinner_label.clear();
-                }
-            }
-            atomcode_core::agent::CompactionUiKind::Mark(label) => {
-                state.compacting = false;
-                renderer.render(UiLine::CompactionMark(label));
-                renderer.flush();
-                if state.compaction_forced_streaming {
-                    state.compaction_forced_streaming = false;
-                    state.phase = UiPhase::Idle;
-                    state.spinner_label.clear();
-                }
-            }
-        },
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -9642,6 +10639,7 @@ fn handle_agent_event(
             // pending state on its own.
         }
         AgentEvent::TokenUsage(u) => {
+            state.on_token_usage();
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;
             state.cached_tokens += u.cached_tokens;
@@ -9668,14 +10666,13 @@ fn handle_agent_event(
             let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
-                ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
         AgentEvent::ProjectSwitched(new_dir) => {
             // A webui /cd switched the project directory (delivered via the
             // live-sync forwarder in sync mode). Follow it: change cwd like
-            // `/cd` (updates runtime_factory + @-file index + recent dirs +
+            // `/cd` (updates working_dir + @-file index + recent dirs +
             // tells the running agent), THEN open a fresh session in the new
             // dir like `/session`. Distinct from WorkingDirChanged (agent's own
             // `cd`, conversation preserved). No-op when already there to avoid
@@ -9760,6 +10757,11 @@ fn handle_agent_event(
             // parallel". No tech-stack hardcoding — tool names come from
             // the model's own tool_calls.name.
             let count = calls.len();
+            // A batch only runs CONCURRENTLY when ≥2 of its calls are parallel_safe
+            // (read-only). Fewer than 2 (all bash, or 1 read + writes) run serially,
+            // so "in parallel" would be a lie. `parallel_safe` is threaded from
+            // Tool::parallel_safe() in the kernel so we never re-classify by name here.
+            let concurrent = calls.iter().filter(|c| c.parallel_safe).count() >= 2;
             let unique_names: std::collections::HashSet<&str> =
                 calls.iter().map(|c| c.name.as_str()).collect();
             // Generic header — no per-tool verb table inside the
@@ -9768,11 +10770,19 @@ fn handle_agent_event(
             // a `match tool_name { "bash" => "Running" ... }` table
             // that drifts whenever new tools land or models invent
             // names (mcp.foo, custom plugins).
-            let label = if unique_names.len() == 1 {
-                let single = unique_names.iter().next().copied().unwrap_or("tool");
-                format!("Running {} {} calls in parallel", count, single)
-            } else {
-                format!("Running {} tools in parallel", count)
+            let label = match (unique_names.len() == 1, concurrent) {
+                (true, true) => format!(
+                    "Running {} {} calls in parallel",
+                    count,
+                    unique_names.iter().next().copied().unwrap_or("tool")
+                ),
+                (true, false) => format!(
+                    "Running {} {} calls",
+                    count,
+                    unique_names.iter().next().copied().unwrap_or("tool")
+                ),
+                (false, true) => format!("Running {} tools in parallel", count),
+                (false, false) => format!("Running {} tools", count),
             };
             // Header alone — child rows are NOT pre-rendered. Each
             // child surfaces as a `  ↳ ✓ name` line when its
@@ -9837,7 +10847,8 @@ fn handle_agent_event(
                 .iter()
                 .zip(disambiguated.iter())
                 .map(|(c, detail)| {
-                    if c.name == "todo" {
+                    // Merged `todowrite` carries `{action}` too (legacy `todo` still recognized).
+                    if c.name == "todo" || c.name == "todowrite" {
                         // Parse the action from arguments JSON rather than
                         // string-matching, because model-generated JSON may
                         // contain whitespace around colons/commas.
@@ -10122,45 +11133,83 @@ fn handle_agent_event(
             }
             state.on_sub_agent_dispatch_end();
         }
-        AgentEvent::BackgroundComplete {
-            summary,
-            files_edited,
-            turns,
-            success,
-        } => {
-            let header = if success {
-                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
-            } else {
-                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
-            };
-            let mut body = String::from(&header);
-            body.push_str("  ");
-            body.push_str(&summary);
-            if !body.ends_with('\n') {
-                body.push('\n');
-            }
-            if !files_edited.is_empty() {
-                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
-                for f in &files_edited {
-                    body.push_str(&format!("    - {}\n", f));
-                }
-            }
-            if success {
-                renderer.render(UiLine::CommandOutput(body));
-            } else {
-                renderer.render(UiLine::Error(body));
-            }
-            renderer.flush();
-        }
         AgentEvent::MessagesSync { snapshot } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
             // the conversation state.
-            if !snapshot.messages.is_empty() {
+            // A tokened SetConversation has its own response variants; ignore a
+            // stale generic sync while that handoff owns the session boundary.
+            if ctx.pending_local_runtime_sync.is_none()
+                && (!snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty())
+            {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
+        }
+        AgentEvent::ConversationRestored {
+            restore_id,
+            snapshot,
+        } => {
+            let matches = ctx
+                .pending_local_runtime_sync
+                .as_ref()
+                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
+            if !matches {
+                crate::tuix_trace!(
+                    "SYNC",
+                    "ignored stale conversation restore id={}",
+                    restore_id
+                );
+                return;
+            }
+
+            let _completed = ctx.pending_local_runtime_sync.take();
+            ctx.current_session
+                .update_from_conversation_snapshot(snapshot);
+            ctx.current_session.touch();
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
+            if let Err(error) = ctx.session_manager.save(&ctx.current_session) {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+            }
+            renderer.render(UiLine::CommandOutput(
+                "本地会话已接管 runtime 实际快照".to_string(),
+            ));
+            renderer.flush();
+        }
+        AgentEvent::ConversationRestoreFailed {
+            restore_id,
+            error,
+        } => {
+            let matches = ctx
+                .pending_local_runtime_sync
+                .as_ref()
+                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
+            if !matches {
+                crate::tuix_trace!(
+                    "SYNC",
+                    "ignored stale conversation restore failure id={}: {}",
+                    restore_id,
+                    error
+                );
+                return;
+            }
+            let restored_live = commands::rollback_pending_local_runtime_sync(ctx);
+            let suffix = if restored_live {
+                "；已恢复 Live 同步"
+            } else {
+                "；原 Live 会话上下文已变化，无法自动恢复"
+            };
+            renderer.render(UiLine::Error(format!(
+                "本地 runtime 接管失败：{error}{suffix}"
+            )));
+            renderer.flush();
         }
         AgentEvent::UserEcho(text) => {
             let markers = image_markers_in_order(&text);
@@ -10208,7 +11257,6 @@ fn handle_agent_event(
                 // model_picker) — otherwise the denominator lags a turn behind
                 // a webui-driven model change.
                 state.on_model_window_changed(ctx.config.default_context_window());
-                ctx.runtime_factory.set_config(ctx.config.clone());
                 let _ = ctx
                     .agent
                     .cmd_tx
@@ -10220,20 +11268,21 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ModeChanged { plan, bypass } => {
-            state.agent_mode = if plan {
+            let mode = if bypass {
+                crate::state::AgentMode::Auto
+            } else if plan {
                 crate::state::AgentMode::Plan
             } else {
                 crate::state::AgentMode::Build
             };
-            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(plan));
-            let label = if bypass {
-                "Web UI Bypass"
-            } else {
-                state.agent_mode.label()
-            };
+            state.agent_mode = mode;
+            if mode == crate::state::AgentMode::Build {
+                state.build_badge_visible = true;
+            }
+            let _ = ctx.agent.cmd_tx.send(AgentCommand::SetMode(mode));
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} mode.\n",
-                label
+                mode.label()
             )));
             renderer.flush();
         }
@@ -10275,6 +11324,9 @@ fn handle_agent_event(
             state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
+            state.active_todos = None;
+            sync_todo_titles(state); // drop prior session's titles
+            state.approval_panel = None;
 
             // 目标会话所属目录：已存在会话用其自身 working_dir；建不出来时沿用当前目录。
             let target_session = match loaded {
@@ -10304,9 +11356,10 @@ fn handle_agent_event(
             // 把历史灌进 agent 会话，使后续回合带上下文（空会话则等价于清空）。
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SetConversation(
-                    target_session.to_conversation_snapshot(),
-                ))
+                .send(AgentCommand::SetConversation {
+                    snapshot: target_session.to_conversation_snapshot(),
+                    restore_id: None,
+                })
                 .ok();
             commands::bind_telemetry_to_session(ctx, &target_session);
             ctx.current_session = target_session;
@@ -10345,7 +11398,7 @@ fn handle_agent_event(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 crate::tuix_trace!(
                     "TUI",
@@ -10386,6 +11439,9 @@ fn handle_agent_event(
             renderer.render(UiLine::Muted(line));
             renderer.flush();
         }
+        AgentEvent::Steered { count } => {
+            state.on_steered(count);
+        }
     }
 }
 
@@ -10414,15 +11470,15 @@ fn apply_ai_session_name(ctx: &mut LoopCtx, name: String, renderer: &mut dyn Ren
 /// Copy the latest conversation into `ctx.current_session`, auto-name
 /// the session from the first real user message, and write the session
 /// file to disk. Called on every TurnComplete and TurnCancelled so
-/// `/resume` can find the conversation after a quit. No-op when the
-/// conversation is empty (don't save a blank session).
+/// `/resume` can find the conversation after a quit. No-op only when both
+/// the recent working set and compressed history are empty.
 fn persist_current_session(
     ctx: &mut LoopCtx,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
     renderer: &mut dyn Renderer,
-) {
-    if snapshot.messages.is_empty() {
-        return;
+) -> bool {
+    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
+        return true;
     }
     apply_session_snapshot(&mut ctx.current_session, snapshot);
     ctx.bg_manager
@@ -10440,14 +11496,16 @@ fn persist_current_session(
             .into_owned(),
         ));
         renderer.flush();
+        return false;
     }
+    true
 }
 
 pub(crate) fn apply_session_snapshot(
     session: &mut atomcode_core::session::Session,
     snapshot: atomcode_core::conversation::ConversationSnapshot,
 ) {
-    if snapshot.messages.is_empty() {
+    if snapshot.messages.is_empty() && snapshot.cold_summaries.is_empty() {
         return;
     }
     session.update_from_conversation_snapshot(snapshot);
@@ -10564,6 +11622,29 @@ mod session_naming_tests {
         );
 
         assert_eq!(session.cold_summaries, vec!["compressed context"]);
+    }
+
+    #[test]
+    fn apply_session_snapshot_accepts_a_cold_only_working_set() {
+        use atomcode_core::conversation::{
+            message::{Message, Role},
+            ConversationSnapshot,
+        };
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        session.messages = vec![Message::new(Role::User, "stale recent turn")];
+
+        apply_session_snapshot(
+            &mut session,
+            ConversationSnapshot {
+                messages: Vec::new(),
+                cold_summaries: vec!["all retained context".to_string()],
+            },
+        );
+
+        assert!(session.messages.is_empty());
+        assert_eq!(session.cold_summaries, vec!["all retained context"]);
     }
 
     #[test]
@@ -10713,20 +11794,17 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             crate::render::HintSeverity::Info,
         ))
     } else if let Some(v) = ctx.update_hint.lock().ok().and_then(|g| g.clone()) {
-        let text = if atomcode_core::self_update::is_package_managed() {
+        let text = if atomcode_updater::is_package_managed() {
             crate::i18n::t(crate::i18n::Msg::StatusUpgradeHintPm { version: &v }).into_owned()
         } else {
             crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned()
         };
         Some((text, crate::render::HintSeverity::Info))
     } else {
-        // Lowest-priority fallback: surface the `/webui` browser-UI entry
-        // point, which is otherwise easy to miss. Yields the slot to every
-        // higher-priority hint above (warnings / usage / upgrade).
-        Some((
-            crate::i18n::t(crate::i18n::Msg::StatusWebuiHint).into_owned(),
-            crate::render::HintSeverity::Info,
-        ))
+        // No lowest-priority fallback: the welcome banner now surfaces the
+        // getting-started tips (including /webui), so the footer hint slot stays
+        // empty when idle instead of showing a persistent /webui nudge.
+        None
     };
     // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
     // (empty string or "not-configured") — showing that raw in the status
@@ -10737,21 +11815,63 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
-    // Mode indicator: only rendered when the user has explicitly
-    // switched away from the default Build mode. Plan disables file
-    // edits + shell, so making it prominent in the status line guards
-    // against the user being confused why the agent refuses to write
-    // files. Default Build = None, no visual noise.
+    // Mode badge (`ModeBadge`): a single left-aligned badge that covers all
+    // non-default modes. The badge carries both its label and its colour slot
+    // (`BadgeColour`), so the renderer just maps the slot to a `CellStyle`.
+    // `None` for the default Build startup so the status row stays clean.
+    use crate::render::{BadgeColour, ModeBadge};
     let mode_indicator = match state.agent_mode {
-        crate::state::AgentMode::Plan => Some("PLAN".to_string()),
-        crate::state::AgentMode::Build => None,
+        crate::state::AgentMode::Plan => {
+            // `⏸ plan` — glyph downgrades to `||` on non-unicode terminals.
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f8} plan".to_string()
+                } else {
+                    "|| plan".to_string()
+                },
+                colour: BadgeColour::Plan,
+            })
+        }
+        crate::state::AgentMode::AcceptEdits => {
+            // `⏵ accept edits` — single play glyph (U+23F5, renders 1-cell text form),
+            // downgrades to `>` on non-unicode terminals.
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f5} accept edits".to_string()
+                } else {
+                    "> accept edits".to_string()
+                },
+                colour: BadgeColour::Mode,
+            })
+        }
+        crate::state::AgentMode::Build if state.build_badge_visible => {
+            // `⏸ build` — only shown after the user explicitly switches to
+            // Build via Tab/Shift+Tab or `/build`; the default startup stays
+            // badge-less. Rendered in faint secondary style so it blends
+            // into the status row naturally.
+            Some(ModeBadge {
+                label: if ctx.caps.unicode_symbols {
+                    "\u{23f8} build".to_string()
+                } else {
+                    "|| build".to_string()
+                },
+                colour: BadgeColour::Secondary,
+            })
+        }
+        // Auto's visual is the warning-colored left badge below (via bypass_indicator).
+        crate::state::AgentMode::Build | crate::state::AgentMode::Auto => None,
     };
-    // Bypass indicator: right-aligned warning badge when
-    // --dangerously-skip-permissions / -y is active. Placed on the
-    // right side of the status row so it does not displace the PLAN
-    // mode indicator on the left.
-    let bypass_indicator = if ctx.dangerously_skip_permissions {
-        Some(crate::i18n::t(crate::i18n::Msg::BypassBadge).into_owned())
+    // Auto mode badge: a single warning-colored LEFT badge `⏵⏵ auto` (rendered
+    // in place of the PLAN badge, since Plan and Auto are mutually exclusive).
+    // `--dangerously-skip-permissions` seeds `agent_mode = Auto` at startup, so
+    // keying off the mode covers both the startup flag AND the runtime Tab /
+    // `/auto` toggle. The `⏵⏵` glyph downgrades to `>>` on non-unicode terminals.
+    let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
+        Some(if ctx.caps.unicode_symbols {
+            "\u{23f5}\u{23f5} auto".to_string()
+        } else {
+            ">> auto".to_string()
+        })
     } else {
         None
     };
@@ -10809,13 +11929,19 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo progress for the dedicated footer todo row. Driven PURELY by the live
-    // in-flight snapshot (set from the turn's todowrite calls, cleared at turn end
-    // in on_turn_complete/cancelled/error) so the row is a live execution
-    // indicator: it appears when the agent starts tracking todos and DISAPPEARS
-    // when the turn finishes — mirroring how the goal/loop row only shows while
-    // active. `total == 0` (a live clear) ⇒ omit the row.
-    let todo = state.live_turn_todo.clone().filter(|p| p.total > 0);
+    // Todo panel source: the persistent `active_todos` cache. Hidden when the
+    // list is empty (`total == 0`) or fully done (`completed == total`) so a
+    // finished panel disappears — otherwise it stands across turns and resume.
+    let todo = state
+        .active_todos
+        .clone()
+        .filter(|p| p.total > 0 && p.completed < p.total);
+    let approval = state.approval_panel.as_ref().map(|p| crate::render::ApprovalPanelView {
+        tool: p.tool.clone(),
+        detail: p.detail.clone(),
+        options: p.options.iter().map(|o| o.label.clone()).collect(),
+        selected: p.selected,
+    });
     crate::render::StatusLine {
         model,
         cwd,
@@ -10833,6 +11959,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        approval,
     }
 }
 
@@ -10947,6 +12074,11 @@ fn format_spinner_label(
     }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
+    }
+    if state.steer_pending > 0 {
+        // Draining "waiting to fold" count — appears when you steer, gone once the
+        // kernel folds it into the turn (mirrors codex/opencode's pending indicator).
+        out.push_str(&format!(" · {} to fold", state.steer_pending));
     }
     // (The mid-stream "· esc to cancel" stall hint was removed by request — esc
     // still cancels, it's just no longer advertised in the spinner. The stall
@@ -11066,7 +12198,8 @@ pub(crate) fn enrich_todo_detail(
     base: &str,
     titles: &std::collections::HashMap<u64, String>,
 ) -> String {
-    if name != "todo" {
+    // Merged `todowrite` carries update actions too; legacy `todo` name still recognized.
+    if name != "todo" && name != "todowrite" {
         return base.to_string();
     }
     let repaired = atomcode_core::turn::json_repair::repair_tool_args(name, args_json);
@@ -11132,6 +12265,22 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "code_review" => {
+            if let Some(scope) = v.get("scope") {
+                return match scope.get("kind").and_then(|kind| kind.as_str()) {
+                    Some("working_tree") => "working tree".to_string(),
+                    Some("staged") => "staged changes".to_string(),
+                    Some("range") => {
+                        let base = scope.get("base").and_then(|value| value.as_str()).unwrap_or("");
+                        let head = scope.get("head").and_then(|value| value.as_str()).unwrap_or("HEAD");
+                        format!("{base}..{head}")
+                    }
+                    Some("commit") => scope
+                        .get("rev")
+                        .and_then(|value| value.as_str())
+                        .map_or_else(String::new, |rev| format!("commit {rev}")),
+                    _ => String::new(),
+                };
+            }
             let base = get_str("base");
             let staged = v.get("staged").and_then(|x| x.as_bool()).unwrap_or(false);
             match (base, staged) {
@@ -11220,37 +12369,35 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 String::new()
             }
         }
-        "todowrite" => {
-            // Show the number of tasks in the full-replace list so the
-            // in-flight row has useful detail even before the glyph block lands.
-            let n = v.get("todos").and_then(|t| t.as_array()).map(|a| a.len());
-            match n {
-                Some(0) => "0 tasks".to_string(),
-                Some(1) => "1 task".to_string(),
-                Some(n) => format!("{} tasks", n),
-                None => String::new(),
-            }
-        }
-        "todo" => {
-            // Show the task description (add) or id+status (update) so the
-            // user can see WHAT the agent is tracking without expanding the row.
-            let action = get_str("action").unwrap_or_default();
-            match action.as_str() {
-                "add" => get_str("content")
-                    .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
-                    .unwrap_or_default(),
-                "update" => {
-                    let id = v.get("id").and_then(|x| x.as_u64());
-                    let status = get_str("status").unwrap_or_default();
-                    match (id, status.as_str()) {
-                        (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
-                        (Some(i), _) => format!("#{}", i),
-                        (None, s) if !s.is_empty() => s.to_string(),
-                        _ => String::new(),
-                    }
+        // Merged `todowrite` (legacy `todo` still recognized for resumed sessions): the shape
+        // decides the detail — a full-list plan shows the count, an `{action}` shows what changed.
+        "todowrite" | "todo" => {
+            if let Some(arr) = v.get("todos").and_then(|t| t.as_array()) {
+                match arr.len() {
+                    0 => "0 tasks".to_string(),
+                    1 => "1 task".to_string(),
+                    n => format!("{} tasks", n),
                 }
-                "list" => "list all".to_string(),
-                _ => String::new(),
+            } else {
+                // Incremental action: show the description (add) or id+status (update).
+                let action = get_str("action").unwrap_or_default();
+                match action.as_str() {
+                    "add" => get_str("content")
+                        .map(|c| crate::width::truncate_with_ellipsis(&c, 100))
+                        .unwrap_or_default(),
+                    "update" => {
+                        let id = v.get("id").and_then(|x| x.as_u64());
+                        let status = get_str("status").unwrap_or_default();
+                        match (id, status.as_str()) {
+                            (Some(i), s) if !s.is_empty() => format!("#{} → {}", i, s),
+                            (Some(i), _) => format!("#{}", i),
+                            (None, s) if !s.is_empty() => s.to_string(),
+                            _ => String::new(),
+                        }
+                    }
+                    "list" => "list all".to_string(),
+                    _ => String::new(),
+                }
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
@@ -11574,6 +12721,152 @@ pub(crate) fn summarise(output: &str) -> String {
     }
 }
 
+/// Collapse a `read_file` first-line preview into a tidy `{n}  {content}`.
+///
+/// `read_file` formats each line as `{n:>6}\t{source line}` — the line number
+/// right-padded to 6 columns, a tab, then the source line WITH its own
+/// indentation. For a deeply-indented line the tab plus that indentation renders
+/// as a big empty gap between the number and the text. Recognise the
+/// `<digits>\t` prefix and collapse the tab + the content's leading whitespace to
+/// two spaces; fall back to the raw first line for anything else (directory
+/// listing, `[File skeleton…]` header, error message).
+pub(crate) fn summarise_read_result(output: &str) -> String {
+    let first = output.lines().next().unwrap_or("(no output)");
+    let n = output.lines().count();
+    let cleaned = match first.split_once('\t') {
+        Some((lead, content))
+            if !lead.trim().is_empty() && lead.trim().chars().all(|c| c.is_ascii_digit()) =>
+        {
+            format!("{}  {}", lead.trim(), content.trim_start())
+        }
+        _ => first.to_string(),
+    };
+    let trimmed = crate::width::truncate_with_ellipsis(&cleaned, 512);
+    if n > 1 {
+        format!("{} ({} lines)", trimmed, n)
+    } else {
+        trimmed
+    }
+}
+
+/// 把 `s` 切成 (head, tail):head 是显示宽度 ≤ `max` 列的最长前缀,绝不从**字素簇**
+/// 中间切开(ZWJ emoji/组合字/宽字整体挪到 tail)。按字素簇+`cluster_width` 度量,
+/// 与调用方推进 `line_len` 用的 `display_width` 完全一致,避免宽度对不齐导致产出行
+/// 反而超宽被 paint 层裁掉。保证前进:至少取一个字素簇,故调用方可循环折到穷尽不死循环。
+/// 前置:`max` 应 ≥ 最宽单簇(2 列),否则单簇本身就超 `max`(仅在退化窄宽度下,生产
+/// 调用方已把 width clamp 到 ≥8 故不触发)。
+fn split_head_by_width(s: &str, max: usize) -> (&str, &str) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut w = 0usize;
+    for (i, g) in s.grapheme_indices(true) {
+        let cw = crate::width::cluster_width(g);
+        if i > 0 && w + cw > max {
+            return (&s[..i], &s[i..]);
+        }
+        w += cw;
+    }
+    (s, "")
+}
+
+/// 把一条 shell 命令软折成多行,按续行边界优先断行,续行缩进 4 空格。
+/// 优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长路径/长 URL)、
+/// 空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全),让整段可见而不被 paint
+/// 层无省略地硬裁。绝不加省略/截断标记——命令必须看得全。
+pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
+    let cmd = cmd.trim_end();
+    if cmd.is_empty() {
+        return vec![String::new()];
+    }
+    // 1) 先在语义边界切成逻辑段:` \` 续行、` && `、` || `、` | `、` -e `。
+    //    保留分隔符在段首(除了 `\` 始终段尾),让读者看清结构。
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let tokens: Vec<&str> = cmd.split(' ').collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok == "\\" {
+            // 反斜杠续行留在段尾,断段。
+            if !cur.is_empty() { cur.push(' '); }
+            cur.push_str(tok);
+            segments.push(std::mem::take(&mut cur));
+        } else if tok == "&&" || tok == "||" || tok == "|" {
+            // 这些分隔符留在段首(下一个逻辑段开头)。
+            if !cur.is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(tok);
+        } else if tok == "-e" && !cur.is_empty() {
+            // `-e` 起新段(sed 常见),留在段首。
+            segments.push(std::mem::take(&mut cur));
+            cur.push_str(tok);
+        } else {
+            if !cur.is_empty() { cur.push(' '); }
+            cur.push_str(tok);
+        }
+        i += 1;
+    }
+    if !cur.is_empty() { segments.push(cur); }
+
+    // 2) 每段再按 width 软折(优先空格断);续行缩进 4 空格。
+    let indent = "    ";
+    let mut out: Vec<String> = Vec::new();
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let lead = if seg_idx == 0 { "" } else { indent };
+        let mut line = String::from(lead);
+        let mut line_len = lead.len();
+        for word in seg.split(' ') {
+            let wlen = crate::width::display_width(word);
+            // 单个 token 本身就比一个续行(去掉缩进)的可用宽度还宽 → 空格断不开,
+            // 按显示宽度字符级折断,让整段可见而不被 paint 层无省略地硬裁。仅在
+            // token 单独放不下时触发;放得下的 token 永不被切。
+            if wlen > width.saturating_sub(indent.len()).max(1) {
+                // 先把当前行冲掉,让超宽 token 从新行(可能是行 0 的空 lead)起。
+                if line_len > lead.len() {
+                    out.push(std::mem::take(&mut line));
+                    line.push_str(indent);
+                    line_len = indent.len();
+                }
+                let mut rest = word;
+                loop {
+                    let avail = width.saturating_sub(line_len).max(1);
+                    let (head, tail) = split_head_by_width(rest, avail);
+                    line.push_str(head);
+                    line_len += crate::width::display_width(head);
+                    rest = tail;
+                    if rest.is_empty() {
+                        break;
+                    }
+                    out.push(std::mem::take(&mut line));
+                    line.push_str(indent);
+                    line_len = indent.len();
+                }
+                continue;
+            }
+            let need = if line_len == lead.len() { wlen } else { wlen + 1 };
+            if line_len > lead.len() && line_len + need > width {
+                out.push(std::mem::take(&mut line));
+                line.push_str(indent);
+                line_len = indent.len();
+            }
+            if line_len > lead.len() && !line.ends_with(' ') {
+                line.push(' ');
+                line_len += 1;
+            }
+            line.push_str(word);
+            line_len += wlen;
+        }
+        // 跳过纯空白段(连续分隔符可能产生),不产出空行。
+        if !line.trim().is_empty() {
+            out.push(line);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Render the `task` tool's `<task ...>` result blocks into clean per-subtask lines:
 /// `id · model · ✓ done` (or `✗ failed (reason)`), one per subtask. A single subtask
 /// drops its `#1` suffix and appends the result's line count. Falls back to the generic
@@ -11695,6 +12988,24 @@ pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str
     reason.starts_with("plan mode").then_some(reason)
 }
 
+/// A tool result that is an approval/user DENIAL → a calm compact label
+/// (localized "denied"), NOT the red ✗ error. Detects the deny messages from
+/// approval.rs / write_approval.rs ("denied by approval policy: ...") and
+/// runner.rs ("Tool 'X' was denied by the user."). Returns None for successes
+/// and non-denial failures (those keep the normal ✗ result). The tool name +
+/// args in the raw message are intentionally dropped — the `● Tool(...)` header
+/// above already shows them (the redundancy the user complained about).
+pub(crate) fn approval_denial_label(output: &str, success: bool) -> Option<String> {
+    if success {
+        return None;
+    }
+    if output.contains("denied by approval policy") || output.contains("was denied by the user") {
+        Some(crate::i18n::t(crate::i18n::Msg::ToolDenied).into_owned())
+    } else {
+        None
+    }
+}
+
 // SessionPicker tests moved alongside the struct in
 // `crate::modals::session_picker::tests`.
 
@@ -11751,66 +13062,27 @@ pub(crate) fn install_password_modal(
     )));
 }
 
-/// Split a todowrite call's args into per-item display lines (`<glyph> <content>`).
-/// Returns an empty Vec on parse failure — the caller then falls back to the normal
-/// tool row. Each returned string is already fully formatted: `<glyph> <content>`.
-/// Parse a todowrite call's args into `(status, "<glyph> <content>")` pairs. Empty
-/// on parse failure / empty list (caller falls back to the normal tool row). Returns
-/// the TYPED status so the renderer styles by status instead of re-sniffing glyph
-/// prefixes (which would silently misclassify a future new status/glyph).
-pub(crate) fn todo_block_lines(
-    args: &str,
-    unicode: bool,
-) -> Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)> {
-    use atomcode_capabilities::tools::todo::{parse_todos, todo_glyph};
-    match parse_todos(args) {
-        Ok(todos) if !todos.is_empty() => todos
-            .into_iter()
-            .map(|t| {
-                (
-                    t.status,
-                    format!("{} {}", todo_glyph(t.status, unicode), t.content),
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// A todowrite call's args → the compact todo block as ready-to-render body
-/// lines, each SGR-styled by status (in-progress bold, completed faint, pending
-/// plain — weight-based so it's theme-safe). SHARED by the LIVE tool-render path
-/// and the `/resume` replay so the two never drift (each renders these as
-/// `UiLine::CommandOutput`). Empty on parse failure (caller falls back to the
-/// normal tool row). Emphasis is deliberately NOT `UiLine::Warning` (it prefixes
-/// a `!` and uses an un-theme-aware bright yellow).
-pub(crate) fn todo_block_styled_lines(args: &str, unicode: bool) -> Vec<String> {
-    use atomcode_capabilities::tools::todo::TodoStatus;
-    todo_block_lines(args, unicode)
-        .into_iter()
-        .map(|(status, line)| match status {
-            TodoStatus::InProgress => format!("\x1b[1m  {line}\x1b[0m"),
-            TodoStatus::Completed => format!("\x1b[2m  {line}\x1b[0m"),
-            TodoStatus::Pending => format!("  {line}"),
-        })
-        .collect()
-}
-
 /// Build footer todo progress (current task + completed/total) from a parsed
 /// list. An empty list yields `total == 0`, which `build_status` filters out.
 pub(crate) fn todo_progress_from_items(
     todos: &[atomcode_capabilities::tools::todo::TodoItem],
 ) -> crate::render::TodoProgress {
     use atomcode_capabilities::tools::todo::{todo_counts, TodoStatus};
-    let (completed, total) = todo_counts(todos);
+    let (completed, in_progress, total) = todo_counts(todos);
     let current = todos
         .iter()
         .find(|t| t.status == TodoStatus::InProgress)
         .map(|t| t.content.clone());
+    let items = todos
+        .iter()
+        .map(|t| (t.status, t.content.clone()))
+        .collect();
     crate::render::TodoProgress {
         current,
         completed,
+        in_progress,
         total,
+        items,
     }
 }
 
@@ -11819,29 +13091,77 @@ pub(crate) fn todo_progress_from_items(
 /// the row) — distinct from `None`, which means "unparseable, keep whatever the
 /// footer already shows". The footer todo row is live-only (cleared at turn end),
 /// so this is its sole source.
+/// Rebuild the id→title cache from the live panel's current items (id = 1-based position), so a
+/// `todo update #N` row can show the task NAME. DERIVED from `active_todos` (not accumulated from
+/// tool outputs), so a re-plan or /resume that reassigns ids never splices a stale title.
+pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
+    state.todo_titles = state
+        .active_todos
+        .as_ref()
+        .map(|p| {
+            p.items
+                .iter()
+                .enumerate()
+                .map(|(i, (_, content))| ((i + 1) as u64, content.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
+/// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
+/// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
+/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
+/// creates the panel.
+pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
+    use atomcode_capabilities::tools::todo::{apply_todo_action, TodoItem};
+    let mut items: Vec<TodoItem> = state
+        .active_todos
+        .as_ref()
+        .map(|p| p.items.iter().map(|(s, c)| TodoItem { status: *s, content: c.clone() }).collect())
+        .unwrap_or_default();
+    apply_todo_action(&mut items, args);
+    state.active_todos = if items.is_empty() { None } else { Some(todo_progress_from_items(&items)) };
+    sync_todo_titles(state);
+}
+
 pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
     atomcode_capabilities::tools::todo::parse_todos(args)
         .ok()
         .map(|todos| todo_progress_from_items(&todos))
 }
 
+/// Todo panel state derived from a full transcript — the last VALID `todowrite`
+/// call wins (mirrors capabilities::derive_current_todos, but over the core
+/// conversation message type held by `Session.messages`; tool calls live inside
+/// `AssistantWithToolCalls`). `None` when the session never used todowrite, or
+/// when the last valid call cleared the list. Used to seed the panel on
+/// `/resume` / session switch with zero extra storage.
+pub(crate) fn todo_progress_from_messages(
+    messages: &[atomcode_core::conversation::message::Message],
+) -> Option<crate::render::TodoProgress> {
+    use atomcode_core::conversation::message::MessageContent;
+    // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
+    // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
+    // not just the last full-list todowrite. Collect (name, args) in order first.
+    let calls: Vec<(&str, &str)> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flat_map(|tcs| tcs.iter())
+        .map(|c| (c.name.as_str(), c.arguments.as_str()))
+        .collect();
+    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    if todos.is_empty() {
+        return None; // no list, or the last valid todowrite cleared it → hide panel
+    }
+    Some(todo_progress_from_items(&todos))
+}
+
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
-
-    #[test]
-    fn todo_block_renders_glyph_lines() {
-        use atomcode_capabilities::tools::todo::TodoStatus;
-        let lines = todo_block_lines(
-            r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
-            false,
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].0, TodoStatus::Completed);
-        assert_eq!(lines[0].1, "[x] a");
-        assert_eq!(lines[1].0, TodoStatus::InProgress);
-        assert_eq!(lines[1].1, "[~] b");
-    }
 
     #[test]
     fn todo_progress_from_args_carries_current_and_distinguishes_clear() {
@@ -11866,34 +13186,78 @@ mod todo_block_tests {
     }
 
     #[test]
-    fn todo_block_bad_args_empty() {
-        assert!(todo_block_lines(r#"{"nope":1}"#, false).is_empty());
+    fn todo_progress_carries_full_items_in_order() {
+        let p = todo_progress_from_args(
+            r#"{"todos":[
+                {"content":"a","status":"completed"},
+                {"content":"b","status":"in_progress"},
+                {"content":"c","status":"pending"}
+            ]}"#,
+        )
+        .unwrap();
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        assert_eq!(p.items.len(), 3);
+        assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
+        assert_eq!(p.items[1], (TodoStatus::InProgress, "b".to_string()));
+        assert_eq!(p.items[2], (TodoStatus::Pending, "c".to_string()));
+        assert_eq!((p.completed, p.total), (1, 3));
     }
 
     #[test]
-    fn todo_block_styled_lines_weights_by_status() {
-        let out = todo_block_styled_lines(
-            r#"{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"completed"},{"content":"c","status":"pending"}]}"#,
-            false,
-        );
-        assert_eq!(out.len(), 3);
-        assert!(
-            out[0].starts_with("\x1b[1m") && out[0].contains('a'),
-            "in-progress bold: {:?}",
-            out[0]
-        );
-        assert!(
-            out[1].starts_with("\x1b[2m") && out[1].contains('b'),
-            "completed faint: {:?}",
-            out[1]
-        );
-        assert!(
-            !out[2].contains("\x1b[") && out[2].contains('c'),
-            "pending plain: {:?}",
-            out[2]
-        );
-        // Empty on parse failure (caller falls back to the normal tool row).
-        assert!(todo_block_styled_lines(r#"{"nope":1}"#, false).is_empty());
+    fn todo_progress_from_messages_last_valid_wins() {
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_core::tool::ToolCall;
+        let mk = |id: &str, args: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall { id: id.into(), name: "todowrite".into(), arguments: args.into() }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let msgs = vec![
+            mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
+            mk("2", r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#),
+        ];
+        let p = todo_progress_from_messages(&msgs).expect("last valid todowrite → Some");
+        assert_eq!((p.completed, p.total), (1, 2)); // LAST call wins
+        assert_eq!(p.current.as_deref(), Some("b"));
+        assert_eq!(p.items.len(), 2);
+        assert!(todo_progress_from_messages(&[]).is_none()); // no todowrite → None
+    }
+
+    #[test]
+    fn todo_progress_from_messages_folds_incremental_todo_events() {
+        // Replay parity: a resumed session must reflect `todo` add/update events, not just the
+        // last full-list todowrite (this was the gap the incremental tool introduced).
+        use atomcode_core::conversation::message::{Message, MessageContent, Role};
+        use atomcode_core::tool::ToolCall;
+        let call = |id: &str, name: &str, args: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments: args.into() }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        };
+        let msgs = vec![
+            call("1", "todowrite", r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#),
+            call("2", "todo", r#"{"action":"update","id":1,"status":"completed"}"#),
+            call("3", "todo", r#"{"action":"add","content":"c"}"#),
+            call("4", "todo", r#"{"action":"update","id":3,"status":"in_progress"}"#),
+        ];
+        use atomcode_capabilities::tools::todo::TodoStatus;
+        let p = todo_progress_from_messages(&msgs).expect("Some");
+        assert_eq!(p.total, 3, "the added task is counted");
+        assert_eq!(p.completed, 1);
+        assert_eq!(p.current.as_deref(), Some("c"), "the in_progress item is #3 'c'");
+        assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
     }
 }
 
@@ -12022,5 +13386,151 @@ mod install_password_modal_tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         install_password_modal(&mut app, "[sudo] password:".into(), tx);
         assert!(app.active_modal.is_some(), "modal installed");
+    }
+}
+
+#[cfg(test)]
+mod format_shell_command_tests {
+    use super::format_shell_command;
+
+    #[test]
+    fn short_command_stays_one_line() {
+        assert_eq!(format_shell_command("ls -la", 80), vec!["ls -la".to_string()]);
+    }
+
+    #[test]
+    fn breaks_on_backslash_continuation() {
+        let out = format_shell_command("sed -i '' \\ -e 's/a/b/' \\ -e 's/c/d/'", 80);
+        // 每个 `\` 续行段独立成行,续行缩进 4 空格
+        assert!(out.len() >= 3, "got {:?}", out);
+        assert!(out[0].ends_with('\\'), "first line keeps its trailing backslash: {:?}", out);
+        assert!(out[1].starts_with("    "), "continuation is indented: {:?}", out);
+    }
+
+    #[test]
+    fn breaks_on_and_and() {
+        let out = format_shell_command("cd /tmp && make build && make test", 80);
+        assert!(out.len() >= 2, "got {:?}", out);
+        assert!(out.iter().any(|l| l.contains("&& make build")), "got {:?}", out);
+    }
+
+    #[test]
+    fn token_that_fits_is_never_split() {
+        // 能装下的 token(width 60 容得下)绝不被切,整体留一行。
+        let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
+        let out = format_shell_command(long, 60);
+        assert!(out.iter().any(|l| l.contains(long)), "fitting token stays intact: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_token_hard_breaks_to_fit_width() {
+        // 单个无空格 token 比窗口还宽时,必须按字符折断以保证全貌可见,而不是
+        // 被硬裁。折断后各行都不超宽,拼回去(去掉续行缩进)能还原整个 token。
+        let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
+        let width = 20;
+        let out = format_shell_command(long, width);
+        assert!(out.len() > 1, "over-wide token must wrap across lines: {:?}", out);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width: {:?} ({} cols)",
+                l,
+                crate::width::display_width(l)
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, long, "reassembled token must equal the original: {:?}", out);
+        assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_cjk_token_breaks_without_splitting_a_wide_char() {
+        // 10 个 CJK 字 = 20 列,单 token,width 12 → 必须字符折断,且每行不超宽、
+        // 绝不把某个 2 列宽字从中间劈开(拼回即原串)。
+        let cmd = "一二三四五六七八九十";
+        let width = 12;
+        let out = format_shell_command(cmd, width);
+        assert!(out.len() > 1, "over-wide CJK token must wrap: {:?}", out);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width: {:?}",
+                l
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, cmd, "CJK token must be fully preserved: {:?}", out);
+    }
+
+    #[test]
+    fn over_wide_token_with_zwj_emoji_never_splits_a_grapheme_cluster() {
+        // A ZWJ family emoji is ONE grapheme (~2 cols) but many codepoints. A
+        // per-codepoint splitter would (a) cut it mid-cluster into garbled halves
+        // and (b) desync width vs display_width so a produced line silently
+        // overshoots the budget and gets re-clipped at paint. The cluster-aware
+        // break must keep every family intact AND keep every line within width.
+        let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧, one grapheme
+        let token = format!("p{fam}{fam}{fam}{fam}{fam}q");
+        let width = 12;
+        let out = format_shell_command(&token, width);
+        for l in &out {
+            assert!(
+                crate::width::display_width(l) <= width,
+                "line exceeds width (codepoint/cluster width desync): {:?} = {} cols",
+                l,
+                crate::width::display_width(l)
+            );
+        }
+        let rejoined: String = out
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { l.clone() } else { l.strip_prefix("    ").unwrap_or(l).to_string() })
+            .collect();
+        assert_eq!(rejoined, token, "emoji token fully preserved: {:?}", out);
+        // Every family emoji stays a single intact cluster (none split across a line).
+        for l in &out {
+            let stripped = l.strip_prefix("    ").unwrap_or(l);
+            assert!(
+                !stripped.starts_with('\u{200D}') && !stripped.ends_with('\u{200D}'),
+                "a ZWJ joiner leaked to a line edge → cluster was split: {:?}",
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn never_appends_truncation_marker() {
+        let out = format_shell_command("echo hello && echo world", 80).join("\n");
+        assert!(!out.contains('…'), "no ellipsis: {}", out);
+        assert!(!out.contains("truncated"), "no truncated marker: {}", out);
+    }
+
+    #[test]
+    fn cjk_chars_use_display_width_no_mid_token_split() {
+        // 每个 CJK 字符占 2 列; "你好世界" = 8 列。宽度 16 时第一段
+        // "echo 你好世界" = 14 列,可容纳;宽度缩到 12 时不够容纳同段
+        // 后续词,但绝不拆断 "你好世界" token 本身。
+        let cmd = "echo 你好世界 && echo done";
+        let out = format_shell_command(cmd, 12);
+        // 无论怎样折行,token "你好世界" 必须整体保留在某行中。
+        assert!(
+            out.iter().any(|l| l.contains("你好世界")),
+            "CJK token must not be split: {:?}",
+            out
+        );
+        // 必须不含截断标记。
+        assert!(!out.join("\n").contains('…'), "no ellipsis: {:?}", out);
+        // 每行至少有一个非空字符(无鬼空行)。
+        for line in &out {
+            assert!(!line.trim().is_empty(), "no empty line in output: {:?}", out);
+        }
     }
 }

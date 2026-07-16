@@ -224,13 +224,7 @@ class AtomCodeDaemonClient(
                 name = raw.jsonString("name").orEmpty(),
                 workingDir = raw.jsonString("working_dir").orEmpty(),
                 projectHash = projectHash,
-                messages = raw.jsonArrayObjects("messages").map {
-                    MessageInfo(
-                        role = it.jsonString("role").orEmpty(),
-                        content = it.jsonString("content").orEmpty(),
-                        synthetic = it.jsonBoolean("synthetic") ?: false,
-                    )
-                },
+                messages = raw.jsonArrayObjects("messages").map(::parseMessageInfo),
             )
         }
 
@@ -460,6 +454,22 @@ internal fun parseSessionMetaList(raw: String): List<SessionMeta> =
             messageCount = meta.jsonInt("message_count") ?: 0,
         )
     }.filter { it.id.isNotBlank() }
+
+internal fun parseMessageInfo(raw: String): MessageInfo =
+    MessageInfo(
+        role = raw.jsonString("role").orEmpty(),
+        content = raw.jsonString("content").orEmpty(),
+        synthetic = raw.jsonBoolean("synthetic") ?: false,
+        internalOrigin = raw.jsonString("internal_origin") ?: raw.jsonString("internalOrigin"),
+        toolCalls = raw.jsonArrayObjects("tool_calls").map(::parseToolCallInfo),
+    )
+
+private fun parseToolCallInfo(raw: String): ToolCallInfo =
+    ToolCallInfo(
+        id = raw.jsonString("id"),
+        name = raw.jsonString("name").orEmpty(),
+        arguments = raw.jsonString("arguments") ?: raw.jsonString("display").orEmpty(),
+    )
 
 private fun String.toProviderInfo(): ProviderInfo =
     ProviderInfo(

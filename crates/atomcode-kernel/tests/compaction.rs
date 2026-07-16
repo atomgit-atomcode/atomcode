@@ -15,6 +15,7 @@
 //!   * a committed compaction opens a NEW cache epoch while preserving the
 //!     byte-identical system prefix.
 
+use atomcode_kernel::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Role, SessionSnapshot};
 use atomcode_kernel::stream::{StreamEvent, TokenUsage};
@@ -23,9 +24,24 @@ use atomcode_kernel::testkit::{
     StubToolResultsStrategy, SummarizeOldestStrategy,
 };
 use atomcode_kernel::tool::ToolRegistry;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const PERSONA: &str = "you are a neutral test agent";
+
+struct TestCheckpoint {
+    saved: Arc<Mutex<Vec<SessionSnapshot>>>,
+    failure: Option<CompactionCheckpointError>,
+}
+
+impl CompactionCheckpoint for TestCheckpoint {
+    fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        self.saved.lock().unwrap().push(snapshot.clone());
+        Ok(())
+    }
+}
 
 // A turn that reports HIGH prompt usage against a small context window so the
 // assistant message's recorded `meta.utilization` is high (≈0.9), then stops.
@@ -319,6 +335,101 @@ async fn manual_compact_command_triggers_regardless_of_threshold() {
     // Confirm epoch persisted on the conversation.
     let snap = snapshot(&mut handle).await;
     assert_eq!(snap.cache_epoch, 1, "manual compaction bumped the conversation's cache_epoch");
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+#[tokio::test]
+async fn manual_compaction_success_is_checkpointed_before_event() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let checkpoint = Arc::new(TestCheckpoint { saved: saved.clone(), failure: None });
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .compaction_checkpoint(checkpoint)
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+
+    let committed = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Compacted { committed: true, snapshot: Some(snapshot), .. }) => {
+                break snapshot;
+            }
+            Some(AgentEvent::CompactionFailed { error, .. }) => {
+                panic!("checkpoint unexpectedly failed: {error}")
+            }
+            Some(_) => continue,
+            None => panic!("channel closed before compact completed"),
+        }
+    };
+
+    let persisted = saved.lock().unwrap().clone();
+    assert_eq!(persisted.as_slice(), &[committed.clone()]);
+    assert_eq!(
+        snapshot(&mut handle).await,
+        committed,
+        "the event snapshot, durable checkpoint, and live commit must be identical"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+#[tokio::test]
+async fn manual_compaction_checkpoint_failure_keeps_live_conversation_unchanged() {
+    let provider = Arc::new(
+        RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("an assistant answer long enough to drain later".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(1000),
+    );
+    let checkpoint = Arc::new(TestCheckpoint {
+        saved: Arc::new(Mutex::new(Vec::new())),
+        failure: Some(CompactionCheckpointError::new("disk full")),
+    });
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 0 }))
+        .compaction_checkpoint(checkpoint)
+        .build()
+        .spawn();
+
+    let _ = drive_turn_collect(&mut handle, "the task with several words to drain later").await;
+    let before = snapshot(&mut handle).await;
+    handle.commands.send(AgentCommand::Compact { focus: None }).unwrap();
+
+    loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::CompactionFailed { error, .. }) => {
+                assert_eq!(error.message(), "disk full");
+                break;
+            }
+            Some(AgentEvent::Compacted { .. }) => {
+                panic!("a failed checkpoint must not report compact success")
+            }
+            Some(_) => continue,
+            None => panic!("channel closed before checkpoint failure was reported"),
+        }
+    }
+
+    let after = snapshot(&mut handle).await;
+    assert_eq!(after, before, "checkpoint failure must not change messages, counters, or epoch");
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
@@ -747,10 +858,11 @@ async fn mid_turn_snapshot_is_queued_and_delivered_after_turn() {
     let _ = handle.task.await;
 }
 
-// (b) A mid-turn SendMessage runs as its OWN turn after the current one completes —
-// the second prompt is NOT lost.
+// (b) A mid-turn SendMessage is FOLDED INTO the current turn's next round (Task 2
+// steer-drain semantics): the second prompt is NOT lost and NOT deferred to a new
+// turn — the kernel responds to it within the SAME turn.
 #[tokio::test]
-async fn mid_turn_send_message_runs_after_current_turn() {
+async fn mid_turn_send_message_is_folded_into_current_turn() {
     use atomcode_kernel::testkit::DeferredCommands;
     use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 
@@ -765,7 +877,8 @@ async fn mid_turn_send_message_runs_after_current_turn() {
 
     let provider = Arc::new(
         RecordingProvider::new(vec![
-            // Turn 1, round 1: call `inject` (sends a mid-turn SendMessage), end round.
+            // Turn 1, round 1: call `inject` (sends a mid-turn SendMessage to cmd_rx),
+            // end round. The steer is drained at the top of round 2 below.
             vec![
                 StreamEvent::ToolCall(ToolCall {
                     id: "i1".into(),
@@ -774,10 +887,9 @@ async fn mid_turn_send_message_runs_after_current_turn() {
                 }),
                 StreamEvent::Done { truncated: false },
             ],
-            // Turn 1, round 2: final answer → turn 1 completes.
-            vec![StreamEvent::TextDelta("first done".into()), StreamEvent::Done { truncated: false }],
-            // Turn 2 (the QUEUED SendMessage): a final answer → completes.
-            vec![StreamEvent::TextDelta("second done".into()), StreamEvent::Done { truncated: false }],
+            // Turn 1, round 2: SECOND-PROMPT has been folded in as a real user message.
+            // Final answer → turn 1 completes. No turn 2 — the steer was handled here.
+            vec![StreamEvent::TextDelta("both done".into()), StreamEvent::Done { truncated: false }],
         ])
         .with_ctx_window(1000),
     );
@@ -793,35 +905,30 @@ async fn mid_turn_send_message_runs_after_current_turn() {
 
     handle.commands.send(AgentCommand::SendMessage { text: "FIRST-PROMPT".into(), images: vec![] }).unwrap();
 
-    // Expect TWO TurnComplete events: turn 1, then the drained mid-turn SendMessage's
-    // turn 2. If the mid-turn SendMessage were dropped (the old no-op), only ONE
-    // would ever arrive and this would hang.
+    // Expect exactly ONE TurnComplete: the steer is folded into turn 1's round 2,
+    // so there is no separate turn 2. (Pre-Task-2 behavior was two turns; Task 2
+    // changes this to in-turn continuation.)
     let mut completes = 0;
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             completes += 1;
-            if completes == 2 {
-                break;
-            }
+            break; // one is all we need
         }
     }
-    assert_eq!(completes, 2, "the queued mid-turn SendMessage must run its own turn");
+    assert_eq!(completes, 1, "the steered mid-turn SendMessage must be folded into the same turn");
 
-    // The queued prompt actually entered history and was sent to the provider on
-    // turn 2 — proof it was not lost. Scope the lock so its guard is not held
-    // across the later `.await`.
+    // The steered prompt actually entered history and was sent to the provider in
+    // turn 1 round 2 — proof it was not lost.
     let second_prompt_reached = {
         let recorded = calls.lock().unwrap();
         recorded
-            .last()
-            .unwrap()
-            .0
             .iter()
-            .any(|m| m.role == Role::User && m.text == "SECOND-PROMPT")
+            .any(|call| call.0.iter().any(|m| m.role == Role::User && m.text == "SECOND-PROMPT"))
     };
     assert!(
         second_prompt_reached,
-        "the second (mid-turn-queued) prompt must reach the provider in turn 2"
+        "the steered prompt must reach the provider within the same turn; calls={:?}",
+        calls.lock().unwrap().iter().map(|c| c.0.iter().map(|m| &m.text).collect::<Vec<_>>()).collect::<Vec<_>>()
     );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();

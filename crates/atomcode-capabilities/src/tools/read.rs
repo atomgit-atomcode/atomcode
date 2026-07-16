@@ -132,6 +132,11 @@ impl Tool for ReadFileTool {
             "required": ["file_path"]
         })
     }
+    /// No side effects — a pure read. Makes it `parallel_safe` (concurrent
+    /// execution) and allowed in plan mode.
+    fn read_only_hint(&self) -> bool {
+        true
+    }
     // read is non-destructive → risk() defaults to Safe.
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
@@ -627,5 +632,12 @@ mod tests {
         std::fs::write(d.path().join("long.txt"), "x".repeat(5000)).unwrap();
         let r = ReadFileTool::default().execute(r#"{"file_path":"long.txt"}"#, &ctx(d.path())).await;
         assert!(r.content.contains("line truncated to 2000 chars"), "{}", r.content);
+    }
+
+    #[test]
+    fn read_file_is_parallel_safe() {
+        let t = ReadFileTool::new(false); // vision flag irrelevant here
+        assert!(t.read_only_hint(), "read_file has no side effects");
+        assert!(t.parallel_safe("{}"), "read_file may run concurrently");
     }
 }

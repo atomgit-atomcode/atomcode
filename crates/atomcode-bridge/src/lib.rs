@@ -24,4 +24,7 @@ mod runtime;
 mod schedule_wakeup;
 mod sign;
 
-pub use runtime::{build_provider_for_acp, spawn_bridged_runtime, BridgeConfig};
+pub use runtime::{
+    apply_reload_provider, build_provider, build_provider_for_acp, gather_plugin_cc_hooks,
+    spawn_bridged_runtime_with_control, BridgeConfig, BridgedRuntime,
+};

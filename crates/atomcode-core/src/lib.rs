@@ -4,35 +4,39 @@
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 pub mod agent;
-pub mod atomgit;
-pub mod auth;
+// `auth` (OAuth login + secure chmod-600 token file) fully lives in the leaf `atomcode-auth`
+// crate now; re-export it so core's own `crate::auth::…` uses and external
+// `atomcode_core::auth` consumers keep working during the transition.
+pub use atomcode_auth as auth;
 pub mod process_utils;
 pub mod coding_plan;
-pub mod config;
+// `config` fully lives in the leaf `atomcode-config` crate now; core code (and its
+// tests) use `atomcode_config::config` directly, so the transitional re-export shim
+// is gone.
 pub mod conversation;
 pub mod ctx;
 pub mod graph;
 pub mod hook;
-pub mod i18n;
+// `i18n` fully lives in the leaf `atomcode-config` crate now (it only needs
+// `locale::Locale`); re-export it so core's own `crate::i18n::…` uses and any
+// external `atomcode_core::i18n` consumers keep working during the transition.
+pub use atomcode_config::i18n;
 pub mod live;
-pub mod locale;
+// `locale` fully lives in `atomcode-config` now (re-export shim removed).
 pub mod lsp;
 pub mod mcp;
-pub mod notify;
 pub mod proxy;
 pub mod provider;
-pub mod self_update;
 pub mod semantic;
 pub mod session;
 pub mod plugin;
 pub mod setup;
 pub mod skill;
 pub mod stream;
-pub mod telemetry_bootstrap;
 pub mod tool;
 pub mod trace;
 pub mod turn;

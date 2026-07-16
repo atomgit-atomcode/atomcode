@@ -14,6 +14,13 @@ use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
 use message::{Message, MessageContent, Role};
 use turn::{TurnStatus, TurnTracker};
 
+/// Reserved synthetic-message origin used when a runtime without a dedicated
+/// cold-summary lane persists a legacy [`ConversationSnapshot`].
+pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
+/// Stable payload prefix paired with [`LEGACY_COLD_SUMMARY_ORIGIN`].
+pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
+    "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
+
 /// Context budget statistics for logging/debugging.
 #[derive(Debug, Clone, Default)]
 pub struct ContextStats {
@@ -181,7 +188,7 @@ impl Conversation {
 
     /// Path to history file.
     pub fn history_path() -> std::path::PathBuf {
-        crate::config::Config::config_dir().join("history.json")
+        atomcode_config::config::Config::config_dir().join("history.json")
     }
 
     pub fn add_user_message(&mut self, content: &str) {
@@ -262,7 +269,8 @@ impl Conversation {
     /// This prevents "messages illegal" API errors from unpaired calls.
     fn backfill_cancelled_tool_results(&mut self) {
         // Collect call_ids that already have results (both inline and ref variants).
-        let mut seen_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_result_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for msg in &self.messages {
             if let Some(call_id) = msg.tool_result_call_id() {
                 seen_result_ids.insert(call_id.to_string());
@@ -289,7 +297,8 @@ impl Conversation {
                     output: "(cancelled)".into(),
                     success: false,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             });
             self.turn_tracker.on_message_added(idx);
         }
@@ -375,6 +384,7 @@ impl Conversation {
                     thinking_blocks,
                 },
                 synthetic: false,
+                internal_origin: None,
             });
         } else {
             self.messages.push(Message::new(Role::Assistant, content));
@@ -415,7 +425,8 @@ impl Conversation {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks,
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -425,7 +436,8 @@ impl Conversation {
         self.messages.push(Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(result),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -540,7 +552,9 @@ impl Conversation {
         // Add to cold zone (FIFO, max 3)
         // Detect potential prompt injection in LLM-generated summary
         let lower = summary.to_lowercase();
-        if lower.contains("ignore all") || lower.contains("from now on") || lower.contains("you are")
+        if lower.contains("ignore all")
+            || lower.contains("from now on")
+            || lower.contains("you are")
         {
             tracing::warn!(
                 summary_len = summary.len(),
@@ -589,8 +603,7 @@ impl Conversation {
                 // scratch — TurnTracker::rebuild walks the messages
                 // and yields the same shape `hard_truncate_to_target`
                 // uses for the equivalent sacred-set drain.
-                self.turn_tracker =
-                    turn::TurnTracker::rebuild(&self.messages);
+                self.turn_tracker = turn::TurnTracker::rebuild(&self.messages);
                 return;
             }
         }
@@ -927,7 +940,10 @@ fn merge_user_content(left: &mut MessageContent, right: MessageContent) -> bool 
                 append_optional_text(text, Some(right_text));
                 true
             }
-            MessageContent::MultiPart { text: right_text, images: mut right_images } => {
+            MessageContent::MultiPart {
+                text: right_text,
+                images: mut right_images,
+            } => {
                 append_optional_text(text, right_text);
                 images.append(&mut right_images);
                 true
@@ -1007,10 +1023,13 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
 
     // Signal 2: C0 control bytes other than \t \n \r. Real model output
     // never contains these; provider bug or transport corruption.
-    let bad_ctrl = text.chars().filter(|&c| {
-        let cp = c as u32;
-        cp < 0x20 && cp != 0x09 && cp != 0x0A && cp != 0x0D
-    }).count();
+    let bad_ctrl = text
+        .chars()
+        .filter(|&c| {
+            let cp = c as u32;
+            cp < 0x20 && cp != 0x09 && cp != 0x0A && cp != 0x0D
+        })
+        .count();
     if bad_ctrl > 0 {
         return Some("c0_control_bytes");
     }
@@ -1022,10 +1041,13 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     // 0xC4 0x8E etc. East Asian text is in U+4E00+ ranges and never
     // triggers this signal. 40% threshold also rejects legitimate short
     // Czech words like `čaj` (33%) while catching the fixture.
-    let latin_ext_a = text.chars().filter(|&c| {
-        let cp = c as u32;
-        (0x0100..=0x017F).contains(&cp)
-    }).count();
+    let latin_ext_a = text
+        .chars()
+        .filter(|&c| {
+            let cp = c as u32;
+            (0x0100..=0x017F).contains(&cp)
+        })
+        .count();
     if latin_ext_a * 10 > total_chars * 4 {
         return Some("latin_extended_a_mojibake");
     }
@@ -1070,7 +1092,7 @@ fn is_typographic_repeat_safe(c: char) -> bool {
         || cp == 0x2026                    // …  ellipsis
         || cp == 0x2022                    // •  bullet
         || cp == 0x25E6                    // ◦  white bullet
-        || cp == 0x00B7                    // ·  middle dot
+        || cp == 0x00B7 // ·  middle dot
 }
 
 #[cfg(test)]
@@ -1440,8 +1462,8 @@ mod tests {
         // Verify compression result
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.messages[0].role, Role::User); // preserved user1
-        // Rebuild yields one Active turn (only user1, no following User
-        // message to close it before EOF).
+                                                       // Rebuild yields one Active turn (only user1, no following User
+                                                       // message to close it before EOF).
         assert_eq!(conv.turn_tracker.turns.len(), 1);
         let surviving = &conv.turn_tracker.turns[0];
         assert_eq!(surviving.start_idx, 0);
@@ -1482,7 +1504,7 @@ mod tests {
         // user1 + last asst survive.
         assert_eq!(conv.messages.len(), 2);
         assert_eq!(conv.messages[0].role, Role::User); // preserved user1
-        // Rebuild: one Active turn containing both messages.
+                                                       // Rebuild: one Active turn containing both messages.
         assert_eq!(conv.turn_tracker.turns.len(), 1);
         assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
@@ -1565,7 +1587,10 @@ mod tests {
         assert_eq!(conv.messages[0].role, Role::User);
         match &conv.messages[0].content {
             MessageContent::Text(s) => assert_eq!(s, "task 1"),
-            other => panic!("msg 0 must remain the original Text prompt; got {:?}", other),
+            other => panic!(
+                "msg 0 must remain the original Text prompt; got {:?}",
+                other
+            ),
         }
     }
 
@@ -1581,8 +1606,7 @@ mod tests {
         // remains outside the real user's turn.
         conv.messages
             .push(Message::synthetic_user("[synthetic context]")); // idx 0
-        conv.messages
-            .push(Message::new(Role::Assistant, "ack")); // idx 1
+        conv.messages.push(Message::new(Role::Assistant, "ack")); // idx 1
         conv.add_user_message("real prompt"); // idx 2
         conv.push_delta("response"); // streamed into idx 3
         conv.finalize_stream();
@@ -1661,10 +1685,7 @@ mod tests {
     #[test]
     fn looks_corrupted_catches_c0_control_bytes() {
         // \x01 \x02 \x03 = SOH STX ETX, never appear in real text
-        assert_eq!(
-            looks_corrupted("hello\x01world"),
-            Some("c0_control_bytes")
-        );
+        assert_eq!(looks_corrupted("hello\x01world"), Some("c0_control_bytes"));
     }
 
     #[test]
@@ -1728,7 +1749,7 @@ mod tests {
         assert_eq!(looks_corrupted(&"—".repeat(20)), None); // em-dash
         assert_eq!(looks_corrupted(&"…".repeat(20)), None); // ellipsis
         assert_eq!(looks_corrupted(&"•".repeat(10)), None); // bullet
-        // Block elements
+                                                            // Block elements
         assert_eq!(looks_corrupted(&"█".repeat(20)), None);
     }
 
@@ -1926,7 +1947,10 @@ mod tests {
             all_text.contains("write_file") || all_text.contains("index.html"),
             "LLM must see what it already did"
         );
-        assert!(all_text.contains("不要删那行"), "LLM must see the corrective prompt");
+        assert!(
+            all_text.contains("不要删那行"),
+            "LLM must see the corrective prompt"
+        );
     }
 
     #[test]
@@ -2051,7 +2075,8 @@ mod tests {
                 byte_size: 20_000,
                 success: true,
             }),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -2131,7 +2156,10 @@ mod tests {
 
         conv.cancel_current_turn_including_user();
 
-        assert!(conv.stream_buffer.is_none(), "stream_buffer must be cleared");
+        assert!(
+            conv.stream_buffer.is_none(),
+            "stream_buffer must be cleared"
+        );
         assert!(conv.messages.is_empty());
     }
 
@@ -2155,7 +2183,10 @@ mod tests {
 
         conv.cancel_current_turn_including_user();
 
-        assert!(conv.tool_call_buffer.is_none(), "tool_call_buffer must be cleared");
+        assert!(
+            conv.tool_call_buffer.is_none(),
+            "tool_call_buffer must be cleared"
+        );
     }
 
     /// cancel_current_turn_including_user on a completed turn (no active turn)
@@ -2241,7 +2272,8 @@ mod tests {
                     byte_size: 10_000,
                     success: true,
                 }),
-                            synthetic: false,
+                synthetic: false,
+                internal_origin: None,
             });
             conv.turn_tracker.on_message_added(idx);
         }
@@ -2302,7 +2334,8 @@ mod tests {
                 byte_size: 50_000,
                 success: true,
             }),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -2599,12 +2632,13 @@ mod tests {
         conv.add_user_message("real original prompt");
         conv.add_synthetic_user_message("[Additional context]: synthetic appended");
 
-        assert_eq!(conv.messages.len(), 2, "history keeps real and synthetic user messages separate");
-        let m = &conv.messages[0];
-        assert!(
-            !m.synthetic,
-            "real user message keeps `synthetic=false`"
+        assert_eq!(
+            conv.messages.len(),
+            2,
+            "history keeps real and synthetic user messages separate"
         );
+        let m = &conv.messages[0];
+        assert!(!m.synthetic, "real user message keeps `synthetic=false`");
         assert!(
             m.text().unwrap().contains("real original prompt"),
             "real text preserved"
@@ -2627,8 +2661,15 @@ mod tests {
         conv.add_synthetic_user_message("[Output limit hit]");
         conv.add_user_message("real follow-up");
 
-        assert_eq!(conv.messages.len(), 3, "history keeps synthetic and later real user messages separate");
-        assert!(conv.messages[1].synthetic, "synthetic predecessor stays synthetic");
+        assert_eq!(
+            conv.messages.len(),
+            3,
+            "history keeps synthetic and later real user messages separate"
+        );
+        assert!(
+            conv.messages[1].synthetic,
+            "synthetic predecessor stays synthetic"
+        );
         assert!(!conv.messages[2].synthetic, "real follow-up stays real");
         assert_eq!(conv.messages[2].text(), Some("real follow-up"));
     }
@@ -2728,15 +2769,30 @@ mod undo_tests {
         c.messages = msgs;
         c
     }
-    fn user(s: &str) -> Message { Message::new(Role::User, s) }
-    fn asst(s: &str) -> Message { Message::new(Role::Assistant, s) }
+    fn user(s: &str) -> Message {
+        Message::new(Role::User, s)
+    }
+    fn asst(s: &str) -> Message {
+        Message::new(Role::Assistant, s)
+    }
     fn synthetic_user(s: &str) -> Message {
-        Message { role: Role::User, content: MessageContent::Text(s.into()), synthetic: true }
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(s.into()),
+            synthetic: true,
+            internal_origin: None,
+        }
     }
 
     #[test]
     fn prompt_count_ignores_synthetic() {
-        let c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        let c = convo(vec![
+            user("p1"),
+            asst("a1"),
+            synthetic_user("[ctx]"),
+            user("p2"),
+            asst("a2"),
+        ]);
         assert_eq!(c.prompt_count(), 2);
     }
 
@@ -2752,7 +2808,14 @@ mod undo_tests {
 
     #[test]
     fn undo_earlier_prompt_removes_following_turns() {
-        let mut c = convo(vec![user("p1"), asst("a1"), user("p2"), asst("a2"), user("p3"), asst("a3")]);
+        let mut c = convo(vec![
+            user("p1"),
+            asst("a1"),
+            user("p2"),
+            asst("a2"),
+            user("p3"),
+            asst("a3"),
+        ]);
         let restored = c.undo_to_prompt(2);
         assert_eq!(restored.as_deref(), Some("p2"));
         assert_eq!(c.messages.len(), 2);
@@ -2762,7 +2825,13 @@ mod undo_tests {
     #[test]
     fn undo_counts_real_prompts_only() {
         // real prompts: p1@0, p2@3. nth=2 must cut at idx 3, keeping the synthetic.
-        let mut c = convo(vec![user("p1"), asst("a1"), synthetic_user("[ctx]"), user("p2"), asst("a2")]);
+        let mut c = convo(vec![
+            user("p1"),
+            asst("a1"),
+            synthetic_user("[ctx]"),
+            user("p2"),
+            asst("a2"),
+        ]);
         let restored = c.undo_to_prompt(2);
         assert_eq!(restored.as_deref(), Some("p2"));
         assert_eq!(c.messages.len(), 3);

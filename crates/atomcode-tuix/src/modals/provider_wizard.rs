@@ -9,7 +9,7 @@
 // palette. Esc cancels at any point.
 
 use anyhow::Result;
-use atomcode_core::config::provider::ProviderConfig;
+use atomcode_config::config::provider::ProviderConfig;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -106,7 +106,7 @@ impl DraftProvider {
     }
 
     fn into_config(self) -> ProviderConfig {
-        use atomcode_core::config::provider::default_context_window_for;
+        use atomcode_config::config::provider::default_context_window_for;
         let provider_type = self.provider_type.clone();
         ProviderConfig {
             provider_type: provider_type.clone(),
@@ -699,7 +699,7 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         (WizardStep::Model, Some(p)) =>
             t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
         (WizardStep::ContextWindow, None) => {
-            use atomcode_core::config::provider::default_context_window_for;
+            use atomcode_config::config::provider::default_context_window_for;
             // No provider_type here (Add uses show_add_step_prompt); fall back
             // to the openai default just for the bare prompt.
             t(Msg::ProviderStepContextWindow {
@@ -732,7 +732,7 @@ fn show_add_step_prompt(
         WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
         WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
         WizardStep::ContextWindow => {
-            use atomcode_core::config::provider::default_context_window_for;
+            use atomcode_config::config::provider::default_context_window_for;
             t(Msg::ProviderStepContextWindow {
                 default: default_context_window_for(&draft.provider_type),
             })

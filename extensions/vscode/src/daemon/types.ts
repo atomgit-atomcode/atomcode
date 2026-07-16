@@ -30,6 +30,7 @@ export type ChatEvent =
   | { type: 'text'; content: string }
   | { type: 'tool_batch'; calls: Array<{ id: string; name: string; arguments: string }> }
   | { type: 'tool_start'; id?: string; name: string; arguments: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id?: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
@@ -62,6 +63,7 @@ export interface ProjectState {
   previous_dir?: string;
   recent_dirs: string[];
   name: string;
+  project_hash: string;
 }
 
 export interface ChangeDirResponse {
@@ -211,6 +213,8 @@ export interface CodingPlanSetupResponse {
 export interface SessionMeta {
   id: string;
   name: string;
+  working_dir?: string;
+  project_hash?: string;
   created_at: number;
   updated_at: number;
   message_count: number;
@@ -231,6 +235,8 @@ export interface MessageInfo {
   role: string;
   content: string;
   synthetic?: boolean;
+  internal_origin?: string;
+  internalOrigin?: string;
   images?: ImageInput[];
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
@@ -289,6 +295,7 @@ export interface ChatStreamCallbacks {
   onText: (content: string) => void;
   onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
+  onToolProgress: (id: string, progress: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
   onPermissionRequest: (request: { sessionId: string; toolName: string; reason: string; callId: string; args: string }) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;

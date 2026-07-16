@@ -72,6 +72,9 @@ pub struct ToolBatchCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// True if this call may run concurrently (read-only); false → serialized
+    /// behind the write-lock. Drives the UI's honest "in parallel" label.
+    pub parallel_safe: bool,
 }
 
 /// Agent → driver. Serializable for the same reason. The id-correlated
@@ -166,6 +169,10 @@ pub enum AgentEvent {
         #[serde(default)]
         auto_resuming: bool,
     },
+    /// One or more user prompts were folded ("steered") into the running turn at
+    /// a round boundary. `count` folded this round. Drivers relabel their
+    /// type-ahead indicator from "queued" to "folded into current turn".
+    Steered { count: usize },
     /// A compaction is ABOUT TO RUN — emitted before the strategy plans/summarizes
     /// (a manual `/compact` may make a slow one-shot LLM summary call here). Lets a
     /// driver show a "compacting…" progress line before the possibly multi-second
@@ -187,6 +194,17 @@ pub enum AgentEvent {
         bytes_before: usize,
         bytes_after: usize,
         committed: bool,
+        /// Exact post-compaction working set. Present for a committed manual
+        /// compaction so driver-owned session mirrors can persist the same bytes
+        /// before reporting success; absent for no-op/auto/overflow attempts.
+        #[serde(default)]
+        snapshot: Option<SessionSnapshot>,
+    },
+    /// A prepared manual compaction could not be durably checkpointed. The live
+    /// conversation and cache epoch are unchanged.
+    CompactionFailed {
+        trigger: crate::message::CompactTrigger,
+        error: crate::checkpoint::CompactionCheckpointError,
     },
 }
 
@@ -205,5 +223,28 @@ mod tests {
             }
             _ => panic!("expected SendMessage"),
         }
+    }
+
+    #[test]
+    fn compacted_serde_defaults_missing_snapshot_to_none() {
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"Compacted":{"trigger":{"Manual":{"focus":null}},"epoch":1,"removed":2,"bytes_before":100,"bytes_after":50,"committed":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, AgentEvent::Compacted { snapshot: None, .. }));
+    }
+
+    #[test]
+    fn compaction_failure_round_trips_with_typed_error() {
+        let event = AgentEvent::CompactionFailed {
+            trigger: crate::message::CompactTrigger::Manual { focus: None },
+            error: crate::checkpoint::CompactionCheckpointError::new("disk full"),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::CompactionFailed { error, .. } if error.message() == "disk full"
+        ));
     }
 }

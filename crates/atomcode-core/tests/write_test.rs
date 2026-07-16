@@ -145,8 +145,7 @@ async fn test_write_overwrite_no_warn_on_growth() {
 
 #[tokio::test]
 async fn test_write_empty_args_returns_friendly_error() {
-    // Reproduces the user-reported bug: provider emits `{}` on max_tokens cutoff,
-    // and WriteFileTool used to propagate the raw serde error
+    // 4-13 regression: writing empty JSON yielded raw Serde mapping errors
     // ("missing field `file_path` at line 1 column 2") which told the model
     // nothing. Expected: success=false with actionable recovery hint.
     let dir = tempfile::tempdir().unwrap();
@@ -156,19 +155,14 @@ async fn test_write_empty_args_returns_friendly_error() {
     let result = tool.execute("{}", &ctx).await.unwrap();
     assert!(!result.success, "empty args should fail gracefully");
     assert!(
-        result.output.contains("missing field"),
-        "keep serde detail: {}",
+        result.output.contains("empty arguments"),
+        "should warn about empty arguments: {}",
         result.output
     );
     assert!(
-        result.output.contains("truncated") || result.output.contains("max_tokens"),
-        "should hint at root cause: {}",
+        result.output.contains("max_tokens"),
+        "should hint at max_tokens: {}",
         result.output,
-    );
-    assert!(
-        result.output.contains("edit_file"),
-        "should suggest edit_file: {}",
-        result.output
     );
 }
 

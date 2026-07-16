@@ -136,9 +136,20 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
     const RANGES: &[(u32, u32)] = &[
         (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
         (0x2194, 0x2199), (0x21A9, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328),
-        (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2),
+        // NOTE: U+23F8..23FA (⏸⏹⏺ pause/stop/record) are deliberately NOT here.
+        // They are Emoji_Presentation=No — bare (without VS16) they default to
+        // TEXT presentation and render NARROW (width 1), like the text-default
+        // ©/® excluded above. Listing them as wide made the status-line `⏸ plan`
+        // badge over-reserve a cell, leaving a stale-glyph residual after ⏸.
+        (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x24C2, 0x24C2),
         (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE),
-        (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611), (0x2614, 0x2615),
+        // NOTE: U+2611 (☑ ballot box with check) is deliberately NOT here. Like
+        // ⏸ (see the 0x23F8 note above), it is Emoji_Presentation=No — bare (no
+        // VS16) it renders NARROW (width 1). It is the `☑ Todos` panel marker
+        // (`todo_marker`), emitted bare; listing it wide over-reserved a cell and
+        // desynced the cursor, intermittently blanking a following glyph ("Todos"→
+        // "To os"). Text-default symbols belong at their unicode-width (1).
+        (0x2600, 0x2604), (0x260E, 0x260E), (0x2614, 0x2615),
         (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623),
         (0x2626, 0x2626), (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A),
         (0x2640, 0x2640), (0x2642, 0x2642), (0x2648, 0x2653), (0x265F, 0x2660),
@@ -458,8 +469,27 @@ pub fn wrap_with_cursor(
 
     // Cursor at end-of-buffer falls through.
     if !cursor_set {
-        cursor_row = lines.len() - 1;
-        cursor_col = col;
+        if col >= max_cols {
+            // The last row is filled to (or past) the edge and the caret sits
+            // after it. Reporting `cursor_col >= max_cols` would place the caret
+            // at/beyond the input box's right edge — which Windows Terminal /
+            // conhost cannot represent (they clamp the caret back onto the last
+            // glyph, so it appears "before the last character"). Soft-wrap it to
+            // col 0 of a fresh next row instead, mirroring the mid-buffer
+            // boundary case (a following grapheme would have wrapped here too;
+            // at end-of-buffer there is none to trigger it).
+            //
+            // `>` (not just `==`) also covers the overshoot case: a single
+            // grapheme wider than `max_cols` written onto an otherwise-empty row
+            // (the wrap guard above refuses to wrap onto an empty line), e.g. a
+            // pasted CJK char or a tab on a 1-col-wide input box.
+            lines.push(String::new());
+            cursor_row = lines.len() - 1;
+            cursor_col = 0;
+        } else {
+            cursor_row = lines.len() - 1;
+            cursor_col = col;
+        }
     }
     (lines, cursor_row, cursor_col)
 }
@@ -749,6 +779,42 @@ mod tests {
     }
 
     #[test]
+    fn wrap_with_cursor_end_of_buffer_full_line_wraps_to_next_row() {
+        // Caret at end-of-buffer on a line filled EXACTLY to max_cols must land
+        // at col 0 of a fresh next row — NOT col == max_cols. col == max_cols
+        // maps (via paint_footer) to one column past the input box's right
+        // edge; Windows Terminal / conhost cannot place the caret there and
+        // clamps it back onto the last glyph, so it appears "before the last
+        // character". Mirrors the mid-buffer boundary case
+        // `wrap_with_cursor("abcdef", 3, 3) -> (row 1, col 0)`.
+        let (lines, r, c) = wrap_with_cursor("abc", 3, 3);
+        assert_eq!(lines, vec!["abc".to_string(), String::new()]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_cursor_end_of_buffer_full_line_cjk() {
+        // Same edge case with a wide (CJK) trailing glyph filling to the edge.
+        // "ab你" = 1+1+2 = 4 cols, max=4, caret at end (byte 5).
+        let (lines, r, c) = wrap_with_cursor("ab你", 4, 5);
+        assert_eq!(lines, vec!["ab你".to_string(), String::new()]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_cursor_end_of_buffer_overshoot_wide_glyph_on_narrow_box() {
+        // A grapheme WIDER than max_cols written onto an otherwise-empty row
+        // overshoots (`col > max_cols`) because the wrap guard refuses to wrap a
+        // lone glyph off an empty line. The end-of-buffer caret must still land
+        // on a fresh next row, not at `col > max_cols` (which is the same
+        // caret-past-edge Windows bug). Reachable on a width-3 terminal
+        // (text_budget == 1) with a pasted CJK char. "世" is 2 cols, max=1.
+        let (lines, r, c) = wrap_with_cursor("世", 1, 3);
+        assert_eq!(lines, vec!["世".to_string(), String::new()]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
     fn wrap_with_cursor_cjk_widths() {
         // "你好" = 4 cols. max=3 → wraps after "你" (width 2 fits, next
         // char 好 (w=2) would overflow 2+2=4>3, so wrap).
@@ -905,6 +971,22 @@ mod tests {
     }
 
     #[test]
+    fn display_width_bare_media_control_symbols_are_narrow() {
+        // ⏸⏹⏺ (U+23F8..23FA) are Emoji_Presentation=No: bare (no VS16) they
+        // default to text presentation and render at width 1. The status-line
+        // `⏸ plan` badge relies on this — a width-2 reservation left a residual.
+        assert_eq!(display_width("\u{23F8}"), 1, "⏸ pause");
+        assert_eq!(display_width("\u{23F9}"), 1, "⏹ stop");
+        assert_eq!(display_width("\u{23FA}"), 1, "⏺ record");
+        assert_eq!(display_width("\u{23F8} plan"), 6, "the whole plan badge");
+        // ☑ U+2611 (todo panel marker, emitted bare) is likewise text-default → width 1.
+        assert_eq!(display_width("\u{2611}"), 1, "☑ ballot box with check");
+        assert_eq!(display_width("\u{2611} Todos"), 7, "the todo header marker + title");
+        // With VS16 they DO become emoji (width 2) — the exclusion is bare-only.
+        assert_eq!(display_width("\u{23F8}\u{FE0F}"), 2, "⏸️ with VS16");
+    }
+
+    #[test]
     fn truncate_to_width_does_not_split_zwj_cluster() {
         // Cluster has display width 2. Budget of 2 must accept the whole
         // cluster, not return "👨\u{200D}" (a broken cluster — the trailing
@@ -992,15 +1074,18 @@ mod tests {
 
     #[test]
     fn wrap_with_cursor_does_not_split_zwj_cluster() {
-        // Family = width 2 = whole cluster. max_cols=3, prefix "a" (1
-        // col) + family (2 col) = 3 = fits. Cursor after family.
+        // Family = width 2 = whole cluster. max_cols=3, prefix "a" (1 col) +
+        // family (2 col) = 3 = fills the line EXACTLY. The cluster must stay
+        // intact on row 0 (never split); the end-of-buffer caret on a full line
+        // then soft-wraps to col 0 of a fresh row 1 (see
+        // `wrap_with_cursor_end_of_buffer_full_line_wraps_to_next_row` — the
+        // caret must not land one column past the right edge).
         let family = "👨\u{200D}👩\u{200D}👦";
         let input = format!("a{family}");
         let cursor_byte = input.len();
-        let (lines, r, _c) = wrap_with_cursor(&input, 3, cursor_byte);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], input);
-        assert_eq!(r, 0);
+        let (lines, r, c) = wrap_with_cursor(&input, 3, cursor_byte);
+        assert_eq!(lines, vec![input.clone(), String::new()]);
+        assert_eq!((r, c), (1, 0));
     }
 
     #[test]

@@ -103,6 +103,30 @@ function testErrorMarksRunningToolsError() {
   assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'error');
 }
 
+function testToolProgressReplacesLatestActivity() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'review-1', name: 'code_review', args: '{}' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'round 1 · thinking' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'round 2 · read_file' });
+
+  assert.equal(state.messages[0].toolCalls?.[0]?.progress, 'round 2 · read_file');
+}
+
+function testPartialReviewResultIsMarkedIncomplete() {
+  let state = startAssistantState();
+  state = chatReducer(state, { type: 'TOOL_START', id: 'review-1', name: 'code_review', args: '{}' });
+  state = chatReducer(state, {
+    type: 'TOOL_RESULT',
+    id: 'review-1',
+    name: 'code_review',
+    output: 'Code review incomplete (MaxRounds)',
+    success: false,
+    durationMs: 600_000,
+  });
+
+  assert.equal(state.messages[0].toolCalls?.[0]?.status, 'incomplete');
+}
+
 function testIdleNoticeAddsSingleStatusBlock() {
   let state = startAssistantState();
   state = chatReducer(state, { type: 'STREAM_IDLE_NOTICE', message: 'still waiting' });
@@ -471,6 +495,74 @@ function testHistorySyntheticUserMessagesAreHidden() {
   assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
     ['user', 'real prompt'],
     ['assistant', 'reply'],
+  ]);
+}
+
+function testHistoryVerifyCadenceAssistantMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'create f.txt' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'w1', name: 'write_file', arguments: '{}' }] },
+      { role: 'tool', content: 'ok', tool_result: { call_id: 'w1', success: true, summary: 'ok', line_count: 1 } },
+      { role: 'user', content: 'You made code edits but have not verified them.', synthetic: true },
+      { role: 'assistant', content: 'No verification is needed.', internal_origin: 'verify_cadence' },
+      { role: 'user', content: 'what model are you' },
+      { role: 'assistant', content: 'I am AtomCode.' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
+    ['user', 'create f.txt'],
+    ['assistant', ''],
+    ['user', 'what model are you'],
+    ['assistant', 'I am AtomCode.'],
+  ]);
+}
+
+function testHistoryVerifyCadenceCamelCaseAssistantMessagesAreHidden() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      { role: 'user', content: 'create f.txt' },
+      { role: 'assistant', content: 'No verification is needed.', internalOrigin: 'verify_cadence' },
+      { role: 'assistant', content: 'I am AtomCode.' },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text]), [
+    ['user', 'create f.txt'],
+    ['assistant', 'I am AtomCode.'],
+  ]);
+}
+
+function testHistoryVerifyCadenceAssistantWithToolCallsIsVisible() {
+  const state = chatReducer({
+    ...initialState,
+    messages: [],
+    queuedMessages: [],
+  }, {
+    type: 'LOAD_SESSION_MESSAGES',
+    messages: [
+      {
+        role: 'assistant',
+        content: 'Running verification',
+        internal_origin: 'verify_cadence',
+        tool_calls: [{ id: 'b1', name: 'bash', arguments: '{"command":"true"}' }],
+      },
+    ],
+  });
+
+  assert.deepEqual(state.messages.map((msg) => [msg.role, msg.text, msg.toolCalls?.length ?? 0]), [
+    ['assistant', 'Running verification', 1],
   ]);
 }
 
@@ -935,6 +1027,9 @@ testHistoryAttachedSelectionMessageDisplaysOnlyUserQuestion();
 testHistoryMissingImagePlaceholderIsPreserved();
 testHistoryRawVisionPreprocessTextDisplaysOriginalUserInput();
 testHistorySyntheticUserMessagesAreHidden();
+testHistoryVerifyCadenceAssistantMessagesAreHidden();
+testHistoryVerifyCadenceCamelCaseAssistantMessagesAreHidden();
+testHistoryVerifyCadenceAssistantWithToolCallsIsVisible();
 testHistoryLegacyInternalUserMessagesAreHidden();
 testHistoryUserMessageStartingWithLegacyWordsIsVisible();
 testTextArtifactWithMarkdownContentIsNotRenderedAsCodeArtifact();
@@ -969,5 +1064,7 @@ testWarningAddsStatusBlockToStreamingAssistantMessage();
 testRateLimitedStatusBlockIsUpdatedInPlace();
 testDoneMarksRunningToolsIncompleteWithoutResult();
 testErrorMarksRunningToolsError();
+testToolProgressReplacesLatestActivity();
+testPartialReviewResultIsMarkedIncomplete();
 testIdleNoticeAddsSingleStatusBlock();
 testIdleNoticePredicateRequiresGeneratingAndThreshold();

@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
 use atomcode_core::live::{LiveEvent, TurnExecutor, TurnState, UserInput};
@@ -25,25 +26,25 @@ use atomcode_core::provider;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::PermissionDecision;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{
-    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
-    PermissionDecider, PlanPermissionDecider,
-};
-use atomcode_core::turn::runner::TurnRunner;
+use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::Telemetry;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use crate::approval_mode::{
-    approval_mode_tool_filter, approval_mode_wire, ApprovalMode, PLAN_MODE_SYSTEM_SUFFIX,
-};
+pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
+use crate::kernel_runtime::DaemonRuntimeEvent;
 
-fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
+pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
         ApprovalMode::Plan => PermissionDecision::Deny,
-        ApprovalMode::Build | ApprovalMode::Bypass => PermissionDecision::Allow,
+        // AcceptEdits groups with Build here: this coarse daemon/webui fallback has no
+        // per-tool granularity yet (webui 4th-mode support is deferred). The real
+        // AcceptEdits enforcement (edits auto-approve, bash still prompts) is the
+        // WriteApprovalGate middleware on the interactive path.
+        ApprovalMode::Build | ApprovalMode::Auto | ApprovalMode::AcceptEdits => {
+            PermissionDecision::Allow
+        }
     }
 }
 
@@ -76,7 +77,7 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 
 /// 当前审批模式的线格字符串（"build" / "plan" / "bypass"），供 Snapshot / 广播使用。
 fn live_current_mode_wire() -> String {
-    approval_mode_wire(live_current_approval_mode()).to_string()
+    live_current_approval_mode().wire().to_string()
 }
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
@@ -114,6 +115,11 @@ fn send_agent_command(
     })
 }
 
+struct AuthoritativeTerminal {
+    snapshot: ConversationSnapshot,
+    cancelled: bool,
+}
+
 /// 设置当前 LiveSession 选中的 provider（None 时不覆盖，保留既有选择）。
 fn set_live_provider(provider: Option<String>) {
     if let Some(p) = provider {
@@ -137,7 +143,7 @@ pub fn live_set_provider(provider: String) {
 pub fn live_set_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     if let Some(s) = current_live_session() {
-        s.notify_mode_changed(approval_mode_wire(mode).to_string());
+        s.notify_mode_changed(mode.wire().to_string());
     }
 }
 
@@ -173,7 +179,51 @@ impl Drop for ScopedApprovalModeForTest {
 pub fn live_set_working_dir(dir: std::path::PathBuf) {
     // 记录进程级覆盖，供两个执行器下一轮读取（修复 #755：sync 模式下 /cd 后模型
     // 仍报旧目录——执行器的 working_dir 在创建时冻结，仅靠广播无法让引擎切目录）。
+    let dir = crate::normalize_working_dir_case(dir);
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+
+    if let Some(store) = crate::DAEMON_PROJECT.lock().unwrap().as_ref() {
+        let store = store.clone();
+        let dir = dir.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut project = store.write().await;
+                let old_dir = project.working_dir.clone();
+                if old_dir != dir {
+                    project.previous_dir = Some(old_dir);
+                    project.working_dir = dir.clone();
+                    project.name = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "project".to_string());
+                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    project
+                        .recent_dirs
+                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    project.recent_dirs.insert(0, dir.clone());
+                    project.recent_dirs.truncate(5);
+                }
+            });
+        } else {
+            let mut project = store.blocking_write();
+            let old_dir = project.working_dir.clone();
+            if old_dir != dir {
+                project.previous_dir = Some(old_dir);
+                project.working_dir = dir.clone();
+                project.name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string());
+                let new_key = atomcode_core::tool::path_case_key(&dir);
+                project
+                    .recent_dirs
+                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                project.recent_dirs.insert(0, dir.clone());
+                project.recent_dirs.truncate(5);
+            }
+        }
+    }
+
     if let Some(s) = current_live_session() {
         s.notify_working_dir_changed(dir);
     }
@@ -228,25 +278,41 @@ pub fn current_live_session() -> Option<Arc<atomcode_core::live::LiveSession>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Return the MCP registry that serves the *current live session's* tools, if a
+/// live session exists. In sync mode (TUI `/webui`) this is the registry the AI
+/// actually uses — kept in the process-global MCP cache, keyed by the live
+/// session's working_dir — which is distinct from the daemon's startup
+/// `state.mcp_registry`. Lets `/mcp/status` report what's really connected
+/// instead of a separate registry that reconnects on the side.
+pub(crate) async fn live_serving_mcp_registry() -> Option<Arc<McpRegistry>> {
+    let working_dir = LIVE_WORKING_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let cache = live_mcp_cache();
+    let guard = cache.read().await;
+    guard.get(&working_dir).map(|entry| entry.registry.clone())
+}
+
 /// 取或建当前活动 LiveSession（TUI 与 /live 共用）。进程级单例。
 /// 不需要传入 AppState — 使用进程级共享 MCP 缓存。
 ///
 /// `session_id`：若提供，则复用此 session_id（而非生成新的），使 LiveSession 与
 /// TUI/WebUI 的当前会话落到同一个文件，修复 #561（三端历史分离）。
-/// `initial_messages`：若提供，则作为 LiveSession 的初始对话历史导入。
+/// `initial_snapshot`：作为 LiveSession 的完整初始对话状态导入。
 pub fn ensure_live_session(
     working_dir: std::path::PathBuf,
     telemetry: Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<atomcode_core::session::SessionId>,
-    initial_messages: Vec<atomcode_core::conversation::message::Message>,
+    initial_snapshot: ConversationSnapshot,
 ) -> Arc<atomcode_core::live::LiveSession> {
-    // TUI 调用方传入的是已在内存里的 ctx.current_session.messages，直接用闭包包一层即可。
+    // TUI 调用方传入的是已在内存里的完整 conversation snapshot。
     ensure_live_session_global(
         working_dir,
         live_mcp_cache(),
         telemetry,
         session_id,
-        move || (initial_messages, Vec::new()),
+        move || (initial_snapshot.messages, initial_snapshot.cold_summaries),
     )
 }
 
@@ -258,7 +324,9 @@ pub fn ensure_live_session(
 /// 求值。复用既有会话时根本不会调用，从而避免 webui 每条消息都为被丢弃的历史读盘。
 pub(crate) fn ensure_live_session_global(
     working_dir: std::path::PathBuf,
-    mcp_cache: Arc<
+    // Retained in the signature for call-site compatibility; the kernel executor
+    // resolves MCP itself, so this daemon-level cache is no longer read here.
+    _mcp_cache: Arc<
         tokio::sync::RwLock<
             std::collections::HashMap<std::path::PathBuf, crate::CachedMcpRegistry>,
         >,
@@ -323,25 +391,14 @@ pub(crate) fn ensure_live_session_global(
     // 污染在另一项目里新建/替换的会话（issue #755）。仅在确实新建/替换时执行，
     // 复用既有会话的分支已在上方提前 return，不会走到这里。
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = if live_engine_v2() {
-        atomcode_core::ctrace!("LIVE", "engine v2: daemon live turns on the new stack");
-        Arc::new(KernelTurnExecutor::new(
-            working_dir,
-            None,
-            false,
-            session_id,
-            telemetry,
-        ))
-    } else {
-        Arc::new(DaemonTurnExecutor {
-            working_dir,
-            provider_name: None,
-            mcp_cache,
-            telemetry,
-            auto_approve: false,
-            session_id,
-        })
-    };
+    atomcode_core::ctrace!("LIVE", "daemon live turns on the kernel stack");
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
+        working_dir,
+        None,
+        false,
+        session_id,
+        telemetry,
+    ));
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let (initial_messages, cold_summaries) = initial_session();
@@ -366,8 +423,6 @@ fn live_session_id_or_unknown() -> String {
 pub(crate) struct TurnParts {
     pub provider: Arc<dyn atomcode_core::provider::LlmProvider>,
     pub tools: Arc<ToolRegistry>,
-    pub context: ToolContext,
-    pub config: Config,
     pub ctx: Arc<dyn atomcode_core::ctx::CtxBuilder>,
     pub system_prompt: String,
 }
@@ -408,58 +463,26 @@ pub(crate) async fn build_turn_parts(
 
     let mut tool_registry = ToolRegistry::new();
 
-    // Honour ATOMCODE_DISABLE_TOOLS env var (same logic as process_chat_request)
-    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = |name: &str| !disabled_tools.contains(name);
-
-    if enabled("read_file") {
-        tool_registry.register_sync(Box::new(ReadFileTool));
-    }
-    if enabled("write_file") {
-        tool_registry.register_sync(Box::new(WriteFileTool));
-    }
-    if enabled("edit_file") {
-        tool_registry.register_sync(Box::new(EditFileTool));
-    }
-    if enabled("bash") {
-        tool_registry.register_sync(Box::new(BashTool));
-    }
-    if enabled("grep") {
-        tool_registry.register_sync(Box::new(GrepTool));
-    }
-    if enabled("glob") {
-        tool_registry.register_sync(Box::new(GlobTool));
-    }
-    if enabled("list_directory") {
-        tool_registry.register_sync(Box::new(ListDirTool));
-    }
-    if enabled("web_search") {
+    tool_registry.register_sync(Box::new(ReadFileTool));
+    tool_registry.register_sync(Box::new(WriteFileTool));
+    tool_registry.register_sync(Box::new(EditFileTool));
+    tool_registry.register_sync(Box::new(BashTool));
+    tool_registry.register_sync(Box::new(GrepTool));
+    tool_registry.register_sync(Box::new(GlobTool));
+    tool_registry.register_sync(Box::new(ListDirTool));
+    if !atomcode_config::config::offline::is_offline_active() {
         tool_registry.register_sync(Box::new(WebSearchTool::from_config(&config.web_search)));
-    }
-    if enabled("web_fetch") {
         tool_registry.register_sync(Box::new(WebFetchTool));
     }
-    if enabled("search_replace") {
-        tool_registry.register_sync(Box::new(SearchReplaceTool));
-    }
-    if enabled("todo") {
-        tool_registry.register_sync(Box::new(TodoTool::new()));
-    }
+    tool_registry.register_sync(Box::new(SearchReplaceTool));
+    tool_registry.register_sync(Box::new(TodoTool::new()));
 
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
     skill_registry.reload(working_dir);
     let has_skills = !skill_registry.is_empty();
     let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills && enabled("use_skill") {
+    if has_skills {
         tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone(),
         }));
@@ -514,7 +537,7 @@ pub(crate) async fn build_turn_parts(
 
     // Build LSP manager from config and inject into ToolContext.
     let lsp_manager = build_lsp_manager(&config.lsp, working_dir);
-    if lsp_manager.is_some() && enabled("diagnostics") {
+    if lsp_manager.is_some() {
         tool_registry.register_sync(Box::new(DiagnosticsTool));
     }
     tool_context.lsp = lsp_manager;
@@ -526,7 +549,7 @@ pub(crate) async fn build_turn_parts(
     let ctx = match config.providers.get(&resolved_provider_name) {
         Some(pc) => atomcode_core::ctx::for_provider(pc),
         None => {
-            atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            atomcode_core::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),
@@ -555,274 +578,15 @@ pub(crate) async fn build_turn_parts(
     Ok(TurnParts {
         provider: provider.into(),
         tools: Arc::new(tool_registry),
-        context: tool_context,
-        config,
         ctx,
         system_prompt,
     })
 }
 
-/// 真实执行器：每个 turn 用 build_turn_parts 建 TurnRunner，跑 turn 循环，
-/// 把 TurnRunner 的 mpsc<TurnEvent> 桥接成 LiveEvent::Turn 广播。
-pub(crate) struct DaemonTurnExecutor {
-    pub working_dir: PathBuf,
-    pub provider_name: Option<String>,
-    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
-    pub telemetry: Arc<Telemetry>,
-    /// 阶段②：自动批准（true=BypassAll），便于多 tab 验证；阶段③改交互式审批。
-    pub auto_approve: bool,
-    /// 稳定的 session_id：进程内唯一，每轮落盘时覆盖同一文件（一会话=一条记录）。
-    pub session_id: atomcode_core::session::SessionId,
-}
-
-#[async_trait]
-impl TurnExecutor for DaemonTurnExecutor {
-    /// 非视觉主模型 + 带图时经 VL 把图转文字（原图保留用于缩略图）。在 coordinator
-    /// 追加用户消息前调用，TUI / webui 共享。provider 解析与 `run_turn` 同源
-    /// （LIVE_PROVIDER 优先，回退执行器默认）。
-    async fn preprocess_input(&self, input: UserInput) -> UserInput {
-        if input.images.is_empty() {
-            return input;
-        }
-        let live_provider = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        let text = preprocess_live_caption(
-            &input.text,
-            &input.images,
-            provider_name,
-            Some(self.session_id.as_str()),
-        )
-        .await;
-        UserInput {
-            text,
-            images: input.images,
-        }
-    }
-    async fn run_turn(
-        &self,
-        conv: &Arc<Mutex<Conversation>>,
-        events: broadcast::Sender<LiveEvent>,
-        approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
-        cancel: CancellationToken,
-    ) {
-        // 优先用 webui 选中的 provider（LIVE_PROVIDER），回退到执行器默认（self.provider_name）。
-        let live_provider = LIVE_PROVIDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let provider_name = live_provider.as_deref().or(self.provider_name.as_deref());
-        // 每轮解析当前生效目录（LIVE_WORKING_DIR 覆盖 → 执行器创建时目录），使 sync
-        // 模式下 /cd 切目录对下一轮的 system prompt / 工具 cwd / 会话落盘全部生效
-        // （issue #755）。v1 每轮重建 parts，故读到新目录即重建出新的 system prompt。
-        let working_dir = live_current_working_dir(&self.working_dir);
-        let mut parts = match build_turn_parts(
-            &working_dir,
-            provider_name,
-            &self.mcp_cache,
-            self.telemetry.clone(),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = events.send(LiveEvent::Turn(TurnEvent::Error(format!(
-                    "构造 turn 失败：{e}"
-                ))));
-                return;
-            }
-        };
-        // Plan mode: tell the model up-front it's read-only so it explores and
-        // presents a plan instead of firing edits that the DenyAll decider will
-        // reject. `parts.system_prompt` is per-turn (rebuilt every turn from the
-        // current working dir), so appending here never persists into the next
-        // non-plan turn. Mirrors the TUI PlanModeGate's intent for the v1 path.
-        if live_current_approval_mode() == ApprovalMode::Plan && !self.auto_approve {
-            parts.system_prompt.push_str(PLAN_MODE_SYSTEM_SUFFIX);
-        }
-        // Build the permission decider. When interactive, mirror process_chat_request:
-        // create two channels, register the response sender into the LiveSession approver
-        // slot (so any view calling LiveSession.approve() delivers the decision here),
-        // and keep the request receiver alive for the duration of the turn (the channel
-        // must stay open so InteractivePermissionDecider::decide() can send on it without
-        // erroring; TurnRunner also emits TurnEvent::ApprovalRequested which we broadcast).
-        // Effective mode: an executor forced to auto-approve (standalone / multi-tab
-        // BypassAll) always bypasses; otherwise honour the webui runtime pill
-        // (`LIVE_APPROVAL_MODE`, default Build). Read per-turn so a mid-session switch
-        // takes effect next turn — same rationale as LIVE_PROVIDER.
-        let effective_mode = if self.auto_approve {
-            ApprovalMode::Bypass
-        } else {
-            live_current_approval_mode()
-        };
-        let (permission, _perm_req_keep): (Box<dyn PermissionDecider>, Option<_>) =
-            match effective_mode {
-                // 免审批：全放行。
-                ApprovalMode::Bypass => (
-                    Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-                    None,
-                ),
-                // Plan：拒改动类工具（放行只读、拒写/改/bash），配合下方注入的 plan 指令
-                // 让模型只探索+出方案。用 PlanPermissionDecider（而非 DenyAll）——其
-                // will_auto_approve=true 抑制了「等待审批」卡片的闪现（DenyAll 会为每个被
-                // 拒的工具先弹一张随即作废的审批卡）。无交互提示、不注册 approver。
-                ApprovalMode::Plan => (Box::new(PlanPermissionDecider), None),
-                // Build：交互审批（现状，走 webui PermissionCard）。
-                ApprovalMode::Build => {
-                    let (perm_req_tx, perm_req_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-                    let (perm_resp_tx, perm_resp_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<PermissionDecision>();
-                    // Register the response sender into the LiveSession approver slot.
-                    // LiveSession.approve(decision) will take this sender and deliver the decision.
-                    *approver.lock().await = Some(perm_resp_tx);
-                    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-                        atomcode_core::tool::PermissionStore::new(),
-                    ));
-                    (
-                        Box::new(InteractivePermissionDecider::new(
-                            perm_req_tx,
-                            perm_resp_rx,
-                            perm_store,
-                        )),
-                        Some(perm_req_rx),
-                    )
-                }
-            };
-
-        // Load configured hooks for this session (JSON/TOML/builtins/webhooks),
-        // mirroring the TUI agent so LiveSession turns stay hook-aware.
-        let mut hook_engine = atomcode_core::hook::HookEngine::new();
-        hook_engine.load_all(&working_dir);
-        let mut runner = TurnRunner {
-            provider: parts.provider,
-            tools: parts.tools,
-            context: parts.context,
-            config: parts.config,
-            ctx: parts.ctx,
-            permission,
-            recently_edited_files: Vec::new(),
-            hook_engine: std::sync::Arc::new(hook_engine),
-            loop_guard: Default::default(),
-            current_turn_number: 0,
-        };
-
-        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
-        let ev2 = events.clone();
-        let forward = tokio::spawn(async move {
-            while let Some(te) = turn_rx.recv().await {
-                let _ = ev2.send(LiveEvent::Turn(te));
-            }
-        });
-
-        {
-            let mut c = conv.lock().await;
-            // 设置 telemetry mode：取 live_message 端点在 LIVE_MODE 写入的 client 来源，
-            // 使本轮 turn 内 TurnRunner 发出的遥测事件携带正确的 envelope.mode。
-            let live_mode = *LIVE_MODE.lock().unwrap_or_else(|e| e.into_inner());
-            let scope_ctx = atomcode_telemetry::CurrentContext {
-                mode: live_mode,
-                session_id: uuid::Uuid::parse_str(self.session_id.as_str()).ok(),
-                ..atomcode_telemetry::CurrentContext::current()
-            };
-            atomcode_telemetry::CurrentContext::scope(scope_ctx, || async {
-                loop {
-                    // ── Context compression check before each turn ──
-                    {
-                        let task_hint = c
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|m| {
-                                matches!(m.role, atomcode_core::conversation::message::Role::User)
-                                    && !m.synthetic
-                            })
-                            .and_then(|m| m.text())
-                            .map(|text| {
-                                if text.chars().count() > 200 {
-                                    format!(
-                                        "TASK: {}...",
-                                        text.chars().take(197).collect::<String>()
-                                    )
-                                } else {
-                                    format!("TASK: {}", text)
-                                }
-                            });
-                        let state_hint = task_hint.as_deref();
-                        atomcode_core::agent::compression::maybe_compress_history(
-                            &*runner.ctx,
-                            &mut c,
-                            &*runner.provider,
-                            &runner.tools,
-                            &parts.system_prompt,
-                            state_hint,
-                        )
-                        .await;
-                    }
-
-                    let tool_filter = approval_mode_tool_filter(effective_mode);
-                    let result = runner
-                        .run_with_filter(
-                            &mut c,
-                            &parts.system_prompt,
-                            "",
-                            &turn_tx,
-                            cancel.clone(),
-                            tool_filter,
-                        )
-                        .await;
-                    match result {
-                        TurnResult::UsedTools { .. } => continue,
-                        TurnResult::Responded { .. } | TurnResult::Cancelled => break,
-                        TurnResult::Failed(e) => {
-                            let _ = turn_tx.send(TurnEvent::Error(e));
-                            break;
-                        }
-                    }
-                }
-            })
-            .await;
-        }
-        drop(turn_tx);
-        let _ = forward.await;
-
-        // 每轮结束后持久化会话（稳定 id → 覆盖同一文件，一会话=一条记录）。
-        // 加载已有 session 以保留 turn_stats 等累积字段，而非每轮 Session::new()
-        // 重置为空。process_chat_request 采用相同模式复用 session 对象。
-        {
-            use atomcode_core::session::{Session, SessionManager};
-            let conv_guard = conv.lock().await;
-            let manager = SessionManager::new(&working_dir);
-            let mut session = manager
-                .load(&self.session_id)
-                .unwrap_or_else(|_| Session::new(working_dir.clone()));
-            session.id = self.session_id.clone();
-            session.update_from_conversation(&conv_guard);
-            session.auto_name_from_messages();
-            session.touch();
-            if let Err(e) = manager.save(&session) {
-                atomcode_core::ctrace!("LIVE", "failed to save live session: {e}");
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
 // ============================================================================
-
-/// True when the daemon should run live turns on the NEW stack (kernel +
-/// capabilities + coding) via atomcode-bridge. The new stack is the DEFAULT now
-/// (same strangler flip as the cli); opt OUT to the legacy `DaemonTurnExecutor`
-/// with `$ATOMCODE_ENGINE=v1` (or `legacy`/`old`).
-pub(crate) fn live_engine_v2() -> bool {
-    !matches!(
-        std::env::var("ATOMCODE_ENGINE").ok().as_deref(),
-        Some("v1" | "1" | "legacy" | "old")
-    )
-}
 
 /// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
 /// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
@@ -845,7 +609,7 @@ pub(crate) struct KernelTurnExecutor {
 
 struct BridgeState {
     client: AgentClient,
-    events: mpsc::UnboundedReceiver<AgentEvent>,
+    events: mpsc::UnboundedReceiver<DaemonRuntimeEvent>,
     /// Whether the pre-existing history has been seeded into the bridge.
     seeded: bool,
     /// The provider name used to build this bridge. Compared against
@@ -1030,7 +794,7 @@ impl TurnExecutor for KernelTurnExecutor {
             };
             let provider_name = self.resolve_provider_name();
             let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = atomcode_bridge::spawn_bridged_runtime(cfg);
+            let (client, rx) = crate::kernel_runtime::spawn_daemon_runtime(cfg);
             *guard = Some(BridgeState {
                 client,
                 events: rx,
@@ -1089,7 +853,15 @@ impl TurnExecutor for KernelTurnExecutor {
             let mut msgs = c.messages.clone();
             let last = msgs.pop();
             let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-            (msgs, text, images, turn_base)
+            (
+                ConversationSnapshot {
+                    messages: msgs,
+                    cold_summaries: c.cold_summaries.clone(),
+                },
+                text,
+                images,
+                turn_base,
+            )
         };
 
         // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
@@ -1102,7 +874,7 @@ impl TurnExecutor for KernelTurnExecutor {
             user_images
         };
         let effective_mode = if self.auto_approve {
-            ApprovalMode::Bypass
+            ApprovalMode::Auto
         } else {
             live_current_approval_mode()
         };
@@ -1119,10 +891,10 @@ impl TurnExecutor for KernelTurnExecutor {
         if should_seed {
             if let Err(event) = send_agent_command(
                 &client,
-                AgentCommand::SetConversation(ConversationSnapshot {
-                    messages: prefix,
-                    cold_summaries: vec![],
-                }),
+                AgentCommand::SetConversation {
+                    snapshot: prefix,
+                    restore_id: None,
+                },
                 "初始化桥接会话",
             ) {
                 *guard = None;
@@ -1209,6 +981,44 @@ impl TurnExecutor for KernelTurnExecutor {
                 bridge_dead = true;
                 break None;
             };
+            let ev = match ev {
+                DaemonRuntimeEvent::Legacy(event) => event,
+                DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
+                    runtime_terminated,
+                } => {
+                    bridge_dead |= runtime_terminated;
+                    break None;
+                }
+                DaemonRuntimeEvent::Native(event) => {
+                    let compact_snapshot = match committed_compaction_snapshot(&event) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            emit(TurnEvent::Error(error.into()));
+                            continue;
+                        }
+                    };
+                    if let Some(snapshot) = compact_snapshot {
+                        {
+                            let mut conversation = conv.lock().await;
+                            *conversation = Conversation::from_snapshot(snapshot.clone());
+                        }
+                        if let Err(error) = save_live_compaction_json(
+                            &self.working_dir,
+                            &self.session_id,
+                            snapshot,
+                        ) {
+                            emit(TurnEvent::Error(format!(
+                                "compact session save failed: {error}"
+                            )));
+                            continue;
+                        }
+                    }
+                    if let Some(event) = coding_runtime_to_turn(event) {
+                        emit(event);
+                    }
+                    continue;
+                }
+            };
             match ev {
                 AgentEvent::TextDelta(t) => {
                     // fix B: accumulate, then throttle a crash-durable progress save.
@@ -1283,9 +1093,6 @@ impl TurnExecutor for KernelTurnExecutor {
                 }),
                 AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
                 AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-                    emit(TurnEvent::Warning(label))
-                }
                 AgentEvent::ApprovalNeeded {
                     tool_name,
                     reason,
@@ -1321,7 +1128,7 @@ impl TurnExecutor for KernelTurnExecutor {
                         PermissionDecision::Allow => "allow",
                         PermissionDecision::AllowAlways => "always_allow",
                         _ => "deny",
-                    };  
+                    };
                     emit(TurnEvent::ApprovalResolved {
                         call_id,
                         decision: decision_str.to_string(),
@@ -1355,8 +1162,18 @@ impl TurnExecutor for KernelTurnExecutor {
                     secs_until_reset,
                     auto_resuming,
                 }),
-                AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
-                AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+                AgentEvent::TurnCancelled { snapshot } => {
+                    break Some(AuthoritativeTerminal {
+                        snapshot,
+                        cancelled: true,
+                    })
+                }
+                AgentEvent::TurnComplete { snapshot, .. } => {
+                    break Some(AuthoritativeTerminal {
+                        snapshot,
+                        cancelled: false,
+                    })
+                }
                 AgentEvent::SessionRenamed { name } => {
                     // Persist on the daemon side (AI rename: sets name + ai_named,
                     // never user_renamed). Broadcast to browser tabs ONLY when the
@@ -1396,15 +1213,25 @@ impl TurnExecutor for KernelTurnExecutor {
         // bridge died mid-turn (`final_messages == None`), `conv` was never updated this
         // turn, so persisting it would CLOBBER the richer in-progress save (fix A/B) with
         // a staler `[.., user]` list — losing the partial turn the user should still see.
-        // (Empty/None never reaches here for a real terminal — Error is non-terminal and
-        // channel-close breaks with None.)
-        if let Some(msgs) = final_messages {
-            let messages = {
+        // A typed lifecycle-only cancellation also becomes None here: unlike a real
+        // terminal snapshot (which may legitimately be empty), it carries no history.
+        if let Some(terminal) = final_messages {
+            let snapshot = {
                 let mut c = conv.lock().await;
-                c.messages = restore_images_from_turn_base(msgs, &turn_base);
-                c.messages.clone()
+                install_authoritative_terminal_snapshot(
+                    &mut c,
+                    terminal.snapshot,
+                    &turn_base,
+                );
+                c.snapshot()
             };
-            if let Err(e) = save_live_session_json(&self.working_dir, &self.session_id, messages) {
+            let cancelled_turn_base = terminal.cancelled.then_some(turn_base.as_slice());
+            if let Err(e) = save_live_terminal_snapshot_json(
+                &self.working_dir,
+                &self.session_id,
+                snapshot,
+                cancelled_turn_base,
+            ) {
                 atomcode_core::ctrace!("LIVE", "failed to save live session (v2): {e}");
             }
         }
@@ -1483,6 +1310,15 @@ fn restore_images_from_turn_base(
     messages
 }
 
+fn install_authoritative_terminal_snapshot(
+    conversation: &mut Conversation,
+    mut snapshot: ConversationSnapshot,
+    turn_base: &[atomcode_core::conversation::message::Message],
+) {
+    snapshot.messages = restore_images_from_turn_base(snapshot.messages, turn_base);
+    *conversation = Conversation::from_snapshot(snapshot);
+}
+
 /// Persist the live conversation to the stable `<session_id>.json` (LOAD-MERGE-SAVE so
 /// `user_renamed` and other accumulated fields survive — not a blind overwrite). Called at
 /// THREE points across a v2 live turn: (1) turn START — so an interrupted / hard-killed
@@ -1494,10 +1330,143 @@ fn restore_images_from_turn_base(
 /// turn (the webui showed only prior completed turns — user-reported bug). Returns the
 /// IO result so the terminal caller can log a failure; the best-effort in-progress
 /// callers ignore it (a transient write miss must never break the turn).
+/// True when persisting `incoming` over `disk` would DROP already-persisted turns — a
+/// staler/divergent write must not silently shrink the on-disk conversation.
+///
+/// The metric is the count of real (non-synthetic) USER messages = completed turns, NOT
+/// total messages. Keying off USER turns is deliberate: within one turn the throttled
+/// Fix-B save persists a PROVISIONAL assistant message that the authoritative terminal
+/// snapshot may legitimately drop (cancel / timeout / rollback) — that lowers the total
+/// message count but keeps the user turns, so it is correctly allowed through. A stale
+/// clobber that loses a whole turn drops a USER message, so it is caught.
+///
+/// Compaction is the one legitimate loss of user turns: it drops old turns but injects a
+/// synthetic `[Context was compressed …]` summary, so its synthetic count grows — that
+/// case is explicitly NOT a net loss and is allowed.
+///
+/// KNOWN BOUND: keys off counts, so a same-length write that SWAPS a persisted turn for a
+/// different one (equal user count) is not caught here. The dominant reported failure is
+/// whole turns vanishing (count drop); the ctrace on refusal is the probe for the rest.
+fn save_would_lose_persisted_turns(
+    disk: &[atomcode_core::conversation::message::Message],
+    incoming: &[atomcode_core::conversation::message::Message],
+) -> bool {
+    use atomcode_core::conversation::message::Role;
+    // (real user turns, synthetic messages) in one pass.
+    let counts = |ms: &[atomcode_core::conversation::message::Message]| {
+        ms.iter().fold((0usize, 0usize), |(turns, synth), m| {
+            if m.synthetic {
+                (turns, synth + 1)
+            } else if m.role == Role::User {
+                (turns + 1, synth)
+            } else {
+                (turns, synth)
+            }
+        })
+    };
+    let (in_turns, in_synth) = counts(incoming);
+    let (disk_turns, disk_synth) = counts(disk);
+    in_turns < disk_turns && in_synth <= disk_synth
+}
+
 fn save_live_session_json(
     working_dir: &std::path::Path,
     session_id: &atomcode_core::session::SessionId,
     messages: Vec<atomcode_core::conversation::message::Message>,
+) -> std::io::Result<()> {
+    save_live_session_state_json(working_dir, session_id, messages, None, None)
+}
+
+fn save_live_terminal_snapshot_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    snapshot: ConversationSnapshot,
+    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
+) -> std::io::Result<()> {
+    save_live_session_state_json(
+        working_dir,
+        session_id,
+        snapshot.messages,
+        Some(snapshot.cold_summaries),
+        cancelled_turn_base,
+    )
+}
+
+fn save_live_session_state_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+    cold_summaries: Option<Vec<String>>,
+    cancelled_turn_base: Option<&[atomcode_core::conversation::message::Message]>,
+) -> std::io::Result<()> {
+    use atomcode_core::session::{Session, SessionManager};
+    let manager = SessionManager::new(working_dir);
+    let mut session = manager
+        .load(session_id)
+        .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
+    // Net-loss guard: a stuck/divergent turn's later authoritative writeback (from a
+    // stale persistent bridge) could carry fewer turns than durability already saved,
+    // reducing the `.json` to just the first turn AND bumping `updated_at` (re-sorting it
+    // to the sidebar top). Refuse such a write: keep disk untouched, don't `touch()`.
+    // See `save_would_lose_persisted_turns` (webui refresh-mid-turn bug).
+    let current_turn_was_rolled_back = cancelled_turn_base.is_some_and(|turn_base| {
+        cancelled_turn_rollback_matches(&session.messages, &messages, turn_base)
+    });
+    if save_would_lose_persisted_turns(&session.messages, &messages)
+        && !current_turn_was_rolled_back
+    {
+        atomcode_core::ctrace!(
+            "LIVE",
+            "save REFUSED net-loss write for {}: disk has {} msgs, incoming {} — keeping disk",
+            session_id,
+            session.messages.len(),
+            messages.len()
+        );
+        return Ok(());
+    }
+    session.id = session_id.clone();
+    session.messages = messages;
+    if let Some(cold_summaries) = cold_summaries {
+        session.cold_summaries = cold_summaries;
+    }
+    session.auto_name_from_messages();
+    session.touch();
+    manager.save(&session)
+}
+
+fn cancelled_turn_rollback_matches(
+    disk: &[atomcode_core::conversation::message::Message],
+    incoming: &[atomcode_core::conversation::message::Message],
+    turn_base: &[atomcode_core::conversation::message::Message],
+) -> bool {
+    use atomcode_core::conversation::message::Role;
+
+    let real_users = |messages: &[atomcode_core::conversation::message::Message]| {
+        messages
+            .iter()
+            .filter(|message| message.role == Role::User && !message.synthetic)
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let (Ok(disk_users), Ok(incoming_users), Ok(turn_users)) =
+        (real_users(disk), real_users(incoming), real_users(turn_base))
+    else {
+        return false;
+    };
+    let Some((_cancelled, prior_turn_users)) = turn_users.split_last() else {
+        return false;
+    };
+
+    disk_users == turn_users && incoming_users == prior_turn_users
+}
+
+/// Persist a kernel-confirmed compaction snapshot without the generic stale-write
+/// guard: this is the exact candidate accepted by the single live runtime, so a
+/// smaller user-turn count is an intentional compaction rather than stale data.
+fn save_live_compaction_json(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    snapshot: ConversationSnapshot,
 ) -> std::io::Result<()> {
     use atomcode_core::session::{Session, SessionManager};
     let manager = SessionManager::new(working_dir);
@@ -1505,7 +1474,7 @@ fn save_live_session_json(
         .load(session_id)
         .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
     session.id = session_id.clone();
-    session.messages = messages;
+    session.update_from_conversation_snapshot(snapshot);
     session.auto_name_from_messages();
     session.touch();
     manager.save(&session)
@@ -1577,11 +1546,74 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
             secs_until_reset,
             auto_resuming,
         },
-        AgentEvent::CompactionUi(atomcode_core::agent::CompactionUiKind::Mark(label)) => {
-            TurnEvent::Warning(label)
-        }
         _ => return None,
     })
+}
+
+/// Convert driver-neutral coding runtime events to the daemon streaming surface.
+pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent> {
+    match ev {
+        CodingRuntimeEvent::CompactionStarted { .. } => None,
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.committed => {
+            Some(TurnEvent::Warning(
+                atomcode_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome),
+        } if outcome.is_manual() => {
+            Some(TurnEvent::TextDelta(
+                atomcode_config::i18n::format_compaction_noop(
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                    outcome.summary_would_grow(),
+                ),
+            ))
+        }
+        CodingRuntimeEvent::CompactionFinished {
+            completion:
+                CompactionCompletion::Interrupted {
+                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                    ..
+                },
+        } => Some(TurnEvent::Warning(
+            atomcode_config::i18n::format_compaction_interrupted(),
+        )),
+        CodingRuntimeEvent::CompactionFinished {
+            completion:
+                CompactionCompletion::Failed {
+                    trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                    error,
+                },
+        } => Some(TurnEvent::Error(format!("compact failed: {error}"))),
+        CodingRuntimeEvent::CompactionFinished { .. } => None,
+        _ => None,
+    }
+}
+
+fn committed_compaction_snapshot(
+    event: &CodingRuntimeEvent,
+) -> Result<Option<atomcode_core::conversation::ConversationSnapshot>, &'static str> {
+    let CodingRuntimeEvent::CompactionFinished {
+        completion: CompactionCompletion::Completed(outcome),
+    } = event
+    else {
+        return Ok(None);
+    };
+    if !outcome.committed || !outcome.is_manual() {
+        return Ok(None);
+    }
+    let snapshot = outcome
+        .committed_snapshot
+        .as_deref()
+        .ok_or("compact completed without a resumable session snapshot")?;
+    Ok(Some(atomcode_bridge::convert::snapshot_to_core(snapshot)))
 }
 
 /// Derive the bridge config for a `/chat` request from the resolved provider.
@@ -1634,7 +1666,7 @@ pub(crate) async fn run_chat_turn_v2(
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = atomcode_bridge::spawn_bridged_runtime(bridge_cfg);
+    let (client, mut events) = crate::kernel_runtime::spawn_daemon_runtime(bridge_cfg);
 
     // Seed the bridge from conv (which already has the just-sent user message), then
     // send that message to actually run the turn.
@@ -1644,7 +1676,15 @@ pub(crate) async fn run_chat_turn_v2(
         let mut msgs = c.messages.clone();
         let last = msgs.pop();
         let (text, images) = last.as_ref().map(extract_user_input).unwrap_or_default();
-        (msgs, text, images, turn_base)
+        (
+            ConversationSnapshot {
+                messages: msgs,
+                cold_summaries: c.cold_summaries.clone(),
+            },
+            text,
+            images,
+            turn_base,
+        )
     };
     // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
     // （非视觉模型的 provider adapter 会因原图而报 400 错误）
@@ -1656,10 +1696,10 @@ pub(crate) async fn run_chat_turn_v2(
     };
     if let Err(event) = send_agent_command(
         &client,
-        AgentCommand::SetConversation(ConversationSnapshot {
-            messages: prefix,
-            cold_summaries: vec![],
-        }),
+        AgentCommand::SetConversation {
+            snapshot: prefix,
+            restore_id: None,
+        },
         "初始化桥接会话",
     ) {
         let _ = turn_tx.send(event);
@@ -1697,6 +1737,28 @@ pub(crate) async fn run_chat_turn_v2(
             ev = events.recv() => ev,
         };
         let Some(ev) = ev else { break None };
+        let ev = match ev {
+            DaemonRuntimeEvent::Legacy(event) => event,
+            DaemonRuntimeEvent::TurnCancelledWithoutSnapshot { .. } => break None,
+            DaemonRuntimeEvent::Native(event) => {
+                let compact_snapshot = match committed_compaction_snapshot(&event) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = turn_tx.send(TurnEvent::Error(error.into()));
+                        continue;
+                    }
+                };
+                if let Some(snapshot) = compact_snapshot {
+                    let mut conversation = conv.lock().await;
+                    conversation.messages = snapshot.messages;
+                    conversation.cold_summaries.clear();
+                }
+                if let Some(event) = coding_runtime_to_turn(event) {
+                    let _ = turn_tx.send(event);
+                }
+                continue;
+            }
+        };
         match ev {
             AgentEvent::ApprovalNeeded {
                 tool_name,
@@ -1732,8 +1794,18 @@ pub(crate) async fn run_chat_turn_v2(
                 // Non-terminal: forward, keep draining to the real terminal.
                 let _ = turn_tx.send(TurnEvent::Error(error));
             }
-            AgentEvent::TurnCancelled { snapshot } => break Some(snapshot.messages),
-            AgentEvent::TurnComplete { snapshot, .. } => break Some(snapshot.messages),
+            AgentEvent::TurnCancelled { snapshot } => {
+                break Some(AuthoritativeTerminal {
+                    snapshot,
+                    cancelled: true,
+                })
+            }
+            AgentEvent::TurnComplete { snapshot, .. } => {
+                break Some(AuthoritativeTerminal {
+                    snapshot,
+                    cancelled: false,
+                })
+            }
             other => {
                 if let Some(te) = agent_to_turn(other) {
                     let _ = turn_tx.send(te);
@@ -1741,9 +1813,9 @@ pub(crate) async fn run_chat_turn_v2(
             }
         }
     };
-    if let Some(msgs) = final_messages {
+    if let Some(terminal) = final_messages {
         let mut c = conv.lock().await;
-        c.messages = restore_images_from_turn_base(msgs, &turn_base);
+        install_authoritative_terminal_snapshot(&mut c, terminal.snapshot, &turn_base);
     }
     // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
     // None), which then persists conv and sends Done.
@@ -1809,6 +1881,8 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "tool_output")]
     ToolOutput { chunk: String },
+    #[serde(rename = "tool_progress")]
+    ToolProgress { id: String, progress: String },
     #[serde(rename = "tool_result")]
     ToolResult {
         id: String,
@@ -1914,16 +1988,15 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 name,
                 arguments,
             },
-            TE::ToolOutputChunk { call_id: _, chunk } => {
-                // A leading U+001E marks a `task` subagent's EPHEMERAL live-activity line
-                // (TUI-only, shown in-place on the spinner — see SUBAGENT_ACTIVITY_MARKER in
-                // atomcode-capabilities `SubtaskProgressHook`). The webui has no such surface,
-                // so drop it rather than leak a raw control char + a per-round flood into the
-                // browser transcript.
-                if chunk.starts_with('\u{1e}') {
-                    return None;
+            TE::ToolOutputChunk { call_id, chunk } => {
+                if let Some(progress) = chunk.strip_prefix('\u{1e}') {
+                    LiveWireEvent::ToolProgress {
+                        id: call_id,
+                        progress: progress.to_string(),
+                    }
+                } else {
+                    LiveWireEvent::ToolOutput { chunk }
                 }
-                LiveWireEvent::ToolOutput { chunk }
             }
             TE::ToolCallResult {
                 call_id,
@@ -1964,7 +2037,9 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 call_id: call.id,
                 arguments: call.arguments,
             },
-            TE::ApprovalResolved { call_id, decision } => LiveWireEvent::PermissionResolved { call_id, decision },
+            TE::ApprovalResolved { call_id, decision } => {
+                LiveWireEvent::PermissionResolved { call_id, decision }
+            }
             TE::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -2033,9 +2108,12 @@ pub(crate) async fn live_stream(
     let sid = parse_session_id(q.session_id);
     let load_dir = working_dir.clone();
     let load_sid = sid.clone();
-    let snapshot_wd = working_dir.clone();
+    // snapshot 的 working_dir 优先取 LIVE_WORKING_DIR（TUI 的 `/cd` 会更新它），
+    // 没有再回退到 state.project.working_dir。避免 TUI `/cd` 后 app 重连拿到旧目录
+    //（TUI 只更新了 ctx.working_dir 和 LIVE_WORKING_DIR，没更新 state.project.working_dir）。
+    let snapshot_wd = live_current_working_dir(&working_dir);
     let session = ensure_live_session_global(
-        working_dir,
+        snapshot_wd.clone(),
         live_mcp_cache(),
         state.telemetry.clone(),
         sid,
@@ -2182,7 +2260,7 @@ pub(crate) async fn live_message(
     Extension(client_mode): Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<LiveMessageReq>,
 ) -> impl IntoResponse {
-    // 更新进程级 live mode，使 DaemonTurnExecutor::run_turn 能用它设置 telemetry envelope mode。
+    // 更新进程级 live mode，供 live turn 执行时设置 telemetry envelope mode。
     *LIVE_MODE.lock().unwrap() = Some(client_mode);
     let working_dir = { state.project.read().await.working_dir.clone() };
     // 切换模型：在投递输入前更新进程级选中的 provider，使本轮 turn 用新模型构造。
@@ -2295,7 +2373,12 @@ pub(crate) async fn live_provider(
     }
     // 确保有 live 会话可供广播（与 /live/message 一致的幂等 ensure）。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    ensure_live_session(
+        working_dir,
+        state.telemetry.clone(),
+        None,
+        ConversationSnapshot::default(),
+    );
     live_set_provider(req.provider);
     Json(serde_json::json!({ "ok": true }))
 }
@@ -2390,7 +2473,12 @@ pub(crate) async fn live_reasoning_effort(
     }
     // 与 /live/provider 一致的幂等 ensure，保证有 live 会话存在。
     let working_dir = { state.project.read().await.working_dir.clone() };
-    ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+    ensure_live_session(
+        working_dir,
+        state.telemetry.clone(),
+        None,
+        ConversationSnapshot::default(),
+    );
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -2437,7 +2525,12 @@ pub(crate) async fn live_permission(
         None => {
             // No live session — try to ensure one exists (idempotent) but there's nothing
             // waiting; return accepted: false so the caller knows.
-            ensure_live_session(working_dir, state.telemetry.clone(), None, Vec::new());
+            ensure_live_session(
+                working_dir,
+                state.telemetry.clone(),
+                None,
+                ConversationSnapshot::default(),
+            );
             false
         }
     };
@@ -2481,6 +2574,27 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_core::conversation::message::Message;
+
+    #[test]
+    fn real_empty_terminal_snapshot_clears_the_conversation() {
+        let mut conversation = Conversation::from_messages_and_cold_summaries(
+            vec![Message::new(
+                atomcode_core::conversation::message::Role::User,
+                "cancelled prompt",
+            )],
+            vec!["stale summary".into()],
+        );
+
+        install_authoritative_terminal_snapshot(
+            &mut conversation,
+            ConversationSnapshot::default(),
+            &[],
+        );
+
+        assert!(conversation.messages.is_empty());
+        assert!(conversation.cold_summaries.is_empty());
+    }
 
     /// The webui `/live/mode` body + `mode`/`snapshot` SSE events serialize the
     /// mode as lowercase `build`/`plan`/`bypass`. The frontend `ApprovalMode`
@@ -2490,7 +2604,7 @@ mod tests {
         let cases = [
             (ApprovalMode::Build, "build"),
             (ApprovalMode::Plan, "plan"),
-            (ApprovalMode::Bypass, "bypass"),
+            (ApprovalMode::Auto, "bypass"),
         ];
         for (mode, wire) in cases {
             // Serialize (used by Snapshot.mode + ModeChanged broadcast).
@@ -2504,22 +2618,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_uses_the_read_only_tool_filter() {
-        let filter = approval_mode_tool_filter(ApprovalMode::Plan)
-            .expect("plan mode must filter advertised tools");
-        assert!(filter.contains(&"read_file"));
-        assert!(filter.contains(&"grep"));
-        assert!(filter.contains(&"web_fetch"));
-        assert!(!filter.contains(&"bash"));
-        assert!(!filter.contains(&"edit_file"));
-        assert!(!filter.contains(&"create_file"));
-        assert!(!filter.contains(&"search_replace"));
-
-        assert!(approval_mode_tool_filter(ApprovalMode::Build).is_none());
-        assert!(approval_mode_tool_filter(ApprovalMode::Bypass).is_none());
-    }
-
-    #[test]
     fn v2_fallback_approval_is_closed_for_plan_mode() {
         assert!(matches!(
             fallback_approval_decision(ApprovalMode::Plan),
@@ -2530,7 +2628,7 @@ mod tests {
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            fallback_approval_decision(ApprovalMode::Bypass),
+            fallback_approval_decision(ApprovalMode::Auto),
             PermissionDecision::Allow
         ));
     }
@@ -2538,7 +2636,7 @@ mod tests {
     #[tokio::test]
     async fn approval_mode_get_returns_current_runtime_mode() {
         let _mode_guard = ScopedApprovalModeForTest::new();
-        live_set_mode(ApprovalMode::Bypass);
+        live_set_mode(ApprovalMode::Auto);
 
         let response = approval_mode_get().await.into_response();
         assert_eq!(response.status().as_u16(), 200);
@@ -2623,6 +2721,16 @@ mod tests {
         let dir_a = std::path::PathBuf::from("/tmp/atomcode-test-a");
         let dir_b = std::path::PathBuf::from("/tmp/atomcode-test-b");
 
+        // Initialize DAEMON_PROJECT with a test ProjectStateStore.
+        let project_state = crate::ProjectState {
+            working_dir: dir_a.clone(),
+            previous_dir: None,
+            recent_dirs: vec![dir_a.clone()],
+            name: "test-a".to_string(),
+        };
+        let project_store = Arc::new(tokio::sync::RwLock::new(project_state));
+        *crate::DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
+
         // 无覆盖时回退到执行器创建目录。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
         assert_eq!(live_current_working_dir(&dir_a), dir_a);
@@ -2635,12 +2743,22 @@ mod tests {
         );
         assert_eq!(live_current_working_dir(&dir_a), dir_b);
 
+        // 验证 DAEMON_PROJECT 也已被同步更新。
+        {
+            let project = project_store.blocking_read();
+            assert_eq!(project.working_dir, dir_b);
+            assert_eq!(project.previous_dir.as_ref(), Some(&dir_a));
+            assert_eq!(project.name, "atomcode-test-b");
+            assert_eq!(project.recent_dirs, vec![dir_b.clone(), dir_a.clone()]);
+        }
+
         // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
         // → 触发 ChangeDir / 重建 parts。
         assert_ne!(live_current_working_dir(&dir_a), dir_a);
 
         // 清理进程级状态，避免污染同进程其他测试。
         *LIVE_WORKING_DIR.lock().unwrap() = None;
+        *crate::DAEMON_PROJECT.lock().unwrap() = None;
     }
 
     // 回归：无图时视觉预处理是直通的——caption 原样返回，不触碰 config/网络。
@@ -2665,6 +2783,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_user = Message::new(
             Role::User,
@@ -2696,6 +2815,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::new(Role::System, "session context"),
@@ -2733,6 +2853,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::new(Role::System, "session context"),
@@ -2774,6 +2895,7 @@ mod tests {
                 }],
             },
             synthetic: false,
+            internal_origin: None,
         };
         let final_messages = vec![
             Message::synthetic_user("[Auto-read from error: src/main.rs]\nfn main() {}"),
@@ -2786,7 +2908,10 @@ mod tests {
 
         let messages = restore_images_from_turn_base(
             final_messages,
-            &[Message::synthetic_user("[Auto-read from error: src/main.rs]"), image_user],
+            &[
+                Message::synthetic_user("[Auto-read from error: src/main.rs]"),
+                image_user,
+            ],
         );
 
         assert!(messages[0].synthetic);
@@ -2804,20 +2929,110 @@ mod tests {
     }
 
     #[test]
-    fn compaction_mark_maps_to_warning_wire_event() {
-        // Web parity / finding 7: a committed compaction's Mark must reach non-TUI
-        // drivers. The bridge now emits CompactionUi(Mark) instead of the old
-        // Warning("conversation compacted"); the daemon must translate it to a warning
-        // wire event so /webui + /chat clients still see the notice. Begin/End are TUI
-        // spinner lifecycle and are intentionally dropped (web has no compaction spinner).
-        use atomcode_core::agent::{AgentEvent, CompactionUiKind};
-        let label = "已压缩 · 摘要 3 条 · ~40K→~10K".to_string();
+    fn coding_compaction_events_preserve_daemon_display_policy() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let outcome = |trigger, committed| CompactionOutcome {
+            trigger,
+            epoch: 1,
+            removed_messages: 3,
+            bytes_before: 160_000,
+            bytes_after: 40_000,
+            committed,
+            estimated_tokens_before: 40_000,
+            estimated_tokens_after: 10_000,
+            committed_snapshot: None,
+        };
+
         assert!(matches!(
-            agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Mark(label.clone()))),
-            Some(TurnEvent::Warning(w)) if w == label
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Auto { utilization: 0.8 },
+                    true,
+                )),
+            }),
+            Some(TurnEvent::Warning(label)) if label.contains("40.0K") && label.contains("10.0K")
         ));
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::Begin)).is_none());
-        assert!(agent_to_turn(AgentEvent::CompactionUi(CompactionUiKind::End)).is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Manual { focus: None },
+                    false,
+                )),
+            }),
+            Some(TurnEvent::TextDelta(_))
+        ));
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome(
+                CompactTrigger::Auto { utilization: 0.8 },
+                false,
+            )),
+        })
+        .is_none());
+        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
+            trigger: CompactTrigger::Manual { focus: None },
+        })
+        .is_none());
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                },
+            }),
+            Some(TurnEvent::Warning(text)) if text.contains("interrupt") || text.contains("中断")
+        ));
+        assert!(matches!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                        "disk full",
+                    ),
+                },
+            }),
+            Some(TurnEvent::Error(text)) if text.contains("disk full")
+        ));
+
+        let missing_snapshot = CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(outcome(
+                CompactTrigger::Manual { focus: None },
+                true,
+            )),
+        };
+        assert!(committed_compaction_snapshot(&missing_snapshot).is_err());
+    }
+
+    #[test]
+    fn committed_compaction_event_exposes_exact_core_mirror_messages() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
+
+        let mut kernel_message = Message::user("after compact");
+        kernel_message.synthetic = true;
+        let snapshot = SessionSnapshot::new(vec![kernel_message]);
+        let event = CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Completed(CompactionOutcome {
+                trigger: CompactTrigger::Manual { focus: None },
+                epoch: 1,
+                removed_messages: 2,
+                bytes_before: 100,
+                bytes_after: 50,
+                committed: true,
+                estimated_tokens_before: 25,
+                estimated_tokens_after: 12,
+                committed_snapshot: Some(std::sync::Arc::new(snapshot)),
+            }),
+        };
+
+        let snapshot = committed_compaction_snapshot(&event)
+            .expect("valid completion")
+            .expect("committed snapshot");
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.messages[0].synthetic);
+        assert_eq!(snapshot.messages[0].text(), Some("after compact"));
+        assert!(snapshot.cold_summaries.is_empty());
     }
 
     // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
@@ -2871,17 +3086,26 @@ mod tests {
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
     }
 
-    // 回归：`task` 子代理的实时活性行（U+001E 前缀）是 TUI 专属的原地 spinner 更新，
-    // webui 没有对应展示面，必须在 to_wire 丢弃 —— 否则浏览器转录里会漏进裸控制符
-    // 和每轮一条的活性刷屏。普通工具输出仍照常下发。
+    // U+001E 前缀是子代理的 latest-wins 活性行。WebUI 必须收到独立 progress 事件，
+    // 不能把它丢掉，也不能当普通 output 累积进转录。
     #[test]
-    fn subagent_activity_marker_chunk_dropped_normal_output_kept() {
-        // Marker-prefixed → dropped (None).
-        let dropped = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
+    fn subagent_activity_marker_maps_to_tool_progress() {
+        let progress = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
             call_id: "c1".into(),
             chunk: "\u{1e}explore#4 · grep unwrap".into(),
-        }));
-        assert!(dropped.is_none(), "marker-prefixed subagent activity must be dropped");
+        }))
+        .expect("marker-prefixed activity must reach webui as progress");
+        let json = serde_json::to_string(&progress).unwrap();
+        assert!(
+            json.contains(r#""type":"tool_progress""#)
+                && json.contains(r#""id":"c1""#)
+                && json.contains("explore#4 · grep unwrap"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn normal_tool_output_is_still_forwarded() {
         // Ordinary tool output → forwarded.
         let kept = to_wire(LiveEvent::Turn(TurnEvent::ToolOutputChunk {
             call_id: "c2".into(),
@@ -2926,12 +3150,10 @@ mod tests {
     // is the helper the executor now also calls at turn start (user message durable) and
     // throttled mid-turn (partial assistant text durable).
 
-    use std::sync::Mutex as TestMutex;
-
-    /// Process-global env lock so ATOMCODE_HOME-mutating tests in THIS binary never race.
-    fn env_lock() -> &'static TestMutex<()> {
-        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TestMutex::new(()))
+    /// Shared process-global env lock so ATOMCODE_HOME-mutating tests across ALL
+    /// daemon test modules in this binary never race.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::atomcode_home_test_lock()
     }
 
     /// Point ATOMCODE_HOME (→ sessions root) at a tempdir for the duration of a test,
@@ -2974,6 +3196,9 @@ mod tests {
             atomcode_core::conversation::message::Role::Assistant,
             text,
         )
+    }
+    fn synthetic_msg(text: &str) -> atomcode_core::conversation::message::Message {
+        atomcode_core::conversation::message::Message::synthetic_user(text)
     }
 
     // Fix A: persisting just the user message mid-turn makes the unfinished turn
@@ -3063,5 +3288,217 @@ mod tests {
             "one session, latest snapshot — not appended copies"
         );
         assert_eq!(loaded.messages[1].text(), Some("a1 a2"));
+    }
+
+    // GUARD — webui refresh-mid-turn bug: a stuck turn's later authoritative writeback
+    // (sourced from a divergent persistent bridge) could carry FEWER turns than what
+    // durability already persisted, silently reducing the on-disk `.json` to just the
+    // first turn. A staler write that would DROP already-persisted turns must be refused.
+    #[test]
+    fn save_live_session_json_refuses_net_loss_of_persisted_turns() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard1");
+        let id = SessionId::new();
+
+        // Two full turns durably persisted.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("seed");
+
+        // A stale writeback carrying only the first turn must NOT win (best-effort Ok).
+        save_live_session_json(&dir, &id, vec![user_msg("u1"), assistant_msg("a1")])
+            .expect("stale save is best-effort ok");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            4,
+            "persisted turns must not be dropped by a staler write"
+        );
+        assert_eq!(loaded.messages[2].text(), Some("u2"));
+    }
+
+    // A refused net-loss write must leave `updated_at` untouched — otherwise the sidebar
+    // re-sorts the session to the top (the reported "first execution time got updated")
+    // even though its content just regressed.
+    #[test]
+    fn save_live_session_json_refused_write_keeps_updated_at() {
+        use atomcode_core::session::{Session, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard2");
+        let mgr = SessionManager::new(&dir);
+
+        let mut existing = Session::new(dir.clone());
+        let id = existing.id.clone();
+        existing.messages = vec![
+            user_msg("u1"),
+            assistant_msg("a1"),
+            user_msg("u2"),
+            assistant_msg("a2"),
+        ];
+        existing.updated_at = 1000;
+        mgr.save(&existing).expect("seed");
+
+        save_live_session_json(&dir, &id, vec![user_msg("u1")]).expect("ok");
+
+        let loaded = mgr.load(&id).expect("load");
+        assert_eq!(
+            loaded.updated_at, 1000,
+            "a refused net-loss write must not bump updated_at"
+        );
+    }
+
+    // Intra-turn rollback: a throttled Fix-B save persisted a PROVISIONAL assistant, then
+    // the turn was cancelled / timed out and the authoritative terminal snapshot drops
+    // that partial. The user turns are unchanged, so this is NOT a net loss — the terminal
+    // must win, else disk wedges on a phantom reply the model actually discarded.
+    #[test]
+    fn save_live_session_json_allows_terminal_to_drop_own_provisional_assistant() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard4");
+        let id = SessionId::new();
+
+        // Fix-B provisional save: [u1, a1, u2, partial-a2].
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("partial a2"),
+            ],
+        )
+        .expect("provisional");
+
+        // Terminal after cancel: same 2 user turns, the provisional assistant is gone.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![user_msg("u1"), assistant_msg("a1"), user_msg("u2")],
+        )
+        .expect("terminal");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            3,
+            "terminal snapshot must replace its own provisional save (same user turns)"
+        );
+        assert_eq!(loaded.messages[2].text(), Some("u2"));
+    }
+
+    #[test]
+    fn cancelled_first_turn_empty_snapshot_removes_provisional_prompt() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/cancel-empty");
+        let id = SessionId::new();
+        let turn_base = vec![user_msg("cancel me")];
+
+        save_live_session_json(&dir, &id, turn_base.clone()).expect("provisional save");
+        save_live_terminal_snapshot_json(
+            &dir,
+            &id,
+            ConversationSnapshot::default(),
+            Some(&turn_base),
+        )
+        .expect("authoritative cancellation save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert!(loaded.messages.is_empty());
+        assert!(loaded.cold_summaries.is_empty());
+    }
+
+    // Compaction legitimately SHRINKS the message list (drops old turns, injects a
+    // synthetic summary). The guard keys off the synthetic count so it must NOT mistake a
+    // real compaction for a stale clobber.
+    #[test]
+    fn save_live_session_json_allows_compaction_shrink() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/guard3");
+        let id = SessionId::new();
+
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                user_msg("u1"),
+                assistant_msg("a1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("seed");
+
+        // Compaction: fewer real messages, but a NEW synthetic summary marks it.
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                synthetic_msg("[Context was compressed. ...]"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+            ],
+        )
+        .expect("compaction save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            3,
+            "compaction shrink (synthetic summary present) must be allowed"
+        );
+        assert!(loaded.messages[0].synthetic);
+    }
+
+    #[test]
+    fn trusted_compaction_save_allows_repeated_shrink_with_same_summary_count() {
+        use atomcode_core::session::{SessionId, SessionManager};
+        let _home = ScopedHome::new();
+        let dir = std::path::PathBuf::from("/proj/compact-checkpoint");
+        let id = SessionId::new();
+
+        save_live_session_json(
+            &dir,
+            &id,
+            vec![
+                synthetic_msg("summary 1"),
+                user_msg("u2"),
+                assistant_msg("a2"),
+                user_msg("u3"),
+                assistant_msg("a3"),
+            ],
+        )
+        .expect("seed");
+
+        save_live_compaction_json(
+            &dir,
+            &id,
+            ConversationSnapshot {
+                messages: vec![
+                    synthetic_msg("summary 2"),
+                    user_msg("u3"),
+                    assistant_msg("a3"),
+                ],
+                cold_summaries: Vec::new(),
+            },
+        )
+        .expect("trusted compaction save");
+
+        let loaded = SessionManager::new(&dir).load(&id).expect("load");
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[0].text(), Some("summary 2"));
     }
 }

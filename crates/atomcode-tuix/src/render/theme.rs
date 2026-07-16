@@ -33,6 +33,29 @@ impl Palette {
     // default background).
     pub const BRAND: Color = Color::Magenta; // bright magenta (95)
 
+    /// Colour for the footer **mode badge** (`⏵ accept edits`, `PLAN`).
+    /// Deliberately a soft 256-colour periwinkle (`AnsiValue(104)` ≈ `#8787d7`)
+    /// rather than the global `BRAND` magenta: the mode indicator reads as a
+    /// distinct "current interaction mode" pill (mirrors Claude Code's purple)
+    /// while tool markers / spinner / prompt glyph stay Brand. 256-colour (not
+    /// truecolor) keeps parity with the `PanelBg` `AnsiValue` usage and stays
+    /// portable across terminals.
+    pub const MODE: Color = Color::AnsiValue(104);
+
+    /// Shell-mode (`!`) accent — atomcode's brand **purple** (`#7c3aed` family),
+    /// deliberately NOT the reddish global `BRAND` magenta. Terminal chrome has
+    /// no 16-colour "purple" (SGR magenta is the red-leaning one), so we use
+    /// 256-colour `AnsiValue` like `MODE`. Split light/dark because `AnsiValue`
+    /// is fixed (doesn't track the terminal palette) — the periwinkle that pops
+    /// on dark washes out on white.
+    ///
+    /// Dark → periwinkle `AnsiValue(104)` (≈`#8787d7`, same hue as the mode
+    /// badge, so `!` shell mode reads as a sibling of `PLAN`/`auto`).
+    pub const SHELL_DARK: Color = Color::AnsiValue(104);
+    /// Light → deeper violet `AnsiValue(56)` (≈`#5f00d7`, close to the `#7c3aed`
+    /// brand) so the border / hint keep contrast on a white background.
+    pub const SHELL_LIGHT: Color = Color::AnsiValue(56);
+
     /// Muted text on **light** backgrounds. SGR 90 ("bright black") maps
     /// to a mid-gray on most light themes — contrast against `#FFFFFF`
     /// lands around 4.5–5:1, comfortably above AA.
@@ -71,7 +94,22 @@ impl Palette {
     pub const ERROR: Color = Color::Red; // bright red (91)
     pub const DIFF_ADD: Color = Color::Green; // bright green (92)
     pub const DIFF_REMOVE: Color = Color::Red; // bright red (91) — paired with Error
+    /// Diff add on **light** backgrounds. `DarkGreen` (SGR 32) is more readable on white.
+    pub const DIFF_ADD_LIGHT: Color = Color::DarkGreen; // SGR 32
+    /// Diff add on **dark** backgrounds — keep bright green for contrast.
+    pub const DIFF_ADD_DARK: Color = Color::Green; // SGR 92
+    /// Diff remove on **light** backgrounds. `DarkRed` (SGR 31) is more readable on white.
+    pub const DIFF_REMOVE_LIGHT: Color = Color::DarkRed; // SGR 31
+    /// Diff remove on **dark** backgrounds — keep bright red for contrast.
+    pub const DIFF_REMOVE_DARK: Color = Color::Red; // SGR 91
     pub const CODE: Color = Color::Cyan; // bright cyan (96)
+
+    /// Colour for the **Plan mode badge** (⏸ plan). Orange (`AnsiValue(208)` ≈
+    /// `#ff8700`) — deliberately distinct from the periwinkle MODE color used by
+    /// AcceptEdits, so the two non-default approval modes are visually separable.
+    /// 256-colour (not truecolor) keeps parity with the MODE/SHELL usage and stays
+    /// portable across terminals.
+    pub const PLAN: Color = Color::AnsiValue(208);
 }
 
 /// Resolve the muted shade for the active palette.
@@ -105,6 +143,49 @@ pub fn warning_for_current_theme() -> Color {
     }
 }
 
+/// Resolve the shell-mode (`!`) accent for the active palette — atomcode's
+/// brand purple, kept readable on both backgrounds.
+///
+/// Light theme → `SHELL_LIGHT` (deeper violet, contrast on white).
+/// Dark theme  → `SHELL_DARK`  (periwinkle, pops on dark).
+pub fn shell_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::SHELL_LIGHT
+    } else {
+        Palette::SHELL_DARK
+    }
+}
+
+/// Resolve the diff add shade for the active palette.
+///
+/// Light theme → `DIFF_ADD_LIGHT` (SGR 32 dark green, readable on white).
+/// Dark theme  → `DIFF_ADD_DARK`  (SGR 92 bright green, pops on dark).
+///
+/// Bright green on light backgrounds lacks contrast; this split matches the
+/// light/dark strategy used by `warning_for_current_theme` and `muted_for_current_theme`.
+pub fn diff_add_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::DIFF_ADD_LIGHT
+    } else {
+        Palette::DIFF_ADD_DARK
+    }
+}
+
+/// Resolve the diff remove shade for the active palette.
+///
+/// Light theme → `DIFF_REMOVE_LIGHT` (SGR 31 dark red, readable on white).
+/// Dark theme  → `DIFF_REMOVE_DARK`  (SGR 91 bright red, pops on dark).
+///
+/// Bright red on light backgrounds lacks contrast; this split matches the
+/// light/dark strategy used by `warning_for_current_theme` and `muted_for_current_theme`.
+pub fn diff_remove_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::DIFF_REMOVE_LIGHT
+    } else {
+        Palette::DIFF_REMOVE_DARK
+    }
+}
+
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
 /// Returns None when colours are disabled OR when the role intentionally
 /// uses the terminal's default foreground (so strong/tool-name text just
@@ -115,6 +196,9 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     }
     match role {
         Role::Brand => Some(Palette::BRAND),
+        Role::Mode => Some(Palette::MODE),
+        Role::Plan => Some(Palette::PLAN),
+        Role::Shell => Some(shell_for_current_theme()),
         Role::Muted => Some(muted_for_current_theme()),
         Role::Accent => Some(Palette::ACCENT),
         Role::AccentDim => Some(muted_for_current_theme()),
@@ -126,18 +210,25 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::Warning => Some(warning_for_current_theme()),
         Role::Error => Some(Palette::ERROR),
         Role::Success => Some(Palette::DIFF_ADD),
-        Role::DiffAdd => Some(Palette::DIFF_ADD),
-        Role::DiffRemove => Some(Palette::DIFF_REMOVE),
-        // Tool names: emphasise with bold only; the caller adds `\x1b[1m`.
-        // No colour means the name picks up the terminal's default fg,
-        // which guarantees readability on any theme.
+        Role::DiffAdd => Some(diff_add_for_current_theme()),
+        Role::DiffRemove => Some(diff_remove_for_current_theme()),
         Role::ToolName => None,
+        Role::PanelBg => {
+            if md_theme::is_light_for_render() {
+                Some(Color::AnsiValue(254)) // Light gray for light theme
+            } else {
+                Some(Color::AnsiValue(236)) // Sleek dark gray for dark theme
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Role {
     Brand,
+    Mode,
+    Plan,
+    Shell,
     Muted,
     Accent,
     AccentDim,
@@ -149,6 +240,7 @@ pub enum Role {
     DiffAdd,
     DiffRemove,
     ToolName,
+    PanelBg,
 }
 
 #[cfg(test)]
@@ -239,10 +331,41 @@ mod tests {
     }
 
     #[test]
+    fn shell_mode_uses_brand_purple_and_switches_with_theme() {
+        // The `!` shell-mode accent is atomcode's brand PURPLE (#7c3aed family),
+        // NOT the reddish `Brand` magenta. Because `AnsiValue` is fixed (doesn't
+        // track the terminal palette), a light-theme-safe deeper purple is used
+        // on light backgrounds and the periwinkle pops on dark.
+        use crate::highlight::theme as md_theme;
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(role(caps(true), Role::Shell), Some(Palette::SHELL_DARK));
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(
+            role(caps(true), Role::Shell),
+            Some(Palette::SHELL_LIGHT),
+            "light theme must use the deeper purple — periwinkle washes out on white"
+        );
+        // Distinct shades, else the split is pointless; and never the red magenta.
+        assert_ne!(Palette::SHELL_LIGHT, Palette::SHELL_DARK);
+        assert_ne!(Palette::SHELL_DARK, Palette::BRAND, "shell must not be the red brand magenta");
+        md_theme::set_theme_mode(false); // restore default
+    }
+
+    #[test]
     fn secondary_and_toolname_return_none() {
         // These roles deliberately fall through to the terminal's default
         // foreground — they should return None even when colours are on.
         assert!(role(caps(true), Role::Secondary).is_none());
         assert!(role(caps(true), Role::ToolName).is_none());
+    }
+
+    #[test]
+    fn diff_colors_soften_on_light_theme() {
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(diff_add_for_current_theme(), Color::DarkGreen);
+        assert_eq!(diff_remove_for_current_theme(), Color::DarkRed);
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(diff_add_for_current_theme(), Color::Green);
+        assert_eq!(diff_remove_for_current_theme(), Color::Red);
     }
 }

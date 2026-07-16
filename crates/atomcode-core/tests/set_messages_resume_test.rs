@@ -20,7 +20,7 @@ use atomcode_core::tool::{ToolCall, ToolResult};
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -64,6 +65,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -144,7 +146,7 @@ fn rebuild_correctly_tracks_message_indices_per_turn() {
 
 #[test]
 fn context_builds_with_turn_tracking_after_set_messages() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -232,7 +234,7 @@ fn context_builds_with_turn_tracking_after_set_messages() {
 
 #[test]
 fn context_uses_fallback_when_turn_tracker_is_empty() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -359,6 +361,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -368,6 +371,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -377,6 +381,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
         Message::new(Role::Assistant, "Here's what I found..."),
         Message::new(Role::User, "now edit it"),
@@ -393,6 +398,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 thinking_blocks: Vec::new(),
             },
                     synthetic: false,
+                    internal_origin: None,
         },
         Message {
             role: Role::Tool,
@@ -402,6 +408,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 success: true,
             }),
                     synthetic: false,
+                    internal_origin: None,
         },
     ];
 
@@ -449,7 +456,7 @@ fn set_messages_with_single_user_message_produces_one_active_turn() {
 
 #[test]
 fn restored_context_contains_same_user_messages_as_original() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 
@@ -522,7 +529,7 @@ fn restored_context_contains_same_user_messages_as_original() {
 
 #[test]
 fn empty_turn_tracker_loses_windowing_precision() {
-    use atomcode_core::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
     use atomcode_core::ctx::CtxBuilder;
     use atomcode_core::ctx::DefaultCtx;
 

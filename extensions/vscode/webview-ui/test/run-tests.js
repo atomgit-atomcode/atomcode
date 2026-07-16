@@ -19,6 +19,7 @@ async function main() {
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
     'mode-selector-style.test.ts',
+    'session-list-regression.test.ts',
   ];
 
   try {

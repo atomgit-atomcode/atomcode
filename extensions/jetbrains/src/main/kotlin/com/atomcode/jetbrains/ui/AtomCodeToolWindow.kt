@@ -104,6 +104,14 @@ fun openAtomCodeWelcomePage(project: Project) {
     }
 }
 
+fun openAtomCodeSessionHistory(project: Project) {
+    ApplicationManager.getApplication().invokeLater {
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater
+        toolWindow.show()
+        ensureAtomCodeChatContent(project, toolWindow).showSessionHistory()
+    }
+}
+
 fun closeCurrentChatTab(project: Project) {
     ApplicationManager.getApplication().invokeLater {
         val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(ATOMCODE_TOOL_WINDOW_ID) ?: return@invokeLater

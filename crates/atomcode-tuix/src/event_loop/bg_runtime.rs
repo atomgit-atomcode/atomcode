@@ -1,6 +1,11 @@
-use atomcode_core::agent::{AgentClient, AgentEvent};
-use atomcode_core::i18n::{t, Msg};
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
+use atomcode_config::i18n::{t, Msg};
+#[cfg(test)]
+use atomcode_core::agent::AgentClient;
+use atomcode_core::agent::AgentEvent;
 use atomcode_core::session::{Session, SessionManager};
+
+use super::RuntimeEndpoint;
 
 pub const MAX_BACKGROUND_SLOTS: usize = 16;
 
@@ -15,12 +20,18 @@ impl RuntimeId {
 
 pub struct RuntimeEvent {
     pub runtime_id: RuntimeId,
-    pub event: AgentEvent,
+    pub event: RuntimeEventPayload,
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeEventPayload {
+    Legacy(AgentEvent),
+    Native(CodingRuntimeEvent),
 }
 
 pub fn spawn_event_forwarder(
     runtime_id: RuntimeId,
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEventPayload>,
     fan_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
 ) {
     tokio::spawn(async move {
@@ -62,13 +73,13 @@ pub enum BgError {
 
 pub struct ForegroundRuntime {
     pub runtime_id: RuntimeId,
-    pub client: Option<AgentClient>,
+    pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
 }
 
 pub struct BackgroundSlot {
     pub runtime_id: RuntimeId,
-    pub client: Option<AgentClient>,
+    pub endpoint: Option<RuntimeEndpoint>,
     pub session: Session,
     pub state: RuntimeState,
     pub created_at: u64,
@@ -80,7 +91,7 @@ impl BackgroundSlot {
     fn into_foreground(self) -> ForegroundRuntime {
         ForegroundRuntime {
             runtime_id: self.runtime_id,
-            client: self.client,
+            endpoint: self.endpoint,
             session: self.session,
         }
     }
@@ -230,7 +241,7 @@ impl BackgroundSlots {
     ) -> Result<usize, BgError> {
         self.push_slot(BackgroundSlot {
             runtime_id: RuntimeId::new(self.slots.len() as u64 + 1),
-            client: None,
+            endpoint: None,
             summary: session.name.clone(),
             session,
             state,
@@ -243,7 +254,7 @@ impl BackgroundSlots {
 pub struct ResumeOutcome {
     pub resumed_session: Session,
     pub resumed_runtime_id: RuntimeId,
-    pub resumed_client: Option<AgentClient>,
+    pub resumed_endpoint: Option<RuntimeEndpoint>,
     pub previous_foreground_slot: Option<usize>,
 }
 
@@ -254,11 +265,11 @@ pub struct BgRuntimeManager {
 }
 
 impl BgRuntimeManager {
-    pub fn new(session: Session, runtime_id: RuntimeId, client: AgentClient) -> Self {
+    pub fn new(session: Session, runtime_id: RuntimeId, endpoint: RuntimeEndpoint) -> Self {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id,
-                client: Some(client),
+                endpoint: Some(endpoint),
                 session,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
@@ -286,19 +297,19 @@ impl BgRuntimeManager {
     pub fn set_foreground_runtime(
         &mut self,
         runtime_id: RuntimeId,
-        client: AgentClient,
+        endpoint: RuntimeEndpoint,
         session: Session,
     ) {
         self.foreground = ForegroundRuntime {
             runtime_id,
-            client: Some(client),
+            endpoint: Some(endpoint),
             session,
         };
     }
 
     pub fn background_current(
         &mut self,
-        new_client: AgentClient,
+        new_endpoint: RuntimeEndpoint,
         new_session: Session,
         new_runtime_id: RuntimeId,
         current_state: RuntimeState,
@@ -312,14 +323,14 @@ impl BgRuntimeManager {
             &mut self.foreground,
             ForegroundRuntime {
                 runtime_id: new_runtime_id,
-                client: Some(new_client),
+                endpoint: Some(new_endpoint),
                 session: new_session,
             },
         );
         let summary = session_summary(&old.session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id: old.runtime_id,
-            client: old.client,
+            endpoint: old.endpoint,
             session: old.session,
             state: current_state,
             created_at: current_timestamp(),
@@ -331,14 +342,14 @@ impl BgRuntimeManager {
     pub fn push_background_runtime(
         &mut self,
         runtime_id: RuntimeId,
-        client: AgentClient,
+        endpoint: RuntimeEndpoint,
         session: Session,
         state: RuntimeState,
     ) -> Result<usize, BgError> {
         let summary = session_summary(&session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id,
-            client: Some(client),
+            endpoint: Some(endpoint),
             session,
             state,
             created_at: current_timestamp(),
@@ -360,7 +371,7 @@ impl BgRuntimeManager {
             let summary = session_summary(&old_foreground.session);
             Some(self.backgrounds.push_slot(BackgroundSlot {
                 runtime_id: old_foreground.runtime_id,
-                client: old_foreground.client,
+                endpoint: old_foreground.endpoint,
                 session: old_foreground.session,
                 state: current_state,
                 created_at: current_timestamp(),
@@ -374,7 +385,7 @@ impl BgRuntimeManager {
         Ok(ResumeOutcome {
             resumed_session: self.foreground.session.clone(),
             resumed_runtime_id: self.foreground.runtime_id,
-            resumed_client: self.foreground.client.clone(),
+            resumed_endpoint: self.foreground.endpoint.clone(),
             previous_foreground_slot,
         })
     }
@@ -386,13 +397,44 @@ impl BgRuntimeManager {
     pub fn apply_background_event(
         &mut self,
         runtime_id: RuntimeId,
-        event: AgentEvent,
+        event: RuntimeEventPayload,
         session_manager: &SessionManager,
     ) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
             return;
         };
-        let terminal = self.backgrounds.apply_event_to_slot(slot, &event);
+        let terminal = match event {
+            RuntimeEventPayload::Legacy(event) => {
+                self.backgrounds.apply_event_to_slot(slot, &event)
+            }
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished { completion })
+                if completion.is_manual() =>
+            {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    let mut failed = matches!(&completion, CompactionCompletion::Failed { .. });
+                    if let CompactionCompletion::Completed(outcome) = &completion {
+                        if outcome.committed {
+                            if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
+                                let core_snapshot = super::kernel_snapshot_to_core(snapshot);
+                                super::apply_session_snapshot(&mut bg.session, core_snapshot);
+                                failed = session_manager.save(&bg.session).is_err();
+                            } else {
+                                failed = true;
+                            }
+                        }
+                    }
+                    if matches!(bg.state, RuntimeState::Running) {
+                        bg.state = if failed {
+                            RuntimeState::Error
+                        } else {
+                            RuntimeState::Idle
+                        };
+                    }
+                }
+                false
+            }
+            RuntimeEventPayload::Native(_) => false,
+        };
         if terminal {
             if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
                 let _ = session_manager.save(&bg.session);
@@ -405,7 +447,7 @@ impl BgRuntimeManager {
         Self {
             foreground: ForegroundRuntime {
                 runtime_id: RuntimeId::new(1),
-                client: None,
+                endpoint: None,
                 session,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
@@ -433,7 +475,7 @@ impl BgRuntimeManager {
         let summary = session_summary(&session);
         self.backgrounds.push_slot(BackgroundSlot {
             runtime_id,
-            client: None,
+            endpoint: None,
             session,
             state,
             created_at: 0,
@@ -446,7 +488,7 @@ impl BgRuntimeManager {
     pub fn background_current_for_test(&mut self) -> Result<usize, BgError> {
         let runtime_id = self.allocate_runtime_id();
         self.background_current(
-            test_client(),
+            test_endpoint(),
             Session::default_session(self.foreground.session.working_dir.clone()),
             runtime_id,
             RuntimeState::Idle,
@@ -555,6 +597,15 @@ fn test_client() -> AgentClient {
 }
 
 #[cfg(test)]
+fn test_endpoint() -> RuntimeEndpoint {
+    let (native, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
+    RuntimeEndpoint {
+        legacy: test_client(),
+        native,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_core::session::Session;
@@ -606,7 +657,7 @@ mod tests {
     #[test]
     fn render_empty_bg_list_mentions_no_background_sessions() {
         let _g = crate::i18n::test_lock();
-        crate::i18n::set_locale(atomcode_core::locale::Locale::En);
+        crate::i18n::set_locale(atomcode_config::locale::Locale::En);
         let slots = BackgroundSlots::new(16);
         assert_eq!(render_bg_list(&slots), "  No background sessions.\n");
     }
@@ -699,6 +750,51 @@ mod tests {
         assert_eq!(manager.backgrounds().len(), 0);
     }
 
+    #[tokio::test]
+    async fn resume_restores_the_native_handle_for_that_runtime() {
+        use atomcode_coding::runtime::{
+            coding_runtime_control_channel, CodingRuntimeControl,
+        };
+
+        let (first_native, mut first_controls) = coding_runtime_control_channel();
+        let first_endpoint = RuntimeEndpoint {
+            legacy: test_client(),
+            native: first_native,
+        };
+        let mut manager = BgRuntimeManager::new(
+            session("first"),
+            RuntimeId::new(1),
+            first_endpoint,
+        );
+
+        let (second_native, _second_controls) = coding_runtime_control_channel();
+        manager
+            .background_current(
+                RuntimeEndpoint {
+                    legacy: test_client(),
+                    native: second_native,
+                },
+                session("second"),
+                RuntimeId::new(2),
+                RuntimeState::Idle,
+            )
+            .unwrap();
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        resumed
+            .resumed_endpoint
+            .unwrap()
+            .native
+            .compact(Some("first runtime".into()))
+            .unwrap();
+
+        assert!(matches!(
+            first_controls.recv().await,
+            Some(CodingRuntimeControl::Compact { focus: Some(focus), .. })
+                if focus == "first runtime"
+        ));
+    }
+
     #[test]
     fn parse_bg_subcommands_use_bare_names() {
         assert_eq!(parse_bg_command("list"), BgCommand::List);
@@ -727,11 +823,174 @@ mod tests {
 
         spawn_event_forwarder(runtime_id, agent_rx, fan_tx);
         agent_tx
-            .send(AgentEvent::TextDelta("hello".to_string()))
+            .send(RuntimeEventPayload::Legacy(AgentEvent::TextDelta(
+                "hello".to_string(),
+            )))
             .unwrap();
 
         let event = fan_rx.recv().await.unwrap();
         assert_eq!(event.runtime_id, runtime_id);
-        assert!(matches!(event.event, AgentEvent::TextDelta(text) if text == "hello"));
+        assert!(matches!(
+            event.event,
+            RuntimeEventPayload::Legacy(AgentEvent::TextDelta(text)) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_finish_releases_background_runtime() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 0,
+                    bytes_before: 0,
+                    bytes_after: 0,
+                    committed: false,
+                    estimated_tokens_before: 0,
+                    estimated_tokens_after: 0,
+                    committed_snapshot: None,
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
+    }
+
+    #[test]
+    fn committed_manual_compaction_updates_background_session_mirror() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};
+
+        let project = tempfile::tempdir().unwrap();
+        let project = project.path().to_path_buf();
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+        let snapshot = SessionSnapshot::new(vec![Message::user("after compact")]);
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 2,
+                    bytes_before: 100,
+                    bytes_after: 50,
+                    committed: true,
+                    estimated_tokens_before: 25,
+                    estimated_tokens_after: 12,
+                    committed_snapshot: Some(std::sync::Arc::new(snapshot)),
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        let messages = &manager.backgrounds.slots[0].session.messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), Some("after compact"));
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
+    }
+
+    #[test]
+    fn manual_compaction_interruption_releases_background_runtime() {
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Interrupted {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    reason: atomcode_coding::runtime::CompactionInterruption::RuntimeReconfigured,
+                },
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+    }
+
+    #[test]
+    fn failed_manual_compaction_marks_background_runtime_error() {
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("compacting"), RuntimeState::Running)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Failed {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    error: atomcode_kernel::checkpoint::CompactionCheckpointError::new("disk full"),
+                },
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Error
+        );
+    }
+
+    #[test]
+    fn late_compaction_finish_does_not_downgrade_terminal_background_state() {
+        use atomcode_coding::runtime::CompactionOutcome;
+        use atomcode_kernel::message::CompactTrigger;
+
+        let project = PathBuf::from("/tmp/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        manager
+            .push_test_background(session("completed"), RuntimeState::Done)
+            .unwrap();
+
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Manual { focus: None },
+                    epoch: 1,
+                    removed_messages: 2,
+                    bytes_before: 100,
+                    bytes_after: 50,
+                    committed: true,
+                    estimated_tokens_before: 25,
+                    estimated_tokens_after: 12,
+                    committed_snapshot: None,
+                }),
+            }),
+            &SessionManager::new(&project),
+        );
+
+        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Done);
     }
 }

@@ -48,6 +48,9 @@ export interface SessionMeta {
   created_at?: string | number;
   updated_at?: string | number;
   project_hash?: string;
+  working_dir?: string;
+  message_count?: number;
+  file_size?: number;
   isGenerating?: boolean;
   hasUnread?: boolean;
 }
@@ -85,6 +88,7 @@ export interface ToolCallData {
   output?: string;
   success?: boolean;
   durationMs?: number;
+  progress?: string;
   status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'error' | 'incomplete';
 }
 
@@ -182,6 +186,7 @@ export type ChatAction =
   | { type: 'APPEND_TEXT'; content: string }
   | { type: 'TOOL_BATCH_START'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
+  | { type: 'TOOL_PROGRESS'; id: string; progress: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'STREAM_WARNING'; message: string }
   | { type: 'STREAM_RATE_LIMITED'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
@@ -191,7 +196,7 @@ export type ChatAction =
   | { type: 'ARTIFACT_END'; id: string }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
   | { type: 'GENERATION_DONE'; tokens?: number }
-  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
   | { type: 'CLEAR_CHAT' }
@@ -230,6 +235,7 @@ export type ExtensionMessage =
   | { type: 'text'; content: string }
   | { type: 'toolBatchStart'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'toolStart'; id?: string; name: string; args: string }
+  | { type: 'toolProgress'; id: string; progress: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'warning'; message: string }
   | { type: 'rateLimited'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
@@ -238,7 +244,7 @@ export type ExtensionMessage =
   | { type: 'artifactEnd'; id: string }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
-  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: unknown; synthetic?: boolean; internal_origin?: string; internalOrigin?: string; images?: ImageData[]; tool_calls?: Array<{ id?: string; name?: string; arguments?: string; display?: string }>; tool_result?: { call_id?: string; success: boolean; summary: string; line_count: number }; artifacts?: Array<{ id: string; artifact_type?: string; artifactType?: string; title?: string; language?: string; content: string }> }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'generationStopped' }

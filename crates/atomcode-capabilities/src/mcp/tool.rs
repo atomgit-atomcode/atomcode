@@ -24,6 +24,9 @@ pub struct McpToolAdapter {
     full_name: String,
     description: String,
     schema: serde_json::Value,
+    /// Server-declared `annotations.readOnlyHint` — a read-only tool has no side
+    /// effects, so it is `Safe` (no approval) and allowed during plan mode.
+    read_only: bool,
 }
 
 impl McpToolAdapter {
@@ -46,6 +49,7 @@ impl McpToolAdapter {
             full_name,
             description,
             schema: info.input_schema,
+            read_only: info.read_only,
         }
     }
 
@@ -76,13 +80,22 @@ impl Tool for McpToolAdapter {
     /// take effect (it was silently ignored before). The `mcp__{server}__{tool}` name
     /// conveys the origin to the prompt when it does fire.
     fn risk(&self, _args: &str) -> RiskLevel {
-        if self.registry.is_server_trusted(&self.server)
+        // A server-declared read-only tool has no side effects → Safe (no approval),
+        // matching codex's `readOnlyHint` handling. Otherwise trust/auto-approve decide.
+        if self.read_only
+            || self.registry.is_server_trusted(&self.server)
             || self.registry.is_tool_auto_approved(&self.full_name)
         {
             RiskLevel::Safe
         } else {
             RiskLevel::Risky
         }
+    }
+
+    /// Server-declared `annotations.readOnlyHint`. Plan mode reads this to allow
+    /// read-only external queries (distinct from `risk()`, which also folds in trust).
+    fn read_only_hint(&self) -> bool {
+        self.read_only
     }
 
     /// "Always" approves THIS tool (`mcp__{server}__{tool}`) regardless of the call's
@@ -141,6 +154,7 @@ mod tests {
             tool_name: tool.to_string(),
             description: String::new(),
             input_schema: json!({}),
+            read_only: false,
         }
     }
 
@@ -157,6 +171,19 @@ mod tests {
         let reg = Arc::new(McpRegistry::new());
         let adapter = McpToolAdapter::new(reg, info("docs", "query"));
         assert_eq!(adapter.risk("{}"), RiskLevel::Risky);
+        assert!(!adapter.read_only_hint(), "unannotated tool is not read-only");
+    }
+
+    #[test]
+    fn read_only_hint_tool_is_safe_even_when_untrusted() {
+        // A server-declared read-only tool (readOnlyHint: true) has no side effects →
+        // Safe (skips approval) and exposes read_only_hint() for plan mode.
+        let reg = Arc::new(McpRegistry::new());
+        let mut ro = info("docs", "query");
+        ro.read_only = true;
+        let adapter = McpToolAdapter::new(reg, ro);
+        assert_eq!(adapter.risk("{}"), RiskLevel::Safe);
+        assert!(adapter.read_only_hint());
     }
 
     #[test]

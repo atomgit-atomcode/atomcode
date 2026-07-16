@@ -9,6 +9,9 @@ description = "Engine bridge: presents atomcode-core's driver-facing channel pro
 # place old and new stacks meet. atomcode-core supplies the legacy TYPES (the wire
 # vocabulary drivers speak) — its engine is what the bridge replaces.
 atomcode-core = { path = "../atomcode-core" }
+# Config system (leaf crate, extracted from core) — used directly, not via the
+# transitional atomcode_core::config re-export shim.
+atomcode-config = { path = "../atomcode-config" }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["provider", "tools", "session", "memory", "mcp"] }
 atomcode-coding = { path = "../atomcode-coding" }

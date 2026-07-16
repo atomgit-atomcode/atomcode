@@ -149,7 +149,7 @@ struct ParsedHttpAuth {
 /// (`ATOMCODE_HOME/mcp.json`) for servers with the same name.
 pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     let user_config = load_config_file(
-        &crate::config::Config::config_dir().join("mcp.json"),
+        &atomcode_config::config::Config::config_dir().join("mcp.json"),
         McpConfigSource::User,
     )
     .unwrap_or_default();
@@ -484,7 +484,7 @@ fn expand_tilde(s: &str) -> String {
 /// Idempotent; preserves existing JSON content.
 pub fn add_auto_approved_tool(project_dir: &Path, server: &str, tool: &str) -> Result<()> {
     let project_path = project_dir.join(".mcp.json");
-    let user_path = crate::config::Config::config_dir().join("mcp.json");
+    let user_path = atomcode_config::config::Config::config_dir().join("mcp.json");
 
     let defines = |p: &Path| -> bool {
         std::fs::read_to_string(p)

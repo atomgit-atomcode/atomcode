@@ -114,6 +114,9 @@ pub struct ToolBatchCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// True if this call may run concurrently (read-only); false → serialized
+    /// behind the write-lock. Drives the UI's honest "in parallel" label.
+    pub parallel_safe: bool,
 }
 
 /// Result of a single turn execution

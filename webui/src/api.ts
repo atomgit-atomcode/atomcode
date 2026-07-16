@@ -21,6 +21,7 @@ export type SSEEvent =
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
   | { type: 'tool_output'; chunk: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
@@ -28,7 +29,14 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean };
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
+  // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
+  // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
+  // these, code block content is silently lost in the WebUI while the TUI sees it fine.
+  | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null }
+  | { type: 'artifact_content'; id: string; content: string }
+  | { type: 'artifact_end'; id: string };
 
 export interface ModelInfo {
   provider: string;
@@ -194,6 +202,8 @@ export interface SessionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   synthetic?: boolean;
+  internal_origin?: string;
+  internalOrigin?: string;
   tool_calls?: ToolCallInfo[];
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
@@ -581,6 +591,7 @@ export type LiveWireEvent =
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: string }
   | { type: 'tool_output'; chunk: string }
+  | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean }
@@ -596,6 +607,9 @@ export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
   signal?: AbortSignal,
   sessionId?: string | null,
+  // Called on every chunk received (events AND the 15s keepalive ping) so the
+  // caller can run a staleness watchdog that reconnects a silently-dead stream.
+  onActivity?: () => void,
 ): Promise<void> {
   const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
   const resp = await fetch(`/live${params}`, { headers: authHeaders(), signal });
@@ -606,6 +620,7 @@ export async function streamLive(
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    onActivity?.();
     buffer += decoder.decode(value, { stream: true });
     const parts = buffer.split('\n\n');
     buffer = parts.pop() ?? '';
