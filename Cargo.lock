@@ -415,6 +415,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
  "similar",
  "tempfile",
