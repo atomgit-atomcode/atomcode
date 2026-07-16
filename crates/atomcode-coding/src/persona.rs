@@ -214,8 +214,11 @@ WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as
 finished, or hand back to the user while any item is still pending or in_progress — keep \
 working through them. Keep each \
 item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
-and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
-quick edit, a one-off command, or a purely informational / conversational reply.";
+and the user aligned and avoids losing the thread across turns. If the user pivots to clearly \
+unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
+than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
+or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
+use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
 
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the
@@ -352,6 +355,36 @@ mod tests {
         assert!(
             p.contains("Do NOT use it for a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
+        );
+    }
+
+    #[test]
+    fn todo_guidance_directs_replace_on_redirect_without_inviting_self_clear() {
+        // When the user pivots to unrelated new work, the model should REPLACE the
+        // list with the new task's full steps — NEVER empty it just to answer a
+        // question or because a step was hard. Emptying is the self-clear path a
+        // weak model over-applies, wiping a still-valid in_progress plan. Framed as
+        // replace-on-genuine-redirect and gated on multi-step new work, so a mere
+        // clarifying question (no new steps) leaves the current list untouched.
+        let on = coding_persona("deepseek-v4-flash", true);
+        assert!(
+            on.contains("REPLACE the old one"),
+            "must direct replacing the list on redirect: {on}"
+        );
+        assert!(
+            on.contains("do NOT reset or empty the list merely to answer a question"),
+            "must forbid self-clearing to answer a question / on a hard step: {on}"
+        );
+        assert!(
+            on.contains("only replace it when genuinely different multi-step work begins"),
+            "replacement must be gated on genuinely different multi-step work: {on}"
+        );
+
+        // Gating parity: absent when the todo tool/hook aren't mounted.
+        let off = coding_persona("deepseek-v4-flash", false);
+        assert!(
+            !off.contains("REPLACE the old one"),
+            "disabled → no redirect guidance: {off}"
         );
     }
 
