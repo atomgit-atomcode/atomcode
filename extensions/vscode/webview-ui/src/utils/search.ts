@@ -6,9 +6,16 @@ export type { SearchMatch, SearchMatchRange };
 
 /**
  * Collect a single, linear searchable string for a message.
- * For user messages we use the raw text. For assistant messages we
- * concatenate every visible block (text blocks, tool outputs, artifact
- * contents) so that searching also surfaces tool calls and code.
+ *
+ * IMPORTANT: this MUST cover only text that the UI can actually HIGHLIGHT,
+ * otherwise the `{current}/{total}` counter and the dim/focus feedback count
+ * "phantom" matches that render no visible `<mark>` — landing the user on a
+ * message with nothing highlighted (the mislabel the search feature is meant
+ * to avoid). Only `text` and `artifact` blocks flow through
+ * `Markdown.tsx → highlightHtml`; `tool` (args/output) and `status` blocks have
+ * NO highlight path, so they are deliberately EXCLUDED here. (If tool/status
+ * search coverage is ever wanted back, it must come WITH a highlight path in
+ * those block renderers, so count and highlights stay in sync.)
  */
 export function getMessageSearchableText(message: ChatMessage): string {
   if (message.role === 'user' || message.role === 'error') {
@@ -23,14 +30,12 @@ export function getMessageSearchableText(message: ChatMessage): string {
   for (const block of blocks) {
     if (block.type === 'text') {
       parts.push(block.content);
-    } else if (block.type === 'tool') {
-      if (block.tool.args) parts.push(block.tool.args);
-      if (block.tool.output) parts.push(block.tool.output);
     } else if (block.type === 'artifact') {
       parts.push(block.artifact.content);
-    } else if (block.type === 'status') {
-      parts.push(block.status.message);
     }
+    // `tool` / `status` blocks are intentionally NOT searched: they have no
+    // highlight path, so matching them would produce phantom (uncounted-yet-
+    // unhighlighted) hits. See the doc comment above.
   }
   return parts.join('\n');
 }

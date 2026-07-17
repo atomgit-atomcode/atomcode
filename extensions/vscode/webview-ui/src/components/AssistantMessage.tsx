@@ -126,7 +126,7 @@ export function AssistantMessage({ message, className = '', searchQuery, isCurre
   const hasContent = blocks.length > 0;
 
   return (
-    <div className={`timeline-message ${dotClass}${className}`}>
+    <div className={`timeline-message ${dotClass}${className}${isCurrentMatch ? ' search-current' : ''}`}>
       <div className="assistant-message-content" ref={contentRef}>
         <div className="assistant-block-list">
           {blocks.map((block) => <AssistantBlock key={block.id} block={block} streaming={isStreaming} searchQuery={searchQuery} />)}

@@ -51,7 +51,7 @@ export function UserMessage({ message, className = '', searchQuery, isCurrentMat
   );
 
   return (
-    <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}`}>
+    <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}${isCurrentMatch ? ' search-current' : ''}`}>
       <div className="user-message-bubble">
         {message.queued && <div className="user-message-status">{t('user.queued')}</div>}
         {message.contextFiles && message.contextFiles.length > 0 && (

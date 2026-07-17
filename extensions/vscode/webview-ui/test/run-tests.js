@@ -20,6 +20,7 @@ async function main() {
     'mode-state.test.ts',
     'mode-selector-style.test.ts',
     'session-list-regression.test.ts',
+    'search.test.ts',
   ];
 
   try {

@@ -35,7 +35,7 @@ test('getMessageSearchableText returns raw text for user messages', () => {
   assert.equal(getMessageSearchableText(msg), 'hello <script>');
 });
 
-test('getMessageSearchableText aggregates assistant blocks', () => {
+test('getMessageSearchableText covers only highlightable blocks (text/artifact, not tool/status)', () => {
   const msg: ChatMessage = {
     id: 'a1',
     role: 'assistant',
@@ -46,15 +46,19 @@ test('getMessageSearchableText aggregates assistant blocks', () => {
       {
         id: 'b2',
         type: 'tool',
-        tool: { id: 't1', name: 'bash', args: 'ls', output: 'file.txt', status: 'done' },
+        tool: { id: 't1', name: 'bash', args: 'lsargs', output: 'file.txt', status: 'done' },
       },
       { id: 'b3', type: 'text', content: 'done' },
     ],
   };
   const text = getMessageSearchableText(msg);
   assert.ok(text.includes('intro'));
-  assert.ok(text.includes('file.txt'));
   assert.ok(text.includes('done'));
+  // tool args/output are NOT searched: they have no highlight path, so matching
+  // them would produce phantom (counted-but-not-highlighted) hits — the very
+  // mislabel this feature must avoid. Same for `status` blocks.
+  assert.ok(!text.includes('file.txt'));
+  assert.ok(!text.includes('lsargs'));
 });
 
 test('buildSearchMatches groups matches by message id', () => {

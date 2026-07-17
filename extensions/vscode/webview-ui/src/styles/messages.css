@@ -921,6 +921,12 @@ mark.search-highlight {
   padding: 0 1px;
 }
 
+/* The CURRENT match message (nav is per-message: `{current}/{total}` counts
+   messages, Enter/Shift+Enter cycle them). Brighten its keyword marks so the
+   focused hit is visually distinct from other matched-but-not-current messages
+   — otherwise the only cue is scroll position. `.active` on an individual mark
+   was dead code (never applied); the `.search-current` ancestor is the live seam. */
+.search-current mark.search-highlight,
 mark.search-highlight.active {
   background: color-mix(in srgb, var(--app-brand), transparent 45%);
   outline: 1px solid color-mix(in srgb, var(--app-brand), transparent 30%);
