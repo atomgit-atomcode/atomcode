@@ -115,4 +115,14 @@ mod tests {
         assert_eq!(format_cost(0.001), "$0.0010");
         assert_eq!(format_cost(12.5), "$12.50");
     }
+
+    #[test]
+    fn self_integrated_unknown_model_gets_nonzero_cost() {
+        // The whole reason `/cost` exists alongside the gateway-only `/usage`:
+        // it prices ANY model from local token accounting. An unknown /
+        // self-integrated model must fall back to the conservative estimate,
+        // never silently $0. (1.0 in / 3.0 out per M → 100k*1.0 + 50k*3.0.)
+        let cost = calculate_cost("my-company-internal-llm-v2", 100_000, 50_000, 0);
+        assert!(cost > 0.0, "self-integrated model must get the fallback price, not $0");
+    }
 }

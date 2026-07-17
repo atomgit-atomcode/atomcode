@@ -1665,8 +1665,14 @@ fn execute_slash_command_impl(
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
         }
-        "usage" | "cost" => {
+        "usage" => {
             open_usage(renderer, active_modal);
+        }
+        "cost" => {
+            // Local session token cost (any model, incl. self-integrated) — as
+            // opposed to `/usage`, which queries the CodingPlan gateway only.
+            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
+            renderer.flush();
         }
         "context" => {
             // `/context` = breakdown only.
@@ -4381,9 +4387,38 @@ fn open_usage(
 
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
 /// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
-pub(super) fn run_remote_command(ctx: &LoopCtx, _state: &UiState, cmd: &str) -> Option<String> {
+/// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
+/// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
+/// 与手机远程执行共用。
+pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    let total = state.prompt_tokens + state.completion_tokens;
+    let cache_rate = if state.prompt_tokens > 0 {
+        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+    } else {
+        0
+    };
+    let cost = crate::pricing::calculate_cost(
+        &ctx.model_name,
+        state.prompt_tokens,
+        state.completion_tokens,
+        state.cached_tokens,
+    );
+    let cost_str = crate::pricing::format_cost(cost);
+    t(Msg::CostReport {
+        prompt: state.prompt_tokens,
+        completion: state.completion_tokens,
+        cached: state.cached_tokens,
+        cache_rate,
+        total,
+        cost: &cost_str,
+    })
+    .into_owned()
+}
+
+pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
     match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
         "status" => Some(build_status_text(ctx, None)),
+        "cost" => Some(build_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
         _ => None,

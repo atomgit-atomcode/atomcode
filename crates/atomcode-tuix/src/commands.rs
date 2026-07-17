@@ -103,9 +103,10 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false, hidden: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false, hidden: false },
     Command { name: "usage",   desc: "Show CodingPlan usage (tabs: current / overview / models)", needs_args: false, hidden: false },
-    // `/cost` is a deprecated alias for `/usage`; kept hidden so muscle memory
-    // still works but it no longer appears in the slash menu or /help.
-    Command { name: "cost",    desc: "Show token cost (alias: /usage)", needs_args: false, hidden: true },
+    // `/cost` reports THIS SESSION's token cost from local accounting × the model
+    // price table — works for ANY model, including self-integrated ones the
+    // gateway-only `/usage` modal can't see.
+    Command { name: "cost",    desc: "Show this session's token cost (any model)", needs_args: false, hidden: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false },
     Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false },
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false },
