@@ -1,19 +1,24 @@
 //! Baked pixel-art mascot (orange cat) for the welcome banner.
 //!
-//! Generated offline from `atomcode.gif` (see `scripts/gen_mascot.py`), NOT read
-//! at runtime. Each row is `2 * MASCOT_WIDTH` chars: two chars per cell
-//! `(top, bottom)`, rendered as the upper-half-block `▀` with fg=top / bg=bottom.
-//! Legend: '.' transparent, 'o' orange, 'w' white, 'k' black.
+//! Generated offline (see `scripts/gen_mascot.py`, `CELLS_WIDE = 13`) from the
+//! reference cat art with its solid background keyed out to transparency first,
+//! NOT read at runtime. 13 cells wide × 6 rows (12 px tall) — enough resolution
+//! for the two pointed ears + two eyes to read distinctly (at 9 wide the eyes
+//! merged into one central blob). Each row is `2 * MASCOT_WIDTH` chars: two
+//! chars per cell `(top, bottom)`, rendered as the upper-half-block `▀` with
+//! fg=top / bg=bottom. Legend: '.' transparent, 'o' orange, 'w' white, 'k' black.
 
 use crossterm::style::Color;
 
-pub const MASCOT_WIDTH: usize = 9;
+pub const MASCOT_WIDTH: usize = 13;
 
-pub const MASCOT_ROWS: [&str; 4] = [
-    "oooo.o.o.o.o.ooooo",
-    "ooooooowokooowokoo",
-    "oooooowowooowowooo",
-    "..o.ooooooooooo...",
+pub const MASCOT_ROWS: [&str; 6] = [
+    "oooooo..............oooooo",
+    "oooooooooooooooooooooooooo",
+    "oooooooowwkwoooooowwkwoooo",
+    "oooooooooooooooooooooooooo",
+    "o.ooooooooooooooooooooooo.",
+    "....o.ooooooooooooooo.....",
 ];
 
 /// Map a legend byte to its 256-color value; `.` (transparent) → None.

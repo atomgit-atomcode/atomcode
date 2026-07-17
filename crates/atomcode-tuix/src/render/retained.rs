@@ -347,6 +347,32 @@ fn format_tok_count(n: usize, round_clean: bool) -> String {
 // ignored — the glyph still renders with the current accumulated
 // style. CSI sequences with a non-`m` final byte are skipped whole.
 
+/// Map a mascot cell's `(top, bottom)` subpixel colours to a rendered cell.
+/// Uses `▄` (lower-half) when ONLY the bottom is coloured so the transparent
+/// top stays the terminal background — NOT `▀` with a `None` fg, which paints
+/// the top half in the terminal's default fg (the "dark bar across the ears"
+/// bug). `▀` (fg=top, bg=bottom) covers the both-coloured case.
+fn mascot_cell(top_c: Option<Color>, bot_c: Option<Color>) -> Cell {
+    match (top_c, bot_c) {
+        (None, None) => Cell::blank(),
+        (Some(t), None) => Cell {
+            ch: '▀',
+            style: CellStyle { fg: Some(t), bg: None, ..CellStyle::default() },
+            width: 1,
+        },
+        (None, Some(b)) => Cell {
+            ch: '▄',
+            style: CellStyle { fg: Some(b), bg: None, ..CellStyle::default() },
+            width: 1,
+        },
+        (Some(t), Some(b)) => Cell {
+            ch: '▀',
+            style: CellStyle { fg: Some(t), bg: Some(b), ..CellStyle::default() },
+            width: 1,
+        },
+    }
+}
+
 /// Parse an ANSI-tinted markdown string into one or more cell
 /// lines, split on `\n`. Wide glyphs get one real cell + N-1
 /// `Cell::continuation()` cells so `cell_index == terminal_column`
@@ -4526,33 +4552,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             for cell in 0..MASCOT_WIDTH {
                 let top = bytes.get(2 * cell).copied().unwrap_or(b'.');
                 let bot = bytes.get(2 * cell + 1).copied().unwrap_or(b'.');
-                let top_c = mascot_color(top);
-                let bot_c = mascot_color(bot);
-                // Half-block choice matters for TRANSPARENT pixels: `▀` fills its
-                // top half with the fg and leaves the bottom as the cell bg, so a
-                // transparent-top pixel would paint the top half in the terminal's
-                // DEFAULT fg (a dark/white bar). Use `▄` (bottom half) when only
-                // the bottom pixel is coloured, keeping the transparent half as the
-                // terminal background on any theme.
-                let cell = match (top_c, bot_c) {
-                    (None, None) => Cell::blank(),
-                    (Some(t), None) => Cell {
-                        ch: '▀',
-                        style: CellStyle { fg: Some(t), bg: None, ..CellStyle::default() },
-                        width: 1,
-                    },
-                    (None, Some(b)) => Cell {
-                        ch: '▄',
-                        style: CellStyle { fg: Some(b), bg: None, ..CellStyle::default() },
-                        width: 1,
-                    },
-                    (Some(t), Some(b)) => Cell {
-                        ch: '▀',
-                        style: CellStyle { fg: Some(t), bg: Some(b), ..CellStyle::default() },
-                        width: 1,
-                    },
-                };
-                row.push(cell);
+                // Half-block choice (see `mascot_cell`): `▄` for transparent-top
+                // pixels so they don't paint a default-fg bar across the ears.
+                row.push(mascot_cell(mascot_color(top), mascot_color(bot)));
             }
             rows.push(row);
         }
@@ -4684,7 +4686,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let gap = 4usize;
         let left_w = if show_mascot { PAD_COL + mascot_w } else { PAD_COL };
         let tips_col = left_w + gap;
-        let min_right = 24usize;
+        // Right-column width = the WIDEST tip row (cmd + padding + desc), not a
+        // fixed guess. The tip rows aren't truncated, so two-column mode must
+        // only engage when the widest tip actually fits beside the mascot;
+        // otherwise the tip overruns the edge and the emulator hard-wraps it,
+        // fragmenting the aligned column. A hardcoded underestimate let this
+        // happen on narrow terminals (and the wider mascot made it worse).
+        let min_right = right
+            .iter()
+            .map(|r| r.iter().map(|c| c.width as usize).sum::<usize>())
+            .max()
+            .unwrap_or(0);
         // Two columns only make sense next to the mascot. With colours off the
         // mascot is omitted, so `tips_col` would be tiny (just `PAD_COL`) and the
         // wider cwd/model bullet rows would staircase the tips onto them — stack
@@ -15361,6 +15373,26 @@ mod tests {
     }
 
     #[test]
+    fn welcome_rows_never_exceed_width() {
+        // With the wider (13-cell) mascot, the two-column tips layout must only
+        // engage when the widest tip fits: NO composed row may exceed the
+        // terminal width, or the emulator hard-wraps it and the column
+        // fragments. Check a range of widths (narrow → wide, both stacked and
+        // two-column regimes) with the mascot shown.
+        for w in [50usize, 60, 72, 80, 100, 120] {
+            let (mut r, _c) = new_counting(w as u16, 40);
+            r.caps.colors = true;
+            r.caps.unicode_symbols = true;
+            r.caps.modern_emulator = true;
+            let rows = r.build_welcome_rows("GLM-5.2", "~/some/project/path", &[0, 1, 2, 3]);
+            for (i, row) in rows.iter().enumerate() {
+                let rw: usize = row.iter().map(|c| c.width as usize).sum();
+                assert!(rw <= w, "width {w}: welcome row {i} is {rw} cols (> {w}) — would wrap");
+            }
+        }
+    }
+
+    #[test]
     fn welcome_reflow_keeps_same_tips() {
         let (mut r, _c) = new_counting(100, 30);
         r.caps.colors = true;
@@ -15396,21 +15428,26 @@ mod tests {
     /// "dark bar across the ears" bug.
     #[test]
     fn build_mascot_rows_transparent_top_uses_lower_half_block() {
+        use super::mascot_cell;
+        let orange = crate::render::mascot::mascot_color(b'o');
+        // Branch logic (mascot-independent): a transparent-top + coloured-bottom
+        // pixel MUST render as lower-half `▄` (colour on fg), never `▀` with a
+        // None fg (which paints the top half in the default fg — the dark-bar bug).
+        let c = mascot_cell(None, orange);
+        assert_eq!(c.ch, '\u{2584}', "transparent-top pixel must render as lower-half '▄'");
+        assert!(c.style.fg.is_some(), "'▄' carries the bottom colour on its fg");
+        assert_eq!(mascot_cell(orange, None).ch, '\u{2580}'); // top-only → '▀'
+        assert_eq!(mascot_cell(orange, orange).ch, '\u{2580}'); // both → '▀' + bg
+        assert_eq!(mascot_cell(None, None), Cell::blank()); // both transparent → blank
+
+        // And the actual mascot never emits the buggy `▀`-with-None-fg cell.
         let (r, _c) = new_counting(80, 24);
-        let rows = r.build_mascot_rows();
-        for row in &rows {
-            for c in row {
-                assert!(
-                    !(c.ch == '\u{2580}' && c.style.fg.is_none()),
-                    "'▀' with no fg paints the top half as the terminal default fg"
-                );
-            }
-        }
         assert!(
-            rows.iter()
+            r.build_mascot_rows()
+                .iter()
                 .flatten()
-                .any(|c| c.ch == '\u{2584}' && c.style.fg.is_some()),
-            "transparent-top pixels must render as lower-half '▄'"
+                .all(|c| !(c.ch == '\u{2580}' && c.style.fg.is_none())),
+            "'▀' with no fg paints the top half as the terminal default fg"
         );
     }
 
