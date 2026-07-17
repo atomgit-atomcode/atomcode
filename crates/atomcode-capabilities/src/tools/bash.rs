@@ -1156,6 +1156,17 @@ pub fn strip_bash_comments(cmd: &str) -> String {
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
             out.push(c);
+            // In double quotes (not single), backslash escapes the next char — including `"`, which
+            // therefore does NOT close the string. Emit both verbatim so an escaped quote can't
+            // desync our quote tracking and make later text look "unquoted" (over-stripping a real
+            // command as if it were a comment).
+            if q == '"' && c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+                prev_is_boundary = false;
+                continue;
+            }
             if c == q {
                 quote = None;
             }
@@ -1163,6 +1174,17 @@ pub fn strip_bash_comments(cmd: &str) -> String {
             continue;
         }
         match c {
+            '\\' => {
+                // Unquoted backslash escapes the next char: it becomes a literal word character,
+                // never a metacharacter (`;`, `&`, `|`) or a comment introducer (`#`). Emit both
+                // verbatim and treat the pair as a non-boundary, so `\;#…` / `\#` don't trigger a
+                // spurious comment strip that would delete a following real command.
+                out.push(c);
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+                prev_is_boundary = false;
+            }
             '\'' | '"' => {
                 out.push(c);
                 quote = Some(c);
@@ -2224,6 +2246,29 @@ mod tests {
         // `#` mid-word is not a comment boundary.
         assert_eq!(strip_bash_comments("git commit -m foo#bar"), "git commit -m foo#bar");
         assert_eq!(strip_bash_comments("rm x # note"), "rm x ");
+    }
+
+    #[test]
+    fn backslash_escape_does_not_over_strip_into_a_bypass() {
+        // Regression: comment-stripping must NEVER remove text bash would EXECUTE, or a destructive
+        // command hides from the substring classifier and runs with no approval.
+        //
+        // (1) Escaped `"` inside a double-quoted string keeps the string open in bash, so the `;`
+        //     after the real closing quote still separates a runnable `rm -rf`. The stripper must
+        //     not close the quote at `\"` (which would make the tail look "unquoted" and get eaten).
+        assert!(
+            check_destructive_command(r#""a\"b # x" ; rm -rf /important"#).is_some(),
+            "escaped-quote desync must not let rm -rf escape classification"
+        );
+        assert!(strip_bash_comments(r#""a\"b # x" ; rm -rf /important"#).contains("rm -rf"));
+        // (2) Unquoted `\;` is a literal char in bash, not a separator, so `#` right after it is
+        //     mid-word (not a comment) — the trailing `;rm -rf /` still runs.
+        assert!(
+            check_destructive_command(r"echo \;#;rm -rf /important").is_some(),
+            "escaped-semicolon must not create a spurious comment boundary that eats rm -rf"
+        );
+        // (3) Escaped `\#` is a literal `#`, never a comment — following text is preserved.
+        assert_eq!(strip_bash_comments(r"echo \# rm -rf /important"), r"echo \# rm -rf /important");
     }
 
     #[test]
