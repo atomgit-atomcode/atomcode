@@ -41,27 +41,25 @@ fn age_windows(windows: &[RateLimitWindow], elapsed: Duration) -> Vec<RateLimitW
         .collect()
 }
 
-/// Pure policy: pick the 5-hour rolling window, apply the auto-wait threshold,
-/// and fall back to the kernel hint when no window data is available. Monthly
-/// windows (30d) are retired; the relevant window is the small (<= 5h) one.
+/// Pure policy: pick the exhausted 5-hour rolling window, apply the auto-wait
+/// threshold, and fall back to the kernel hint when no in-range window is actually
+/// over quota (transient 429) or no window data is available. Monthly windows (30d)
+/// are retired; the relevant window is the small (<= 5h) one.
 pub fn decide_from_windows(windows: &[RateLimitWindow], hint: &RateLimitHint) -> RateLimitDecision {
     // The blocking window is the 5h rolling one (<= 18000s; 30d monthly windows are
-    // retired). Prefer the window the server flagged `quota_exhausted` — that's the one
-    // actually causing THIS 429 — and fall back to the smallest in-range window only when
-    // none is flagged. Picking purely by smallest size could wait on a non-exhausted short
-    // window while a larger exhausted one keeps rejecting requests (and show its reset time).
+    // retired). Only a window the server flagged `quota_exhausted` justifies pausing on
+    // its reset countdown; among those, the smallest reopens first. If NO in-range window
+    // is exhausted, this 429 is transient gateway load-shedding (the plan still has quota)
+    // — defer to the hint's short retry-after backoff. We must NOT fall back to a
+    // non-exhausted window's `seconds_until_reset`: a 5h ROLLING window's countdown is
+    // large at almost all times regardless of remaining quota, so pausing on it would
+    // misreport a transient 429 (e.g. usage 2%) as "5-hour window exhausted" for ~5h.
     let w = windows
         .iter()
         .filter(|w| {
             w.window_size_seconds > 0 && w.window_size_seconds <= 18_000 && w.quota_exhausted
         })
-        .min_by_key(|w| w.window_size_seconds)
-        .or_else(|| {
-            windows
-                .iter()
-                .filter(|w| w.window_size_seconds > 0 && w.window_size_seconds <= 18_000)
-                .min_by_key(|w| w.window_size_seconds)
-        });
+        .min_by_key(|w| w.window_size_seconds);
     let Some(w) = w else {
         return RateLimitDecision::from_hint(hint);
     };
@@ -237,13 +235,45 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_smallest_when_none_exhausted() {
-        // No window flagged exhausted → smallest in-range wins (prior behavior).
+    fn no_exhausted_window_defers_to_hint_not_window_reset() {
+        // No window is over quota → the 429 is transient gateway load-shedding, not a
+        // plan-quota exhaustion. Must use the hint's short retry-after backoff, NOT pause
+        // on a healthy window's natural reset countdown (the old fallback that misreported
+        // a transient 429 as "5-hour window exhausted").
         let d = decide_from_windows(
             &[win_sized(18000, 7200, false), win_sized(3600, 90, false)],
-            &hint(),
+            &RateLimitHint { http_status: Some(429), retry_after_secs: Some(15) },
         );
-        assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 90 });
+        assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 15 });
+    }
+
+    #[test]
+    fn transient_429_on_healthy_5h_window_does_not_report_exhausted() {
+        // Reported bug: a 429 storm while the 5h ROLLING window is at 2% usage and resets
+        // in ~3h56m (14160s), quota_exhausted=false. A rolling window's seconds_until_reset
+        // is large at almost all times regardless of remaining quota, so the old "pause on
+        // the smallest in-range window" fallback stopped the turn for ~4h with
+        // "5小时窗口已用尽". With no window actually exhausted the decision must come from
+        // the hint, never from the healthy window's reset time.
+        assert_eq!(
+            decide_from_windows(
+                &[win_sized(18000, 14160, false)],
+                &RateLimitHint { http_status: Some(429), retry_after_secs: Some(20) },
+            ),
+            RateLimitDecision::WaitAndRetry { secs: 20 },
+        );
+        // With no retry hint we may pause, but must NOT surface the healthy window's reset
+        // time/countdown (that's what read as the bogus "5小时窗口已用尽 3h56m").
+        match decide_from_windows(
+            &[win_sized(18000, 14160, false)],
+            &RateLimitHint { http_status: Some(429), retry_after_secs: None },
+        ) {
+            RateLimitDecision::Pause { reset_at_display, secs_until_reset, .. } => {
+                assert!(reset_at_display.is_empty(), "must not show a healthy window's reset time");
+                assert_eq!(secs_until_reset, None);
+            }
+            RateLimitDecision::WaitAndRetry { .. } => {}
+        }
     }
 
     #[test]
