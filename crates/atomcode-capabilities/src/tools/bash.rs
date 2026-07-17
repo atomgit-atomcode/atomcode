@@ -61,6 +61,17 @@ impl Tool for BashTool {
             Err(_) => RiskLevel::Risky,
         }
     }
+    /// "Always allow" scope: the NORMALIZED command (comments stripped, whitespace collapsed),
+    /// keeping the DEFAULT per-command scope. Every bash approval is for a destructive command
+    /// (see `risk`), so a command-family prefix (`rm *`) would over-approve — per-command is
+    /// deliberate. Normalizing means a cosmetic re-emit of the SAME command (changed trailing
+    /// `# comment`, added whitespace) keeps the grant instead of re-prompting every turn.
+    fn always_grant_scope(&self, args: &str) -> String {
+        match serde_json::from_str::<Args>(args) {
+            Ok(a) => normalize_command_for_grant(&a.command),
+            Err(_) => args.to_string(),
+        }
+    }
     /// Read-only bash commands (per [`is_read_only_bash`]) may run concurrently;
     /// everything else serializes behind the write-lock. A parse failure is
     /// conservatively NOT parallel-safe.
@@ -1132,10 +1143,66 @@ fn git_worktree_discard(cmd: &str) -> Option<&'static str> {
 }
 
 /// Classify a shell command as destructive (returns `Some(reason)`) or not (`None`).
+/// Strip bash line comments so a `#…` note can't smuggle a scary substring past the
+/// substring-based classifier below (`sleep 1 # kill the cache` must NOT read as a `kill -9`).
+/// Quote-aware and word-boundary-aware: a `#` only starts a comment when UNQUOTED and at the start
+/// of a word (preceded by whitespace / start-of-input / a shell metachar), matching bash. (Quoted
+/// occurrences like `echo 'kill -9'` are NOT stripped — that would need full AST parsing.)
+pub fn strip_bash_comments(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut quote: Option<char> = None;
+    let mut prev_is_boundary = true; // start-of-input is a word boundary
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            prev_is_boundary = false;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                out.push(c);
+                quote = Some(c);
+                prev_is_boundary = false;
+            }
+            '#' if prev_is_boundary => {
+                // Comment runs to end of line; keep the newline so multi-line commands survive.
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+                prev_is_boundary = true;
+            }
+            _ => {
+                out.push(c);
+                prev_is_boundary = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(');
+            }
+        }
+    }
+    out
+}
+
+/// The "Always allow" grant key for a bash command: comments stripped + whitespace collapsed, so a
+/// cosmetic re-emit of the SAME command (a changed trailing `# comment`, extra spaces) keeps the
+/// grant instead of re-prompting. Stays PER-COMMAND (not a `rm *` family prefix): every bash
+/// approval is for a destructive command, so a family prefix would over-approve.
+pub fn normalize_command_for_grant(command: &str) -> String {
+    strip_bash_comments(command).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Faithful, condensed port of the production `check_destructive_command`: it
 /// normalizes simple quoting, strips wrappers, and recurses into subshells / eval /
 /// compound parts / pipe-to-shell so a destructive command cannot hide one layer down.
 pub fn check_destructive_command(command: &str) -> Option<String> {
+    // Strip comments first — the classifier is substring-based, so a `# rm -rf everything` note
+    // would otherwise read as a destructive command.
+    let command = strip_bash_comments(command);
+    let command = command.as_str();
     let cmd = command.to_lowercase();
 
     fn base(token: &str) -> &str {
@@ -2139,6 +2206,35 @@ mod tests {
         ] {
             assert_eq!(risk_of(c), RiskLevel::Safe, "{c} should be Safe");
         }
+    }
+
+    #[test]
+    fn comment_does_not_trigger_destructive_false_positive() {
+        // A `#…` note must not be read as a command by the substring classifier.
+        assert!(check_destructive_command("sleep 1 # kill -9 fallback").is_none());
+        assert!(
+            check_destructive_command("taskkill //F //IM WinNFSd.exe 2>/dev/null # rm -rf cache").is_none(),
+            "the reported taskkill+comment case must not be flagged destructive"
+        );
+        // Real destructive commands are STILL flagged (strip only removes comments). Use a
+        // non-artifact target — `build/`, `dist/` etc. are intentionally allowed as artifact cleanup.
+        assert!(check_destructive_command("rm -rf my-important-data # cleanup").is_some());
+        // A `#` inside quotes is NOT a comment → the substring is still seen (pre-existing limit).
+        assert!(check_destructive_command("echo 'kill -9'").is_some());
+        // `#` mid-word is not a comment boundary.
+        assert_eq!(strip_bash_comments("git commit -m foo#bar"), "git commit -m foo#bar");
+        assert_eq!(strip_bash_comments("rm x # note"), "rm x ");
+    }
+
+    #[test]
+    fn always_grant_scope_is_stable_across_cosmetic_variation() {
+        let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
+        // Same command, different trailing comment + whitespace → SAME grant key (so "always" sticks).
+        assert_eq!(key("taskkill //F //IM X.exe  # attempt 1"), key("taskkill //F //IM X.exe # attempt 2"));
+        assert_eq!(key("rm  foo.txt   # a"), key("rm foo.txt # b"));
+        assert_eq!(key("rm foo.txt # a"), "rm foo.txt");
+        // A genuinely different command → different key (stays per-command, no family blanket).
+        assert_ne!(key("rm foo.txt"), key("rm bar.txt"));
     }
 
     #[test]

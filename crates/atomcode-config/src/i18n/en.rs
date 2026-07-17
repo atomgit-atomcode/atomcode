@@ -320,6 +320,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAlwaysAllowFolder => {
             "Always allow writes to this folder (this session)".into()
         }
+        Msg::ApprovalAlwaysAllowCommand => "Always allow this command (this session)".into(),
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
         Msg::ApprovalHeader { tool, detail } => {

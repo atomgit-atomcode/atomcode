@@ -8401,6 +8401,10 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
     // Display names (snake→Pascal) of the directory-scoped write tools.
     let always_label = if matches!(tool, "WriteFile" | "EditFile") {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
+    } else if tool == "bash" {
+        // bash's grant is scoped to THIS COMMAND (not the whole tool), so don't imply
+        // "Always allow bash" — say "this command".
+        crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
     };

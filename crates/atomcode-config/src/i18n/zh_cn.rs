@@ -308,6 +308,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowOnce => "允许一次".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalAlwaysAllowFolder => "本会话总是允许写入此目录".into(),
+        Msg::ApprovalAlwaysAllowCommand => "本会话总是允许此命令".into(),
         Msg::ApprovalDeny => "拒绝".into(),
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
         Msg::ApprovalHeader { tool, detail } => {

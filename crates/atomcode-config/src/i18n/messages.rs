@@ -239,6 +239,9 @@ pub enum Msg<'a> {
     /// "Always" for the single-file write tools, whose grant is scoped to the
     /// target's DIRECTORY (not the whole tool) — so the label names the folder.
     ApprovalAlwaysAllowFolder,
+    /// "Always" for `bash`, whose grant is scoped to THIS COMMAND (not the whole
+    /// tool) — so the label says "this command", not "Always allow bash".
+    ApprovalAlwaysAllowCommand,
     ApprovalDeny,
     ApprovalHint,
     /// Header line above the interactive approval options, naming what is being
