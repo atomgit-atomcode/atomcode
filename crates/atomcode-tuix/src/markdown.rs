@@ -425,6 +425,246 @@ fn split_table_row(line: &str) -> Vec<String> {
     cells
 }
 
+/// A GFM delimiter row (`---|:--:|--:`) — cells are made up only of `-`, `:`
+/// and spaces. Shared by every table stage so the "is this the separator?"
+/// rule can't drift between the box, wrapped-grid and flat paths.
+fn is_separator_row(row: &[String]) -> bool {
+    row.iter()
+        .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+}
+
+/// Display width of the longest whitespace-delimited token in `plain`. Used as
+/// a column's shrink floor: a column should not be squeezed narrower than its
+/// widest unbreakable word, or the word gets char-wrapped mid-token. Runs of
+/// CJK (no interior spaces) count as one token — but the caller caps the floor,
+/// and CJK reads fine char-wrapped, so that's fine.
+fn longest_token_width(plain: &str) -> usize {
+    plain
+        .split_whitespace()
+        .map(crate::width::display_width)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Word-aware wrap of plain cell text to `width` display columns: greedily pack
+/// whitespace-delimited tokens per line, and char-wrap (via
+/// [`crate::width::wrap_line_to_width`]) only a single token too wide to fit —
+/// so prose breaks at spaces (`Handles login and` / `session tokens`) instead of
+/// mid-word, while a long identifier or a space-less CJK run still degrades
+/// gracefully. Returns at least one (possibly empty) line.
+fn word_wrap_cell(plain: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![plain.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for token in plain.split_whitespace() {
+        let tw = crate::width::display_width(token);
+        if tw > width {
+            // Token can't fit on any line — char-wrap it. Flush what we have,
+            // emit the full chunks, and keep the trailing partial as the new
+            // current line so following short tokens can pack onto it.
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            let mut chunks = crate::width::wrap_line_to_width(token, width);
+            if let Some(last) = chunks.pop() {
+                lines.extend(chunks);
+                cur_w = crate::width::display_width(&last);
+                cur = last;
+            }
+            continue;
+        }
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + tw > width {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(token);
+            cur_w = tw;
+        } else {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(token);
+            cur_w += sep + tw;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Middle tier between the natural box and the flat key/value fallback: try to
+/// keep the GRID by shrinking wide columns (wrapping their cells to multiple
+/// lines) so a table that's only *somewhat* too wide doesn't collapse straight
+/// to a vertical list. Returns per-column widths that fit `max_width` (borders
+/// + padding included), or `None` when even at each column's floor the row
+/// can't fit — then the caller uses the flat fallback.
+///
+/// `bar_w` is the `│` border width (1 in the default non-CJK-border mode this
+/// tier runs in). Column floors clamp to `[MIN_COL, TOKEN_CAP]` around each
+/// column's longest token so identifiers aren't broken mid-word, while a single
+/// enormous token can't veto the whole grid.
+fn fit_columns_to_grid(
+    parsed: &[Vec<String>],
+    natural: &[usize],
+    ncols: usize,
+    max_width: usize,
+    bar_w: usize,
+) -> Option<Vec<usize>> {
+    const MIN_COL: usize = 4;
+    const TOKEN_CAP: usize = 16;
+    // One row's chrome: leading │, then per column ` cell ` (2 spaces) + a `│`.
+    let chrome = bar_w * (ncols + 1) + 2 * ncols;
+    let content_budget = max_width.checked_sub(chrome)?;
+    if content_budget == 0 {
+        return None;
+    }
+    let mut floors = vec![MIN_COL; ncols];
+    for row in parsed {
+        if is_separator_row(row) {
+            continue;
+        }
+        for (j, cell) in row.iter().enumerate() {
+            if j >= ncols {
+                break;
+            }
+            let tok = longest_token_width(&strip_md_for_width(cell));
+            floors[j] = floors[j].max(tok.min(TOKEN_CAP));
+        }
+    }
+    // Never grow beyond natural — a column narrower than its floor stays put.
+    for (f, n) in floors.iter_mut().zip(natural) {
+        *f = (*f).min(*n);
+    }
+    if floors.iter().sum::<usize>() > content_budget {
+        return None;
+    }
+    // Greedily shave the widest still-shrinkable column until the row fits.
+    let mut w = natural.to_vec();
+    let mut total: usize = w.iter().sum();
+    while total > content_budget {
+        let mut best: Option<usize> = None;
+        for j in 0..ncols {
+            if w[j] > floors[j] && best.map_or(true, |b| w[j] > w[b]) {
+                best = Some(j);
+            }
+        }
+        match best {
+            Some(j) => {
+                w[j] -= 1;
+                total -= 1;
+            }
+            // Unreachable: floor_sum ≤ budget guarantees we can reach it.
+            None => return None,
+        }
+    }
+    Some(w)
+}
+
+/// True when the wrapped grid would be so cramped that a flat key/value record
+/// reads better: any data row wraps taller than `MAX_ROW_LINES`. Mirrors codex's
+/// "starved cell" fallback so a moderately-wide table stays a grid, but a table
+/// with a genuinely huge cell squeezed into a narrow column drops to flat instead
+/// of drawing a 20-line-tall box row.
+fn grid_too_starved(parsed: &[Vec<String>], col_widths: &[usize]) -> bool {
+    const MAX_ROW_LINES: usize = 8;
+    for row in parsed {
+        if is_separator_row(row) {
+            continue;
+        }
+        let height = col_widths
+            .iter()
+            .enumerate()
+            .map(|(j, &w)| {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                word_wrap_cell(&strip_md_for_width(cell), w).len()
+            })
+            .max()
+            .unwrap_or(1);
+        if height > MAX_ROW_LINES {
+            return true;
+        }
+    }
+    false
+}
+
+/// Render the wrapped-grid middle tier: a box table whose cells wrap to their
+/// (shrunk) column widths. Cell content is rendered as PLAIN text (inline
+/// styling dropped) in this degraded mode — wrapping styled SGR spans across a
+/// line boundary would desync the per-line padding and break box alignment.
+/// The gain is that no content is lost and the scannable grid survives.
+///
+/// Runs only in the default border mode (`─`/`│` are 1 cell), so no CJK
+/// dash-rounding is needed here.
+fn render_wrapped_box_table(
+    parsed: &[Vec<String>],
+    col_widths: &[usize],
+    caps: TerminalCaps,
+) -> String {
+    let border_on = if caps.colors { theme::md_border_open() } else { "" };
+    let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
+    let ncols = col_widths.len();
+    let rule = |left: char, mid: char, right: char| -> String {
+        let mut s = String::new();
+        s.push_str(border_on);
+        s.push(left);
+        for (j, w) in col_widths.iter().enumerate() {
+            for _ in 0..(w + 2) {
+                s.push('─');
+            }
+            if j + 1 < ncols {
+                s.push(mid);
+            }
+        }
+        s.push(right);
+        s.push_str(border_off);
+        s
+    };
+    let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_separator_row(r)).collect();
+
+    let mut out = String::new();
+    out.push_str(&rule('┌', '┬', '┐'));
+    out.push('\n');
+    for (i, row) in data_rows.iter().enumerate() {
+        // Wrap every cell to its column width; row height = tallest cell.
+        let wrapped: Vec<Vec<String>> = (0..ncols)
+            .map(|j| {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                word_wrap_cell(&strip_md_for_width(cell), col_widths[j])
+            })
+            .collect();
+        let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+        for line_idx in 0..height {
+            out.push_str(border_on);
+            out.push('│');
+            out.push_str(border_off);
+            for (j, w) in col_widths.iter().enumerate() {
+                let cell_line = wrapped[j].get(line_idx).map(|s| s.as_str()).unwrap_or("");
+                let lw = crate::width::display_width(cell_line);
+                out.push(' ');
+                out.push_str(cell_line);
+                for _ in 0..w.saturating_sub(lw) {
+                    out.push(' ');
+                }
+                out.push(' ');
+                out.push_str(border_on);
+                out.push('│');
+                out.push_str(border_off);
+            }
+            out.push('\n');
+        }
+        if i + 1 < data_rows.len() {
+            out.push_str(&rule('├', '┼', '┤'));
+            out.push('\n');
+        }
+    }
+    out.push_str(&rule('└', '┴', '┘'));
+    out
+}
+
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
 /// natural column widths, fall back to a flat key/value record format
 /// (`header: cell` per line, blank line between rows) so no information is
@@ -439,10 +679,7 @@ pub fn flush_aligned_table_with_width(
     let parsed: Vec<Vec<String>> = rows.iter().map(|r| split_table_row(r)).collect();
 
     // Identify separator row(s) — cells match `[-: ]+` only.
-    let is_sep = |row: &[String]| -> bool {
-        row.iter()
-            .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
-    };
+    let is_sep = is_separator_row;
 
     // A real GFM table REQUIRES a delimiter row (`---|---`). Since detection now
     // speculatively buffers any pipe-splitting line, a lone prose line with a
@@ -519,6 +756,24 @@ pub fn flush_aligned_table_with_width(
     let natural_row_width: usize =
         bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
     if max_width > 0 && natural_row_width > max_width {
+        // Middle tier (codex-style graceful degradation): before collapsing to a
+        // flat vertical list, try to keep the GRID by shrinking wide columns and
+        // wrapping their cells. Skipped when the border glyphs occupy >1 cell
+        // (`ATOMCODE_CJK_WIDTH=1`) — multi-line box alignment with wide dashes is
+        // hairier, so those go straight to the safe flat path.
+        let cjk_border = dash_w > 1 || bar_w > 1;
+        if !cjk_border {
+            if let Some(shrunk) =
+                fit_columns_to_grid(&parsed, &col_widths, ncols, max_width, bar_w)
+            {
+                // Starvation guard (codex-style): if keeping the grid squeezes a
+                // column so hard that a cell wraps into a tall stack, a flat
+                // one-field-per-line record is more scannable — don't force a box.
+                if !grid_too_starved(&parsed, &shrunk) {
+                    return render_wrapped_box_table(&parsed, &shrunk, caps);
+                }
+            }
+        }
         return render_flat_table(&parsed, caps);
     }
 
@@ -615,12 +870,8 @@ pub fn flush_aligned_table_with_width(
 /// of long lines is left to the caller's downstream wrap stage so the
 /// terminal width budget is honoured without losing any cell content.
 fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
-    let is_sep = |row: &[String]| -> bool {
-        row.iter()
-            .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
-    };
-    let has_sep = parsed.iter().any(|r| is_sep(r));
-    let mut data_iter = parsed.iter().filter(|r| !is_sep(r));
+    let has_sep = parsed.iter().any(|r| is_separator_row(r));
+    let mut data_iter = parsed.iter().filter(|r| !is_separator_row(r));
 
     // First non-sep row is treated as headers when a separator exists.
     // Without a separator the source isn't a real markdown table (it's
@@ -635,6 +886,14 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
     };
 
     let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    // Right-pad every label to the widest header so the `：value` parts line up
+    // into a scannable column (codex-style key/value record), instead of ragged
+    // `Session：…` / `Detected：…`.
+    let label_w = headers
+        .iter()
+        .map(|h| crate::width::display_width(&strip_md_for_width(h)))
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     let mut first = true;
     for row in data_iter {
@@ -647,7 +906,11 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
             let cell_rendered = render_inline(cell, caps);
             if let Some(header) = headers.get(j) {
                 let h_rendered = render_inline(header, caps);
+                let hw = crate::width::display_width(&strip_md_for_width(header));
                 out.push_str(&h_rendered);
+                for _ in 0..label_w.saturating_sub(hw) {
+                    out.push(' ');
+                }
                 out.push('：');
                 out.push_str(&cell_rendered);
             } else {
@@ -1626,6 +1889,130 @@ mod tests {
         assert!(
             out.contains("\n\n"),
             "expected blank line between flat records"
+        );
+    }
+
+    #[test]
+    fn word_wrap_cell_breaks_at_spaces_and_char_wraps_long_tokens() {
+        // Prose breaks at word boundaries, never over the width.
+        let lines = word_wrap_cell("Handles login and session tokens", 20);
+        assert!(
+            lines.iter().all(|l| crate::width::display_width(l) <= 20),
+            "no line over width: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.starts_with(' ') && !l.ends_with(' ')),
+            "clean word breaks, no dangling spaces: {lines:?}"
+        );
+        assert_eq!(lines.join(" "), "Handles login and session tokens");
+
+        // A single token wider than the column still degrades (char-wrapped),
+        // never overflowing the box.
+        let long = word_wrap_cell("parallel_edit_files", 8);
+        assert!(long.len() >= 2, "oversized token must char-wrap: {long:?}");
+        assert!(long.iter().all(|l| crate::width::display_width(l) <= 8));
+        assert_eq!(long.concat(), "parallel_edit_files");
+
+        // Empty content yields exactly one (empty) line so row height stays ≥ 1.
+        assert_eq!(word_wrap_cell("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn moderately_wide_table_wraps_into_grid_not_flat() {
+        // A table that's only *somewhat* too wide should keep its GRID (codex-style
+        // middle tier): shrink the fat column + wrap its cell, rather than collapsing
+        // to a flat vertical list.
+        let rows = vec![
+            "| Feature | Description | S |".to_string(),
+            "|---|---|---|".to_string(),
+            "| Auth | Handles login and session tokens | Y |".to_string(),
+        ];
+        // Natural row width ~50; give a 40-col budget so it overflows but can still
+        // fit as a grid once the Description column is shrunk + wrapped.
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
+
+        // Grid survives — box corners present, NOT the flat fallback.
+        assert!(out.contains('┌'), "grid must be kept, not flattened:\n{out}");
+        // No content lost to the wrap.
+        assert!(out.contains("Handles"), "start of wrapped cell present:\n{out}");
+        assert!(out.contains("tokens"), "end of wrapped cell present:\n{out}");
+        // Every rendered line fits the budget.
+        for line in out.lines() {
+            assert!(
+                crate::width::display_width(line) <= 40,
+                "line exceeds budget ({}> 40): {line:?}",
+                crate::width::display_width(line)
+            );
+        }
+        // Wrapping actually happened: more physical lines than a single-row box
+        // (top + ≥2 wrapped body lines + bottom).
+        assert!(
+            out.lines().count() >= 4,
+            "expected the description cell to wrap across lines:\n{out}"
+        );
+    }
+
+    #[test]
+    fn huge_cell_squeezed_thin_falls_back_to_flat_not_a_tall_box() {
+        // The column floors let this fit as a grid, but the long prose cell would
+        // wrap into a very tall stack in the thin column — the starvation guard
+        // should prefer the flat key/value record instead of a 10+-line box row.
+        let prose = "this is a fairly long note that keeps going and going with many \
+                     small words on purpose to force the cell to wrap into a very tall \
+                     stack of quite a lot of lines indeed well beyond what a single box \
+                     row should ever hold in a scannable table";
+        let rows = vec![
+            "| Note | Detail |".to_string(),
+            "|---|---|".to_string(),
+            format!("| A | {prose} |"),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 30);
+        assert!(
+            !out.contains('│'),
+            "a cell squeezed into a tall stack must drop to flat:\n{out}"
+        );
+        assert!(out.contains("tall stack"), "content preserved:\n{out}");
+    }
+
+    #[test]
+    fn wrapped_grid_falls_back_to_flat_when_far_too_narrow() {
+        // When even each column's token floor can't fit, the grid is abandoned for
+        // the flat key/value fallback (no box characters survive).
+        let rows = vec![
+            "| Feature | Description | Status |".to_string(),
+            "|---|---|---|".to_string(),
+            "| Authentication | Handles login and session tokens | Complete |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 16);
+        assert!(!out.contains('│'), "far-too-narrow must collapse to flat:\n{out}");
+        assert!(out.contains("Handles"), "content preserved in flat mode:\n{out}");
+    }
+
+    #[test]
+    fn flat_mode_aligns_labels_into_a_column() {
+        // The flat key/value fallback right-pads labels so the fullwidth colons
+        // line up (codex-style record), instead of ragged `Session：`/`Detected：`.
+        let rows = vec![
+            "| Session | Detected |".to_string(),
+            "|---|---|".to_string(),
+            "| gallery build from this long thread | 7 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 20);
+        assert!(!out.contains('│'), "should be flat at 20 cols:\n{out}");
+        // The shorter label "Session" is padded to the width of "Detected" so its
+        // colon sits at the same column.
+        let colon_cols: Vec<usize> = out
+            .lines()
+            .filter(|l| l.contains('：'))
+            .map(|l| {
+                let idx = l.find('：').unwrap();
+                crate::width::display_width(&l[..idx])
+            })
+            .collect();
+        assert!(colon_cols.len() >= 2, "expected ≥2 labelled lines:\n{out}");
+        assert!(
+            colon_cols.iter().all(|&c| c == colon_cols[0]),
+            "all colons must align to the same column, got {colon_cols:?}:\n{out}"
         );
     }
 
