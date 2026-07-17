@@ -156,6 +156,52 @@ impl ApprovalMiddleware {
     }
 }
 
+/// The fail-closed `Deny` for a DEGRADED approval round-trip — a `Null` response, which
+/// the kernel emits when the driver's oneshot sender was dropped, the bounded round-trip
+/// timed out, or the turn was cancelled (see `RequestCtx::request` / `cancel_pending`). A
+/// genuine user "deny" arrives as `{"decision":"deny"}` (non-null); this is NOT that. We
+/// fail closed either way, but surface the difference — on stderr AND in the deny reason
+/// the model/UI sees — so an internal channel failure can be told apart from a real user
+/// denial (issue #173). SHARED by every gate that round-trips the driver so the contract +
+/// wording can never drift between copies.
+pub fn approval_channel_failure_deny(tool_name: &str) -> BeforeOutcome {
+    eprintln!(
+        "[approval] no decision received for tool '{tool_name}' (driver disconnected, \
+         timed out, or cancelled); denying due to internal channel failure, not a user decision"
+    );
+    BeforeOutcome::deny(format!(
+        "approval unresolved for '{tool_name}': no decision received (driver disconnected, \
+         timed out, or cancelled) — internal channel failure, not a user denial"
+    ))
+}
+
+/// Round-trip the driver for an approval decision on `call` under request `kind`, built
+/// from the exported typed [`ApprovalRequest`] contract so the wire shape can never drift.
+/// Returns the parsed [`PermissionDecision`], or `Err(BeforeOutcome::Deny)` when the
+/// round-trip DEGRADED to `Null` (fail closed via [`approval_channel_failure_deny`]). The
+/// decision→outcome MAPPING stays with each caller (they diverge: the generic gate
+/// remembers `AllowAlways` in its store and maps allow→`Proceed`, while a hook-forced ask
+/// maps allow→`Allow` to short-circuit downstream gates), so only the shared round-trip +
+/// degraded-path handling is factored here.
+pub async fn request_approval_decision(
+    rt: &RequestCtx,
+    kind: &str,
+    call: &ToolCall,
+    tool_name: &str,
+) -> Result<PermissionDecision, BeforeOutcome> {
+    let payload = serde_json::to_value(ApprovalRequest {
+        call_id: call.id.clone(),
+        tool: tool_name.to_string(),
+        args: call.arguments.clone(),
+    })
+    .unwrap_or(serde_json::Value::Null);
+    let response = rt.request(kind, payload).await;
+    if response.is_null() {
+        return Err(approval_channel_failure_deny(tool_name));
+    }
+    Ok(PermissionDecision::from_value(&response))
+}
+
 #[async_trait]
 impl ToolMiddleware for ApprovalMiddleware {
     async fn before(
@@ -173,43 +219,14 @@ impl ToolMiddleware for ApprovalMiddleware {
         if self.store.is_granted(&key) {
             return BeforeOutcome::Proceed;
         }
-        // Round-trip the driver for a decision (the oneshot lives in the kernel's
-        // RequestCtx, never in an event → events stay serializable). Built from the
-        // exported typed contract so the wire shape can never drift from it.
-        let payload = serde_json::to_value(ApprovalRequest {
-            call_id: call.id.clone(),
-            tool: tool.name().to_string(),
-            args: call.arguments.clone(),
-        })
-        .unwrap_or(serde_json::Value::Null);
-        let response = rt.request(&self.kind, payload).await;
-        // A `Null` response is the kernel's DEGRADED signal, not a user decision: the
-        // driver's oneshot sender was dropped, the bounded round-trip timed out, or the
-        // turn was cancelled (see `RequestCtx::request` / `cancel_pending`). A genuine
-        // user "deny" arrives as `{"decision":"deny"}` (non-null). We still fail closed,
-        // but surface the difference — on stderr AND in the deny reason the model/UI
-        // sees — so an internal channel failure can be told apart from a real user
-        // denial. (Issue #173: this path used to collapse both into a silent Deny.)
-        if response.is_null() {
-            eprintln!(
-                "[approval] no decision received for tool '{}' (driver disconnected, \
-                 timed out, or cancelled); denying due to internal channel failure, \
-                 not a user decision",
-                tool.name()
-            );
-            return BeforeOutcome::deny(format!(
-                "approval unresolved for '{}': no decision received (driver disconnected, \
-                 timed out, or cancelled) — internal channel failure, not a user denial",
-                tool.name()
-            ));
-        }
-        match PermissionDecision::from_value(&response) {
-            PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
-            PermissionDecision::AllowAlways => {
+        match request_approval_decision(rt, &self.kind, call, tool.name()).await {
+            Err(degraded) => degraded, // Null → fail closed (channel failure, not a user deny).
+            Ok(PermissionDecision::AllowOnce) => BeforeOutcome::Proceed,
+            Ok(PermissionDecision::AllowAlways) => {
                 self.store.grant(&key);
                 BeforeOutcome::Proceed
             }
-            PermissionDecision::Deny => {
+            Ok(PermissionDecision::Deny) => {
                 // Deny reason goes back to the model as the tool result; it made the call, so
                 // don't echo its full arguments back (token waste + the arg preview already
                 // renders in the tool header). Name the tool and the policy — that's the signal.

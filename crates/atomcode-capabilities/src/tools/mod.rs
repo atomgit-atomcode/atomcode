@@ -63,8 +63,8 @@ mod memory;
 pub use memory::MemoryTool;
 
 pub use approval::{
-    ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
-    PermissionDecision, PermissionStore, APPROVAL_KIND,
+    request_approval_decision, ApprovalMiddleware, ApprovalRequest, ApprovalResponse,
+    InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;

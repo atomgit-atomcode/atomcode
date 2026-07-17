@@ -2401,7 +2401,9 @@ impl RunningAgent {
                                 // round-trip ITSELF and returns Allow/Deny (as the CC
                                 // external-hooks `permissionDecision:"ask"` producer
                                 // does). A bare `Ask` reaching here therefore falls
-                                // through to the normal approval flow.
+                                // through to the normal approval flow — i.e. to a
+                                // downstream approval middleware if one is wired; with
+                                // none, it simply proceeds.
                                 BeforeOutcome::Ask { .. } => {}
                                 // `allow` force-approves: stop the remaining `before`
                                 // gates and execute (CC `permissionDecision: "allow"`

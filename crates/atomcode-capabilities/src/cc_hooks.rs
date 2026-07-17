@@ -41,7 +41,7 @@ use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall, ToolResult};
 
-use crate::tools::{ApprovalRequest, PermissionDecision, APPROVAL_KIND};
+use crate::tools::{request_approval_decision, PermissionDecision, APPROVAL_KIND};
 
 // ───────────────────────────── event + config ─────────────────────────────
 
@@ -608,25 +608,12 @@ impl CCExternalHooks {
     /// A hook-forced ask is NOT remembered (no grant store here): "always" behaves like
     /// "allow once", so the ask keeps prompting — the intended semantics of a forced ask.
     async fn resolve_ask(&self, call: &ToolCall, rt: &RequestCtx) -> BeforeOutcome {
-        let payload = serde_json::to_value(ApprovalRequest {
-            call_id: call.id.clone(),
-            tool: call.name.clone(),
-            args: call.arguments.clone(),
-        })
-        .unwrap_or(Value::Null);
-        let response = rt.request(APPROVAL_KIND, payload).await;
-        if response.is_null() {
-            return BeforeOutcome::deny(format!(
-                "approval unresolved for '{}': no decision received (driver disconnected, \
-                 timed out, or cancelled) — internal channel failure, not a user denial",
-                call.name
-            ));
-        }
-        match PermissionDecision::from_value(&response) {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
+        match request_approval_decision(rt, APPROVAL_KIND, call, &call.name).await {
+            Err(degraded) => degraded, // Null → fail closed (shared channel-failure deny).
+            Ok(PermissionDecision::AllowOnce | PermissionDecision::AllowAlways) => {
                 BeforeOutcome::Allow { reason: Some("approved (hook ask)".into()) }
             }
-            PermissionDecision::Deny => {
+            Ok(PermissionDecision::Deny) => {
                 BeforeOutcome::deny(format!("denied by approval prompt (hook ask): {}", call.name))
             }
         }
