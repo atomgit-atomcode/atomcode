@@ -1671,7 +1671,7 @@ fn execute_slash_command_impl(
         "cost" => {
             // Local session token cost (any model, incl. self-integrated) — as
             // opposed to `/usage`, which queries the CodingPlan gateway only.
-            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
+            renderer.render(UiLine::CommandOutput(build_cost_text(&ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens)));
             renderer.flush();
         }
         "context" => {
@@ -4341,7 +4341,7 @@ pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
     }
 }
 
-/// `/usage` (and its hidden alias `/cost`) — open the CodingPlan usage modal.
+/// `/usage` — open the CodingPlan usage modal.
 ///
 /// Mirrors the `"model" =>` arm pattern: render a notice and return when the
 /// precondition isn't met, otherwise push the modal into `active_modal`.
@@ -4385,29 +4385,20 @@ fn open_usage(
     })));
 }
 
-/// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
-/// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
 /// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
 /// 与手机远程执行共用。
-pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
-    let total = state.prompt_tokens + state.completion_tokens;
-    let cache_rate = if state.prompt_tokens > 0 {
-        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
-    } else {
-        0
-    };
-    let cost = crate::pricing::calculate_cost(
-        &ctx.model_name,
-        state.prompt_tokens,
-        state.completion_tokens,
-        state.cached_tokens,
-    );
+pub(crate) fn build_cost_text(model: &str, prompt: usize, completion: usize, cached: usize) -> String {
+    // Reuse the tested cache-% helper (clamps a degenerate cached>prompt to 100%).
+    let (_billable, cache_pct) = crate::state::turn_token_summary(prompt, completion, cached);
+    let cache_rate = cache_pct.unwrap_or(0) as usize;
+    let total = prompt + completion;
+    let cost = crate::pricing::calculate_cost(model, prompt, completion, cached);
     let cost_str = crate::pricing::format_cost(cost);
     t(Msg::CostReport {
-        prompt: state.prompt_tokens,
-        completion: state.completion_tokens,
-        cached: state.cached_tokens,
+        prompt,
+        completion,
+        cached,
         cache_rate,
         total,
         cost: &cost_str,
@@ -4415,10 +4406,12 @@ pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     .into_owned()
 }
 
+/// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
+/// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
 pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
     match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
         "status" => Some(build_status_text(ctx, None)),
-        "cost" => Some(build_cost_text(ctx, state)),
+        "cost" => Some(build_cost_text(&ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
@@ -6778,5 +6771,17 @@ mod todo_command_tests {
     fn init_submits_the_coding_init_prompt() {
         // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
         assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn build_cost_text_reports_tokens_cost_and_nonzero_for_self_integrated() {
+        use crate::event_loop::commands::build_cost_text;
+        // Distinct values so substring asserts don't cross-match.
+        let out = build_cost_text("my-self-hosted-llm-v9", 1234, 567, 89);
+        assert!(out.contains("1234"), "prompt tokens shown");
+        assert!(out.contains("567"), "completion tokens shown");
+        assert!(out.contains("89"), "cached tokens shown");
+        assert!(out.contains('$'), "a cost figure is rendered");
+        assert!(!out.contains("$0.0000"), "self-integrated/unknown model must not price to $0");
     }
 }

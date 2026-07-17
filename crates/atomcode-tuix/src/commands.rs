@@ -12,8 +12,8 @@ pub struct Command {
     pub needs_args: bool,
     /// Hidden commands are still dispatchable but are excluded from the `/`
     /// slash-menu, Tab completion, and `/help` output. Use this for deprecated
-    /// aliases (e.g. `/cost` → `/usage`) that must keep working for muscle
-    /// memory / scripting without cluttering the discovery surfaces.
+    /// aliases that must keep working for muscle memory / scripting without
+    /// cluttering the discovery surfaces.
     pub hidden: bool,
 }
 
