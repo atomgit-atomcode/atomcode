@@ -4,10 +4,6 @@ import { blocksFromLegacyMessage } from '../state/blocks';
 /** Re-exported so existing imports keep working. */
 export type { SearchMatch, SearchMatchRange };
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
  * Collect a single, linear searchable string for a message.
  * For user messages we use the raw text. For assistant messages we
@@ -55,12 +51,6 @@ export function findMatches(text: string, query: string): SearchMatchRange[] {
     if (ranges.length > 500) break; // hard cap to protect rendering perf
   }
   return ranges;
-}
-
-/** True when the message body contains at least one match. */
-export function messageMatches(message: ChatMessage, query: string): boolean {
-  if (!query.trim()) return false;
-  return findMatches(getMessageSearchableText(message), query).length > 0;
 }
 
 /**
@@ -124,6 +114,28 @@ export function highlightPlainText(text: string, query: string): string {
 
 const TEXT_NODE_TAG_PATTERN = /^<(?:p|li|td|th|h[1-6]|blockquote|strong|em|code|pre|span|div|a|ul|ol|table|thead|tbody|tr|article|section|dd|dt|dl)(\s|>|\/)/i;
 
+interface QueryVariant {
+  /** The string to match against the HTML. */
+  text: string;
+  /** Whether this is already entity-encoded (skip re-escaping inside mark). */
+  alreadyEscaped: boolean;
+}
+
+/**
+ * Build match variants for the query: the raw form and the entity-encoded
+ * form. `buildSearchMatches` runs against raw text, but rendered HTML has
+ * `&` → `&amp;` etc., so we also need to match the encoded version.
+ */
+function buildQueryVariants(query: string): QueryVariant[] {
+  const trimmed = query.trim();
+  const escaped = escapeHtml(trimmed);
+  if (escaped === trimmed) return [{ text: trimmed, alreadyEscaped: false }];
+  return [
+    { text: trimmed, alreadyEscaped: false },
+    { text: escaped, alreadyEscaped: true },
+  ];
+}
+
 /**
  * Inject <mark class="search-highlight"> into already-rendered HTML.
  *
@@ -135,8 +147,9 @@ export function highlightHtml(html: string, query: string): string {
   const trimmed = query.trim();
   if (!trimmed) return html;
 
-  const lowerQuery = trimmed.toLowerCase();
-  const queryLen = trimmed.length;
+  const variants = buildQueryVariants(trimmed);
+  // Sort by length descending so the longest (escaped) variant is tried first.
+  variants.sort((a, b) => b.text.length - a.text.length);
 
   let result = '';
   let i = 0;
@@ -197,13 +210,20 @@ export function highlightHtml(html: string, query: string): string {
       continue;
     }
 
-    // Try to match the query at the current position (case-insensitive).
-    const slice = html.slice(i, i + Math.max(queryLen, 1));
-    if (slice.length >= queryLen && slice.toLowerCase() === lowerQuery) {
-      result += `<mark class="search-highlight">${escapeHtml(slice)}</mark>`;
-      i += queryLen;
-      continue;
+    // Try to match each query variant at the current position (longest first).
+    let matched = false;
+    for (const variant of variants) {
+      const slice = html.slice(i, i + variant.text.length);
+      if (slice.length >= variant.text.length && slice.toLowerCase() === variant.text.toLowerCase()) {
+        result += variant.alreadyEscaped
+          ? `<mark class="search-highlight">${slice}</mark>`
+          : `<mark class="search-highlight">${escapeHtml(slice)}</mark>`;
+        i += variant.text.length;
+        matched = true;
+        break;
+      }
     }
+    if (matched) continue;
 
     result += ch;
     i += 1;

@@ -15,7 +15,7 @@ interface AssistantMessageProps {
   isCurrentMatch?: boolean;
 }
 
-function ArtifactBlock({ artifact, searchQuery }: { artifact: ArtifactData; searchQuery?: string }) {
+function ArtifactBlock({ artifact }: { artifact: ArtifactData }) {
   const t = useT();
   const label = artifact.title || artifact.language || artifact.artifactType || t('assistant.artifact');
   const isStreaming = artifact.status === 'streaming';
@@ -73,7 +73,7 @@ function AssistantBlock({ block, streaming, searchQuery }: { block: MessageBlock
           : null;
       }
       return shouldRenderArtifactChrome(block.artifact)
-        ? <ArtifactBlock artifact={block.artifact} searchQuery={searchQuery} />
+        ? <ArtifactBlock artifact={block.artifact} />
         : <ArtifactCodeView artifact={block.artifact} />;
     case 'permission':
       return block.request.status === 'pending' || block.request.status === 'submitting'

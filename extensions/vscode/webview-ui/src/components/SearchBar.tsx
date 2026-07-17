@@ -21,18 +21,13 @@ export function SearchBar() {
   const goNext = () => dispatch({ type: 'SEARCH_NEXT' });
 
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 6,
-      padding: '6px 10px',
-      borderBottom: '0.5px solid var(--app-input-border)',
-      background: 'var(--app-primary-background)',
-      flexShrink: 0,
-    }}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--app-secondary-foreground)" strokeWidth="2" style={{ flexShrink: 0 }}>
+    <div className="search-bar">
+      <svg className="search-bar-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--app-secondary-foreground)" strokeWidth="2">
         <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
       </svg>
       <input
         ref={inputRef}
+        className="search-bar-input"
         value={state.searchQuery}
         onChange={(e) => dispatch({ type: 'SET_SEARCH_QUERY', query: e.target.value })}
         onKeyDown={(e) => {
@@ -49,14 +44,9 @@ export function SearchBar() {
           }
         }}
         placeholder={t('search.placeholder')}
-        style={{
-          flex: 1, background: 'transparent', border: 'none', outline: 'none',
-          color: 'var(--app-primary-foreground)', fontSize: 12, fontFamily: 'inherit',
-          minWidth: 0,
-        }}
       />
       {state.searchQuery.trim() && (
-        <span style={{ fontSize: 11, color: 'var(--app-secondary-foreground)', flexShrink: 0, whiteSpace: 'nowrap' }}>
+        <span className="search-bar-count">
           {hasMatches
             ? t('search.position', { current, total })
             : t('search.noResults')}
@@ -85,13 +75,10 @@ export function SearchBar() {
         </svg>
       </button>
       <button
+        className="search-bar-close"
         onClick={() => dispatch({ type: 'TOGGLE_SEARCH' })}
         aria-label={t('search.close')}
         title={t('search.close')}
-        style={{
-          background: 'transparent', border: 'none', cursor: 'pointer',
-          color: 'var(--app-secondary-foreground)', fontSize: 14, padding: 0, lineHeight: 1, flexShrink: 0,
-        }}
       >
         ×
       </button>

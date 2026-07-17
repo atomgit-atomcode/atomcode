@@ -242,7 +242,6 @@ export type ChatAction =
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'SEARCH_NEXT' }
   | { type: 'SEARCH_PREV' }
-  | { type: 'SEARCH_SET_INDEX'; index: number }
   | { type: 'RESUME_STREAMING' }
   | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean; locale?: string; approvalMode?: ApprovalMode; approvalModePending?: boolean };
 

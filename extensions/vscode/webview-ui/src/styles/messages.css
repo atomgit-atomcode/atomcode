@@ -365,7 +365,7 @@
   position: relative;
 }
 
-.timeline-message.highlighted::before {
+.timeline-message.highlighted {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-brand), transparent 70%);
 }
 

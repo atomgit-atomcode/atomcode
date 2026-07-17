@@ -3,7 +3,6 @@ import assert from 'node:assert';
 import {
   findMatches,
   getMessageSearchableText,
-  messageMatches,
   buildSearchMatches,
   highlightPlainText,
   highlightHtml,
@@ -12,18 +11,6 @@ import type { ChatMessage } from '../src/state/types';
 
 function userMessage(id: string, text: string): ChatMessage {
   return { id, role: 'user', text, timestamp: 0 };
-}
-
-function assistantMessage(id: string, text: string): ChatMessage {
-  return {
-    id,
-    role: 'assistant',
-    text,
-    blocks: [{ id: `${id}-text-0`, type: 'text', content: text }],
-    toolCalls: [],
-    streaming: false,
-    timestamp: 0,
-  };
 }
 
 test('findMatches returns empty for empty query', () => {
@@ -68,11 +55,6 @@ test('getMessageSearchableText aggregates assistant blocks', () => {
   assert.ok(text.includes('intro'));
   assert.ok(text.includes('file.txt'));
   assert.ok(text.includes('done'));
-});
-
-test('messageMatches is true when query present', () => {
-  assert.equal(messageMatches(userMessage('u1', 'find the bug'), 'bug'), true);
-  assert.equal(messageMatches(userMessage('u1', 'nothing here'), 'bug'), false);
 });
 
 test('buildSearchMatches groups matches by message id', () => {
@@ -125,4 +107,16 @@ test('highlightHtml does not highlight inside code blocks', () => {
 test('highlightHtml returns unchanged when no query', () => {
   const input = '<p>hello</p>';
   assert.equal(highlightHtml(input, ''), input);
+});
+
+test('highlightHtml matches entity-encoded query in HTML text', () => {
+  // The raw text is "a & b" but marked renders it as "a &amp; b".
+  // Searching for "a & b" should still match.
+  const html = highlightHtml('<p>a &amp; b</p>', 'a & b');
+  assert.ok(html.includes('<mark class="search-highlight">a &amp; b</mark>'));
+});
+
+test('highlightHtml matches entity-encoded query with angle brackets', () => {
+  const html = highlightHtml('<p>use &lt;div&gt; here</p>', '<div>');
+  assert.ok(html.includes('<mark class="search-highlight">&lt;div&gt;</mark>'));
 });

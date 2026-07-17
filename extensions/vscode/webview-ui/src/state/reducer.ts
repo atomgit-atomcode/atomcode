@@ -395,7 +395,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
   // Keep search matches in sync when messages change and a query is active.
   if (next.messages !== state.messages && next.searchQuery.trim()) {
     const recomputed = recomputeSearch(next.messages, next.searchQuery, next.search);
-    if (recomputed !== next.search) {
+    // Skip if matches haven't meaningfully changed (avoids unnecessary re-renders).
+    const sameMatches =
+      recomputed.matches.length === next.search.matches.length &&
+      recomputed.matches.every((m, idx) =>
+        m.messageId === next.search.matches[idx]?.messageId &&
+        m.ranges.length === next.search.matches[idx]?.ranges.length);
+    if (!sameMatches || recomputed.currentMatchIndex !== next.search.currentMatchIndex) {
       return { ...next, search: recomputed };
     }
   }
@@ -982,13 +988,6 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       if (matches.length === 0) return state;
       const prev = currentMatchIndex <= 0 ? matches.length - 1 : currentMatchIndex - 1;
       return { ...state, search: { matches, currentMatchIndex: prev } };
-    }
-
-    case 'SEARCH_SET_INDEX': {
-      const { matches } = state.search;
-      if (matches.length === 0) return state;
-      const idx = Math.max(0, Math.min(action.index, matches.length - 1));
-      return { ...state, search: { matches, currentMatchIndex: idx } };
     }
 
     case 'PERMISSION_REQUEST': {

@@ -4,6 +4,7 @@ import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { SearchBar } from './SearchBar';
 import { useT } from '../i18n';
+import { highlightPlainText } from '../utils/search';
 
 export function MessageList() {
   const { state } = useChatContext();
@@ -89,7 +90,11 @@ export function MessageList() {
           if (msg.role === 'error') {
             return (
               <div key={msg.id} className={`timeline-message dot-error${highlightClass}`}>
-                <div className="error-message-content">{msg.text}</div>
+                <div className="error-message-content">
+                  {hasSearch
+                    ? <span dangerouslySetInnerHTML={{ __html: highlightPlainText(msg.text ?? '', query) }} />
+                    : msg.text}
+                </div>
               </div>
             );
           }

@@ -27,18 +27,23 @@ export function UserMessage({ message, className = '', searchQuery, isCurrentMat
     }
   }, [isCurrentMatch, shouldCollapse]);
 
-  // Scroll the active match into view.
+  // Scroll the active match into view. Deferred to the next frame so the
+  // expand state has flushed to the DOM (overflow: hidden can otherwise
+  // prevent the keyword from being scrolled into the visible area).
   useEffect(() => {
     if (!isCurrentMatch) return;
-    const el = textRef.current;
-    if (!el) return;
-    const mark = el.querySelector('mark.search-highlight');
-    if (mark) {
-      mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    } else {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }, [isCurrentMatch, searchQuery]);
+    const raf = requestAnimationFrame(() => {
+      const el = textRef.current;
+      if (!el) return;
+      const mark = el.querySelector('mark.search-highlight');
+      if (mark) {
+        mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [isCurrentMatch, searchQuery, expanded]);
 
   const textHtml = useMemo(
     () => (searchQuery && searchQuery.trim() ? highlightPlainText(message.text, searchQuery) : undefined),
