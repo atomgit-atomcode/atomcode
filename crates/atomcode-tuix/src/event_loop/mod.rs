@@ -4148,12 +4148,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             .filter(|s| !s.trusted)
             .collect();
         if !untrusted.is_empty() {
-            let names: Vec<String> = untrusted.iter().map(|s| s.plugin.clone()).collect();
-            renderer.render(UiLine::Warning(format!(
-                "{} plugin(s) ship untrusted hooks ({}) — they won't run. Trust: atomcode plugin trust <name>",
-                untrusted.len(),
-                names.join(", ")
-            )));
+            let names = untrusted.iter().map(|s| s.plugin.clone()).collect::<Vec<_>>().join(", ");
+            renderer.render(UiLine::Warning(
+                crate::i18n::t(crate::i18n::Msg::PluginHooksUntrusted {
+                    count: untrusted.len(),
+                    names: &names,
+                })
+                .into_owned(),
+            ));
         }
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):

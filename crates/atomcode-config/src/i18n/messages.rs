@@ -559,6 +559,9 @@ pub enum Msg<'a> {
     /// Calm one-line advisory shown once at startup when offline mode is active.
     /// Informs the user that web tools, telemetry, and auto-update are disabled.
     OfflineModeActive,
+    /// Startup advisory: `count` installed plugins ship UNTRUSTED hooks that will
+    /// not run until the user grants trust. `names` is a comma-joined plugin-name list.
+    PluginHooksUntrusted { count: usize, names: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
     PluginInstallingByName { plugin: &'a str },
     PluginAlreadyInstalled { id: &'a str },
