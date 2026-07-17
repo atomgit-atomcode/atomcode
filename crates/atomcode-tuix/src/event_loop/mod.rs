@@ -71,6 +71,24 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// bytes directly (screenshots, Preview Copy). If that fails, falls back
 /// to reading a file:// URL from the clipboard text (Finder Cmd+C case)
 /// and loading the image from that path.
+/// Whether a key event is the "paste clipboard image" chord.
+///
+/// `Ctrl+V` is the canonical binding. `Ctrl+Alt+V` is an alternate for
+/// terminals — notably **Windows Terminal** — that bind plain `Ctrl+V` to their
+/// own text-paste action and never forward the key to the app, so plain `Ctrl+V`
+/// can't reach this handler there. The clipboard read (arboard, native Win32)
+/// works regardless; only the trigger key needs an alternate that the terminal
+/// doesn't intercept. `Ctrl+Shift+V` is deliberately NOT matched so a terminal's
+/// "paste as plain text" chord passes through untouched.
+fn is_paste_image_chord(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    code == crossterm::event::KeyCode::Char('v')
+        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+        && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+}
+
 /// Returns the image data and a fingerprint hash.
 /// bytes (not the PNG-encoded base64) — same hash function the status
 /// poll uses, so paste-side and poll-side fingerprints line up for the
@@ -466,6 +484,21 @@ mod image_path_tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::tempdir;
+
+    #[test]
+    fn paste_image_chord_accepts_ctrl_v_and_ctrl_alt_v_only() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let v = KeyCode::Char('v');
+        // Canonical + the Windows-Terminal alternate both trigger.
+        assert!(is_paste_image_chord(v, KeyModifiers::CONTROL));
+        assert!(is_paste_image_chord(v, KeyModifiers::CONTROL | KeyModifiers::ALT));
+        // Ctrl+Shift+V stays a terminal "paste as plain text" passthrough.
+        assert!(!is_paste_image_chord(v, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        // Not a paste chord without Ctrl, or on a different key.
+        assert!(!is_paste_image_chord(v, KeyModifiers::ALT));
+        assert!(!is_paste_image_chord(v, KeyModifiers::NONE));
+        assert!(!is_paste_image_chord(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    }
 
     /// Materialise a small file at `<dir>/<name>` whose contents are
     /// `bytes`. Returned absolute path is what the user-facing paste
@@ -5943,10 +5976,7 @@ fn handle_input(
             // Plain Text") still pass through to whatever else might
             // bind them in the future.
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
-                && code == crossterm::event::KeyCode::Char('v')
-                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                && is_paste_image_chord(code, modifiers)
             {
                 let img_hash = try_paste_clipboard_image();
                 if attach_image_to_input(app, ctx, renderer, img_hash)? {

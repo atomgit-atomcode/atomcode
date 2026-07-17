@@ -128,7 +128,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
-            "Image in clipboard · ctrl+v to paste".into(),
+            "Image in clipboard · ctrl+v / ctrl+alt+v to paste".into(),
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
         Msg::StatusWebuiHint =>

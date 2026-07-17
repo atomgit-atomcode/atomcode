@@ -120,7 +120,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
-            "剪贴板有图片 · ctrl+v 粘贴".into(),
+            "剪贴板有图片 · ctrl+v / ctrl+alt+v 粘贴".into(),
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
         Msg::StatusWebuiHint =>
