@@ -422,11 +422,11 @@ pub async fn prepare_with_plugin_hooks(
     if crate::persona::todo_switch_enabled() {
         hooks.push(Arc::new(crate::todo::TodoHook));
     }
-    // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
-    // right wait-vs-pause decision (decide_from_windows). Returns None for
-    // non-CodingPlan providers / fetch failures so the kernel falls back to its
-    // hint-based default with zero behavior change.
-    hooks.push(Arc::new(crate::rate_limit::RateLimitHook::new()) as Arc<dyn LifecycleHooks>);
+    // NOTE: the `RateLimitHook` is NOT built here. It gates CodingPlan-specific 429
+    // messaging on `cfg.base_url` being the gateway, so — like the turn-level
+    // `TelemetryHook` — it must be built in `assemble` (which re-runs on a /model
+    // swap), NOT here in `prepare` (which does not). A prepare-frozen base_url would
+    // keep mislabelling an external-model 429 as a CodingPlan quota after a switch.
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
     // (`plugin_cc_hooks`, resolved by the driver) on the kernel seams — the port of core's
     // CC-parity hook engine onto the v2 engine. ONE instance serves both seams: pushed here
@@ -682,6 +682,12 @@ pub fn assemble(
         // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
         // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
         .hook(Arc::new(crate::plan_mode::PlanModeReminderHook::new(parts.plan_mode.clone())))
+        // Rate-limit hook: on a 429 it decides wait-vs-pause from CodingPlan usage windows.
+        // Built HERE (not in `prepare`) — like TelemetryHook — so a /model swap (which re-runs
+        // assemble only) re-captures the CURRENT provider's base_url. That base_url is the gate
+        // that keeps a user's external-model 429 from being mislabelled as a CodingPlan quota;
+        // a prepare-frozen base_url would defeat it after a model switch.
+        .hook(Arc::new(crate::rate_limit::RateLimitHook::new(cfg.base_url.clone())))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.

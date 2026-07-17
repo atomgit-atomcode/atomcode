@@ -5030,16 +5030,19 @@ pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
     format!("\x1b]52;{};{}\x1b\\", buffer, b64)
 }
 
-/// Build the non-error rate-limit pause body line. Two branches:
-/// - `reset_at_display` non-empty → user must wait (Pause); shows reset
-///   time and remaining duration.
-/// - `reset_at_display` empty + small `secs_until_reset` → kernel is
-///   auto-retrying (WaitAndRetry); shows a countdown.
+/// Build the non-error rate-limit pause body line. Three branches:
+/// - `auto_resuming` → kernel is auto-retrying (WaitAndRetry); generic countdown.
+/// - Pause, `reset_at_display` NON-empty → a CONFIRMED CodingPlan quota exhaustion
+///   (real reset time from the usage windows) → the CodingPlan "5h window" message.
+/// - Pause, `reset_at_display` EMPTY → generic 429 (a user's external-model 429, or
+///   a gateway 429 with no window data) → a neutral "limited (HTTP 429)" line, NOT
+///   the CodingPlan message. The `RateLimitHook` gates itself to gateway 429s, so an
+///   external-model 429 lands here via the kernel's generic default.
 ///
 /// Kept as a pure function so it is unit-testable without a renderer.
 pub(crate) fn format_rate_limited_line(
     reset_at_display: &str,
-    _reset_label: &str,
+    reset_label: &str,
     secs_until_reset: Option<u64>,
     auto_resuming: bool,
 ) -> String {
@@ -5048,23 +5051,31 @@ pub(crate) fn format_rate_limited_line(
         let n = secs_until_reset.unwrap_or(0);
         return format!("⏳ 限流，{n}s 后自动继续…");
     }
-    // Pause: kernel stopped, user must act.
-    if reset_at_display.is_empty() {
-        // Pause with no wall-clock reset time (e.g. from_hint fallback). Still show the
-        // remaining duration when the gateway gave one (secs_until_reset) instead of
-        // silently dropping it.
+    // Pause: kernel stopped, user must act. A CodingPlan verdict (decide_from_windows)
+    // carries window data — a reset time AND/OR a window label. The kernel's generic
+    // default (from_hint, used for non-CodingPlan / external-model 429s) carries
+    // NEITHER. So "has any window signal" ⇒ a real CodingPlan quota; otherwise it's a
+    // generic 429 and must NOT be dressed up as a CodingPlan quota exhaustion. Keying
+    // on reset_at_display ALONE would wrongly go generic for an exhausted window whose
+    // display string the server omitted (both fields are `#[serde(default)]`).
+    let is_coding_plan = !reset_at_display.is_empty() || !reset_label.is_empty();
+    if !is_coding_plan {
         let tail = match secs_until_reset {
-            Some(s) => format!("（还有 {}）", fmt_dur(s)),
+            Some(s) => format!("（约 {} 后可重试）", fmt_dur(s)),
             None => String::new(),
         };
-        return format!(
-            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
-        );
+        return format!("⏸ 限流（HTTP 429）{tail} · 已保留已完成内容 · 稍后重试或换模型");
     }
+    // Confirmed CodingPlan window exhaustion.
     let tail = match secs_until_reset {
         Some(s) => format!("（还有 {}）", fmt_dur(s)),
         None => String::new(),
     };
+    if reset_at_display.is_empty() {
+        return format!(
+            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+        );
+    }
     format!(
         "⏸ 5小时窗口已用尽，约 {reset_at_display} 恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
     )
@@ -5212,18 +5223,44 @@ mod rate_limited_tests {
         assert!(!line.contains("自动继续"), "Pause must not say 自动继续");
     }
 
-    // Branch 3: auto_resuming=false, reset_at_display empty → pause without time
+    // Branch 3: auto_resuming=false, reset_at_display EMPTY → GENERIC 429 (a user's
+    // external-model 429, or a gateway 429 with no window data), NOT the CodingPlan
+    // "5h window exhausted" message. Locks the mis-attribution fix.
     #[test]
-    fn rate_limited_pause_no_time_shows_no_countdown_no_reset_time() {
+    fn rate_limited_pause_empty_reset_is_generic_not_coding_plan() {
         let line = format_rate_limited_line("", "", None, false);
         assert!(line.contains('⏸'), "must use pause glyph ⏸");
         assert!(!line.contains("自动继续"), "must not say 自动继续");
-        assert!(!line.contains("约"), "must not say 约 _ 恢复 when no reset time");
         assert!(!line.contains("还有"), "must not show countdown when no reset time");
+        // The regression guard: an empty-reset 429 must NOT be dressed up as a
+        // CodingPlan quota exhaustion.
         assert!(
-            line.contains("稍后恢复") || line.contains("稍后重试"),
-            "should indicate to retry later"
+            !line.contains("5小时窗口"),
+            "empty-reset 429 must not claim CodingPlan quota: {line}"
         );
+        assert!(
+            line.contains("HTTP 429") || line.contains("限流"),
+            "should be a generic rate-limit line: {line}"
+        );
+        assert!(line.contains("稍后重试"), "should indicate to retry later");
+    }
+
+    // A gateway CodingPlan quota (real reset time) KEEPS the "5h window" message.
+    #[test]
+    fn rate_limited_pause_with_reset_time_keeps_coding_plan_message() {
+        let line = format_rate_limited_line("18:09", "", Some(7200), false);
+        assert!(line.contains("5小时窗口"), "confirmed CodingPlan quota keeps its message: {line}");
+        assert!(line.contains("18:09"), "shows the window reset time");
+    }
+
+    // Regression (review F2): an exhausted CodingPlan window whose server OMITTED
+    // reset_at_display but provided a window LABEL must STILL keep the CodingPlan
+    // message — keying on reset_at_display alone would wrongly go generic.
+    #[test]
+    fn rate_limited_empty_display_but_label_keeps_coding_plan() {
+        let line = format_rate_limited_line("", "（每 5 小时一个窗口）", Some(7200), false);
+        assert!(line.contains("5小时窗口"), "label alone must keep CodingPlan framing: {line}");
+        assert!(!line.contains("HTTP 429"), "must not fall to the generic line: {line}");
     }
 
     #[test]
@@ -5236,11 +5273,13 @@ mod rate_limited_tests {
     #[test]
     fn rate_limited_pause_no_reset_time_still_shows_remaining_secs() {
         // Pause (auto_resuming=false) with no wall-clock display but a known
-        // remaining duration: the duration must NOT be dropped.
+        // remaining duration: the duration must NOT be dropped. (Generic 429 line
+        // now — no CodingPlan claim without a real reset time.)
         let line = format_rate_limited_line("", "", Some(7200), false);
         assert!(line.contains('⏸'), "must use pause glyph");
         assert!(!line.contains("自动继续"), "must not say auto-continue (this is a Pause)");
-        assert!(line.contains("还有"), "must surface the remaining duration");
+        assert!(!line.contains("5小时窗口"), "empty-reset 429 must not claim CodingPlan quota: {line}");
+        assert!(line.contains("后可重试"), "must surface the remaining duration: {line}");
         assert!(line.contains("2h0m"), "7200s → 2h0m: {line}");
     }
 

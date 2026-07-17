@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use atomcode_core::coding_plan::crypto::is_atomgit_gateway;
 use atomcode_core::coding_plan::types::RateLimitWindow;
 use atomcode_kernel::hook::{
     LifecycleHooks, RateLimitDecision, RateLimitHint, RATE_LIMIT_AUTO_WAIT_SECS,
@@ -85,12 +86,19 @@ pub fn decide_from_windows(windows: &[RateLimitWindow], hint: &RateLimitHint) ->
 /// and so a transient `status_v2` failure degrades to a slightly-aged reset time
 /// rather than losing the reset info entirely.
 pub struct RateLimitHook {
+    /// The active provider's base URL. The CodingPlan-specific verdict (window
+    /// fetch + reset time) is produced ONLY when THIS 429 came from the CodingPlan
+    /// gateway; a 429 from a user's own external model/endpoint returns `None` so
+    /// the kernel falls back to a GENERIC rate-limit message instead of dressing it
+    /// up as a CodingPlan quota exhaustion. Mirrors codex/opencode: plan-quota
+    /// messaging is gated to the platform's own endpoint. Empty ⇒ not the gateway.
+    base_url: String,
     cache: Mutex<Option<(Instant, Vec<RateLimitWindow>)>>,
 }
 
 impl RateLimitHook {
-    pub fn new() -> Self {
-        Self { cache: Mutex::new(None) }
+    pub fn new(base_url: String) -> Self {
+        Self { base_url, cache: Mutex::new(None) }
     }
 
     /// Return aged cached windows if the cache is younger than `ttl`, else None.
@@ -110,7 +118,9 @@ impl RateLimitHook {
 
 impl Default for RateLimitHook {
     fn default() -> Self {
-        Self::new()
+        // Empty base_url ⇒ not the gateway ⇒ every 429 defers to the kernel's
+        // generic default. A safe, no-CodingPlan-claim default.
+        Self::new(String::new())
     }
 }
 
@@ -123,6 +133,14 @@ fn decide_or_none(windows: &[RateLimitWindow], hint: &RateLimitHint) -> Option<R
 #[async_trait]
 impl LifecycleHooks for RateLimitHook {
     async fn on_rate_limit(&self, hint: &RateLimitHint) -> Option<RateLimitDecision> {
+        // Only a 429 FROM the CodingPlan gateway carries a CodingPlan quota meaning.
+        // A 429 from a user's own external model/endpoint must NOT be dressed up as a
+        // CodingPlan window exhaustion — bail before any status_v2 fetch so the kernel
+        // uses its generic hint-based default (mirrors codex/opencode: plan-quota
+        // messaging is gated to the platform's own endpoint, everything else generic).
+        if !is_atomgit_gateway(&self.base_url) {
+            return None;
+        }
         // 1. Recent successful fetch → reuse without touching the network.
         if let Some(w) = self.cached_within(CACHE_REUSE_TTL) {
             return decide_or_none(&w, hint);
@@ -155,7 +173,26 @@ impl LifecycleHooks for RateLimitHook {
 mod tests {
     use super::*;
     use atomcode_core::coding_plan::types::RateLimitWindow;
-    use atomcode_kernel::hook::{RateLimitDecision, RateLimitHint};
+    use atomcode_kernel::hook::{LifecycleHooks, RateLimitDecision, RateLimitHint};
+
+    // ---- gateway gate: only the CodingPlan gateway's 429 is treated as a plan quota ----
+
+    #[tokio::test]
+    async fn external_provider_429_returns_none_without_fetch() {
+        // A user's own external endpoint: the hook must bail BEFORE any status_v2
+        // fetch (no network in this test) and return None so the kernel shows a
+        // generic rate-limit message — not a bogus "CodingPlan quota exhausted".
+        let hook = RateLimitHook::new("https://api.openai.com/v1".to_string());
+        let hint = RateLimitHint { http_status: Some(429), retry_after_secs: Some(30) };
+        assert_eq!(hook.on_rate_limit(&hint).await, None);
+    }
+
+    #[tokio::test]
+    async fn empty_base_url_is_not_gateway_returns_none() {
+        let hook = RateLimitHook::new(String::new());
+        let hint = RateLimitHint { http_status: Some(429), retry_after_secs: None };
+        assert_eq!(hook.on_rate_limit(&hint).await, None);
+    }
 
     fn win(secs_until_reset: i64, exhausted: bool) -> RateLimitWindow {
         RateLimitWindow {

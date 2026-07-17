@@ -2371,6 +2371,7 @@ async fn run_headless(
             }
             AgentEvent::RateLimited {
                 reset_at_display,
+                reset_label,
                 secs_until_reset,
                 auto_resuming,
                 ..
@@ -2380,19 +2381,30 @@ async fn run_headless(
                 // turn via the upcoming TurnComplete(RateLimited); a WaitAndRetry
                 // keeps the turn running and resumes on its own.
                 close_thinking_line(&mut thinking_line_open);
+                // A CodingPlan verdict carries window data (a reset time and/or a
+                // window label); the kernel's generic default (external-model / non-
+                // CodingPlan 429) carries NEITHER. Only claim "5h window exhausted"
+                // for a real CodingPlan quota — mirrors the TUI's format_rate_limited_line.
+                let is_coding_plan = !reset_at_display.is_empty() || !reset_label.is_empty();
                 if auto_resuming {
                     eprintln!(
                         "[rate-limited] auto-continuing in {}s…",
                         secs_until_reset.unwrap_or(0)
                     );
+                } else if !is_coding_plan {
+                    // Generic 429 (a user's own external model / no window data).
+                    match secs_until_reset {
+                        Some(s) => eprintln!("[rate-limited] HTTP 429 — retry later (in {}s)", s),
+                        None => eprintln!("[rate-limited] HTTP 429 — paused, retry later"),
+                    }
                 } else if !reset_at_display.is_empty() {
                     eprintln!(
                         "[rate-limited] 5h window exhausted — resets around {}",
                         reset_at_display
                     );
                 } else if let Some(s) = secs_until_reset {
-                    // Pause with no wall-clock time but a known remaining duration:
-                    // surface the seconds instead of dropping them.
+                    // CodingPlan window (label present) with no wall-clock time but a
+                    // known remaining duration: surface the seconds instead of dropping them.
                     eprintln!(
                         "[rate-limited] 5h window exhausted — resets in {}s, retry later",
                         s
