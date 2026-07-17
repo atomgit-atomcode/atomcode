@@ -411,6 +411,14 @@ fn extract_targets(cmd: &str, args: &[String]) -> Option<Vec<String>> {
     }
 }
 
+/// The COMMAND word, normalized for classification: path basename, quotes stripped, and a leading
+/// `\` removed. Bash's `\cmd` bypasses aliases/functions but still runs the REAL command, so
+/// `\rm` / `\mv` must be gated exactly like `rm` / `mv` — without this strip they'd be classified
+/// as an unknown command and slip through as non-destructive.
+fn command_word(tok: &str) -> &str {
+    base(strip_quotes(tok)).trim_start_matches('\\')
+}
+
 /// Effective commands whose `>`/`<` are COMPARISON operators, not redirects (`[[ $a > $b ]]`,
 /// `(( a > b ))`, `test`). Redirect scanning is skipped for these so ordinary conditionals don't
 /// prompt.
@@ -434,7 +442,7 @@ pub(crate) fn mv_moves(command: &str) -> Vec<(String, String)> {
         let Some(ci) = effective_command_index(&toks) else {
             continue;
         };
-        if base(strip_quotes(&toks[ci])) != "mv" {
+        if command_word(&toks[ci]) != "mv" {
             continue;
         }
         let Some((positionals, target_dir)) = parse_path_operands(&toks[ci + 1..]) else {
@@ -478,7 +486,7 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
             continue;
         }
         let ci = effective_command_index(&toks);
-        let effcmd: Option<&str> = ci.map(|i| base(strip_quotes(&toks[i])));
+        let effcmd: Option<&str> = ci.map(|i| command_word(&toks[i]));
 
         // Redirect writes (any command in this segment) — except inside a test/arithmetic
         // construct, where `>` is a comparison operator.
@@ -631,11 +639,11 @@ impl ToolMiddleware for BashWorkspaceGate {
         // degrade to "not in workspace" → a normal prompt (safe, never hangs).
         // `mv` (source, dest) pairs — for the "moved OUT of the workspace = deleted" check below.
         let mv_pairs = mv_moves(&command);
-        let (all_in_workspace, key) = {
+        let (all_in_workspace, out_keys) = {
             let targets = targets.clone();
             let mv_pairs = mv_pairs.clone();
             let cwd = cwd.clone();
-            let fallback = (false, "bashdir::".to_string());
+            let fallback = (false, Vec::<String>::new());
             super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
                 // Written/deleted TARGETS that land OUTSIDE the workspace (path canonicalizes —
                 // filesystem I/O). Temp-dir targets (codex parity: /tmp + $TMPDIR are
@@ -650,18 +658,20 @@ impl ToolMiddleware for BashWorkspaceGate {
                 // it from the workspace — an equivalent delete. Temp does NOT rescue the dest here
                 // (moving a workspace file to /tmp still deletes it from the workspace), so a
                 // rejected `rm` can't be laundered through `mv <ws_file> /tmp/backup`. Treat that
-                // dest as out-of-workspace so the move prompts.
+                // dest as out-of-workspace so the move prompts. `!out.contains` avoids a duplicate
+                // when the same dest is already a scan target (`mv ws /outside/x`).
                 for (src, dst) in &mv_pairs {
-                    if path_in_workspace(src, &cwd) && !path_in_workspace(dst, &cwd) {
+                    if path_in_workspace(src, &cwd) && !path_in_workspace(dst, &cwd) && !out.contains(dst) {
                         out.push(dst.clone());
                     }
                 }
                 let all_in = out.is_empty();
-                let key = match out.first() {
-                    Some(t) => format!("bashdir::{}", canonical_dir_key(t, &cwd)),
-                    None => "bashdir::".to_string(),
-                };
-                (all_in, key)
+                // Per-out-target directory grant keys, deduped (multiple targets can share a dir).
+                let mut keys: Vec<String> =
+                    out.iter().map(|t| format!("bashdir::{}", canonical_dir_key(t, &cwd))).collect();
+                keys.sort();
+                keys.dedup();
+                (all_in, keys)
             })
             .await
         };
@@ -672,14 +682,20 @@ impl ToolMiddleware for BashWorkspaceGate {
             return BeforeOutcome::Proceed;
         }
 
-        // Out-of-workspace → prompt; "Always" remembers per canonical directory.
-        if self.store.is_granted(&key) {
+        // Out-of-workspace → prompt; "Always" remembers per canonical directory. Auto-allow ONLY
+        // when EVERY out-of-workspace target's directory is already granted — a prior grant for
+        // ONE directory must not let an ADDITIONAL out-of-workspace / mv-escape target in the same
+        // command ride along (`rm /granted/x && mv ws_file /tmp/stolen`). Empty keys (FS-timeout
+        // fallback) → never auto-allow → prompt (fail-closed).
+        if !out_keys.is_empty() && out_keys.iter().all(|k| self.store.is_granted(k)) {
             return BeforeOutcome::Allow { reason: Some("previously granted this session".into()) };
         }
         match self.prompt(call, tool, rt).await {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow { reason: Some("approved once".into()) },
             PermissionDecision::AllowAlways => {
-                self.store.grant(&key);
+                for k in &out_keys {
+                    self.store.grant(k);
+                }
                 BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
             }
             PermissionDecision::Deny => {
@@ -743,6 +759,15 @@ mod tests {
         // rm / single-operand mv → no pair
         assert!(mv_moves("rm a.txt").is_empty());
         assert!(mv_moves("mv onlyone").is_empty());
+    }
+
+    #[test]
+    fn escaped_command_is_still_recognized() {
+        // `\rm` / `\mv` (leading backslash bypasses aliases but runs the real command) must not
+        // slip through as non-destructive.
+        assert_eq!(scan("\\rm /outside/x.txt"), BashScan::Targets(vec!["/outside/x.txt".into()]));
+        assert_eq!(scan("\\mv a.txt /outside/b"), BashScan::Targets(vec!["a.txt".into(), "/outside/b".into()]));
+        assert_eq!(mv_moves("\\mv a.txt /tmp/b"), vec![("a.txt".to_string(), "/tmp/b".to_string())]);
     }
 
     #[test]
@@ -990,6 +1015,35 @@ mod tests {
         let mut call = bash_call("mv data.bin /tmp/atomcode-mv-test-backup");
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(out.is_deny(), "mv of a workspace file out to /tmp must prompt (fail closed), got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn escaped_mv_out_of_workspace_prompts() {
+        // `\mv` must be gated like `mv` — the backslash-escape can't launder a workspace delete.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("data.bin"), "x").unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("\\mv data.bin /tmp/atomcode-esc-backup");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(out.is_deny(), "escaped mv of a workspace file out must prompt, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn grant_does_not_cover_an_additional_out_target() {
+        // A prior grant for ONE out-of-workspace dir must NOT auto-approve a compound command that
+        // ALSO moves a workspace file out (the equivalent-delete must still prompt).
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("data.bin"), "x").unwrap();
+        let granted_dir = std::path::PathBuf::from("/atomcode-test-grant-cover/a");
+        let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        store.grant(&format!("bashdir::{}", canonical_dir_key(granted_dir.join("x").to_str().unwrap(), ws.path())));
+        let gate = BashWorkspaceGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
+        let tool = bash_tool();
+        // Op in the granted dir + an mv-escape of a workspace file to /tmp.
+        let mut call = bash_call(&format!("rm {}/x && mv data.bin /tmp/atomcode-stolen", granted_dir.to_str().unwrap()));
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(out.is_deny(), "the grant must not cover the additional mv-escape target, got {out:?}");
     }
 
     #[tokio::test]
