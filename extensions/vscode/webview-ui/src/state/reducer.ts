@@ -8,8 +8,10 @@ import type {
   MessageBlock,
   PermissionRequestData,
   StatusData,
+  SearchState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
+import { buildSearchMatches } from '../utils/search';
 
 let _msgCounter = 0;
 function nextId(): string {
@@ -344,6 +346,24 @@ function stripVisionPreprocessText(rawText: string): { displayText: string; hadV
   };
 }
 
+const EMPTY_SEARCH: SearchState = { matches: [], currentMatchIndex: -1 };
+
+/** Recompute search matches for the given query. Keeps the current index
+ *  clamped to the new range so navigation stays valid after edits. */
+function recomputeSearch(
+  messages: ChatMessage[],
+  query: string,
+  prev?: SearchState,
+): SearchState {
+  const trimmed = query.trim();
+  if (!trimmed) return EMPTY_SEARCH;
+  const matches = buildSearchMatches(messages, query);
+  if (matches.length === 0) return { matches, currentMatchIndex: -1 };
+  let nextIndex = prev && prev.currentMatchIndex >= 0 ? prev.currentMatchIndex : 0;
+  if (nextIndex >= matches.length) nextIndex = 0;
+  return { matches, currentMatchIndex: nextIndex };
+}
+
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
@@ -368,12 +388,31 @@ export const initialState: ChatState = {
   settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
+  search: EMPTY_SEARCH,
   locale: document.body.dataset.locale,
   approvalMode: 'build',
   approvalModePending: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  const next = chatReducerInner(state, action);
+  // Keep search matches in sync when messages change and a query is active.
+  if (next.messages !== state.messages && next.searchQuery.trim()) {
+    const recomputed = recomputeSearch(next.messages, next.searchQuery, next.search);
+    // Skip if matches haven't meaningfully changed (avoids unnecessary re-renders).
+    const sameMatches =
+      recomputed.matches.length === next.search.matches.length &&
+      recomputed.matches.every((m, idx) =>
+        m.messageId === next.search.matches[idx]?.messageId &&
+        m.ranges.length === next.search.matches[idx]?.ranges.length);
+    if (!sameMatches || recomputed.currentMatchIndex !== next.search.currentMatchIndex) {
+      return { ...next, search: recomputed };
+    }
+  }
+  return next;
+}
+
+function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     // ─── User sends a message ────────────────────────
     case 'ADD_USER_MESSAGE': {
@@ -951,11 +990,34 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages, isGenerating: false };
     }
 
-    case 'SET_SEARCH_QUERY':
-      return { ...state, searchQuery: action.query };
+    case 'SET_SEARCH_QUERY': {
+      const search = recomputeSearch(state.messages, action.query, state.search);
+      return { ...state, searchQuery: action.query, search };
+    }
 
-    case 'TOGGLE_SEARCH':
-      return { ...state, searchOpen: !state.searchOpen, searchQuery: state.searchOpen ? '' : state.searchQuery };
+    case 'TOGGLE_SEARCH': {
+      const closing = state.searchOpen;
+      return {
+        ...state,
+        searchOpen: !state.searchOpen,
+        searchQuery: closing ? '' : state.searchQuery,
+        search: closing ? EMPTY_SEARCH : recomputeSearch(state.messages, state.searchQuery),
+      };
+    }
+
+    case 'SEARCH_NEXT': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const next = (currentMatchIndex + 1) % matches.length;
+      return { ...state, search: { matches, currentMatchIndex: next } };
+    }
+
+    case 'SEARCH_PREV': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const prev = currentMatchIndex <= 0 ? matches.length - 1 : currentMatchIndex - 1;
+      return { ...state, search: { matches, currentMatchIndex: prev } };
+    }
 
     case 'PERMISSION_REQUEST': {
       const msgs = [...state.messages];

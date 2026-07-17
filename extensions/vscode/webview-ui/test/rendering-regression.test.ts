@@ -822,7 +822,9 @@ function testUserMessageRendersPlainTextInsteadOfMarkdown() {
   assert.doesNotMatch(source, /import\s+\{\s*Markdown\s*\}/);
   assert.doesNotMatch(source, /<Markdown\s+content=\{message\.text\}/);
   assert.match(source, /className="user-message-plain-text"/);
-  assert.match(source, /\{message\.text\}/);
+  // When no search query is active, the raw message text is rendered as-is
+  // (search highlights are injected only when a query is present).
+  assert.match(source, /: message\.text\}/);
 }
 
 function testUserPlainTextCssPreservesLiteralInput() {
