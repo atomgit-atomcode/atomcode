@@ -2356,8 +2356,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // padding for the input box only).
         let rule_width = w.saturating_sub(PAD_COL * 2);
         let input_rule_width = w;
-        // "> " prompt prefix is 2 display cols; text fills the rest.
-        let text_budget = input_rule_width.saturating_sub(2);
+        // "> " prompt prefix is 2 display cols; text fills the rest. On JediTerm
+        // (DevEco Studio / IntelliJ terminals) reserve ONE extra trailing column:
+        // its no-fallback paint layer soft-wraps a row whose last column holds a
+        // (wide CJK) glyph, colliding that soft-wrap with our own explicit wrap
+        // and duplicating/garbling the row. Keeping the last column empty means
+        // no glyph ever reaches the edge, so JediTerm never auto-wraps.
+        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
+        let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
 
         // Wrap input + locate cursor in wrapped layout.
         let safe = scrub_controls(&self.input_buf);
@@ -3139,8 +3145,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
-        // Mirror paint_footer: input box is full-width (only "> " prefix).
-        let text_budget = (self.screen.width() as usize).saturating_sub(2);
+        // Mirror paint_footer: input box is full-width (only "> " prefix), with
+        // the same JediTerm last-column reserve so the wrapped ROW COUNT here
+        // matches the actual render (else body_bottom is off by a row).
+        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
+        let text_budget = (self.screen.width() as usize).saturating_sub(prefix_and_reserve);
         let safe = scrub_controls(&self.input_buf);
         let middle_rows = if text_budget == 0 {
             1
@@ -15330,6 +15339,25 @@ mod tests {
         let text = body_text(&r);
         assert!(!text.contains('▀'), "no mascot on a non-modern emulator (FinalShell-like)");
         assert!(text.contains("/login"), "tips still present");
+    }
+
+    #[test]
+    fn jediterm_input_wrap_reserves_last_column() {
+        // A CJK line exactly filling the normal budget (width-2 cols) must wrap
+        // to one MORE row on JediTerm (budget width-3): the last column is
+        // reserved so no glyph reaches the edge and triggers JediTerm's own
+        // soft-wrap, which duplicated/garbled the row (DevEco Studio report).
+        let (mut r, _c) = new_counting(100, 30);
+        r.input_buf = "中".repeat(49); // 49 wide chars = 98 cols = width(100) - 2
+        r.input_cursor_byte = 0;
+        r.caps.jediterm = false;
+        let normal = r.current_footer_rows();
+        r.caps.jediterm = true;
+        let jedi = r.current_footer_rows();
+        assert!(
+            jedi > normal,
+            "JediTerm must reserve the last column → one extra wrapped row; normal={normal} jedi={jedi}"
+        );
     }
 
     #[test]
