@@ -973,7 +973,7 @@ pub enum Msg<'a> {
     LoopStopped,
     /// End-of-loop banner emitted by the `LoopUpdate { active: false }` handler
     /// when the loop ends with a non-cancellation reason.
-    /// `reason` is the internal English identifier from the bridge's loop driver
+    /// `reason` is the internal English identifier from CodingRuntime's loop controller
     /// (e.g. "completed", "round limit (10)") — kept English as-is.
     LoopEnded { reason: &'a str },
     /// One-line hint shown when a `/loop` is armed: the loop is a live-only
@@ -1216,7 +1216,7 @@ pub enum Msg<'a> {
     /// Brief confirmation shown after Ctrl+S copy.
     UsageCopied,
 
-    // ── engine v2 provider init (atomcode-bridge) ──
+    // ── CodingRuntime provider init ──
     /// Frame for a provider/engine init failure surfaced to the driver.
     /// `detail` carries the underlying cause (often `GatewayAuthUnavailable`).
     ProviderInitFailed { detail: &'a str },

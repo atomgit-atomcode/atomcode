@@ -1232,7 +1232,7 @@ impl RunningAgent {
             // cleanly into the next user prompt on Anthropic and is valid consecutive-user
             // on openai-compat.
             // `synthetic_user` (not `user`) so the marker is excluded from prompt
-            // counting: `compute_undo` in the bridge skips `synthetic = true` messages
+            // counting: `compute_runtime_undo` skips `synthetic = true` messages
             // when locating the /undo target, and compaction's `active_turn_start`
             // skip synthetic messages when computing keep-recent-turns boundaries.
             convo.push(Message::synthetic_user(

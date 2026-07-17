@@ -6908,6 +6908,7 @@ mod tests {
     #[test]
     fn shell_mode_paints_input_box_chevron_and_bang_purple() {
         use crate::highlight::theme as md_theme;
+        let _theme = md_theme::test_lock();
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
@@ -7002,6 +7003,7 @@ mod tests {
     #[test]
     fn shell_mode_shows_shell_badge_overriding_plan() {
         use crate::highlight::theme as md_theme;
+        let _theme = md_theme::test_lock();
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
@@ -9216,6 +9218,8 @@ mod tests {
 
     #[test]
     fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         // 22-col WIDTH is the test's actual subject (column reflow).
         // Use 30-row HEIGHT — large enough that the reflowed banner
         // (title × 2 + blank + mascot × 6 + path × 4 + model × 2 +
@@ -9548,6 +9552,7 @@ mod tests {
     /// NOT faint — it's the prominent tier.
     #[test]
     fn retained_tool_result_summary_is_faint_in_dark_theme() {
+        let _theme = crate::highlight::theme::test_lock();
         crate::highlight::theme::set_theme_mode(false); // dark
         let (mut r, buf) = new_capturing(80, 24);
         r.caps.colors = true;
@@ -9569,6 +9574,18 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
+        assert!(
+            r.body_lines
+                .iter()
+                .flatten()
+                .any(|cell| cell.ch == '└' && cell.style.faint),
+            "renderer model must retain the faint result marker"
+        );
+        let raw = buf.lock().unwrap().clone();
+        assert!(
+            raw.windows(4).any(|window| window == b"\x1b[2m"),
+            "renderer byte stream must emit SGR 2 for the faint result marker"
+        );
         drain_into_vterm(&buf, &mut vterm);
 
         // Result line: the `└` glyph and the summary text must be faint.
@@ -9582,7 +9599,11 @@ mod tests {
             "`└` glyph must be faint in dark theme, got {:?}",
             arrow_cell,
         );
-        let summary_col = vterm.row_text(res_idx).find("3 files").unwrap();
+        let summary_col = vterm
+            .row_text(res_idx)
+            .chars()
+            .position(|ch| ch == '3')
+            .unwrap();
         let summary_cell = vterm.cell_at(res_idx, summary_col);
         assert!(
             summary_cell.faint,
@@ -9759,6 +9780,8 @@ mod tests {
     /// with diff-remove blocks. See retained.rs UiLine::ToolResult arm.
     #[test]
     fn retained_tool_result_failure_header_red_body_default() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, buf) = new_capturing(120, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
         let status = status_basic();
@@ -9782,7 +9805,7 @@ mod tests {
             .find(|&i| vterm.row_text(i).contains("✗") && vterm.row_text(i).contains("not found"))
             .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
         let header_text = vterm.row_text(header_idx);
-        let glyph_col = header_text.find('✗').unwrap();
+        let glyph_col = header_text.chars().position(|ch| ch == '✗').unwrap();
         let header_cell = vterm.cell_at(header_idx, glyph_col);
         assert_eq!(
             header_cell.fg,
@@ -10041,6 +10064,8 @@ mod tests {
     /// the text + the fg style on the '[' cell.
     #[test]
     fn retained_error_line_renders_via_vterm() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
@@ -10607,6 +10632,8 @@ mod tests {
     /// serialize → vte parse round-trip.
     #[test]
     fn retained_markdown_inline_styles_via_vterm() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
@@ -11792,6 +11819,8 @@ mod tests {
     /// `approval_panel_row_count` must equal `options.len() + 2` (header + hint rows).
     #[test]
     fn approval_panel_numbered_prefixes_fullwidth_hint() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         const W: u16 = 80;
         let (mut r, buf) = new_capturing(W, 24);
         r.caps.colors = true;
@@ -15217,6 +15246,8 @@ mod tests {
     /// the body row above the footer is NOT overwritten by footer content.
     #[test]
     fn footer_height_mirrors_match_during_approval() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         const W: u16 = 80;
         const H: u16 = 24;
         let (mut r, buf) = new_capturing(W, H);

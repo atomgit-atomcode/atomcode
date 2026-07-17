@@ -1212,7 +1212,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::UsageCodingPlanOnly =>
             "使用情况仅 CodingPlan 可用 — 请先 /login。".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── CodingRuntime provider init ──
         Msg::ProviderInitFailed { detail } =>
             format!("模型初始化失败：{detail}").into(),
         Msg::ProviderInitNeedsLogin =>

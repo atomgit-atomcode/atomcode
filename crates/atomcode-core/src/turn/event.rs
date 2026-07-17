@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Low-level events emitted by TurnRunner during execution.
-/// Does not contain approval events — approval is handled internally via PermissionDecider.
+/// Live-session turn events broadcast to daemon, web, and TUI consumers.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// LLM streaming text output
@@ -120,33 +119,4 @@ pub struct ToolBatchCall {
     /// True if this call may run concurrently (read-only); false → serialized
     /// behind the write-lock. Drives the UI's honest "in parallel" label.
     pub parallel_safe: bool,
-}
-
-/// Result of a single turn execution
-#[derive(Debug)]
-pub enum TurnResult {
-    /// LLM produced text only, no tool calls.
-    /// `truncated` = true means finish_reason was "length" (model hit max_tokens).
-    Responded {
-        text: String,
-        tokens: usize,
-        truncated: bool,
-    },
-    /// LLM called tools, results added to conversation — ready for next turn
-    UsedTools {
-        text: Option<String>,
-        tool_count: usize,
-        tokens: usize,
-    },
-    /// Unrecoverable error
-    Failed(String),
-    /// Cancelled by caller
-    Cancelled,
-}
-
-impl TurnResult {
-    /// Returns true if this result represents an error condition (used by telemetry).
-    pub fn is_failed(&self) -> bool {
-        matches!(self, TurnResult::Failed(_))
-    }
 }

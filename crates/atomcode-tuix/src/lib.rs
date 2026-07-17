@@ -18,12 +18,12 @@ pub mod glyph;
 pub mod highlight;
 pub mod i18n;
 pub mod input;
-pub mod pricing;
-pub mod version_check;
 pub mod markdown;
 pub mod modals;
 pub mod platform;
+pub mod pricing;
 pub mod render;
+pub(crate) mod runtime_convert;
 pub mod sanitize;
 #[cfg(unix)]
 mod signal_restore;
@@ -35,6 +35,7 @@ pub mod test_term;
 pub mod think;
 pub mod title;
 pub mod trace;
+pub mod version_check;
 pub mod width;
 
 use anyhow::Result;
@@ -50,9 +51,11 @@ use std::io;
 use tokio::sync::mpsc;
 
 use crate::commands::CommandRegistry;
-use crate::event_loop::{run_loop, LoopCtx};
 pub use crate::event_loop::bg_runtime::RuntimeEventPayload;
-pub use crate::event_loop::{RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime};
+use crate::event_loop::{run_loop, LoopCtx};
+pub use crate::event_loop::{
+    RuntimeControl, RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime,
+};
 use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
@@ -287,17 +290,22 @@ pub async fn run(
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
-    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
-    lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
+    mcp_connect_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>,
+    >,
+    lsp_connect_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>,
+    >,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
     is_admin: bool,
 ) -> Result<()> {
-    let SpawnedRuntime { endpoint, event_rx } = spawned_runtime;
-    let RuntimeEndpoint {
-        legacy: agent_client,
-        native: runtime,
-    } = endpoint;
+    let SpawnedRuntime {
+        endpoint,
+        event_rx,
+        session_id: runtime_session_id,
+    } = spawned_runtime;
+    let RuntimeEndpoint { native: runtime } = endpoint;
     let mut caps = TerminalCaps::probe();
 
     // Decide force_plain BEFORE activating TerminalGuard. Plain mode
@@ -396,10 +404,8 @@ pub async fn run(
         atomcode_config::config::UiTheme::Dark => false,
         atomcode_config::config::UiTheme::Auto => {
             if caps.colors && !force_plain {
-                crate::terminal_bg::detect_light(
-                    std::time::Duration::from_millis(60),
-                )
-                .unwrap_or(false)
+                crate::terminal_bg::detect_light(std::time::Duration::from_millis(60))
+                    .unwrap_or(false)
             } else {
                 false
             }
@@ -506,15 +512,17 @@ pub async fn run(
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
     let history = {
-        let path = History::default_path()
-            .unwrap_or_else(crate::platform::history_path);
+        let path = History::default_path().unwrap_or_else(crate::platform::history_path);
         let cache = crate::platform::image_cache_dir();
         crate::input::history::History::load_with_cache(path, cache)
     };
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
     // Fresh session by default; `/resume` replaces this on load.
-    let current_session = atomcode_core::session::Session::default_session(working_dir.clone());
+    let mut current_session = atomcode_core::session::Session::default_session(working_dir.clone());
+    if let Some(session_id) = runtime_session_id {
+        current_session.id = atomcode_core::session::SessionId::from_string(session_id);
+    }
 
     // Passive "new version available" check. Detached — never blocks
     // startup; on any error returns None silently. On a positive hit
@@ -595,7 +603,12 @@ pub async fn run(
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
-    let skill_registry = agent_client.skill_registry.clone();
+    let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(
+        atomcode_core::skill::SkillRegistry::new(),
+    ));
+    if let Ok(mut registry) = skill_registry.write() {
+        let _ = registry.reload(&working_dir);
+    }
 
     // ── Plugin marketplace bootstrap (detached) ──
     //
@@ -651,7 +664,6 @@ pub async fn run(
         current_session.clone(),
         foreground_runtime_id,
         event_loop::RuntimeEndpoint {
-            legacy: agent_client.clone(),
             native: runtime.clone(),
         },
     );
@@ -668,26 +680,25 @@ pub async fn run(
     #[cfg(unix)]
     let _askpass_guard: Option<atomcode_capabilities::askpass::server::AskpassServerGuard>;
     #[cfg(unix)]
-    let askpass_rx: Option<tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>>;
+    let askpass_rx: Option<
+        tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>,
+    >;
 
     #[cfg(unix)]
     {
-        let cache = std::sync::Arc::new(
-            atomcode_capabilities::askpass::cache::PasswordCache::new(std::time::Duration::from_secs(300)),
-        );
+        let cache = std::sync::Arc::new(atomcode_capabilities::askpass::cache::PasswordCache::new(
+            std::time::Duration::from_secs(300),
+        ));
         match atomcode_capabilities::askpass::server::start(cache) {
             Ok((mut env, rx, guard)) => {
                 // Write the wrapper script next to the socket.  On failure,
                 // degrade (no askpass) rather than crashing the TUI.
-                let script_result = std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| {
-                        env.sock_path
-                            .parent()
-                            .and_then(|dir| {
-                                atomcode_capabilities::askpass::wrapper::write_askpass_script(&exe, dir).ok()
-                            })
-                    });
+                let script_result = std::env::current_exe().ok().and_then(|exe| {
+                    env.sock_path.parent().and_then(|dir| {
+                        atomcode_capabilities::askpass::wrapper::write_askpass_script(&exe, dir)
+                            .ok()
+                    })
+                });
                 if let Some(script) = script_result {
                     env.askpass_script = script;
                     atomcode_capabilities::askpass::set_env(env);
@@ -706,8 +717,9 @@ pub async fn run(
     let ctx = LoopCtx {
         config,
         model_name,
-        agent: agent_client,
         runtime,
+        pending_runtime_request_id: None,
+        native_tools: std::collections::HashMap::new(),
         shutdown_deadline: None,
         runtime_spawn_override,
         bg_manager,
@@ -809,7 +821,10 @@ pub async fn run(
     if let Ok(event_loop::ExitReason::UpgradeRestart { exe }) = &result {
         // Set env var so the new process can show a one-time "upgraded" banner
         // on the welcome screen.
-        std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
+        std::env::set_var(
+            "ATOMCODE_UPGRADED_FROM",
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+        );
         match atomcode_updater::re_exec_self(Some(exe)) {
             Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
             Err(e) => {
@@ -867,11 +882,29 @@ mod panic_restore_tests {
     #[test]
     fn panic_restore_sequence_restores_cursor_autowrap_scroll_and_mouse() {
         let text = String::from_utf8_lossy(panic_restore_sequence());
-        assert!(text.contains("\x1b[?25h"), "must show cursor (DECTCEM): {text:?}");
-        assert!(text.contains("\x1b[?7h"), "must re-enable autowrap (DECAWM): {text:?}");
-        assert!(text.contains("\x1b[r"), "must release DECSTBM scroll region: {text:?}");
-        assert!(text.contains("\x1b[?1002l"), "must disable button-event mouse: {text:?}");
-        assert!(text.contains("\x1b[?1006l"), "must disable SGR mouse coords: {text:?}");
-        assert!(text.contains("\x1b[?2004l"), "must disable bracketed paste: {text:?}");
+        assert!(
+            text.contains("\x1b[?25h"),
+            "must show cursor (DECTCEM): {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[?7h"),
+            "must re-enable autowrap (DECAWM): {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[r"),
+            "must release DECSTBM scroll region: {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[?1002l"),
+            "must disable button-event mouse: {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[?1006l"),
+            "must disable SGR mouse coords: {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[?2004l"),
+            "must disable bracketed paste: {text:?}"
+        );
     }
 }

@@ -1,9 +1,9 @@
 // crates/atomcode-tuix/src/state.rs
 
-/// Execution mode (unified). Alias of the shared core enum so TUI, daemon,
+/// Execution mode (unified). Alias of the shared coding runtime enum so TUI, daemon,
 /// webui share one type. Build = interactive approval; Auto = auto-approve all
 /// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
-pub use atomcode_core::agent::Mode as AgentMode;
+pub use atomcode_coding::RuntimeMode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
@@ -276,9 +276,9 @@ pub struct UiState {
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
     pub last_context: Option<ContextSnapshot>,
-    /// Temporary occupancy projected from a committed native compaction. The
-    /// bridge's legacy `/context` refresh still holds pre-compaction usage, so
-    /// its sent-token field is ignored until the next real TokenUsage arrives.
+    /// Temporary occupancy projected from a committed native compaction. A context
+    /// refresh can still hold pre-compaction usage, so its sent-token field is
+    /// ignored until the next real TokenUsage arrives.
     pub post_compaction_used_tokens: Option<usize>,
     /// Verbatim text of the message that is currently running. Set
     /// on every submit, cleared on turn-complete. When the user hits
@@ -353,7 +353,7 @@ pub struct UiState {
     /// `AgentEvent::SubAgentDispatchStart` so the UI can look up a
     /// child's display path from the `index` field on Started/Done/
     /// Failed events. Cleared on `on_sub_agent_dispatch_end`.
-    pub sub_agent_tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    pub sub_agent_tasks: Vec<crate::event_loop::ui_event::SubAgentTaskInfo>,
     /// Number of failed sub-agents in the current dispatch — tracked
     /// separately from `sub_agent_done` so the aggregate summary can
     /// distinguish "6/7 ok · 1 fail" from "7/7 ok". Reset on each new
@@ -563,8 +563,7 @@ impl UiState {
     }
 
     /// Merge one `AgentEvent::ContextStats` emission into the cached
-    /// snapshot. The agent side fires two emissions per turn: one narrow
-    /// (from `TurnRunner`) and one rich (from `handle_send_message`).
+    /// snapshot. The runtime may emit a narrow update followed by a rich update.
     /// Each leaves the fields it doesn't know at 0 / empty — we keep the
     /// most-recent non-zero value per field so either order works.
     pub fn on_context_stats(
@@ -585,7 +584,7 @@ impl UiState {
         if is_rich {
             snap.system_tokens = system_tokens;
             // A rich emission with `sent_tokens == 0` means "no completed turn yet
-            // this engine session" (the v2 bridge's `last_usage` is None), NOT a
+            // this runtime generation" (`last_usage` is None), NOT a
             // genuine zero occupancy — `emit_context_stats` never reports a real 0.
             // Preserve a value restored from the persisted session on resume so
             // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
@@ -910,7 +909,7 @@ impl UiState {
 
     pub fn on_thinking(&mut self) {
         // A model round is starting. Restore Streaming if we'd fallen back to
-        // Idle: a `/goal` continuation runs SERVER-SIDE (the bridge injects the
+        // Idle: a `/goal` continuation runs inside CodingRuntime (its controller injects the
         // next round, it never flows through the local `on_submit` that normally
         // sets Streaming), so without this the TUI can sit in Idle while the
         // agent keeps looping — and Esc / Ctrl+C, which only reach the cancel
@@ -929,7 +928,7 @@ impl UiState {
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
         //
-        // EXCEPT during a parallel batch: the bridge emits PhaseChange(Thinking)
+        // EXCEPT during a parallel batch: the runtime projection emits PhaseChange(Thinking)
         // after every ToolResult, so in a batch these interleave with the tool
         // events and would restart the clock on each completion — the spinner's
         // elapsed-ms flicker 0→N→0. The batch anchors the clock once
@@ -947,7 +946,7 @@ impl UiState {
     /// spinner label since `pool.execute_all` blocks the loop.
     pub fn on_sub_agent_dispatch_start(
         &mut self,
-        tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+        tasks: Vec<crate::event_loop::ui_event::SubAgentTaskInfo>,
     ) {
         self.sub_agent_total = tasks.len();
         self.sub_agent_done = 0;
@@ -1220,8 +1219,8 @@ mod tests {
 
     #[test]
     fn refresh_with_zero_sent_does_not_clobber_restored_gauge() {
-        // `/context` after resume dispatches RefreshContextStats; the v2 bridge
-        // replies with sent_tokens=0 (last_usage None) but a real window. That
+        // `/context` after resume dispatches RefreshContextStats; the runtime can
+        // reply with sent_tokens=0 (last_usage None) but a real window. That
         // "unknown" 0 must not wipe the value restored from the persisted session.
         let mut s = UiState::new();
         s.restore_context(42_000, 200_000);
@@ -1618,7 +1617,7 @@ mod tests {
 
     #[test]
     fn thinking_does_not_reset_phase_clock_during_batch() {
-        // The bridge emits PhaseChange(Thinking) after EVERY ToolResult, so in a
+        // The runtime projection emits PhaseChange(Thinking) after every ToolResult, so in a
         // parallel batch these interleave with the tool events. on_thinking must
         // NOT restart the phase clock then — otherwise the spinner ms still
         // flickers 0→N→0 even with the tool-event guards.
@@ -1675,8 +1674,8 @@ mod tests {
         assert_eq!(AgentMode::default(), AgentMode::Build);
     }
 
-    fn task_info(path: &str, dedup: &str) -> atomcode_core::agent::SubAgentTaskInfo {
-        atomcode_core::agent::SubAgentTaskInfo {
+    fn task_info(path: &str, dedup: &str) -> crate::event_loop::ui_event::SubAgentTaskInfo {
+        crate::event_loop::ui_event::SubAgentTaskInfo {
             path: path.to_string(),
             dedup_suffix: dedup.to_string(),
         }

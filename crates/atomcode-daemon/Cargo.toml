@@ -18,10 +18,7 @@ atomcode-core = { path = "../atomcode-core" }
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
 atomcode-capabilities = { path = "../atomcode-capabilities" }
-# Engine v2: drive the new stack behind the legacy command/event protocol. The
-# daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
-atomcode-bridge = { path = "../atomcode-bridge" }
-# Kernel-native runtime (Task 1: scaffold; nothing calls it yet).
+# Unified native runtime used by daemon live/chat/session paths.
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }

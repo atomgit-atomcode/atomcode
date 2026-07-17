@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
-use atomcode_core::agent::{AgentClient, AgentCommand, AgentEvent};
 use atomcode_config::config::Config;
 use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::{Conversation, ConversationSnapshot};
@@ -33,7 +32,6 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use crate::approval_mode::ApprovalMode;
 use crate::CachedMcpRegistry;
-use crate::kernel_runtime::DaemonRuntimeEvent;
 
 pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecision {
     match mode {
@@ -59,12 +57,12 @@ static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex:
 static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// 当前 LiveSession 选中的 provider（模型）。None=用 config.default_provider。
-/// webui 每次 /live/message 带上 provider 时更新；DaemonTurnExecutor::run_turn 每轮读取，
+/// webui 每次 /live/message 带上 provider 时更新；KernelTurnExecutor::run_turn 每轮读取，
 /// 因此在 sync/live 模式下切换模型才能对下一轮生效（执行器是 Arc<dyn> 不可变，故用进程级覆盖）。
 static LIVE_PROVIDER: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// 当前 LiveSession 的审批模式（webui 底栏「模式」pill 切换，默认 Build）。
-/// `/live/mode` 端点写入；DaemonTurnExecutor::run_turn 每轮读取以选择 PermissionDecider，
+/// `/live/mode` 端点写入；KernelTurnExecutor::run_turn 每轮读取以选择 PermissionDecider，
 /// 因此在 sync/live 模式下切换模式对下一轮生效（执行器 Arc<dyn> 不可变，沿用 LIVE_PROVIDER
 /// 的进程级覆盖范式）。跨 tab / TUI 通过 LiveEvent::ModeChanged 广播同步。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
@@ -81,7 +79,7 @@ fn live_current_mode_wire() -> String {
 }
 
 /// 当前 LiveSession 的 telemetry mode（来自 X-AtomCode-Client 请求头）。
-/// live_message / live_stream 端点写入；DaemonTurnExecutor::run_turn 读取后设置
+/// live_message / live_stream 端点写入；KernelTurnExecutor::run_turn 读取后设置
 /// CurrentContext.mode，确保 live 路径发出的遥测事件携带正确的 client 来源。
 static LIVE_MODE: StdMutex<Option<atomcode_telemetry::SessionMode>> = StdMutex::new(None);
 
@@ -100,19 +98,6 @@ fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| fallback.to_path_buf())
-}
-
-fn send_agent_command(
-    client: &AgentClient,
-    command: AgentCommand,
-    action: &str,
-) -> Result<(), TurnEvent> {
-    client.cmd_tx.send(command).map_err(|_| {
-        TurnEvent::Error(format!(
-            "engine v2：{}失败，kernel 命令通道已关闭，请重试本轮会话",
-            action
-        ))
-    })
 }
 
 struct AuthoritativeTerminal {
@@ -427,6 +412,46 @@ pub(crate) struct TurnParts {
     pub system_prompt: String,
 }
 
+fn resolve_live_provider_switch(
+    current: &atomcode_coding::CodingAgentConfig,
+    config: &Config,
+    provider_name: &str,
+) -> Result<atomcode_coding::CodingAgentConfig, String> {
+    let provider = config
+        .providers
+        .get(provider_name)
+        .ok_or_else(|| format!("provider '{provider_name}' 不存在"))?;
+    let mut next = current.clone();
+    atomcode_coding::apply_provider_config(&mut next, provider);
+    Ok(next)
+}
+
+fn ai_rename_session_file(
+    working_dir: &std::path::Path,
+    session_id: &atomcode_core::session::SessionId,
+    new_name: &str,
+) -> std::io::Result<bool> {
+    use atomcode_core::session::SessionManager;
+
+    let mut session = SessionManager::load_any(session_id)?;
+    if !atomcode_coding::session_title::should_accept_ai_name(
+        session.user_renamed,
+        session.ai_named,
+    ) {
+        return Ok(false);
+    }
+    session.name = new_name.to_string();
+    session.ai_named = true;
+    session.touch();
+    let save_dir = if session.working_dir.as_os_str().is_empty() {
+        working_dir.to_path_buf()
+    } else {
+        session.working_dir.clone()
+    };
+    SessionManager::new(&save_dir).save(&session)?;
+    Ok(true)
+}
+
 /// 独立构造 turn 组件（与 process_chat_request 等价，但不复用其代码）。
 /// `provider_name` 为 None 时用 config.default_provider。
 pub(crate) async fn build_turn_parts(
@@ -583,44 +608,44 @@ pub(crate) async fn build_turn_parts(
     })
 }
 
-
 // ============================================================================
-// Engine v2: kernel-backed TurnExecutor (via atomcode-bridge)
+// Kernel-backed native TurnExecutor
 // ============================================================================
 
-/// `TurnExecutor` backed by the new stack, presented through atomcode-bridge's
-/// legacy channel protocol. ONE bridge runtime per LiveSession (persistent across
+/// `TurnExecutor` backed by one native runtime per LiveSession (persistent across
 /// turns) so MCP/memory are prepared once, not per message. `conv` stays the
-/// source of truth: the bridge is seeded from it on the first turn, then each turn
+/// source of truth: the runtime is seeded from it on the first turn, then each turn
 /// sends only the new user message and the engine's resulting snapshot is written
 /// back.
 pub(crate) struct KernelTurnExecutor {
     working_dir: PathBuf,
     provider_name: Option<String>,
     /// Phase-2 default false (interactive); the approver slot is wired to the
-    /// bridge's ApproveTool/DenyTool exactly as the legacy executor wires it to
-    /// the PermissionDecider.
+    /// runtime request/response path.
     auto_approve: bool,
     session_id: atomcode_core::session::SessionId,
     telemetry: Arc<Telemetry>,
-    /// Persistent bridge runtime; built lazily on the first turn.
-    bridge: Mutex<Option<BridgeState>>,
+    /// Persistent native runtime; built lazily on the first turn.
+    runtime: Mutex<Option<NativeRuntimeState>>,
 }
 
-struct BridgeState {
-    client: AgentClient,
-    events: mpsc::UnboundedReceiver<DaemonRuntimeEvent>,
-    /// Whether the pre-existing history has been seeded into the bridge.
+struct NativeRuntimeState {
+    handle: atomcode_coding::CodingRuntimeHandle,
+    events: atomcode_coding::CodingRuntimeEvents,
+    _task: tokio::task::JoinHandle<atomcode_coding::RuntimeExit>,
+    coding_cfg: atomcode_coding::CodingAgentConfig,
+    projector: KernelTurnProjector,
+    /// Whether the pre-existing history has been seeded into the runtime.
     seeded: bool,
-    /// The provider name used to build this bridge. Compared against
+    /// The provider name used to build this runtime. Compared against
     /// `LIVE_PROVIDER` on each `run_turn` to detect model switches
-    /// that require a `ReloadConfig` to the bridge runtime.
+    /// that require a native provider reload.
     provider_name: String,
-    /// The working directory this bridge is currently rooted at. Compared
+    /// The working directory this runtime is currently rooted at. Compared
     /// against `LIVE_WORKING_DIR` on each `run_turn` to detect a `/cd` that
-    /// requires a `ChangeDir` (→ bridge respawn(Fresh)) so the new project's
+    /// requires a native reprepare so the new project's
     /// system prompt / context bind. Without this, a sync-mode `/cd` updates
-    /// the override but the bridge's frozen session context still names the
+    /// the override but the runtime's session context still names the
     /// old project — the model reports the stale cwd (issue #755).
     working_dir: std::path::PathBuf,
 }
@@ -639,12 +664,12 @@ impl KernelTurnExecutor {
             auto_approve,
             session_id,
             telemetry,
-            bridge: Mutex::new(None),
+            runtime: Mutex::new(None),
         }
     }
 
     /// Resolve the currently active provider name using the same precedence as
-    /// `bridge_config`: LIVE_PROVIDER → executor default → config default.
+    /// `runtime_config`: LIVE_PROVIDER → executor default → config default.
     fn resolve_provider_name(&self) -> String {
         let live = LIVE_PROVIDER
             .lock()
@@ -658,18 +683,18 @@ impl KernelTurnExecutor {
             })
     }
 
-    /// Resolve the bridge config from the live provider selection + on-disk config.
+    /// Resolve the runtime config from the live provider selection + on-disk config.
     /// Mirrors `build_turn_parts`' provider resolution (LIVE_PROVIDER → executor
     /// default → config default).
-    fn bridge_config(&self) -> Option<atomcode_bridge::BridgeConfig> {
+    fn runtime_config(&self) -> Option<atomcode_coding::CodingRuntimeConfig> {
         let config = Config::load(&Config::default_path()).ok()?;
         let name = self.resolve_provider_name();
         let p = config.providers.get(&name)?;
-        Some(atomcode_bridge::BridgeConfig {
+        Some(atomcode_coding::CodingRuntimeConfig {
             api_key: p.api_key.clone().unwrap_or_default(),
             base_url: p.base_url.clone().unwrap_or_default(),
             model: p.model.clone(),
-            // Honor a live `/cd` override (issue #755) when first building the bridge;
+            // Honor a live `/cd` override (issue #755) when first building the runtime;
             // falls back to the executor's creation dir.
             working_dir: live_current_working_dir(&self.working_dir),
             context_window: p.context_window as u32,
@@ -683,7 +708,7 @@ impl KernelTurnExecutor {
             thinking_type: p.thinking_type.clone(),
             thinking_keep: p.thinking_keep.clone(),
             // The daemon answers approvals at its OWN driver seam (the `/live`
-            // BypassAll decider / `/chat` interactive perm_rx), so the bridge must
+            // BypassAll decider / `/chat` interactive perm_rx), so the runtime must
             // NOT auto-approve — keep the round-trip and the daemon decides.
             dangerously_skip_permissions: false,
             // Keep the fail-closed approval timeout for the daemon (current behavior); the
@@ -693,42 +718,9 @@ impl KernelTurnExecutor {
             user_agent: p.user_agent.clone(),
             skip_tls_verify: p.skip_tls_verify,
             loop_max_rounds: config.loop_config.max_rounds,
+            subagent_config: Some(Arc::new(config.clone())),
         })
     }
-}
-
-/// Persist an AI-generated session rename without setting `user_renamed`.
-/// Guards with `should_accept_ai_name` — silently no-ops if the session has
-/// already been user-renamed or has a non-default AI name.
-/// Returns `Ok(true)` when the AI name was actually applied+persisted, `Ok(false)`
-/// when the guard rejected it (already user-renamed / already AI-named) so the
-/// caller can skip the broadcast — otherwise browser tabs would flip to a name
-/// that was never persisted (and could contradict an explicit `/rename`).
-fn ai_rename_session_file(
-    working_dir: &std::path::Path,
-    session_id: &atomcode_core::session::SessionId,
-    new_name: &str,
-) -> std::io::Result<bool> {
-    use atomcode_core::session::SessionManager;
-    let mut session = SessionManager::load_any(session_id)?;
-    if !atomcode_core::agent::session_title::should_accept_ai_name(
-        session.user_renamed,
-        session.ai_named,
-    ) {
-        return Ok(false);
-    }
-    session.name = new_name.to_string();
-    session.ai_named = true;
-    session.touch();
-    // Save via the session's own working_dir (most accurate); fall back to the
-    // executor working_dir only if the session's stored path is missing/wrong.
-    let save_dir = if session.working_dir.as_os_str().is_empty() {
-        working_dir.to_path_buf()
-    } else {
-        session.working_dir.clone()
-    };
-    SessionManager::new(&save_dir).save(&session)?;
-    Ok(true)
 }
 
 /// Pull the text + images out of the just-appended user message.
@@ -785,66 +777,102 @@ impl TurnExecutor for KernelTurnExecutor {
             let _ = events.send(LiveEvent::Turn(te));
         };
 
-        // Lazily build the persistent bridge for this LiveSession.
-        let mut guard = self.bridge.lock().await;
+        // Lazily build the persistent runtime for this LiveSession.
+        let mut guard = self.runtime.lock().await;
         if guard.is_none() {
-            let Some(cfg) = self.bridge_config() else {
-                emit(TurnEvent::Error("engine v2：provider 未配置".into()));
+            let Some(cfg) = self.runtime_config() else {
+                emit(TurnEvent::Error("native runtime：provider 未配置".into()));
                 return;
             };
             let provider_name = self.resolve_provider_name();
             let working_dir = live_current_working_dir(&self.working_dir);
-            let (client, rx) = crate::kernel_runtime::spawn_daemon_runtime(cfg);
-            *guard = Some(BridgeState {
-                client,
-                events: rx,
+            let (runtime, coding_cfg) = match crate::start_native_runtime(cfg).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    emit(TurnEvent::Error(error.to_string()));
+                    return;
+                }
+            };
+            let atomcode_coding::CodingRuntime {
+                handle,
+                events: runtime_events,
+                task,
+                ..
+            } = runtime;
+            *guard = Some(NativeRuntimeState {
+                handle,
+                events: runtime_events,
+                _task: task,
+                projector: KernelTurnProjector::default(),
+                coding_cfg,
                 seeded: false,
                 provider_name,
                 working_dir,
             });
         }
 
-        // Detect model switch: if LIVE_PROVIDER changed since this bridge was built,
-        // send ReloadConfig so the bridge runtime updates its system prompt, provider,
+        // Detect model switch: if LIVE_PROVIDER changed since this runtime was built,
+        // reassemble the native runtime so its system prompt, provider,
         // and context strategy. Without this, a webui dropdown switch updates
-        // LIVE_PROVIDER but the bridge's frozen system prompt still carries the old
+        // LIVE_PROVIDER but the runtime's frozen system prompt still carries the old
         // model name — the agent mis-identifies itself (issue #659).
-        let (client, should_seed) = {
+        let (runtime, should_seed) = {
             let current_provider = self.resolve_provider_name();
             let state = guard.as_mut().unwrap();
             if current_provider != state.provider_name {
-                if let Ok(new_config) = Config::load(&Config::default_path()) {
-                    let _ = state
-                        .client
-                        .cmd_tx
-                        .send(atomcode_core::agent::AgentCommand::ReloadConfig(new_config));
+                let new_config = match Config::load(&Config::default_path()) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        emit(TurnEvent::Error(format!("加载 provider 配置失败：{error}")));
+                        return;
+                    }
+                };
+                let next = match resolve_live_provider_switch(
+                    &state.coding_cfg,
+                    &new_config,
+                    &current_provider,
+                ) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        emit(TurnEvent::Error(format!("切换 provider 失败：{error}")));
+                        return;
+                    }
+                };
+                match state.handle.reassemble_provider(next.clone()).await {
+                    Ok(_) => {
+                        state.projector = KernelTurnProjector::default();
+                        state.coding_cfg = next;
+                    }
+                    Err(error) => {
+                        emit(TurnEvent::Error(format!("切换 provider 失败：{error}")));
+                        return;
+                    }
                 }
                 state.provider_name = current_provider;
             }
 
             // Detect working-dir switch: a sync-mode `/cd` updated LIVE_WORKING_DIR but the
-            // persistent bridge is still rooted at the old project (its session context is
-            // frozen at prepare time). Send ChangeDir so the bridge respawn(Fresh)es into the
+            // persistent runtime is still rooted at the old project (its session context is
+            // frozen at prepare time). Reprepare it so the new project owns the
             // new dir — the SAME mechanism the TUI uses — rebinding persona/context/cwd.
             // Mirrors the model-switch detection above (issue #755). NOTE: respawn(Fresh)
             // starts the new project's conversation empty; `seeded` stays true so we do NOT
             // re-push the old project's history (matches /cd = a fresh session in the new dir).
             let current_dir = live_current_working_dir(&self.working_dir);
             if current_dir != state.working_dir {
-                let _ = state
-                    .client
-                    .cmd_tx
-                    .send(atomcode_core::agent::AgentCommand::ChangeDir(
-                        current_dir.to_string_lossy().into_owned(),
-                    ));
+                if let Err(error) = state.handle.change_directory(current_dir.clone()).await {
+                    emit(TurnEvent::Error(format!("切换工作目录失败：{error}")));
+                    return;
+                }
+                state.coding_cfg.working_dir = current_dir.clone();
                 state.working_dir = current_dir;
             }
 
-            (state.client.clone(), !state.seeded)
+            (state.handle.clone(), !state.seeded)
         };
 
         // `conv` already has the just-typed user message appended (coordinator).
-        // Split it off: the prefix seeds the bridge (first turn only), the last
+        // Split it off: the prefix seeds the runtime (first turn only), the last
         // message is sent as this turn's input. `turn_base` keeps the FULL message
         // list (incl. the user message) for the crash-durable in-progress saves below.
         let (prefix, user_text, user_images, turn_base) = {
@@ -878,41 +906,37 @@ impl TurnExecutor for KernelTurnExecutor {
         } else {
             live_current_approval_mode()
         };
-        if let Err(event) = send_agent_command(
-            &client,
-            AgentCommand::SetPlanMode(effective_mode == ApprovalMode::Plan),
-            "切换 Plan 模式",
-        ) {
+        let mode = if effective_mode == ApprovalMode::Plan {
+            atomcode_coding::RuntimeMode::Plan
+        } else {
+            atomcode_coding::RuntimeMode::Build
+        };
+        if let Err(error) = runtime.set_mode(mode).await {
             *guard = None;
-            emit(event);
+            emit(TurnEvent::Error(format!("切换模式失败：{error}")));
             return;
         }
 
         if should_seed {
-            if let Err(event) = send_agent_command(
-                &client,
-                AgentCommand::SetConversation {
-                    snapshot: prefix,
-                    restore_id: None,
-                },
-                "初始化桥接会话",
-            ) {
+            if let Err(error) = runtime
+                .restore_snapshot(crate::legacy_convert::snapshot_to_kernel(&prefix))
+                .await
+            {
                 *guard = None;
-                emit(event);
+                emit(TurnEvent::Error(format!("初始化会话失败：{error}")));
                 return;
             }
         }
-        if let Err(event) = send_agent_command(
-            &client,
-            AgentCommand::SendMessage {
-                text: user_text,
-                images: user_images,
-                image_markers: Vec::new(),
-            },
-            "发送用户消息",
-        ) {
+        let input = atomcode_coding::UserInput {
+            text: user_text,
+            images: user_images
+                .iter()
+                .map(crate::legacy_convert::image_to_kernel)
+                .collect(),
+        };
+        if let Err(error) = runtime.submit(input).await {
             *guard = None;
-            emit(event);
+            emit(TurnEvent::Error(format!("发送用户消息失败：{error}")));
             return;
         }
         if should_seed {
@@ -965,62 +989,176 @@ impl TurnExecutor for KernelTurnExecutor {
 
         let state = guard.as_mut().unwrap();
         let mut cancelled = false;
-        let mut bridge_dead = false;
-        let final_messages = loop {
-            let ev = tokio::select! {
-                _ = cancel.cancelled(), if !cancelled => {
-                    cancelled = true;
-                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                    continue;
-                }
-                ev = state.events.recv() => ev,
-            };
-            let Some(ev) = ev else {
-                // Bridge task exited (channel closed). Drop it after the loop so the
-                // next turn respawns instead of no-op'ing on a dead bridge forever.
-                bridge_dead = true;
-                break None;
-            };
-            let ev = match ev {
-                DaemonRuntimeEvent::Legacy(event) => event,
-                DaemonRuntimeEvent::TurnCancelledWithoutSnapshot {
-                    runtime_terminated,
-                } => {
-                    bridge_dead |= runtime_terminated;
-                    break None;
-                }
-                DaemonRuntimeEvent::Native(event) => {
-                    let compact_snapshot = match committed_compaction_snapshot(&event) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            emit(TurnEvent::Error(error.into()));
+        let mut runtime_dead = false;
+        let mut pending_events = std::collections::VecDeque::<TurnEvent>::new();
+        let final_messages = 'turn: loop {
+            let ev = if let Some(event) = pending_events.pop_front() {
+                event
+            } else {
+                loop {
+                    let event = tokio::select! {
+                        _ = cancel.cancelled(), if !cancelled => {
+                            cancelled = true;
+                            let _ = runtime.cancel().await;
                             continue;
                         }
+                        event = state.events.recv() => event,
                     };
-                    if let Some(snapshot) = compact_snapshot {
-                        {
-                            let mut conversation = conv.lock().await;
-                            *conversation = Conversation::from_snapshot(snapshot.clone());
+                    let Some(event) = event.map(|event| event.event) else {
+                        runtime_dead = true;
+                        emit(TurnEvent::Error(
+                            "coding runtime event stream closed before turn terminal".into(),
+                        ));
+                        break 'turn None;
+                    };
+                    match event {
+                        CodingRuntimeEvent::Agent(event) => {
+                            if let Some(event) = state.projector.project(event) {
+                                break event;
+                            }
                         }
-                        if let Err(error) = save_live_compaction_json(
-                            &self.working_dir,
-                            &self.session_id,
-                            snapshot,
-                        ) {
-                            emit(TurnEvent::Error(format!(
-                                "compact session save failed: {error}"
-                            )));
-                            continue;
+                        CodingRuntimeEvent::Request(request) => {
+                            use atomcode_capabilities::tools::{
+                                ApprovalRequest, ApprovalResponse, APPROVAL_KIND,
+                            };
+                            if request.kind != APPROVAL_KIND {
+                                let _ = runtime.respond(request.id, serde_json::Value::Null).await;
+                                continue;
+                            }
+                            let approval: ApprovalRequest =
+                                match serde_json::from_value(request.payload) {
+                                    Ok(approval) => approval,
+                                    Err(_) => {
+                                        let _ = runtime
+                                            .respond(request.id, serde_json::Value::Null)
+                                            .await;
+                                        continue;
+                                    }
+                                };
+                            let call_id = approval.call_id.clone();
+                            emit(TurnEvent::ApprovalRequested {
+                                tool_name: approval.tool.clone(),
+                                reason: "Requires approval".into(),
+                                call: atomcode_core::tool::ToolCall {
+                                    id: approval.call_id,
+                                    name: approval.tool,
+                                    arguments: approval.args,
+                                },
+                                snapshot: ConversationSnapshot::default(),
+                            });
+                            let decision = match &mut perm_rx {
+                                None => fallback_approval_decision(effective_mode),
+                                Some(rx) => tokio::select! {
+                                    _ = cancel.cancelled(), if !cancelled => {
+                                        cancelled = true;
+                                        let _ = runtime.cancel().await;
+                                        PermissionDecision::Deny
+                                    }
+                                    decision = rx.recv() => decision.unwrap_or(PermissionDecision::Deny),
+                                },
+                            };
+                            let (decision_str, response) = match decision {
+                                PermissionDecision::Allow => ("allow", ApprovalResponse::allow()),
+                                PermissionDecision::AllowAlways => {
+                                    ("always_allow", ApprovalResponse::allow_always())
+                                }
+                                _ => ("deny", ApprovalResponse::deny()),
+                            };
+                            emit(TurnEvent::ApprovalResolved {
+                                call_id,
+                                decision: decision_str.into(),
+                            });
+                            let value =
+                                serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                            let _ = runtime.respond(request.id, value).await;
                         }
+                        CodingRuntimeEvent::TurnFinished(
+                            atomcode_coding::TurnCompletion::Completed {
+                                reason, snapshot, ..
+                            },
+                        ) => {
+                            break 'turn Some(AuthoritativeTerminal {
+                                snapshot: crate::legacy_convert::snapshot_to_core(
+                                    snapshot.as_ref(),
+                                ),
+                                cancelled: matches!(
+                                    reason,
+                                    atomcode_kernel::event::StopReason::Cancelled
+                                ),
+                            });
+                        }
+                        CodingRuntimeEvent::TurnFinished(
+                            atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. },
+                        ) => {
+                            emit(TurnEvent::Error(error.message));
+                            break 'turn None;
+                        }
+                        event @ CodingRuntimeEvent::CompactionStarted { .. }
+                        | event @ CodingRuntimeEvent::CompactionFinished { .. } => {
+                            let compact_snapshot = match committed_compaction_snapshot(&event) {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    emit(TurnEvent::Error(error.into()));
+                                    continue;
+                                }
+                            };
+                            if let Some(snapshot) = compact_snapshot {
+                                {
+                                    let mut conversation = conv.lock().await;
+                                    *conversation = Conversation::from_snapshot(snapshot.clone());
+                                }
+                                if let Err(error) = save_live_compaction_json(
+                                    &self.working_dir,
+                                    &self.session_id,
+                                    snapshot,
+                                ) {
+                                    emit(TurnEvent::Error(format!(
+                                        "compact session save failed: {error}"
+                                    )));
+                                    continue;
+                                }
+                            }
+                            if let Some(event) = coding_runtime_to_turn(event) {
+                                emit(event);
+                            }
+                        }
+                        CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
+                            emit(TurnEvent::WorkingDirChanged(directory));
+                        }
+                        CodingRuntimeEvent::SessionNameSuggested { name } => {
+                            match ai_rename_session_file(
+                                &self.working_dir,
+                                &self.session_id,
+                                &name,
+                            ) {
+                                Ok(true) => {
+                                    let _ = events.send(LiveEvent::SessionRenamed {
+                                        session_id: self.session_id.to_string(),
+                                        name,
+                                    });
+                                }
+                                Ok(false) => {}
+                                Err(error) => emit(TurnEvent::Warning(format!(
+                                    "session rename persist failed: {error}"
+                                ))),
+                            }
+                        }
+                        CodingRuntimeEvent::ControllerWarning(message) => {
+                            emit(TurnEvent::Warning(message));
+                        }
+                        CodingRuntimeEvent::RuntimeStopped(_) => {
+                            runtime_dead = true;
+                            emit(TurnEvent::Error(
+                                "coding runtime stopped before turn terminal".into(),
+                            ));
+                            break 'turn None;
+                        }
+                        _ => {}
                     }
-                    if let Some(event) = coding_runtime_to_turn(event) {
-                        emit(event);
-                    }
-                    continue;
                 }
             };
             match ev {
-                AgentEvent::TextDelta(t) => {
+                TurnEvent::TextDelta(t) => {
                     // fix B: accumulate, then throttle a crash-durable progress save.
                     assistant_buf.push_str(&t);
                     emit(TurnEvent::TextDelta(t));
@@ -1032,11 +1170,11 @@ impl TurnExecutor for KernelTurnExecutor {
                         persisted_len = assistant_buf.len();
                     }
                 }
-                AgentEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
-                AgentEvent::ToolCallStreaming { name, hint } => {
+                TurnEvent::ReasoningDelta(t) => emit(TurnEvent::ReasoningDelta(t)),
+                TurnEvent::ToolCallStreaming { name, hint } => {
                     emit(TurnEvent::ToolCallStreaming { name, hint })
                 }
-                AgentEvent::ToolCallStarted {
+                TurnEvent::ToolCallStarted {
                     id,
                     name,
                     arguments,
@@ -1055,10 +1193,10 @@ impl TurnExecutor for KernelTurnExecutor {
                         arguments,
                     })
                 }
-                AgentEvent::ToolOutputChunk { call_id, chunk } => {
+                TurnEvent::ToolOutputChunk { call_id, chunk } => {
                     emit(TurnEvent::ToolOutputChunk { call_id, chunk })
                 }
-                AgentEvent::ToolCallResult {
+                TurnEvent::ToolCallResult {
                     call_id,
                     name,
                     output,
@@ -1071,87 +1209,20 @@ impl TurnExecutor for KernelTurnExecutor {
                     success,
                     duration,
                 }),
-                AgentEvent::TokenUsage(u) => emit(TurnEvent::TokenUsage {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
-                    total_tokens: u.prompt_tokens + u.completion_tokens,
-                    cached_tokens: u.cached_tokens,
-                }),
-                AgentEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                    ..
-                } => emit(TurnEvent::ContextStats {
-                    system_tokens,
-                    sent_tokens,
-                    dropped_tokens,
-                    working_set_tokens,
-                    total_messages,
-                }),
-                AgentEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
-                AgentEvent::Warning(w) => emit(TurnEvent::Warning(w)),
-                AgentEvent::ApprovalNeeded {
-                    tool_name,
-                    reason,
-                    call,
-                    snapshot,
-                } => {
-                    let call_id = call.id.clone();
-                    emit(TurnEvent::ApprovalRequested {
-                        tool_name,
-                        reason,
-                        call,
-                        snapshot,
-                    });
-                    let decision = match &mut perm_rx {
-                        None => fallback_approval_decision(effective_mode),
-                        Some(rx) => {
-                            tokio::select! {
-                                _ = cancel.cancelled(), if !cancelled => {
-                                    cancelled = true;
-                                    // Deny this tool AND stop the turn — without the
-                                    // Cancel the outer cancel branch is now disabled
-                                    // (`if !cancelled`) so the turn would otherwise run
-                                    // on after a single denied tool.
-                                    let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                                    PermissionDecision::Deny
-                                }
-                                d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
-                            }
-                        }
-                    };
-                    // 广播审批已解决，让其他视图（App/WebUI）同步卡片状态。
-                    let decision_str = match decision {
-                        PermissionDecision::Allow => "allow",
-                        PermissionDecision::AllowAlways => "always_allow",
-                        _ => "deny",
-                    };
-                    emit(TurnEvent::ApprovalResolved {
-                        call_id,
-                        decision: decision_str.to_string(),
-                    });
-                    let cmd = match decision {
-                        PermissionDecision::Allow => AgentCommand::ApproveTool,
-                        PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
-                        PermissionDecision::Ask(_) | PermissionDecision::Deny => {
-                            AgentCommand::DenyTool
-                        }
-                    };
-                    let _ = client.cmd_tx.send(cmd);
-                }
-                AgentEvent::Error { error, .. } => {
-                    // NON-terminal. The bridge forwards the kernel error HERE and then
+                event @ TurnEvent::TokenUsage { .. } => emit(event),
+                event @ TurnEvent::ContextStats { .. } => emit(event),
+                TurnEvent::WorkingDirChanged(p) => emit(TurnEvent::WorkingDirChanged(p)),
+                TurnEvent::Warning(w) => emit(TurnEvent::Warning(w)),
+                TurnEvent::Error(error) => {
+                    // NON-terminal. The runtime forwards the kernel error HERE and then
                     // still emits a terminal TurnComplete/TurnCancelled (or closes the
-                    // channel). Breaking now would (a) write back the bridge's empty
+                    // channel). Breaking now would (a) write back an empty
                     // `messages` and WIPE the conversation + on-disk session, and (b)
-                    // leave the bridge's later terminal events to be mis-read by the
+                    // leave the runtime's later terminal events to be mis-read by the
                     // NEXT turn. Surface the error and keep draining to the real end.
                     emit(TurnEvent::Error(error));
                 }
-                AgentEvent::RateLimited {
+                TurnEvent::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
@@ -1164,40 +1235,10 @@ impl TurnExecutor for KernelTurnExecutor {
                     auto_resuming,
                     server_message,
                 }),
-                AgentEvent::TurnCancelled { snapshot } => {
-                    break Some(AuthoritativeTerminal {
-                        snapshot,
-                        cancelled: true,
-                    })
-                }
-                AgentEvent::TurnComplete { snapshot, .. } => {
-                    break Some(AuthoritativeTerminal {
-                        snapshot,
-                        cancelled: false,
-                    })
-                }
-                AgentEvent::SessionRenamed { name } => {
-                    // Persist on the daemon side (AI rename: sets name + ai_named,
-                    // never user_renamed). Broadcast to browser tabs ONLY when the
-                    // rename was actually applied — a guard-rejected name (already
-                    // user-renamed / AI-named) must not flip every tab's title to a
-                    // value that was never persisted.
-                    match ai_rename_session_file(&self.working_dir, &self.session_id, &name) {
-                        Ok(true) => {
-                            let _ = events.send(LiveEvent::SessionRenamed {
-                                session_id: self.session_id.to_string(),
-                                name,
-                            });
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            emit(TurnEvent::Warning(format!(
-                                "session rename persist failed: {e}"
-                            )));
-                        }
-                    }
-                }
-                _ => {}
+                event @ TurnEvent::ToolBatchStarted { .. }
+                | event @ TurnEvent::ToolBatchCompleted { .. }
+                | event @ TurnEvent::ApprovalRequested { .. }
+                | event @ TurnEvent::ApprovalResolved { .. } => emit(event),
             }
         };
 
@@ -1212,7 +1253,7 @@ impl TurnExecutor for KernelTurnExecutor {
         // `save_live_session_json`.
         //
         // CRITICAL: only when the engine actually delivered a terminal snapshot. If the
-        // bridge died mid-turn (`final_messages == None`), `conv` was never updated this
+        // runtime died mid-turn (`final_messages == None`), `conv` was never updated this
         // turn, so persisting it would CLOBBER the richer in-progress save (fix A/B) with
         // a staler `[.., user]` list — losing the partial turn the user should still see.
         // A typed lifecycle-only cancellation also becomes None here: unlike a real
@@ -1220,11 +1261,7 @@ impl TurnExecutor for KernelTurnExecutor {
         if let Some(terminal) = final_messages {
             let snapshot = {
                 let mut c = conv.lock().await;
-                install_authoritative_terminal_snapshot(
-                    &mut c,
-                    terminal.snapshot,
-                    &turn_base,
-                );
+                install_authoritative_terminal_snapshot(&mut c, terminal.snapshot, &turn_base);
                 c.snapshot()
             };
             let cancelled_turn_base = terminal.cancelled.then_some(turn_base.as_slice());
@@ -1238,9 +1275,9 @@ impl TurnExecutor for KernelTurnExecutor {
             }
         }
 
-        // A dead bridge can't serve another turn — drop it so the next run_turn
+        // A dead runtime can't serve another turn — drop it so the next run_turn
         // rebuilds a fresh one (see the `guard.is_none()` lazy-init above).
-        if bridge_dead {
+        if runtime_dead {
             *guard = None;
         }
     }
@@ -1407,7 +1444,7 @@ fn save_live_session_state_json(
         .load(session_id)
         .unwrap_or_else(|_| Session::new(working_dir.to_path_buf()));
     // Net-loss guard: a stuck/divergent turn's later authoritative writeback (from a
-    // stale persistent bridge) could carry fewer turns than durability already saved,
+    // stale persistent runtime) could carry fewer turns than durability already saved,
     // reducing the `.json` to just the first turn AND bumping `updated_at` (re-sorting it
     // to the sidebar top). Refuse such a write: keep disk untouched, don't `touch()`.
     // See `save_would_lose_persisted_turns` (webui refresh-mid-turn bug).
@@ -1450,9 +1487,11 @@ fn cancelled_turn_rollback_matches(
             .map(serde_json::to_vec)
             .collect::<Result<Vec<_>, _>>()
     };
-    let (Ok(disk_users), Ok(incoming_users), Ok(turn_users)) =
-        (real_users(disk), real_users(incoming), real_users(turn_base))
-    else {
+    let (Ok(disk_users), Ok(incoming_users), Ok(turn_users)) = (
+        real_users(disk),
+        real_users(incoming),
+        real_users(turn_base),
+    ) else {
         return false;
     };
     let Some((_cancelled, prior_turn_users)) = turn_users.split_last() else {
@@ -1482,76 +1521,106 @@ fn save_live_compaction_json(
     manager.save(&session)
 }
 
-/// Simple 1:1 `AgentEvent` → `TurnEvent` translations (the streaming surface both
-/// the `/live` executor and the `/chat` v2 producer forward). Returns `None` for
-/// events the caller handles specially (approval, turn terminals) or ignores.
-pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
-    Some(match ev {
-        AgentEvent::TextDelta(t) => TurnEvent::TextDelta(t),
-        AgentEvent::ReasoningDelta(t) => TurnEvent::ReasoningDelta(t),
-        AgentEvent::ToolCallStreaming { name, hint } => TurnEvent::ToolCallStreaming { name, hint },
-        AgentEvent::ToolCallStarted {
-            id,
-            name,
-            arguments,
-        } => TurnEvent::ToolCallStarted {
-            id,
-            name,
-            arguments,
-        },
-        AgentEvent::ToolOutputChunk { call_id, chunk } => {
-            TurnEvent::ToolOutputChunk { call_id, chunk }
-        }
-        AgentEvent::ToolCallResult {
-            call_id,
-            name,
-            output,
-            success,
-            duration,
-        } => TurnEvent::ToolCallResult {
-            call_id,
-            name,
-            output,
-            success,
-            duration,
-        },
-        AgentEvent::TokenUsage(u) => TurnEvent::TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.prompt_tokens + u.completion_tokens,
-            cached_tokens: u.cached_tokens,
-        },
-        AgentEvent::ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            working_set_tokens,
-            total_messages,
-            ..
-        } => TurnEvent::ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            working_set_tokens,
-            total_messages,
-        },
-        AgentEvent::WorkingDirChanged(p) => TurnEvent::WorkingDirChanged(p),
-        AgentEvent::Warning(w) => TurnEvent::Warning(w),
-        AgentEvent::RateLimited {
-            reset_at_display,
-            reset_label,
-            secs_until_reset,
-            auto_resuming,
-            server_message,
-        } => TurnEvent::RateLimited {
-            reset_at_display,
-            reset_label,
-            secs_until_reset,
-            auto_resuming,
-            server_message,
-        },
-        _ => return None,
-    })
+#[derive(Default)]
+struct KernelTurnProjector {
+    live_tools: std::collections::HashMap<String, (String, std::time::Instant)>,
+}
+
+impl KernelTurnProjector {
+    fn project(&mut self, event: atomcode_kernel::event::AgentEvent) -> Option<TurnEvent> {
+        use atomcode_kernel::event::AgentEvent as Kernel;
+        Some(match event {
+            Kernel::TextDelta(text) => TurnEvent::TextDelta(text),
+            Kernel::Reasoning(text) => TurnEvent::ReasoningDelta(text),
+            Kernel::ToolCallStreaming {
+                name, arguments, ..
+            } => TurnEvent::ToolCallStreaming {
+                name: name.unwrap_or_else(|| "tool".into()),
+                hint: arguments.chars().take(80).collect(),
+            },
+            Kernel::ToolBatchStarted { batch_id, calls } => TurnEvent::ToolBatchStarted {
+                batch_id,
+                calls: calls
+                    .into_iter()
+                    .map(|call| atomcode_core::turn::event::ToolBatchCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                        parallel_safe: call.parallel_safe,
+                    })
+                    .collect(),
+            },
+            Kernel::ToolBatchCompleted {
+                batch_id,
+                ok,
+                total,
+                elapsed_ms,
+            } => TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok,
+                total,
+                elapsed_ms,
+            },
+            Kernel::ToolStarted { call } => {
+                self.live_tools.insert(
+                    call.id.clone(),
+                    (call.name.clone(), std::time::Instant::now()),
+                );
+                TurnEvent::ToolCallStarted {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                }
+            }
+            Kernel::ToolProgress { call_id, message } => {
+                TurnEvent::ToolOutputChunk { call_id, chunk: message }
+            }
+            Kernel::ToolResult { result } => {
+                let (name, started) = self
+                    .live_tools
+                    .remove(&result.call_id)
+                    .unwrap_or_else(|| ("tool".into(), std::time::Instant::now()));
+                TurnEvent::ToolCallResult {
+                    call_id: result.call_id,
+                    name,
+                    output: result.content,
+                    success: !result.is_error,
+                    duration: started.elapsed(),
+                }
+            }
+            Kernel::Usage(meta) => TurnEvent::TokenUsage {
+                prompt_tokens: meta.tokens.prompt as usize,
+                completion_tokens: meta.tokens.completion as usize,
+                total_tokens: (meta.tokens.prompt + meta.tokens.completion) as usize,
+                cached_tokens: meta.tokens.cached as usize,
+            },
+            Kernel::Error { message, .. } => TurnEvent::Error(message),
+            Kernel::Warning(message) => TurnEvent::Warning(message),
+            Kernel::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            } => TurnEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            },
+            Kernel::TurnStarted
+            | Kernel::Request { .. }
+            | Kernel::Snapshot { .. }
+            | Kernel::TurnComplete { .. }
+            | Kernel::Cancelled
+            | Kernel::Steered { .. }
+            | Kernel::CompactionStarted { .. }
+            | Kernel::Compacted { .. }
+            | Kernel::CompactionFailed { .. } => return None,
+            _ => return None,
+        })
+    }
 }
 
 /// Convert driver-neutral coding runtime events to the daemon streaming surface.
@@ -1560,26 +1629,22 @@ pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent
         CodingRuntimeEvent::CompactionStarted { .. } => None,
         CodingRuntimeEvent::CompactionFinished {
             completion: CompactionCompletion::Completed(outcome),
-        } if outcome.committed => {
-            Some(TurnEvent::Warning(
-                atomcode_config::i18n::format_compaction_mark(
-                    outcome.removed_messages,
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                ),
-            ))
-        }
+        } if outcome.committed => Some(TurnEvent::Warning(
+            atomcode_config::i18n::format_compaction_mark(
+                outcome.removed_messages,
+                outcome.estimated_tokens_before,
+                outcome.estimated_tokens_after,
+            ),
+        )),
         CodingRuntimeEvent::CompactionFinished {
             completion: CompactionCompletion::Completed(outcome),
-        } if outcome.is_manual() => {
-            Some(TurnEvent::TextDelta(
-                atomcode_config::i18n::format_compaction_noop(
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                    outcome.summary_would_grow(),
-                ),
-            ))
-        }
+        } if outcome.is_manual() => Some(TurnEvent::TextDelta(
+            atomcode_config::i18n::format_compaction_noop(
+                outcome.estimated_tokens_before,
+                outcome.estimated_tokens_after,
+                outcome.summary_would_grow(),
+            ),
+        )),
         CodingRuntimeEvent::CompactionFinished {
             completion:
                 CompactionCompletion::Interrupted {
@@ -1617,18 +1682,18 @@ fn committed_compaction_snapshot(
         .committed_snapshot
         .as_deref()
         .ok_or("compact completed without a resumable session snapshot")?;
-    Ok(Some(atomcode_bridge::convert::snapshot_to_core(snapshot)))
+    Ok(Some(crate::legacy_convert::snapshot_to_core(snapshot)))
 }
 
-/// Derive the bridge config for a `/chat` request from the resolved provider.
-pub(crate) fn chat_bridge_config(
+/// Derive the native runtime config for a `/chat` request.
+pub(crate) fn chat_runtime_config(
     config: &Config,
     provider_name: &str,
     working_dir: &Path,
     telemetry: Arc<Telemetry>,
-) -> atomcode_bridge::BridgeConfig {
+) -> atomcode_coding::CodingRuntimeConfig {
     let p = config.providers.get(provider_name);
-    atomcode_bridge::BridgeConfig {
+    atomcode_coding::CodingRuntimeConfig {
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
@@ -1646,7 +1711,7 @@ pub(crate) fn chat_bridge_config(
         thinking_type: p.and_then(|p| p.thinking_type.clone()),
         thinking_keep: p.and_then(|p| p.thinking_keep.clone()),
         // The daemon answers `/chat` approvals at its own seam (interactive perm_rx),
-        // so the bridge must keep the round-trip rather than auto-approving here.
+        // so the runtime must keep the round-trip rather than auto-approving here.
         dangerously_skip_permissions: false,
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
@@ -1654,10 +1719,11 @@ pub(crate) fn chat_bridge_config(
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         loop_max_rounds: config.loop_config.max_rounds,
+        subagent_config: Some(Arc::new(config.clone())),
     }
 }
 
-/// The engine-v2 producer for `/chat`: drive a bridged agent over `conv` and forward
+/// Drive a native runtime over `conv` and forward
 /// its events as `TurnEvent`s on `turn_tx` (which the shared `/chat` consumer turns
 /// into SSE). `perm_rx` carries interactive approval decisions from `/chat/permission`
 /// (`None` = auto-approve / standalone). The kernel snapshot is written back to `conv`
@@ -1666,13 +1732,28 @@ pub(crate) async fn run_chat_turn_v2(
     conv: Arc<Mutex<Conversation>>,
     turn_tx: mpsc::UnboundedSender<TurnEvent>,
     cancel: CancellationToken,
-    bridge_cfg: atomcode_bridge::BridgeConfig,
+    runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
     approval_mode: ApprovalMode,
 ) {
-    let (client, mut events) = crate::kernel_runtime::spawn_daemon_runtime(bridge_cfg);
+    use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
+    use atomcode_coding::{CodingRuntime, RuntimeMode, TurnCompletion};
 
-    // Seed the bridge from conv (which already has the just-sent user message), then
+    let (runtime, _coding_cfg) = match crate::start_native_runtime(runtime_cfg).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = turn_tx.send(TurnEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    let CodingRuntime {
+        handle,
+        mut events,
+        task,
+        ..
+    } = runtime;
+
+    // Seed the runtime from conv (which already has the just-sent user message), then
     // send that message to actually run the turn.
     let (prefix, user_text, user_images, turn_base) = {
         let c = conv.lock().await;
@@ -1698,53 +1779,115 @@ pub(crate) async fn run_chat_turn_v2(
     } else {
         user_images
     };
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SetConversation {
-            snapshot: prefix,
-            restore_id: None,
-        },
-        "初始化桥接会话",
-    ) {
-        let _ = turn_tx.send(event);
+    if let Err(error) = handle
+        .restore_snapshot(crate::legacy_convert::snapshot_to_kernel(&prefix))
+        .await
+    {
+        let _ = turn_tx.send(TurnEvent::Error(format!("初始化会话失败：{error}")));
         return;
     }
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SetPlanMode(approval_mode == ApprovalMode::Plan),
-        "切换 Plan 模式",
-    ) {
-        let _ = turn_tx.send(event);
+    let mode = if approval_mode == ApprovalMode::Plan {
+        RuntimeMode::Plan
+    } else {
+        RuntimeMode::Build
+    };
+    if let Err(error) = handle.set_mode(mode).await {
+        let _ = turn_tx.send(TurnEvent::Error(format!("切换模式失败：{error}")));
         return;
     }
-    if let Err(event) = send_agent_command(
-        &client,
-        AgentCommand::SendMessage {
-            text: user_text,
-            images: user_images,
-            image_markers: Vec::new(),
-        },
-        "发送用户消息",
-    ) {
-        let _ = turn_tx.send(event);
+    let input = atomcode_coding::UserInput {
+        text: user_text,
+        images: user_images
+            .iter()
+            .map(crate::legacy_convert::image_to_kernel)
+            .collect(),
+    };
+    if let Err(error) = handle.submit(input).await {
+        let _ = turn_tx.send(TurnEvent::Error(format!("发送用户消息失败：{error}")));
         return;
     }
 
     let mut cancelled = false;
+    let mut projector = KernelTurnProjector::default();
     let final_messages = loop {
         let ev = tokio::select! {
             _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
-                let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                let _ = handle.cancel().await;
                 continue;
             }
             ev = events.recv() => ev,
         };
-        let Some(ev) = ev else { break None };
-        let ev = match ev {
-            DaemonRuntimeEvent::Legacy(event) => event,
-            DaemonRuntimeEvent::TurnCancelledWithoutSnapshot { .. } => break None,
-            DaemonRuntimeEvent::Native(event) => {
+        let Some(ev) = ev.map(|event| event.event) else {
+            let _ = turn_tx.send(TurnEvent::Error(
+                "coding runtime event stream closed before turn terminal".into(),
+            ));
+            break None;
+        };
+        match ev {
+            CodingRuntimeEvent::Agent(event) => {
+                if let Some(event) = projector.project(event) {
+                    let _ = turn_tx.send(event);
+                }
+            }
+            CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
+                let approval: ApprovalRequest = match serde_json::from_value(request.payload) {
+                    Ok(approval) => approval,
+                    Err(_) => {
+                        let _ = handle.respond(request.id, serde_json::Value::Null).await;
+                        continue;
+                    }
+                };
+                let _ = turn_tx.send(TurnEvent::ApprovalRequested {
+                    tool_name: approval.tool.clone(),
+                    reason: "Requires approval".into(),
+                    call: atomcode_core::tool::ToolCall {
+                        id: approval.call_id,
+                        name: approval.tool,
+                        arguments: approval.args,
+                    },
+                    snapshot: ConversationSnapshot::default(),
+                });
+                let decision = match &mut perm_rx {
+                    None => fallback_approval_decision(approval_mode),
+                    Some(rx) => tokio::select! {
+                        _ = cancel.cancelled(), if !cancelled => {
+                            cancelled = true;
+                            let _ = handle.cancel().await;
+                            PermissionDecision::Deny
+                        }
+                        decision = rx.recv() => decision.unwrap_or(PermissionDecision::Deny),
+                    },
+                };
+                let response = match decision {
+                    PermissionDecision::Allow => ApprovalResponse::allow(),
+                    PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
+                    _ => ApprovalResponse::deny(),
+                };
+                let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                let _ = handle.respond(request.id, value).await;
+            }
+            CodingRuntimeEvent::Request(request) => {
+                let _ = handle.respond(request.id, serde_json::Value::Null).await;
+            }
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                reason,
+                snapshot,
+                ..
+            }) => {
+                break Some(AuthoritativeTerminal {
+                    snapshot: crate::legacy_convert::snapshot_to_core(snapshot.as_ref()),
+                    cancelled: matches!(reason, atomcode_kernel::event::StopReason::Cancelled),
+                });
+            }
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                error, ..
+            }) => {
+                let _ = turn_tx.send(TurnEvent::Error(error.message));
+                break None;
+            }
+            event @ CodingRuntimeEvent::CompactionStarted { .. }
+            | event @ CodingRuntimeEvent::CompactionFinished { .. } => {
                 let compact_snapshot = match committed_compaction_snapshot(&event) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -1760,67 +1903,28 @@ pub(crate) async fn run_chat_turn_v2(
                 if let Some(event) = coding_runtime_to_turn(event) {
                     let _ = turn_tx.send(event);
                 }
-                continue;
             }
-        };
-        match ev {
-            AgentEvent::ApprovalNeeded {
-                tool_name,
-                reason,
-                call,
-                snapshot,
-            } => {
-                let _ = turn_tx.send(TurnEvent::ApprovalRequested {
-                    tool_name,
-                    reason,
-                    call,
-                    snapshot,
-                });
-                let decision = match &mut perm_rx {
-                    None => fallback_approval_decision(approval_mode),
-                    Some(rx) => tokio::select! {
-                        _ = cancel.cancelled(), if !cancelled => {
-                            cancelled = true;
-                            let _ = client.cmd_tx.send(AgentCommand::Cancel);
-                            PermissionDecision::Deny
-                        }
-                        d = rx.recv() => d.unwrap_or(PermissionDecision::Deny),
-                    },
-                };
-                let cmd = match decision {
-                    PermissionDecision::Allow => AgentCommand::ApproveTool,
-                    PermissionDecision::AllowAlways => AgentCommand::ApproveToolAlways,
-                    _ => AgentCommand::DenyTool,
-                };
-                let _ = client.cmd_tx.send(cmd);
+            CodingRuntimeEvent::WorkingDirectoryChanged(directory) => {
+                let _ = turn_tx.send(TurnEvent::WorkingDirChanged(directory));
             }
-            AgentEvent::Error { error, .. } => {
-                // Non-terminal: forward, keep draining to the real terminal.
-                let _ = turn_tx.send(TurnEvent::Error(error));
+            CodingRuntimeEvent::ControllerWarning(message) => {
+                let _ = turn_tx.send(TurnEvent::Warning(message));
             }
-            AgentEvent::TurnCancelled { snapshot } => {
-                break Some(AuthoritativeTerminal {
-                    snapshot,
-                    cancelled: true,
-                })
+            CodingRuntimeEvent::RuntimeStopped(_) => {
+                let _ = turn_tx.send(TurnEvent::Error(
+                    "coding runtime stopped before turn terminal".into(),
+                ));
+                break None;
             }
-            AgentEvent::TurnComplete { snapshot, .. } => {
-                break Some(AuthoritativeTerminal {
-                    snapshot,
-                    cancelled: false,
-                })
-            }
-            other => {
-                if let Some(te) = agent_to_turn(other) {
-                    let _ = turn_tx.send(te);
-                }
-            }
+            _ => {}
         }
     };
     if let Some(terminal) = final_messages {
         let mut c = conv.lock().await;
         install_authoritative_terminal_snapshot(&mut c, terminal.snapshot, &turn_base);
     }
+    let _ = handle.shutdown().await;
+    let _ = task.await;
     // Dropping turn_tx here closes the consumer loop (its `turn_rx.recv()` returns
     // None), which then persists conv and sends Done.
 }
@@ -2211,19 +2315,48 @@ pub(crate) struct LiveMessageReq {
     pub session_id: Option<String>,
 }
 
+/// Apply the shared daemon image-preprocessing policy to one user caption.
+///
+/// The caller keeps the original images in its persisted/display conversation. A changed
+/// return value means the runtime input must clear those images because the returned text
+/// already contains either the VL description or an explicit failure marker.
+pub(crate) async fn preprocess_image_caption(
+    config: &Config,
+    active: &dyn atomcode_core::provider::LlmProvider,
+    message: &str,
+    images: &[ImagePart],
+) -> String {
+    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+    match maybe_preprocess(config, active, message, images).await {
+        PreprocessOutcome::Skipped => message.to_string(),
+        PreprocessOutcome::Replaced { text, vl_key } => {
+            if message.trim().is_empty() {
+                format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+            } else {
+                format!("{message}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
+            }
+        }
+        PreprocessOutcome::Failed { .. } => {
+            if message.trim().is_empty() {
+                "[图片识别失败]".to_string()
+            } else {
+                format!("{message}\n\n[图片识别失败]")
+            }
+        }
+    }
+}
+
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
-/// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径（lib.rs:process_chat_request）
-/// 行为一致——同步会话把 live 路径从 `Agent::run` 切到 coordinator 后曾漏掉这一步，导致
-/// 非视觉主模型（如 deepseek-v4-flash）在 sync/live 下看不到图片。任何 config/provider
-/// 加载失败都降级为原文，不阻断发送。`provider_name` 为本轮已解析的主 provider（与
-/// `DaemonTurnExecutor::run_turn` 同源），仅用其模型名判定是否原生支持视觉。
+/// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
+/// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
+/// `provider_name` 为本轮已解析的主 provider（与 `KernelTurnExecutor::run_turn` 同源），
+/// 仅用其模型名判定是否原生支持视觉。
 async fn preprocess_live_caption(
     message: &str,
     images: &[ImagePart],
     provider_name: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
-    use atomcode_core::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
     if images.is_empty() {
         return message.to_string();
     }
@@ -2245,23 +2378,7 @@ async fn preprocess_live_caption(
     if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
         active.set_session_id(sid);
     }
-    match maybe_preprocess(&config, &*active, message, images).await {
-        PreprocessOutcome::Skipped => message.to_string(),
-        PreprocessOutcome::Replaced { text, vl_key } => {
-            if message.trim().is_empty() {
-                format!("[图片内容（由 {vl_key} 识别）]\n{text}")
-            } else {
-                format!("{message}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
-            }
-        }
-        PreprocessOutcome::Failed { .. } => {
-            if message.trim().is_empty() {
-                "[图片识别失败]".to_string()
-            } else {
-                format!("{message}\n\n[图片识别失败]")
-            }
-        }
-    }
+    preprocess_image_caption(&config, &*active, message, images).await
 }
 
 pub(crate) async fn live_message(
@@ -2642,6 +2759,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn provider_switch_rejects_unknown_provider_without_a_candidate_config() {
+        let config = Config::default();
+        let current = atomcode_coding::CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "current-model",
+            ".",
+        );
+
+        assert!(resolve_live_provider_switch(&current, &config, "missing").is_err());
+        assert_eq!(current.model, "current-model");
+    }
+
     #[tokio::test]
     async fn approval_mode_get_returns_current_runtime_mode() {
         let _mode_guard = ScopedApprovalModeForTest::new();
@@ -2661,7 +2792,7 @@ mod tests {
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
     /// top of this file). Under `/webui` the LiveSession path runs IN the TUI
     /// process, so a console print writes straight to the shared terminal and
-    /// corrupts the TUI — a stray "[engine v2] daemon live turns on the new stack"
+    /// corrupts the TUI — a stray native-runtime startup diagnostic
     /// landed on the input line when a dir switch during sync spun up the live
     /// stack. Every diagnostic in this file must use the file-sink `ctrace!`.
     ///
@@ -2761,7 +2892,7 @@ mod tests {
             assert_eq!(project.recent_dirs, vec![dir_b.clone(), dir_a.clone()]);
         }
 
-        // 这正是执行器里的 /cd 检测条件：current(dir_b) != bridge_built_with(dir_a)
+        // 这正是执行器里的 /cd 检测条件：current(dir_b) != runtime_built_with(dir_a)
         // → 触发 ChangeDir / 重建 parts。
         assert_ne!(live_current_working_dir(&dir_a), dir_a);
 
@@ -2972,17 +3103,21 @@ mod tests {
             }),
             Some(TurnEvent::TextDelta(_))
         ));
-        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
-            completion: CompactionCompletion::Completed(outcome(
-                CompactTrigger::Auto { utilization: 0.8 },
-                false,
-            )),
-        })
-        .is_none());
-        assert!(coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
-            trigger: CompactTrigger::Manual { focus: None },
-        })
-        .is_none());
+        assert!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome(
+                    CompactTrigger::Auto { utilization: 0.8 },
+                    false,
+                )),
+            })
+            .is_none()
+        );
+        assert!(
+            coding_runtime_to_turn(CodingRuntimeEvent::CompactionStarted {
+                trigger: CompactTrigger::Manual { focus: None },
+            })
+            .is_none()
+        );
         assert!(matches!(
             coding_runtime_to_turn(CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Interrupted {
@@ -3044,38 +3179,6 @@ mod tests {
         assert!(snapshot.cold_summaries.is_empty());
     }
 
-    // 回归：agent_to_turn 必须转发 AgentEvent::RateLimited 为 TurnEvent::RateLimited，
-    // 字段透传——历史上该臂缺失导致事件被 `_ => return None` 静默丢弃（dead code）。
-    #[test]
-    fn agent_to_turn_rate_limited_is_forwarded_not_dropped() {
-        use atomcode_core::agent::AgentEvent;
-        let result = agent_to_turn(AgentEvent::RateLimited {
-            reset_at_display: "18:09".into(),
-            reset_label: "5h".into(),
-            secs_until_reset: Some(7200),
-            auto_resuming: false,
-            server_message: None,
-        });
-        match result {
-            Some(TurnEvent::RateLimited {
-                reset_at_display,
-                reset_label,
-                secs_until_reset,
-                auto_resuming,
-                ..
-            }) => {
-                assert_eq!(reset_at_display, "18:09");
-                assert_eq!(reset_label, "5h");
-                assert_eq!(secs_until_reset, Some(7200));
-                assert!(!auto_resuming);
-            }
-            other => panic!(
-                "expected Some(TurnEvent::RateLimited{{..}}), got {:?}",
-                other
-            ),
-        }
-    }
-
     // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
     // secs_until_reset 字段，供 webui 渲染倒计时提示而非普通错误。
     #[test]
@@ -3085,7 +3188,7 @@ mod tests {
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
             auto_resuming: false,
-            server_message: None,
+            server_message: Some("provider quota exhausted".into()),
         }))
         .expect("should map");
         let json = serde_json::to_string(&wire).unwrap();
@@ -3096,6 +3199,10 @@ mod tests {
         assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
         assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
         assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+        assert!(
+            json.contains(r#""server_message":"provider quota exhausted""#),
+            "{json}"
+        );
     }
 
     // U+001E 前缀是子代理的 latest-wins 活性行。WebUI 必须收到独立 progress 事件，
@@ -3303,7 +3410,7 @@ mod tests {
     }
 
     // GUARD — webui refresh-mid-turn bug: a stuck turn's later authoritative writeback
-    // (sourced from a divergent persistent bridge) could carry FEWER turns than what
+    // (sourced from a divergent persistent runtime) could carry FEWER turns than what
     // durability already persisted, silently reducing the on-disk `.json` to just the
     // first turn. A staler write that would DROP already-persisted turns must be refused.
     #[test]

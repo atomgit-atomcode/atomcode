@@ -31,6 +31,33 @@ pub fn set_theme_mode(light: bool) {
     MODE.store(if light { MODE_LIGHT } else { MODE_DARK }, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+pub fn test_lock() -> ThemeTestGuard {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    ThemeTestGuard {
+        original: MODE.load(Ordering::Relaxed),
+        _guard: guard,
+    }
+}
+
+#[cfg(test)]
+pub struct ThemeTestGuard {
+    original: u8,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ThemeTestGuard {
+    fn drop(&mut self) {
+        MODE.store(self.original, Ordering::Relaxed);
+    }
+}
+
 #[inline]
 fn is_light() -> bool {
     MODE.load(Ordering::Relaxed) == MODE_LIGHT
@@ -118,25 +145,17 @@ pub fn md_border_open() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Guard around theme-switching tests so they don't race each other
-    // (the static `MODE` is per-process). Each test takes the lock,
-    // switches, asserts, switches back.
-    static THEME_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_dark<F: FnOnce()>(f: F) {
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_lock();
         set_theme_mode(false);
         f();
-        set_theme_mode(false); // restore default
     }
 
     fn with_light<F: FnOnce()>(f: F) {
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_lock();
         set_theme_mode(true);
         f();
-        set_theme_mode(false); // restore default
     }
 
     #[test]

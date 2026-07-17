@@ -7,21 +7,17 @@ CODING 特化层。它把中性内核（[`atomcode_kernel`]）+ 能力层
 
 ---
 
-## 依赖现状：L2 直接依赖 atomcode-core
+## 依赖现状：L2 已脱离 atomcode-core
 
-`atomcode-coding` **依赖 `atomcode-core`**，并非「完全不涉及 core」。依赖图
-`atomcode-coding → atomcode-core` 成立，且是**单向**的——core 不反向依赖
-kernel / L1 / L2（`Cargo.toml` 注明「L2 is allowed to depend on core」）。当前用到
-core 的地方：
+`atomcode-coding` 的生产依赖中已经没有 `atomcode-core`。模型能力判断由
+`atomcode-capabilities` 提供；限流逻辑只依赖可注入的 `RateLimitWindowSource`，具体
+CodingPlan 客户端由 CLI/daemon 等 host adapter 实现；plugin hook 同样通过
+`PluginHookSource` 注入。
 
-- **模型视觉判断**：`assemble.rs` / `parts.rs` 使用 core 的模型视觉（vision）判断。
-- **CodingPlan 客户端与类型**：`rate_limit.rs` 使用 core 的 `CodingPlan` 类型及 REST 客户端。
-- 直接依赖的 workspace crate：`atomcode-core` / `atomcode-config` /
-  `atomcode-telemetry` / `atomcode-review`。
-
-> 若未来想让 L2 脱离 core，需把上述用法（vision 判断、CodingPlan 客户端）下沉到
-> capabilities / 本地 service——但这是方向性设想、非既定承诺：当前 `Cargo.toml` 明确
-> 允许 L2 依赖 core。
+直接依赖的 workspace crate 是 `atomcode-kernel`、`atomcode-capabilities`、
+`atomcode-config`、`atomcode-telemetry` 和 `atomcode-review`。CLI、TUI、daemon 仍可能
+为了历史 session、plugin、live transport 等非引擎职责依赖 `atomcode-core`，但这不再
+形成 `atomcode-coding → atomcode-core` 的依赖边。
 
 ---
 
@@ -60,7 +56,9 @@ println!("{}", outcome.text);
 除上面三项核心抽象外，L2 还涉及以下职责。**公开 API**（通过 `pub mod` 或 re-export 暴露）：
 
 - `config` —— coding 专属配置。
-- `runtime` —— runtime control（运行期控制）。
+- `runtime` —— 原生 runtime owner、运行期控制、生命周期事务和事件。
+- `provider_factory` / `plugin_hooks` —— 可注入的 provider 与 plugin hook host seam。
+- `session_title` —— 会话自动命名。
 - `plan_mode` —— plan 模式。
 - `parts` / `persona` / `discipline` —— 两阶段装配、persona、verify 纪律（均 `pub mod`）。
 - `telemetry` —— 遥测上报。
@@ -69,7 +67,8 @@ println!("{}", outcome.text);
 
 **内部实现**（私有 `mod`，未直接公开）：
 
-- `mod rate_limit` —— CodingPlan 限速（`RateLimitHook`），依赖 core 的 CodingPlan 客户端。
+- `mod rate_limit` —— 限速决策（`RateLimitHook`）及可注入的数据源接口，不直接读取
+  CodingPlan 或依赖 core。
 - `mod todo` —— todo 钩子内部实现（`TodoHook` 已 re-export）。
 - `mod assemble` —— `build_coding_agent` 等最小装配（已 re-export）。
 - `mod init_prompt` —— 初始化提示词。

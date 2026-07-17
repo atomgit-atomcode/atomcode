@@ -316,7 +316,6 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "assert_cmd",
- "atomcode-bridge",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-config",
@@ -356,6 +355,7 @@ name = "atomcode-auth"
 version = "5.0.0"
 dependencies = [
  "anyhow",
+ "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-telemetry",
  "libc",
@@ -363,31 +363,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "toml 0.8.23",
  "tracing",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "atomcode-bridge"
-version = "5.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-config",
- "atomcode-core",
- "atomcode-kernel",
- "atomcode-telemetry",
- "getrandom 0.2.17",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "url",
 ]
 
 [[package]]
@@ -397,6 +378,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "atomcode-auth",
  "atomcode-config",
  "atomcode-kernel",
  "base64",
@@ -406,6 +388,7 @@ dependencies = [
  "dirs",
  "encoding_rs",
  "futures",
+ "getrandom 0.2.17",
  "globset",
  "grep",
  "httpdate",
@@ -422,6 +405,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -469,7 +453,6 @@ dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-config",
- "atomcode-core",
  "atomcode-kernel",
  "atomcode-review",
  "atomcode-telemetry",
@@ -477,10 +460,12 @@ dependencies = [
  "ctor",
  "dirs",
  "futures",
+ "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -509,7 +494,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-auth",
- "atomcode-codingplan-crypto",
  "atomcode-config",
  "atomcode-kernel",
  "atomcode-telemetry",
@@ -569,7 +553,6 @@ version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "atomcode-bridge",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-config",
@@ -680,6 +663,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "unicode-segmentation",
  "unicode-width",

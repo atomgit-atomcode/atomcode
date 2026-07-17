@@ -33,6 +33,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         memory: false,
         web: false,
         review: false,
+        rate_limit_source: None,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
 
@@ -47,12 +48,18 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
             }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("cannot read it".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("cannot read it".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
 
     let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
     h.commands
-        .send(AgentCommand::SendMessage { text: "show me my ssh key".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "show me my ssh key".into(),
+            images: vec![],
+        })
         .unwrap();
 
     let mut blocked: Option<(bool, String)> = None;

@@ -4,12 +4,11 @@
 //
 // Lists all sessions for the current project (pre-filtered to >0 msgs)
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
-// into scrollback + syncs the agent via `AgentCommand::SetConversation`,
+// into scrollback + restores the runtime conversation through the native API,
 // Esc cancels, printable chars + Backspace edit the filter query.
 // F2 renames the selected session.
 
 use anyhow::Result;
-use atomcode_core::agent::AgentCommand;
 use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -287,12 +286,12 @@ impl Modal for SessionPicker {
                     Ok(session) => {
                         ctx.current_session_id = Some(id);
                         replay_session(renderer, state, &session, true);
-                        ctx.agent
-                            .cmd_tx
-                            .send(AgentCommand::SetConversation {
-                                snapshot: session.to_conversation_snapshot(),
-                                restore_id: None,
-                            })
+                        ctx.runtime
+                            .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
+                                crate::runtime_convert::snapshot_to_kernel(
+                                    &session.to_conversation_snapshot(),
+                                ),
+                            ))
                             .ok();
                         // Continue accumulating into the same session file —
                         // future TurnComplete saves overwrite it. Bind

@@ -108,8 +108,8 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 /// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
 /// image file back to the model as an actual picture (a VISION model SEES it) instead
 /// of the "binary, cannot display" text. The caller decides the flag from the model
-/// (the coding layer uses `atomcode_core::provider::model_name_suggests_vision`, the
-/// same detector as the user-paste path) — kept out of this crate so it stays core-free.
+/// using [`crate::provider::model_suggests_vision`], the same detector used by the
+/// provider image encoder.
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool));

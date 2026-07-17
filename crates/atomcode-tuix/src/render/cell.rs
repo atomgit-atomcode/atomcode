@@ -20,7 +20,7 @@
 // output) keeps the pure-append path — body lines enter scrollback and
 // never need a diff cycle.
 
-use crossterm::style::{Color, SetForegroundColor, SetBackgroundColor};
+use crossterm::style::Color;
 use std::io::Write as _;
 
 /// Visual attributes that can vary per cell in our footer. Kept minimal
@@ -681,10 +681,10 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
             out.extend_from_slice(b"\x1b[7m");
         }
         if let Some(c) = to.fg {
-            let _ = write!(out, "{}", SetForegroundColor(c));
+            emit_ansi_color(out, 38, c);
         }
         if let Some(c) = to.bg {
-            let _ = write!(out, "{}", SetBackgroundColor(c));
+            emit_ansi_color(out, 48, c);
         }
     } else {
         // Additive path — current attributes stay, just flip on whatever
@@ -700,7 +700,7 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if fg_change {
             if let Some(c) = to.fg {
-                let _ = write!(out, "{}", SetForegroundColor(c));
+                emit_ansi_color(out, 38, c);
             } else {
                 // Should have been caught by needs_reset, but defensive.
                 out.extend_from_slice(b"\x1b[39m");
@@ -708,12 +708,49 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if bg_change {
             if let Some(c) = to.bg {
-                let _ = write!(out, "{}", SetBackgroundColor(c));
+                emit_ansi_color(out, 48, c);
             } else {
                 out.extend_from_slice(b"\x1b[49m");
             }
         }
     }
+}
+
+/// Serialize a concrete cell color without consulting crossterm's process-global
+/// `NO_COLOR` cache. Color enablement has already been resolved into `TerminalCaps`
+/// before a `CellStyle` is built; a second ambient-env check here can otherwise turn
+/// an explicitly colored cell into `ESC[m` and silently discard its attributes.
+fn emit_ansi_color(out: &mut Vec<u8>, channel: u8, color: Color) {
+    let reset = if channel == 38 { 39 } else { 49 };
+    match color {
+        Color::Reset => {
+            let _ = write!(out, "\x1b[{reset}m");
+        }
+        Color::Black => emit_ansi_index(out, channel, 0),
+        Color::DarkGrey => emit_ansi_index(out, channel, 8),
+        Color::Red => emit_ansi_index(out, channel, 9),
+        Color::DarkRed => emit_ansi_index(out, channel, 1),
+        Color::Green => emit_ansi_index(out, channel, 10),
+        Color::DarkGreen => emit_ansi_index(out, channel, 2),
+        Color::Yellow => emit_ansi_index(out, channel, 11),
+        Color::DarkYellow => emit_ansi_index(out, channel, 3),
+        Color::Blue => emit_ansi_index(out, channel, 12),
+        Color::DarkBlue => emit_ansi_index(out, channel, 4),
+        Color::Magenta => emit_ansi_index(out, channel, 13),
+        Color::DarkMagenta => emit_ansi_index(out, channel, 5),
+        Color::Cyan => emit_ansi_index(out, channel, 14),
+        Color::DarkCyan => emit_ansi_index(out, channel, 6),
+        Color::White => emit_ansi_index(out, channel, 15),
+        Color::Grey => emit_ansi_index(out, channel, 7),
+        Color::Rgb { r, g, b } => {
+            let _ = write!(out, "\x1b[{channel};2;{r};{g};{b}m");
+        }
+        Color::AnsiValue(value) => emit_ansi_index(out, channel, value),
+    }
+}
+
+fn emit_ansi_index(out: &mut Vec<u8>, channel: u8, value: u8) {
+    let _ = write!(out, "\x1b[{channel};5;{value}m");
 }
 
 #[cfg(test)]

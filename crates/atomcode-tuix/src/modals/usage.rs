@@ -879,6 +879,8 @@ mod tests {
 
     #[test]
     fn overview_lines_contains_humanized_total_and_requests() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let m = sample_modal();
         let lines = m.overview_lines();
         let all = lines.join("\n");
@@ -939,6 +941,8 @@ mod tests {
 
     #[test]
     fn tab_bar_marks_active_tab_bold() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut m = sample_modal();
         m.tab = Tab::Overview;
         let bar = m.tab_bar();

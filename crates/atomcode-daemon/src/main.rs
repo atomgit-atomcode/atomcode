@@ -141,7 +141,7 @@ async fn main() {
     // Used by IDE packaging to reject a daemon compiled after the private
     // signer overlay was removed. Keep this check side-effect free.
     if std::env::args().any(|arg| arg == "--check-official-build") {
-        std::process::exit(if atomcode_core::coding_plan::signer_available() {
+        std::process::exit(if atomcode_capabilities::provider::signer_available() {
             0
         } else {
             1

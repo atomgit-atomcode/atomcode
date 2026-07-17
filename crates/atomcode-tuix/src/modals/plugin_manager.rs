@@ -1508,6 +1508,7 @@ mod tests {
 
     #[test]
     fn tab_bar_colors_on_dark_theme() {
+        let _theme = crate::highlight::theme::test_lock();
         let m = manager(vec![], vec![]);
         crate::highlight::theme::set_theme_mode(false); // force dark
         let bar = m.tab_bar();

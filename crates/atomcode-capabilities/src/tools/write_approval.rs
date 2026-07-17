@@ -299,7 +299,7 @@ impl ToolMiddleware for WriteApprovalGate {
         // Auto-accept-edits mode: a non-sensitive edit auto-approves with NO prompt
         // (sensitive was handled above and still prompts). This only affects the write
         // tools this gate owns — bash still flows to ApprovalMiddleware and prompts.
-        // Enforced here (middleware), so it is independent of the bridge approval seam.
+        // Enforced here in middleware, before the runtime approval seam.
         if self.accept_edits.load(std::sync::atomic::Ordering::Relaxed) {
             return BeforeOutcome::Allow { reason: Some("accept-edits mode".into()) };
         }

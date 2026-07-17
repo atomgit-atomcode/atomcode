@@ -781,6 +781,7 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 /// Floor for collapse: outputs smaller than this are left alone.
 /// Doubles as the idempotence guarantee — every stub we produce is
 /// well under this size, so re-running compaction never re-stubs.
+#[cfg(test)]
 pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
 
 /// Build the generic compaction stub used by both `collapse_committed`
@@ -803,6 +804,7 @@ pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
 /// knowledge of our own bash tool's output format, not tech-stack
 /// hardcoding (the prefix is the same regardless of cargo/npm/etc).
 /// Same category as the `read_file` exemption in `collapse_committed`.
+#[cfg(test)]
 pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let line_count = output.lines().count();
     let first_line: String = {
@@ -825,6 +827,7 @@ pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -
 /// Build a `call_id -> tool_name` lookup from a slice of messages. The
 /// `MessageContent::AssistantWithToolCalls` variant carries the model's
 /// own tool name; this is what we surface in stubs.
+#[cfg(test)]
 fn build_call_id_to_tool_map(msgs: &[Message]) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for msg in msgs {
@@ -848,6 +851,7 @@ fn build_call_id_to_tool_map(msgs: &[Message]) -> std::collections::HashMap<Stri
 ///
 /// Idempotent: stubs already in place are smaller than MIN_COLLAPSE_SIZE
 /// and skip the rewrite.
+#[cfg(test)]
 pub(crate) fn compact_old_tool_results_in_place(
     conv: &mut crate::conversation::Conversation,
     keep_recent_turns: usize,
@@ -899,6 +903,7 @@ pub(crate) fn compact_old_tool_results_in_place(
 /// (`keep_recent_turns = 1` → keeps everything after the last `Role::User`,
 /// i.e. the active turn). Because it commits, the stubbed prefix never
 /// changes again across turns — the property `microcompact` violated.
+#[cfg(test)]
 pub(crate) fn collapse_committed(
     conv: &mut crate::conversation::Conversation,
     token_budget: usize,

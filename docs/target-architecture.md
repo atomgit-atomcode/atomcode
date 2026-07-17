@@ -1,7 +1,9 @@
 # 目标架构（北极星）— AtomCode 去 core 终极态
 
-> 状态：方向性目标，非现状。现状是「旧引擎(atomcode-core) + 新栈(kernel/capabilities/coding) + bridge 绞杀缝」并存的迁移中途。
-> 本文定义迁移**收尾后**的形态，作为后续每一步重构的对照基准。
+> 状态：方向性目标，尚未全部实现。当前 CLI、TUI、daemon、background、ACP 和 clix
+> 已统一走 `CodingRuntime → kernel`，core driver 协议与 `atomcode-bridge` 已退役；
+> `atomcode-core` 仍承载历史 session、plugin、live transport 等非引擎职责。
+> 本文定义后续完成 protocol/foundation 拆分并清空 core 后的形态，作为剩余重构的对照基准。
 >
 > 终极态里 **`atomcode-core`、`atomcode-bridge`、以及过渡用的 legacy-protocol 全部消失**。
 

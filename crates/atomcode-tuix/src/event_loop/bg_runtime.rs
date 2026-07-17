@@ -1,8 +1,6 @@
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
-#[cfg(test)]
-use atomcode_core::agent::AgentClient;
-use atomcode_core::agent::AgentEvent;
+use super::ui_event::UiEvent as AgentEvent;
 use atomcode_core::session::{Session, SessionManager};
 
 use super::RuntimeEndpoint;
@@ -25,8 +23,14 @@ pub struct RuntimeEvent {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeEventPayload {
-    Legacy(AgentEvent),
+    Ui(AgentEvent),
     Native(CodingRuntimeEvent),
+    Driver(DriverEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum DriverEvent {
+    LocalShellFinished { output: String, failed: bool },
 }
 
 pub fn spawn_event_forwarder(
@@ -404,7 +408,7 @@ impl BgRuntimeManager {
             return;
         };
         let terminal = match event {
-            RuntimeEventPayload::Legacy(event) => {
+            RuntimeEventPayload::Ui(event) => {
                 self.backgrounds.apply_event_to_slot(slot, &event)
             }
             RuntimeEventPayload::Native(CodingRuntimeEvent::CompactionFinished { completion })
@@ -434,6 +438,7 @@ impl BgRuntimeManager {
                 false
             }
             RuntimeEventPayload::Native(_) => false,
+            RuntimeEventPayload::Driver(_) => false,
         };
         if terminal {
             if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
@@ -544,13 +549,16 @@ pub fn render_bg_list(slots: &BackgroundSlots) -> String {
     }
     let mut out = t(Msg::BgListHeader).into_owned();
     for row in slots.list_rows() {
-        out.push_str(&t(Msg::BgListRow {
-            slot: row.slot,
-            short_id: &row.short_id,
-            state: &row.state.localised(),
-            age: &humanize_age(row.created_at),
-            summary: &row.summary,
-        }).into_owned());
+        out.push_str(
+            &t(Msg::BgListRow {
+                slot: row.slot,
+                short_id: &row.short_id,
+                state: &row.state.localised(),
+                age: &humanize_age(row.created_at),
+                summary: &row.summary,
+            })
+            .into_owned(),
+        );
     }
     out
 }
@@ -585,23 +593,10 @@ fn humanize_age(ts: u64) -> String {
 }
 
 #[cfg(test)]
-fn test_client() -> AgentClient {
-    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    AgentClient {
-        cmd_tx,
-        tool_registry: std::sync::Arc::new(atomcode_core::tool::ToolRegistry::new()),
-        skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
-            atomcode_core::skill::SkillRegistry::new(),
-        )),
-    }
-}
-
-#[cfg(test)]
 fn test_endpoint() -> RuntimeEndpoint {
     let (native, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
     RuntimeEndpoint {
-        legacy: test_client(),
-        native,
+        native: native.into(),
     }
 }
 
@@ -703,7 +698,7 @@ mod tests {
 
     #[test]
     fn background_turn_complete_updates_slot_to_done_and_messages() {
-        use atomcode_core::agent::TurnStopReason;
+        use crate::event_loop::ui_event::UiTurnStopReason as TurnStopReason;
         use atomcode_core::conversation::{
             message::{Message, Role},
             ConversationSnapshot,
@@ -752,27 +747,20 @@ mod tests {
 
     #[tokio::test]
     async fn resume_restores_the_native_handle_for_that_runtime() {
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl,
-        };
+        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
 
         let (first_native, mut first_controls) = coding_runtime_control_channel();
         let first_endpoint = RuntimeEndpoint {
-            legacy: test_client(),
-            native: first_native,
+            native: first_native.into(),
         };
-        let mut manager = BgRuntimeManager::new(
-            session("first"),
-            RuntimeId::new(1),
-            first_endpoint,
-        );
+        let mut manager =
+            BgRuntimeManager::new(session("first"), RuntimeId::new(1), first_endpoint);
 
         let (second_native, _second_controls) = coding_runtime_control_channel();
         manager
             .background_current(
                 RuntimeEndpoint {
-                    legacy: test_client(),
-                    native: second_native,
+                    native: second_native.into(),
                 },
                 session("second"),
                 RuntimeId::new(2),
@@ -815,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_event_forwarder_tags_events() {
-        use atomcode_core::agent::AgentEvent;
+        use crate::event_loop::ui_event::UiEvent as AgentEvent;
 
         let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (fan_tx, mut fan_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -823,7 +811,7 @@ mod tests {
 
         spawn_event_forwarder(runtime_id, agent_rx, fan_tx);
         agent_tx
-            .send(RuntimeEventPayload::Legacy(AgentEvent::TextDelta(
+            .send(RuntimeEventPayload::Ui(AgentEvent::TextDelta(
                 "hello".to_string(),
             )))
             .unwrap();
@@ -832,7 +820,7 @@ mod tests {
         assert_eq!(event.runtime_id, runtime_id);
         assert!(matches!(
             event.event,
-            RuntimeEventPayload::Legacy(AgentEvent::TextDelta(text)) if text == "hello"
+            RuntimeEventPayload::Ui(AgentEvent::TextDelta(text)) if text == "hello"
         ));
     }
 
@@ -932,7 +920,10 @@ mod tests {
             &SessionManager::new(&project),
         );
 
-        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Idle);
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Idle
+        );
     }
 
     #[test]
@@ -991,6 +982,9 @@ mod tests {
             &SessionManager::new(&project),
         );
 
-        assert_eq!(manager.backgrounds().list_rows()[0].state, RuntimeState::Done);
+        assert_eq!(
+            manager.backgrounds().list_rows()[0].state,
+            RuntimeState::Done
+        );
     }
 }
