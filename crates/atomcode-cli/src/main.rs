@@ -3296,6 +3296,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             Ok(())
         }
         PluginCli::Install { spec } => {
+            let installed_plugin_name: String;
             match parse_plugin_spec(&spec)? {
                 PluginSpec::Qualified {
                     plugin,
@@ -3305,6 +3306,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                         installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
                             .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                     println!("  installed `{}@{}`", info.plugin, info.marketplace);
+                    installed_plugin_name = info.plugin;
                 }
                 PluginSpec::Bare { plugin } => {
                     match installer::resolve_plugin_marketplace(&plugin)
@@ -3321,6 +3323,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             )
                             .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                             println!("  installed `{}@{}`", info.plugin, info.marketplace);
+                            installed_plugin_name = info.plugin;
                         }
                         matches if matches.len() > 1 => {
                             let mut msg = format!(
@@ -3341,10 +3344,12 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     }
                 }
             }
-            // Surface any untrusted hooks the freshly-installed plugin ships — they
+            // Surface untrusted hooks for the freshly-installed plugin only — they
             // will NOT run until the user trusts them (loaded-code trust gate).
+            // Filtered by `info.plugin` (the canonical plugin name returned by the
+            // installer) so pre-existing untrusted plugins don't produce spurious output.
             for s in atomcode_core::plugin::installed_plugin_hook_trust_status() {
-                if !s.trusted {
+                if !s.trusted && s.plugin == installed_plugin_name {
                     println!(
                         "Plugin `{}` ships {} hook(s) on [{}]. They will NOT run until trusted:\n  atomcode plugin trust {}",
                         s.plugin, s.hook_count, s.events.join(", "), s.plugin

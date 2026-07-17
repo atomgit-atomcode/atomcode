@@ -109,11 +109,19 @@ pub fn plugin_file_cc_hooks(plugin_dir: &Path) -> Vec<PluginCcHook> {
 
 /// Drop duplicate hooks by `(event, matcher, command)`, keeping first occurrence —
 /// so a plugin declaring the same hook both inline and in a file never double-fires.
+/// The matcher key normalizes `None` and `Some("")` to the same empty string so they
+/// collapse correctly (matching the hash normalization in `plugin_hook_set_hash`).
 fn dedup_hooks(hooks: Vec<PluginCcHook>) -> Vec<PluginCcHook> {
     let mut seen = std::collections::HashSet::new();
     hooks
         .into_iter()
-        .filter(|h| seen.insert((h.event.clone(), h.matcher.clone(), h.command.clone())))
+        .filter(|h| {
+            seen.insert((
+                h.event.clone(),
+                h.matcher.clone().unwrap_or_default(),
+                h.command.clone(),
+            ))
+        })
         .collect()
 }
 
@@ -123,9 +131,12 @@ fn plugin_file_cc_hooks_for(plugin_dir: &Path, manifest: &PluginManifest) -> Vec
     if let Some(super::manifest::HooksField::Path(p)) = &manifest.hooks {
         let path = plugin_dir.join(p);
         if path.exists() {
-            if let Some(map) = load_cc_hooks_file(&path) {
-                return expand_cc_hooks(&map, plugin_dir);
-            }
+            // Declared path is authoritative when present — do NOT fall back to
+            // the default drill if it fails to parse (that would load hooks the
+            // plugin never declared under this path).
+            return load_cc_hooks_file(&path)
+                .map(|m| expand_cc_hooks(&m, plugin_dir))
+                .unwrap_or_default();
         }
     }
     plugin_file_cc_hooks(plugin_dir)
@@ -326,6 +337,30 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].command, "a");
         assert_eq!(out[1].command, "b");
+    }
+
+    #[test]
+    fn custom_hooks_path_malformed_does_not_fall_back_to_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        std::fs::write(dir.join("cfg/h.json"), "{ not json").unwrap();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        std::fs::write(dir.join("hooks/hooks.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo default"}]}]}"#).unwrap();
+        let manifest: crate::plugin::manifest::PluginManifest =
+            serde_json::from_str(r#"{"name":"p","hooks":"cfg/h.json"}"#).unwrap();
+        let hooks = plugin_file_cc_hooks_for(dir, &manifest);
+        assert!(hooks.is_empty(), "malformed declared path must not fall back to default drill");
+    }
+
+    #[test]
+    fn dedup_collapses_none_and_empty_matcher() {
+        let mk = |m: Option<&str>| PluginCcHook { event: "SessionStart".into(),
+            matcher: m.map(|s| s.into()), command: "c".into(), timeout_secs: None,
+            plugin_root: std::path::PathBuf::from("/x") };
+        let out = dedup_hooks(vec![mk(None), mk(Some(""))]);
+        assert_eq!(out.len(), 1);
     }
 
     fn make_repo(name: &str) -> PathBuf {

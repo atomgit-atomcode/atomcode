@@ -4140,6 +4140,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // inactive and how to enable them. Mirrors the offline advisory above:
     // UiLine::Warning (yellow) rather than Error — informational, not a failure.
     {
+        // Run migration first so pre-existing plugins are grandfathered before
+        // we query trust status — prevents the banner from wrongly listing them.
+        atomcode_core::plugin::hook_trust::ensure_migrated();
         let untrusted: Vec<_> = atomcode_core::plugin::installed_plugin_hook_trust_status()
             .into_iter()
             .filter(|s| !s.trusted)
