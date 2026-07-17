@@ -119,7 +119,17 @@ pub fn render_line_with_width(
     // cells (respecting code-span pipes + `\|` via `split_table_row`); the flush
     // then REQUIRES a delimiter row, so a lone prose line with a literal `|`
     // still renders as prose, not a box.
-    if !state.in_code_block && split_table_row(trimmed).len() >= 2 {
+    //
+    // EXCLUDE list items: a bullet/number line that merely mentions a pipe
+    // (`- option A | option B`, `1. run cmd a | cmd b`) is a LIST item, not a
+    // table row — GFM only treats it as a table cell when a table is actually
+    // established. Without this guard the broadened detection stole such items
+    // from the list path and dropped their marker. The `---|---` delimiter is
+    // NOT a list item (`- ` needs a trailing space), so tables still work.
+    if !state.in_code_block
+        && split_table_row(trimmed).len() >= 2
+        && parse_list_item(line).is_none()
+    {
         state.table_buf.push(trimmed.to_string());
         return None;
     }
@@ -1536,6 +1546,24 @@ mod tests {
         assert!(out.contains('┌') || out.contains('│'), "must render as a table box: {out}");
         assert!(!out.contains("---|---"), "raw delimiter must not leak: {out}");
         assert!(out.contains("HEAD") && out.contains("代码"), "cells preserved: {out}");
+    }
+
+    #[test]
+    fn list_item_with_pipe_keeps_its_bullet_not_stolen_by_table_detection() {
+        // Regression (code-review): a list item that mentions a literal `|`
+        // (`- option A | option B`) is a LIST item, not a table row — it must keep
+        // its bullet, not get buffered as a table and lose its marker.
+        let mut st = MdState::new();
+        let a = render_line("- option A | option B", &mut st, plain_caps()).expect("list item renders inline");
+        assert!(a.contains('•') || a.contains('-'), "list marker preserved: {a}");
+        assert!(a.contains("option A") && a.contains("option B"), "content preserved: {a}");
+        assert!(!a.contains('┌'), "must not be boxed: {a}");
+        // The `---|---` delimiter is NOT a list item, so real pipe-less tables still work.
+        let mut st2 = MdState::new();
+        assert!(render_line("H1 | H2", &mut st2, plain_caps()).is_none());
+        assert!(render_line("---|---", &mut st2, plain_caps()).is_none(), "delimiter buffered, not a list item");
+        let out = render_line("done", &mut st2, plain_caps()).expect("flush");
+        assert!(out.contains('┌') || out.contains('│'), "pipe-less table still renders: {out}");
     }
 
     #[test]
