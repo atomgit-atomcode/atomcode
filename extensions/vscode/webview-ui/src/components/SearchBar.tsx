@@ -31,6 +31,7 @@ export function SearchBar() {
         value={state.searchQuery}
         onChange={(e) => dispatch({ type: 'SET_SEARCH_QUERY', query: e.target.value })}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing) return;
           if (e.key === 'Escape') {
             e.preventDefault();
             dispatch({ type: 'TOGGLE_SEARCH' });
