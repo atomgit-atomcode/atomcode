@@ -2374,6 +2374,7 @@ async fn run_headless(
                 reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message,
                 ..
             } => {
                 // 429 rate-limit PAUSE/auto-wait notice. Headless: loud to
@@ -2392,10 +2393,15 @@ async fn run_headless(
                         secs_until_reset.unwrap_or(0)
                     );
                 } else if !is_coding_plan {
-                    // Generic 429 (a user's own external model / no window data).
+                    // Generic 429 (a user's own external model / no window data). Surface
+                    // the provider's OWN reason when present (e.g. "余额不足…请充值").
+                    let reason = match server_message.as_deref() {
+                        Some(m) if !m.trim().is_empty() => format!(" — {}", m.trim()),
+                        _ => String::new(),
+                    };
                     match secs_until_reset {
-                        Some(s) => eprintln!("[rate-limited] HTTP 429 — retry later (in {}s)", s),
-                        None => eprintln!("[rate-limited] HTTP 429 — paused, retry later"),
+                        Some(s) => eprintln!("[rate-limited] HTTP 429{reason} — retry later (in {}s)", s),
+                        None => eprintln!("[rate-limited] HTTP 429{reason} — paused, retry later"),
                     }
                 } else if !reset_at_display.is_empty() {
                     eprintln!(

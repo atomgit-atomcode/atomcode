@@ -5073,6 +5073,7 @@ pub(crate) fn format_rate_limited_line(
     reset_label: &str,
     secs_until_reset: Option<u64>,
     auto_resuming: bool,
+    server_message: Option<&str>,
 ) -> String {
     if auto_resuming {
         // WaitAndRetry: kernel is sleeping then will retry automatically.
@@ -5092,7 +5093,13 @@ pub(crate) fn format_rate_limited_line(
             Some(s) => format!("（约 {} 后可重试）", fmt_dur(s)),
             None => String::new(),
         };
-        return format!("⏸ 限流（HTTP 429）{tail} · 已保留已完成内容 · 稍后重试或换模型");
+        // Surface the provider's OWN 429 reason when it carried one (e.g. an external
+        // model's "余额不足…请充值") so the user sees the actionable cause, not a bare 429.
+        let reason = match server_message {
+            Some(m) if !m.trim().is_empty() => format!("：{}", m.trim()),
+            _ => String::new(),
+        };
+        return format!("⏸ 限流（HTTP 429）{reason}{tail} · 已保留已完成内容 · 稍后重试或换模型");
     }
     // Confirmed CodingPlan window exhaustion.
     let tail = match secs_until_reset {
@@ -5229,7 +5236,7 @@ mod rate_limited_tests {
     // Branch 1: auto_resuming=true → countdown line (WaitAndRetry)
     #[test]
     fn rate_limited_wait_shows_countdown() {
-        let line = format_rate_limited_line("", "", Some(45), true);
+        let line = format_rate_limited_line("", "", Some(45), true, None);
         assert!(line.contains("45"), "should contain countdown seconds");
         assert!(line.contains("自动继续"), "should mention auto-continue");
         assert!(line.contains('⏳'), "must use clock glyph ⏳ for WaitAndRetry");
@@ -5239,7 +5246,7 @@ mod rate_limited_tests {
     // Branch 2: auto_resuming=false, reset_at_display non-empty → pause with time (Pause)
     #[test]
     fn rate_limited_renders_non_error_pause_line() {
-        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false);
+        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false, None);
         assert!(line.contains("18:09"), "should contain reset time");
         assert!(
             line.contains("可换模型") || line.contains("稍后重试"),
@@ -5256,7 +5263,7 @@ mod rate_limited_tests {
     // "5h window exhausted" message. Locks the mis-attribution fix.
     #[test]
     fn rate_limited_pause_empty_reset_is_generic_not_coding_plan() {
-        let line = format_rate_limited_line("", "", None, false);
+        let line = format_rate_limited_line("", "", None, false, None);
         assert!(line.contains('⏸'), "must use pause glyph ⏸");
         assert!(!line.contains("自动继续"), "must not say 自动继续");
         assert!(!line.contains("还有"), "must not show countdown when no reset time");
@@ -5273,10 +5280,30 @@ mod rate_limited_tests {
         assert!(line.contains("稍后重试"), "should indicate to retry later");
     }
 
+    #[test]
+    fn rate_limited_generic_surfaces_provider_reason() {
+        // A generic (non-CodingPlan) 429 that carried a real provider body — e.g. an
+        // external model's "余额不足…请充值" — must surface that actionable reason.
+        let line =
+            format_rate_limited_line("", "", None, false, Some("余额不足或无可用资源包,请充值"));
+        assert!(line.contains("余额不足或无可用资源包,请充值"), "must show provider reason: {line}");
+        assert!(line.contains("HTTP 429") || line.contains("限流"), "still a generic 429 line: {line}");
+        assert!(!line.contains("5小时窗口"), "must not claim CodingPlan quota: {line}");
+    }
+
+    #[test]
+    fn rate_limited_coding_plan_ignores_server_message() {
+        // A CodingPlan window pause (has reset time) keeps its window message even if a
+        // server_message tags along — the reason line is only for the generic branch.
+        let line = format_rate_limited_line("18:09", "", Some(7200), false, Some("请充值"));
+        assert!(line.contains("5小时窗口"), "CodingPlan quota keeps its message: {line}");
+        assert!(!line.contains("请充值"), "server_message must not leak into the CodingPlan line: {line}");
+    }
+
     // A gateway CodingPlan quota (real reset time) KEEPS the "5h window" message.
     #[test]
     fn rate_limited_pause_with_reset_time_keeps_coding_plan_message() {
-        let line = format_rate_limited_line("18:09", "", Some(7200), false);
+        let line = format_rate_limited_line("18:09", "", Some(7200), false, None);
         assert!(line.contains("5小时窗口"), "confirmed CodingPlan quota keeps its message: {line}");
         assert!(line.contains("18:09"), "shows the window reset time");
     }
@@ -5286,14 +5313,14 @@ mod rate_limited_tests {
     // message — keying on reset_at_display alone would wrongly go generic.
     #[test]
     fn rate_limited_empty_display_but_label_keeps_coding_plan() {
-        let line = format_rate_limited_line("", "（每 5 小时一个窗口）", Some(7200), false);
+        let line = format_rate_limited_line("", "（每 5 小时一个窗口）", Some(7200), false, None);
         assert!(line.contains("5小时窗口"), "label alone must keep CodingPlan framing: {line}");
         assert!(!line.contains("HTTP 429"), "must not fall to the generic line: {line}");
     }
 
     #[test]
     fn rate_limited_no_secs_shows_no_duration() {
-        let line = format_rate_limited_line("23:59", "", None, false);
+        let line = format_rate_limited_line("23:59", "", None, false, None);
         assert!(line.contains("23:59"));
         assert!(!line.contains("还有"));
     }
@@ -5303,7 +5330,7 @@ mod rate_limited_tests {
         // Pause (auto_resuming=false) with no wall-clock display but a known
         // remaining duration: the duration must NOT be dropped. (Generic 429 line
         // now — no CodingPlan claim without a real reset time.)
-        let line = format_rate_limited_line("", "", Some(7200), false);
+        let line = format_rate_limited_line("", "", Some(7200), false, None);
         assert!(line.contains('⏸'), "must use pause glyph");
         assert!(!line.contains("自动继续"), "must not say auto-continue (this is a Pause)");
         assert!(!line.contains("5小时窗口"), "empty-reset 429 must not claim CodingPlan quota: {line}");

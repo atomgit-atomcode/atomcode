@@ -29,7 +29,7 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
@@ -597,7 +597,7 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }

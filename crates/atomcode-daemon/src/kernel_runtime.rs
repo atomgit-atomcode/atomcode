@@ -617,12 +617,13 @@ impl KernelToWebui {
             }
             // ---- advisory ----
             KEv::Warning(w) => vec![CoreEv::Warning(w)],
-            KEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming } => {
+            KEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming, server_message } => {
                 vec![CoreEv::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
                     auto_resuming,
+                    server_message,
                 }]
             }
             // ---- usage ----
@@ -1772,9 +1773,10 @@ mod kernel_runtime_translate_tests {
             reset_label: "resets".into(),
             secs_until_reset: Some(60),
             auto_resuming: true,
+            server_message: None,
         });
         match &out[..] {
-            [CoreEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming }] => {
+            [CoreEv::RateLimited { reset_at_display, reset_label, secs_until_reset, auto_resuming, .. }] => {
                 assert_eq!(reset_at_display, "12:00");
                 assert_eq!(reset_label, "resets");
                 assert_eq!(*secs_until_reset, Some(60));

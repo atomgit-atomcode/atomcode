@@ -853,7 +853,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
-      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
+      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
       // NOTE: no artifact_* mapping. This is safe today because the /sync live
       // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
       // live_api.rs — it does NOT run text through ArtifactDetector), so the
@@ -1447,8 +1447,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           text = t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
         } else if (!isCodingPlan) {
           // Generic 429 (external model / no CodingPlan window data): must NOT be
-          // dressed up as a CodingPlan quota exhaustion.
-          text = `${t('chat.rateLimited.generic')}${dur} · ${t('chat.rateLimited.hint')}`;
+          // dressed up as a CodingPlan quota exhaustion. Surface the provider's OWN
+          // reason when present (e.g. an external model's "余额不足…请充值").
+          const reason = event.server_message?.trim() ? `：${event.server_message.trim()}` : '';
+          text = `${t('chat.rateLimited.generic')}${reason}${dur} · ${t('chat.rateLimited.hint')}`;
         } else if (time) {
           text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
         } else {

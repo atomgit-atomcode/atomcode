@@ -2317,6 +2317,9 @@ pub enum ChatEvent {
         /// `false` = Pause (kernel stopped the turn, user must act).
         #[serde(default)]
         auto_resuming: bool,
+        /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
+        #[serde(default)]
+        server_message: Option<String>,
     },
 }
 
@@ -3088,12 +3091,14 @@ async fn process_chat_request(
                 reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message,
             } => {
                 let _ = event_tx.send(ChatEvent::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
                     auto_resuming,
+                    server_message,
                 });
             }
             TurnEvent::ApprovalResolved { .. } => {
@@ -4892,6 +4897,7 @@ mod tests {
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
             auto_resuming: false,
+            server_message: None,
         })
         .unwrap();
         // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)

@@ -245,6 +245,19 @@ fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
         .or_else(|| parse_retry_after_secs(&e.message))
 }
 
+/// The provider's OWN 429 body, with the `HTTP <status>: ` prefix that the
+/// capabilities provider prepends stripped off, so a driver can surface the
+/// actionable reason (e.g. an external model's `余额不足…请充值`) on a generic
+/// pause instead of a bare "HTTP 429". `None` when the body is empty / only the
+/// prefix. Kept prefix-exact (the known status) rather than a loose match, and
+/// falls back to the whole message if the prefix isn't present (other providers).
+fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
+    let status = e.http_status.unwrap_or(429);
+    let prefix = format!("HTTP {status}: ");
+    let detail = e.message.strip_prefix(&prefix).unwrap_or(e.message.as_str()).trim();
+    (!detail.is_empty()).then(|| detail.to_string())
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -1498,6 +1511,7 @@ impl RunningAgent {
                         http_status: e.http_status,
                         retry_after_secs: effective_retry_after(&e),
                     };
+                    let server_message = rate_limit_server_message(&e);
                     let decision = self
                         .hooks
                         .on_rate_limit(&hint)
@@ -1516,6 +1530,7 @@ impl RunningAgent {
                                     reset_label: String::new(),
                                     secs_until_reset: None,
                                     auto_resuming: false,
+                                    server_message,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                     .await;
@@ -1526,6 +1541,7 @@ impl RunningAgent {
                                 reset_label: String::new(),
                                 secs_until_reset: Some(secs),
                                 auto_resuming: true,
+                                server_message: None, // auto-retrying: no user-facing reason line
                             });
                             tokio::select! {
                                 biased;
@@ -1549,6 +1565,7 @@ impl RunningAgent {
                                 reset_label,
                                 secs_until_reset,
                                 auto_resuming: false,
+                                server_message,
                             });
                             self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                 .await;
@@ -1822,6 +1839,7 @@ impl RunningAgent {
                             http_status: e.http_status,
                             retry_after_secs: effective_retry_after(&e),
                         };
+                        let server_message = rate_limit_server_message(&e);
                         let decision =
                             self.hooks.on_rate_limit(&hint).await.unwrap_or_else(|| {
                                 crate::hook::RateLimitDecision::from_hint(&hint)
@@ -1837,6 +1855,7 @@ impl RunningAgent {
                                         reset_label: String::new(),
                                         secs_until_reset: None,
                                         auto_resuming: false,
+                                        server_message,
                                     });
                                     self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                         .await;
@@ -1847,6 +1866,7 @@ impl RunningAgent {
                                     reset_label: String::new(),
                                     secs_until_reset: Some(secs),
                                     auto_resuming: true,
+                                    server_message: None,
                                 });
                                 tokio::select! {
                                     biased;
@@ -1908,6 +1928,7 @@ impl RunningAgent {
                                     reset_label,
                                     secs_until_reset,
                                     auto_resuming: false,
+                                    server_message,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                     .await;

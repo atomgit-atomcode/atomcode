@@ -432,6 +432,11 @@ pub enum AgentEvent {
         /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
         /// `false` = Pause (kernel stopped the turn, user must act).
         auto_resuming: bool,
+        /// The provider's OWN 429 message (extracted, no `HTTP …:` prefix) when the
+        /// 429 carried an actionable body (e.g. an external model's `余额不足…请充值`).
+        /// `None` for CodingPlan-window pauses and auto-retry. Drivers surface it ONLY
+        /// on the generic (non-CodingPlan) pause.
+        server_message: Option<String>,
     },
     /// A UserPromptSubmit hook failed due to an environment issue (missing
     /// dependency, crash, etc.) rather than an explicit block. The turn

@@ -72,6 +72,9 @@ pub enum TurnEvent {
         /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
         /// `false` = Pause (kernel stopped the turn, user must act).
         auto_resuming: bool,
+        /// The provider's own 429 message (extracted, no `HTTP …:` prefix) for the
+        /// generic (non-CodingPlan) pause. `None` otherwise. See `AgentEvent::RateLimited`.
+        server_message: Option<String>,
     },
     /// Token usage update
     TokenUsage {

@@ -11480,13 +11480,14 @@ fn handle_agent_event(
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         } => {
             // Non-error pause line: dim/plain body row, never red.
             // auto_resuming=true (WaitAndRetry): "⏳ 限流，Ns 后自动继续…"
             // auto_resuming=false + CodingPlan window data (reset time and/or label):
             //   "⏸ 5小时窗口已用尽，约 HH:MM 恢复…" / "…稍后恢复…"
             // auto_resuming=false + NO window data (external-model / generic 429):
-            //   "⏸ 限流（HTTP 429）…" — not dressed up as a CodingPlan quota.
+            //   "⏸ 限流（HTTP 429）[：<provider reason>]…" — not a CodingPlan quota.
             // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
             // Rate-limit is a pause, not an error/warning — it must not
             // render with the yellow `! ` prefix that Warning applies.
@@ -11495,6 +11496,7 @@ fn handle_agent_event(
                 &reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message.as_deref(),
             );
             renderer.render(UiLine::Muted(line));
             renderer.flush();

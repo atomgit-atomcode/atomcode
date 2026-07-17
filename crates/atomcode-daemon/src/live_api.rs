@@ -1156,11 +1156,13 @@ impl TurnExecutor for KernelTurnExecutor {
                     reset_label,
                     secs_until_reset,
                     auto_resuming,
+                    server_message,
                 } => emit(TurnEvent::RateLimited {
                     reset_at_display,
                     reset_label,
                     secs_until_reset,
                     auto_resuming,
+                    server_message,
                 }),
                 AgentEvent::TurnCancelled { snapshot } => {
                     break Some(AuthoritativeTerminal {
@@ -1540,11 +1542,13 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         } => TurnEvent::RateLimited {
             reset_at_display,
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         },
         _ => return None,
     })
@@ -1937,6 +1941,9 @@ pub(crate) enum LiveWireEvent {
         /// `false` = Pause (kernel stopped the turn, user must act).
         #[serde(default)]
         auto_resuming: bool,
+        /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
+        #[serde(default)]
+        server_message: Option<String>,
     },
 }
 
@@ -2045,11 +2052,13 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message,
             } => LiveWireEvent::RateLimited {
                 reset_at_display,
                 reset_label,
                 secs_until_reset,
                 auto_resuming,
+                server_message,
             },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
@@ -3045,6 +3054,7 @@ mod tests {
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
             auto_resuming: false,
+            server_message: None,
         });
         match result {
             Some(TurnEvent::RateLimited {
@@ -3052,6 +3062,7 @@ mod tests {
                 reset_label,
                 secs_until_reset,
                 auto_resuming,
+                ..
             }) => {
                 assert_eq!(reset_at_display, "18:09");
                 assert_eq!(reset_label, "5h");
@@ -3074,6 +3085,7 @@ mod tests {
             reset_label: "5h".into(),
             secs_until_reset: Some(7200),
             auto_resuming: false,
+            server_message: None,
         }))
         .expect("should map");
         let json = serde_json::to_string(&wire).unwrap();

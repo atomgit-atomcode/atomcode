@@ -70,11 +70,13 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         } => AgentEvent::RateLimited {
             reset_at_display,
             reset_label,
             secs_until_reset,
             auto_resuming,
+            server_message,
         },
         // 不需要的：忽略
         TurnEvent::ToolCallStreaming { .. }

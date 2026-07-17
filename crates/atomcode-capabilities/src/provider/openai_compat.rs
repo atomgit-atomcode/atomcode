@@ -447,12 +447,12 @@ async fn open_stream(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs = retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
                     let text = resp.text().await.unwrap_or_default();
-                    // Parse the error envelope ONCE for both the readable detail and
-                    // the STRUCTURED provider code.
+                    // Standard multi-shape extraction (detail / error / top-level message)
+                    // so a clean human message surfaces for EVERY vendor — not just the
+                    // OpenAI `error` object. GLM returns top-level `{"code","message"}`.
+                    let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
-                    let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
-                    let detail = err_obj.map(parse_error_obj).unwrap_or_else(|| truncate_msg(&text));
-                    let provider_code = err_obj.and_then(error_code);
+                    let provider_code = envelope.as_ref().and_then(|v| v.get("error")).and_then(error_code);
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
                         message: format!("HTTP {code}: {detail}"),
@@ -736,6 +736,41 @@ fn truncate_msg(s: &str) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// Extract a human-readable error detail from a provider's JSON error body, covering
+/// the common envelope shapes so a clean message surfaces regardless of vendor:
+/// - FastAPI / AtomGit-gateway: `{"detail":{"message":…}}` or `{"detail":"…"}`
+/// - OpenAI / Anthropic: `{"error":{"message","type","code"}}` (kept as the tagged
+///   `[type/code] message` form via [`parse_error_obj`])
+/// - Top-level `{"code","message"}` (e.g. GLM `{"code":"1113","message":"余额不足…"}`)
+/// Falls back to the truncated raw body when nothing parses. Mirrors
+/// `atomcode_core::provider::extract_error_message`'s shape list (kept LOCAL — L1 must
+/// not depend on core). Previously only the `error` object was handled, so GLM-style
+/// top-level `message` bodies dumped raw JSON into the user-facing error.
+fn extract_error_detail(text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if let Some(detail) = v.get("detail") {
+            if let Some(msg) = detail.get("message").and_then(|m| m.as_str()) {
+                return truncate_msg(msg.trim());
+            }
+            if let Some(s) = detail.as_str() {
+                return truncate_msg(s.trim());
+            }
+        }
+        if let Some(err) = v.get("error") {
+            if err.is_object() {
+                return parse_error_obj(err);
+            }
+            if let Some(s) = err.as_str() {
+                return truncate_msg(s.trim());
+            }
+        }
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            return truncate_msg(msg.trim());
+        }
+    }
+    truncate_msg(text)
 }
 
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
@@ -1756,6 +1791,24 @@ mod tests {
         assert_eq!(error_code(&v2).as_deref(), Some("server_error"));
         let v3: serde_json::Value = serde_json::from_str(r#"{"message":"x","code":429}"#).unwrap();
         assert_eq!(error_code(&v3).as_deref(), Some("429"));
+    }
+
+    #[test]
+    fn extract_error_detail_covers_all_envelope_shapes() {
+        // OpenAI / Anthropic `{"error":{...}}` → tagged "[type/code] message".
+        let openai = extract_error_detail(r#"{"error":{"message":"boom","type":"rate_limit","code":"429"}}"#);
+        assert!(openai.contains("boom") && openai.contains("rate_limit"), "{openai}");
+        // FastAPI / AtomGit `{"detail":{"message":...}}`.
+        assert_eq!(extract_error_detail(r#"{"detail":{"code":"X","message":"请升级"}}"#), "请升级");
+        // FastAPI `{"detail":"..."}` string form.
+        assert_eq!(extract_error_detail(r#"{"detail":"nope"}"#), "nope");
+        // GLM-style TOP-LEVEL `{"code","message"}` — the case that previously dumped raw JSON.
+        assert_eq!(
+            extract_error_detail(r#"{"code":"1113","message":"余额不足或无可用资源包,请充值。"}"#),
+            "余额不足或无可用资源包,请充值。"
+        );
+        // Non-JSON / unknown shape → raw body (truncated).
+        assert_eq!(extract_error_detail("plain text error"), "plain text error");
     }
 
     #[test]
