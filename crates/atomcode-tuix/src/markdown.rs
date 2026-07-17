@@ -110,8 +110,16 @@ pub fn render_line_with_width(
 ) -> Option<String> {
     let trimmed = line.trim();
 
-    // Table row: buffer and defer emit until block ends.
-    if !state.in_code_block && trimmed.starts_with('|') {
+    // Table row: buffer and defer emit until the block ends. GitHub-flavored
+    // markdown allows tables WITHOUT the leading/trailing `|` (`a | b` +
+    // `---|---` is as valid as `| a | b |`), and models emit both forms. Keying
+    // detection on `starts_with('|')` missed the pipe-less form entirely — those
+    // tables fell through and rendered as raw markdown source (issue: long
+    // comparison tables shown un-rendered). Buffer any row that splits into ≥2
+    // cells (respecting code-span pipes + `\|` via `split_table_row`); the flush
+    // then REQUIRES a delimiter row, so a lone prose line with a literal `|`
+    // still renders as prose, not a box.
+    if !state.in_code_block && split_table_row(trimmed).len() >= 2 {
         state.table_buf.push(trimmed.to_string());
         return None;
     }
@@ -425,6 +433,19 @@ pub fn flush_aligned_table_with_width(
         row.iter()
             .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
     };
+
+    // A real GFM table REQUIRES a delimiter row (`---|---`). Since detection now
+    // speculatively buffers any pipe-splitting line, a lone prose line with a
+    // literal `|` (or a header with no following delimiter) lands here with NO
+    // separator — render those as normal inline markdown, NOT a drawn box.
+    let has_sep = parsed.iter().any(|r| is_sep(r));
+    if !has_sep || parsed.len() < 2 {
+        return rows
+            .iter()
+            .map(|r| render_inline_line(r, caps))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
 
     let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
     if ncols == 0 {
@@ -1500,6 +1521,49 @@ mod tests {
         assert!(out.contains("signup"));
         // No ellipsis introduced.
         assert!(!out.contains('…'));
+    }
+
+    #[test]
+    fn pipeless_gfm_table_is_detected_and_rendered() {
+        // GFM tables WITHOUT leading/trailing pipes (`a | b` + `---|---`) must
+        // render as a table, not show raw markdown source. Regression for the
+        // "long comparison tables rendered un-rendered in the TUI" report.
+        let mut st = MdState::new();
+        assert!(render_line("对比 | HEAD | main", &mut st, plain_caps()).is_none(), "header buffered");
+        assert!(render_line("---|---|---", &mut st, plain_caps()).is_none(), "delimiter buffered");
+        assert!(render_line("代码 | 手动 | 调用", &mut st, plain_caps()).is_none(), "data buffered");
+        let out = render_line("下一段", &mut st, plain_caps()).expect("trailing line flushes table");
+        assert!(out.contains('┌') || out.contains('│'), "must render as a table box: {out}");
+        assert!(!out.contains("---|---"), "raw delimiter must not leak: {out}");
+        assert!(out.contains("HEAD") && out.contains("代码"), "cells preserved: {out}");
+    }
+
+    #[test]
+    fn prose_with_literal_pipe_is_not_boxed() {
+        // A lone prose line with a literal `|` splits into ≥2 cells and is
+        // speculatively buffered, but with NO delimiter row the flush must render
+        // it as inline prose, NOT draw a table box around it.
+        let mut st = MdState::new();
+        assert!(render_line("run foo | bar here", &mut st, plain_caps()).is_none());
+        let out = render_line("next paragraph", &mut st, plain_caps()).expect("flush");
+        assert!(!out.contains('┌'), "prose-with-pipe must not be boxed: {out}");
+        assert!(out.contains("foo") && out.contains("bar"), "prose preserved: {out}");
+    }
+
+    #[test]
+    fn flush_pipeless_rows_render_as_table_and_no_sep_renders_inline() {
+        // Flush directly: pipe-less rows WITH a delimiter → box.
+        let table = flush_aligned_table_with_width(
+            &["A | B".to_string(), "---|---".to_string(), "c | d".to_string()],
+            plain_caps(),
+            80,
+        );
+        assert!(table.contains('┌') && table.contains('│'), "pipe-less table renders as box: {table}");
+        assert!(table.contains('A') && table.contains('d'), "cells preserved: {table}");
+        // No delimiter → NOT a table → inline, no box.
+        let prose = flush_aligned_table_with_width(&["a | b".to_string()], plain_caps(), 80);
+        assert!(!prose.contains('┌'), "no box without a delimiter row: {prose}");
+        assert!(prose.contains("a | b"), "raw inline preserved: {prose}");
     }
 
     /// Narrow terminal: table can't fit at natural widths → fall back to
