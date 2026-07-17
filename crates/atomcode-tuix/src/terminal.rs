@@ -129,6 +129,16 @@ pub struct TerminalCaps {
     /// per-`─`-CUP rule fragmentation that JediTerm's no-fallback paint layer
     /// produces. See `EnvView::terminal_emulator` for the full mechanism.
     pub jediterm: bool,
+    /// A modern terminal emulator was detected: Windows Terminal (`WT_SESSION`)
+    /// or iTerm2 / VS Code / WezTerm / Hyper (`TERM_PROGRAM`). Same signal as
+    /// the legacy-console heuristic. Consumed by the welcome-mascot gate: the
+    /// half-block + per-cell-background pixel art renders reliably only on
+    /// modern emulators; bare / SSH terminals (FinalShell, PuTTY, …) that set
+    /// neither var may not paint cell backgrounds, fragmenting the art — so we
+    /// omit it there (the tips stack cleanly instead). Note this is `false` over
+    /// SSH regardless of the client, since SSH doesn't forward these client-side
+    /// vars to the remote where atomcode runs.
+    pub modern_emulator: bool,
 }
 
 impl TerminalCaps {
@@ -183,6 +193,7 @@ impl TerminalCaps {
             unicode_symbols,
             legacy_conhost: windows_legacy_console,
             jediterm,
+            modern_emulator: on_modern_emulator,
         }
     }
 

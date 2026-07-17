@@ -13401,6 +13401,7 @@ mod install_password_modal_tests {
             unicode_symbols: false,
             legacy_conhost: false,
             jediterm: false,
+            modern_emulator: false,
         }
     }
 

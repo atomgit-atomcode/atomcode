@@ -4606,11 +4606,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // ---- Left block: mascot (if colors) + cwd + model ----
         let secondary = self.style_for(Role::Secondary);
         let bullet = self.style_for(Role::AccentDim);
-        // The mascot is half-block art (`▀`/`▄`) in 256-colour. It needs BOTH
-        // colour and unicode: on a classic Windows console (`unicode_symbols =
-        // false`) the glyphs downgrade to `#`, so omit the mascot there (a
-        // `#`-soup reads worse than no mascot) and let the tips stack.
-        let show_mascot = self.caps.colors && self.caps.unicode_symbols;
+        // The mascot is half-block art (`▀`/`▄`) that packs two vertical pixels
+        // per cell via fg (top) + per-cell BACKGROUND (bottom). It needs colour,
+        // unicode, AND a terminal that actually paints cell backgrounds. On a
+        // classic Windows console (`unicode_symbols = false`) the glyphs
+        // downgrade to `#`; and bare / SSH terminals like FinalShell render the
+        // block glyphs but drop the cell background, so the bottom pixels vanish
+        // and the art fragments. Gate on `modern_emulator` (WT_SESSION /
+        // TERM_PROGRAM) — reliably backgrounds-capable — plus JediTerm (a local
+        // modern IDE terminal that also paints backgrounds); omit elsewhere and
+        // let the tips stack cleanly.
+        let show_mascot = self.caps.colors
+            && self.caps.unicode_symbols
+            && (self.caps.modern_emulator || self.caps.jediterm);
         let mascot_w = crate::render::mascot::MASCOT_WIDTH;
 
         let mut left: Vec<Vec<Cell>> = Vec::new();
@@ -15286,6 +15294,7 @@ mod tests {
         let (mut r, _c) = new_counting(100, 30);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
+        r.caps.modern_emulator = true; // half-block+bg art needs a bg-capable emulator
         r.push_welcome("GLM-5.2", "~/proj");
         let text = body_text(&r);
         assert!(text.contains('▀'), "mascot half-blocks must be present");
@@ -15304,6 +15313,23 @@ mod tests {
         let text = body_text(&r);
         assert!(!text.contains('▀'), "no mascot when colors are disabled");
         assert!(text.contains("/login"), "tips still present without color");
+    }
+
+    #[test]
+    fn welcome_non_modern_emulator_omits_mascot() {
+        // FinalShell-like: colours + unicode present, but NOT a modern emulator
+        // (no WT_SESSION / TERM_PROGRAM, e.g. bare SSH). Such terminals render
+        // the block glyphs but may drop the per-cell background, fragmenting the
+        // half-block art — so omit it and let the tips stack.
+        let (mut r, _c) = new_counting(100, 30);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        r.caps.modern_emulator = false;
+        r.caps.jediterm = false;
+        r.push_welcome("GLM-5.2", "~/proj");
+        let text = body_text(&r);
+        assert!(!text.contains('▀'), "no mascot on a non-modern emulator (FinalShell-like)");
+        assert!(text.contains("/login"), "tips still present");
     }
 
     #[test]

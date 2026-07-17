@@ -511,6 +511,7 @@ mod tests {
             unicode_symbols: false,
             legacy_conhost: false,
             jediterm: false,
+            modern_emulator: false,
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
             unicode_symbols: true,
             legacy_conhost: false,
             jediterm: true,
+            modern_emulator: false,
         }
     }
 
