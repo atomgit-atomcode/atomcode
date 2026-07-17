@@ -418,6 +418,45 @@ fn is_test_construct(effcmd: Option<&str>) -> bool {
     matches!(effcmd, Some("[[") | Some("[") | Some("((") | Some("test"))
 }
 
+/// For each `mv` in the line, the `(source, dest)` pairs it performs — `mv A B C DEST`
+/// (or `mv -t DEST A B C`) → `[(A,DEST), (B,DEST), (C,DEST)]`.
+///
+/// Used to catch a MOVE that removes an in-workspace file by relocating it OUT of the workspace
+/// (temp included). The target-location check alone misses this: `mv ws_file /tmp/x` has a
+/// temp/absolute dest that counts as an acceptable WRITE location, yet the SOURCE has left the
+/// workspace — an equivalent delete. `cp` is excluded: it copies, so the source stays put.
+/// Sources/dests with a dynamic token are already fail-closed by `scan_destructive_bash`.
+pub(crate) fn mv_moves(command: &str) -> Vec<(String, String)> {
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+    let mut out = Vec::new();
+    for seg in split_segments(joined.trim()) {
+        let toks = tokenize(seg.trim());
+        let Some(ci) = effective_command_index(&toks) else {
+            continue;
+        };
+        if base(strip_quotes(&toks[ci])) != "mv" {
+            continue;
+        }
+        let Some((positionals, target_dir)) = parse_path_operands(&toks[ci + 1..]) else {
+            continue;
+        };
+        let (sources, dest) = match target_dir {
+            // `mv -t DEST A B` — every positional is a source; DEST is the destination dir.
+            Some(d) => (positionals, d),
+            // `mv A B ... DEST` — last positional is the destination, the rest are sources.
+            None if positionals.len() >= 2 => {
+                let dest = positionals[positionals.len() - 1].clone();
+                (positionals[..positionals.len() - 1].to_vec(), dest)
+            }
+            None => continue, // `mv` with < 2 operands and no `-t` does nothing well-formed
+        };
+        for src in sources {
+            out.push((src, dest.clone()));
+        }
+    }
+    out
+}
+
 /// Statically scan a bash command line for filesystem-destructive operations. See [`BashScan`].
 pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
     // Bash removes `\<newline>` line continuations entirely (joining the tokens). Do the same so a
@@ -590,22 +629,36 @@ impl ToolMiddleware for BashWorkspaceGate {
         // Classification canonicalizes paths (filesystem I/O) — run OFF the async worker, bounded,
         // so a hung mount can't freeze the kernel's turn loop (Esc/Ctrl-C stay live). On timeout we
         // degrade to "not in workspace" → a normal prompt (safe, never hangs).
+        // `mv` (source, dest) pairs — for the "moved OUT of the workspace = deleted" check below.
+        let mv_pairs = mv_moves(&command);
         let (all_in_workspace, key) = {
             let targets = targets.clone();
+            let mv_pairs = mv_pairs.clone();
             let cwd = cwd.clone();
             let fallback = (false, "bashdir::".to_string());
             super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
-                // Classify each target once (path_in_workspace canonicalizes — filesystem I/O).
-                // Temp-dir targets (codex parity: /tmp + $TMPDIR are default-writable) are treated
-                // as in-workspace: a `cargo build > /tmp/x.json` is benign scratch, not a write to
-                // a user-owned directory outside the workspace.
-                let in_ws: Vec<bool> = targets
+                // Written/deleted TARGETS that land OUTSIDE the workspace (path canonicalizes —
+                // filesystem I/O). Temp-dir targets (codex parity: /tmp + $TMPDIR are
+                // default-writable) count as in-workspace: `cargo build > /tmp/x.json` is benign
+                // scratch, not a write to a user-owned directory outside the workspace.
+                let mut out: Vec<String> = targets
                     .iter()
-                    .map(|t| path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
+                    .filter(|t| !(path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd)))
+                    .cloned()
                     .collect();
-                let all_in = in_ws.iter().all(|&b| b);
-                let key = match targets.iter().zip(&in_ws).find(|(_, &inws)| !inws) {
-                    Some((t, _)) => format!("bashdir::{}", canonical_dir_key(t, &cwd)),
+                // A `mv` carrying an in-workspace file to a dest NOT in the workspace PROPER removes
+                // it from the workspace — an equivalent delete. Temp does NOT rescue the dest here
+                // (moving a workspace file to /tmp still deletes it from the workspace), so a
+                // rejected `rm` can't be laundered through `mv <ws_file> /tmp/backup`. Treat that
+                // dest as out-of-workspace so the move prompts.
+                for (src, dst) in &mv_pairs {
+                    if path_in_workspace(src, &cwd) && !path_in_workspace(dst, &cwd) {
+                        out.push(dst.clone());
+                    }
+                }
+                let all_in = out.is_empty();
+                let key = match out.first() {
+                    Some(t) => format!("bashdir::{}", canonical_dir_key(t, &cwd)),
                     None => "bashdir::".to_string(),
                 };
                 (all_in, key)
@@ -666,6 +719,30 @@ mod tests {
     #[test]
     fn mv_targets_both_operands() {
         assert_eq!(scan("mv a.txt /outside/b.txt"), BashScan::Targets(vec!["a.txt".into(), "/outside/b.txt".into()]));
+    }
+
+    #[test]
+    fn mv_moves_extracts_source_dest_pairs() {
+        assert_eq!(mv_moves("mv a.txt /tmp/b"), vec![("a.txt".to_string(), "/tmp/b".to_string())]);
+        // multi-source → one pair per source, shared dest dir
+        assert_eq!(
+            mv_moves("mv a b c /tmp/dest"),
+            vec![
+                ("a".to_string(), "/tmp/dest".to_string()),
+                ("b".to_string(), "/tmp/dest".to_string()),
+                ("c".to_string(), "/tmp/dest".to_string()),
+            ]
+        );
+        // `-t DEST` form: every positional is a source
+        assert_eq!(
+            mv_moves("mv -t /tmp/dest a b"),
+            vec![("a".to_string(), "/tmp/dest".to_string()), ("b".to_string(), "/tmp/dest".to_string())]
+        );
+        // cp is a copy (source stays) → not a move
+        assert!(mv_moves("cp a.txt /tmp/b").is_empty());
+        // rm / single-operand mv → no pair
+        assert!(mv_moves("rm a.txt").is_empty());
+        assert!(mv_moves("mv onlyone").is_empty());
     }
 
     #[test]
@@ -899,6 +976,41 @@ mod tests {
             gate.before(&mut o, &tool, &silent_rt()).await.is_deny(),
             "a delete in a different folder must still prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn mv_workspace_file_to_temp_prompts() {
+        // The equivalent-delete bypass: a rejected `rm` laundered through `mv <ws_file> /tmp/x`.
+        // Moving an in-workspace file to /tmp removes it from the workspace, so it must prompt —
+        // the temp carve-out must NOT rescue an mv DEST when the SOURCE is in the workspace.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("data.bin"), "x").unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("mv data.bin /tmp/atomcode-mv-test-backup");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(out.is_deny(), "mv of a workspace file out to /tmp must prompt (fail closed), got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn mv_within_workspace_proceeds() {
+        // A rename inside the workspace keeps the file in the workspace → no prompt.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "x").unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("mv a.txt b.txt");
+        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
+    }
+
+    #[tokio::test]
+    async fn mv_temp_to_temp_proceeds() {
+        // No in-workspace source involved → the move doesn't touch the workspace → no prompt.
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = bash_call("mv /tmp/atomcode-a /tmp/atomcode-b");
+        assert_eq!(gate.before(&mut call, &tool, &silent_rt()).await, BeforeOutcome::Proceed);
     }
 
     #[tokio::test]
