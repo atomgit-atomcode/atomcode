@@ -1429,21 +1429,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'rate_limited': {
         // 限流暂停：渲染成暗色中性卡片，非红色 error 样式；保留已完成内容，不结束回合。
         // auto_resuming=true → WaitAndRetry (kernel will sleep then retry)
-        // auto_resuming=false + reset_at_display → Pause with known reset time
-        // auto_resuming=false + empty reset_at_display → Pause with unknown reset time
+        // A CodingPlan verdict carries window data (a reset time AND/OR a window
+        // label); the kernel's generic default (an external-model / non-CodingPlan
+        // 429) carries NEITHER. So only claim "5h window exhausted" for a real
+        // CodingPlan quota — otherwise a generic "限流（HTTP 429）". Mirrors the TUI/CLI.
         const time = event.reset_at_display;
+        const isCodingPlan = !!time || !!event.reset_label;
+        const secs = event.secs_until_reset;
+        // Bare compact h/m/s (locale-neutral), then wrap in a localized suffix so the
+        // English notice doesn't leak a Chinese "（还有 …）" fragment.
+        const durRaw = secs == null ? '' :
+          secs >= 3600 ? `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m` :
+          secs >= 60 ? `${Math.floor(secs / 60)}m` : `${secs}s`;
+        const dur = durRaw ? t('chat.rateLimited.remaining', { dur: durRaw }) : '';
         let text: string;
         if (event.auto_resuming) {
           text = t('chat.rateLimited.waiting', { secs: String(event.secs_until_reset ?? 0) });
+        } else if (!isCodingPlan) {
+          // Generic 429 (external model / no CodingPlan window data): must NOT be
+          // dressed up as a CodingPlan quota exhaustion.
+          text = `${t('chat.rateLimited.generic')}${dur} · ${t('chat.rateLimited.hint')}`;
         } else if (time) {
           text = `${t('chat.rateLimited.paused', { time })} · ${t('chat.rateLimited.hint')}`;
         } else {
-          // Pause with no wall-clock time but a known remaining duration: show it
-          // (compact h/m/s, matching the TUI) instead of dropping secs_until_reset.
-          const secs = event.secs_until_reset;
-          const dur = secs == null ? '' :
-            secs >= 3600 ? `（还有 ${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m）` :
-            secs >= 60 ? `（还有 ${Math.floor(secs / 60)}m）` : `（还有 ${secs}s）`;
+          // CodingPlan window (label present) with no wall-clock reset time.
           text = `${t('chat.rateLimited.pausedNoTime')}${dur} · ${t('chat.rateLimited.hint')}`;
         }
         pushRateLimitedToLastAssistant(text);
