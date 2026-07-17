@@ -66,20 +66,25 @@
    light in dark mode (jarring white bar in Edge/Chrome). `color-scheme` above fixes the
    native fallback + form controls; the rules below give a thin, subtle, theme-following
    thumb across every scroll area — the left session list AND the right chat pane. */
+/* Standard properties — the ONLY path Chrome/Edge 121+ and Firefox use. Once these
+   are set, Chromium IGNORES the ::-webkit-scrollbar rules below (they remain purely as
+   a Safari fallback, which doesn't support the standard props yet). 55% keeps the thin
+   bar findable — a too-faint thumb defeats the purpose. No hover on this path (the
+   standard props can't style :hover), so the base opacity carries visibility. */
 * {
-  scrollbar-width: thin;                                              /* Firefox */
-  scrollbar-color: color-mix(in srgb, var(--app-secondary-foreground) 40%, transparent) transparent;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent) transparent;
 }
-::-webkit-scrollbar { width: 10px; height: 10px; }                    /* Chromium / Edge / WebKit */
+/* Safari fallback only (Chrome/Edge/Firefox render via the standard props above). */
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--app-secondary-foreground) 35%, transparent);
-  border-radius: 8px;
-  border: 2px solid transparent;                                      /* inset the thumb */
+  background: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent);
+  border-radius: var(--corner-radius-small);
+  border: 2px solid transparent;                     /* inset the thumb via padding-box */
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--app-secondary-foreground) 60%, transparent);
-  background-clip: padding-box;
+::-webkit-scrollbar-thumb:hover {                     /* background-clip inherits from base */
+  background: color-mix(in srgb, var(--app-secondary-foreground) 75%, transparent);
 }
 ::-webkit-scrollbar-corner { background: transparent; }
