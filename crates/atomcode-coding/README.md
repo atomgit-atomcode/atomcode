@@ -7,20 +7,21 @@ CODING 特化层。它把中性内核（[`atomcode_kernel`]）+ 能力层
 
 ---
 
-## ⚠️ 依赖现状：L2 仍直接依赖 atomcode-core（尚未退役）
+## 依赖现状：L2 直接依赖 atomcode-core
 
-`atomcode-coding` **当前仍依赖 `atomcode-core`**（`Cargo.toml:11`），并非「完全
-不涉及 core」。依赖图 `atomcode-coding → atomcode-core` 成立。具体残留：
+`atomcode-coding` **依赖 `atomcode-core`**，并非「完全不涉及 core」。依赖图
+`atomcode-coding → atomcode-core` 成立，且是**单向**的——core 不反向依赖
+kernel / L1 / L2（`Cargo.toml` 注明「L2 is allowed to depend on core」）。当前用到
+core 的地方：
 
 - **模型视觉判断**：`assemble.rs` / `parts.rs` 使用 core 的模型视觉（vision）判断。
-- **CodingPlan 客户端与类型**：`rate_limit.rs`（`:15`、`:132`）使用 core 的 `CodingPlan`
-  类型及 REST 客户端。
-- 其余直接依赖：`atomcode-core` / `atomcode-config` / `atomcode-telemetry` /
-  `atomcode-review`。
+- **CodingPlan 客户端与类型**：`rate_limit.rs` 使用 core 的 `CodingPlan` 类型及 REST 客户端。
+- 直接依赖的 workspace crate：`atomcode-core` / `atomcode-config` /
+  `atomcode-telemetry` / `atomcode-review`。
 
-**目标（迁出方向）：** 把上述 core 残留（vision 判断、CodingPlan 客户端）下沉到
-capabilities / 本地 service，删除 `atomcode-coding → atomcode-core` 这条边；完成后
-L2 才真正脱离 core。在此之前，「不依赖 core」属于目标而非现状。
+> 若未来想让 L2 脱离 core，需把上述用法（vision 判断、CodingPlan 客户端）下沉到
+> capabilities / 本地 service——但这是方向性设想、非既定承诺：当前 `Cargo.toml` 明确
+> 允许 L2 依赖 core。
 
 ---
 
@@ -33,7 +34,7 @@ L2 才真正脱离 core。在此之前，「不依赖 core」属于目标而非�
 2. **Persona** —— [`persona::coding_persona`]：coding 系统提示词。
 3. **Discipline** —— [`discipline::VerifyCadenceHook`]：edit-then-verify 的
    `offer_continuation` 钩子（编码自我纠正循环，接入内核已有的
-   `LifecycleHooks::turn_complete` seam）。
+   `LifecycleHooks::offer_continuation` seam，非新增回合末 hook）。
 
 ```rust
 # async fn demo() -> Result<(), String> {

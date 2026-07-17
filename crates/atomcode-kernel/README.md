@@ -15,7 +15,7 @@
 - `Agent` —— 运行循环，由 `AgentCommand` / `AgentEvent` 双向驱动
 - `provider` —— provider 抽象（`LlmProvider`），不含具体适配器
 - `tool` —— 工具 trait 与注册
-- `hook` —— `LifecycleHooks`（`turn_complete` 等生命周期钩子，seam 已存在）
+- `hook` —— `LifecycleHooks`（`offer_continuation` / `turn_complete` 等生命周期钩子，seam 已存在）
 - `message` / `stream` / `event` / `request` —— 对话、流、事件、请求原语
 - `checkpoint` / `conformance` / `testkit` —— 检查点、一致性测试、测试套件
 
@@ -30,9 +30,10 @@ use atomcode_kernel::agent::Agent;
 
 ## 生命周期 seam 现状
 
-内核**已有**普通回合末钩子：`LifecycleHooks::turn_complete`
-（`crates/atomcode-kernel/src/hook.rs`）。coding 的 verify loop 正是通过
-`offer_continuation` 接入这个已有 seam，无需新增回合末 hook。
+`LifecycleHooks`（`hook.rs`）里**已有**回合边界钩子——`offer_continuation`
+（回合欲停止时被调用，返回 `Some` 即续跑）与 `turn_complete`（回合结束回调）。
+coding 的 verify loop 接入的是已有的 **`offer_continuation`** seam（edit 后自动
+verify、未通过则续跑），无需在内核新增任何回合末 hook。
 
 ## Cargo features
 
