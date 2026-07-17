@@ -80,6 +80,11 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// works regardless; only the trigger key needs an alternate that the terminal
 /// doesn't intercept. `Ctrl+Shift+V` is deliberately NOT matched so a terminal's
 /// "paste as plain text" chord passes through untouched.
+///
+/// Known trade-off (same as Codex's `ctrl_alt(v)` binding): on Windows the
+/// **AltGr** key is delivered as `Ctrl+Alt`, so on the rare keyboard layout
+/// where `AltGr+V` is a printable glyph, that keystroke triggers image-paste
+/// instead of inserting the glyph. Accepted as an inherent cost of the chord.
 fn is_paste_image_chord(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -5971,10 +5976,10 @@ fn handle_input(
             //
             // Gated to Idle / Streaming. Approval and Suspended don't
             // accept input; modals (handled above) get first refusal.
-            // Shift / Alt with Ctrl+V are excluded so reserved chords
-            // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
-            // Plain Text") still pass through to whatever else might
-            // bind them in the future.
+            // Chord matching lives in `is_paste_image_chord`: Ctrl+V AND
+            // Ctrl+Alt+V (the Windows-Terminal alternate) both trigger; only
+            // Ctrl+Shift+V is excluded so a terminal's "paste as plain text"
+            // chord still passes through.
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
                 && is_paste_image_chord(code, modifiers)
             {
