@@ -2393,11 +2393,15 @@ impl RunningAgent {
                         for mw in &self.middlewares {
                             match mw.before(&mut call, &tool, &self.rt).await {
                                 BeforeOutcome::Proceed => {}
-                                // `ask` has no kernel-independent prompt yet (the
-                                // approval gate — also a middleware in this chain —
-                                // owns the round-trip), so it defers to the normal
-                                // approval flow. Full force-ask lands with the CC
-                                // bridge producer (M2).
+                                // `ask` has no kernel-owned prompt: the approval
+                                // round-trip is L1 policy (see the injected approval
+                                // middleware), NOT L0. So the kernel defers — a
+                                // middleware that wants to FORCE a prompt for a call
+                                // that would otherwise auto-approve resolves the
+                                // round-trip ITSELF and returns Allow/Deny (as the CC
+                                // external-hooks `permissionDecision:"ask"` producer
+                                // does). A bare `Ask` reaching here therefore falls
+                                // through to the normal approval flow.
                                 BeforeOutcome::Ask { .. } => {}
                                 // `allow` force-approves: stop the remaining `before`
                                 // gates and execute (CC `permissionDecision: "allow"`

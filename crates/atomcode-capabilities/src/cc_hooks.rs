@@ -41,6 +41,8 @@ use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall, ToolResult};
 
+use crate::tools::{ApprovalRequest, PermissionDecision, APPROVAL_KIND};
+
 // ───────────────────────────── event + config ─────────────────────────────
 
 /// The lifecycle events this port surfaces. A subset of CC's full surface — the
@@ -596,13 +598,48 @@ impl LifecycleHooks for CCExternalHooks {
     }
 }
 
+impl CCExternalHooks {
+    /// Round-trip the driver for a hook-forced `ask` and map the decision, reusing the
+    /// generic approval wire contract (`ApprovalMiddleware`'s `kind` + shapes) so the
+    /// driver renders its normal approval prompt. A `Null` response (driver gone / timed
+    /// out / cancelled) fails CLOSED as `Deny`, distinguishable in the reason from a real
+    /// user denial (matching `ApprovalMiddleware`). Approval returns `Allow` so it
+    /// short-circuits the downstream auto-approve gates — the point of an explicit "ask".
+    /// A hook-forced ask is NOT remembered (no grant store here): "always" behaves like
+    /// "allow once", so the ask keeps prompting — the intended semantics of a forced ask.
+    async fn resolve_ask(&self, call: &ToolCall, rt: &RequestCtx) -> BeforeOutcome {
+        let payload = serde_json::to_value(ApprovalRequest {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            args: call.arguments.clone(),
+        })
+        .unwrap_or(Value::Null);
+        let response = rt.request(APPROVAL_KIND, payload).await;
+        if response.is_null() {
+            return BeforeOutcome::deny(format!(
+                "approval unresolved for '{}': no decision received (driver disconnected, \
+                 timed out, or cancelled) — internal channel failure, not a user denial",
+                call.name
+            ));
+        }
+        match PermissionDecision::from_value(&response) {
+            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
+                BeforeOutcome::Allow { reason: Some("approved (hook ask)".into()) }
+            }
+            PermissionDecision::Deny => {
+                BeforeOutcome::deny(format!("denied by approval prompt (hook ask): {}", call.name))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for CCExternalHooks {
     async fn before(
         &self,
         call: &mut ToolCall,
         _tool: &Arc<dyn Tool>,
-        _rt: &RequestCtx,
+        rt: &RequestCtx,
     ) -> BeforeOutcome {
         // PreToolUse stdin: tool_input is the PARSED args object (CC sends an
         // object, not a string), falling back to the raw string if unparseable.
@@ -686,6 +723,17 @@ impl ToolMiddleware for CCExternalHooks {
             if matches!(gate, BeforeOutcome::Deny { .. }) {
                 break; // deny is final.
             }
+        }
+        // Resolve a folded `ask` (CC `permissionDecision:"ask"`) into a REAL approval
+        // prompt. The kernel has no L0 approval mechanism (it treats `Ask` as a no-op), so
+        // — like `BashWorkspaceGate` / `WriteApprovalGate` — we round-trip the driver here
+        // and map the decision. This middleware runs BEFORE the downstream auto-approve
+        // gates, so returning `Allow` on approval short-circuits them: an explicit hook
+        // "ask" forces a prompt even for an in-workspace edit or a Safe read, which would
+        // otherwise auto-approve and drop the "ask" silently. Resolved AFTER the fold so a
+        // later hook's `Deny` still outranks it (Deny > Ask).
+        if matches!(gate, BeforeOutcome::Ask { .. }) {
+            gate = self.resolve_ask(call, rt).await;
         }
         // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
         // name), but ONLY for a call that will actually run — a Deny here means the tool is
@@ -885,6 +933,36 @@ mod tests {
         let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
         let out = cc.before(&mut call, &tool, &rt).await;
         assert!(out.is_deny(), "CC deny must block: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn before_ask_forces_approval_round_trip_and_fails_closed() {
+        // REGRESSION: a hook `permissionDecision:"ask"` must FORCE a real approval prompt,
+        // not be silently dropped. Previously the kernel no-op'd `BeforeOutcome::Ask`, so an
+        // "ask" hook let the call auto-approve (esp. an in-workspace edit or a Safe read).
+        // Now the middleware round-trips the driver itself. With a SILENT driver the bounded
+        // round-trip times out → Null → Deny (fail closed), marked as an internal channel
+        // failure so it's distinguishable from a real user denial. Before the fix this
+        // assertion would have been `Proceed`.
+        let hook = HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(20)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+        let mut call = ToolCall { id: "1".into(), name: "edit_file".into(), arguments: "{}".into() };
+        let out = cc.before(&mut call, &tool, &rt).await;
+        assert!(out.is_deny(), "hook ask with a silent driver must fail closed, not proceed: {out:?}");
+        let reason = out.deny_reason().unwrap();
+        assert!(
+            reason.contains("internal channel failure") && reason.contains("not a user"),
+            "a degraded (Null) forced-ask round-trip must read as a channel failure, not a user deny: {reason}"
+        );
     }
 
     #[tokio::test]
