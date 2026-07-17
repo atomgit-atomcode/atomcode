@@ -433,6 +433,26 @@ fn is_separator_row(row: &[String]) -> bool {
         .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
 }
 
+/// GFM-effective column count: the widest NON-separator (content) row, minus any
+/// TRAILING columns that are empty across every content row. Weak models often
+/// emit a stray extra `|` or an over-long delimiter (`---|---|---|---`); counting
+/// columns as the raw max-over-all-rows (separator included) then painted a ghost
+/// empty column on the right. Trimming trailing all-empty columns — and ignoring
+/// separator-only width — keeps the drawn grid to the table's real shape. Always
+/// keeps at least one column.
+fn effective_ncols(parsed: &[Vec<String>]) -> usize {
+    let content: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_separator_row(r)).collect();
+    let mut n = content.iter().map(|r| r.len()).max().unwrap_or(0);
+    while n > 1
+        && content
+            .iter()
+            .all(|r| r.get(n - 1).map_or(true, |c| c.trim().is_empty()))
+    {
+        n -= 1;
+    }
+    n
+}
+
 /// Display width of the longest whitespace-delimited token in `plain`. Used as
 /// a column's shrink floor: a column should not be squeezed narrower than its
 /// widest unbreakable word, or the word gets char-wrapped mid-token. Runs of
@@ -694,7 +714,7 @@ pub fn flush_aligned_table_with_width(
             .join("\n");
     }
 
-    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    let ncols = effective_ncols(&parsed);
     if ncols == 0 {
         return String::new();
     }
@@ -885,7 +905,7 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
         Vec::new()
     };
 
-    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    let ncols = effective_ncols(parsed);
     // Right-pad every label to the widest header so the `：value` parts line up
     // into a scannable column (codex-style key/value record), instead of ragged
     // `Session：…` / `Detected：…`.
@@ -1889,6 +1909,43 @@ mod tests {
         assert!(
             out.contains("\n\n"),
             "expected blank line between flat records"
+        );
+    }
+
+    #[test]
+    fn over_long_delimiter_does_not_paint_a_ghost_column() {
+        // Weak models sometimes emit a delimiter row with one group too many.
+        // The extra column has no data — it must not be drawn (GFM: content rows
+        // define the shape). 3 real columns → exactly two interior `┬` junctions.
+        let rows = vec![
+            "| 功能 | 说明 | 状态 |".to_string(),
+            "| --- | --- | --- | --- |".to_string(),
+            "| 补全 | 提示代码片段 | 已完成 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let top = out.lines().next().unwrap();
+        assert_eq!(
+            top.matches('┬').count(),
+            2,
+            "3 columns expected, no ghost column:\n{out}"
+        );
+        assert!(out.contains("已完成"), "content preserved:\n{out}");
+    }
+
+    #[test]
+    fn stray_trailing_empty_cell_is_trimmed_from_the_grid() {
+        // A stray trailing `|` gives a data row an empty last cell. It must not
+        // widen the table into a ghost column.
+        let rows = vec![
+            "| a | b | c |".to_string(),
+            "| - | - | - |".to_string(),
+            "| x | y | z |  |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        assert_eq!(
+            out.lines().next().unwrap().matches('┬').count(),
+            2,
+            "trailing empty cell must be trimmed:\n{out}"
         );
     }
 
