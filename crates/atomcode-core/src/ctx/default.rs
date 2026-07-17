@@ -6,7 +6,7 @@
 //! [`super::for_provider`] lands here.
 
 use super::CtxBuilder;
-use crate::config::provider::ProviderConfig;
+use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
@@ -81,7 +81,7 @@ impl CtxBuilder for DefaultCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
 
     fn test_provider(ctx: usize) -> ProviderConfig {
         ProviderConfig {

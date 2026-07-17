@@ -70,7 +70,7 @@ impl Modal for LanguagePicker {
                 // back in English on a zh_CN selection.
                 i18n::set_locale(locale);
                 ctx.config.language = Some(locale);
-                let config_path = atomcode_core::config::Config::default_path();
+                let config_path = atomcode_config::config::Config::default_path();
                 if let Err(e) = ctx.config.save(&config_path) {
                     // TODO: surface via renderer once a non-modal error display is available
                     eprintln!("[language] failed to save config: {e}");

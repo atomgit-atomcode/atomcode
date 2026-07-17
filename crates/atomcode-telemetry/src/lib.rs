@@ -8,11 +8,13 @@ pub mod identity;
 pub mod notice;
 pub mod pending_invite;
 pub mod queue;
+pub mod repo_origin;
 pub mod runtime;
 pub mod scrub;
 pub mod sender;
 
 pub use config::{CliOverride, ResolvedConfig, TelemetryConfig, TelemetryState};
+pub use repo_origin::detect_repo_origin;
 pub use event::{
     CodingplanErrorKind, CodingplanResult, Envelope, Event, LlmErrorKind, McpErrorKind,
     McpTransport, Record, RepoHost, RepoOrigin, SessionMode, ToolErrorKind, UseCommandErrorKind,

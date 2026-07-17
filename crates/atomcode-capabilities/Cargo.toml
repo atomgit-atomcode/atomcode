@@ -8,6 +8,12 @@ publish = false
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+# Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
+# the config crate is explicitly designed so every stack layer can read config without an
+# atomcode-core dep. Optional + behind the `notify` feature so a provider-only / lean
+# embedder that never wants desktop notifications does not drag config→telemetry (and its
+# reqwest/rustls/flate2 stack) into the build — same optionality discipline as reqwest above.
+atomcode-config = { path = "../atomcode-config", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
@@ -34,12 +40,18 @@ regex = { version = "1", optional = true }
 # on a large file); skips binary; pairs with the `ignore` walker above.
 grep = { version = "0.3", optional = true }
 globset = { version = "0.4", optional = true }
+# Real line diff for edit_file's compact diff (git-style unified hunks + line numbers).
+similar = { workspace = true, optional = true }
 # Decode subprocess (bash) output that isn't UTF-8: CJK Windows consoles emit OEM
 # codepage bytes (GBK/CP936, Big5, …), which otherwise render as `◇◇◇` mojibake.
 encoding_rs = { version = "0.8", optional = true }
 # `codeintel` capability deps (tree-sitter symbol extraction). Heavy C compilation, so
 # opt-in (NOT in default) — an embedder that wants only provider/tools skips all grammars.
 tree-sitter = { version = "0.26", optional = true }
+# `tools` capability: AST-based read-only bash classification (is_read_only_bash walks a
+# tree-sitter-bash parse instead of hand-rolled string matching). Shares the vendored
+# tree-sitter runtime with codeintel above. Optional so a provider-only embedder skips it.
+tree-sitter-bash = { version = "0.25.1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
@@ -78,7 +90,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
@@ -102,6 +114,10 @@ codeintel = [
 lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
 # Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
 lsp-e2e = ["lsp"]
+# Desktop / terminal notifications (turn-finished + approval-needed). Reads NotificationConfig
+# from the config leaf, so it pulls `atomcode-config`. Opt-in (NOT default) — a provider-only
+# embedder skips config→telemetry. Hosts that surface notifications (TUI/CLI) enable it.
+notify = ["dep:atomcode-config"]
 # Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
 skills = []
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel
@@ -132,10 +148,19 @@ session = ["dep:dirs", "dep:chrono"]
 # v1 is USER-driven only (driver slash-commands write the store); no model-facing
 # remember/forget tools. Opt-in (NOT default).
 memory = ["dep:dirs"]
+# Lazy offline auto-detection: web_search transport failures flip the process
+# offline verdict (for offline_mode="auto"). Pulls the config leaf (where the verdict
+# lives). Opt-in — a network embedder that doesn't use offline_mode skips it.
+offline = ["dep:atomcode-config"]
 
 [target.'cfg(unix)'.dependencies]
-# Askpass: inject SUDO_ASKPASS/SSH_ASKPASS into bash children (unix only).
-atomcode-askpass = { path = "../atomcode-askpass" }
+# Askpass (the `askpass` module): a Unix-socket server + wrapper script that route
+# sudo/ssh password prompts to the host UI. Unix-only — `*_ASKPASS` has no Windows
+# analogue. Needs the UDS server (tokio net/io-util, unioned onto the base tokio
+# features above), `umask`/`/dev/urandom` (libc), and a zeroized password cache.
+tokio = { version = "1", features = ["net", "io-util"] }
+libc = "0.2"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }
@@ -147,8 +172,10 @@ tokio-util = "0.7"
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module + every tests/*.rs binary) so tests
 # that persist sessions/config/memory never write into the developer's real home.
-atomcode-test-support = { path = "../atomcode-test-support" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
+serial_test = "3"
 
 # In-tree stdio MCP server used as a deterministic fixture by the `mcp` integration
 # tests (tests/mcp.rs). Built only with the `mcp` feature; the test spawns it via the

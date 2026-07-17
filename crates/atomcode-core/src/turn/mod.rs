@@ -5,6 +5,7 @@ pub mod log;
 pub mod loop_guard;
 pub mod permission;
 pub mod runner;
+mod tool_args;
 
 #[cfg(test)]
 mod tests;

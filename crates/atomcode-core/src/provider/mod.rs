@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::Stream;
 
-use crate::config::provider::ProviderConfig;
+use atomcode_config::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
@@ -709,7 +709,7 @@ mod tests {
         // `auth_file_path()`); serialising keeps a parallel test from mutating
         // ATOMCODE_HOME between the two reads.
         let auth_module_path = crate::auth::auth_file_path();
-        let expected_path = crate::config::Config::config_dir().join("auth.toml");
+        let expected_path = atomcode_config::config::Config::config_dir().join("auth.toml");
 
         assert_eq!(
             auth_module_path, expected_path,
@@ -722,7 +722,7 @@ mod tests {
         );
     }
 
-    use crate::config::provider::ProviderConfig;
+    use atomcode_config::config::provider::ProviderConfig;
 
     fn cfg(provider_type: &str, api_key: &str) -> ProviderConfig {
         ProviderConfig {

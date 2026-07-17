@@ -52,8 +52,8 @@ import {
   ensureActiveDescendantVisible,
   splitAtToken,
 } from '../lib/atMention';
-import { upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
-import { isInternalHistoryUserMessage } from '../lib/historyMessages';
+import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -450,6 +450,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
+  // Wall-clock of the last byte received on the /live stream (any event OR the
+  // 15s keepalive ping). A watchdog reconnects when this goes stale, catching
+  // silently-dead half-open connections after long idle.
+  const lastLiveActivityRef = useRef<number>(Date.now());
+  // Pending reconnect backoff timer, so teardown can cancel it.
+  const reconnectTimerRef = useRef<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
@@ -473,6 +479,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 是否已为「当前会话」上报过乐观侧栏条目。每次切换/新建会话时复位，
   // 避免同一会话第二条消息（尤其 sync 路径本地不落消息）重复上报、改写标题。
   const optimisticFiredRef = useRef(false);
+  // Artifact (code block) streaming: the daemon's ArtifactDetector strips fenced
+  // code blocks from TextDelta and emits them as artifact_start / content / end.
+  // These refs accumulate the language tag and code body for each artifact so
+  // artifact_end can reconstruct the original markdown code block.
+  const artifactLangRef = useRef('');
+  const artifactBufRef = useRef('');
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -580,8 +592,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages, tokens]);
 
-  // Abort the live (/live) stream if the component unmounts while sync is on.
-  useEffect(() => () => { liveAbortRef.current?.abort(); }, []);
+  // Abort the live (/live) stream + cancel any pending reconnect timer if the
+  // component unmounts while sync is on.
+  useEffect(() => () => {
+    liveAbortRef.current?.abort();
+    if (reconnectTimerRef.current !== null) clearTimeout(reconnectTimerRef.current);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -669,22 +685,70 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // token counts). startLiveStream is reachable from mount, toggleSync, and
     // session_switched — without this, those overlap into N concurrent streams.
     liveAbortRef.current?.abort();
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     const controller = new AbortController();
     liveAbortRef.current = controller;
-    streamLive(onLiveEvent, controller.signal, activeIdRef.current).catch(() => {
-      // Stream ended or errored; turn sync back off — but NOT when the
-      // stream was deliberately aborted (session switch / manual toggle),
-      // because a new stream is already being (re)started and setting
-      // sync=false here would cause the next user message to go through
-      // /chat instead of /live/message, breaking TUI sync output.
+    lastLiveActivityRef.current = Date.now();
+
+    // /live can silently die after a long idle (proxy / OS TCP timeout), and
+    // the daemon stays alive — so a prompt sent afterwards reaches the daemon
+    // (the synced TUI shows it) but its `user` echo never arrives here and the
+    // message is missing in the webui. On stream death we RECONNECT instead of
+    // dropping sync: the fresh snapshot re-renders the whole conversation,
+    // recovering anything sent while the stream was down, and resumes live
+    // events. Backoff caps the retry rate; after a run of failures (daemon
+    // genuinely gone) we fall back to non-sync so the user isn't stuck.
+    let attempt = 0;
+    const scheduleReconnect = (startedAt: number) => {
+      // Superseded by a newer stream (session switch / manual toggle / watchdog)
+      // — that one owns reconnection now.
       if (controller.signal.aborted) return;
-      setSync(false);
-    });
+      // A connection that stayed up a while was healthy → reset the backoff so a
+      // later idle-death starts fresh. A connect that dies immediately keeps
+      // escalating, so a broken/flapping daemon backs off and eventually falls
+      // to non-sync instead of hammering ~1s reconnects (each re-snapshots the
+      // whole conversation). NB: do NOT reset on every byte — the snapshot's
+      // first byte would pin backoff at 1s forever.
+      if (Date.now() - startedAt >= 30000) attempt = 0;
+      attempt += 1;
+      if (attempt > 6) {
+        stopLiveStream();
+        setSync(false);
+        return;
+      }
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (!controller.signal.aborted) run();
+      }, delay);
+    };
+    const run = () => {
+      const startedAt = Date.now();
+      streamLive(
+        onLiveEvent,
+        controller.signal,
+        activeIdRef.current,
+        () => {
+          // Heartbeat for the staleness watchdog (any byte incl. keepalive ping).
+          lastLiveActivityRef.current = Date.now();
+        },
+      )
+        .then(() => scheduleReconnect(startedAt)) // clean server close → reconnect
+        .catch(() => scheduleReconnect(startedAt)); // error → reconnect
+    };
+    run();
   }
 
   function stopLiveStream() {
     liveAbortRef.current?.abort();
     liveAbortRef.current = null;
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
   }
 
   // 若 sync 初始值为 true（URL 带 sync=1），在挂载时自动连接实时流。
@@ -696,6 +760,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 仅在挂载时执行一次；后续由 toggleSync 控制。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 实时流保活看门狗：daemon 每 15s 发一次 keepalive ping，健康连接至少每
+  // 15s 有字节。若 45s（约 3 个 ping）无任何字节，说明连接已「静默半开」
+  // （长时间空闲后被代理/OS 掐断却没有 FIN，reader.read() 会一直挂着，既不
+  // 报错也收不到消息 —— 正是「隔很久后发消息 webui 不显示、TUI 却有」的成因）。
+  // 此时主动重连：abort 会解开挂起的 read，新连接的 snapshot 重绘整段对话，
+  // 找回期间漏收的消息并恢复实时事件。
+  useEffect(() => {
+    if (!sync) return;
+    const id = setInterval(() => {
+      if (Date.now() - lastLiveActivityRef.current > 45000) {
+        // startLiveStream 会先 abort 旧流再重连（内部已处理重入）。
+        startLiveStream();
+      }
+    }, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sync]);
 
   // 把 sync 状态写回 URL 的 ?sync 参数，使刷新后能保持当前开/关状态
   // （否则关掉同步后 URL 仍带 sync=1，刷新一下又被重新开启 —— issue #816）。
@@ -723,6 +805,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           ts: msg.created_at,
         });
       } else if (msg.role === 'assistant') {
+        if (isInternalHistoryAssistantMessage(msg)) continue;
         // Text comes first (the LLM speaks, then calls tools), so the part
         // order for a persisted round is [text, tool, tool, …].
         const parts: MsgPart[] = [];
@@ -747,7 +830,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           for (const p of m.parts) {
             if (p.kind === 'tool' && p.tool.id === result.call_id) {
               p.tool.output = result.summary;
-              p.tool.status = result.success ? 'done' : 'error';
+              p.tool.status = toolResultStatus(result.success, result.summary);
               break outer;
             }
           }
@@ -765,11 +848,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'reasoning': return { type: 'reasoning', content: e.content };
       case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
       case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
+      case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'error': return { type: 'error', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming };
+      // NOTE: no artifact_* mapping. This is safe today because the /sync live
+      // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
+      // live_api.rs — it does NOT run text through ArtifactDetector), so the
+      // Markdown renderer sees code blocks directly. The /chat path strips them
+      // into artifact_* events, which handleEvent reconstructs. If the live path
+      // ever adopts the ArtifactDetector, add artifact_start/content/end here or
+      // /sync will silently drop fenced code again.
       default: return null;
     }
   }
@@ -786,7 +877,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
-      setMessages(loaded.length > 0 ? loaded : []);
+      // The daemon commits the user message into the snapshot at turn START, so
+      // a snapshot ending in a `user` message means a turn is in progress and
+      // its assistant reply is still streaming via the replay/live events that
+      // follow. Append the empty assistant placeholder those events append into
+      // (the live `user` event that normally creates it isn't replayed), and
+      // mark busy — otherwise a mid-turn reconnect drops the in-flight reply,
+      // and a reconnect after the turn finished during a dead window would
+      // otherwise leave `busy` stuck true. Idle snapshots clear busy.
+      const inProgress = loaded.length > 0 && loaded[loaded.length - 1].role === 'user';
+      if (inProgress) {
+        setMessages([...loaded, { role: 'assistant', parts: [], ts: Date.now() }]);
+        setBusy(true);
+      } else {
+        setMessages(loaded.length > 0 ? loaded : []);
+        setBusy(false);
+      }
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider) setProvider(e.provider);
@@ -1252,11 +1358,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         appendToolOutput(event.chunk);
         break;
 
+      case 'tool_progress':
+        setMessages((prev) => {
+          if (prev.length === 0) return prev;
+          const last = prev[prev.length - 1];
+          if (last.role !== 'assistant') return prev;
+          return [
+            ...prev.slice(0, -1),
+            { ...last, parts: updateToolProgress(last.parts, event.id, event.progress) },
+          ];
+        });
+        break;
+
       case 'tool_result':
         updateToolInLastAssistant(event.id, {
-          status: event.success ? 'done' : 'error',
+          status: toolResultStatus(event.success, event.output),
           duration_ms: event.duration_ms,
           output: event.output,
+          progress: undefined,
         });
         // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
         onPermissionResolved?.(event.id);
@@ -1331,8 +1450,37 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
       }
 
+      // Artifact events: the daemon's ArtifactDetector strips fenced code blocks
+      // (and HTML/SVG) from TextDelta and emits them as separate artifact_* events.
+      // Without handling these, the code content is silently lost in the WebUI.
+      case 'artifact_start': {
+        artifactLangRef.current = event.language ?? '';
+        artifactBufRef.current = '';
+        break;
+      }
+      case 'artifact_content': {
+        artifactBufRef.current += event.content;
+        break;
+      }
+      case 'artifact_end': {
+        const lang = artifactLangRef.current;
+        const code = artifactBufRef.current;
+        artifactLangRef.current = '';
+        artifactBufRef.current = '';
+        // Reconstruct the fenced code block so the Markdown renderer can process it.
+        // The daemon stripped the ``` fences; we put them back here.
+        const fence = '```';
+        const tag = lang ? fence + lang : fence;
+        // The detector's body already ends with the newline before the closing
+        // fence (find_code_fence_end returns line_start), so only add one if it's
+        // missing — otherwise the block renders with a spurious trailing blank line.
+        const body = code.endsWith('\n') ? code : code + '\n';
+        appendToLastAssistant('\n' + tag + '\n' + body + fence + '\n');
+        break;
+      }
+
       default:
-        // Ignore tool_batch, artifact_*, etc.
+        // Ignore tool_batch, etc.
         break;
     }
   }
@@ -2633,6 +2781,8 @@ function ToolStatusIcon({ cls }: { cls: string }) {
         <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
       ) : cls === 'error' ? (
         <path d="M4 4l8 8M12 4l-8 8" />
+      ) : cls === 'warning' ? (
+        <path d="M8 2.5 14 13H2L8 2.5ZM8 6v3.5M8 11.5h.01" />
       ) : (
         <path d="M8 2.5a5.5 5.5 0 1 1-5.18 3.65" />
       )}
@@ -2655,6 +2805,8 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
     annotation = { cls: 'success', label: t('tool.done') };
   } else if (tool.status === 'error') {
     annotation = { cls: 'error', label: t('tool.failed') };
+  } else if (tool.status === 'incomplete') {
+    annotation = { cls: 'warning', label: t('tool.incomplete') };
   }
 
   const hasDetail = !!(tool.args || tool.output);
@@ -2675,6 +2827,9 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
           <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>
         )}
       </div>
+      {tool.status === 'pending' && tool.progress && (
+        <div class="tool-progress" title={tool.progress}>{tool.progress}</div>
+      )}
       {expanded && hasDetail && (
         <div class="tool-body-grid">
           {tool.args && (

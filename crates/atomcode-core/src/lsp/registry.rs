@@ -1,15 +1,9 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LspServerConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub root_markers: Vec<String>,
-}
+// `LspServerConfig` (the config type) moved to the leaf `atomcode-config`; the LSP
+// runtime below stays here. Re-exported so `crate::lsp::registry::LspServerConfig`
+// and `atomcode_core::lsp::registry::LspServerConfig` keep resolving.
+pub use atomcode_config::lsp_registry::LspServerConfig;
 
 pub struct LspServerRegistry {
     servers: HashMap<String, LspServerConfig>,

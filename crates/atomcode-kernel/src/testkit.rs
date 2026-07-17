@@ -115,6 +115,49 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+/// Opens OK but its stream PENDS FOREVER on the first `stall_calls` `chat_stream`
+/// calls (driving the stream idle-timeout), then returns `events` on the next
+/// call. Drives the RECONNECT path: with `stall_calls = 1` the first attempt
+/// times out and the reconnect succeeds; a large `stall_calls` exhausts the
+/// reconnect budget and the turn clean-fails.
+pub struct StallThenProvider {
+    stall_calls: usize,
+    calls: AtomicUsize,
+    events: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl StallThenProvider {
+    pub fn new(stall_calls: usize, events: Vec<StreamEvent>) -> Self {
+        Self {
+            stall_calls,
+            calls: AtomicUsize::new(0),
+            events: Mutex::new(Some(events)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for StallThenProvider {
+    fn model_name(&self) -> &str {
+        "stall-then"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.stall_calls {
+            // Open OK, then never yield → the kernel's stream idle-timeout fires.
+            Ok(Box::pin(futures::stream::pending::<StreamEvent>()))
+        } else {
+            let events = self.events.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+}
+
 /// Scripted, RICH-recording provider for prefix-cache regression tests. Unlike
 /// `MockProvider` (which snapshots only `(role, text)` and discards tools /
 /// tool_calls), this records the FULL `(Vec<Message>, Vec<ToolDef>, ChatOptions)`
@@ -1091,6 +1134,186 @@ impl ScriptedRateLimitHook {
 impl LifecycleHooks for ScriptedRateLimitHook {
     async fn on_rate_limit(&self, _hint: &RateLimitHint) -> Option<RateLimitDecision> {
         Some(self.decision.clone())
+    }
+}
+
+/// A MockProvider variant that, on a specified `inject_on_call` (1-based), sends a
+/// `SendMessage` command into a DEFERRED command sender (filled after spawn) and
+/// then yields between events so the driver's select-loop has a guaranteed
+/// opportunity to process the steer before the next model round begins.
+///
+/// This makes steer-buffer tests deterministic without relying on task-scheduler
+/// timing: the steer is in cmd_rx before the stream's first yield, the driver
+/// processes it during that yield, and it is in steer.lock() by the time the
+/// next round's drain runs.
+pub struct DeferredSteerProvider {
+    inner: MockProvider,
+    /// Which chat_stream call (1-based) triggers the steer injection.
+    inject_on_call: usize,
+    /// The steer text to inject.
+    inject_text: String,
+    /// Deferred command sender — filled by the test after `handle = agent.spawn()`.
+    inject_cmd: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::event::AgentCommand>>>>,
+    call_count: std::sync::atomic::AtomicUsize,
+}
+
+impl DeferredSteerProvider {
+    pub fn new(
+        turns: Vec<Vec<StreamEvent>>,
+        inject_on_call: usize,
+        inject_text: impl Into<String>,
+        inject_cmd: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::event::AgentCommand>>>>,
+    ) -> Self {
+        Self {
+            inner: MockProvider::new(turns),
+            inject_on_call,
+            inject_text: inject_text.into(),
+            inject_cmd,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    /// Expose the received log from the inner MockProvider for assertions.
+    pub fn received(&self) -> ReceivedLog {
+        self.inner.received.clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for DeferredSteerProvider {
+    fn model_name(&self) -> &str { "deferred-steer" }
+    fn context_window(&self) -> u32 { 0 }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let call_n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call_n == self.inject_on_call {
+            // Inject steer into the driver's cmd_rx. The steer is now in the channel
+            // and will be processed into steer.lock() at the next driver select! poll.
+            if let Some(tx) = self.inject_cmd.lock().unwrap().as_ref() {
+                let _ = tx.send(crate::event::AgentCommand::SendMessage {
+                    text: self.inject_text.clone(),
+                    images: vec![],
+                });
+            }
+        }
+        // Delegate recording + scripted events to inner provider.
+        let inner_stream = self.inner.chat_stream(messages, tools, options).await?;
+        // Wrap the stream with a real async pause at the START so the driver's
+        // select! has an EXCLUSIVE window to process the steer from cmd_rx into
+        // steer.lock() before the stream emits any events.
+        //
+        // `sleep(1ms)` is used rather than `yield_now` because yield_now just
+        // re-schedules the current task; the outer select! might pick `turn` again
+        // (it is immediately re-ready after yield_now), causing a race. A real sleep
+        // means `turn` is genuinely NOT ready for at least 1ms, so the outer select!
+        // MUST pick cmd_rx if data is present — eliminating the race.
+        let yielding = futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            None::<StreamEvent>
+        })
+        .filter_map(futures::future::ready)
+        .chain(inner_stream);
+        Ok(Box::pin(yielding))
+    }
+}
+
+/// A trivial tool that always succeeds immediately (name `"noop"`, returns Ok).
+/// Used by steer-buffer tests that need a real tool call but don't care about output.
+pub struct NoopTool;
+
+#[async_trait]
+impl Tool for NoopTool {
+    fn name(&self) -> &str { "noop" }
+    fn description(&self) -> &str { "Does nothing and returns Ok" }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        ToolResult { call_id: String::new(), content: "noop".into(), is_error: false, images: vec![] }
+    }
+}
+
+/// A read-only tool that (a) bumps a shared "in-flight" counter on entry and
+/// records the peak, (b) awaits a short tokio sleep so concurrent instances
+/// overlap under `tokio::time`, (c) decrements on exit. Proves real overlap and
+/// enforces the cap. `read_only_hint` = true so it is `parallel_safe`.
+pub struct ConcurrencyProbeTool {
+    pub name: &'static str,
+    pub inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ConcurrencyProbeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: self.name.into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+/// A probe whose `parallel_safe` is decided by its ARGS (mirrors BashTool: the
+/// command string decides). If args contain `"ro":true` it is parallel-safe and
+/// overlaps; else it serializes. Shares inflight/peak counters like
+/// `ConcurrencyProbeTool` so a test can assert overlap vs. barrier.
+///
+/// The `name` field is used in `execute` output so tests can check which tool ran.
+/// Fields are `pub` to allow construction from integration tests.
+pub struct ArgGatedProbeTool {
+    pub name: &'static str,
+    pub inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Tool for ArgGatedProbeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn parallel_safe(&self, args: &str) -> bool {
+        args.contains("\"ro\":true")
+    }
+    async fn execute(&self, _args: &str, _c: &ToolContext) -> ToolResult {
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: self.name.into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 

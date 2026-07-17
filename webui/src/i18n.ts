@@ -151,6 +151,7 @@ const zh = {
   'tool.running': '运行中…',
   'tool.done': '完成',
   'tool.failed': '失败',
+  'tool.incomplete': '未完成',
   'tool.args': '参数',
   'tool.output': '输出',
 
@@ -446,6 +447,7 @@ const en: Record<MsgKey, string> = {
   'tool.running': 'Running…',
   'tool.done': 'Done',
   'tool.failed': 'Failed',
+  'tool.incomplete': 'Incomplete',
   'tool.args': 'Arguments',
   'tool.output': 'Output',
 

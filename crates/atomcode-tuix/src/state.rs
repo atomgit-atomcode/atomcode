@@ -1,33 +1,9 @@
 // crates/atomcode-tuix/src/state.rs
 
-/// Plan vs Build execution mode. Plan is read-only exploration (no file
-/// writes, no shell commands); Build is full execution with all tools.
-/// Toggled by the Tab key (when the input buffer is empty) or the
-/// `/plan` and `/build` slash commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AgentMode {
-    #[default]
-    Build,
-    Plan,
-}
-
-impl AgentMode {
-    /// Human-readable label for status bar display.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Build => "Build",
-            Self::Plan => "Plan",
-        }
-    }
-
-    /// Return the opposite mode.
-    pub fn toggle(self) -> Self {
-        match self {
-            Self::Build => Self::Plan,
-            Self::Plan => Self::Build,
-        }
-    }
-}
+/// Execution mode (unified). Alias of the shared core enum so TUI, daemon,
+/// webui share one type. Build = interactive approval; Auto = auto-approve all
+/// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
+pub use atomcode_core::agent::Mode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
@@ -35,6 +11,57 @@ pub enum UiPhase {
     Streaming,
     Approval,
     Suspended,
+}
+
+/// A tool-approval decision offered in the footer approval panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    AllowOnce,
+    AlwaysAllow,
+    Deny,
+}
+
+/// One selectable row of the approval panel.
+#[derive(Debug, Clone)]
+pub struct ApprovalOption {
+    pub label: String,
+    pub kind: ApprovalKind,
+    /// Single-key accelerator (lower-case): 'y' / 'a' / 'n'.
+    pub accel: char,
+}
+
+/// The active tool-approval prompt, shown as a footer panel while
+/// `UiPhase::Approval`. `None` when no approval is pending.
+#[derive(Debug, Clone)]
+pub struct ApprovalPanel {
+    pub tool: String,
+    pub detail: String,
+    pub options: Vec<ApprovalOption>,
+    pub selected: usize,
+}
+
+impl ApprovalPanel {
+    pub fn move_up(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.options.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+    pub fn move_down(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.options.len();
+    }
+    /// Index of the option whose accelerator matches `c` (case-insensitive).
+    pub fn accel_index(&self, c: char) -> Option<usize> {
+        let c = c.to_ascii_lowercase();
+        self.options.iter().position(|o| o.accel == c)
+    }
 }
 
 /// How long the model may go silent before the spinner surfaces the "slow
@@ -55,6 +82,13 @@ pub const STREAM_STALL_HINT: std::time::Duration = std::time::Duration::from_sec
 pub fn stream_stalled_for(awaiting_model: bool, since_activity: Option<std::time::Duration>) -> bool {
     awaiting_model && since_activity.is_some_and(|d| d >= STREAM_STALL_HINT)
 }
+
+/// Minimum wall-clock gap between spinner frame advances. Slightly under the
+/// 100ms interval-timer period so a timer tick always advances the glyph (no
+/// visible stall), while the far more frequent per-token post-event redraws
+/// during streaming are collapsed to at most one advance per gap — otherwise
+/// the spinner blurs at token rate. See [`UiState::tick_spinner_at`].
+pub const SPINNER_MIN_ADVANCE: std::time::Duration = std::time::Duration::from_millis(80);
 
 /// Rotating pool of "thinking" labels — CC-style playful verbs.
 /// Advances once per turn so consecutive turns vary.
@@ -144,12 +178,20 @@ pub struct UiState {
     pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// When the spinner frame last actually advanced. `tick_spinner` is called
+    /// from BOTH the 100ms interval timer AND an opportunistic post-event
+    /// redraw that fires once per streamed token (to keep the footer's elapsed
+    /// clock fresh). Without a gate the per-token redraws spun the glyph dozens
+    /// of times a second during output — it looked like a blur. We rate-limit
+    /// the advance to [`SPINNER_MIN_ADVANCE`] regardless of call frequency.
+    pub spinner_last_advance: Option<std::time::Instant>,
     /// A compaction's slow LLM summary is currently running — the footer
     /// spinner shows "Compacting…" instead of a thinking label and the stall
-    /// hint is compaction-specific. Set by `AgentEvent::CompactionUi(Begin)`,
-    /// cleared on `End`/`Mark`.
+    /// hint is compaction-specific. Set by
+    /// `CodingRuntimeEvent::CompactionStarted`, then cleared when compaction
+    /// finishes.
     pub compacting: bool,
-    /// Whether `CompactionUi(Begin)` forced `phase = Streaming` (a standalone
+    /// Whether `CodingRuntimeEvent::CompactionStarted` forced `phase = Streaming` (a standalone
     /// manual `/compact` started from Idle, which otherwise animates no
     /// spinner). If so, completion restores Idle; an auto-compaction runs
     /// mid-turn and leaves the phase to the turn's own lifecycle.
@@ -206,6 +248,10 @@ pub struct UiState {
     /// on `permission.decide().await` — looked identical to a real tool
     /// hang.
     pub prior_spinner_label: Option<String>,
+    /// The active footer approval panel (arrow-key selectable). `None` when no
+    /// tool approval is pending. Set in the `ApprovalNeeded` handler, cleared on
+    /// resolve / turn-end / session reset.
+    pub approval_panel: Option<ApprovalPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -230,6 +276,10 @@ pub struct UiState {
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
     pub last_context: Option<ContextSnapshot>,
+    /// Temporary occupancy projected from a committed native compaction. The
+    /// bridge's legacy `/context` refresh still holds pre-compaction usage, so
+    /// its sent-token field is ignored until the next real TokenUsage arrives.
+    pub post_compaction_used_tokens: Option<usize>,
     /// Verbatim text of the message that is currently running. Set
     /// on every submit, cleared on turn-complete. When the user hits
     /// Ctrl+C / Esc mid-stream the streaming-key handler takes this
@@ -332,13 +382,12 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
-    /// Live todo progress (current task + completed/total) for the footer todo
-    /// row, captured from the in-flight turn's `todowrite` calls. This is the
-    /// row's SOLE source: cleared on TurnComplete / TurnCancelled / Error so the
-    /// row is a live execution indicator that DISAPPEARS when the turn ends
-    /// (mirroring the goal/loop row). `None` ⇒ no row. At-rest progress is seen
-    /// via the `/todo` command or the inline todowrite block, not this row.
-    pub live_turn_todo: Option<crate::render::TodoProgress>,
+    /// Active todo list for the persistent footer todo PANEL. Written from the
+    /// turn's `todowrite` calls, seeded from the transcript on resume/switch
+    /// (`replay_session`), reset on `/clear`/`/new` (`reset_to_new_session`).
+    /// Unlike the old live-only row, this PERSISTS across turn boundaries — the
+    /// panel is a standing view, hidden only when the list is empty or all done.
+    pub active_todos: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -360,6 +409,19 @@ pub struct UiState {
     /// Any other event flushes this buffer with the usual `↻ goal round N`
     /// or `✓ done` label.
     pub pending_separator: Option<PendingSeparator>,
+    /// Mid-turn steers submitted but NOT YET folded into the turn by the kernel
+    /// — i.e. still waiting for the next model-request boundary. Incremented when
+    /// the TUI dispatches a steer (`on_steer_sent`), decremented when the kernel
+    /// confirms the fold (`AgentEvent::Steered { count }` → `on_steered`), and
+    /// cleared at turn end / new turn start. Surfaced in the footer as
+    /// `· N to fold` while non-zero, so it DRAINS to nothing once folded (it is a
+    /// pending indicator, not a cumulative tally). Mirrors codex's pending-steer
+    /// list / opencode's draining `N queued`.
+    pub steer_pending: usize,
+    /// Whether the user has explicitly switched to Build mode via
+    /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
+    /// the `⏸ build` badge so the default startup state stays clean.
+    pub build_badge_visible: bool,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -433,6 +495,7 @@ impl UiState {
             agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
+            spinner_last_advance: None,
             compacting: false,
             compaction_forced_streaming: false,
             subagent_activity: None,
@@ -450,11 +513,13 @@ impl UiState {
             response_finalized: false,
             prior_phase: None,
             prior_spinner_label: None,
+            approval_panel: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
             last_stream_activity: None,
             last_context: None,
+            post_compaction_used_tokens: None,
             last_submitted_message: None,
             pending_context_render: None,
             pending_images: Vec::new(),
@@ -472,7 +537,7 @@ impl UiState {
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
-            live_turn_todo: None,
+            active_todos: None,
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
@@ -481,6 +546,8 @@ impl UiState {
             loop_round: 0,
             loop_started_at: None,
             pending_separator: None,
+            steer_pending: 0,
+            build_badge_visible: false,
         }
     }
 
@@ -523,7 +590,7 @@ impl UiState {
             // Preserve a value restored from the persisted session on resume so
             // `/context`'s `RefreshContextStats` round-trip can't re-zero the gauge
             // the moment the user runs it. A real turn always sends `sent > 0`.
-            if sent_tokens > 0 {
+            if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
                 snap.sent_tokens = sent_tokens;
             }
             snap.tool_defs_tokens = tool_defs_tokens;
@@ -539,7 +606,7 @@ impl UiState {
         if system_tokens > 0 {
             snap.system_tokens = system_tokens;
         }
-        if sent_tokens > 0 {
+        if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
             snap.sent_tokens = sent_tokens;
         }
         if tool_defs_tokens > 0 {
@@ -579,6 +646,7 @@ impl UiState {
     /// with no cached snapshot) so a fresh session still reads "no turns yet"
     /// rather than a fabricated `0/0` "waiting for window" state.
     pub fn restore_context(&mut self, used_tokens: usize, ctx_window: usize) {
+        self.post_compaction_used_tokens = None;
         if used_tokens == 0 && ctx_window == 0 && self.last_context.is_none() {
             return;
         }
@@ -589,6 +657,21 @@ impl UiState {
         if ctx_window > 0 && snap.ctx_window == 0 {
             snap.ctx_window = ctx_window;
         }
+    }
+
+    /// Project the committed `/compact` result into the context gauge without
+    /// migrating the legacy `/context` command protocol in this slice.
+    pub fn on_compaction_committed(&mut self, used_tokens: usize) {
+        self.last_context
+            .get_or_insert_with(ContextSnapshot::default)
+            .sent_tokens = used_tokens;
+        self.post_compaction_used_tokens = Some(used_tokens);
+    }
+
+    /// A provider usage event is authoritative and releases the temporary
+    /// post-compaction projection before its ContextStats companion arrives.
+    pub fn on_token_usage(&mut self) {
+        self.post_compaction_used_tokens = None;
     }
 
     /// Refresh the cached context window after a model switch.
@@ -694,6 +777,9 @@ impl UiState {
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
+        // Belt-and-suspenders: a fresh turn always starts with zero steers, even
+        // if the previous turn ended abnormally and never fired on_turn_complete.
+        self.steer_pending = 0;
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -717,14 +803,13 @@ impl UiState {
         // reaches here, so the cancelled path naturally leaves this
         // None too.)
         self.last_submitted_message = None;
-        // The footer's live todo snapshot belongs to the turn that produced it;
-        // hand the segment back to the transcript-derived source now that the
-        // turn (or peer turn / session switch — all funnel through here) is over.
-        // Single source of truth so no turn-end path can pin a stale count.
-        self.live_turn_todo = None;
         // Same discipline for the subagent fan-out activity: no turn-end path may
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
+        // Safety clear: if a turn ends without resolving an approval (e.g. error
+        // path or session switch), ensure the panel is not left stale.
+        self.approval_panel = None;
+        self.steer_pending = 0;
     }
 
     pub fn on_turn_cancelled(&mut self) {
@@ -739,8 +824,29 @@ impl UiState {
         self.turn_cached_tokens = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
-        self.live_turn_todo = None;
         self.subagent_activity = None;
+        self.approval_panel = None;
+        self.steer_pending = 0;
+        // The todo panel is per-session, not per-turn: it survives turn
+        // termination (mirrors on_turn_complete). Clearing it here nuked the
+        // plan, and a "继续" turn only sends incremental todowrite updates that
+        // fold against the existing panel (a no-op on an empty base), so the
+        // panel could never rebuild — it stayed gone while the model kept
+        // executing. Only a session switch / new session / explicit clear drops
+        // `active_todos` + `todo_titles`.
+    }
+
+    /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
+    /// to fold into the running turn at the next model-request boundary.
+    pub fn on_steer_sent(&mut self) {
+        self.steer_pending += 1;
+    }
+
+    /// The kernel confirmed it folded `count` steered prompt(s) into the turn
+    /// (`AgentEvent::Steered`). Drain the pending count; `saturating_sub` so a
+    /// steer folded from another client (no local `on_steer_sent`) can't underflow.
+    pub fn on_steered(&mut self, count: usize) {
+        self.steer_pending = self.steer_pending.saturating_sub(count);
     }
 
     pub fn on_error(&mut self) {
@@ -750,12 +856,20 @@ impl UiState {
         self.compaction_forced_streaming = false;
         self.turn_started_at = None;
         self.phase_started_at = None;
-        self.live_turn_todo = None;
         self.subagent_activity = None;
         // Parity with on_turn_complete/on_turn_cancelled: clear the blank-turn
         // flags so an errored turn can't leak a stale notice into a reused turn.
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        self.approval_panel = None;
+        self.steer_pending = 0;
+        // The todo panel is per-session, not per-turn: it survives turn
+        // termination (mirrors on_turn_complete). Clearing it here nuked the
+        // plan, and a "继续" turn only sends incremental todowrite updates that
+        // fold against the existing panel (a no-op on an empty base), so the
+        // panel could never rebuild — it stayed gone while the model kept
+        // executing. Only a session switch / new session / explicit clear drops
+        // `active_todos` + `todo_titles`.
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -909,6 +1023,7 @@ impl UiState {
     }
 
     pub fn on_approval_resolved(&mut self) {
+        self.approval_panel = None;
         self.phase = UiPhase::Streaming;
         if let Some(prior) = self.prior_spinner_label.take() {
             self.spinner_label = prior;
@@ -966,20 +1081,41 @@ impl UiState {
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
+        self.tick_spinner_at(std::time::Instant::now())
+    }
+
+    /// Frame-advance core, taking `now` so the rate limit is testable. Advances
+    /// the frame at most once per [`SPINNER_MIN_ADVANCE`], no matter how often
+    /// it's called: the interval timer (every 100ms) always clears the gate, but
+    /// the per-token post-event redraws during streaming do NOT — that's what
+    /// keeps the glyph from blurring while the model emits output.
+    fn tick_spinner_at(&mut self, now: std::time::Instant) -> &'static str {
         // Two frame sets, picked once at construction:
-        //   Unicode → half-moon rotation; Braille was prettier but
-        //   Windows fonts often lack that block and fall back to ":".
-        //   ASCII   → classic `|/-\` for terminals whose font also
-        //   lacks the Geometric Shapes block (notably Windows legacy
-        //   conhost with NSimSun / Consolas variants).
-        const UNICODE_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+        //   Unicode → braille dot rotation: a true single-cell glyph. The old
+        //   half-moon set (◐◓◑◒, Geometric Shapes) is often given emoji
+        //   presentation and renders oversized/double-width on modern
+        //   terminals — braille avoids that and is the de-facto CLI spinner.
+        //   ASCII   → classic `|/-\` for legacy terminals whose font lacks
+        //   the Braille block (notably Windows legacy conhost); those already
+        //   run with unicode_symbols = false, so they take this path.
+        const UNICODE_FRAMES: &[&str] =
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
         let frames = if self.unicode_symbols {
             UNICODE_FRAMES
         } else {
             ASCII_FRAMES
         };
-        self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+        // Rate-limit the advance. `None` (first tick of a stream, or after a
+        // reset) always advances so the spinner never appears frozen on start.
+        let due = match self.spinner_last_advance {
+            Some(prev) => now.duration_since(prev) >= SPINNER_MIN_ADVANCE,
+            None => true,
+        };
+        if due {
+            self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+            self.spinner_last_advance = Some(now);
+        }
         frames[self.spinner_frame]
     }
 }
@@ -987,6 +1123,47 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_frame_is_rate_limited_across_rapid_redraws() {
+        use std::time::Duration;
+        // Reproduces the "spins too fast during output" report: `tick_spinner`
+        // runs once per streamed token (post-event redraw), which used to
+        // advance the glyph every call. It must now advance at most once per
+        // SPINNER_MIN_ADVANCE regardless of how often it's called.
+        let mut s = UiState::with_unicode(true);
+        let t0 = std::time::Instant::now();
+
+        // First tick of the stream always advances (last_advance is None).
+        let _ = s.tick_spinner_at(t0);
+        let after_first = s.spinner_frame;
+
+        // A flood of per-token redraws inside one gap must NOT advance.
+        for ms in [1, 10, 40, 79] {
+            let _ = s.tick_spinner_at(t0 + Duration::from_millis(ms));
+            assert_eq!(
+                s.spinner_frame, after_first,
+                "redraw at +{ms}ms (< gap) must not advance the spinner",
+            );
+        }
+
+        // Once the gap elapses (the 100ms interval timer), it advances once.
+        let _ = s.tick_spinner_at(t0 + Duration::from_millis(80));
+        assert_ne!(
+            s.spinner_frame, after_first,
+            "spinner must advance once SPINNER_MIN_ADVANCE has elapsed",
+        );
+        let after_second = s.spinner_frame;
+
+        // ...and only once more even if hammered again within the next gap.
+        for ms in [85, 120, 159] {
+            let _ = s.tick_spinner_at(t0 + Duration::from_millis(ms));
+        }
+        assert_eq!(
+            s.spinner_frame, after_second,
+            "a second flood inside the next gap must not advance again",
+        );
+    }
 
     #[test]
     fn spinner_warns_only_when_model_stream_silent_past_threshold() {
@@ -1053,6 +1230,29 @@ mod tests {
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
         assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn stale_context_refresh_does_not_clobber_post_compaction_usage() {
+        let mut s = UiState::new();
+        s.on_context_stats(0, 40_000, 0, 0, 10, 128_000, "engine-v2", "");
+        s.on_compaction_committed(12_000);
+
+        s.on_context_stats(0, 40_000, 0, 0, 6, 128_000, "engine-v2", "");
+
+        assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 12_000);
+        assert_eq!(s.post_compaction_used_tokens, Some(12_000));
+    }
+
+    #[test]
+    fn real_usage_releases_post_compaction_projection() {
+        let mut s = UiState::new();
+        s.on_compaction_committed(12_000);
+        s.on_token_usage();
+        s.on_context_stats(0, 14_000, 0, 0, 8, 128_000, "engine-v2", "");
+
+        assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 14_000);
+        assert!(s.post_compaction_used_tokens.is_none());
     }
 
     #[test]
@@ -1174,10 +1374,14 @@ mod tests {
     // ASCII fallback gives them readable `|/-\` and `...` instead.
     #[test]
     fn ascii_spinner_uses_pipe_slash_dash_backslash() {
+        use std::time::Duration;
         let mut s = UiState::with_unicode(false);
+        let t0 = std::time::Instant::now();
         let mut seen = Vec::new();
-        for _ in 0..4 {
-            seen.push(s.tick_spinner());
+        // Space the ticks past SPINNER_MIN_ADVANCE so each one actually advances
+        // (the rate limit only collapses redraws inside a single gap).
+        for i in 0..4 {
+            seen.push(s.tick_spinner_at(t0 + Duration::from_millis(i * 100)));
         }
         // Order is implementation detail; the SET must match.
         let mut sorted = seen.clone();
@@ -1186,15 +1390,27 @@ mod tests {
     }
 
     #[test]
-    fn unicode_spinner_uses_half_moons() {
+    fn unicode_spinner_uses_single_cell_braille() {
+        use std::time::Duration;
+        // Braille dots are true single-cell glyphs; the old half-moon set
+        // (◐◓◑◒) was often given emoji presentation and rendered oversized.
         let mut s = UiState::with_unicode(true);
+        let t0 = std::time::Instant::now();
         let mut seen = Vec::new();
-        for _ in 0..4 {
-            seen.push(s.tick_spinner());
+        // Walk a full cycle (frame count is an implementation detail), spacing
+        // ticks past the frame-advance rate limit.
+        for i in 0..10 {
+            seen.push(s.tick_spinner_at(t0 + Duration::from_millis(i * 100)));
         }
-        let mut sorted = seen.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec!["◐", "◑", "◒", "◓"]);
+        // Every frame is a Braille Patterns glyph (U+2800..=U+28FF).
+        for f in &seen {
+            let ch = f.chars().next().unwrap();
+            assert_eq!(f.chars().count(), 1, "frame {f:?} must be a single char");
+            assert!(
+                ('\u{2800}'..='\u{28FF}').contains(&ch),
+                "frame {f:?} must be a Braille glyph"
+            );
+        }
     }
 
     #[test]
@@ -1568,18 +1784,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_build_toggles_to_plan() {
-        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    fn agent_mode_build_next_is_accept_edits() {
+        assert_eq!(AgentMode::Build.next(), AgentMode::AcceptEdits);
+        assert_eq!(AgentMode::AcceptEdits.next(), AgentMode::Auto);
     }
 
     #[test]
-    fn agent_mode_plan_toggles_to_build() {
-        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+    fn agent_mode_auto_next_is_plan() {
+        assert_eq!(AgentMode::Auto.next(), AgentMode::Plan);
     }
 
     #[test]
-    fn agent_mode_double_toggle_returns_to_original() {
-        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    fn agent_mode_plan_next_is_build() {
+        assert_eq!(AgentMode::Plan.next(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_cycle_forward_and_back() {
+        assert_eq!(AgentMode::Build.next().prev(), AgentMode::Build);
     }
 
     #[test]
@@ -1615,5 +1837,101 @@ mod tests {
         // Compacting but fresh activity → not stalled.
         s.last_stream_activity = Some(std::time::Instant::now());
         assert!(!s.compaction_stalled());
+    }
+
+    #[test]
+    fn active_todos_persists_across_turn_end() {
+        let mut s = UiState::new();
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("x".into()),
+            completed: 0,
+            in_progress: 0,
+            total: 2,
+            items: vec![],
+        });
+        s.on_turn_complete();
+        assert!(s.active_todos.is_some(), "panel must survive turn end");
+    }
+
+    #[test]
+    fn active_todos_persist_across_cancel_and_error() {
+        // The todo panel is PER-SESSION state (see reset_to_new_session /
+        // SessionSwitched, which drop it), NOT per-turn — it already survives
+        // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
+        // error are just turn terminations too, so they must preserve it as
+        // well. Regression: clearing on cancel/error nuked the plan, and since
+        // a "继续" turn sends only INCREMENTAL todowrite updates (which fold
+        // against the existing panel via apply_todo_action — a no-op on an
+        // empty base), the panel could never rebuild. It stayed gone on screen
+        // while the model kept executing the plan from its own context. Only an
+        // explicit clear or a session switch may drop the panel.
+        let mut s = UiState::new();
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("Task".to_string()),
+            completed: 2,
+            in_progress: 1,
+            total: 3,
+            items: vec![],
+        });
+        s.todo_titles.insert(1, "Todo".to_string());
+
+        s.on_turn_cancelled();
+        assert!(s.active_todos.is_some(), "panel must survive cancellation");
+        assert!(!s.todo_titles.is_empty(), "titles must survive cancellation");
+
+        s.on_error();
+        assert!(s.active_todos.is_some(), "panel must survive error");
+        assert!(!s.todo_titles.is_empty(), "titles must survive error");
+    }
+
+    #[test]
+    fn approval_panel_selection_wraps_and_accel_maps() {
+        use crate::state::{ApprovalKind, ApprovalOption, ApprovalPanel};
+        let mut p = ApprovalPanel {
+            tool: "bash".into(),
+            detail: "rm -rf build/".into(),
+            options: vec![
+                ApprovalOption { label: "Allow once".into(), kind: ApprovalKind::AllowOnce, accel: 'y' },
+                ApprovalOption { label: "Always allow bash".into(), kind: ApprovalKind::AlwaysAllow, accel: 'a' },
+                ApprovalOption { label: "Deny".into(), kind: ApprovalKind::Deny, accel: 'n' },
+            ],
+            selected: 0,
+        };
+        p.move_up();
+        assert_eq!(p.selected, 2, "up from 0 wraps to last");
+        p.move_down();
+        assert_eq!(p.selected, 0, "down from last wraps to 0");
+        p.move_down();
+        assert_eq!(p.selected, 1);
+        assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
+        assert_eq!(p.accel_index('n'), Some(2));
+        assert_eq!(p.accel_index('z'), None);
+    }
+
+    #[test]
+    fn steer_pending_counts_unfolded_and_drains_on_fold() {
+        let mut st = UiState::new();
+        st.on_steer_sent();
+        st.on_steer_sent();
+        assert_eq!(st.steer_pending, 2, "two steers dispatched, none folded yet");
+        st.on_steered(1); // kernel confirms one fold
+        assert_eq!(st.steer_pending, 1, "drains as folds are confirmed");
+        st.on_steered(1);
+        assert_eq!(st.steer_pending, 0, "back to zero once all folded — a draining indicator");
+        st.on_steered(3); // spurious / cross-client fold never underflows
+        assert_eq!(st.steer_pending, 0, "saturating: never goes negative");
+        // Every turn-end path clears it, parity with the other per-turn counters.
+        st.on_steer_sent();
+        st.on_turn_complete();
+        assert_eq!(st.steer_pending, 0, "cleared at turn end");
+        st.on_steer_sent();
+        st.on_turn_cancelled();
+        assert_eq!(st.steer_pending, 0, "cleared on cancel");
+        st.on_steer_sent();
+        st.on_error();
+        assert_eq!(st.steer_pending, 0, "cleared on error");
+        st.on_steer_sent();
+        st.on_submit();
+        assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
     }
 }

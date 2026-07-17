@@ -304,6 +304,14 @@ export class DaemonClient {
     return this.get<SessionMeta[]>('/sessions');
   }
 
+  listProjectSessions(projectHash: string): Promise<SessionMeta[]> {
+    return this.get<SessionMeta[]>(`/projects/${encodeURIComponent(projectHash)}/sessions`);
+  }
+
+  listSessionsForWorkingDir(workingDir: string): Promise<SessionMeta[]> {
+    return this.get<SessionMeta[]>(`/sessions/by-working-dir?working_dir=${encodeURIComponent(workingDir)}`);
+  }
+
   getSession(projectHash: string, id: string): Promise<SessionDetail> {
     return this.get<SessionDetail>(`/projects/${projectHash}/sessions/${id}`);
   }
@@ -478,6 +486,9 @@ export class DaemonClient {
         break;
       case 'tool_start':
         callbacks.onToolStart(event.id, event.name, event.arguments);
+        break;
+      case 'tool_progress':
+        callbacks.onToolProgress(event.id, event.progress);
         break;
       case 'tool_result':
         callbacks.onToolResult(event.id, event.name, event.output, event.success, event.duration_ms);

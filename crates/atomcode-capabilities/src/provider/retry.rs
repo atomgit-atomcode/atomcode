@@ -81,6 +81,12 @@ pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 /// indicates a dropped/half-open connection (as opposed to a logical failure
 /// like NotFound). Retrying these is safe **only on the OPEN path** (no
 /// response bytes consumed yet) — mid-stream errors stay non-retryable.
+///
+/// `TimedOut` (Linux `ETIMEDOUT` / `os error 110`, Windows `10060`) is included:
+/// the kernel gave up on a dead/stalled TCP connection while reading the streamed
+/// body. It's a transport drop just like a reset — re-opening is safe, and it
+/// earns the plain-language notice from [`stream_read_error_message`] instead of
+/// the opaque raw chain.
 pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) -> bool {
     use std::io::ErrorKind::*;
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
@@ -88,7 +94,7 @@ pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) ->
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
             if matches!(
                 io.kind(),
-                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected | TimedOut
             ) {
                 return true;
             }
@@ -387,6 +393,20 @@ mod tests {
         }
         // A bare io error (no wrapper) is detected too.
         assert!(chain_has_transient_io(&Error::new(ErrorKind::BrokenPipe, "bp")));
+    }
+
+    #[test]
+    fn chain_has_transient_io_detects_connection_timeout() {
+        use std::io::{Error, ErrorKind};
+        // The reported case: a streamed body read that dies with
+        // `Connection timed out (os error 110)` (Linux ETIMEDOUT → ErrorKind::TimedOut)
+        // must be treated as a transport drop — both for the plain-language message
+        // and for open-path retry.
+        let e = Wrap(Error::new(ErrorKind::TimedOut, "Connection timed out (os error 110)"));
+        assert!(chain_has_transient_io(&e), "ETIMEDOUT buried in the chain is a transport drop");
+        let msg = stream_read_error_message(&e);
+        assert!(msg.contains("网络连接中断"), "leads with a plain-language notice: {msg}");
+        assert!(msg.contains("os error 110"), "still appends the raw cause: {msg}");
     }
 
     #[test]

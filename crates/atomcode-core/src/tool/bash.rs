@@ -813,7 +813,7 @@ pub async fn run_shell(
             cmd.pre_exec(|| {
                 extern "C" {
                     fn setsid() -> i32;
-                    fn open(path: *const u8, oflag: i32) -> i32;
+                    fn open(path: *const i8, oflag: i32, ...) -> i32;
                     fn close(fd: i32) -> i32;
                     fn ioctl(fd: i32, request: u64, ...) -> i32;
                 }
@@ -823,7 +823,7 @@ pub async fn run_shell(
                 const TIOCNOTTY: u64 = 0x20007471;
                 #[cfg(not(target_os = "macos"))]
                 const TIOCNOTTY: u64 = 0x5422;
-                let tty_fd = open(b"/dev/tty\0".as_ptr(), O_RDWR);
+                let tty_fd = open(b"/dev/tty\0".as_ptr() as *const i8, O_RDWR);
                 if tty_fd >= 0 {
                     ioctl(tty_fd, TIOCNOTTY);
                     close(tty_fd);

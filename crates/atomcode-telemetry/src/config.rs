@@ -41,13 +41,22 @@ impl TelemetryState {
     }
 }
 
+/// Resolve the 5-level telemetry opt-out: offline → env×2 → cli → config.
+///
+/// `offline` is resolved ONCE at startup. Under `offline_mode="auto"` the verdict is
+/// optimistic-online at telemetry-init time; a later network-failure flip does NOT
+/// re-resolve telemetry, so `auto` does NOT disable telemetry — only a forced `on` /
+/// `ATOMCODE_OFFLINE=on` does.
 pub fn resolve(
     cfg: &TelemetryConfig,
     cli: &CliOverride,
     atomcode_dir: PathBuf,
     env: &impl EnvLookup,
+    offline: bool,
 ) -> ResolvedConfig {
-    let state = if env.var("ATOMCODE_TELEMETRY").as_deref() == Some("0") {
+    let state = if offline {
+        TelemetryState::Disabled("offline")
+    } else if env.var("ATOMCODE_TELEMETRY").as_deref() == Some("0") {
         TelemetryState::Disabled("env:ATOMCODE_TELEMETRY=0")
     } else if env.var("DO_NOT_TRACK").as_deref() == Some("1") {
         TelemetryState::Disabled("env:DO_NOT_TRACK=1")
@@ -107,6 +116,7 @@ mod tests {
             &CliOverride::default(),
             dir(),
             &env(&[]),
+            false,
         );
         assert!(r.state.is_enabled());
         assert_eq!(r.endpoint, DEFAULT_ENDPOINT);
@@ -123,6 +133,7 @@ mod tests {
             &CliOverride::default(),
             dir(),
             &env(&[("ATOMCODE_TELEMETRY", "0")]),
+            false,
         );
         assert_eq!(r.state.reason(), Some("env:ATOMCODE_TELEMETRY=0"));
     }
@@ -134,6 +145,7 @@ mod tests {
             &CliOverride { disabled: true },
             dir(),
             &env(&[("DO_NOT_TRACK", "1")]),
+            false,
         );
         assert_eq!(r.state.reason(), Some("env:DO_NOT_TRACK=1"));
     }
@@ -144,7 +156,7 @@ mod tests {
             enabled: Some(true),
             endpoint: None,
         };
-        let r = resolve(&cfg, &CliOverride { disabled: true }, dir(), &env(&[]));
+        let r = resolve(&cfg, &CliOverride { disabled: true }, dir(), &env(&[]), false);
         assert_eq!(r.state.reason(), Some("cli:--no-telemetry"));
     }
 
@@ -154,7 +166,7 @@ mod tests {
             enabled: Some(false),
             endpoint: None,
         };
-        let r = resolve(&cfg, &CliOverride::default(), dir(), &env(&[]));
+        let r = resolve(&cfg, &CliOverride::default(), dir(), &env(&[]), false);
         assert_eq!(r.state.reason(), Some("config"));
     }
 
@@ -165,7 +177,20 @@ mod tests {
             &CliOverride::default(),
             dir(),
             &env(&[("ATOMCODE_TELEMETRY_ENDPOINT", "https://test.example/v1")]),
+            false,
         );
         assert_eq!(r.endpoint, "https://test.example/v1");
+    }
+
+    #[test]
+    fn offline_disables_telemetry() {
+        let r = resolve(
+            &TelemetryConfig { enabled: Some(true), endpoint: None },
+            &CliOverride::default(),
+            dir(),
+            &env(&[]),
+            /* offline: */ true,
+        );
+        assert_eq!(r.state.reason(), Some("offline"));
     }
 }

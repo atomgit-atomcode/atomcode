@@ -1,0 +1,32 @@
+[package]
+name = "atomcode-updater"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Self-update mechanics (check / download / verify / self-replace / re-exec) for the atomcode binary. Shared by the tuix and cli frontends; extracted out of the retiring atomcode-core."
+publish = false
+
+[features]
+# Package-managed builds (e.g. the HarmonyBrew formula): upgrades are the package
+# manager's job, so is_package_managed() returns true and run_upgrade short-circuits.
+distro-pm = []
+
+[dependencies]
+anyhow = "1"
+# `StreamExt::next` on the reqwest byte-stream during download.
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time", "net"] }
+# `config_dir()` for the staged-upgrade path; `proxy` env items to apply the proxy
+# policy to the download client without depending on atomcode-core.
+atomcode-config = { path = "../atomcode-config" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+# Mock HTTP server for the manifest/download tests.
+wiremock = "0.6"

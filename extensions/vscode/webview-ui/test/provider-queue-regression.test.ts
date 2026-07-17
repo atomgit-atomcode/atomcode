@@ -6,22 +6,23 @@ declare const require: {
 };
 
 const originalLoad = (Module as unknown as { _load: typeof Module['_load'] })._load;
+const vscodeMock = {
+  Uri: { joinPath: (...parts: Array<{ fsPath?: string } | string>) => ({ fsPath: parts.map((p) => typeof p === 'string' ? p : p.fsPath || '').join('/') }) },
+  workspace: { workspaceFolders: [] as Array<{ uri: { fsPath: string } }> },
+  window: {},
+  env: { language: 'en' },
+  commands: {},
+  l10n: { t: (value: string) => value },
+  ViewColumn: { Beside: 2, Active: -1 },
+};
 (Module as unknown as { _load: typeof Module['_load'] })._load = function patchedLoad(request, parent, isMain) {
   if (request === 'vscode') {
-    return {
-      Uri: { joinPath: (...parts: Array<{ fsPath?: string } | string>) => ({ fsPath: parts.map((p) => typeof p === 'string' ? p : p.fsPath || '').join('/') }) },
-      workspace: { workspaceFolders: [] },
-      window: {},
-      env: { language: 'en' },
-      commands: {},
-      l10n: { t: (value: string) => value },
-      ViewColumn: { Beside: 2, Active: -1 },
-    };
+    return vscodeMock;
   }
   return originalLoad.call(this, request, parent, isMain);
 };
 
-const { ChatViewProvider } = require('../../src/chat/provider');
+const { ChatViewProvider, mergeSessionsForDisplay } = require('../../src/chat/provider');
 
 (Module as unknown as { _load: typeof Module['_load'] })._load = originalLoad;
 
@@ -264,6 +265,174 @@ async function testPermissionResponsePostsExplicitDecisionToDaemon() {
   }]);
 }
 
+async function testLoadSessionsForDisplayUsesVscodeWorkspaceDirectory() {
+  vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/repo/atomcode' } }];
+
+  const calls: string[] = [];
+  const client = {
+    listSessions: async () => {
+      calls.push('listSessions');
+      return [{ id: 'other', name: 'Other project', project_hash: 'other-hash', updated_at: 300 }];
+    },
+    listSessionsForWorkingDir: async (workingDir: string) => {
+      calls.push(`listSessionsForWorkingDir:${workingDir}`);
+      return [{ id: 'current', name: 'Current project', project_hash: 'current-hash', working_dir: workingDir, updated_at: 100 }];
+    },
+    getProject: async () => {
+      calls.push('getProject');
+      return { project_hash: 'wrong-daemon-hash' };
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _loadSessionsForDisplay: () => Promise<{ sessions: Array<{ id: string }>; currentProjectHash?: string }>;
+  };
+
+  const loaded = await unsafeProvider._loadSessionsForDisplay();
+
+  assert.deepEqual(calls, [
+    'listSessionsForWorkingDir:/repo/atomcode',
+  ]);
+  assert.deepEqual(loaded.sessions.map((s) => s.id), ['current']);
+  assert.equal(loaded.currentProjectHash, 'current-hash');
+
+  vscodeMock.workspace.workspaceFolders = [];
+}
+
+async function testLoadSessionsForDisplayDoesNotFallBackToGlobalWhenWorkspaceHasNoSessions() {
+  vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/repo/empty-project' } }];
+
+  const client = {
+    listSessions: async () => [{ id: 'other', name: 'Other project', project_hash: 'other-hash', updated_at: 300 }],
+    listSessionsForWorkingDir: async () => [],
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _loadSessionsForDisplay: () => Promise<{ sessions: Array<{ id: string }>; currentProjectHash?: string }>;
+  };
+
+  const loaded = await unsafeProvider._loadSessionsForDisplay();
+
+  assert.deepEqual(loaded.sessions, []);
+
+  vscodeMock.workspace.workspaceFolders = [];
+}
+
+async function testLoadSessionsForDisplayFallsBackToGlobalWhenWorkspaceRequestFails() {
+  vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/repo/atomcode' } }];
+
+  const calls: string[] = [];
+  const client = {
+    listSessions: async () => {
+      calls.push('listSessions');
+      return [{ id: 'global', name: 'Global fallback', project_hash: 'fallback-hash', updated_at: 300 }];
+    },
+    listSessionsForWorkingDir: async (workingDir: string) => {
+      calls.push(`listSessionsForWorkingDir:${workingDir}`);
+      throw new Error('unsupported endpoint');
+    },
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _loadSessionsForDisplay: () => Promise<{ sessions: Array<{ id: string }>; currentProjectHash?: string }>;
+  };
+
+  const loaded = await unsafeProvider._loadSessionsForDisplay();
+
+  assert.deepEqual(calls, [
+    'listSessionsForWorkingDir:/repo/atomcode',
+    'listSessions',
+  ]);
+  assert.deepEqual(loaded.sessions.map((s) => s.id), ['global']);
+
+  vscodeMock.workspace.workspaceFolders = [];
+}
+
+async function testRefreshSessionsOnlyPrependsSyntheticPanelsForCurrentWorkspace() {
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, {} as never);
+  const unsafeProvider = provider as unknown as {
+    _panelSessions: Map<string, { sessionId: string; projectHash?: string; workingDir?: string }>;
+    _sessionRuntimes: Map<string, { isGenerating: boolean; queuedMessages: unknown[]; eventBuffer: unknown[] }>;
+    _loadSessionsForDisplay: () => Promise<{ sessions: Array<{ id: string }>; workspaceFolder?: string; currentProjectHash?: string }>;
+    _annotateSessionGenerating: (sessions: unknown[]) => Promise<void>;
+    _broadcastMessage: (msg: unknown) => void;
+    _refreshSessions: () => Promise<void>;
+  };
+
+  const messages: unknown[] = [];
+  unsafeProvider._loadSessionsForDisplay = async () => ({
+    sessions: [],
+    workspaceFolder: '/repo/current',
+  });
+  unsafeProvider._annotateSessionGenerating = async () => {};
+  unsafeProvider._broadcastMessage = (msg: unknown) => {
+    messages.push(msg);
+  };
+  unsafeProvider._panelSessions.set('current-new', {
+    sessionId: 'current-new',
+    projectHash: 'current-hash',
+    workingDir: '/repo/current',
+  });
+  unsafeProvider._panelSessions.set('other-new', {
+    sessionId: 'other-new',
+    projectHash: 'other-hash',
+    workingDir: '/repo/other',
+  });
+
+  await unsafeProvider._refreshSessions();
+
+  const sessionsMessage = messages.find((msg) => (msg as { type?: string }).type === 'sessions') as {
+    sessions: Array<{ id: string }>;
+  };
+  assert.deepEqual(sessionsMessage.sessions.map((s) => s.id), ['current-new']);
+}
+
+function testMergeSessionsForDisplayShowsOnlyCurrentProjectSessionsWhenProjectIsKnown() {
+  const merged = mergeSessionsForDisplay(
+    [
+      {
+        id: 'global-newer',
+        name: 'Global newer',
+        project_hash: 'other-hash',
+        updated_at: 300,
+      },
+      {
+        id: 'duplicate-current',
+        name: 'Current from global',
+        project_hash: 'current-hash',
+        working_dir: '/repo/current',
+        updated_at: 200,
+      },
+    ],
+    [
+      {
+        id: 'current-old',
+        name: 'Current old',
+        project_hash: 'current-hash',
+        working_dir: '/repo/current',
+        updated_at: 100,
+      },
+      {
+        id: 'duplicate-current',
+        name: 'Current from project endpoint',
+        project_hash: 'current-hash',
+        working_dir: '/repo/current',
+        updated_at: 250,
+      },
+    ],
+    'current-hash',
+  );
+
+  assert.deepEqual(merged.map((s: { id: string }) => s.id), [
+    'duplicate-current',
+    'current-old',
+  ]);
+  assert.equal(
+    merged.find((s: { id: string }) => s.id === 'duplicate-current')?.name,
+    'Current from project endpoint',
+  );
+}
+
 Promise.resolve()
   .then(testQueuedMessageDrainsForCompletedSessionWithoutFocusedPanel)
   .then(testQueuedMessageDoesNotDrainWhileApprovalModeIsPending)
@@ -271,6 +440,11 @@ Promise.resolve()
   .then(testPermissionRequestFromStreamIsForwardedToPanel)
   .then(testPermissionResponsePostsDecisionToDaemon)
   .then(testPermissionResponsePostsExplicitDecisionToDaemon)
+  .then(testMergeSessionsForDisplayShowsOnlyCurrentProjectSessionsWhenProjectIsKnown)
+  .then(testLoadSessionsForDisplayUsesVscodeWorkspaceDirectory)
+  .then(testLoadSessionsForDisplayDoesNotFallBackToGlobalWhenWorkspaceHasNoSessions)
+  .then(testLoadSessionsForDisplayFallsBackToGlobalWhenWorkspaceRequestFails)
+  .then(testRefreshSessionsOnlyPrependsSyntheticPanelsForCurrentWorkspace)
   .catch((err) => {
   console.error(err);
   process.exit(1);

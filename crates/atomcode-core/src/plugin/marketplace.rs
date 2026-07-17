@@ -225,6 +225,7 @@ pub(super) fn resolve_marketplace_identity(
                 name: dir_name.to_string(),
                 source: PluginSource::Inline("./".into()),
                 description: None,
+                version: None,
             }],
         ),
     }
@@ -644,7 +645,7 @@ mod tests {
         // user never had. ATOMCODE_HOME is isolated, so this writes to a
         // tempdir, never the real ~/.atomcode/auth.toml.
         let _home = isolated_home();
-        let dir = crate::config::Config::config_dir();
+        let dir = atomcode_config::config::Config::config_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("auth.toml"),

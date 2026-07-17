@@ -57,6 +57,7 @@ class SseParser {
             "tool_batch" -> ChatEvent.ToolBatch(data)
             "tool_start" -> ChatEvent.ToolStart(json.string("id"), json.string("name").orEmpty(), json.string("arguments").orEmpty())
             "tool_output" -> ChatEvent.ToolOutput(json.string("chunk").orEmpty())
+            "tool_progress" -> ChatEvent.ToolProgress(json.string("id"), json.string("progress").orEmpty())
             "tool_result" -> ChatEvent.ToolResult(
                 json.string("id"),
                 json.string("name").orEmpty(),

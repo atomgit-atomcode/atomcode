@@ -5,6 +5,12 @@ edition = "2021"
 description = "Spike: neutral agent kernel (Phase A0 — design validation, throwaway internals)"
 publish = false
 
+[features]
+# Test-only helper: gates `test_support::isolate_home()`, which consuming crates
+# enable via a dev-dependency + call from a `#[ctor]` so their tests can't pollute
+# the developer's real ~/.atomcode. No extra deps (std only).
+test-support = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = "0.7"

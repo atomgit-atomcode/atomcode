@@ -10,7 +10,7 @@ use std::path::Path;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 /// 在 tempdir 项目中跑 setup,同时把 `ATOMCODE_HOME` 指向另一个 tempdir。

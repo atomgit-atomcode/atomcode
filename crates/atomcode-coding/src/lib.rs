@@ -29,11 +29,12 @@
 //! ```
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any unit test runs, so the
-// suite can't persist into the developer's real ~/.atomcode (see atomcode-test-support).
+// suite can't persist into the developer's real ~/.atomcode (see
+// atomcode_kernel::test_support).
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 pub mod config;
@@ -41,9 +42,11 @@ pub mod discipline;
 pub mod parts;
 pub mod persona;
 pub mod plan_mode;
+pub mod runtime;
 pub mod telemetry;
 
 mod assemble;
+mod init_prompt;
 mod rate_limit;
 mod todo;
 pub mod subagent_tiers;
@@ -52,6 +55,7 @@ pub use assemble::{build_coding_agent, build_coding_agent_with};
 pub use config::{CodingAgentConfig, SubagentProvider, TierProvider};
 pub use discipline::VerifyCadenceHook;
 pub use plan_mode::PlanModeGate;
+pub use runtime::{CodingRuntimeHandle, RuntimeUnavailable};
 pub use todo::TodoHook;
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use parts::{
@@ -59,6 +63,7 @@ pub use parts::{
     SessionMode, subagent_enabled_from_env,
 };
 pub use persona::coding_persona;
+pub use init_prompt::INIT_PROMPT;
 
 /// Re-export the CC external-hooks types so drivers (e.g. the bridge) that resolve
 /// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct

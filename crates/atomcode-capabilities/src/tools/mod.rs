@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub mod approval;
 pub mod ast_grep;
 pub mod bash;
+pub mod bash_workspace_gate;
 pub mod cd;
 pub mod edit;
 pub mod glob;
@@ -55,6 +56,11 @@ pub mod web_search;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
+/// Model-facing memory tool (remember / forget / list). Opt-in `memory` feature.
+#[cfg(feature = "memory")]
+mod memory;
+#[cfg(feature = "memory")]
+pub use memory::MemoryTool;
 
 pub use approval::{
     ApprovalMiddleware, ApprovalRequest, ApprovalResponse, InMemoryPermissionStore,
@@ -63,6 +69,7 @@ pub use approval::{
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
+pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
@@ -88,7 +95,7 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite"]
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -122,7 +129,23 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
         .unwrap_or(false);
     if !todo_env_off {
+        // Single `todowrite` tool: accepts the full-list plan shape AND the incremental
+        // `{action}` shape (merged — was a separate `todo` tool). One tool = no plan-vs-patch
+        // tool-choice confusion for the model; the reducer distinguishes by arg SHAPE.
         reg.register(Arc::new(TodoTool::new()));
+    }
+    // Gate on ATOMCODE_MEMORY_TOOL (0/false/off → skip; absent/other → register).
+    // Mirrors the TodoTool env gate; the tool name stays in `coding_tool_names()`
+    // unconditionally (mount() skips unregistered names).
+    #[cfg(feature = "memory")]
+    {
+        let memory_off = std::env::var("ATOMCODE_MEMORY_TOOL")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(false);
+        if !memory_off {
+            reg.register(Arc::new(MemoryTool));
+        }
     }
 }
 
@@ -327,11 +350,24 @@ mod tests {
 
     #[test]
     fn coding_tool_names_matches_expected_list() {
-        let mut names = coding_tool_names().to_vec();
-        names.sort();
-        let mut expected = EXPECTED_TOOL_NAMES.to_vec();
-        expected.sort();
-        assert_eq!(names, expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES");
+        let names = coding_tool_names();
+        // Every name in EXPECTED_TOOL_NAMES must appear in coding_tool_names().
+        for expected_name in EXPECTED_TOOL_NAMES {
+            assert!(
+                names.contains(expected_name),
+                "coding_tool_names() must include '{expected_name}'"
+            );
+        }
+        // "memory" is always included in coding_tool_names() (mount() skips it
+        // when the feature / env gate is off; the name itself is unconditional).
+        assert!(names.contains(&"memory"), "coding_tool_names() must include 'memory'");
+        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + "memory".
+        let expected_with_memory: Vec<&str> = EXPECTED_TOOL_NAMES.iter().copied().chain(std::iter::once("memory")).collect();
+        let mut sorted_names = names.to_vec();
+        sorted_names.sort();
+        let mut sorted_expected = expected_with_memory.clone();
+        sorted_expected.sort();
+        assert_eq!(sorted_names, sorted_expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory");
     }
 
     #[test]
@@ -434,5 +470,34 @@ mod tests {
         let mounted = reg.mount(coding_tool_names());
         let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
         assert!(names.iter().any(|n| n == "todowrite"), "todowrite must be registered: {names:?}");
+    }
+
+    /// `memory` is registered when `ATOMCODE_MEMORY_TOOL` is unset, and absent when
+    /// `ATOMCODE_MEMORY_TOOL=0`. Uses `MountedTools::defs()` (the stable public API)
+    /// since `MountedTools` does not expose `.len()`/`.is_empty()` directly.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn memory_tool_registered_unless_env_off() {
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        assert!(
+            reg.mount(&["memory"]).defs().len() == 1,
+            "memory mounts when env unset"
+        );
+
+        std::env::set_var("ATOMCODE_MEMORY_TOOL", "0");
+        let mut reg_off = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg_off, false);
+        assert!(
+            reg_off.mount(&["memory"]).defs().is_empty(),
+            "memory absent when env=0"
+        );
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+    }
+
+    #[test]
+    fn coding_tool_names_includes_memory() {
+        assert!(coding_tool_names().contains(&"memory"));
     }
 }

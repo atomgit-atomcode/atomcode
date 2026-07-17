@@ -10,19 +10,19 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::provider::ProviderConfig;
-use crate::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{
-    ApprovalRequirement, PermissionDecision, Tool, ToolCall, ToolContext, ToolDef, ToolRegistry,
+    ApprovalRequirement, Tool, ToolCall, ToolContext, ToolDef, ToolRegistry,
     ToolResult,
 };
 
 use super::event::{TurnEvent, TurnResult};
-use super::permission::{AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider};
+use super::permission::{AutoPermissionDecider, AutoPermissionMode};
 use super::runner::TurnRunner;
 use crate::hook::HookEngine;
 
@@ -309,7 +309,7 @@ fn make_runner(
 ) -> TurnRunner {
     // Tests don't set up real ProviderConfig, so construct a DefaultCtx
     // directly with a generous window (matches test_config's implicit budget).
-    let test_provider = crate::config::provider::ProviderConfig {
+    let test_provider = atomcode_config::config::provider::ProviderConfig {
         provider_type: "test".into(),
         api_key: None,
         model: "test-model".into(),
@@ -658,87 +658,6 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
             if let crate::conversation::message::MessageContent::ToolResult(ref r) = last.content {
                 assert!(r.success);
                 assert!(r.output.contains("dangerous action done"));
-            } else {
-                panic!("Expected ToolResult");
-            }
-        }
-        other => panic!("Expected UsedTools, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn test_turn_runner_interactive_approval_allow() {
-    let tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool)).await;
-
-    let (req_tx, mut req_rx) = mpsc::unbounded_channel();
-    let (resp_tx, resp_rx) = mpsc::unbounded_channel();
-    let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
-    let permission = Box::new(InteractivePermissionDecider::new(req_tx, resp_rx, store));
-
-    let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let mut runner = make_runner(provider, tools, permission);
-    let mut conv = Conversation::new();
-    conv.add_user_message("do it");
-    let (tx, _rx) = mpsc::unbounded_channel();
-
-    // Spawn responder: auto-approve when request arrives
-    tokio::spawn(async move {
-        if let Some(_req) = req_rx.recv().await {
-            resp_tx.send(PermissionDecision::Allow).unwrap();
-        }
-    });
-
-    let result = runner
-        .run(&mut conv, "system", &tx, CancellationToken::new())
-        .await;
-
-    match result {
-        TurnResult::UsedTools { .. } => {
-            let last = conv.messages.last().unwrap();
-            if let crate::conversation::message::MessageContent::ToolResult(ref r) = last.content {
-                assert!(r.success, "Tool should have been approved and executed");
-            } else {
-                panic!("Expected ToolResult");
-            }
-        }
-        other => panic!("Expected UsedTools, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn test_turn_runner_interactive_approval_deny() {
-    let tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool)).await;
-
-    let (req_tx, mut req_rx) = mpsc::unbounded_channel();
-    let (resp_tx, resp_rx) = mpsc::unbounded_channel();
-    let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
-    let permission = Box::new(InteractivePermissionDecider::new(req_tx, resp_rx, store));
-
-    let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let mut runner = make_runner(provider, tools, permission);
-    let mut conv = Conversation::new();
-    conv.add_user_message("do it");
-    let (tx, _rx) = mpsc::unbounded_channel();
-
-    // Spawn responder: deny when request arrives
-    tokio::spawn(async move {
-        if let Some(_req) = req_rx.recv().await {
-            resp_tx.send(PermissionDecision::Deny).unwrap();
-        }
-    });
-
-    let result = runner
-        .run(&mut conv, "system", &tx, CancellationToken::new())
-        .await;
-
-    match result {
-        TurnResult::UsedTools { .. } => {
-            let last = conv.messages.last().unwrap();
-            if let crate::conversation::message::MessageContent::ToolResult(ref r) = last.content {
-                assert!(!r.success, "Tool should have been denied");
-                assert!(r.output.contains("denied"));
             } else {
                 panic!("Expected ToolResult");
             }
@@ -1255,7 +1174,7 @@ async fn test_tool_registry_stable_order() {
 /// (those belong in tool definitions, not system prompt).
 #[test]
 fn test_rules_no_tool_descriptions() {
-    let rules = crate::config::prompt_sections::build_rules();
+    let rules = atomcode_config::config::prompt_sections::build_rules();
 
     // Should NOT contain tool usage descriptions (removed for token savings)
     assert!(
@@ -1294,7 +1213,7 @@ fn test_rules_no_tool_descriptions() {
 /// that would break prompt caching.
 #[test]
 fn test_rules_no_dynamic_content() {
-    let rules = crate::config::prompt_sections::build_rules();
+    let rules = atomcode_config::config::prompt_sections::build_rules();
 
     assert!(!rules.contains("Date:"), "Rules should not contain date");
     assert!(
@@ -1463,7 +1382,7 @@ mod telemetry_tests {
         let (tel, captured) = Telemetry::in_memory("test".into());
         let ctx = ToolContext::with_telemetry(PathBuf::from("/tmp/test"), "session-1", tel);
 
-        let test_provider_cfg = crate::config::provider::ProviderConfig {
+        let test_provider_cfg = atomcode_config::config::provider::ProviderConfig {
             provider_type: "test".into(),
             api_key: None,
             model: "test-model".into(),

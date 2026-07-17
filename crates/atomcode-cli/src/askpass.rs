@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use atomcode_askpass::protocol::{read_frame, write_frame, Request, Response};
+use atomcode_capabilities::askpass::protocol::{read_frame, write_frame, Request, Response};
 
 /// Connect to `sock`, authenticate with `token`, send `prompt`, and return
 /// the password the TUI user typed.  Returns `None` on any I/O or protocol

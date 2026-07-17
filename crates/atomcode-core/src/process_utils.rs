@@ -72,7 +72,12 @@ pub(crate) fn locale_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
 
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    // This lock only serializes env mutation; recover from a poisoned lock (a prior
+    // holder panicked, e.g. an env-race assertion under the parallel harness) instead
+    // of cascading a `.unwrap()` panic into every other locale test.
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

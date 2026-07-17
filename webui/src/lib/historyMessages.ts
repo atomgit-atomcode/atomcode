@@ -20,6 +20,13 @@ export function isInternalHistoryUserMessage(text: string, synthetic?: boolean):
   return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
+export function isInternalHistoryAssistantMessage(msg: SessionMessage): boolean {
+  const internalOrigin = msg.internal_origin ?? msg.internalOrigin;
+  return msg.role === 'assistant'
+    && internalOrigin === 'verify_cadence'
+    && !(msg.tool_calls?.length);
+}
+
 export function sessionMessagesToMarkdownLines(
   messages: SessionMessage[],
   title: string,
@@ -31,6 +38,7 @@ export function sessionMessagesToMarkdownLines(
       if (isInternalHistoryUserMessage(msg.content || '', msg.synthetic)) continue;
       lines.push('## User', '', msg.content || '', '');
     } else if (msg.role === 'assistant') {
+      if (isInternalHistoryAssistantMessage(msg)) continue;
       lines.push('## Assistant', '');
       if (msg.content) {
         lines.push(msg.content, '');

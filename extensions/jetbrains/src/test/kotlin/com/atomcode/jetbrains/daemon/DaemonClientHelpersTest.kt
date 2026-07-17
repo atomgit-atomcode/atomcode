@@ -160,4 +160,35 @@ class DaemonClientHelpersTest {
         assertEquals(20L, sessions.single().updatedAt)
         assertEquals(3, sessions.single().messageCount)
     }
+
+    @Test
+    fun `parseMessageInfo reads snake case internal origin`() {
+        val message = parseMessageInfo(
+            """{"role":"assistant","content":"No verification is needed.","internal_origin":"verify_cadence"}""",
+        )
+
+        assertEquals("assistant", message.role)
+        assertEquals("verify_cadence", message.internalOrigin)
+    }
+
+    @Test
+    fun `parseMessageInfo reads camel case internal origin`() {
+        val message = parseMessageInfo(
+            """{"role":"assistant","content":"No verification is needed.","internalOrigin":"verify_cadence"}""",
+        )
+
+        assertEquals("verify_cadence", message.internalOrigin)
+    }
+
+    @Test
+    fun `parseMessageInfo reads tool calls`() {
+        val message = parseMessageInfo(
+            """{"role":"assistant","content":"","tool_calls":[{"id":"t1","name":"bash","arguments":"{\"command\":\"true\"}"}]}""",
+        )
+
+        assertEquals(1, message.toolCalls.size)
+        assertEquals("t1", message.toolCalls.single().id)
+        assertEquals("bash", message.toolCalls.single().name)
+        assertEquals("""{"command":"true"}""", message.toolCalls.single().arguments)
+    }
 }

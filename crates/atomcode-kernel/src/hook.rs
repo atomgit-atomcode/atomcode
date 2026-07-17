@@ -51,6 +51,44 @@ pub struct TurnCtx {
 /// to the user. Mirrors the spec's `RATE_LIMIT_AUTO_WAIT_SECS`.
 pub const RATE_LIMIT_AUTO_WAIT_SECS: u64 = 120;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationKind {
+    Generic,
+    VerifyCadence,
+    TruncationResume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationVisibility {
+    Normal,
+    InternalControl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    pub text: String,
+    pub kind: ContinuationKind,
+    pub visibility: ContinuationVisibility,
+}
+
+impl Continuation {
+    pub fn generic(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ContinuationKind::Generic,
+            visibility: ContinuationVisibility::Normal,
+        }
+    }
+
+    pub fn verify_cadence(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ContinuationKind::VerifyCadence,
+            visibility: ContinuationVisibility::InternalControl,
+        }
+    }
+}
+
 /// What the kernel knows about a 429 at the moment it fires. The kernel cannot
 /// see CodingPlan usage windows (that lives in `atomcode-core`, off-limits here)
 /// so this carries only its own best-effort signal: the status and any
@@ -66,7 +104,9 @@ pub struct RateLimitHint {
 /// turn cleanly (no red error), preserving already-produced content.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RateLimitDecision {
-    WaitAndRetry { secs: u64 },
+    WaitAndRetry {
+        secs: u64,
+    },
     Pause {
         reset_at_display: String,
         reset_label: String,
@@ -80,7 +120,9 @@ impl RateLimitDecision {
     /// reset is imminent, otherwise pause with whatever little we know.
     pub fn from_hint(hint: &RateLimitHint) -> Self {
         match hint.retry_after_secs {
-            Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => RateLimitDecision::WaitAndRetry { secs: s },
+            Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => {
+                RateLimitDecision::WaitAndRetry { secs: s }
+            }
             _ => RateLimitDecision::Pause {
                 reset_at_display: String::new(),
                 reset_label: String::new(),
@@ -195,6 +237,12 @@ pub trait LifecycleHooks: Send + Sync {
     /// inject a follow-up USER message and CONTINUE; `None` to complete. Read-only.
     async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         None
+    }
+
+    async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        self.offer_continuation(convo)
+            .await
+            .map(Continuation::generic)
     }
 
     /// A turn has TERMINATED — fired EXACTLY ONCE per turn on EVERY terminal path
@@ -355,6 +403,17 @@ impl LifecycleHooks for HookChain {
         continuation
     }
 
+    async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        let mut continuation = None;
+        for h in &self.hooks {
+            let r = h.offer_typed_continuation(convo).await;
+            if continuation.is_none() {
+                continuation = r;
+            }
+        }
+        continuation
+    }
+
     async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
         for h in &self.hooks {
             h.turn_complete(convo, reason, ctx).await;
@@ -391,10 +450,17 @@ mod tests {
     async fn empty_hookchain_is_noop() {
         let chain = HookChain::new(vec![]);
         let mut text = "hi".to_string();
-        assert!(chain.user_prompt_submit(&mut text).await.is_ok(), "empty chain must not block");
+        assert!(
+            chain.user_prompt_submit(&mut text).await.is_ok(),
+            "empty chain must not block"
+        );
         assert_eq!(text, "hi", "empty chain must not mutate the prompt");
         let convo = Conversation::new();
-        assert_eq!(chain.offer_continuation(&convo).await, None, "empty chain offer_continuation must be None");
+        assert_eq!(
+            chain.offer_continuation(&convo).await,
+            None,
+            "empty chain offer_continuation must be None"
+        );
     }
 
     #[test]
@@ -425,7 +491,34 @@ mod tests {
         struct Bare;
         #[async_trait::async_trait]
         impl LifecycleHooks for Bare {}
-        let hint = RateLimitHint { http_status: Some(429), retry_after_secs: Some(10) };
+        let hint = RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: Some(10),
+        };
         assert!(Bare.on_rate_limit(&hint).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn offer_typed_continuation_wraps_legacy_text_as_generic_visible() {
+        struct Legacy;
+
+        #[async_trait::async_trait]
+        impl LifecycleHooks for Legacy {
+            async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
+                Some("continue".to_string())
+            }
+        }
+
+        let got = Legacy
+            .offer_typed_continuation(&Conversation::default())
+            .await;
+        assert_eq!(
+            got,
+            Some(Continuation {
+                text: "continue".to_string(),
+                kind: ContinuationKind::Generic,
+                visibility: ContinuationVisibility::Normal,
+            })
+        );
     }
 }

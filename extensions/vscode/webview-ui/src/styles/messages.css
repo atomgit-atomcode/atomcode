@@ -797,6 +797,16 @@
 .tool-header:hover .tool-name-secondary { color: var(--app-primary-foreground); }
 .tool-header:active { opacity: 0.65; }
 
+.tool-progress {
+  margin: 1px 0 4px;
+  color: var(--app-secondary-foreground);
+  font-family: var(--app-monospace-font-family);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-name {
   font-weight: 700;
   color: var(--app-primary-foreground);

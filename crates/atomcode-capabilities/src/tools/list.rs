@@ -40,6 +40,11 @@ impl Tool for ListDirTool {
             }
         })
     }
+    /// No side effects — a pure read. Makes it `parallel_safe` (concurrent
+    /// execution) and allowed in plan mode.
+    fn read_only_hint(&self) -> bool {
+        true
+    }
     // listing is non-destructive → risk() defaults to Safe.
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {

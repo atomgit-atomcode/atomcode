@@ -74,12 +74,14 @@ pub fn md_heading_open() -> &'static str {
 /// Close heading: bold off + fg default (SGR 22;39). Theme-invariant.
 pub const MD_HEADING_CLOSE: &str = "\x1b[22;39m";
 
-/// Inline code.
-/// `dark`: bold + bright cyan (matches headings).
-/// `light`: bold + standard magenta (SGR 1;35) — distinct from headings,
-/// terminal profiles map 35 to a dark magenta that's readable on white.
+/// Inline code — NOT bold. Bold + bright cyan made every `` `code` `` span in
+/// dense prose flare (and rendered harshly on terminals that don't soften
+/// bright cyan); weight is reserved for `**bold**`. Color alone marks it as
+/// code, calmly and consistently across terminals.
+/// `dark`: bright cyan (matches headings, minus the bold).
+/// `light`: standard magenta (SGR 35) — distinct from headings, readable on white.
 pub fn md_inline_code_open() -> &'static str {
-    if is_light() { "\x1b[1;35m" } else { "\x1b[1;96m" }
+    if is_light() { "\x1b[35m" } else { "\x1b[96m" }
 }
 
 /// Close inline code: bold off + fg default. Theme-invariant.
@@ -158,8 +160,8 @@ mod tests {
     }
 
     #[test]
-    fn dark_md_inline_code_is_bold_bright_cyan() {
-        with_dark(|| assert_eq!(md_inline_code_open(), "\x1b[1;96m"));
+    fn dark_md_inline_code_is_bright_cyan_not_bold() {
+        with_dark(|| assert_eq!(md_inline_code_open(), "\x1b[96m"));
     }
 
     #[test]
@@ -179,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn light_md_inline_code_is_bold_magenta() {
-        with_light(|| assert_eq!(md_inline_code_open(), "\x1b[1;35m"));
+    fn light_md_inline_code_is_magenta_not_bold() {
+        with_light(|| assert_eq!(md_inline_code_open(), "\x1b[35m"));
     }
 
     #[test]

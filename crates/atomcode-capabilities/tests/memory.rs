@@ -18,7 +18,7 @@ use atomcode_capabilities::memory::{MemoryHook, MemoryStore};
 // never writes into the developer's real home. Tests that set ATOMCODE_HOME still win.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
-    atomcode_test_support::isolate_home();
+    atomcode_kernel::test_support::isolate_home();
 }
 
 #[tokio::test]

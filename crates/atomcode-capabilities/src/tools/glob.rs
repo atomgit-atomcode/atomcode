@@ -44,6 +44,11 @@ impl Tool for GlobTool {
             "required": ["pattern"]
         })
     }
+    /// No side effects — a pure read. Makes it `parallel_safe` (concurrent
+    /// execution) and allowed in plan mode.
+    fn read_only_hint(&self) -> bool {
+        true
+    }
     // read-only → risk() defaults to Safe.
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
