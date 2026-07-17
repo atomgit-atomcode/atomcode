@@ -1710,7 +1710,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             let avail_w = rule_width.saturating_sub(4).max(1);
             let chunks = crate::width::wrap_line_to_width(description, avail_w);
-            1 + chunks.len().max(1)
+            1 + chunks.len().min(2).max(1)
         }
     }
 
@@ -1820,11 +1820,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
 
         let avail_w = rule_width.saturating_sub(4).max(1);
-        let chunks = if description.is_empty() {
+        let mut chunks = if description.is_empty() {
             vec![String::new()]
         } else {
             crate::width::wrap_line_to_width(description, avail_w)
         };
+
+        if chunks.len() > 2 {
+            chunks.truncate(2);
+            let second_line = &chunks[1];
+            let max_w = avail_w.saturating_sub(3).max(1);
+            let mut truncated = crate::width::truncate_to_width(second_line, max_w);
+            truncated.push_str("...");
+            chunks[1] = truncated;
+        }
 
         let mut rows = Vec::new();
         rows.push(row1);
