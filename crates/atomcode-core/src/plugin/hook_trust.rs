@@ -19,17 +19,21 @@ pub fn plugin_id(plugin: &str, marketplace: &str) -> String {
 }
 
 /// SHA-256 over the sorted `(event, matcher, command)` triples — sensitive to
-/// WHAT CODE RUNS, not to timeout or install path. Empty set → empty-string hash.
+/// WHAT CODE RUNS, not to timeout or install path. Each field is length-prefixed
+/// so no field content (including control bytes) can shift a boundary and collide
+/// two different hook sets. Empty set → SHA-256 of empty input.
 pub fn plugin_hook_set_hash(hooks: &[PluginCcHook]) -> String {
-    let mut parts: Vec<String> = hooks
+    let mut triples: Vec<(&str, &str, &str)> = hooks
         .iter()
-        .map(|h| format!("{}\x1f{}\x1f{}", h.event, h.matcher.as_deref().unwrap_or(""), h.command))
+        .map(|h| (h.event.as_str(), h.matcher.as_deref().unwrap_or(""), h.command.as_str()))
         .collect();
-    parts.sort();
+    triples.sort_unstable();
     let mut hasher = Sha256::new();
-    for p in &parts {
-        hasher.update(p.as_bytes());
-        hasher.update([0x1e]);
+    for (event, matcher, command) in &triples {
+        for field in [event, matcher, command] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
     }
     format!("{:x}", hasher.finalize())
 }
@@ -128,6 +132,14 @@ mod tests {
         let mut with_timeout = mk("SessionStart", None, "x");
         with_timeout.timeout_secs = Some(30);
         assert_eq!(base, plugin_hook_set_hash(&[with_timeout]));
+    }
+
+    #[test]
+    fn hash_no_collision_across_field_boundaries() {
+        // Old delimiter-join scheme collided these two DISTINCT hook sets.
+        let a = plugin_hook_set_hash(&[mk("E", Some("b\u{1f}c"), "d")]);
+        let b = plugin_hook_set_hash(&[mk("E", Some("b"), "c\u{1f}d")]);
+        assert_ne!(a, b);
     }
 
     #[test]

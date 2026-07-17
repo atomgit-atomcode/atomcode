@@ -117,6 +117,20 @@ fn dedup_hooks(hooks: Vec<PluginCcHook>) -> Vec<PluginCcHook> {
         .collect()
 }
 
+/// Like `plugin_file_cc_hooks` but honors a `plugin.json`-declared custom hooks
+/// path (`"hooks": "custom/x.json"`) first, then falls back to the default drill.
+fn plugin_file_cc_hooks_for(plugin_dir: &Path, manifest: &PluginManifest) -> Vec<PluginCcHook> {
+    if let Some(super::manifest::HooksField::Path(p)) = &manifest.hooks {
+        let path = plugin_dir.join(p);
+        if path.exists() {
+            if let Some(map) = load_cc_hooks_file(&path) {
+                return expand_cc_hooks(&map, plugin_dir);
+            }
+        }
+    }
+    plugin_file_cc_hooks(plugin_dir)
+}
+
 /// All CC hooks a plugin contributes: inline (`plugin.json` hooks) + file-based
 /// (`hooks/hooks.json` / `hooks.json`), deduped by `(event, matcher, command)`.
 fn plugin_all_cc_hooks(assets: &InstalledPluginAssets) -> Vec<PluginCcHook> {
@@ -124,7 +138,7 @@ fn plugin_all_cc_hooks(assets: &InstalledPluginAssets) -> Vec<PluginCcHook> {
     if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
         hooks.extend(expand_cc_hooks(cc_map, &assets.plugin_dir));
     }
-    hooks.extend(plugin_file_cc_hooks(&assets.plugin_dir));
+    hooks.extend(plugin_file_cc_hooks_for(&assets.plugin_dir, &assets.manifest));
     dedup_hooks(hooks)
 }
 
@@ -412,6 +426,29 @@ mod tests {
         let loaded = installed_plugin_cc_hooks();
         assert_eq!(loaded.len(), 1, "new post-migration plugin NOT auto-trusted");
         assert!(loaded.iter().all(|h| h.command == "echo one"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_hooks_path_from_manifest_is_honored() {
+        let _home = crate::plugin::test_support::isolated_home();
+        let work = tempfile::tempdir().unwrap().keep();
+        let repo = work.join("cp");
+        std::fs::create_dir_all(repo.join("cfg")).unwrap();
+        std::fs::write(repo.join("plugin.json"), r#"{"name":"cp","hooks":"cfg/h.json"}"#).unwrap();
+        std::fs::write(repo.join("cfg/h.json"),
+            r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo custom"}]}]}"#).unwrap();
+        for args in [["init","-q"].as_slice(), &["config","user.email","t@t"], &["config","user.name","t"], &["add","-A"], &["commit","-q","-m","i"]] {
+            std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap();
+        }
+        crate::plugin::marketplace::add_marketplace(&format!("file://{}", repo.display())).unwrap();
+        crate::plugin::installer::install("cp", "cp", InstallScope::User).unwrap();
+        let status = installed_plugin_hook_trust_status();
+        let e = status.iter().find(|s| s.plugin == "cp").expect("has hooks");
+        crate::plugin::hook_trust::trust(&e.plugin_id, &e.hash).unwrap();
+        let loaded = installed_plugin_cc_hooks();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command, "echo custom");
     }
 
     /// Debug test: dump the real-world installed plugins + skill loading.
