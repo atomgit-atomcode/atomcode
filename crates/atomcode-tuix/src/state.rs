@@ -121,14 +121,33 @@ impl UserInputPanel {
     pub fn other_index(&self) -> usize {
         self.options.len()
     }
-    /// Last navigable cursor index for single/multiple mode — the "Other" row
-    /// at `options.len()` (there is no submit row in either mode).
+    /// Index of the Submit row (multiple mode only: `options.len() + 1`).
+    /// Returns `None` for single mode (no submit row).
+    pub fn submit_index(&self) -> Option<usize> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        if matches!(self.mode, UserInputMode::Multiple) {
+            Some(self.options.len() + 1)
+        } else {
+            None
+        }
+    }
+    /// Last navigable cursor index.
+    /// - Single: `options.len()` (the "Other" row is last; no submit row).
+    /// - Multiple: `options.len() + 1` (Submit row is last, after Other).
     fn last_row(&self) -> usize {
-        self.other_index()
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Multiple => self.options.len() + 1,
+            _ => self.other_index(),
+        }
     }
     /// Whether `cursor` is on the always-appended "Other" free-text row.
     pub fn is_other_row(&self) -> bool {
         self.cursor == self.other_index()
+    }
+    /// Whether `cursor` is on the Submit row (multiple mode only).
+    pub fn is_submit_row(&self) -> bool {
+        self.submit_index().is_some_and(|i| self.cursor == i)
     }
     /// Back-compat alias for the "Other" row (formerly `✎ 自己输入…`).
     pub fn is_custom_row(&self) -> bool {
@@ -268,7 +287,8 @@ impl UserInputPanel {
     /// For **single** mode only: Enter confirms the cursor row. On a concrete
     /// option → `{selected:[label]}`; on the "Other" row → `{selected:[custom]}`
     /// when non-empty, else `None` (no-op). Multiple / text return `None`
-    /// (their Enter path goes through `build_response` / the caller).
+    /// (their Enter path is handled differently: multiple Enter on the Submit row
+    /// calls `build_response()` directly; Enter on option/Other rows toggles).
     pub fn try_immediate_response(
         &self,
     ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {

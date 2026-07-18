@@ -448,6 +448,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                                         scrub_controls(&panel.custom_text)
                                     );
                                 }
+                                // Multiple: explicit Submit row after Other.
+                                if matches!(panel.mode, UserInputMode::Multiple) {
+                                    let _ = writeln!(self.out, "  + Submit");
+                                }
                             }
                         }
                         // Real TTY — write `❯ ` so the user can see we

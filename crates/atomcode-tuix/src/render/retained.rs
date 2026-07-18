@@ -2376,6 +2376,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
                 // "Other" row: 1 label row + 1 subtitle row (always present).
                 n += 2;
+                // Multiple: +1 for the Submit row.
+                if matches!(panel.mode, UserInputMode::Multiple) {
+                    n += 1;
+                }
                 // blank + hint
                 n += 2;
                 n
@@ -2519,6 +2523,37 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     Some(other_sub.as_str()),
                     other_checked,
                 );
+
+                // Multiple mode: a navigable Submit row after Other.
+                if multiple {
+                    let submit_index = other_index + 1;
+                    let on_cursor = submit_index == panel.cursor;
+                    let marker = if on_cursor {
+                        if unicode { "\u{276f} " } else { "> " }
+                    } else {
+                        "  "
+                    };
+                    let submit_label = if unicode { "\u{2714} \u{63d0}\u{4ea4}" } else { "+ Submit" };
+                    let label_style = if on_cursor {
+                        self.style_bold(Role::Plan)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let chrome_style = if on_cursor {
+                        self.style_for(Role::Plan)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let budget = rule_width.saturating_sub(crate::width::display_width(marker));
+                    let lbl = crate::width::truncate_with_ellipsis(
+                        &scrub_controls(submit_label),
+                        budget,
+                    );
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, marker, &chrome_style);
+                    push_str_cells(&mut row, &lbl, &label_style);
+                    out.push(row);
+                }
             }
             UserInputMode::Text => {
                 // Header CHIP + question + a `> {buffer}` input row.
@@ -2551,7 +2586,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // number of navigable options INCLUDING the always-appended "Other".
         let n = panel.options.len() + 1;
         let single_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel");
-        let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} toggle \u{00b7} Enter confirm \u{00b7} Esc cancel");
+        // Multiple: Enter toggles rows, confirms only on the Submit row.
+        let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} Space toggle \u{00b7} Enter \u{63d0}\u{4ea4}\u{884c}\u{786e}\u{8ba4} \u{00b7} Esc cancel");
         let hint_raw: &str = match panel.mode {
             UserInputMode::Single => &single_hint,
             UserInputMode::Multiple => &multiple_hint,
@@ -12113,7 +12149,13 @@ mod tests {
             assert!(vterm.any_row(|r| r.contains("[ ] 2. Tool use")), "Tool use unchecked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("[x] 3. Other")), "Other checked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("Zig")), "custom text shown\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("1-3 toggle")), "multiple hint\n{dump}");
+            // Multiple: Submit row after Other (unicode ✔ 提交).
+            assert!(
+                vterm.any_row(|r| r.contains("\u{2714}") || r.contains("Submit")),
+                "Submit row must be rendered\n{dump}"
+            );
+            // Multiple hint no longer says "1-N toggle … Enter confirm" — it says Submit row confirms.
+            assert!(vterm.any_row(|r| r.contains("Space toggle")), "multiple hint Space toggle\n{dump}");
         }
 
         // Text: a `> {buffer}` input row shows the typed answer.
