@@ -8635,6 +8635,34 @@ mod user_input_key_tests {
             user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none()
         );
     }
+
+    // Ctrl+C must NOT be handled by `user_input_response_for` (which is
+    // modifier-unaware): the plain `Char('c')` key must pass through as None so
+    // it does not accidentally type 'c' into a text buffer.  The actual Ctrl+C
+    // cancel path is handled upstream in `handle_user_input_key` before this
+    // function is called.
+    #[test]
+    fn ctrl_c_char_does_not_resolve_via_pure_fn() {
+        // Char('c') without a modifier check is a navigation/typing key → None.
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('c')).is_none(),
+            "Char('c') alone must not resolve — Ctrl+C is handled upstream with modifier check"
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Single), KeyCode::Char('c')).is_none(),
+        );
+    }
+
+    // Ctrl+C sends a declined response — verify the shape UserInputResponse::declined()
+    // produces, since that is what handle_user_input_key delivers on Ctrl+C.
+    #[test]
+    fn ctrl_c_delivers_declined_response() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let resp = UserInputResponse::declined();
+        assert!(resp.declined, "Ctrl+C must produce a declined response");
+        assert!(resp.selected.is_empty(), "declined response must have no selections");
+        assert!(resp.text.is_none(), "declined response must have no text");
+    }
 }
 
 fn handle_approval_key(
@@ -8766,7 +8794,7 @@ fn handle_user_input_key(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     code: KeyCode,
-    _mods: crossterm::event::KeyModifiers,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
     let Some(panel) = app.state.user_input_panel.as_ref() else {
@@ -8774,6 +8802,20 @@ fn handle_user_input_key(
     };
     let id = panel.request_id;
     let mode = panel.mode.clone();
+
+    // Ctrl+C: decline the pending request (so the tool round-trip is answered,
+    // not left hanging) and then cancel the running turn — exactly like Ctrl+C
+    // during Streaming stops generation.  Checked BEFORE the Char(c) arm so
+    // Ctrl+C does not type 'c' into a text-mode buffer.
+    use crossterm::event::KeyModifiers;
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, UserInputResponse::declined());
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
 
     // Resolving keys (Esc / Enter): compute the response, clear the panel, and
     // deliver it. Repaint so the panel disappears immediately.

@@ -2542,12 +2542,12 @@ async fn run_headless(
             AgentEvent::LoopUpdate { .. } => {
                 // Loop progress — headless mode ignores for now.
             }
-            // Placeholder: Task 9 (daemon/CLI wiring) replaces this with
-            // interactive prompt handling and AgentCommand::Respond dispatch.
-            // Until then an unanswered Request will hang the turn — only
-            // fires when a request_user_input tool is active (not reachable
-            // in current headless code paths).
-            AgentEvent::Request { .. } => {}
+            // The headless CLI has no UI to answer an interactive question, so
+            // it fail-closes: send Null so the tool round-trip resolves as
+            // "not supported" instead of hanging the turn indefinitely.
+            AgentEvent::Request { id, .. } => {
+                let _ = cmd_tx.send(AgentCommand::Respond { id, value: serde_json::Value::Null });
+            }
         }
     }
 

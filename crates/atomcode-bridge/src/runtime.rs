@@ -826,6 +826,16 @@ impl Bridge {
                     // The command-specific branch below rejects only the new
                     // request and leaves the in-flight verification intact.
                 }
+                CoreCmd::Respond { id, value } => {
+                    // Resolving an in-flight kernel request by id is safe and
+                    // independent of the conversation swap — forward immediately
+                    // so the tool round-trip is not left hanging.
+                    let _ = self
+                        .handle
+                        .commands
+                        .send(respond_to_kernel_cmd(*id, value.clone()));
+                    return false;
+                }
                 _ => {
                     self.emit(CoreEv::Warning(
                         "engine v2 is verifying a conversation restore; the concurrent command was ignored"
@@ -3537,6 +3547,26 @@ mod generic_request_passthrough_tests {
             KCmd::Respond { id, value: v } => {
                 assert_eq!(id, 7);
                 assert_eq!(v, value);
+            }
+            other => panic!("expected KCmd::Respond, got {other:?}"),
+        }
+    }
+
+    /// Guard: with a pending restore active, `CoreCmd::Respond` must still reach
+    /// the kernel (not be dropped by the `_ =>` warning arm).  The `on_command`
+    /// guard uses `respond_to_kernel_cmd` for the forward — this test locks the
+    /// pure mapping so a rename/refactor stays caught.
+    #[test]
+    fn respond_during_pending_restore_uses_same_mapping() {
+        // The pending-restore guard forwards Respond via respond_to_kernel_cmd(id, value).
+        // Both the normal path (line ~1474) and the restore-guard path (newly added arm)
+        // call the same function — verify it produces KCmd::Respond{id,value} verbatim.
+        let value = serde_json::json!({"declined": false, "selected": ["yes"], "text": null});
+        let cmd = respond_to_kernel_cmd(7u64, value.clone());
+        match cmd {
+            KCmd::Respond { id, value: v } => {
+                assert_eq!(id, 7, "id must be forwarded verbatim even during pending restore");
+                assert_eq!(v, value, "value must be forwarded verbatim even during pending restore");
             }
             other => panic!("expected KCmd::Respond, got {other:?}"),
         }
