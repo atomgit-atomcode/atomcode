@@ -8597,26 +8597,25 @@ mod user_input_key_tests {
         }
     }
 
-    // Single: Enter on option 1 immediately returns {selected:["B"]} (cursor on B, no submit row).
+    // Single: cursor on option 2 (B) + Enter → {selected:["B"]} (cursor-as-radio).
     #[test]
     fn single_enter_on_option_submits_immediately() {
         let mut p = panel(UserInputMode::Single);
         p.move_down(); // cursor → "B" (index 1)
-        // Single has NO submit row — Enter on an option submits immediately.
         let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on option submits");
         assert!(!resp.declined);
         assert_eq!(resp.selected, vec!["B".to_string()]);
         assert_eq!(resp.text, None);
     }
 
-    // Single: cursor on custom row, custom_text="foo", Enter → {selected:["foo"]}.
+    // Single: cursor on the "Other" row, custom_text="foo", Enter → {selected:["foo"]}.
     #[test]
     fn single_custom_row_enter_submits_custom_text() {
         let mut p = panel(UserInputMode::Single);
-        // options=2 → custom row is index 2.
+        // options=2 → "Other" row is index 2.
         p.move_down(); // → B
-        p.move_down(); // → custom row
-        assert!(p.is_custom_row());
+        p.move_down(); // → Other row
+        assert!(p.is_other_row());
         p.push_custom('f');
         p.push_custom('o');
         p.push_custom('o');
@@ -8625,61 +8624,54 @@ mod user_input_key_tests {
         assert_eq!(resp.selected, vec!["foo".to_string()]);
     }
 
-    // Single: cursor on custom row, empty custom_text → Enter is a no-op (None).
+    // Single: cursor on "Other" row, empty custom_text → Enter is a no-op (None).
     #[test]
     fn single_custom_row_empty_enter_is_noop() {
         let mut p = panel(UserInputMode::Single);
-        // options=2 → custom row is index 2.
         p.move_down();
         p.move_down();
-        assert!(p.is_custom_row());
+        assert!(p.is_other_row());
         assert!(p.custom_text.is_empty());
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
-            "empty custom text on custom row must not submit"
+            "empty custom text on Other row must not submit"
         );
     }
 
-    // Single: is_submit_row() always returns false; move_down() stops at the custom row.
+    // Single: move_down() stops at the "Other" row (options.len()); no submit row.
     #[test]
     fn single_has_no_submit_row() {
         let mut p = panel(UserInputMode::Single);
-        // Drive down past every row.
         for _ in 0..10 {
             p.move_down();
         }
-        // Cursor must not exceed options.len() (the custom row) for single.
-        assert_eq!(p.cursor, p.options.len(), "single cursor must stop at custom row");
-        assert!(!p.is_submit_row(), "single must never report is_submit_row");
+        assert_eq!(p.cursor, p.options.len(), "single cursor must stop at Other row");
+        assert!(p.is_other_row(), "last row is the Other row");
     }
 
-    // Single: typing a custom answer on the custom row submits custom_text (not the option).
+    // Single: typing a custom answer on the "Other" row submits custom_text.
     #[test]
     fn single_custom_text_supersedes_option() {
         let mut p = panel(UserInputMode::Single);
-        p.select_current_option(); // check "A" (cursor 0)
         p.move_down(); // → B
-        p.move_down(); // → custom row
-        assert!(p.is_custom_row());
+        p.move_down(); // → Other row
+        assert!(p.is_other_row());
         p.push_custom('h');
         p.push_custom('i');
         let resp = user_input_response_for(&p, KeyCode::Enter).expect("custom text submits");
         assert_eq!(resp.selected, vec!["hi".to_string()]);
     }
 
-    // Multiple: submit-row Enter yields all checked labels + appended custom.
+    // Multiple: Enter (any cursor) yields all checked labels + appended custom
+    // (when the "Other" row is checked). No submit row.
     #[test]
     fn multiple_submit_appends_custom_text() {
         let mut p = panel(UserInputMode::Multiple);
-        p.toggle(); // check "A"
+        p.toggle(); // check "A" (cursor 0)
         p.move_down();
-        p.toggle(); // check "B"
-        p.push_custom('x');
-        // Options=2 → custom=2 → submit=3.
-        p.move_down(); // was on B (cursor 1); → custom
-        p.move_down(); // → submit
-        assert!(p.is_submit_row());
-        let resp = user_input_response_for(&p, KeyCode::Enter).expect("submit resolves");
+        p.toggle(); // check "B" (cursor 1)
+        p.push_custom('x'); // auto-checks the "Other" row
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
         assert_eq!(resp.selected, vec!["A".to_string(), "B".to_string(), "x".to_string()]);
         assert_eq!(resp.text, None);
     }
@@ -8751,20 +8743,35 @@ mod user_input_key_tests {
         );
     }
 
-    // FIX 3: Multiple mode — Enter on submit row with nothing checked is a no-op.
+    // FIX 3: Multiple mode — Enter with nothing checked is a no-op.
     #[test]
     fn multiple_empty_submit_is_noop() {
-        let mut p = panel(UserInputMode::Multiple);
-        // Navigate to the submit row without checking anything.
-        // options=2 → custom=2 → submit=3.
-        p.move_down(); // → B (index 1)
-        p.move_down(); // → custom (index 2)
-        p.move_down(); // → submit (index 3)
-        assert!(p.is_submit_row());
+        let p = panel(UserInputMode::Multiple);
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "submit with nothing selected must be a no-op"
         );
+    }
+
+    // Single: number key '2' selects the 2nd option's label via cursor-as-radio.
+    #[test]
+    fn single_number_key_selects_option() {
+        let mut p = panel(UserInputMode::Single);
+        // Simulate the number-key handler: single → move cursor to idx.
+        p.cursor = 1; // '2' → index 1 ("B")
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter submits");
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+    }
+
+    // Multiple: toggle_index flips a specific row's checkbox.
+    #[test]
+    fn multiple_toggle_index_flips_checkbox() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle_index(0); // '1' → check "A"
+        p.toggle_index(1); // '2' → check "B"
+        p.toggle_index(0); // '1' again → uncheck "A"
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert_eq!(resp.selected, vec!["B".to_string()]);
     }
 }
 
@@ -8866,14 +8873,14 @@ fn handle_approval_key(
 ///   - `None`       — this key is navigation / typing / ignored; caller mutates
 ///                    the panel in place (handled in `handle_user_input_key`).
 ///
-/// Esc always declines. In **single** mode Enter on a concrete option row
-/// submits immediately (`{selected:[label]}`); Enter on the custom row submits
-/// `{selected:[custom_text]}` when non-empty, otherwise `None` (no-op). Single
-/// mode has NO submit row. In **multiple** mode Enter only *finishes* the prompt
-/// when the cursor is on the `✔ 提交` submit row (and then only if there is
-/// something to submit — propagates `None` for empty). Enter on an option row
-/// in multiple *toggles* in place (returns `None`). Text mode: Enter submits
-/// the buffer. Nav / typing keys return `None`.
+/// Esc always declines. In **single** mode Enter confirms the cursor row: a
+/// concrete option → `{selected:[label]}`; the "Other" row →
+/// `{selected:[custom_text]}` when non-empty, otherwise `None` (no-op). In
+/// **multiple** mode Enter confirms the checked concrete options PLUS the
+/// "Other" custom text (when the Other row is checked and non-empty), returning
+/// `None` when nothing is selected. Neither mode has a submit row. Text mode:
+/// Enter submits the buffer. Nav / typing / number keys return `None` (the
+/// caller mutates the panel in place).
 pub(crate) fn user_input_response_for(
     panel: &crate::state::UserInputPanel,
     code: KeyCode,
@@ -8892,15 +8899,11 @@ pub(crate) fn user_input_response_for(
                 })
             }
         }
-        // Single: Enter on any row (option or custom) tries an immediate submit.
-        // On a concrete option row this always succeeds; on the custom row it
-        // returns None when custom_text is empty (no-op, keep panel open).
+        // Single: Enter confirms the cursor row (concrete option or Other).
         (UserInputMode::Single, KeyCode::Enter) => panel.try_immediate_response(),
-        // Multiple: Enter only resolves on the submit row; on an option row it
-        // toggles in place (handled by the caller → None here).
-        (UserInputMode::Multiple, KeyCode::Enter) if panel.is_submit_row() => {
-            panel.build_response()
-        }
+        // Multiple: Enter confirms the checked set + Other custom text; None
+        // when nothing is selected (keeps the panel open).
+        (UserInputMode::Multiple, KeyCode::Enter) => panel.build_response(),
         _ => None,
     }
 }
@@ -8968,41 +8971,55 @@ fn handle_user_input_key(
                 p.move_down();
             }
         }
-        // Multiple: Enter on an option row toggles in place (the submit-row and
-        // single-mode Enter are both resolving keys handled above).
-        // Single: Enter on any row is resolving (handled above) — this arm is
-        // unreachable for Single.
-        (UserInputMode::Multiple, KeyCode::Enter) => {
+        // Number keys 1..9: select the Nth navigable row (concrete options 1..N,
+        // then "Other" as N+1). Single → move the cursor there (cursor is the
+        // radio). Multiple → toggle that row's checkbox. Only when NOT editing
+        // the "Other" row (so digits can be typed into a custom answer).
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
+            if c.is_ascii_digit()
+                && c != '0'
+                && !app
+                    .state
+                    .user_input_panel
+                    .as_ref()
+                    .map(|p| p.is_other_row())
+                    .unwrap_or(false) =>
+        {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                if !p.is_custom_row() && !p.is_submit_row() {
-                    p.toggle();
+                let idx = (c as usize) - ('1' as usize);
+                if idx <= p.other_index() {
+                    match p.mode {
+                        UserInputMode::Multiple => p.toggle_index(idx),
+                        // Single: cursor-as-radio — move to it (this IS selecting it).
+                        _ => p.cursor = idx,
+                    }
                 }
             }
         }
-        // Backspace edits the custom-text buffer when the cursor is on it.
+        // Backspace edits the "Other" custom-text buffer when the cursor is on it.
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                if p.is_custom_row() {
+                if p.is_other_row() {
                     p.pop_custom();
                 }
             }
         }
-        // Space toggles the highlighted option (convenience) when on an option
-        // row; on the custom row it types a literal space instead.
+        // Space: on the "Other" row it types a literal space; on a concrete
+        // option row it toggles (multiple) / moves the radio (single, no-op).
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(' ')) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                if p.is_custom_row() {
+                if p.is_other_row() {
                     p.push_custom(' ');
-                } else if !p.is_submit_row() {
+                } else {
                     p.toggle();
                 }
             }
         }
-        // Any other printable char types into the custom-text row (and focuses
-        // it there); ignored on option/submit rows.
+        // Any other printable char types into the "Other" row (only when the
+        // cursor is on it); ignored on concrete option rows.
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c)) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                if p.is_custom_row() {
+                if p.is_other_row() {
                     p.push_custom(c);
                 } else {
                     return Ok(());

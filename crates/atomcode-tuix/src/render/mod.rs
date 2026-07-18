@@ -568,15 +568,19 @@ pub struct UserInputPanelView {
     pub header: String,
     pub question: String,
     pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
-    pub options: Vec<String>,
-    /// Highlighted row. For single/multiple this ranges over the option rows,
-    /// then the custom-text row (`options.len()`), then the submit row
-    /// (`options.len()+1`).
+    /// Concrete options: label + optional description (faint second line).
+    /// Does NOT include the always-appended "Other" free-text row.
+    pub options: Vec<(String, Option<String>)>,
+    /// Highlighted row. For single/multiple this ranges over the concrete
+    /// option rows, then the always-appended "Other" row (`options.len()`).
+    /// There is no separate submit row.
     pub cursor: usize,
+    /// Per-row checked flags (multiple mode). Length `options.len() + 1` — one
+    /// per concrete option plus the trailing "Other" row.
     pub checked: Vec<bool>,
     /// Standalone text-mode input buffer.
     pub text: String,
-    /// Folded `✎ 自己输入…` row buffer for single/multiple mode.
+    /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
 }
 

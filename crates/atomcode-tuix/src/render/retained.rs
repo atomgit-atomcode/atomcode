@@ -2363,23 +2363,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// hint row. Must equal `build_user_input_rows(..).len()`.
     fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
-        let body = match panel.mode {
-            // Single: options + the `✎ 自己输入` custom row (NO submit row).
-            UserInputMode::Single => panel.options.len() + 1,
-            // Multiple: options + the `✎ 自己输入` custom row + the `✔ 提交` submit row.
-            UserInputMode::Multiple => panel.options.len() + 2,
-            UserInputMode::Text => 1,
-        };
-        // 1 header (question) + body + 1 hint.
-        body + 2
+        match panel.mode {
+            UserInputMode::Single | UserInputMode::Multiple => {
+                // header chip + blank + question + blank
+                let mut n = 4;
+                // Each concrete option: 1 label row + (1 description row if present).
+                for (_, desc) in &panel.options {
+                    n += 1;
+                    if desc.as_deref().map(|d| !d.trim().is_empty()).unwrap_or(false) {
+                        n += 1;
+                    }
+                }
+                // "Other" row: 1 label row + 1 subtitle row (always present).
+                n += 2;
+                // blank + hint
+                n += 2;
+                n
+            }
+            // Text: header chip + blank + question + blank + input row + hint.
+            UserInputMode::Text => 6,
+        }
     }
 
-    /// Build the compact footer `request_user_input` panel. Mirrors
-    /// `build_approval_rows`, branching on `mode`:
-    ///   - Single: numbered reverse-highlight list (like approval).
-    ///   - Multiple: `[x]`/`[ ]` prefix + reverse-highlight on the cursor row.
+    /// Build the compact footer `request_user_input` panel.
+    ///   - Single / Multiple: a header chip, the question, then numbered options
+    ///     each with an optional faint description line, an always-appended
+    ///     "Other" free-text option, and a hint. The cursor row is marked `❯`;
+    ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
+    ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
-    /// Header row shows the question; a muted hint row closes the panel.
+    /// `user_input_panel_row_count` MUST equal `build_user_input_rows(..).len()`.
     fn build_user_input_rows(
         &self,
         panel: &crate::render::UserInputPanelView,
@@ -2390,139 +2403,129 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
 
-        // Header row: the question, bold, width-truncated to one line.
-        {
-            let raw = crate::glyph::downgrade_glyphs(&panel.question, unicode);
-            let q = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), rule_width.saturating_sub(2));
-            let style = CellStyle { bold: true, ..CellStyle::default() };
+        // A blank spacer row (empty cells).
+        let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
+        // Emit a 2-space-indented styled text line, width-truncated.
+        let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
+            let raw = crate::glyph::downgrade_glyphs(text, unicode);
+            let body =
+                crate::width::truncate_with_ellipsis(&scrub_controls(&raw), rule_width.saturating_sub(2));
             let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", &style);
-            push_str_cells(&mut row, &q, &style);
+            push_str_cells(&mut row, "  ", style);
+            push_str_cells(&mut row, &body, style);
             out.push(row);
-        }
+        };
 
         match panel.mode {
             UserInputMode::Single | UserInputMode::Multiple => {
                 let multiple = matches!(panel.mode, UserInputMode::Multiple);
-                let single = !multiple;
-                // Helper closure to emit one navigable row: marker (cursor),
-                // content, and (when highlighted) full-width reverse padding.
-                let custom_row = panel.options.len();
-                let submit_row = panel.options.len() + 1;
-                // Option rows: single = radio `(•)`/`( )`; multiple = checkbox
-                // `[x]`/`[ ]`. The checked flag now drives BOTH modes (single is
-                // exclusive so at most one is set).
-                for (i, label) in panel.options.iter().enumerate() {
-                    let mut row = Vec::new();
-                    let selected = i == panel.cursor;
-                    let marker = if selected {
-                        if unicode { "\u{25b8} " } else { "> " } // ▸
-                    } else {
-                        "  "
+
+                // Header CHIP: a short bold label in the orange highlight colour.
+                push_line(&mut out, &panel.header, &self.style_bold(Role::Plan));
+                blank_row(&mut out);
+                // Question line (bold, terminal-default fg).
+                push_line(&mut out, &panel.question, &self.style_bold(Role::Secondary));
+                blank_row(&mut out);
+
+                // Styles for the faint description lines.
+                let desc_style = self.style_faint(Role::Muted);
+
+                let other_index = panel.options.len();
+                // Emit one navigable option row (label) + optional description.
+                // `number` is the 1-based display index; `label`/`desc` its text.
+                let emit_option =
+                    |out: &mut Vec<Vec<Cell>>,
+                     idx: usize,
+                     number: usize,
+                     label: &str,
+                     desc: Option<&str>,
+                     checked: bool| {
+                        let on_cursor = idx == panel.cursor;
+                        // Marker: `❯ ` on the cursor row, else two spaces.
+                        let marker = if on_cursor {
+                            if unicode { "\u{276f} " } else { "> " } // ❯
+                        } else {
+                            "  "
+                        };
+                        // Multiple mode prepends a checkbox.
+                        let checkbox = if multiple {
+                            if checked { "[x] " } else { "[ ] " }
+                        } else {
+                            ""
+                        };
+                        let num = format!("{}. ", number);
+                        // Label emphasis: cursor row → bold orange (Plan).
+                        let label_style = if on_cursor {
+                            self.style_bold(Role::Plan)
+                        } else {
+                            self.style_for(Role::Secondary)
+                        };
+                        let chrome_style = if on_cursor {
+                            self.style_for(Role::Plan)
+                        } else {
+                            self.style_for(Role::Secondary)
+                        };
+                        let prefix_width = crate::width::display_width(marker)
+                            + crate::width::display_width(checkbox)
+                            + crate::width::display_width(&num);
+                        let budget = rule_width.saturating_sub(prefix_width);
+                        let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
+                        let mut row = Vec::new();
+                        push_str_cells(&mut row, marker, &chrome_style);
+                        if multiple {
+                            push_str_cells(&mut row, checkbox, &chrome_style);
+                        }
+                        push_str_cells(&mut row, &num, &chrome_style);
+                        push_str_cells(&mut row, &lbl, &label_style);
+                        out.push(row);
+                        // Description: a faint second line, indented under the label.
+                        if let Some(d) = desc {
+                            let dtrim = d.trim();
+                            if !dtrim.is_empty() {
+                                let indent = " ".repeat(prefix_width);
+                                let dbudget = rule_width.saturating_sub(prefix_width);
+                                let draw = crate::glyph::downgrade_glyphs(dtrim, unicode);
+                                let dtext = crate::width::truncate_with_ellipsis(
+                                    &scrub_controls(&draw),
+                                    dbudget,
+                                );
+                                let mut drow = Vec::new();
+                                push_str_cells(&mut drow, &indent, &desc_style);
+                                push_str_cells(&mut drow, &dtext, &desc_style);
+                                out.push(drow);
+                            }
+                        }
                     };
+
+                for (i, (label, desc)) in panel.options.iter().enumerate() {
                     let checked = panel.checked.get(i).copied().unwrap_or(false);
-                    let prefix = if multiple {
-                        if checked { "[x] " } else { "[ ] " }.to_string()
-                    } else if checked {
-                        "(\u{2022}) ".to_string() // (•)
-                    } else {
-                        "( ) ".to_string()
-                    };
-                    let prefix_width = crate::width::display_width(&prefix);
-                    let style = if selected {
-                        CellStyle { reverse: true, ..CellStyle::default() }
-                    } else {
-                        self.style_for(Role::Secondary)
-                    };
-                    let budget = rule_width.saturating_sub(2 + prefix_width);
-                    let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
-                    push_str_cells(&mut row, marker, &style);
-                    push_str_cells(&mut row, &prefix, &style);
-                    push_str_cells(&mut row, &lbl, &style);
-                    if selected {
-                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
-                        let pad = screen_width.saturating_sub(current_width);
-                        if pad > 0 {
-                            push_str_cells(&mut row, &" ".repeat(pad), &style);
-                        }
-                    }
-                    out.push(row);
+                    emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
                 }
 
-                // Free-text row: `✎ 自己输入: <custom_text>` (placeholder when
-                // empty). Highlighted when the cursor is on it.
-                {
-                    let selected = panel.cursor == custom_row;
-                    let marker = if selected {
-                        if unicode { "\u{25b8} " } else { "> " }
-                    } else {
-                        "  "
-                    };
-                    let pen = if unicode { "\u{270e} " } else { "* " }; // ✎
-                    let content = if panel.custom_text.is_empty() {
-                        "自己输入…".to_string()
-                    } else {
-                        format!("自己输入: {}", panel.custom_text)
-                    };
-                    let raw = crate::glyph::downgrade_glyphs(&content, unicode);
-                    let style = if selected {
-                        CellStyle { reverse: true, ..CellStyle::default() }
-                    } else {
-                        self.style_for(Role::Secondary)
-                    };
-                    let prefix_width = crate::width::display_width(pen);
-                    let budget = rule_width.saturating_sub(2 + prefix_width);
-                    let body = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), budget);
-                    let mut row = Vec::new();
-                    push_str_cells(&mut row, marker, &style);
-                    push_str_cells(&mut row, &crate::glyph::downgrade_glyphs(pen, unicode), &style);
-                    push_str_cells(&mut row, &body, &style);
-                    if selected {
-                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
-                        let pad = screen_width.saturating_sub(current_width);
-                        if pad > 0 {
-                            push_str_cells(&mut row, &" ".repeat(pad), &style);
-                        }
-                    }
-                    out.push(row);
-                }
-
-                // Submit row: `✔ 提交`. Only rendered for multiple mode.
-                // Single mode has no submit row — Enter on an option or the
-                // custom row submits immediately.
-                if !single {
-                    let selected = panel.cursor == submit_row;
-                    let marker = if selected {
-                        if unicode { "\u{25b8} " } else { "> " }
-                    } else {
-                        "  "
-                    };
-                    let check = if unicode { "\u{2714} " } else { "+ " }; // ✔
-                    let content = format!("{}提交", check);
-                    let raw = crate::glyph::downgrade_glyphs(&content, unicode);
-                    let style = if selected {
-                        CellStyle { reverse: true, ..CellStyle::default() }
-                    } else {
-                        self.style_for(Role::Secondary)
-                    };
-                    let budget = rule_width.saturating_sub(2);
-                    let body = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), budget);
-                    let mut row = Vec::new();
-                    push_str_cells(&mut row, marker, &style);
-                    push_str_cells(&mut row, &body, &style);
-                    if selected {
-                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
-                        let pad = screen_width.saturating_sub(current_width);
-                        if pad > 0 {
-                            push_str_cells(&mut row, &" ".repeat(pad), &style);
-                        }
-                    }
-                    out.push(row);
-                }
+                // Always-appended "Other" free-text option (index = options.len()).
+                // Its "description" line shows the typed custom text, or the
+                // "Type a custom answer" subtitle when empty.
+                let other_checked = panel.checked.get(other_index).copied().unwrap_or(false);
+                let other_sub = if panel.custom_text.trim().is_empty() {
+                    "Type a custom answer".to_string()
+                } else {
+                    panel.custom_text.clone()
+                };
+                emit_option(
+                    &mut out,
+                    other_index,
+                    other_index + 1,
+                    "Other",
+                    Some(other_sub.as_str()),
+                    other_checked,
+                );
             }
             UserInputMode::Text => {
-                // A single `> {buffer}` input row (reverse-highlighted, full-width)
-                // so the typed answer reads like an active input line.
+                // Header CHIP + question + a `> {buffer}` input row.
+                push_line(&mut out, &panel.header, &self.style_bold(Role::Plan));
+                blank_row(&mut out);
+                push_line(&mut out, &panel.question, &self.style_bold(Role::Secondary));
+                blank_row(&mut out);
                 let style = CellStyle { reverse: true, ..CellStyle::default() };
                 let mut row = Vec::new();
                 let budget = rule_width.saturating_sub(2);
@@ -2538,15 +2541,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
 
-        // Hint row: mode-appropriate guidance, muted + glyph-downgraded.
-        let hint_raw = match panel.mode {
-            UserInputMode::Single => {
-                "↑↓ 移动 · Enter 选择并提交 · 自己输入行打字后 Enter 提交 · Esc 取消"
-            }
-            UserInputMode::Multiple => {
-                "↑↓ 移动 · Enter 选中 · 提交行确认 · Esc 取消"
-            }
-            UserInputMode::Text => "type answer · Enter confirm · Esc cancel",
+        // A blank spacer before the hint (single/multiple only — text closes
+        // straight into the hint).
+        if matches!(panel.mode, UserInputMode::Single | UserInputMode::Multiple) {
+            blank_row(&mut out);
+        }
+
+        // Hint row: mode-appropriate guidance, muted + glyph-downgraded. N is the
+        // number of navigable options INCLUDING the always-appended "Other".
+        let n = panel.options.len() + 1;
+        let single_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel");
+        let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} toggle \u{00b7} Enter confirm \u{00b7} Esc cancel");
+        let hint_raw: &str = match panel.mode {
+            UserInputMode::Single => &single_hint,
+            UserInputMode::Multiple => &multiple_hint,
+            UserInputMode::Text => "type answer \u{00b7} Enter confirm \u{00b7} Esc cancel",
         };
         let hint = crate::glyph::downgrade_glyphs(hint_raw, unicode);
         let hint_budget = rule_width.saturating_sub(2);
@@ -12017,25 +12026,30 @@ mod tests {
     fn user_input_panel_renders_all_three_modes() {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
 
-        // Single: numbered list, cursor row has the ▸ marker.
+        // Single: numbered list with per-item descriptions, cursor row has the
+        // ❯ marker, "Other" appended as the last numbered option.
         {
             let (mut r, buf) = new_capturing(80, 24);
             r.caps.colors = true;
             let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
             let mut status = status_basic();
             let view = crate::render::UserInputPanelView {
-                header: "Auth".into(),
-                question: "Which auth flow?".into(),
+                header: "Library".into(),
+                question: "Which library?".into(),
                 mode: UserInputMode::Single,
-                options: vec!["OAuth".into(), "API key".into()],
-                cursor: 1,
-                checked: vec![false, true],
+                options: vec![
+                    ("date-fns".into(), Some("Tree-shakeable".into())),
+                    ("Day.js".into(), None),
+                ],
+                cursor: 0,
+                checked: vec![false, false, false],
                 text: String::new(),
                 custom_text: String::new(),
             };
-            // Row count contract for single: header + options + custom + hint (NO submit row).
-            // 2 options + 1 custom + 1 header + 1 hint = 5 rows.
-            assert_eq!(r.user_input_panel_row_count(&view), 1 + 2 + 1 + 1);
+            // Row count: header + blank + question + blank
+            //   + opt1 label + opt1 desc + opt2 label (no desc)
+            //   + Other label + Other subtitle + blank + hint.
+            assert_eq!(r.user_input_panel_row_count(&view), 4 + 3 + 2 + 2);
             assert_eq!(
                 r.build_user_input_rows(&view, 78, 80).len(),
                 r.user_input_panel_row_count(&view),
@@ -12048,29 +12062,37 @@ mod tests {
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
-            assert!(vterm.any_row(|r| r.contains("Which auth flow?")), "question header\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("( ) OAuth")), "radio option 1 unchecked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("(•) API key")), "radio option 2 checked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("▸") && r.contains("API key")), "cursor marker on option 2\n{dump}");
-            assert!(vterm.any_row(|r| r.contains('自')), "custom free-text row\n{dump}");
-            // Single mode must NOT have a submit row.
-            assert!(!vterm.any_row(|r| r.trim_start().starts_with('\u{2714}') || r.trim_start().starts_with('+')), "single must NOT render a submit row\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Library")), "header chip\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Which library?")), "question\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("1. date-fns")), "numbered option 1\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Tree-shakeable")), "description line rendered\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("2. Day.js")), "numbered option 2\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("\u{276f}") && r.contains("date-fns")), "cursor marker on option 1\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("3. Other")), "Other appended as last numbered option\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Type a custom answer")), "Other subtitle\n{dump}");
+            // Single mode must NOT render a checkbox.
+            assert!(!vterm.any_row(|r| r.contains("[x]") || r.contains("[ ]")), "single must NOT render checkboxes\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("1-3 select")), "single hint\n{dump}");
         }
 
-        // Multiple: checkbox prefixes reflect the `checked` flags; custom row
-        // shows the typed buffer; both extra rows are present.
+        // Multiple: checkbox prefixes reflect the `checked` flags; "Other" row
+        // shows the typed buffer.
         {
             let (mut r, buf) = new_capturing(80, 24);
             r.caps.colors = true;
             let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
             let mut status = status_basic();
             let view = crate::render::UserInputPanelView {
-                header: "Langs".into(),
-                question: "Pick languages".into(),
+                header: "Features".into(),
+                question: "Which features?".into(),
                 mode: UserInputMode::Multiple,
-                options: vec!["Rust".into(), "Go".into()],
+                options: vec![
+                    ("Streaming".into(), Some("Token-by-token".into())),
+                    ("Tool use".into(), None),
+                ],
+                // checked has length options.len()+1 (Other slot last); Other checked.
                 cursor: 0,
-                checked: vec![true, false],
+                checked: vec![true, false, true],
                 text: String::new(),
                 custom_text: "Zig".into(),
             };
@@ -12086,10 +12108,12 @@ mod tests {
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
-            assert!(vterm.any_row(|r| r.contains("[x] Rust")), "Rust checked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("[ ] Go")), "Go unchecked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains('自') && r.contains("Zig")), "custom text shown\n{dump}");
-            assert!(vterm.any_row(|r| r.contains('提')), "submit row\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("[x] 1. Streaming")), "Streaming checked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Token-by-token")), "description rendered\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("[ ] 2. Tool use")), "Tool use unchecked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("[x] 3. Other")), "Other checked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("Zig")), "custom text shown\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("1-3 toggle")), "multiple hint\n{dump}");
         }
 
         // Text: a `> {buffer}` input row shows the typed answer.
@@ -12108,7 +12132,13 @@ mod tests {
                 text: "atomcode".into(),
                 custom_text: String::new(),
             };
-            assert_eq!(r.user_input_panel_row_count(&view), 1 + 2, "header + 1 input row + hint");
+            // header + blank + question + blank + input + hint = 6.
+            assert_eq!(r.user_input_panel_row_count(&view), 6, "text panel rows");
+            assert_eq!(
+                r.build_user_input_rows(&view, 78, 80).len(),
+                r.user_input_panel_row_count(&view),
+                "row_count must equal build_user_input_rows().len()"
+            );
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
