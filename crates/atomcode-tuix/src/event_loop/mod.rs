@@ -6023,6 +6023,7 @@ fn handle_input(
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::UserInput => handle_user_input_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -8378,6 +8379,28 @@ fn deliver_approval(ctx: &mut LoopCtx, cmd: AgentCommand) {
     }
 }
 
+/// Send a `request_user_input` answer back to the agent as the generic
+/// `AgentCommand::Respond { id, value }`. Unlike `deliver_approval` there is no
+/// sync-mode special case: the Respond round-trip is a plain kernel command
+/// (the interactive panel is TUI-driven), so it always goes to `cmd_tx`.
+fn deliver_user_input(
+    ctx: &mut LoopCtx,
+    id: u64,
+    resp: atomcode_capabilities::tools::request_user_input::UserInputResponse,
+) {
+    let value = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    ctx.agent.cmd_tx.send(AgentCommand::Respond { id, value }).ok();
+}
+
+/// Fail-close: respond with `Null` so the tool round-trip resolves as
+/// "not supported in this environment" instead of hanging the turn.
+fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::Respond { id, value: serde_json::Value::Null })
+        .ok();
+}
+
 /// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
 /// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
 /// the command↔decision contract (notably that an auto-approve sends `Allow`,
@@ -8529,6 +8552,91 @@ mod bypass_approval_tests {
     }
 }
 
+#[cfg(test)]
+mod user_input_key_tests {
+    use super::user_input_response_for;
+    use crate::state::UserInputPanel;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+    use crossterm::event::KeyCode;
+
+    fn panel(mode: UserInputMode) -> UserInputPanel {
+        UserInputPanel::new(
+            42,
+            &UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode,
+                options: vec![
+                    UserInputOption { label: "A".into(), description: None },
+                    UserInputOption { label: "B".into(), description: None },
+                ],
+            },
+        )
+    }
+
+    // Esc always declines, regardless of mode.
+    #[test]
+    fn esc_declines_in_every_mode() {
+        for m in [UserInputMode::Single, UserInputMode::Multiple, UserInputMode::Text] {
+            let resp = user_input_response_for(&panel(m), KeyCode::Esc).expect("Esc resolves");
+            assert!(resp.declined, "Esc must decline");
+        }
+    }
+
+    // Single: Enter yields exactly the highlighted label.
+    #[test]
+    fn single_enter_yields_cursor_label() {
+        let mut p = panel(UserInputMode::Single);
+        p.move_down(); // cursor → "B"
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert!(!resp.declined);
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+        assert_eq!(resp.text, None);
+    }
+
+    // Multiple: Enter yields all checked labels (order = option order).
+    #[test]
+    fn multiple_enter_yields_checked_labels() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A"
+        p.move_down();
+        p.toggle(); // check "B"
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert_eq!(resp.selected, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(resp.text, None);
+    }
+
+    // Text: Enter yields the buffer via `text`, never `selected`.
+    #[test]
+    fn text_enter_yields_buffer() {
+        let mut p = panel(UserInputMode::Text);
+        p.text.push_str("hi there");
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert!(!resp.declined);
+        assert!(resp.selected.is_empty());
+        assert_eq!(resp.text.as_deref(), Some("hi there"));
+    }
+
+    // Navigation / typing keys do NOT resolve (return None so the caller mutates
+    // in place instead of closing the panel).
+    #[test]
+    fn navigation_keys_do_not_resolve() {
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Up).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Down).is_none());
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('x')).is_none()
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none()
+        );
+    }
+}
+
 fn handle_approval_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -8616,6 +8724,96 @@ fn handle_approval_key(
     // (approval still `Some`) until the next event that carries a fresh
     // `StatusLine`, leaving a ghost panel over the input box (the inverse of
     // issue #455's "输入框没了" — here the panel lingers after a decision).
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+/// Pure resolver for `request_user_input` keys that FINISH the prompt (produce a
+/// response), extracted so the mode→response contract is unit-testable without a
+/// `LoopCtx` / channel. Returns:
+///   - `Some(resp)` — this key resolves the panel; caller should clear + deliver.
+///   - `None`       — this key is navigation / typing / ignored; caller mutates
+///                    the panel in place (handled in `handle_user_input_key`).
+///
+/// Esc always declines. Enter resolves per mode (single/multiple → selected
+/// labels; text → the buffer). Nav keys (↑↓, space, char/backspace in text)
+/// return `None`.
+pub(crate) fn user_input_response_for(
+    panel: &crate::state::UserInputPanel,
+    code: KeyCode,
+) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+    use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+    match (&panel.mode, code) {
+        (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
+        (UserInputMode::Text, KeyCode::Enter) => Some(UserInputResponse {
+            declined: false,
+            selected: vec![],
+            text: Some(panel.text.clone()),
+        }),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Enter) => {
+            Some(UserInputResponse { declined: false, selected: panel.chosen(), text: None })
+        }
+        _ => None,
+    }
+}
+
+/// Key handling while `UiPhase::UserInput`. Mirrors `handle_approval_key`:
+/// resolving keys (Esc / Enter) clear the panel and deliver an
+/// `AgentCommand::Respond`; navigation / typing mutate the panel in place and
+/// repaint. `user_input_response_for` owns the (mode, key) → response contract.
+fn handle_user_input_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    _mods: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    let Some(panel) = app.state.user_input_panel.as_ref() else {
+        return Ok(());
+    };
+    let id = panel.request_id;
+    let mode = panel.mode.clone();
+
+    // Resolving keys (Esc / Enter): compute the response, clear the panel, and
+    // deliver it. Repaint so the panel disappears immediately.
+    if let Some(resp) = user_input_response_for(panel, code) {
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, resp);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Non-resolving keys: mutate the panel in place, then repaint.
+    match (mode, code) {
+        (UserInputMode::Text, KeyCode::Char(c)) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.push(c);
+            }
+        }
+        (UserInputMode::Text, KeyCode::Backspace) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.pop();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_up();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_down();
+            }
+        }
+        (UserInputMode::Multiple, KeyCode::Char(' ')) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.toggle();
+            }
+        }
+        // Any other key is ignored (no state change, no repaint needed).
+        _ => return Ok(()),
+    }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
@@ -11516,11 +11714,31 @@ fn handle_agent_event(
         AgentEvent::Steered { count } => {
             state.on_steered(count);
         }
-        // Placeholder: Task 6 (TUI wiring) replaces this with interactive
-        // prompt rendering and AgentCommand::Respond dispatch. Until then
-        // an unanswered Request will hang the turn — only fires when a
-        // request_user_input tool is active (not reachable in current code paths).
-        AgentEvent::Request { .. } => {}
+        // Interactive tool round-trip (`request_user_input`): open the footer
+        // panel and switch to `UiPhase::UserInput`; the answer returns via
+        // `AgentCommand::Respond` (see `handle_user_input_key`). Any code path
+        // here MUST eventually respond — an unanswered Request hangs the turn.
+        AgentEvent::Request { id, kind, payload } => {
+            use atomcode_capabilities::tools::request_user_input::{
+                UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
+            };
+            if kind == REQUEST_USER_INPUT_KIND {
+                match serde_json::from_value::<UserInputRequest>(payload) {
+                    Ok(req) => {
+                        state.user_input_panel =
+                            Some(crate::state::UserInputPanel::new(id, &req));
+                        state.phase = UiPhase::UserInput;
+                        renderer.flush();
+                    }
+                    // Malformed payload → decline so the tool returns gracefully.
+                    Err(_) => deliver_user_input(ctx, id, UserInputResponse::declined()),
+                }
+            } else {
+                // Unknown interactive kind: fail-close with a Null response so the
+                // round-trip never hangs (the tool maps Null → "not supported").
+                deliver_user_input_null(ctx, id);
+            }
+        }
     }
 }
 
@@ -12021,6 +12239,18 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         options: p.options.iter().map(|o| o.label.clone()).collect(),
         selected: p.selected,
     });
+    let user_input = state
+        .user_input_panel
+        .as_ref()
+        .map(|p| crate::render::UserInputPanelView {
+            header: p.header.clone(),
+            question: p.question.clone(),
+            mode: p.mode.clone(),
+            options: p.options.clone(),
+            cursor: p.cursor,
+            checked: p.checked.clone(),
+            text: p.text.clone(),
+        });
     crate::render::StatusLine {
         model,
         cwd,
@@ -12039,6 +12269,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         loop_status,
         todo,
         approval,
+        user_input,
     }
 }
 

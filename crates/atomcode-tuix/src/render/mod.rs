@@ -530,6 +530,11 @@ pub struct StatusLine {
     /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
     /// omitted. Mirrors `todo` — the renderer owns glyph/width/terminal-safety.
     pub approval: Option<ApprovalPanelView>,
+    /// When a `request_user_input` question is active, this carries its state for
+    /// the dedicated footer panel (rendered in the same slot as `approval` — the
+    /// two are mutually exclusive). `None` ⇒ no question pending, panel omitted.
+    /// Mirrors `approval` — the renderer owns glyph/width/terminal-safety.
+    pub user_input: Option<UserInputPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -552,6 +557,21 @@ pub struct ApprovalPanelView {
     pub detail: String,
     pub options: Vec<String>,
     pub selected: usize,
+}
+
+/// Renderer-facing snapshot of the `request_user_input` panel (mirrors
+/// `ApprovalPanelView`). Header + question + the mode-specific body: a
+/// reverse-highlight option list (single), `[x]`/`[ ]` checkboxes (multiple),
+/// or a `> {buffer}` input row (text).
+#[derive(Debug, Clone)]
+pub struct UserInputPanelView {
+    pub header: String,
+    pub question: String,
+    pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
+    pub options: Vec<String>,
+    pub cursor: usize,
+    pub checked: Vec<bool>,
+    pub text: String,
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo

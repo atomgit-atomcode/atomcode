@@ -407,6 +407,21 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                                 })
                             );
                         }
+                        // request_user_input has no retained footer panel in this
+                        // renderer either — print the question (and options, if any)
+                        // as plain body text before the chevron so a human on a
+                        // dumb TTY can still answer.
+                        if let Some(panel) = &status.user_input {
+                            let _ = writeln!(self.out, "{}", scrub_controls(&panel.question));
+                            for (i, label) in panel.options.iter().enumerate() {
+                                let _ = writeln!(
+                                    self.out,
+                                    "  {}. {}",
+                                    i + 1,
+                                    scrub_controls(label)
+                                );
+                            }
+                        }
                         // Real TTY — write `❯ ` so the user can see we
                         // are ready and the kernel will overlay their
                         // typed input on top of this prefix.
