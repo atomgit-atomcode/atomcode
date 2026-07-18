@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult } from '../api';
+import { streamChat, stopChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -44,6 +44,7 @@ import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
+import { UserInputCard } from './UserInputCard';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -447,6 +448,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
+  // Pending user_input_request from the live stream (shown as UserInputCard, calls /live/user-input).
+  const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
@@ -991,6 +994,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
         if (!e.running) {
           setLivePending(null);
+          setUserInputReq(null);
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1001,6 +1005,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         updateToolInLastAssistant(e.call_id, { status: 'waiting_approval' });
         // Show the PermissionCard for the live session (calls /live/permission via onDecide)
         setLivePending({ tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments });
+        break;
+      }
+      case 'user_input_request': {
+        // Show the UserInputCard; it calls /live/user-input directly.
+        setUserInputReq(e);
         break;
       }
       default: {
@@ -2165,6 +2174,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // Live-session UserInputCard: shown when a user_input_request arrives on the live stream.
+  const liveUserInputCard = userInputReq && (
+    <UserInputCard
+      req={userInputReq}
+      onDone={() => setUserInputReq(null)}
+    />
+  );
+
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
     { label: t('chat.chipReview'), insert: '/code-review ' },
@@ -2213,6 +2230,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
         {filePickerModal}
         {livePermissionCard}
+        {liveUserInputCard}
       </>
     );
   }
@@ -2446,6 +2464,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       </div>
       {filePickerModal}
       {livePermissionCard}
+      {liveUserInputCard}
     </>
   );
 }
