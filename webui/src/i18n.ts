@@ -252,7 +252,7 @@ const zh = {
   // User input card
   'userInput.submit': '提交',
   'userInput.skip': '跳过',
-  'userInput.other': '自己输入 / Other',
+  'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
 
   // Sync toggle
@@ -552,7 +552,7 @@ const en: Record<MsgKey, string> = {
   // User input card
   'userInput.submit': 'Submit',
   'userInput.skip': 'Skip',
-  'userInput.other': 'Other (free text)',
+  'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
 
   // Sync toggle
