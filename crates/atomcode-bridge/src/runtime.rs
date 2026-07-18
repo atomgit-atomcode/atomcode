@@ -1470,13 +1470,9 @@ impl Bridge {
                 self.loop_cancel.cancel();
                 return true;
             }
-            // Placeholder: Task 5 (bridge wiring) replaces this with real
-            // forwarding of the driver's Respond to the kernel's pending
-            // AgentEvent::Request round-trip. Until then, unanswered
-            // Request events will hang — those only fire when a
-            // request_user_input tool is active (not reachable in current
-            // code paths).
-            CoreCmd::Respond { .. } => {}
+            CoreCmd::Respond { id, value } => {
+                let _ = self.handle.commands.send(respond_to_kernel_cmd(id, value));
+            }
         }
         false
     }
@@ -2007,12 +2003,12 @@ impl Bridge {
                     snapshot: ConversationSnapshot::default(),
                 });
             }
-            KEv::Request { id, .. } => {
-                // Unknown request kind: fail closed.
-                let _ = self
-                    .handle
-                    .commands
-                    .send(KCmd::Respond { id, value: serde_json::Value::Null });
+            KEv::Request { id, kind, payload } => {
+                // Generic interactive request (e.g. `request_user_input`). Forward verbatim
+                // to the driver, which renders by `kind` and answers with CoreCmd::Respond{id,..}.
+                // A driver that does not recognize `kind` MUST answer Null (fail-closed) — that
+                // is the driver's responsibility now (see the TUI/daemon tasks).
+                self.emit(generic_request_to_core_ev(id, kind, payload));
             }
             KEv::Usage(meta) => {
                 self.stats.rounds += 1;
@@ -2211,6 +2207,18 @@ fn bypass_auto_approval(skip_permissions: bool) -> Option<ApprovalResponse> {
 /// parked request lets the kernel backfill the cancelled tool's result (so the
 /// conversation has no dangling tool_use), and `take()` clears the mirror so a stale
 /// approval can't re-fire after a model swap re-reads the snapshot.
+/// Map a non-approval kernel `Request` directly to a `CoreEv::Request` for the driver.
+/// The bridge passes `id`, `kind`, and `payload` verbatim — no domain knowledge here.
+fn generic_request_to_core_ev(id: RequestId, kind: String, payload: serde_json::Value) -> CoreEv {
+    CoreEv::Request { id, kind, payload }
+}
+
+/// Map a driver `CoreCmd::Respond` directly to a `KCmd::Respond` for the kernel.
+/// The bridge passes `id` and `value` verbatim — no domain knowledge here.
+fn respond_to_kernel_cmd(id: RequestId, value: serde_json::Value) -> KCmd {
+    KCmd::Respond { id, value }
+}
+
 fn take_deny_cmd(pending: &mut Option<(RequestId, String)>) -> Option<KCmd> {
     pending.take().map(|(id, _tool)| {
         let value =
@@ -3499,5 +3507,38 @@ mod ai_name_tests {
         assert!(!should_attempt(true, true, true)); // already attempted
         assert!(!should_attempt(false, false, true)); // disabled
         assert!(!should_attempt(true, false, false)); // no user msg yet
+    }
+}
+
+#[cfg(test)]
+mod generic_request_passthrough_tests {
+    use super::{generic_request_to_core_ev, respond_to_kernel_cmd};
+    use atomcode_core::agent::AgentEvent as CoreEv;
+    use atomcode_kernel::event::AgentCommand as KCmd;
+
+    #[test]
+    fn bridge_forwards_generic_request_and_respond() {
+        // Direction 1: KEv::Request (non-approval kind) → CoreEv::Request verbatim.
+        let payload = serde_json::json!({"prompt": "Enter your name"});
+        let ev = generic_request_to_core_ev(7u64, "request_user_input".into(), payload.clone());
+        match ev {
+            CoreEv::Request { id, kind, payload: p } => {
+                assert_eq!(id, 7);
+                assert_eq!(kind, "request_user_input");
+                assert_eq!(p, payload);
+            }
+            other => panic!("expected CoreEv::Request, got {other:?}"),
+        }
+
+        // Direction 2: CoreCmd::Respond → KCmd::Respond verbatim (same id + value).
+        let value = serde_json::json!("Alice");
+        let cmd = respond_to_kernel_cmd(7u64, value.clone());
+        match cmd {
+            KCmd::Respond { id, value: v } => {
+                assert_eq!(id, 7);
+                assert_eq!(v, value);
+            }
+            other => panic!("expected KCmd::Respond, got {other:?}"),
+        }
     }
 }
