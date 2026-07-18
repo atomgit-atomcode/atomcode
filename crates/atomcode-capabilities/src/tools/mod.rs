@@ -139,8 +139,8 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
         // tool-choice confusion for the model; the reducer distinguishes by arg SHAPE.
         reg.register(Arc::new(TodoTool::new()));
     }
-    // Gate on ATOMCODE_REQUEST_USER_INPUT (default OFF — register only when set truthy;
-    // 0/false/off/empty/absent → skip). Interactive user-input tool is opt-in until validated.
+    // Gate on ATOMCODE_REQUEST_USER_INPUT (default ON — opt-out via 0/false/off/empty).
+    // Register UNLESS the env var is explicitly set to a falsy value.
     //
     // INTENTIONAL DUPLICATION: the same env-var logic lives in
     // `atomcode_config::config::request_user_input_enabled_from_env` (the authoritative
@@ -150,10 +150,14 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     // need the tools layer).  If you change the logic here, mirror the change in
     // `atomcode-config/src/config/mod.rs::request_user_input_enabled_from_env` and vice
     // versa.  The two blocks MUST stay in sync.
-    let request_user_input_on = std::env::var("ATOMCODE_REQUEST_USER_INPUT")
+    let request_user_input_on = match std::env::var("ATOMCODE_REQUEST_USER_INPUT")
         .ok()
-        .map(|v| { let v = v.trim().to_ascii_lowercase(); !(v.is_empty() || v == "0" || v == "false" || v == "off") })
-        .unwrap_or(false);
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(v) if v == "0" || v == "false" || v == "off" || v.is_empty() => false,
+        _ => true, // default ON — unset, or any other value
+    };
     if request_user_input_on {
         reg.register(Arc::new(crate::tools::request_user_input::RequestUserInputTool));
     }
@@ -504,20 +508,20 @@ mod tests {
     }
 
     #[test]
-    fn request_user_input_gated_off_by_default_on_when_enabled() {
-        // default (unset) → NOT registered
+    fn request_user_input_gated_on_by_default_off_when_opt_out() {
+        // default (unset) → NOW registered (default ON)
         std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut reg = ToolRegistry::new();
         register_coding_tools_with_vision(&mut reg, false);
-        let names_off: Vec<String> = reg.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
-        assert!(!names_off.iter().any(|n| n == "request_user_input"), "must be OFF by default: {names_off:?}");
+        let names_on: Vec<String> = reg.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(names_on.iter().any(|n| n == "request_user_input"), "must be ON by default: {names_on:?}");
 
-        // truthy → registered
-        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+        // explicit opt-out → NOT registered
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "0");
         let mut reg2 = ToolRegistry::new();
         register_coding_tools_with_vision(&mut reg2, false);
-        let names_on: Vec<String> = reg2.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
-        assert!(names_on.iter().any(|n| n == "request_user_input"), "must register when enabled: {names_on:?}");
+        let names_off: Vec<String> = reg2.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(!names_off.iter().any(|n| n == "request_user_input"), "must be OFF when opt-out: {names_off:?}");
         std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
     }
 
@@ -550,33 +554,33 @@ mod tests {
         assert!(coding_tool_names().contains(&"memory"));
     }
 
-    /// Regression: with ATOMCODE_REQUEST_USER_INPUT=1, the tool must reach
-    /// `MountedTools::defs()` (the API tools array) — not merely be registered.
-    /// Previously `request_user_input` was registered but absent from `coding_tool_names()`,
-    /// so `mount()` never selected it and the model never saw it.
+    /// Regression: the tool must reach `MountedTools::defs()` (the API tools array) by
+    /// default — not merely be registered. Previously `request_user_input` was registered
+    /// but absent from `coding_tool_names()`, so `mount()` never selected it and the model
+    /// never saw it.
     #[test]
-    fn request_user_input_when_enabled_reaches_mounted_defs() {
-        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+    fn request_user_input_default_on_reaches_mounted_defs() {
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut reg = ToolRegistry::new();
         register_coding_tools(&mut reg);
         let mounted = reg.mount(coding_tool_names());
         let has = mounted.defs().iter().any(|d| d.name == "request_user_input");
-        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         assert!(
             has,
-            "enabled request_user_input must be MOUNTED and present in API defs(), not just registered"
+            "default-on request_user_input must be MOUNTED and present in API defs() when unset"
         );
     }
 
     #[test]
-    fn request_user_input_off_by_default_absent_from_defs() {
-        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+    fn request_user_input_absent_from_defs_when_opt_out() {
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "0");
         let mut reg = ToolRegistry::new();
         register_coding_tools(&mut reg);
         let mounted = reg.mount(coding_tool_names());
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         assert!(
             !mounted.defs().iter().any(|d| d.name == "request_user_input"),
-            "default-off must not mount request_user_input"
+            "opt-out (ATOMCODE_REQUEST_USER_INPUT=0) must not mount request_user_input"
         );
     }
 }

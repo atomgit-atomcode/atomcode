@@ -1861,6 +1861,18 @@ pub(crate) async fn run_chat_turn_v2(
                     cancelled: false,
                 })
             }
+            // Fail-close: /chat has no interactive UI that can answer a
+            // request_user_input prompt (and no /chat/user-input endpoint).
+            // Sending Respond{id, Null} immediately unblocks the kernel so the
+            // tool returns a graceful "not supported" result and the model
+            // proceeds — preventing an unbounded hang.  The tool maps Null →
+            // "Interactive questions are not supported in this environment."
+            AgentEvent::Request { id, .. } => {
+                let _ = client.cmd_tx.send(AgentCommand::Respond {
+                    id,
+                    value: serde_json::Value::Null,
+                });
+            }
             other => {
                 if let Some(te) = agent_to_turn(other) {
                     let _ = turn_tx.send(te);
@@ -3244,6 +3256,40 @@ mod tests {
         assert!(json.contains(r#""request_id":42"#), "{json}");
         assert!(json.contains(r#""mode":"single""#), "{json}");
         assert!(json.contains("Red"), "{json}");
+    }
+
+    // Regression / fail-close: AgentEvent::Request on the /chat path MUST NOT be
+    // forwarded to agent_to_turn() as a TurnEvent::UserInputRequested, because the
+    // turn-event consumer at lib.rs:3107 no-ops it and the kernel hangs waiting for
+    // AgentCommand::Respond.  The run_chat_turn_v2 executor explicitly intercepts
+    // AgentEvent::Request and sends Respond{id, Null} so the kernel unblocks.
+    // This unit test verifies the agent_to_turn() mapping is STILL intact (for the
+    // /live path that DOES have a UI), while separately documenting the /chat
+    // fail-close arm that bypasses agent_to_turn() entirely.
+    #[test]
+    fn agent_to_turn_request_user_input_still_maps_for_live_path() {
+        use atomcode_core::agent::AgentEvent;
+        // The /live path consumes TurnEvent::UserInputRequested → agent_to_turn must
+        // still produce it (the mapping must not be removed by the /chat fix).
+        let result = agent_to_turn(AgentEvent::Request {
+            id: 99,
+            kind: "request_user_input".into(),
+            payload: serde_json::json!({ "header": "H", "question": "Q?", "mode": "single", "options": [] }),
+        });
+        assert!(
+            matches!(result, Some(TurnEvent::UserInputRequested { request_id: 99, .. })),
+            "agent_to_turn must still produce UserInputRequested for the /live path: {result:?}"
+        );
+        // Generic Request kinds (future extensibility) fall through to None.
+        let unknown = agent_to_turn(AgentEvent::Request {
+            id: 1,
+            kind: "unknown_future_kind".into(),
+            payload: serde_json::Value::Null,
+        });
+        assert!(
+            unknown.is_none(),
+            "unknown Request kind must return None from agent_to_turn: {unknown:?}"
+        );
     }
 
     // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/

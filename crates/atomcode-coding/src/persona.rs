@@ -27,9 +27,9 @@ pub(crate) fn todo_switch_enabled() -> bool {
 }
 
 /// Resolve the `request_user_input` tool switch for every `coding_persona` call site
-/// (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF).  Delegates to
-/// `atomcode_config::config::request_user_input_enabled_from_env` so the persona gate
-/// and the config helper always agree.
+/// (`ATOMCODE_REQUEST_USER_INPUT` env, default ON — opt-out via `=0`/`false`/`off`).
+/// Delegates to `atomcode_config::config::request_user_input_enabled_from_env` so the
+/// persona gate and the config helper always agree.
 ///
 /// NOTE: the tool-registration gate in `atomcode-capabilities/src/tools/mod.rs` contains
 /// an INTENTIONAL DUPLICATE of the same env logic — it cannot call this helper (or the
@@ -122,9 +122,10 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // `request_user_input` tool usage guidance — surfaced in the system prompt so weak models
     // (GLM / DeepSeek) that under-weight tool descriptions still see the judgment line.
     // MUST stay gated on the SAME condition as the tool registration in `atomcode-capabilities`
-    // (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF): instructing the model to call a tool
-    // that isn't mounted provokes phantom tool calls. `request_user_input_enabled` is that
-    // switch, resolved by the caller via `request_user_input_switch_enabled()`.
+    // (`ATOMCODE_REQUEST_USER_INPUT` env, default ON — opt-out via =0/false/off): instructing
+    // the model to call a tool that isn't mounted provokes phantom tool calls.
+    // `request_user_input_enabled` is that switch, resolved by the caller via
+    // `request_user_input_switch_enabled()`.
     if request_user_input_enabled {
         p.push_str(REQUEST_USER_INPUT_USAGE);
     }
@@ -922,5 +923,43 @@ mod tests {
         let p = coding_persona("glm-5.2", true, false);
         assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+    }
+
+    // request_user_input_switch_enabled() is now default ON: unset → true, =0/false/off → false.
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_switch_enabled_default_on() {
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        assert!(
+            request_user_input_switch_enabled(),
+            "unset ATOMCODE_REQUEST_USER_INPUT must default to ON"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_switch_enabled_opt_out() {
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "0");
+        assert!(
+            !request_user_input_switch_enabled(),
+            "ATOMCODE_REQUEST_USER_INPUT=0 must disable the tool"
+        );
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_guidance_present_by_default() {
+        // With the env unset the switch is ON, so the ASKING THE USER section should
+        // appear in the persona produced by coding_persona with enabled=true.
+        // (coding_persona itself takes an explicit bool; the test verifies the
+        // content gate — the full env→bool path is covered by switch_enabled tests.)
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let enabled = request_user_input_switch_enabled();
+        let p = coding_persona("glm-5.2", false, enabled);
+        assert!(
+            p.contains("## ASKING THE USER"),
+            "guidance must be present when switch is default-on: {p}"
+        );
     }
 }
