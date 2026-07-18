@@ -8663,15 +8663,15 @@ mod user_input_key_tests {
     }
 
     // Multiple: Enter on the Submit row yields all checked labels + appended
-    // custom (when the "Other" row is checked). Enter on option/Other rows
-    // returns None (caller toggles instead).
+    // custom text when non-empty. Enter on option/Other rows returns None (caller
+    // toggles concrete options; Other row Enter is a no-op).
     #[test]
     fn multiple_submit_appends_custom_text() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A" (cursor 0)
         p.move_down();
         p.toggle(); // check "B" (cursor 1)
-        p.push_custom('x'); // auto-checks the "Other" row
+        p.push_custom('x'); // custom_text="x"; no separate auto-check needed
         // Enter on option/Other rows is NOT a submit — returns None.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
@@ -8688,6 +8688,59 @@ mod user_input_key_tests {
         let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit row resolves");
         assert_eq!(resp.selected, vec!["A".to_string(), "B".to_string(), "x".to_string()]);
         assert_eq!(resp.text, None);
+    }
+
+    // FIX 1: Multiple — typing custom text then Submit includes it REGARDLESS of
+    // any prior Enter on the Other row (Enter on Other is a no-op; inclusion is
+    // text-derived, so it cannot be toggled off by Enter).
+    #[test]
+    fn multiple_custom_text_included_after_enter_on_other_row() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A"
+        // Move to Other row and type custom text.
+        p.move_down(); // cursor 1 (B)
+        p.move_down(); // cursor 2 (Other)
+        assert!(p.is_other_row());
+        p.push_custom('h');
+        p.push_custom('i');
+        // Enter on Other row must be a no-op — does NOT toggle anything off.
+        // (Simulated by user_input_response_for returning None, which is what
+        // handle_user_input_key would see and NOT call toggle().)
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on Other row must NOT submit (or toggle)"
+        );
+        // custom_text is still "hi" — not wiped by Enter.
+        assert_eq!(p.custom_text, "hi");
+        // Navigate to Submit and confirm.
+        p.move_down(); // cursor 3 (Submit)
+        assert!(p.is_submit_row());
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter on Submit resolves");
+        // Both checked "A" and custom "hi" must appear.
+        assert!(resp.selected.contains(&"A".to_string()), "checked option included");
+        assert!(resp.selected.contains(&"hi".to_string()), "custom text included despite Enter on Other");
+    }
+
+    // FIX 1: Multiple — number key on Other row's index moves cursor (not toggle).
+    #[test]
+    fn multiple_number_key_on_other_index_moves_cursor() {
+        let mut p = panel(UserInputMode::Multiple);
+        assert_eq!(p.cursor, 0);
+        // The Other row is index 2 (options.len() for 2-option panel), number key '3'.
+        // Simulating what handle_user_input_key does: idx == other_index → set cursor.
+        p.cursor = p.other_index(); // simulate number key '3' moving cursor to Other
+        assert!(p.is_other_row(), "cursor moved to Other row");
+        // No checkbox was toggled — checked[other_index] should still be false
+        // (but that field is unused for Other; the invariant is that custom_text is empty).
+        assert!(p.custom_text.is_empty(), "custom_text untouched by cursor move");
+        // build_response with nothing checked and no custom text → None.
+        // Move to Submit.
+        p.move_down();
+        assert!(p.is_submit_row());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "empty Other + nothing checked → no-op"
+        );
     }
 
     // Text: Enter yields the buffer via `text`, never `selected`.
@@ -9069,14 +9122,17 @@ fn handle_user_input_key(
         return Ok(());
     }
 
-    // Multiple + Enter on a non-Submit row: toggle the current row
-    // (option or Other) instead of confirming. `user_input_response_for`
-    // returned None for this case so we handle it here.
+    // Multiple + Enter on a non-Submit row: toggle concrete option rows; the
+    // "Other" row is text-based so Enter there is a no-op (the user types to
+    // include it, then navigates to Submit to confirm).
+    // `user_input_response_for` returned None for this case so we handle it here.
     if matches!(mode, UserInputMode::Multiple) && code == KeyCode::Enter {
         if let Some(p) = app.state.user_input_panel.as_mut() {
-            if !p.is_submit_row() {
+            if !p.is_submit_row() && !p.is_other_row() {
+                // Concrete option row: toggle the checkbox.
                 p.toggle();
             }
+            // Other row: no-op — inclusion is derived from custom_text, not a checkbox.
         }
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
@@ -9106,8 +9162,10 @@ fn handle_user_input_key(
         }
         // Number keys 1..9: select the Nth navigable row (concrete options 1..N,
         // then "Other" as N+1). Single → move the cursor there (cursor is the
-        // radio). Multiple → toggle that row's checkbox. Only when NOT editing
-        // the "Other" row (so digits can be typed into a custom answer).
+        // radio). Multiple → toggle that concrete row's checkbox, OR move the
+        // cursor to the Other row (so the user can type a custom answer).
+        // Only when NOT already editing the "Other" row (so digits can be typed
+        // into a custom answer).
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
             if c.is_ascii_digit()
                 && c != '0'
@@ -9121,10 +9179,16 @@ fn handle_user_input_key(
             if let Some(p) = app.state.user_input_panel.as_mut() {
                 let idx = (c as usize) - ('1' as usize);
                 if idx <= p.other_index() {
-                    match p.mode {
-                        UserInputMode::Multiple => p.toggle_index(idx),
-                        // Single: cursor-as-radio — move to it (this IS selecting it).
-                        _ => p.cursor = idx,
+                    if idx == p.other_index() {
+                        // Number key for the Other row: move cursor to it (focus for
+                        // typing). Inclusion is text-derived, not toggled by a number key.
+                        p.cursor = p.other_index();
+                    } else {
+                        match p.mode {
+                            UserInputMode::Multiple => p.toggle_index(idx),
+                            // Single: cursor-as-radio — move to it (this IS selecting it).
+                            _ => p.cursor = idx,
+                        }
                     }
                 }
             }

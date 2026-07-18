@@ -200,17 +200,10 @@ impl UserInputPanel {
     }
     /// Typed characters edit the "Other" custom-text buffer. In single mode
     /// this supersedes any concrete-option radio selection (the cursor should
-    /// already be on the "Other" row). In multiple mode, typing auto-checks the
-    /// "Other" row so an empty-labelled custom answer still counts.
+    /// already be on the "Other" row). Inclusion of the custom answer is derived
+    /// from `custom_text.trim()` being non-empty — no separate checkbox state.
     pub fn push_custom(&mut self, c: char) {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
         self.custom_text.push(c);
-        if matches!(self.mode, Multiple) {
-            let other = self.other_index();
-            if let Some(slot) = self.checked.get_mut(other) {
-                *slot = true;
-            }
-        }
     }
     /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
@@ -244,7 +237,8 @@ impl UserInputPanel {
     /// - single: the cursor row → its label, OR (cursor on "Other")
     ///   `custom_text.trim()` when non-empty; `None` when nothing to submit.
     /// - multiple: all checked concrete labels, PLUS `custom_text.trim()` when
-    ///   the "Other" row is checked and non-empty; `None` when empty.
+    ///   non-empty (inclusion is text-derived, NOT from `checked[other_index]`);
+    ///   `None` when nothing selected.
     /// Text mode is handled separately by the caller.
     pub fn build_response(
         &self,
@@ -265,10 +259,11 @@ impl UserInputPanel {
             }
             Multiple => {
                 let mut selected = self.chosen();
-                let other_checked =
-                    self.checked.get(self.other_index()).copied().unwrap_or(false);
+                // Inclusion of the custom answer is derived from the text itself,
+                // NOT from a separate checked flag — so Enter on the Other row
+                // (which is a no-op) can never desync the checkbox from the text.
                 let custom = self.custom_text.trim();
-                if other_checked && !custom.is_empty() {
+                if !custom.is_empty() {
                     selected.push(custom.to_string());
                 }
                 if selected.is_empty() {
@@ -2232,8 +2227,8 @@ mod tests {
         assert_eq!(m.chosen(), vec!["OAuth".to_string(), "Device".to_string()]);
         m.toggle(); // uncheck "Device"
         assert_eq!(m.chosen(), vec!["OAuth".to_string()], "toggle flips off");
-        // Multiple: custom text is APPENDED only when the "Other" row is checked
-        // (push_custom auto-checks it).
+        // Multiple: custom text is APPENDED whenever non-empty (text-derived,
+        // no separate checked flag needed).
         m.push_custom('x');
         let resp = m.build_response().expect("multiple always submits");
         assert_eq!(resp.selected, vec!["OAuth".to_string(), "x".to_string()]);

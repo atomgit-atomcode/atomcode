@@ -2515,14 +2515,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let idx = other_index;
                     let number = other_index + 1;
                     let on_cursor = idx == panel.cursor;
-                    let other_checked = panel.checked.get(idx).copied().unwrap_or(false);
+                    // Checkbox for the Other row is derived from custom_text, NOT from
+                    // checked[other_index], so Enter on Other (a no-op) can never desync it.
+                    let other_has_text = !panel.custom_text.trim().is_empty();
                     let marker = if on_cursor {
                         if unicode { "\u{276f} " } else { "> " }
                     } else {
                         "  "
                     };
                     let checkbox = if multiple {
-                        if other_checked { "[x] " } else { "[ ] " }
+                        if other_has_text { "[x] " } else { "[ ] " }
                     } else {
                         ""
                     };
@@ -2545,15 +2547,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     push_str_cells(&mut row, &num, &chrome_style);
 
-                    if panel.custom_text.is_empty() {
-                        // Faint placeholder when no text has been typed yet.
+                    if panel.custom_text.trim().is_empty() {
+                        // Faint placeholder when no text has been typed yet
+                        // (consistent with build_response which trims before checking).
+                        let cursor_glyph = if unicode { "\u{258f}" } else { "|" }; // ▏
+                        let glyph_width: usize = 1;
+                        // Reserve 1 column for the cursor glyph when on cursor.
+                        let ph_budget = if on_cursor {
+                            budget.saturating_sub(glyph_width)
+                        } else {
+                            budget
+                        };
                         let placeholder = "输入自己的答案\u{2026}"; // 输入自己的答案…
                         let ph = crate::width::truncate_with_ellipsis(
                             &scrub_controls(placeholder),
-                            budget,
+                            ph_budget,
                         );
                         let ph_style = self.style_faint(Role::Muted);
                         push_str_cells(&mut row, &ph, &ph_style);
+                        if on_cursor {
+                            push_str_cells(&mut row, cursor_glyph, &chrome_style);
+                        }
                     } else {
                         // Show the typed text.  Append a cursor indicator when
                         // this is the active row.

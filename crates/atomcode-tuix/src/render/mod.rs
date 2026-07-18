@@ -572,8 +572,10 @@ pub struct UserInputPanelView {
     /// Does NOT include the always-appended "Other" free-text row.
     pub options: Vec<(String, Option<String>)>,
     /// Highlighted row. For single/multiple this ranges over the concrete
-    /// option rows, then the always-appended "Other" row (`options.len()`).
-    /// There is no separate submit row.
+    /// option rows (`0..options.len()`), then the always-appended "Other" row
+    /// (`options.len()`). For multiple mode the cursor also reaches
+    /// `options.len()+1` (the Submit row); single mode's last row is the
+    /// custom-answer row at `options.len()`.
     pub cursor: usize,
     /// Per-row checked flags (multiple mode). Length `options.len() + 1` — one
     /// per concrete option plus the trailing "Other" row.
