@@ -43,6 +43,7 @@ pub mod task;
 pub mod read;
 pub mod repair;
 pub mod report_finding;
+pub mod request_user_input;
 pub mod search_replace;
 pub mod sensitive_path;
 pub mod todo;
