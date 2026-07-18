@@ -1,7 +1,7 @@
 // User input request card — mirrors PermissionCard structure/styling.
 // Shown when the daemon emits a `user_input_request` SSE event on the live stream.
 
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { postLiveUserInput, UserInputRequestEvent } from '../api';
 import { useT } from '../settings';
 
@@ -10,17 +10,32 @@ interface UserInputCardProps {
   onDone: () => void;
 }
 
+const OTHER_SENTINEL = '__other__';
+
 export function UserInputCard({ req, onDone }: UserInputCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // single: at most one selected label
+  // single: selected label, or OTHER_SENTINEL when the "Other" radio is chosen
   const [singleSelected, setSingleSelected] = useState<string | null>(null);
-  // multiple: set of selected labels
+  // multiple: set of selected concrete labels
   const [multiSelected, setMultiSelected] = useState<Set<string>>(new Set());
-  // free-text input (used for 'text' mode AND as an "Other" addendum for single/multiple)
+  // whether the "Other" checkbox is checked (multiple mode)
+  const [otherChecked, setOtherChecked] = useState(false);
+  // free-text value shared by both single-Other and multiple-Other paths
   const [freeText, setFreeText] = useState('');
+
+  // Autofocus the free-text input when it becomes visible
+  const freeTextRef = useRef<HTMLInputElement>(null);
+  const singleOtherActive = req.mode === 'single' && singleSelected === OTHER_SENTINEL;
+  const multiOtherActive  = req.mode === 'multiple' && otherChecked;
+
+  useEffect(() => {
+    if ((singleOtherActive || multiOtherActive) && freeTextRef.current) {
+      freeTextRef.current.focus();
+    }
+  }, [singleOtherActive, multiOtherActive]);
 
   function toggleMulti(label: string) {
     setMultiSelected((prev) => {
@@ -30,11 +45,23 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
     });
   }
 
-  // FIX 4 (webui): text mode — disable Submit when textarea is empty.
-  const textEmpty = req.mode === 'text' && freeText.trim() === '';
+  // Derive whether Submit should be disabled
+  const submitDisabled: boolean = (() => {
+    if (loading) return true;
+    if (req.mode === 'text') return freeText.trim() === '';
+    if (req.mode === 'single') {
+      if (singleSelected === null) return true;                       // nothing picked
+      if (singleSelected === OTHER_SENTINEL) return freeText.trim() === ''; // Other but empty
+      return false;
+    }
+    // multiple
+    const hasConcreteChecked = multiSelected.size > 0;
+    const hasOtherText = otherChecked && freeText.trim() !== '';
+    return !hasConcreteChecked && !hasOtherText;
+  })();
 
   async function submit() {
-    if (loading) return;
+    if (loading || submitDisabled) return;
     setLoading(true);
     setError(null);
     try {
@@ -42,24 +69,22 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
       if (req.mode === 'text') {
         body = { request_id: req.request_id, declined: false, selected: [], text: freeText || null };
       } else if (req.mode === 'single') {
-        // FIX 5: enforce single semantics — free-text "Other" takes priority over radio.
-        const chosen: string[] = freeText.trim()
-          ? [freeText.trim()]
-          : singleSelected
-            ? [singleSelected]
-            : [];
+        const chosen: string[] =
+          singleSelected === OTHER_SENTINEL
+            ? [freeText.trim()]
+            : singleSelected
+              ? [singleSelected]
+              : [];
         body = { request_id: req.request_id, declined: false, selected: chosen, text: null };
       } else {
         // multiple
         const chosen = Array.from(multiSelected);
-        if (freeText.trim()) chosen.push(freeText.trim());
+        if (otherChecked && freeText.trim()) chosen.push(freeText.trim());
         body = { request_id: req.request_id, declined: false, selected: chosen, text: null };
       }
       await postLiveUserInput(body);
-      // FIX 2: only dismiss on success.
       onDone();
     } catch {
-      // FIX 2: keep card open on failure, show inline error so user can retry.
       setLoading(false);
       setError(t('userInput.error'));
     }
@@ -107,12 +132,39 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
                     onChange={() => setSingleSelected(opt.label)}
                     disabled={loading}
                   />
-                  <span class="user-input-option-label">{opt.label}</span>
-                  {opt.description && (
-                    <span class="user-input-option-desc">{opt.description}</span>
-                  )}
+                  <span class="user-input-option-body">
+                    <span class="user-input-option-label">{opt.label}</span>
+                    {opt.description && (
+                      <span class="user-input-option-desc">{opt.description}</span>
+                    )}
+                  </span>
                 </label>
               ))}
+              {/* "Other" as the last radio in the same group */}
+              <label class="user-input-option">
+                <input
+                  type="radio"
+                  name={`uiq-${req.request_id}`}
+                  value={OTHER_SENTINEL}
+                  checked={singleSelected === OTHER_SENTINEL}
+                  onChange={() => setSingleSelected(OTHER_SENTINEL)}
+                  disabled={loading}
+                />
+                <span class="user-input-option-body">
+                  <span class="user-input-option-label">{t('userInput.other')}</span>
+                </span>
+              </label>
+              {singleOtherActive && (
+                <input
+                  ref={freeTextRef}
+                  type="text"
+                  class="user-input-text"
+                  value={freeText}
+                  onInput={(e) => setFreeText((e.target as HTMLInputElement).value)}
+                  disabled={loading}
+                  placeholder="输入自己的答案…"
+                />
+              )}
             </div>
           )}
 
@@ -127,16 +179,41 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
                     onChange={() => toggleMulti(opt.label)}
                     disabled={loading}
                   />
-                  <span class="user-input-option-label">{opt.label}</span>
-                  {opt.description && (
-                    <span class="user-input-option-desc">{opt.description}</span>
-                  )}
+                  <span class="user-input-option-body">
+                    <span class="user-input-option-label">{opt.label}</span>
+                    {opt.description && (
+                      <span class="user-input-option-desc">{opt.description}</span>
+                    )}
+                  </span>
                 </label>
               ))}
+              {/* "Other" as the last checkbox */}
+              <label class="user-input-option">
+                <input
+                  type="checkbox"
+                  checked={otherChecked}
+                  onChange={() => setOtherChecked((v) => !v)}
+                  disabled={loading}
+                />
+                <span class="user-input-option-body">
+                  <span class="user-input-option-label">{t('userInput.other')}</span>
+                </span>
+              </label>
+              {multiOtherActive && (
+                <input
+                  ref={freeTextRef}
+                  type="text"
+                  class="user-input-text"
+                  value={freeText}
+                  onInput={(e) => setFreeText((e.target as HTMLInputElement).value)}
+                  disabled={loading}
+                  placeholder="输入自己的答案…"
+                />
+              )}
             </div>
           )}
 
-          {req.mode === 'text' ? (
+          {req.mode === 'text' && (
             <div class="field-group">
               <textarea
                 class="user-input-textarea"
@@ -145,17 +222,6 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
                 onInput={(e) => setFreeText((e.target as HTMLTextAreaElement).value)}
                 disabled={loading}
                 placeholder=""
-              />
-            </div>
-          ) : (
-            <div class="field-group">
-              <span class="modal-label">{t('userInput.other')}</span>
-              <input
-                type="text"
-                class="user-input-text"
-                value={freeText}
-                onInput={(e) => setFreeText((e.target as HTMLInputElement).value)}
-                disabled={loading}
               />
             </div>
           )}
@@ -169,7 +235,7 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
           <button class="btn" disabled={loading} onClick={skip}>
             {t('userInput.skip')}
           </button>
-          <button class="btn btn-primary" disabled={loading || textEmpty} onClick={submit}>
+          <button class="btn btn-primary" disabled={submitDisabled} onClick={submit}>
             {t('userInput.submit')}
           </button>
         </div>
