@@ -84,6 +84,9 @@ pub(crate) fn turn_to_agent_event(te: TurnEvent) -> Option<AgentEvent> {
         | TurnEvent::ToolBatchCompleted { .. }
         | TurnEvent::ContextStats { .. }
         | TurnEvent::WorkingDirChanged(_)
+        // request_user_input (webui stage 1): TUI rendering of the ask tool is a
+        // later stage — ignored here for now.
+        | TurnEvent::UserInputRequested { .. }
         | TurnEvent::ApprovalResolved { .. } => return None,
     })
 }

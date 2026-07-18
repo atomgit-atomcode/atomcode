@@ -779,6 +779,7 @@ impl TurnExecutor for KernelTurnExecutor {
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
         approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
         cancel: CancellationToken,
     ) {
         let emit = |te: TurnEvent| {
@@ -963,6 +964,16 @@ impl TurnExecutor for KernelTurnExecutor {
             None
         };
 
+        // request_user_input: register the responder so any view's
+        // `LiveSession.respond(id, value)` is drained below into
+        // `AgentCommand::Respond { id, value }`. Independent of approval mode —
+        // the tool can raise a question in any mode.
+        let mut responder_rx = {
+            let (tx, rx) = mpsc::unbounded_channel::<(u64, serde_json::Value)>();
+            *responder.lock().await = Some(tx);
+            rx
+        };
+
         let state = guard.as_mut().unwrap();
         let mut cancelled = false;
         let mut bridge_dead = false;
@@ -971,6 +982,14 @@ impl TurnExecutor for KernelTurnExecutor {
                 _ = cancel.cancelled(), if !cancelled => {
                     cancelled = true;
                     let _ = client.cmd_tx.send(AgentCommand::Cancel);
+                    continue;
+                }
+                // request_user_input answer from any view (LiveSession.respond) →
+                // forward to the kernel as AgentCommand::Respond so the pending
+                // round-trip resolves. Channel never closes mid-turn (we hold the
+                // registered sender in `responder`); `None` only after clear at end.
+                Some((id, value)) = responder_rx.recv() => {
+                    let _ = client.cmd_tx.send(AgentCommand::Respond { id, value });
                     continue;
                 }
                 ev = state.events.recv() => ev,
@@ -1203,6 +1222,9 @@ impl TurnExecutor for KernelTurnExecutor {
 
         // The approval slot is per-turn; clear it so a stale sender can't leak.
         *approver.lock().await = None;
+        // The request_user_input responder slot is per-turn; clear it too so a
+        // stale sender can't leak into the next turn.
+        *responder.lock().await = None;
 
         // Writeback + AUTHORITATIVE terminal persist — the engine's snapshot becomes the
         // conversation of record, and we overwrite the stable `<id>.json` with it (so
@@ -2064,6 +2086,9 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
             | TE::ToolBatchStarted { .. }
             | TE::ToolBatchCompleted { .. }
             | TE::ContextStats { .. }
+            // request_user_input (webui stage 1): not surfaced over the SSE wire
+            // yet — a LiveWireEvent + frontend rendering is a later stage.
+            | TE::UserInputRequested { .. }
             | TE::WorkingDirChanged(_) => return None,
         },
     })
