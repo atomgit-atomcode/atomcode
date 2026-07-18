@@ -8491,7 +8491,15 @@ mod bypass_approval_tests {
         assert_eq!(opts.len(), 3);
         assert_eq!((opts[0].kind, opts[0].accel), (ApprovalKind::AllowOnce, 'y'));
         assert_eq!((opts[1].kind, opts[1].accel), (ApprovalKind::AlwaysAllow, 'a'));
-        assert!(opts[1].label.contains("bash"), "always-allow label names the tool: {}", opts[1].label);
+        // bash's grant is scoped to THIS COMMAND (not the whole tool), so — like the
+        // folder-scoped write tools (see build_approval_options_write_tools_use_folder_label)
+        // — its always-allow label must NOT imply "always allow bash". This pins the
+        // honest command-scoped label from 3f1e49f9.
+        assert!(
+            !opts[1].label.contains("bash"),
+            "bash always-allow must not name the tool (command-scoped): {}",
+            opts[1].label
+        );
         assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
     }
 
