@@ -2012,7 +2012,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             <button
               key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); chooseAtRow(item); }}
+              // stopPropagation: this mousedown is an INSIDE click. Without it the
+              // event bubbles to the document click-outside handler, whose
+              // `contains(target)` guard fails once `setAtMention` clears+refetches
+              // the list (the clicked row detaches), so it wrongly closes the menu —
+              // a directory then can't drill in via mouse (keyboard was immune since
+              // it never triggers a document mousedown). preventDefault keeps focus.
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
               title={item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}
@@ -2032,7 +2038,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             <button
               key={`${item.kind}:${item.name}`}
               class={'slash-row' + (i === slashIndex ? ' active' : '')}
-              onMouseDown={(e) => { e.preventDefault(); insertSkill(item.name); }}
+              // stopPropagation for the same reason as the @-menu rows above: keep
+              // this inside-click from reaching the document click-outside handler.
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); insertSkill(item.name); }}
               onMouseEnter={() => setSlashIndex(i)}
               type="button"
               title={item.description || ''}
