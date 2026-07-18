@@ -1335,7 +1335,7 @@ const T={
   'tip.ver':{zh:'当前版本',en:'Current version'},
   'os.mac':{zh:'macOS · Intel / Apple Silicon',en:'macOS · Intel / Apple Silicon'},
   'os.linux':{zh:'Linux · x86_64 / arm64',en:'Linux · x86_64 / arm64'},
-  'os.win':{zh:'Windows · PowerShell',en:'Windows · PowerShell'},
+  'os.win':{zh:'Windows · PowerShell / Git-Bash',en:'Windows · PowerShell / Git-Bash'},
   'os.harmony':{zh:'HarmonyOS PC · arm64',en:'HarmonyOS PC · arm64'},
   'os.auto':{zh:'✓ 自动检测 · ',en:'✓ Auto-detected · '},
   'method.oneclick':{zh:'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH',en:'macOS / Linux / HarmonyOS PC + Windows · auto PATH'},
@@ -1379,7 +1379,9 @@ function winInstallCmd(){
 const OS_CMDS={
   mac:unixInstallCmd(),
   linux:unixInstallCmd(),
-  win:winInstallCmd(),
+  // PowerShell is the primary Windows path (system PATH); the curl|sh line is for users
+  // living in a Unix shell on Windows (Git-Bash / MSYS / Cygwin) — install.sh detects it.
+  win:`# PowerShell\n${winInstallCmd()}\n\n# Git-Bash / MSYS\n${unixInstallCmd()}`,
   harmony:unixInstallCmd(),
 };
 function osHint(os){return t('os.'+os);}
