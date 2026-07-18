@@ -575,8 +575,15 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
 /// Resolve the effective `request_user_input` tool switch: DEFAULT-OFF semantics.
 /// Returns `true` only when `env` is `Some` and NOT one of `""`/`"0"`/`"false"`/`"off"`
 /// (case-insensitive, trimmed). `None` → `false`.
-/// Used by the persona guidance gate AND (via caller) the tool-registration gate so the
-/// two can never disagree.
+///
+/// Called by `atomcode-coding`'s persona gate (`request_user_input_switch_enabled`).
+///
+/// NOTE: `atomcode-capabilities`' tool-registration gate contains an INTENTIONAL
+/// DUPLICATE of this logic — it cannot call this helper because `atomcode-config` is not
+/// a dependency of the capabilities `tools` feature layer.  If you change the logic here
+/// you MUST mirror the change in
+/// `atomcode-capabilities/src/tools/mod.rs` (the `request_user_input_on` block), and
+/// vice versa.
 pub fn request_user_input_enabled_from_env(env: Option<&str>) -> bool {
     match env.map(|s| s.trim().to_ascii_lowercase()) {
         None => false,

@@ -904,6 +904,10 @@ mod tests {
     #[serial_test::serial(offline_verdict)]
     fn model_switch_replaces_persona_without_duplication() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
+        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is deterministic regardless
+        // of what other tests may have set concurrently (we hold the serial lock, so this
+        // is safe — no other test in this serial group can observe the removal).
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(coding_persona("old-model", crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled())),
             Message::system("SESSION CONTEXT"),
@@ -926,6 +930,10 @@ mod tests {
     #[serial_test::serial(offline_verdict)]
     fn current_persona_keeps_snapshot_byte_stable() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
+        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is stable for both builds of
+        // the persona string (captured and reconciled).  We hold the serial lock, so this
+        // is safe.
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),

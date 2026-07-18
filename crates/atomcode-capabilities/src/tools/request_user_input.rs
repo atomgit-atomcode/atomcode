@@ -73,7 +73,10 @@ fn ok_result(msg: impl Into<String>) -> ToolResult {
 /// Map the user's answer to a tool result string.
 pub fn format_result(resp: &UserInputResponse) -> ToolResult {
     if resp.declined {
-        return err_result("User declined to answer.");
+        return ok_result(
+            "No answer was provided. Proceed with your own best judgment; only ask again if you \
+             are truly blocked.",
+        );
     }
     if let Some(t) = &resp.text {
         return ok_result(format!("User answered: {t:?}"));
@@ -222,8 +225,12 @@ mod tests {
             r#"User answered: "hi""#
         );
         let d = format_result(&UserInputResponse::declined());
-        assert!(d.is_error);
-        assert_eq!(d.content, "User declined to answer.");
+        assert!(!d.is_error, "declined must not be an error — model should proceed, not retry/abort");
+        assert_eq!(
+            d.content,
+            "No answer was provided. Proceed with your own best judgment; only ask again if you \
+             are truly blocked.",
+        );
     }
 
     #[test]

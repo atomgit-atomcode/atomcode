@@ -26,11 +26,15 @@ pub(crate) fn todo_switch_enabled() -> bool {
     )
 }
 
-/// Single source of truth for the `request_user_input` tool switch across every
-/// `coding_persona` call site AND the capabilities tool-registration gate
-/// (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF). Keeping all call sites on
-/// this helper guarantees the system-prompt guidance and the mounted tool never
-/// disagree — the model is NEVER told to call a tool that isn't registered.
+/// Resolve the `request_user_input` tool switch for every `coding_persona` call site
+/// (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF).  Delegates to
+/// `atomcode_config::config::request_user_input_enabled_from_env` so the persona gate
+/// and the config helper always agree.
+///
+/// NOTE: the tool-registration gate in `atomcode-capabilities/src/tools/mod.rs` contains
+/// an INTENTIONAL DUPLICATE of the same env logic — it cannot call this helper (or the
+/// config helper) because `atomcode-config` is not a dependency of that crate's `tools`
+/// feature.  Keep the two blocks in sync whenever the gate logic changes.
 pub(crate) fn request_user_input_switch_enabled() -> bool {
     atomcode_config::config::request_user_input_enabled_from_env(
         std::env::var("ATOMCODE_REQUEST_USER_INPUT").ok().as_deref(),
@@ -269,12 +273,14 @@ use it for a single quick edit, a one-off command, or a purely informational / c
 /// injected when the `request_user_input` tool is actually mounted (see the
 /// `request_user_input_enabled` gate in `coding_persona`).
 const REQUEST_USER_INPUT_USAGE: &str = "\n\n## ASKING THE USER:\n\
-When you reach a decision that is genuinely the USER'S to make — a preference, a credential or \
-confirmation, or a choice between approaches where no option is clearly correct from the code or \
-the task — call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` \
-with concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask \
-ONLY for what you genuinely cannot decide, look up, or verify yourself — never for something the \
-code, the task, or a quick check already answers. One focused question at a time.";
+When you reach a decision that is genuinely the USER'S to make — a preference, a confirmation, \
+or a choice between approaches where no option is clearly correct from the code or the task — \
+call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` with \
+concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask ONLY \
+for what you genuinely cannot decide, look up, or verify yourself — never for something the \
+code, the task, or a quick check already answers. One focused question at a time. Never ask the \
+user to type a secret (password, API key, token) into the prompt — those come from the \
+environment or a secrets store, not a question.";
 
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the

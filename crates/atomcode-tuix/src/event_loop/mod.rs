@@ -13952,8 +13952,9 @@ mod user_input_bypass_tests {
     }
 
     /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
-    /// The Bypass bypass delivers this response — the model sees "User declined to
-    /// answer." and continues with its own judgment.
+    /// The Bypass mode delivers this response — `format_result` turns it into a non-error
+    /// "No answer was provided…" message so the model proceeds with its own judgment
+    /// instead of treating the decline as an error to recover from.
     #[test]
     fn declined_response_shape() {
         use atomcode_capabilities::tools::request_user_input::UserInputResponse;

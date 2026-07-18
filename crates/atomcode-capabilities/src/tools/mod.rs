@@ -137,6 +137,15 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     }
     // Gate on ATOMCODE_REQUEST_USER_INPUT (default OFF — register only when set truthy;
     // 0/false/off/empty/absent → skip). Interactive user-input tool is opt-in until validated.
+    //
+    // INTENTIONAL DUPLICATION: the same env-var logic lives in
+    // `atomcode_config::config::request_user_input_enabled_from_env` (the authoritative
+    // helper used by atomcode-coding's persona gate).  We cannot call that helper here
+    // because `atomcode-config` is NOT a dependency of `atomcode-capabilities` under the
+    // `tools` feature (it would drag in unwanted transitive deps for embedders that only
+    // need the tools layer).  If you change the logic here, mirror the change in
+    // `atomcode-config/src/config/mod.rs::request_user_input_enabled_from_env` and vice
+    // versa.  The two blocks MUST stay in sync.
     let request_user_input_on = std::env::var("ATOMCODE_REQUEST_USER_INPUT")
         .ok()
         .map(|v| { let v = v.trim().to_ascii_lowercase(); !(v.is_empty() || v == "0" || v == "false" || v == "off") })
