@@ -295,4 +295,5 @@ export type ExtensionMessage =
   | { type: 'permissionRequest'; sessionId: string; id: string; toolName: string; reason: string; args: string; isDestructive: boolean }
   | { type: 'permissionResponseResult'; id: string; success: boolean; message?: string }
   | { type: 'resumeStreaming' }
-  | { type: 'setDraft'; text: string };
+  | { type: 'setDraft'; text: string }
+  | { type: 'chromeFont'; value: string | null };

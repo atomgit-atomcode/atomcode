@@ -135,10 +135,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _approvalModeState: ApprovalModeState = initApprovalModeState('build');
   public onModelSelected?: (model: string) => void;
 
+  private _configWatcher?: vscode.Disposable;
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _client: DaemonClient,
-  ) {}
+  ) {
+    // Apply a chat-font config change LIVE (set the CSS var in the DOM) instead of rebuilding
+    // the webview HTML — a rebuild would reset the active chat. Initial load is handled by the
+    // `{{fontStyle}}` injection in `_getHtml`.
+    this._configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (
+        e.affectsConfiguration('atomcode.chat.fontFamily') ||
+        e.affectsConfiguration('chatEditor.fontFamily')
+      ) {
+        this._broadcastChromeFont();
+      }
+    });
+  }
+
+  private _broadcastChromeFont() {
+    const msg = { type: 'chromeFont', value: resolveChatFontFamily() ?? null };
+    this._view?.webview.postMessage(msg);
+    for (const panel of this._panels.values()) {
+      panel.webview.postMessage(msg);
+    }
+  }
 
   private async _loadSessionsForDisplay(): Promise<LoadedSessionsForDisplay> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -164,6 +186,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public dispose() {
     this._clearLoginPoll();
+    this._configWatcher?.dispose();
   }
 
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
@@ -2161,9 +2184,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
     html = html.replace(/\{\{viewMode\}\}/g, mode);
     html = html.replace(/\{\{locale\}\}/g, vscode.env.language || 'en');
+    // VS Code injects `editor.fontFamily` as `--vscode-editor-font-family` but NOT
+    // `chatEditor.fontFamily` (that setting is for the built-in chat only). Resolve the chat
+    // font ourselves and, when set, override the monospace var so code blocks AND the input
+    // honor it. Empty → no override, so the CSS default (`--vscode-editor-font-family`) wins.
+    const font = resolveChatFontFamily();
+    // Always emit the element (empty when no font) with a stable id, so the live-update path
+    // (`chromeFont`) can edit THIS SAME rule — setting/clearing its text — instead of an inline
+    // `documentElement.style`, which could not clear a value that lives in a stylesheet rule.
+    html = html.replace(
+      /\{\{fontStyle\}\}/g,
+      `<style id="atomcode-chat-font">${font ? `:root{--app-monospace-font-family:${font};}` : ''}</style>`,
+    );
 
     return html;
   }
+}
+
+/**
+ * Read the chat monospace font from config and sanitize it for safe inlining into a
+ * `<style>` block. Precedence: `atomcode.chat.fontFamily` (our own setting) > VS Code's
+ * `chatEditor.fontFamily`. Returns `undefined` when neither is set (fall back to the CSS
+ * default, i.e. `editor.fontFamily`). The sanitizer strips anything that could break out of
+ * the CSS value (`<`, `>`, `{`, `}`, `;`, `:`, backslash, …) — a font-family value only ever
+ * needs letters, digits, spaces, quotes, commas, dots and hyphens.
+ */
+function resolveChatFontFamily(): string | undefined {
+  // Scoped reads, matching the rest of this file (`getConfiguration('atomcode')`): our own
+  // key, else VS Code's built-in `chatEditor.fontFamily`. `editor.fontFamily` is deliberately
+  // NOT read here — it already reaches the webview as `--vscode-editor-font-family` (the CSS
+  // default), so an empty result correctly falls through to it with no override.
+  const raw =
+    vscode.workspace.getConfiguration('atomcode').get<string>('chat.fontFamily', '').trim() ||
+    vscode.workspace.getConfiguration('chatEditor').get<string>('fontFamily', '').trim();
+  if (!raw) {
+    return undefined;
+  }
+  // A font-family value only needs letters, digits, spaces, quotes, commas, dots and hyphens.
+  // Strip everything else — incl. `<>{};:()\` and `url` would be inert but we drop `()` too —
+  // so the value cannot break out of the inlined `--app-monospace-font-family:VALUE;` declaration.
+  const safe = raw.replace(/[^a-zA-Z0-9 ,._'"-]/g, '').slice(0, 200).trim();
+  return safe || undefined;
 }
 
 function getNonce(): string {

@@ -92,7 +92,9 @@
   outline: none;
   resize: none;
   color: var(--app-input-foreground);
-  font-family: inherit;
+  /* Compose the chat input like a code editor: monospace, following the same font var as
+     code blocks (`editor.fontFamily`, overridable via `atomcode.chat.fontFamily`). */
+  font-family: var(--app-monospace-font-family);
   font-size: inherit;
   line-height: 1.5;
   min-height: 1.5em;
