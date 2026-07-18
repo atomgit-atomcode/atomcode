@@ -165,6 +165,8 @@ pub enum AgentCommand {
     ApproveToolAlways,
     /// Deny a pending tool call.
     DenyTool,
+    /// A driver's answer to a pending generic `AgentEvent::Request` (matched by `id`).
+    Respond { id: u64, value: serde_json::Value },
     /// Reload config from TUI (the single source of truth for in-memory config,
     /// including ephemeral OAuth providers). Switches to the new default provider.
     ReloadConfig(atomcode_config::config::Config),
@@ -350,6 +352,12 @@ pub enum AgentEvent {
         /// for approval).
         snapshot: ConversationSnapshot,
     },
+    /// Generic driver round-trip: the runtime raised an opaque interactive request
+    /// (`kind` + `payload`) that a driver must render and answer with
+    /// `AgentCommand::Respond { id, .. }`. Core is agnostic to `kind`/`payload` — the
+    /// domain-level mirror of the kernel's own `Request`, so interactive tools (e.g.
+    /// `request_user_input`) need no tool-specific core code.
+    Request { id: u64, kind: String, payload: serde_json::Value },
     /// Token usage update.
     TokenUsage(crate::stream::TokenUsage),
     /// The agent's current phase changed.
@@ -659,6 +667,19 @@ pub async fn compute_rich_context_stats(
         cold_zone_tokens,
         ctx_window: ctx.ctx_window(),
         ctx_name: ctx.name().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod generic_round_trip_tests {
+    use super::{AgentCommand, AgentEvent};
+
+    #[test]
+    fn core_generic_request_respond_variants_exist() {
+        let ev = AgentEvent::Request { id: 7, kind: "request_user_input".into(), payload: serde_json::json!({"q":1}) };
+        match ev { AgentEvent::Request { id, kind, .. } => { assert_eq!(id, 7); assert_eq!(kind, "request_user_input"); } _ => panic!() }
+        let cmd = AgentCommand::Respond { id: 7, value: serde_json::json!({"ok":true}) };
+        match cmd { AgentCommand::Respond { id, .. } => assert_eq!(id, 7), _ => panic!() }
     }
 }
 

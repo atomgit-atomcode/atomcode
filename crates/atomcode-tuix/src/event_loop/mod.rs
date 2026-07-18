@@ -11516,6 +11516,11 @@ fn handle_agent_event(
         AgentEvent::Steered { count } => {
             state.on_steered(count);
         }
+        // Placeholder: Task 6 (TUI wiring) replaces this with interactive
+        // prompt rendering and AgentCommand::Respond dispatch. Until then
+        // an unanswered Request will hang the turn — only fires when a
+        // request_user_input tool is active (not reachable in current code paths).
+        AgentEvent::Request { .. } => {}
     }
 }
 

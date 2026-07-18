@@ -1470,6 +1470,13 @@ impl Bridge {
                 self.loop_cancel.cancel();
                 return true;
             }
+            // Placeholder: Task 5 (bridge wiring) replaces this with real
+            // forwarding of the driver's Respond to the kernel's pending
+            // AgentEvent::Request round-trip. Until then, unanswered
+            // Request events will hang — those only fire when a
+            // request_user_input tool is active (not reachable in current
+            // code paths).
+            CoreCmd::Respond { .. } => {}
         }
         false
     }
