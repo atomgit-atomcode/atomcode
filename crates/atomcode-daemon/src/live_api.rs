@@ -1572,6 +1572,31 @@ pub(crate) fn agent_to_turn(ev: AgentEvent) -> Option<TurnEvent> {
             auto_resuming,
             server_message,
         },
+        AgentEvent::Request { id, kind, payload } if kind == "request_user_input" => {
+            TurnEvent::UserInputRequested {
+                request_id: id,
+                header: payload
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                question: payload
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                mode: payload
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("single")
+                    .to_string(),
+                options: payload
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            }
+        }
         _ => return None,
     })
 }
@@ -1940,6 +1965,14 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "permission_resolved")]
     PermissionResolved { call_id: String, decision: String },
+    #[serde(rename = "user_input_request")]
+    UserInputRequest {
+        request_id: u64,
+        header: String,
+        question: String,
+        mode: String,
+        options: Vec<serde_json::Value>,
+    },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -2082,13 +2115,23 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 auto_resuming,
                 server_message,
             },
+            TE::UserInputRequested {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            } => LiveWireEvent::UserInputRequest {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
             | TE::ToolBatchCompleted { .. }
             | TE::ContextStats { .. }
-            // request_user_input (webui stage 1): not surfaced over the SSE wire
-            // yet — a LiveWireEvent + frontend rendering is a later stage.
-            | TE::UserInputRequested { .. }
             | TE::WorkingDirChanged(_) => return None,
         },
     })
@@ -2569,6 +2612,38 @@ pub(crate) async fn live_permission(
         }
     };
     Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserInputAnswerReq {
+    pub request_id: u64,
+    pub declined: bool,
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// POST /live/user-input — Deliver the user's answer to a pending `request_user_input`
+/// question raised by the agent. First-come-first-served via `LiveSession.respond`.
+///
+/// Request body: `{ "request_id": u64, "declined": bool, "selected": [string], "text": string|null }`
+/// Response: `{ "accepted": bool }` — false if there is no live session or no pending request
+/// with that id.
+pub(crate) async fn live_user_input(
+    State(_state): State<AppState>,
+    Json(req): Json<UserInputAnswerReq>,
+) -> impl IntoResponse {
+    let value = serde_json::json!({
+        "declined": req.declined,
+        "selected": req.selected,
+        "text": req.text,
+    });
+    let ok = match current_live_session() {
+        Some(s) => s.respond(req.request_id, value).await,
+        None => false,
+    };
+    axum::Json(serde_json::json!({ "accepted": ok }))
 }
 
 #[derive(serde::Deserialize)]
@@ -3099,6 +3174,72 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // agent_to_turn must map AgentEvent::Request { kind="request_user_input" } →
+    // TurnEvent::UserInputRequested with all payload fields forwarded.
+    #[test]
+    fn agent_to_turn_request_user_input_maps_to_user_input_requested() {
+        use atomcode_core::agent::AgentEvent;
+        let payload = serde_json::json!({
+            "header": "Choose wisely",
+            "question": "Which option?",
+            "mode": "single",
+            "options": [
+                { "label": "Alpha", "description": "First choice" },
+                { "label": "Beta" }
+            ]
+        });
+        let result = agent_to_turn(AgentEvent::Request {
+            id: 7,
+            kind: "request_user_input".into(),
+            payload,
+        });
+        match result {
+            Some(TurnEvent::UserInputRequested {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            }) => {
+                assert_eq!(request_id, 7);
+                assert_eq!(header, "Choose wisely");
+                assert_eq!(question, "Which option?");
+                assert_eq!(mode, "single");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].get("label").and_then(|v| v.as_str()), Some("Alpha"));
+            }
+            other => panic!(
+                "expected Some(TurnEvent::UserInputRequested{{..}}), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // UserInputRequest must serialize with `"type":"user_input_request"` and carry
+    // `request_id` so the frontend can correlate the pending question.
+    #[test]
+    fn user_input_request_serializes_as_correct_type() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::UserInputRequested {
+            request_id: 42,
+            header: "Pick one".into(),
+            question: "Red or blue?".into(),
+            mode: "single".into(),
+            options: vec![
+                serde_json::json!({ "label": "Red" }),
+                serde_json::json!({ "label": "Blue" }),
+            ],
+        }))
+        .expect("UserInputRequested must produce a wire event");
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(
+            json.contains(r#""type":"user_input_request""#),
+            "wire type must be user_input_request: {json}"
+        );
+        assert!(json.contains(r#""request_id":42"#), "{json}");
+        assert!(json.contains(r#""mode":"single""#), "{json}");
+        assert!(json.contains("Red"), "{json}");
     }
 
     // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/

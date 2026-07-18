@@ -4514,6 +4514,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/message", post(live_api::live_message))
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
+        .route("/live/user-input", post(live_api::live_user_input))
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
