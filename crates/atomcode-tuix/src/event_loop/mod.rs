@@ -8401,6 +8401,18 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
         .ok();
 }
 
+/// Pure predicate: should a `request_user_input` tool call be auto-skipped
+/// without showing the interactive panel?
+///
+/// Only Bypass / 免审批 mode (`Mode::Auto`) skips the panel.  Build and Plan
+/// modes always show the panel (asking during coding/planning is intentional).
+/// Extracted as a pure function so the contract is unit-testable without a
+/// full `LoopCtx`.
+#[inline]
+pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool {
+    mode.is_auto()
+}
+
 /// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
 /// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
 /// the command↔decision contract (notably that an auto-approve sends `Allow`,
@@ -11765,6 +11777,16 @@ fn handle_agent_event(
                 UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
             };
             if kind == REQUEST_USER_INPUT_KIND {
+                // Bypass (免审批) mode: the user opted into full autonomy — do NOT
+                // interrupt with an interactive question panel.  Auto-answer with a
+                // declined response so the round-trip completes immediately and the
+                // model proceeds with its own best judgment.  Mirrors how Bypass
+                // auto-approves tool-call approval requests (see line ~10464).
+                // Build and Plan modes are unaffected — they still show the panel.
+                if user_input_should_auto_skip(state.agent_mode) {
+                    deliver_user_input(ctx, id, UserInputResponse::declined());
+                    return;
+                }
                 match serde_json::from_value::<UserInputRequest>(payload) {
                     Ok(req) => {
                         state.user_input_panel =
@@ -13885,5 +13907,59 @@ mod format_shell_command_tests {
         for line in &out {
             assert!(!line.trim().is_empty(), "no empty line in output: {:?}", out);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_input_bypass_tests {
+    use super::user_input_should_auto_skip;
+    use crate::state::AgentMode;
+
+    /// Bypass (Auto) mode → panel must be skipped.
+    #[test]
+    fn bypass_mode_skips_panel() {
+        assert!(
+            user_input_should_auto_skip(AgentMode::Auto),
+            "Bypass/Auto mode must auto-skip the user_input panel"
+        );
+    }
+
+    /// Build mode → panel must be shown (no skip).
+    #[test]
+    fn build_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Build),
+            "Build mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Plan mode → panel must be shown (planning explicitly asks the user).
+    #[test]
+    fn plan_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Plan),
+            "Plan mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// AcceptEdits mode → panel must be shown (only file edits are auto-approved).
+    #[test]
+    fn accept_edits_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::AcceptEdits),
+            "AcceptEdits mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
+    /// The Bypass bypass delivers this response — the model sees "User declined to
+    /// answer." and continues with its own judgment.
+    #[test]
+    fn declined_response_shape() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let r = UserInputResponse::declined();
+        assert!(r.declined, "declined() must set declined=true");
+        assert!(r.text.is_none(), "declined() must have no text");
+        assert!(r.selected.is_empty(), "declined() must have no selections");
     }
 }
