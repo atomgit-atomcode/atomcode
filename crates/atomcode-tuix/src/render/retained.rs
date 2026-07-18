@@ -2364,8 +2364,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let body = match panel.mode {
-            // options + the `✎ 自己输入` custom row + the `✔ 提交` submit row.
-            UserInputMode::Single | UserInputMode::Multiple => panel.options.len() + 2,
+            // Single: options + the `✎ 自己输入` custom row (NO submit row).
+            UserInputMode::Single => panel.options.len() + 1,
+            // Multiple: options + the `✎ 自己输入` custom row + the `✔ 提交` submit row.
+            UserInputMode::Multiple => panel.options.len() + 2,
             UserInputMode::Text => 1,
         };
         // 1 header (question) + body + 1 hint.
@@ -2402,6 +2404,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         match panel.mode {
             UserInputMode::Single | UserInputMode::Multiple => {
                 let multiple = matches!(panel.mode, UserInputMode::Multiple);
+                let single = !multiple;
                 // Helper closure to emit one navigable row: marker (cursor),
                 // content, and (when highlighted) full-width reverse padding.
                 let custom_row = panel.options.len();
@@ -2484,8 +2487,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                 }
 
-                // Submit row: `✔ 提交`. Highlighted when the cursor is on it.
-                {
+                // Submit row: `✔ 提交`. Only rendered for multiple mode.
+                // Single mode has no submit row — Enter on an option or the
+                // custom row submits immediately.
+                if !single {
                     let selected = panel.cursor == submit_row;
                     let marker = if selected {
                         if unicode { "\u{25b8} " } else { "> " }
@@ -2535,7 +2540,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Hint row: mode-appropriate guidance, muted + glyph-downgraded.
         let hint_raw = match panel.mode {
-            UserInputMode::Single | UserInputMode::Multiple => {
+            UserInputMode::Single => {
+                "↑↓ 移动 · Enter 选择并提交 · 自己输入行打字后 Enter 提交 · Esc 取消"
+            }
+            UserInputMode::Multiple => {
                 "↑↓ 移动 · Enter 选中 · 提交行确认 · Esc 取消"
             }
             UserInputMode::Text => "type answer · Enter confirm · Esc cancel",
@@ -12025,9 +12033,9 @@ mod tests {
                 text: String::new(),
                 custom_text: String::new(),
             };
-            // Row count contract: header + options + custom + submit + hint,
-            // and it MUST equal the produced row count.
-            assert_eq!(r.user_input_panel_row_count(&view), 2 + 2 + 2);
+            // Row count contract for single: header + options + custom + hint (NO submit row).
+            // 2 options + 1 custom + 1 header + 1 hint = 5 rows.
+            assert_eq!(r.user_input_panel_row_count(&view), 1 + 2 + 1 + 1);
             assert_eq!(
                 r.build_user_input_rows(&view, 78, 80).len(),
                 r.user_input_panel_row_count(&view),
@@ -12045,7 +12053,8 @@ mod tests {
             assert!(vterm.any_row(|r| r.contains("(•) API key")), "radio option 2 checked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("▸") && r.contains("API key")), "cursor marker on option 2\n{dump}");
             assert!(vterm.any_row(|r| r.contains('自')), "custom free-text row\n{dump}");
-            assert!(vterm.any_row(|r| r.contains('提')), "submit row\n{dump}");
+            // Single mode must NOT have a submit row.
+            assert!(!vterm.any_row(|r| r.trim_start().starts_with('\u{2714}') || r.trim_start().starts_with('+')), "single must NOT render a submit row\n{dump}");
         }
 
         // Multiple: checkbox prefixes reflect the `checked` flags; custom row

@@ -111,18 +111,28 @@ impl UserInputPanel {
             custom_text: String::new(),
         }
     }
-    /// Last navigable cursor index for single/multiple mode: the submit row at
-    /// `options.len() + 1` (options, then the custom-text row, then submit).
+    /// Last navigable cursor index for single/multiple mode.
+    /// Single: the custom-text row at `options.len()` (no submit row).
+    /// Multiple: the submit row at `options.len() + 1` (custom then submit).
     fn last_row(&self) -> usize {
-        self.options.len() + 1
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Single => self.options.len(),
+            _ => self.options.len() + 1,
+        }
     }
     /// Whether `cursor` is on the `✎ 自己输入…` free-text row.
     pub fn is_custom_row(&self) -> bool {
         self.cursor == self.options.len()
     }
     /// Whether `cursor` is on the `✔ 提交` submit row.
+    /// In single mode there is no submit row — always returns `false`.
     pub fn is_submit_row(&self) -> bool {
-        self.cursor == self.options.len() + 1
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Single => false,
+            _ => self.cursor == self.options.len() + 1,
+        }
     }
     pub fn move_up(&mut self) {
         if self.cursor > 0 {
@@ -229,6 +239,41 @@ impl UserInputPanel {
                 selected: vec![],
                 text: Some(self.text.clone()),
             }),
+        }
+    }
+
+    /// For **single** mode only: if the cursor is on a concrete option row,
+    /// return an immediate `{selected:[label]}` response; if the cursor is on
+    /// the custom row AND `custom_text` (trimmed) is non-empty, return
+    /// `{selected:[custom_text]}`; otherwise `None` (no-op, keep open).
+    ///
+    /// Multiple and text mode always return `None` — they use the submit-row /
+    /// Enter-buffer flow instead.
+    pub fn try_immediate_response(
+        &self,
+    ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+        if !matches!(self.mode, UserInputMode::Single) {
+            return None;
+        }
+        if self.cursor < self.options.len() {
+            // Concrete option row.
+            let label = self.options[self.cursor].clone();
+            Some(UserInputResponse { declined: false, selected: vec![label], text: None })
+        } else if self.is_custom_row() {
+            // Custom-text row: submit only when there is something typed.
+            let custom = self.custom_text.trim();
+            if custom.is_empty() {
+                None // no-op
+            } else {
+                Some(UserInputResponse {
+                    declined: false,
+                    selected: vec![custom.to_string()],
+                    text: None,
+                })
+            }
+        } else {
+            None
         }
     }
 }
@@ -2114,15 +2159,14 @@ mod tests {
         let mut p = UserInputPanel::new(7, &single_req);
         assert_eq!(p.request_id, 7);
         assert_eq!(p.cursor, 0);
-        // Cursor spans options (0..3), the custom row (3), and the submit row
-        // (4). move_down clamps at the submit row (no wrap).
+        // Single: cursor spans options (0..3) and the custom row (3) — NO submit
+        // row. move_down clamps at the custom row (options.len()).
         for _ in 0..10 {
             p.move_down();
         }
-        assert_eq!(p.cursor, 4, "move_down clamps at the submit row (options+1)");
-        assert!(p.is_submit_row());
-        p.move_up();
-        assert!(p.is_custom_row(), "row above submit is the custom-text row");
+        assert_eq!(p.cursor, 3, "single move_down clamps at the custom row (options.len())");
+        assert!(p.is_custom_row(), "single cursor clamps at the custom-text row");
+        assert!(!p.is_submit_row(), "single has no submit row");
         // move_up clamps at 0.
         for _ in 0..10 {
             p.move_up();
