@@ -11792,7 +11792,13 @@ fn handle_agent_event(
                         state.user_input_panel =
                             Some(crate::state::UserInputPanel::new(id, &req));
                         state.phase = UiPhase::UserInput;
-                        renderer.flush();
+                        // Rebuild the StatusLine (via build_status) and repaint the
+                        // footer so the panel actually renders — `renderer.flush()`
+                        // alone only flushes the existing diff and never rebuilds the
+                        // status, leaving the panel state set but INVISIBLE (the user
+                        // then blindly presses Esc → decline). Mirrors the approval
+                        // arm, which calls `redraw_idle_plain` for exactly this reason.
+                        redraw_idle_plain(buf, state, ctx, renderer);
                     }
                     // Malformed payload → decline so the tool returns gracefully.
                     Err(_) => deliver_user_input(ctx, id, UserInputResponse::declined()),
