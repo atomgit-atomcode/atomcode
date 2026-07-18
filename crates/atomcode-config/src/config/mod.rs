@@ -572,6 +572,19 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
     }
 }
 
+/// Resolve the effective `request_user_input` tool switch: DEFAULT-OFF semantics.
+/// Returns `true` only when `env` is `Some` and NOT one of `""`/`"0"`/`"false"`/`"off"`
+/// (case-insensitive, trimmed). `None` → `false`.
+/// Used by the persona guidance gate AND (via caller) the tool-registration gate so the
+/// two can never disagree.
+pub fn request_user_input_enabled_from_env(env: Option<&str>) -> bool {
+    match env.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(v) if v.is_empty() || v == "0" || v == "false" || v == "off" => false,
+        Some(_) => true,
+    }
+}
+
 impl Default for DatalogConfig {
     fn default() -> Self {
         Self {
@@ -1126,6 +1139,25 @@ mod tests {
         assert!(!super::todo_enabled_from_env(Some("0"), true));
         assert!(super::todo_enabled_from_env(Some("1"), false));
         assert!(super::todo_enabled_from_env(None, true));  // 无 env → 用 config 值
+    }
+
+    #[test]
+    fn request_user_input_enabled_default_off() {
+        // None → false (default-off)
+        assert!(!super::request_user_input_enabled_from_env(None));
+        // Falsy values → false
+        assert!(!super::request_user_input_enabled_from_env(Some("")));
+        assert!(!super::request_user_input_enabled_from_env(Some("0")));
+        assert!(!super::request_user_input_enabled_from_env(Some("false")));
+        assert!(!super::request_user_input_enabled_from_env(Some("FALSE")));
+        assert!(!super::request_user_input_enabled_from_env(Some("off")));
+        assert!(!super::request_user_input_enabled_from_env(Some("OFF")));
+        assert!(!super::request_user_input_enabled_from_env(Some("  off  ")));
+        // Truthy values → true
+        assert!(super::request_user_input_enabled_from_env(Some("1")));
+        assert!(super::request_user_input_enabled_from_env(Some("true")));
+        assert!(super::request_user_input_enabled_from_env(Some("yes")));
+        assert!(super::request_user_input_enabled_from_env(Some("on")));
     }
 
     /// Migration: on-disk config that looks like it was auto-written by

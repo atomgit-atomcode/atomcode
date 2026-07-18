@@ -26,6 +26,17 @@ pub(crate) fn todo_switch_enabled() -> bool {
     )
 }
 
+/// Single source of truth for the `request_user_input` tool switch across every
+/// `coding_persona` call site AND the capabilities tool-registration gate
+/// (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF). Keeping all call sites on
+/// this helper guarantees the system-prompt guidance and the mounted tool never
+/// disagree — the model is NEVER told to call a tool that isn't registered.
+pub(crate) fn request_user_input_switch_enabled() -> bool {
+    atomcode_config::config::request_user_input_enabled_from_env(
+        std::env::var("ATOMCODE_REQUEST_USER_INPUT").ok().as_deref(),
+    )
+}
+
 /// Whether the `memory` tool is mounted (mirrors the registration gate in
 /// `register_coding_tools_with_vision`): env `ATOMCODE_MEMORY_TOOL` != 0/false/off.
 pub(crate) fn memory_tool_enabled() -> bool {
@@ -55,7 +66,7 @@ pub fn offline_environment_block() -> String {
     s
 }
 
-pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
+pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enabled: bool) -> String {
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
     let mut p = format!(
         "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
@@ -103,6 +114,15 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // phantom tool call. `todo_enabled` is that switch, resolved by the caller.
     if todo_enabled {
         p.push_str(TODO_USAGE);
+    }
+    // `request_user_input` tool usage guidance — surfaced in the system prompt so weak models
+    // (GLM / DeepSeek) that under-weight tool descriptions still see the judgment line.
+    // MUST stay gated on the SAME condition as the tool registration in `atomcode-capabilities`
+    // (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF): instructing the model to call a tool
+    // that isn't mounted provokes phantom tool calls. `request_user_input_enabled` is that
+    // switch, resolved by the caller via `request_user_input_switch_enabled()`.
+    if request_user_input_enabled {
+        p.push_str(REQUEST_USER_INPUT_USAGE);
     }
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
@@ -243,6 +263,19 @@ than carrying stale items forward — but do NOT reset or empty the list merely 
 or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
 use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
 
+/// Asking-the-user guidance for the system prompt. Judgment-framed: call
+/// `request_user_input` only when the decision is genuinely the user's to make —
+/// not for things the code, the task, or a quick check already answers. Only
+/// injected when the `request_user_input` tool is actually mounted (see the
+/// `request_user_input_enabled` gate in `coding_persona`).
+const REQUEST_USER_INPUT_USAGE: &str = "\n\n## ASKING THE USER:\n\
+When you reach a decision that is genuinely the USER'S to make — a preference, a credential or \
+confirmation, or a choice between approaches where no option is clearly correct from the code or \
+the task — call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` \
+with concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask \
+ONLY for what you genuinely cannot decide, look up, or verify yourself — never for something the \
+code, the task, or a quick check already answers. One focused question at a time.";
+
 /// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
 /// learnings — not standard facts or session one-offs. Only injected when the
 /// `memory` tool is actually mounted (see the `memory_tool_enabled()` gate in
@@ -340,6 +373,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_user_input_guidance_gated() {
+        let on = coding_persona("deepseek-v4-flash", false, true);
+        assert!(on.contains("## ASKING THE USER"), "enabled → guidance present");
+        assert!(on.contains("request_user_input"), "enabled → names the tool");
+        let off = coding_persona("deepseek-v4-flash", false, false);
+        assert!(!off.contains("## ASKING THE USER"), "disabled → no guidance");
+    }
+
+    #[test]
     fn date_anchor_line_formats_env_block() {
         assert_eq!(
             date_anchor_line("2099-01-02 (Friday)"),
@@ -352,7 +394,7 @@ mod tests {
         // Gating parity: the system-prompt todo guidance must appear iff the
         // `todowrite` tool + hook are mounted (same ATOMCODE_TODO switch), else the
         // model would be told to call a tool that isn't there.
-        let on = coding_persona("glm-5.2", true);
+        let on = coding_persona("glm-5.2", true, false);
         assert!(on.contains("## TASK TRACKING"), "enabled → guidance present");
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
         // Threshold disambiguation: count steps, not tool calls (fixes weak-model
@@ -362,7 +404,7 @@ mod tests {
             "guidance must disambiguate steps from tool calls: {on}"
         );
 
-        let off = coding_persona("glm-5.2", false);
+        let off = coding_persona("glm-5.2", false, false);
         assert!(!off.contains("## TASK TRACKING"), "disabled → no guidance");
         assert!(
             !off.contains("todowrite"),
@@ -374,7 +416,7 @@ mod tests {
     fn todo_guidance_is_judgment_framed_not_mandatory() {
         // Not a blanket mandate — must carry the explicit skip clause so trivial
         // tasks don't get a checklist.
-        let p = coding_persona("glm-5.2", true);
+        let p = coding_persona("glm-5.2", true, false);
         assert!(
             p.contains("Do NOT use it for a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
@@ -389,7 +431,7 @@ mod tests {
         // weak model over-applies, wiping a still-valid in_progress plan. Framed as
         // replace-on-genuine-redirect and gated on multi-step new work, so a mere
         // clarifying question (no new steps) leaves the current list untouched.
-        let on = coding_persona("deepseek-v4-flash", true);
+        let on = coding_persona("deepseek-v4-flash", true, false);
         assert!(
             on.contains("REPLACE the old one"),
             "must direct replacing the list on redirect: {on}"
@@ -404,7 +446,7 @@ mod tests {
         );
 
         // Gating parity: absent when the todo tool/hook aren't mounted.
-        let off = coding_persona("deepseek-v4-flash", false);
+        let off = coding_persona("deepseek-v4-flash", false, false);
         assert!(
             !off.contains("REPLACE the old one"),
             "disabled → no redirect guidance: {off}"
@@ -415,13 +457,13 @@ mod tests {
     fn persona_carries_a_current_date_anchor() {
         // Every round needs a date anchor (round 1 is skipped by StatusReminderHook),
         // else web_search defaults to the training year.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(p.contains("Today's date:"), "persona must carry a date anchor: {p}");
     }
 
     #[test]
     fn persona_carries_model_and_anchors() {
-        let p = coding_persona("deepseek-chat", true);
+        let p = coding_persona("deepseek-chat", true, false);
         assert!(
             p.contains("running the deepseek-chat model"),
             "identity must carry the model"
@@ -473,7 +515,7 @@ mod tests {
     fn persona_carries_behavioral_guardrails() {
         // Three v1 guardrails the initial v2 port dropped, restored for parity with the
         // legacy engine (peer agents like opencode keep them too).
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             p.contains("Prioritize technical correctness over agreeing with the user"),
             "anti-sycophancy guardrail (DOING TASKS)"
@@ -493,7 +535,7 @@ mod tests {
         // Users reported "system_prompt too strong, my own global rules carry no weight".
         // The persona must explicitly cede precedence to the injected GLOBAL/PROJECT/USER
         // instruction files (AGENTS.md etc.), mirroring codex / Claude Code.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(p.contains("## PRECEDENCE:"), "has a PRECEDENCE section");
         assert!(p.contains("AGENTS.md"), "names the user instruction files");
         assert!(
@@ -515,7 +557,7 @@ mod tests {
         // models like GLM over-comment with line-by-line narration); the initial v2 port
         // dropped it. Restore parity and cross-ref CHINESE CODE SUPPORT so the volume
         // limit applies to NEW comments only, never to existing (incl. Chinese) ones.
-        let p = coding_persona("glm-5.2", true);
+        let p = coding_persona("glm-5.2", true, false);
         assert!(
             p.contains("comment density"),
             "must keep the soft comment-density rule: {p}"
@@ -531,7 +573,7 @@ mod tests {
         // "minimal tool calls" contradicts the `## TOOLS:` section (which urges maximal
         // parallel calls) and can push weak models to under-read / guess. The real cost is
         // round-trip latency, so the opening line must target round-trips, not tool count.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             p.contains("minimizing round-trips"),
             "opening line must frame efficiency as round-trips: {p}"
@@ -547,7 +589,7 @@ mod tests {
         // Many bugs (UI/rendering, intermittent, state-dependent) have no single runnable
         // command; the old absolute "run the failing command BEFORE reading code" made weak
         // models burn a round or fabricate a repro. The step must be conditional.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             p.contains("when a runnable reproduction exists"),
             "REPRODUCE must be conditional on a runnable repro: {p}"
@@ -566,7 +608,7 @@ mod tests {
         // to use it — otherwise the model obeys, calls an unmounted tool, and
         // hits "unknown or unmounted tool: change_dir" (the reported
         // regression), then misleadingly claims `bash cd` switched the dir.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             !p.contains("change_dir"),
             "persona must not advertise the unmounted `change_dir` tool"
@@ -586,7 +628,7 @@ mod tests {
         // (the reported "I'll write it in one go" → finish_reason=length failure).
         // The persona must steer toward INCREMENTAL file writes instead. Guard the
         // exact failure mode so nobody re-introduces the one-shot advice.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             p.contains("## CONTENT-TRANSFORMATION:"),
             "content-transformation section must exist"
@@ -612,7 +654,7 @@ mod tests {
     fn persona_drops_compaction_claim() {
         // Still must NOT make the over-stated "unlimited context" promise, and must
         // not reuse production's `## CONTEXT:` header (we use `## CONTEXT MANAGEMENT:`).
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             !p.contains("not limited by the context window"),
             "no false compaction promise"
@@ -628,7 +670,7 @@ mod tests {
         // Regression: without this, GLM/DeepSeek suggest "start a new conversation"
         // around ~80% context. The persona must own context management so the model
         // doesn't push that onto the user.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(p.contains("## CONTEXT MANAGEMENT:"), "context-management section present");
         assert!(
             p.contains("start a new conversation"),
@@ -638,7 +680,7 @@ mod tests {
 
     #[test]
     fn persona_has_v1_parity_sections() {
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         for s in [
             "## GIT COMMITS:",
             "## CONTENT-TRANSFORMATION:",
@@ -673,7 +715,7 @@ mod tests {
 
     #[test]
     fn persona_prefers_builtin_tools_over_shell_equivalents() {
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         for phrase in [
             "not `bash cat`",
             "instead of `bash ls`",
@@ -697,7 +739,7 @@ mod tests {
         // `bash ls -la` for almost anything. Replace the vague condition with one
         // concrete exception (sizes/permissions/timestamps) so the default is
         // unambiguous, while still preferring list_directory over `bash ls`.
-        let p = coding_persona("m", true);
+        let p = coding_persona("m", true, false);
         assert!(
             !p.contains("when a tree view is enough"),
             "the vague escape hatch must be gone: {p}"
@@ -719,14 +761,14 @@ mod tests {
         // Give them an extra, blunt restatement at the model's decision point. Models
         // that already comply don't need the extra tokens.
         for weak in ["glm-5.2", "GLM-4.6", "deepseek-v4-flash"] {
-            let p = coding_persona(weak, true);
+            let p = coding_persona(weak, true, false);
             assert!(
                 p.contains("## TOOL DISCIPLINE"),
                 "{weak} must get the firm tool-discipline block: {p}"
             );
         }
         for strong in ["claude-opus-4-8", "gpt-5", "m"] {
-            let p = coding_persona(strong, true);
+            let p = coding_persona(strong, true, false);
             assert!(
                 !p.contains("## TOOL DISCIPLINE"),
                 "{strong} must not carry the extra firm block"
@@ -739,7 +781,7 @@ mod tests {
         // The behavior block is DeepSeek-only (its execution behavior was the one reported to
         // slip): silently deleting code/tests to clear errors, shipping unverified edits,
         // offloading doable work, quitting after one failure, treating stale memory as truth.
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         assert!(p.contains("## EXECUTION DISCIPLINE"), "deepseek must get the block: {p}");
         // The five behaviors it must cover.
         assert!(p.contains("FIX, DON'T HIDE"), "must forbid deleting code to clear errors");
@@ -755,7 +797,7 @@ mod tests {
         // GLM is deliberately EXCLUDED from the behavior block (option A) — but STILL gets
         // the tool block. Frontier models get neither.
         for glm in ["glm-5.2", "GLM-4.6"] {
-            let p = coding_persona(glm, true);
+            let p = coding_persona(glm, true, false);
             assert!(
                 !p.contains("## EXECUTION DISCIPLINE"),
                 "{glm} must NOT get the execution block (it is more capable): {p}"
@@ -766,7 +808,7 @@ mod tests {
             );
         }
         for strong in ["claude-opus-4-8", "gpt-5", "m"] {
-            let p = coding_persona(strong, true);
+            let p = coding_persona(strong, true, false);
             assert!(!p.contains("## EXECUTION DISCIPLINE"), "{strong}: no execution block");
             assert!(!p.contains("## TOOL DISCIPLINE"), "{strong}: no tool block");
         }
@@ -786,7 +828,7 @@ mod tests {
         // Deliberately NOT opencode's "beast mode": a "keep going forever / never end your
         // turn" framing trades the offload failure for runaway loops + out-of-scope changes.
         // The legitimate stop conditions must remain explicit, and SCOPE discipline unchanged.
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         assert!(
             !p.to_lowercase().contains("never end your turn")
                 && !p.to_lowercase().contains("keep going until"),
@@ -830,7 +872,7 @@ mod tests {
         use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::On, None);
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block must appear when offline: {p}");
         reset_offline_verdict_for_test();
     }
@@ -841,7 +883,7 @@ mod tests {
         use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::Off, None);
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         assert!(!p.contains("## OFFLINE ENVIRONMENT:"), "offline block must NOT appear when online: {p}");
         reset_offline_verdict_for_test();
     }
@@ -853,7 +895,7 @@ mod tests {
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::On, None);
         set_offline_note(Some("npm via nexus.internal".to_string()));
-        let p = coding_persona("deepseek-v4-flash", true);
+        let p = coding_persona("deepseek-v4-flash", true, false);
         assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block header must appear: {p}");
         assert!(p.contains("npm via nexus.internal"), "offline note must be appended: {p}");
         reset_offline_verdict_for_test();
@@ -863,7 +905,7 @@ mod tests {
     #[serial_test::serial(atomcode_memory_tool_env)]
     fn persona_includes_memory_guidance_when_enabled() {
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
-        let p = coding_persona("glm-5.2", true);
+        let p = coding_persona("glm-5.2", true, false);
         assert!(p.contains("## MEMORY"), "memory guidance present when tool enabled");
     }
 
@@ -871,7 +913,7 @@ mod tests {
     #[serial_test::serial(atomcode_memory_tool_env)]
     fn persona_omits_memory_guidance_when_env_off() {
         std::env::set_var("ATOMCODE_MEMORY_TOOL", "0");
-        let p = coding_persona("glm-5.2", true);
+        let p = coding_persona("glm-5.2", true, false);
         assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
     }
