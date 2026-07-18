@@ -6476,6 +6476,7 @@ fn handle_input(
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::UserInput => handle_user_input_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -8855,6 +8856,47 @@ fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
     }
 }
 
+/// Send a `request_user_input` answer through the native runtime protocol.
+fn deliver_user_input(
+    ctx: &mut LoopCtx,
+    id: u64,
+    resp: atomcode_capabilities::tools::request_user_input::UserInputResponse,
+) {
+    let value = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+        .ok();
+}
+
+/// Fail-close: respond with `Null` so the tool round-trip resolves as
+/// "not supported in this environment" instead of hanging the turn.
+fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
+    if ctx.pending_runtime_request_id == Some(id) {
+        ctx.pending_runtime_request_id = None;
+    }
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::Respond {
+            id,
+            value: serde_json::Value::Null,
+        })
+        .ok();
+}
+
+/// Pure predicate: should a `request_user_input` tool call be auto-skipped
+/// without showing the interactive panel?
+///
+/// Only Bypass / 免审批 mode (`Mode::Auto`) skips the panel.  Build and Plan
+/// modes always show the panel (asking during coding/planning is intentional).
+/// Extracted as a pure function so the contract is unit-testable without a
+/// full `LoopCtx`.
+#[inline]
+pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool {
+    mode.is_auto()
+}
+
 /// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
 /// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
 /// the command↔decision contract (notably that an auto-approve sends `Allow`,
@@ -9017,6 +9059,119 @@ mod bypass_approval_tests {
     }
 }
 
+#[cfg(test)]
+mod user_input_key_tests {
+    use super::user_input_response_for;
+    use crate::state::UserInputPanel;
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+    use crossterm::event::KeyCode;
+
+    fn panel(mode: UserInputMode) -> UserInputPanel {
+        UserInputPanel::new(
+            42,
+            &UserInputRequest {
+                header: "H".into(),
+                question: "Q?".into(),
+                mode,
+                options: vec![
+                    UserInputOption { label: "A".into(), description: None },
+                    UserInputOption { label: "B".into(), description: None },
+                ],
+            },
+        )
+    }
+
+    // Esc always declines, regardless of mode.
+    #[test]
+    fn esc_declines_in_every_mode() {
+        for m in [UserInputMode::Single, UserInputMode::Multiple, UserInputMode::Text] {
+            let resp = user_input_response_for(&panel(m), KeyCode::Esc).expect("Esc resolves");
+            assert!(resp.declined, "Esc must decline");
+        }
+    }
+
+    // Single: Enter yields exactly the highlighted label.
+    #[test]
+    fn single_enter_yields_cursor_label() {
+        let mut p = panel(UserInputMode::Single);
+        p.move_down(); // cursor → "B"
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert!(!resp.declined);
+        assert_eq!(resp.selected, vec!["B".to_string()]);
+        assert_eq!(resp.text, None);
+    }
+
+    // Multiple: Enter yields all checked labels (order = option order).
+    #[test]
+    fn multiple_enter_yields_checked_labels() {
+        let mut p = panel(UserInputMode::Multiple);
+        p.toggle(); // check "A"
+        p.move_down();
+        p.toggle(); // check "B"
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert_eq!(resp.selected, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(resp.text, None);
+    }
+
+    // Text: Enter yields the buffer via `text`, never `selected`.
+    #[test]
+    fn text_enter_yields_buffer() {
+        let mut p = panel(UserInputMode::Text);
+        p.text.push_str("hi there");
+        let resp = user_input_response_for(&p, KeyCode::Enter).expect("Enter resolves");
+        assert!(!resp.declined);
+        assert!(resp.selected.is_empty());
+        assert_eq!(resp.text.as_deref(), Some("hi there"));
+    }
+
+    // Navigation / typing keys do NOT resolve (return None so the caller mutates
+    // in place instead of closing the panel).
+    #[test]
+    fn navigation_keys_do_not_resolve() {
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Up).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Down).is_none());
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('x')).is_none()
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Backspace).is_none()
+        );
+    }
+
+    // Ctrl+C must NOT be handled by `user_input_response_for` (which is
+    // modifier-unaware): the plain `Char('c')` key must pass through as None so
+    // it does not accidentally type 'c' into a text buffer.  The actual Ctrl+C
+    // cancel path is handled upstream in `handle_user_input_key` before this
+    // function is called.
+    #[test]
+    fn ctrl_c_char_does_not_resolve_via_pure_fn() {
+        // Char('c') without a modifier check is a navigation/typing key → None.
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Text), KeyCode::Char('c')).is_none(),
+            "Char('c') alone must not resolve — Ctrl+C is handled upstream with modifier check"
+        );
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Single), KeyCode::Char('c')).is_none(),
+        );
+    }
+
+    // Ctrl+C sends a declined response — verify the shape UserInputResponse::declined()
+    // produces, since that is what handle_user_input_key delivers on Ctrl+C.
+    #[test]
+    fn ctrl_c_delivers_declined_response() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let resp = UserInputResponse::declined();
+        assert!(resp.declined, "Ctrl+C must produce a declined response");
+        assert!(resp.selected.is_empty(), "declined response must have no selections");
+        assert!(resp.text.is_none(), "declined response must have no text");
+    }
+}
+
 fn handle_approval_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -9105,6 +9260,110 @@ fn handle_approval_key(
                                       // (approval still `Some`) until the next event that carries a fresh
                                       // `StatusLine`, leaving a ghost panel over the input box (the inverse of
                                       // issue #455's "输入框没了" — here the panel lingers after a decision).
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+/// Pure resolver for `request_user_input` keys that FINISH the prompt (produce a
+/// response), extracted so the mode→response contract is unit-testable without a
+/// `LoopCtx` / channel. Returns:
+///   - `Some(resp)` — this key resolves the panel; caller should clear + deliver.
+///   - `None`       — this key is navigation / typing / ignored; caller mutates
+///                    the panel in place (handled in `handle_user_input_key`).
+///
+/// Esc always declines. Enter resolves per mode (single/multiple → selected
+/// labels; text → the buffer). Nav keys (↑↓, space, char/backspace in text)
+/// return `None`.
+pub(crate) fn user_input_response_for(
+    panel: &crate::state::UserInputPanel,
+    code: KeyCode,
+) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+    use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+    match (&panel.mode, code) {
+        (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
+        (UserInputMode::Text, KeyCode::Enter) => Some(UserInputResponse {
+            declined: false,
+            selected: vec![],
+            text: Some(panel.text.clone()),
+        }),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Enter) => {
+            Some(UserInputResponse { declined: false, selected: panel.chosen(), text: None })
+        }
+        _ => None,
+    }
+}
+
+/// Key handling while `UiPhase::UserInput`. Mirrors `handle_approval_key`:
+/// resolving keys (Esc / Enter) clear the panel and deliver an
+/// `AgentCommand::Respond`; navigation / typing mutate the panel in place and
+/// repaint. `user_input_response_for` owns the (mode, key) → response contract.
+fn handle_user_input_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    let Some(panel) = app.state.user_input_panel.as_ref() else {
+        return Ok(());
+    };
+    let id = panel.request_id;
+    let mode = panel.mode.clone();
+
+    // Ctrl+C: decline the pending request (so the tool round-trip is answered,
+    // not left hanging) and then cancel the running turn — exactly like Ctrl+C
+    // during Streaming stops generation.  Checked BEFORE the Char(c) arm so
+    // Ctrl+C does not type 'c' into a text-mode buffer.
+    use crossterm::event::KeyModifiers;
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, UserInputResponse::declined());
+        cancel_active_turn(ctx);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Resolving keys (Esc / Enter): compute the response, clear the panel, and
+    // deliver it. Repaint so the panel disappears immediately.
+    if let Some(resp) = user_input_response_for(panel, code) {
+        app.state.on_user_input_resolved();
+        deliver_user_input(ctx, id, resp);
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // Non-resolving keys: mutate the panel in place, then repaint.
+    match (mode, code) {
+        (UserInputMode::Text, KeyCode::Char(c)) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.push(c);
+            }
+        }
+        (UserInputMode::Text, KeyCode::Backspace) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.text.pop();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_up();
+            }
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.move_down();
+            }
+        }
+        (UserInputMode::Multiple, KeyCode::Char(' ')) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.toggle();
+            }
+        }
+        // Any other key is ignored (no state change, no repaint needed).
+        _ => return Ok(()),
+    }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
@@ -9938,14 +10197,34 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::Request(request) => {
-                    use atomcode_capabilities::tools::{ApprovalRequest, APPROVAL_KIND};
+                    use atomcode_capabilities::tools::{
+                        request_user_input::{
+                            UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
+                        },
+                        ApprovalRequest, APPROVAL_KIND,
+                    };
+                    if request.kind == REQUEST_USER_INPUT_KIND {
+                        if user_input_should_auto_skip(state.agent_mode) {
+                            deliver_user_input(ctx, request.id, UserInputResponse::declined());
+                            return;
+                        }
+                        match serde_json::from_value::<UserInputRequest>(request.payload) {
+                            Ok(input) => {
+                                state.user_input_panel =
+                                    Some(crate::state::UserInputPanel::new(request.id, &input));
+                                state.phase = UiPhase::UserInput;
+                                redraw_idle_plain(buf, state, ctx, renderer);
+                            }
+                            Err(_) => deliver_user_input(
+                                ctx,
+                                request.id,
+                                UserInputResponse::declined(),
+                            ),
+                        }
+                        return;
+                    }
                     if request.kind != APPROVAL_KIND {
-                        ctx.runtime
-                            .dispatch(atomcode_coding::DriverCommand::Respond {
-                                id: request.id,
-                                value: serde_json::Value::Null,
-                            })
-                            .ok();
+                        deliver_user_input_null(ctx, request.id);
                         return;
                     }
                     let approval: ApprovalRequest = match serde_json::from_value(request.payload) {
@@ -10272,6 +10551,7 @@ fn run_local_shell_command(command: String, ctx: &LoopCtx) {
             working_dir,
             cancel: tokio_util::sync::CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         };
         let result = tool.execute(&args, &tool_ctx).await;
         let output = truncate_local_shell_output(result.content);
@@ -13070,6 +13350,18 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
         });
+    let user_input = state
+        .user_input_panel
+        .as_ref()
+        .map(|p| crate::render::UserInputPanelView {
+            header: p.header.clone(),
+            question: p.question.clone(),
+            mode: p.mode.clone(),
+            options: p.options.clone(),
+            cursor: p.cursor,
+            checked: p.checked.clone(),
+            text: p.text.clone(),
+        });
     crate::render::StatusLine {
         model,
         cwd,
@@ -13088,6 +13380,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         loop_status,
         todo,
         approval,
+        user_input,
     }
 }
 
@@ -14769,5 +15062,60 @@ mod format_shell_command_tests {
                 out
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod user_input_bypass_tests {
+    use super::user_input_should_auto_skip;
+    use crate::state::AgentMode;
+
+    /// Bypass (Auto) mode → panel must be skipped.
+    #[test]
+    fn bypass_mode_skips_panel() {
+        assert!(
+            user_input_should_auto_skip(AgentMode::Auto),
+            "Bypass/Auto mode must auto-skip the user_input panel"
+        );
+    }
+
+    /// Build mode → panel must be shown (no skip).
+    #[test]
+    fn build_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Build),
+            "Build mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Plan mode → panel must be shown (planning explicitly asks the user).
+    #[test]
+    fn plan_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::Plan),
+            "Plan mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// AcceptEdits mode → panel must be shown (only file edits are auto-approved).
+    #[test]
+    fn accept_edits_mode_shows_panel() {
+        assert!(
+            !user_input_should_auto_skip(AgentMode::AcceptEdits),
+            "AcceptEdits mode must NOT skip the user_input panel"
+        );
+    }
+
+    /// Confirm the shape of the auto-answer: `declined()` encodes `declined: true`.
+    /// The Bypass mode delivers this response — `format_result` turns it into a non-error
+    /// "No answer was provided…" message so the model proceeds with its own judgment
+    /// instead of treating the decline as an error to recover from.
+    #[test]
+    fn declined_response_shape() {
+        use atomcode_capabilities::tools::request_user_input::UserInputResponse;
+        let r = UserInputResponse::declined();
+        assert!(r.declined, "declined() must set declined=true");
+        assert!(r.text.is_none(), "declined() must have no text");
+        assert!(r.selected.is_empty(), "declined() must have no selections");
     }
 }

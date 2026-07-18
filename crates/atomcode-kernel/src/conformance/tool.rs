@@ -24,6 +24,7 @@ fn probe_ctx() -> ToolContext {
         working_dir: std::env::temp_dir(),
         cancel: CancellationToken::new(),
         progress: ProgressSink::noop(),
+        requester: None,
     }
 }
 
@@ -108,7 +109,7 @@ pub async fn check_respects_cancel(tool: Arc<dyn Tool>, args: &str) -> Conforman
     let subject = catch_sync(|| tool.name().to_string()).unwrap_or_else(|_| "<name() panicked>".into());
     let mut r = ConformanceReport::new("Tool", subject);
     let cancel = CancellationToken::new();
-    let ctx = ToolContext { working_dir: std::env::temp_dir(), cancel: cancel.clone(), progress: ProgressSink::noop() };
+    let ctx = ToolContext { working_dir: std::env::temp_dir(), cancel: cancel.clone(), progress: ProgressSink::noop(), requester: None };
     cancel.cancel(); // pre-cancelled: a cooperative tool must observe it and bail.
     let fut = async { tool.execute(args, &ctx).await };
     match with_timeout(Duration::from_secs(2), catch_async(fut)).await {

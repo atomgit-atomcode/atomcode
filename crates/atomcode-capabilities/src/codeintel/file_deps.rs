@@ -123,7 +123,7 @@ mod tests {
         std::fs::write(d.path().join("mid.rs"), "fn mid() { dep_fn(); }\n").unwrap();
         std::fs::write(d.path().join("top.rs"), "fn top() { mid(); }\n").unwrap();
         let tool = FileDependenciesTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"file":"mid.rs"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("File dependencies for mid.rs"), "{}", r.content);

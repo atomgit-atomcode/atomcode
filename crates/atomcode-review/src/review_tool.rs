@@ -984,6 +984,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1049,6 +1050,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1081,6 +1083,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         let result = tool.execute("{}", &ctx).await;
@@ -1130,6 +1133,7 @@ mod tests {
             progress: ProgressSink::new(Arc::new(move |message| {
                 progress_capture.lock().unwrap().push(message);
             })),
+            requester: None,
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "review should succeed: {}", res.content);
@@ -1177,6 +1181,7 @@ mod tests {
             working_dir: root.to_path_buf(),
             cancel: Default::default(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         };
         let res = tool.execute("{}", &ctx).await;
         assert!(!res.is_error, "clean tree is not an error: {}", res.content);

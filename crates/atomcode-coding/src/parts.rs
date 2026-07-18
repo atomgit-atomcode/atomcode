@@ -208,7 +208,7 @@ pub async fn prepare_with_plugin_hooks(
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
-    // SAME canonical detector as the user-paste path (`model_name_suggests_vision`) so one
+    // SAME canonical detector as the user-paste path (`model_suggests_vision`) so one
     // model can't accept a pasted image yet refuse a read_file image. NOTE: this is the
     // PREPARE-time flag; `assemble` re-registers read_file on every model swap (see there)
     // so a `/model` change to/from a VL model can't leave it stale.
@@ -733,6 +733,7 @@ pub fn assemble(
         .persona(coding_persona(
             &cfg.model,
             crate::persona::todo_switch_enabled(),
+            crate::persona::request_user_input_switch_enabled(),
         ));
     // Tool telemetry registers FIRST. It is observation-only — it never rewrites args
     // or blocks — so its position does not affect the approve-what-runs contract (an
@@ -902,7 +903,7 @@ const ATOMCODE_PERSONA_PREFIX: &str =
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
 fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, model: &str) {
-    let persona = coding_persona(model, crate::persona::todo_switch_enabled());
+    let persona = coding_persona(model, crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled());
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
     };
@@ -1020,10 +1021,15 @@ mod tests {
     #[serial_test::serial(offline_verdict)]
     fn model_switch_replaces_persona_without_duplication() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
+        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is deterministic regardless
+        // of what other tests may have set concurrently (we hold the serial lock, so this
+        // is safe — no other test in this serial group can observe the removal).
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(coding_persona(
                 "old-model",
                 crate::persona::todo_switch_enabled(),
+                crate::persona::request_user_input_switch_enabled(),
             )),
             Message::system("SESSION CONTEXT"),
         ]);
@@ -1047,7 +1053,11 @@ mod tests {
     #[serial_test::serial(offline_verdict)]
     fn current_persona_keeps_snapshot_byte_stable() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
-        let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled());
+        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is stable for both builds of
+        // the persona string (captured and reconciled).  We hold the serial lock, so this
+        // is safe.
+        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled(), crate::persona::request_user_input_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),
             Message::system("SESSION CONTEXT"),

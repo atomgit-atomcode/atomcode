@@ -325,36 +325,39 @@ impl UsageModal {
         lines.push(String::new());
         let overview = self.data.overview.as_ref().cloned().unwrap_or_else(|| compute_overview(u));
 
-        let stat = |label: &str, value: &str| -> String {
-            format!("  {m}{label:<20}\x1b[39m \x1b[1m{value}\x1b[22m")
-        };
-
+        // Collect the label/value pairs, then align the value column by DISPLAY
+        // width. The old `{label:<20}` padded by CHAR COUNT, but CJK labels have
+        // different char-count-vs-cell-width ratios (`请求次数` = 4 chars / 8 cells
+        // vs `总 Token 数` = 9 chars / 11 cells), so every value started at a
+        // different terminal column — the misalignment reported on `/usage`.
+        let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(fav) = &overview.favorite_model {
-            lines.push(stat(&t(Msg::UsageStatFavorite), fav));
+            pairs.push((t(Msg::UsageStatFavorite).into_owned(), fav.clone()));
         }
-        lines.push(stat(
-            &t(Msg::UsageStatTotal),
-            &humanize_tokens(overview.total_tokens),
+        pairs.push((
+            t(Msg::UsageStatTotal).into_owned(),
+            humanize_tokens(overview.total_tokens),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatRequests),
-            &overview.total_requests.to_string(),
+        pairs.push((
+            t(Msg::UsageStatRequests).into_owned(),
+            overview.total_requests.to_string(),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatActiveDays),
-            &format!("{} / {}", overview.active_days, overview.total_days),
+        pairs.push((
+            t(Msg::UsageStatActiveDays).into_owned(),
+            format!("{} / {}", overview.active_days, overview.total_days),
         ));
         if let Some(day) = &overview.most_active_day {
-            lines.push(stat(&t(Msg::UsageStatMostActive), day));
+            pairs.push((t(Msg::UsageStatMostActive).into_owned(), day.clone()));
         }
-        lines.push(stat(
-            &t(Msg::UsageStatLongestStreak),
-            &format!("{} days", overview.longest_streak),
+        pairs.push((
+            t(Msg::UsageStatLongestStreak).into_owned(),
+            format!("{} days", overview.longest_streak),
         ));
-        lines.push(stat(
-            &t(Msg::UsageStatCurrentStreak),
-            &format!("{} days", overview.current_streak),
+        pairs.push((
+            t(Msg::UsageStatCurrentStreak).into_owned(),
+            format!("{} days", overview.current_streak),
         ));
+        lines.extend(align_stat_lines(&pairs, m));
 
         lines
     }
@@ -799,6 +802,29 @@ fn muted_open() -> &'static str {
     }
 }
 
+/// Render a `label → value` stats block with the value column aligned by DISPLAY
+/// width. Padding is computed from `crate::width::display_width` (CJK-aware), NOT
+/// char count, so mixed-width labels (`请求次数` vs `总 Token 数`) still put every
+/// value at the same terminal column. `muted` is the label's SGR-open colour;
+/// labels are muted, values bold, with a fixed gap between the widest label and
+/// the value column.
+fn align_stat_lines(pairs: &[(String, String)], muted: &str) -> Vec<String> {
+    const GAP: usize = 3;
+    let label_w = pairs
+        .iter()
+        .map(|(l, _)| crate::width::display_width(l))
+        .max()
+        .unwrap_or(0);
+    pairs
+        .iter()
+        .map(|(label, value)| {
+            let pad = label_w.saturating_sub(crate::width::display_width(label)) + GAP;
+            let spaces = " ".repeat(pad);
+            format!("  {muted}{label}\x1b[39m{spaces}\x1b[1m{value}\x1b[22m")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +901,52 @@ mod tests {
         assert_eq!(UsageModal::hms(7259), "02:00:59");
         // Negative → clamp to 0
         assert_eq!(UsageModal::hms(-5), "00:00:00");
+    }
+
+    #[test]
+    fn align_stat_lines_aligns_value_column_by_display_width() {
+        // CJK labels of different char-count-vs-cell-width ratios must still put
+        // every value at the same terminal column (the /usage misalignment bug).
+        let pairs = vec![
+            ("最常用模型".to_string(), "deepseek-v4-flash".to_string()),
+            ("总 Token 数".to_string(), "166.0m".to_string()),
+            ("请求次数".to_string(), "4332".to_string()),
+            ("最长连续天数".to_string(), "18 days".to_string()),
+        ];
+        let lines = align_stat_lines(&pairs, "\x1b[37m");
+
+        // Strip SGR, measure the display column where each value (bold) starts.
+        let strip = |s: &str| -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c2 in chars.by_ref() {
+                        if c2 == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let cols: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                let prefix = l.split("\x1b[1m").next().unwrap();
+                crate::width::display_width(&strip(prefix))
+            })
+            .collect();
+        assert_eq!(cols.len(), 4);
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "value column must align across CJK labels, got {cols:?}"
+        );
+        // Values survive intact.
+        assert!(lines[0].contains("deepseek-v4-flash"));
+        assert!(lines[3].contains("18 days"));
     }
 
     #[test]

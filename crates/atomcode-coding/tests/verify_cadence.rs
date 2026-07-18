@@ -18,7 +18,7 @@ async fn text_only_verify_continuation_is_suppressed() {
             StreamEvent::ToolCall(ToolCall {
                 id: "1".into(),
                 name: "write_file".into(),
-                arguments: r#"{"file_path":"f.txt","content":"hello"}"#.into(),
+                arguments: r#"{"file_path":"f.rs","content":"hello"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
         ],
@@ -34,12 +34,12 @@ async fn text_only_verify_continuation_is_suppressed() {
 
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", dir.path());
     let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("create f.txt", AutoRespond::AllowAll)
+        .run_to_completion("create f.rs", AutoRespond::AllowAll)
         .await;
 
     assert_eq!(outcome.tool_results.len(), 1, "exactly one write_file");
     assert!(
-        dir.path().join("f.txt").exists(),
+        dir.path().join("f.rs").exists(),
         "write_file must have created the file"
     );
     assert!(
@@ -57,7 +57,7 @@ async fn reasoning_only_verify_continuation_is_suppressed() {
             StreamEvent::ToolCall(ToolCall {
                 id: "1".into(),
                 name: "write_file".into(),
-                arguments: r#"{"file_path":"f.txt","content":"hello"}"#.into(),
+                arguments: r#"{"file_path":"f.rs","content":"hello"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
         ],
@@ -76,7 +76,7 @@ async fn reasoning_only_verify_continuation_is_suppressed() {
     handle
         .commands
         .send(AgentCommand::SendMessage {
-            text: "create f.txt".to_string(),
+            text: "create f.rs".to_string(),
             images: vec![],
         })
         .unwrap();
@@ -120,7 +120,7 @@ async fn verify_continuation_with_tool_call_still_runs_and_surfaces_tool_result(
             StreamEvent::ToolCall(ToolCall {
                 id: "1".into(),
                 name: "write_file".into(),
-                arguments: r#"{"file_path":"f.txt","content":"hello"}"#.into(),
+                arguments: r#"{"file_path":"f.rs","content":"hello"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
         ],
@@ -144,7 +144,7 @@ async fn verify_continuation_with_tool_call_still_runs_and_surfaces_tool_result(
 
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", dir.path());
     let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("create f.txt", AutoRespond::AllowAll)
+        .run_to_completion("create f.rs", AutoRespond::AllowAll)
         .await;
 
     assert_eq!(
@@ -167,7 +167,7 @@ async fn later_user_turn_does_not_reopen_prior_unverified_edit() {
             StreamEvent::ToolCall(ToolCall {
                 id: "1".into(),
                 name: "write_file".into(),
-                arguments: r#"{"file_path":"f.txt","content":"hello"}"#.into(),
+                arguments: r#"{"file_path":"f.rs","content":"hello"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
         ],
@@ -191,7 +191,7 @@ async fn later_user_turn_does_not_reopen_prior_unverified_edit() {
     handle
         .commands
         .send(AgentCommand::SendMessage {
-            text: "create f.txt".to_string(),
+            text: "create f.rs".to_string(),
             images: vec![],
         })
         .unwrap();

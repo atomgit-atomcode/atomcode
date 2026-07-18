@@ -43,6 +43,7 @@ pub mod task;
 pub mod read;
 pub mod repair;
 pub mod report_finding;
+pub mod request_user_input;
 pub mod search_replace;
 pub mod sensitive_path;
 pub mod todo;
@@ -95,7 +96,11 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory"]
+    // NOTE: env-gated tools (`memory`, `request_user_input`) keep their name here
+    // UNCONDITIONALLY — `mount()` selects them only when actually registered (gate on),
+    // but the name MUST be in this allowlist or the registered tool never reaches the
+    // model's API `tools` array (registered != mounted).
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory", "request_user_input"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -133,6 +138,24 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
         // `{action}` shape (merged — was a separate `todo` tool). One tool = no plan-vs-patch
         // tool-choice confusion for the model; the reducer distinguishes by arg SHAPE.
         reg.register(Arc::new(TodoTool::new()));
+    }
+    // Gate on ATOMCODE_REQUEST_USER_INPUT (default OFF — register only when set truthy;
+    // 0/false/off/empty/absent → skip). Interactive user-input tool is opt-in until validated.
+    //
+    // INTENTIONAL DUPLICATION: the same env-var logic lives in
+    // `atomcode_config::config::request_user_input_enabled_from_env` (the authoritative
+    // helper used by atomcode-coding's persona gate).  We cannot call that helper here
+    // because `atomcode-config` is NOT a dependency of `atomcode-capabilities` under the
+    // `tools` feature (it would drag in unwanted transitive deps for embedders that only
+    // need the tools layer).  If you change the logic here, mirror the change in
+    // `atomcode-config/src/config/mod.rs::request_user_input_enabled_from_env` and vice
+    // versa.  The two blocks MUST stay in sync.
+    let request_user_input_on = std::env::var("ATOMCODE_REQUEST_USER_INPUT")
+        .ok()
+        .map(|v| { let v = v.trim().to_ascii_lowercase(); !(v.is_empty() || v == "0" || v == "false" || v == "off") })
+        .unwrap_or(false);
+    if request_user_input_on {
+        reg.register(Arc::new(crate::tools::request_user_input::RequestUserInputTool));
     }
     // Gate on ATOMCODE_MEMORY_TOOL (0/false/off → skip; absent/other → register).
     // Mirrors the TodoTool env gate; the tool name stays in `coding_tool_names()`
@@ -361,13 +384,20 @@ mod tests {
         // "memory" is always included in coding_tool_names() (mount() skips it
         // when the feature / env gate is off; the name itself is unconditional).
         assert!(names.contains(&"memory"), "coding_tool_names() must include 'memory'");
-        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + "memory".
-        let expected_with_memory: Vec<&str> = EXPECTED_TOOL_NAMES.iter().copied().chain(std::iter::once("memory")).collect();
+        // "request_user_input" is always included in coding_tool_names() (mount() skips it
+        // when ATOMCODE_REQUEST_USER_INPUT is off; the name itself is unconditional).
+        assert!(names.contains(&"request_user_input"), "coding_tool_names() must include 'request_user_input'");
+        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + "memory" + "request_user_input".
+        let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["memory", "request_user_input"])
+            .collect();
         let mut sorted_names = names.to_vec();
         sorted_names.sort();
-        let mut sorted_expected = expected_with_memory.clone();
+        let mut sorted_expected = expected_full.clone();
         sorted_expected.sort();
-        assert_eq!(sorted_names, sorted_expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory");
+        assert_eq!(sorted_names, sorted_expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input");
     }
 
     #[test]
@@ -446,6 +476,7 @@ mod tests {
             working_dir: d.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         // First mount: text-only model → read of an image stays the binary-text dead-end.
@@ -470,6 +501,25 @@ mod tests {
         let mounted = reg.mount(coding_tool_names());
         let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
         assert!(names.iter().any(|n| n == "todowrite"), "todowrite must be registered: {names:?}");
+    }
+
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_gated_off_by_default_on_when_enabled() {
+        // default (unset) → NOT registered
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let names_off: Vec<String> = reg.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(!names_off.iter().any(|n| n == "request_user_input"), "must be OFF by default: {names_off:?}");
+
+        // truthy → registered
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+        let mut reg2 = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg2, false);
+        let names_on: Vec<String> = reg2.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(names_on.iter().any(|n| n == "request_user_input"), "must register when enabled: {names_on:?}");
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
     }
 
     /// `memory` is registered when `ATOMCODE_MEMORY_TOOL` is unset, and absent when
@@ -499,5 +549,37 @@ mod tests {
     #[test]
     fn coding_tool_names_includes_memory() {
         assert!(coding_tool_names().contains(&"memory"));
+    }
+
+    /// Regression: with ATOMCODE_REQUEST_USER_INPUT=1, the tool must reach
+    /// `MountedTools::defs()` (the API tools array) — not merely be registered.
+    /// Previously `request_user_input` was registered but absent from `coding_tool_names()`,
+    /// so `mount()` never selected it and the model never saw it.
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_when_enabled_reaches_mounted_defs() {
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let has = mounted.defs().iter().any(|d| d.name == "request_user_input");
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        assert!(
+            has,
+            "enabled request_user_input must be MOUNTED and present in API defs(), not just registered"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_off_by_default_absent_from_defs() {
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        assert!(
+            !mounted.defs().iter().any(|d| d.name == "request_user_input"),
+            "default-off must not mount request_user_input"
+        );
     }
 }

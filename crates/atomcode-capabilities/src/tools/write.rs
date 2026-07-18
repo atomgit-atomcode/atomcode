@@ -105,7 +105,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None }
     }
 
     #[tokio::test]

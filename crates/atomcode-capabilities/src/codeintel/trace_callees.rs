@@ -100,7 +100,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn leaf() {}\nfn root() { leaf(); }\n").unwrap();
         let tool = TraceCalleesTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"symbol":"root"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Callees of root"), "{}", r.content);

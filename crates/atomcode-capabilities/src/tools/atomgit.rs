@@ -621,6 +621,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("."),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 

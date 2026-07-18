@@ -116,7 +116,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
-        ToolContext { working_dir: std::path::PathBuf::from("."), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext { working_dir: std::path::PathBuf::from("."), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None }
     }
     fn registry_with(skills: &[(&str, &str)]) -> Arc<SkillRegistry> {
         let d = Box::leak(Box::new(tempfile::tempdir().unwrap())); // keep alive for the test

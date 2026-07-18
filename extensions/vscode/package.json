@@ -157,6 +157,11 @@
           "default": "sidebar",
           "description": "%atomcode.configuration.preferredLocation.description%"
         },
+        "atomcode.chat.fontFamily": {
+          "type": "string",
+          "default": "",
+          "description": "%atomcode.configuration.chat.fontFamily.description%"
+        },
         "atomcode.autoSave": {
           "type": "boolean",
           "default": true,

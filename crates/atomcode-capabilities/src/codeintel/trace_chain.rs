@@ -98,7 +98,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn c() {}\nfn b() { c(); }\nfn a() { b(); }\n").unwrap();
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"from":"a","to":"c"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Call chain from 'a' to 'c'"), "{}", r.content);
@@ -110,7 +110,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"from":"a","to":"b"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("No call chain"), "{}", r.content);

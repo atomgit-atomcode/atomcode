@@ -10,6 +10,7 @@ pub enum UiPhase {
     Idle,
     Streaming,
     Approval,
+    UserInput,
     Suspended,
 }
 
@@ -61,6 +62,78 @@ impl ApprovalPanel {
     pub fn accel_index(&self, c: char) -> Option<usize> {
         let c = c.to_ascii_lowercase();
         self.options.iter().position(|o| o.accel == c)
+    }
+}
+
+/// The active `request_user_input` prompt, shown as a footer panel while
+/// `UiPhase::UserInput`. `None` when no interactive question is pending.
+/// Mirrors `ApprovalPanel`: it replaces the input box and the user answers with
+/// arrow keys / space / Enter (single/multiple) or by typing (text).
+#[derive(Debug, Clone)]
+pub struct UserInputPanel {
+    /// Kernel round-trip id — echoed back in `AgentCommand::Respond { id, .. }`.
+    pub request_id: u64,
+    pub header: String,
+    pub question: String,
+    pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
+    /// Option labels (single/multiple). Empty for text mode.
+    pub options: Vec<String>,
+    /// Highlighted option (single/multiple).
+    pub cursor: usize,
+    /// Per-option checked flags (multiple mode only; parallel to `options`).
+    pub checked: Vec<bool>,
+    /// Free-form buffer (text mode only).
+    pub text: String,
+}
+
+impl UserInputPanel {
+    pub fn new(
+        request_id: u64,
+        r: &atomcode_capabilities::tools::request_user_input::UserInputRequest,
+    ) -> Self {
+        let options: Vec<String> = r.options.iter().map(|o| o.label.clone()).collect();
+        let checked = vec![false; options.len()];
+        Self {
+            request_id,
+            header: r.header.clone(),
+            question: r.question.clone(),
+            mode: r.mode.clone(),
+            options,
+            cursor: 0,
+            checked,
+            text: String::new(),
+        }
+    }
+    pub fn move_up(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    pub fn move_down(&mut self) {
+        if self.cursor + 1 < self.options.len() {
+            self.cursor += 1;
+        }
+    }
+    pub fn toggle(&mut self) {
+        if let Some(c) = self.checked.get_mut(self.cursor) {
+            *c = !*c;
+        }
+    }
+    /// The chosen labels: the highlighted one (single), all checked ones
+    /// (multiple), or empty (text — the answer rides `text`, not `selected`).
+    pub fn chosen(&self) -> Vec<String> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+        match self.mode {
+            Single => self.options.get(self.cursor).cloned().into_iter().collect(),
+            Multiple => self
+                .options
+                .iter()
+                .zip(&self.checked)
+                .filter(|(_, c)| **c)
+                .map(|(l, _)| l.clone())
+                .collect(),
+            Text => vec![],
+        }
     }
 }
 
@@ -252,6 +325,10 @@ pub struct UiState {
     /// tool approval is pending. Set in the `ApprovalNeeded` handler, cleared on
     /// resolve / turn-end / session reset.
     pub approval_panel: Option<ApprovalPanel>,
+    /// The active footer `request_user_input` panel. `None` when no interactive
+    /// question is pending. Set in the `Request` handler, cleared on resolve /
+    /// turn-end / session reset. Mirrors `approval_panel`.
+    pub user_input_panel: Option<UserInputPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -514,6 +591,7 @@ impl UiState {
             prior_phase: None,
             prior_spinner_label: None,
             approval_panel: None,
+            user_input_panel: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -808,6 +886,7 @@ impl UiState {
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
+        self.user_input_panel = None;
         self.steer_pending = 0;
     }
 
@@ -825,6 +904,7 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.approval_panel = None;
+        self.user_input_panel = None;
         self.steer_pending = 0;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
@@ -861,6 +941,7 @@ impl UiState {
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         self.approval_panel = None;
+        self.user_input_panel = None;
         self.steer_pending = 0;
         // The todo panel is per-session, not per-turn: it survives turn
         // termination (mirrors on_turn_complete). Clearing it here nuked the
@@ -1031,6 +1112,15 @@ impl UiState {
             // reflects that, not the cumulative wait-then-run time.
             self.phase_started_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Clear the interactive question panel and return to streaming — the same
+    /// shape as `on_approval_resolved` (the turn resumes once the tool receives
+    /// its answer). No spinner-label stash to restore: unlike approval, the
+    /// `Request` handler does not swap `spinner_label` when the panel opens.
+    pub fn on_user_input_resolved(&mut self) {
+        self.user_input_panel = None;
+        self.phase = UiPhase::Streaming;
     }
 
     pub fn on_suspend(&mut self) {
@@ -1905,6 +1995,81 @@ mod tests {
         assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
         assert_eq!(p.accel_index('n'), Some(2));
         assert_eq!(p.accel_index('z'), None);
+    }
+
+    #[test]
+    fn user_input_panel_navigation_toggle_and_chosen() {
+        use atomcode_capabilities::tools::request_user_input::{
+            UserInputMode, UserInputOption, UserInputRequest,
+        };
+        use crate::state::UserInputPanel;
+
+        let single_req = UserInputRequest {
+            header: "Auth".into(),
+            question: "Which flow?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                UserInputOption { label: "OAuth".into(), description: None },
+                UserInputOption { label: "API key".into(), description: None },
+                UserInputOption { label: "Device".into(), description: None },
+            ],
+        };
+        let mut p = UserInputPanel::new(7, &single_req);
+        assert_eq!(p.request_id, 7);
+        assert_eq!(p.cursor, 0);
+        // move_down clamps at the last option (no wrap).
+        p.move_down();
+        p.move_down();
+        p.move_down();
+        p.move_down();
+        assert_eq!(p.cursor, 2, "move_down clamps at last index");
+        // move_up clamps at 0.
+        p.move_up();
+        p.move_up();
+        p.move_up();
+        assert_eq!(p.cursor, 0, "move_up clamps at 0");
+        p.move_down();
+        // Single: chosen() = the highlighted label only.
+        assert_eq!(p.chosen(), vec!["API key".to_string()]);
+
+        // Multiple: toggle flips the highlighted option; chosen() = all checked.
+        let mut m = UserInputPanel::new(9, &UserInputRequest {
+            mode: UserInputMode::Multiple,
+            ..single_req.clone()
+        });
+        m.toggle(); // check "OAuth"
+        m.move_down();
+        m.move_down();
+        m.toggle(); // check "Device"
+        assert_eq!(m.chosen(), vec!["OAuth".to_string(), "Device".to_string()]);
+        m.toggle(); // uncheck "Device"
+        assert_eq!(m.chosen(), vec!["OAuth".to_string()], "toggle flips off");
+
+        // Text: chosen() is empty (answer rides `text`).
+        let mut t = UserInputPanel::new(1, &UserInputRequest {
+            mode: UserInputMode::Text,
+            options: vec![],
+            ..single_req.clone()
+        });
+        t.text.push_str("hello");
+        assert!(t.chosen().is_empty(), "text mode has no selected labels");
+        assert_eq!(t.text, "hello");
+    }
+
+    #[test]
+    fn on_user_input_resolved_clears_panel_and_resumes() {
+        use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputRequest};
+        let mut s = UiState::new();
+        s.user_input_panel = Some(crate::state::UserInputPanel::new(3, &UserInputRequest {
+            header: "H".into(),
+            question: "Q?".into(),
+            mode: UserInputMode::Text,
+            options: vec![],
+        }));
+        s.phase = UiPhase::UserInput;
+        s.on_user_input_resolved();
+        assert!(s.user_input_panel.is_none(), "panel cleared on resolve");
+        assert_eq!(s.phase, UiPhase::Streaming, "phase resumes to Streaming");
     }
 
     #[test]

@@ -440,6 +440,7 @@ mod tests {
             working_dir: dir,
             cancel: CancellationToken::new(),
             progress: ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -466,6 +467,7 @@ mod tests {
             working_dir: tempfile::tempdir().expect("tempdir").keep(),
             cancel: CancellationToken::new(),
             progress: sink,
+            requester: None,
         };
         let _ = tool(Some("done"))
             .execute(

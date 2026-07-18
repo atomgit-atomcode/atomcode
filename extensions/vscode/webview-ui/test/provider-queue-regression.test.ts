@@ -8,7 +8,11 @@ declare const require: {
 const originalLoad = (Module as unknown as { _load: typeof Module['_load'] })._load;
 const vscodeMock = {
   Uri: { joinPath: (...parts: Array<{ fsPath?: string } | string>) => ({ fsPath: parts.map((p) => typeof p === 'string' ? p : p.fsPath || '').join('/') }) },
-  workspace: { workspaceFolders: [] as Array<{ uri: { fsPath: string } }> },
+  workspace: {
+    workspaceFolders: [] as Array<{ uri: { fsPath: string } }>,
+    onDidChangeConfiguration: (_listener: unknown) => ({ dispose() {} }),
+    getConfiguration: () => ({ get: (_key: string) => undefined }),
+  },
   window: {},
   env: { language: 'en' },
   commands: {},

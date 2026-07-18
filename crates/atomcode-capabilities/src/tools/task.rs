@@ -586,6 +586,7 @@ mod tests {
             working_dir: dir,
             cancel: CancellationToken::new(),
             progress: ProgressSink::noop(),
+            requester: None,
         }
     }
 

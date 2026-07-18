@@ -64,6 +64,9 @@ fn phase_status_glyph(phase: UiPhase) -> Option<&'static str> {
         UiPhase::Idle => Some("🟢"),
         UiPhase::Streaming => Some("🟡"),
         UiPhase::Approval => Some("🔴"),
+        // Waiting on the user to answer an interactive question — same
+        // "needs-you" red as approval.
+        UiPhase::UserInput => Some("🔴"),
         UiPhase::Suspended => None,
     }
 }

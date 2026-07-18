@@ -2357,6 +2357,131 @@ impl<W: Write + Send> RetainedRenderer<W> {
         out
     }
 
+    /// Rows the `request_user_input` panel occupies. Mirrors
+    /// `approval_panel_row_count`: 1 header (the question) + the mode body
+    /// (single/multiple = one row per option; text = one `> {buffer}` row) + 1
+    /// hint row. Must equal `build_user_input_rows(..).len()`.
+    fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let body = match panel.mode {
+            UserInputMode::Single | UserInputMode::Multiple => panel.options.len(),
+            UserInputMode::Text => 1,
+        };
+        // 1 header (question) + body + 1 hint.
+        body + 2
+    }
+
+    /// Build the compact footer `request_user_input` panel. Mirrors
+    /// `build_approval_rows`, branching on `mode`:
+    ///   - Single: numbered reverse-highlight list (like approval).
+    ///   - Multiple: `[x]`/`[ ]` prefix + reverse-highlight on the cursor row.
+    ///   - Text: a single `> {buffer}` input row.
+    /// Header row shows the question; a muted hint row closes the panel.
+    fn build_user_input_rows(
+        &self,
+        panel: &crate::render::UserInputPanelView,
+        rule_width: usize,
+        screen_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let unicode = self.caps.unicode_symbols;
+        let mut out: Vec<Vec<Cell>> = Vec::new();
+
+        // Header row: the question, bold, width-truncated to one line.
+        {
+            let raw = crate::glyph::downgrade_glyphs(&panel.question, unicode);
+            let q = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), rule_width.saturating_sub(2));
+            let style = CellStyle { bold: true, ..CellStyle::default() };
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &q, &style);
+            out.push(row);
+        }
+
+        match panel.mode {
+            UserInputMode::Single | UserInputMode::Multiple => {
+                let multiple = matches!(panel.mode, UserInputMode::Multiple);
+                for (i, label) in panel.options.iter().enumerate() {
+                    let mut row = Vec::new();
+                    let selected = i == panel.cursor;
+                    let marker = if selected {
+                        if unicode { "\u{25b8} " } else { "> " } // ▸
+                    } else {
+                        "  "
+                    };
+                    // Multiple mode prepends a checkbox; single mode uses the
+                    // positional number (same as approval).
+                    let prefix = if multiple {
+                        let checked = panel.checked.get(i).copied().unwrap_or(false);
+                        if checked {
+                            "[x] ".to_string()
+                        } else {
+                            "[ ] ".to_string()
+                        }
+                    } else {
+                        format!("{}. ", i + 1)
+                    };
+                    let prefix_width = crate::width::display_width(&prefix);
+                    let style = if selected {
+                        CellStyle { reverse: true, ..CellStyle::default() }
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let budget = rule_width.saturating_sub(2 + prefix_width);
+                    let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
+                    push_str_cells(&mut row, marker, &style);
+                    push_str_cells(&mut row, &prefix, &style);
+                    push_str_cells(&mut row, &lbl, &style);
+                    if selected {
+                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
+                        let pad = screen_width.saturating_sub(current_width);
+                        if pad > 0 {
+                            push_str_cells(&mut row, &" ".repeat(pad), &style);
+                        }
+                    }
+                    out.push(row);
+                }
+            }
+            UserInputMode::Text => {
+                // A single `> {buffer}` input row (reverse-highlighted, full-width)
+                // so the typed answer reads like an active input line.
+                let style = CellStyle { reverse: true, ..CellStyle::default() };
+                let mut row = Vec::new();
+                let budget = rule_width.saturating_sub(2);
+                let buf = crate::width::truncate_with_ellipsis(&scrub_controls(&panel.text), budget);
+                push_str_cells(&mut row, "> ", &style);
+                push_str_cells(&mut row, &buf, &style);
+                let current_width: usize = row.iter().map(|c| c.width as usize).sum();
+                let pad = screen_width.saturating_sub(current_width);
+                if pad > 0 {
+                    push_str_cells(&mut row, &" ".repeat(pad), &style);
+                }
+                out.push(row);
+            }
+        }
+
+        // Hint row: mode-appropriate guidance, muted + glyph-downgraded.
+        let hint_raw = match panel.mode {
+            UserInputMode::Single => "↑↓ select · Enter confirm · Esc cancel",
+            UserInputMode::Multiple => "↑↓ move · Space toggle · Enter confirm · Esc cancel",
+            UserInputMode::Text => "type answer · Enter confirm · Esc cancel",
+        };
+        let hint = crate::glyph::downgrade_glyphs(hint_raw, unicode);
+        let hint_budget = rule_width.saturating_sub(2);
+        let hint_truncated = crate::width::truncate_with_ellipsis(&hint, hint_budget);
+        let hint_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        let mut hint_row = Vec::new();
+        push_str_cells(&mut hint_row, "  ", &hint_style);
+        push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
+        out.push(hint_row);
+
+        out
+    }
+
     /// Paint the full footer into `self.screen`. Layout (top to bottom):
     ///
     ///   rows 0..T:   todo panel (T = todo_rows, a standing view above input)
@@ -2607,13 +2732,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
-        // Approval panel: sits above the todo panel (top of footer block).
-        let approval_rows = self
-            .status
-            .approval
-            .as_ref()
-            .map(|p| self.approval_panel_row_count(p))
-            .unwrap_or(0);
+        // Modal panel (approval OR request_user_input): sits above the todo
+        // panel (top of footer block) and replaces the input box.
+        let approval_rows = self.modal_panel_rows();
         // Cap the input-box height so a long paste / typed text can't grow the
         // footer past the screen (overflow). The full text stays in input_buf;
         // we render a scrolling window that keeps the cursor row visible. The
@@ -2703,11 +2824,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
-        let approval_cells: Vec<Vec<Cell>> = status_clone
-            .approval
-            .as_ref()
-            .map(|p| self.build_approval_rows(p, rule_width, w))
-            .unwrap_or_default();
+        // Modal panel cells: approval OR user_input (mutually exclusive; approval
+        // wins if both are set). Drawn in the shared `approval_active` slot below.
+        let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
+            self.build_approval_rows(p, rule_width, w)
+        } else if let Some(p) = status_clone.user_input.as_ref() {
+            self.build_user_input_rows(p, rule_width, w)
+        } else {
+            Vec::new()
+        };
         let menu_kind = self
             .menu
             .as_ref()
@@ -3137,11 +3262,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.screen.set_cursor_visible(!suppress_cursor);
     }
 
-    /// Returns `true` when an approval panel is currently active (replaces
-    /// the input box and hides the status row in the footer).
+    /// Returns `true` when a modal footer panel that REPLACES the input box is
+    /// active — either the tool-approval panel or the `request_user_input`
+    /// panel (mutually exclusive). Both hide the input box + status row and are
+    /// drawn in the same slot, so the layout treats them identically.
     #[inline]
     fn approval_active(&self) -> bool {
-        self.status.approval.is_some()
+        self.status.approval.is_some() || self.status.user_input.is_some()
+    }
+
+    /// Rows the modal panel (approval OR user_input) occupies — 0 when neither
+    /// is active. Single source so both `paint_footer` and `current_footer_rows`
+    /// agree. The two panels are mutually exclusive; approval wins if both are
+    /// somehow set (shouldn't happen).
+    fn modal_panel_rows(&self) -> usize {
+        if let Some(p) = self.status.approval.as_ref() {
+            self.approval_panel_row_count(p)
+        } else if let Some(p) = self.status.user_input.as_ref() {
+            self.user_input_panel_row_count(p)
+        } else {
+            0
+        }
     }
 
     /// Single source of truth for the footer height formula so
@@ -3202,12 +3343,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .as_ref()
             .map(|t| self.todo_panel_row_count(t))
             .unwrap_or(0);
-        let approval_rows = self
-            .status
-            .approval
-            .as_ref()
-            .map(|p| self.approval_panel_row_count(p))
-            .unwrap_or(0);
+        let approval_rows = self.modal_panel_rows();
         let attachment_rows = self.input_attachments.len();
         // Cap the input height (mirrors paint_footer) so a long paste / typed
         // input can't make the footer exceed the screen.
@@ -6884,6 +7020,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         }
     }
 
@@ -6978,6 +7115,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -7026,6 +7164,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -7087,6 +7226,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -7130,6 +7270,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let idx = row
@@ -7174,6 +7315,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -7221,6 +7363,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -7252,6 +7395,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -11812,6 +11956,95 @@ mod tests {
         assert!(row_of("Allow once") > row_of("❯"), "panel below input\n{dump}");
     }
 
+    // request_user_input panel: the question header + a mode-specific body
+    // render, in the same modal slot as approval (replacing the input box).
+    #[test]
+    fn user_input_panel_renders_all_three_modes() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        // Single: numbered list, cursor row has the ▸ marker.
+        {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            let view = crate::render::UserInputPanelView {
+                header: "Auth".into(),
+                question: "Which auth flow?".into(),
+                mode: UserInputMode::Single,
+                options: vec!["OAuth".into(), "API key".into()],
+                cursor: 1,
+                checked: vec![false, false],
+                text: String::new(),
+            };
+            // Row count contract: header + options + hint.
+            assert_eq!(r.user_input_panel_row_count(&view), 2 + 2);
+            status.user_input = Some(view);
+            r.render(UiLine::InputPrompt {
+                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            let dump = vterm.dump();
+            assert!(vterm.any_row(|r| r.contains("Which auth flow?")), "question header\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("1. OAuth")), "numbered option 1\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("2. API key")), "numbered option 2\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("▸") && r.contains("API key")), "cursor marker on option 2\n{dump}");
+        }
+
+        // Multiple: checkbox prefixes reflect the `checked` flags.
+        {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            status.user_input = Some(crate::render::UserInputPanelView {
+                header: "Langs".into(),
+                question: "Pick languages".into(),
+                mode: UserInputMode::Multiple,
+                options: vec!["Rust".into(), "Go".into()],
+                cursor: 0,
+                checked: vec![true, false],
+                text: String::new(),
+            });
+            r.render(UiLine::InputPrompt {
+                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            let dump = vterm.dump();
+            assert!(vterm.any_row(|r| r.contains("[x] Rust")), "Rust checked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("[ ] Go")), "Go unchecked\n{dump}");
+        }
+
+        // Text: a `> {buffer}` input row shows the typed answer.
+        {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            let view = crate::render::UserInputPanelView {
+                header: "Name".into(),
+                question: "Project name?".into(),
+                mode: UserInputMode::Text,
+                options: vec![],
+                cursor: 0,
+                checked: vec![],
+                text: "atomcode".into(),
+            };
+            assert_eq!(r.user_input_panel_row_count(&view), 1 + 2, "header + 1 input row + hint");
+            status.user_input = Some(view);
+            r.render(UiLine::InputPrompt {
+                buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            let dump = vterm.dump();
+            assert!(vterm.any_row(|r| r.contains("Project name?")), "question header\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("> atomcode")), "text input row\n{dump}");
+        }
+    }
+
     /// Step 1: option rows carry `1. ` / `2. ` / `3. ` numeric prefixes, the
     /// selected row (`selected=0`) spans the full terminal width with reverse
     /// highlight, and a hint row appears after the last option.
@@ -15269,6 +15502,7 @@ mod tests {
             loop_status: None,
             todo: None,
             approval: None,
+            user_input: None,
         };
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),

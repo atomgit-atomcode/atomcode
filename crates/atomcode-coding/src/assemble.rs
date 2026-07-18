@@ -68,7 +68,11 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(mount_coding_tools(model_suggests_vision(&cfg.model)))
-        .persona(coding_persona(&cfg.model, todo_enabled))
+        .persona(coding_persona(
+            &cfg.model,
+            todo_enabled,
+            crate::persona::request_user_input_switch_enabled(),
+        ))
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
