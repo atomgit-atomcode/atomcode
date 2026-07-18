@@ -145,6 +145,7 @@ mod tests {
             working_dir: dir.to_path_buf(),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 

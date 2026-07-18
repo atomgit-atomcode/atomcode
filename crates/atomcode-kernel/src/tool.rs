@@ -144,6 +144,18 @@ pub struct ToolContext {
     /// Live progress channel (see [`ProgressSink`]). Default `noop()` — a tool reports
     /// progress only if it wants to, and only a driver that cares receives it.
     pub progress: ProgressSink,
+    /// Request seam so a tool can ask the driver a structured question and await the
+    /// answer. `None` in tests/headless → `request()` returns Null and callers degrade.
+    pub requester: Option<crate::request::Requester>,
+}
+
+impl ToolContext {
+    pub async fn request(&self, kind: &str, payload: serde_json::Value) -> serde_json::Value {
+        match &self.requester {
+            Some(r) => r.request(kind, payload).await,
+            None => serde_json::Value::Null,
+        }
+    }
 }
 
 /// A mounted tool. Its `execute` runs with the host process's FULL ambient
@@ -335,5 +347,16 @@ mod tests {
 
         assert!(mounted.get("echo").is_some());
         assert!(mounted.get("risky_write").is_none(), "unmounted tool must be inert/invisible");
+    }
+
+    #[tokio::test]
+    async fn tool_context_without_requester_returns_null() {
+        let ctx = ToolContext {
+            working_dir: std::path::PathBuf::from("/"),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        assert_eq!(ctx.request("ask", serde_json::json!({})).await, serde_json::Value::Null);
     }
 }

@@ -101,7 +101,7 @@ mod tests {
         std::fs::write(d.path().join("lib.rs"), "fn target() {}\n").unwrap();
         std::fs::write(d.path().join("a.rs"), "fn caller_a() { target(); }\n").unwrap();
         let tool = TraceCallersTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"symbol":"target"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Callers of target"), "{}", r.content);
@@ -113,7 +113,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn x() {}\n").unwrap();
         let tool = TraceCallersTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop(), requester: None };
         let r = tool.execute(r#"{"symbol":"nope"}"#, &ctx).await;
         assert!(r.is_error);
         assert!(r.content.contains("not found in code graph"), "{}", r.content);

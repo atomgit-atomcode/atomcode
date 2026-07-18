@@ -43,6 +43,7 @@ fn ctx() -> ToolContext {
         working_dir: std::env::temp_dir(),
         cancel: CancellationToken::new(),
         progress: ProgressSink::noop(),
+        requester: None,
     }
 }
 

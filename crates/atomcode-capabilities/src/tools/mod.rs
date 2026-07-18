@@ -446,6 +446,7 @@ mod tests {
             working_dir: d.path().to_path_buf(),
             cancel: Default::default(),
             progress: ProgressSink::noop(),
+            requester: None,
         };
 
         // First mount: text-only model → read of an image stays the binary-text dead-end.

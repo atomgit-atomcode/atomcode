@@ -2547,6 +2547,7 @@ impl RunningAgent {
                                 });
                             }))
                         },
+                        requester: Some(self.rt.requester()),
                     };
                     // Emit ToolStarted as THIS tool actually starts (inside the
                     // future, once it holds its lock) via `events.send` — NOT
