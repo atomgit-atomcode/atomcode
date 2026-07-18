@@ -2374,8 +2374,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         n += 1;
                     }
                 }
-                // "Other" row: 1 label row + 1 subtitle row (always present).
-                n += 2;
+                // Custom-answer ("Other") row: 1 inline input line.
+                n += 1;
                 // Multiple: +1 for the Submit row.
                 if matches!(panel.mode, UserInputMode::Multiple) {
                     n += 1;
@@ -2391,8 +2391,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Build the compact footer `request_user_input` panel.
     ///   - Single / Multiple: a header chip, the question, then numbered options
-    ///     each with an optional faint description line, an always-appended
-    ///     "Other" free-text option, and a hint. The cursor row is marked `❯`;
+    ///     each with an optional faint description line, and a final inline
+    ///     custom-answer row (faint placeholder when empty, typed text + cursor
+    ///     indicator when non-empty / active). The cursor row is marked `❯`;
     ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
@@ -2506,23 +2507,75 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
                 }
 
-                // Always-appended "Other" free-text option (index = options.len()).
-                // Its "description" line shows the typed custom text, or the
-                // "Type a custom answer" subtitle when empty.
-                let other_checked = panel.checked.get(other_index).copied().unwrap_or(false);
-                let other_sub = if panel.custom_text.trim().is_empty() {
-                    "Type a custom answer".to_string()
-                } else {
-                    panel.custom_text.clone()
-                };
-                emit_option(
-                    &mut out,
-                    other_index,
-                    other_index + 1,
-                    "Other",
-                    Some(other_sub.as_str()),
-                    other_checked,
-                );
+                // Always-appended custom-answer row (index = options.len()): a
+                // ONE-LINE inline text input.  No "Other" label, no subtitle —
+                // the cursor indicator and typed text (or faint placeholder) are
+                // rendered directly on this row.
+                {
+                    let idx = other_index;
+                    let number = other_index + 1;
+                    let on_cursor = idx == panel.cursor;
+                    let other_checked = panel.checked.get(idx).copied().unwrap_or(false);
+                    let marker = if on_cursor {
+                        if unicode { "\u{276f} " } else { "> " }
+                    } else {
+                        "  "
+                    };
+                    let checkbox = if multiple {
+                        if other_checked { "[x] " } else { "[ ] " }
+                    } else {
+                        ""
+                    };
+                    let num = format!("{}. ", number);
+                    let chrome_style = if on_cursor {
+                        self.style_for(Role::Plan)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+
+                    let prefix_width = crate::width::display_width(marker)
+                        + crate::width::display_width(checkbox)
+                        + crate::width::display_width(&num);
+                    let budget = rule_width.saturating_sub(prefix_width);
+
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, marker, &chrome_style);
+                    if multiple {
+                        push_str_cells(&mut row, checkbox, &chrome_style);
+                    }
+                    push_str_cells(&mut row, &num, &chrome_style);
+
+                    if panel.custom_text.is_empty() {
+                        // Faint placeholder when no text has been typed yet.
+                        let placeholder = "输入自己的答案\u{2026}"; // 输入自己的答案…
+                        let ph = crate::width::truncate_with_ellipsis(
+                            &scrub_controls(placeholder),
+                            budget,
+                        );
+                        let ph_style = self.style_faint(Role::Muted);
+                        push_str_cells(&mut row, &ph, &ph_style);
+                    } else {
+                        // Show the typed text.  Append a cursor indicator when
+                        // this is the active row.
+                        let text_style = if on_cursor {
+                            self.style_bold(Role::Plan)
+                        } else {
+                            self.style_for(Role::Secondary)
+                        };
+                        // Reserve 1 column for the cursor glyph when on cursor.
+                        let text_budget = if on_cursor { budget.saturating_sub(1) } else { budget };
+                        let text = crate::width::truncate_with_ellipsis(
+                            &scrub_controls(&panel.custom_text),
+                            text_budget,
+                        );
+                        push_str_cells(&mut row, &text, &text_style);
+                        if on_cursor {
+                            let cursor_glyph = if unicode { "\u{258f}" } else { "|" }; // ▏
+                            push_str_cells(&mut row, cursor_glyph, &chrome_style);
+                        }
+                    }
+                    out.push(row);
+                }
 
                 // Multiple mode: a navigable Submit row after Other.
                 if multiple {
@@ -12084,8 +12137,8 @@ mod tests {
             };
             // Row count: header + blank + question + blank
             //   + opt1 label + opt1 desc + opt2 label (no desc)
-            //   + Other label + Other subtitle + blank + hint.
-            assert_eq!(r.user_input_panel_row_count(&view), 4 + 3 + 2 + 2);
+            //   + custom inline row (1 line) + blank + hint.
+            assert_eq!(r.user_input_panel_row_count(&view), 4 + 3 + 1 + 2);
             assert_eq!(
                 r.build_user_input_rows(&view, 78, 80).len(),
                 r.user_input_panel_row_count(&view),
@@ -12104,8 +12157,8 @@ mod tests {
             assert!(vterm.any_row(|r| r.contains("Tree-shakeable")), "description line rendered\n{dump}");
             assert!(vterm.any_row(|r| r.contains("2. Day.js")), "numbered option 2\n{dump}");
             assert!(vterm.any_row(|r| r.contains("\u{276f}") && r.contains("date-fns")), "cursor marker on option 1\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("3. Other")), "Other appended as last numbered option\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("Type a custom answer")), "Other subtitle\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("3.") && r.contains("输")), "custom-answer row: number + faint placeholder (输入自己的答案…)\n{dump}");
+            assert!(!vterm.any_row(|r| r.contains("Other") || r.contains("Type a custom answer")), "no redundant 'Other' label/subtitle\n{dump}");
             // Single mode must NOT render a checkbox.
             assert!(!vterm.any_row(|r| r.contains("[x]") || r.contains("[ ]")), "single must NOT render checkboxes\n{dump}");
             assert!(vterm.any_row(|r| r.contains("1-3 select")), "single hint\n{dump}");
@@ -12147,7 +12200,7 @@ mod tests {
             assert!(vterm.any_row(|r| r.contains("[x] 1. Streaming")), "Streaming checked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("Token-by-token")), "description rendered\n{dump}");
             assert!(vterm.any_row(|r| r.contains("[ ] 2. Tool use")), "Tool use unchecked\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("[x] 3. Other")), "Other checked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("[x] 3. Zig")), "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}");
             assert!(vterm.any_row(|r| r.contains("Zig")), "custom text shown\n{dump}");
             // Multiple: Submit row after Other (unicode ✔ 提交).
             assert!(

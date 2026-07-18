@@ -430,24 +430,22 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                                     }
                                 }
                             }
-                            // For single/multiple, append the always-on "Other"
-                            // free-text option (index N, number N+1) so a human on
-                            // a dumb TTY can give a custom answer.
+                            // For single/multiple, append the always-on custom-answer
+                            // row (index N, number N+1) as a ONE-LINE inline input so a
+                            // human on a dumb TTY can type a custom answer. No "Other"
+                            // label / subtitle — the typed text (or a faint placeholder)
+                            // is shown directly.
                             if matches!(
                                 panel.mode,
                                 UserInputMode::Single | UserInputMode::Multiple
                             ) {
                                 let other_no = panel.options.len() + 1;
-                                let _ = writeln!(self.out, "  {}. Other", other_no);
-                                if panel.custom_text.trim().is_empty() {
-                                    let _ = writeln!(self.out, "       Type a custom answer");
+                                let custom = if panel.custom_text.trim().is_empty() {
+                                    "输入自己的答案\u{2026}".to_string()
                                 } else {
-                                    let _ = writeln!(
-                                        self.out,
-                                        "       {}",
-                                        scrub_controls(&panel.custom_text)
-                                    );
-                                }
+                                    scrub_controls(&panel.custom_text)
+                                };
+                                let _ = writeln!(self.out, "  {}. {}", other_no, custom);
                                 // Multiple: explicit Submit row after Other.
                                 if matches!(panel.mode, UserInputMode::Multiple) {
                                     let _ = writeln!(self.out, "  + Submit");
