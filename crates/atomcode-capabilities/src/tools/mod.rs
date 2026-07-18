@@ -135,6 +135,15 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
         // tool-choice confusion for the model; the reducer distinguishes by arg SHAPE.
         reg.register(Arc::new(TodoTool::new()));
     }
+    // Gate on ATOMCODE_REQUEST_USER_INPUT (default OFF — register only when set truthy;
+    // 0/false/off/empty/absent → skip). Interactive user-input tool is opt-in until validated.
+    let request_user_input_on = std::env::var("ATOMCODE_REQUEST_USER_INPUT")
+        .ok()
+        .map(|v| { let v = v.trim().to_ascii_lowercase(); !(v.is_empty() || v == "0" || v == "false" || v == "off") })
+        .unwrap_or(false);
+    if request_user_input_on {
+        reg.register(Arc::new(crate::tools::request_user_input::RequestUserInputTool));
+    }
     // Gate on ATOMCODE_MEMORY_TOOL (0/false/off → skip; absent/other → register).
     // Mirrors the TodoTool env gate; the tool name stays in `coding_tool_names()`
     // unconditionally (mount() skips unregistered names).
@@ -472,6 +481,24 @@ mod tests {
         let mounted = reg.mount(coding_tool_names());
         let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
         assert!(names.iter().any(|n| n == "todowrite"), "todowrite must be registered: {names:?}");
+    }
+
+    #[test]
+    fn request_user_input_gated_off_by_default_on_when_enabled() {
+        // default (unset) → NOT registered
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let names_off: Vec<String> = reg.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(!names_off.iter().any(|n| n == "request_user_input"), "must be OFF by default: {names_off:?}");
+
+        // truthy → registered
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+        let mut reg2 = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg2, false);
+        let names_on: Vec<String> = reg2.mount(&["request_user_input"]).defs().into_iter().map(|d| d.name).collect();
+        assert!(names_on.iter().any(|n| n == "request_user_input"), "must register when enabled: {names_on:?}");
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
     }
 
     /// `memory` is registered when `ATOMCODE_MEMORY_TOOL` is unset, and absent when
