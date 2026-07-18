@@ -96,7 +96,11 @@ pub use atomgit::{atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, 
 /// Names of the full neutral coding toolset — pass to
 /// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn coding_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory"]
+    // NOTE: env-gated tools (`memory`, `request_user_input`) keep their name here
+    // UNCONDITIONALLY — `mount()` selects them only when actually registered (gate on),
+    // but the name MUST be in this allowlist or the registered tool never reaches the
+    // model's API `tools` array (registered != mounted).
+    &["read_file", "write_file", "edit_file", "list_directory", "open_file", "bash", "grep", "glob", "search_replace", "ast_grep", "todowrite", "memory", "request_user_input"]
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
@@ -380,13 +384,20 @@ mod tests {
         // "memory" is always included in coding_tool_names() (mount() skips it
         // when the feature / env gate is off; the name itself is unconditional).
         assert!(names.contains(&"memory"), "coding_tool_names() must include 'memory'");
-        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + "memory".
-        let expected_with_memory: Vec<&str> = EXPECTED_TOOL_NAMES.iter().copied().chain(std::iter::once("memory")).collect();
+        // "request_user_input" is always included in coding_tool_names() (mount() skips it
+        // when ATOMCODE_REQUEST_USER_INPUT is off; the name itself is unconditional).
+        assert!(names.contains(&"request_user_input"), "coding_tool_names() must include 'request_user_input'");
+        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + "memory" + "request_user_input".
+        let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["memory", "request_user_input"])
+            .collect();
         let mut sorted_names = names.to_vec();
         sorted_names.sort();
-        let mut sorted_expected = expected_with_memory.clone();
+        let mut sorted_expected = expected_full.clone();
         sorted_expected.sort();
-        assert_eq!(sorted_names, sorted_expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory");
+        assert_eq!(sorted_names, sorted_expected, "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input");
     }
 
     #[test]
@@ -537,5 +548,35 @@ mod tests {
     #[test]
     fn coding_tool_names_includes_memory() {
         assert!(coding_tool_names().contains(&"memory"));
+    }
+
+    /// Regression: with ATOMCODE_REQUEST_USER_INPUT=1, the tool must reach
+    /// `MountedTools::defs()` (the API tools array) — not merely be registered.
+    /// Previously `request_user_input` was registered but absent from `coding_tool_names()`,
+    /// so `mount()` never selected it and the model never saw it.
+    #[test]
+    fn request_user_input_when_enabled_reaches_mounted_defs() {
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "1");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let has = mounted.defs().iter().any(|d| d.name == "request_user_input");
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        assert!(
+            has,
+            "enabled request_user_input must be MOUNTED and present in API defs(), not just registered"
+        );
+    }
+
+    #[test]
+    fn request_user_input_off_by_default_absent_from_defs() {
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        assert!(
+            !mounted.defs().iter().any(|d| d.name == "request_user_input"),
+            "default-off must not mount request_user_input"
+        );
     }
 }
