@@ -1216,7 +1216,11 @@ impl TurnExecutor for KernelTurnExecutor {
                         }
                     }
                 }
-                _ => {}
+                other => {
+                    if let Some(te) = agent_to_turn(other) {
+                        emit(te);
+                    }
+                }
             }
         };
 

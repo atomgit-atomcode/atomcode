@@ -8739,6 +8739,33 @@ mod user_input_key_tests {
         assert!(resp.selected.is_empty(), "declined response must have no selections");
         assert!(resp.text.is_none(), "declined response must have no text");
     }
+
+    // FIX 4: Text mode — Enter with an empty buffer is a no-op (panel stays open).
+    #[test]
+    fn text_empty_enter_is_noop() {
+        let p = panel(UserInputMode::Text);
+        assert!(p.text.is_empty());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "Enter on an empty text buffer must not submit"
+        );
+    }
+
+    // FIX 3: Multiple mode — Enter on submit row with nothing checked is a no-op.
+    #[test]
+    fn multiple_empty_submit_is_noop() {
+        let mut p = panel(UserInputMode::Multiple);
+        // Navigate to the submit row without checking anything.
+        // options=2 → custom=2 → submit=3.
+        p.move_down(); // → B (index 1)
+        p.move_down(); // → custom (index 2)
+        p.move_down(); // → submit (index 3)
+        assert!(p.is_submit_row());
+        assert!(
+            user_input_response_for(&p, KeyCode::Enter).is_none(),
+            "submit with nothing selected must be a no-op"
+        );
+    }
 }
 
 fn handle_approval_key(
@@ -8854,11 +8881,17 @@ pub(crate) fn user_input_response_for(
     use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
     match (&panel.mode, code) {
         (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
-        (UserInputMode::Text, KeyCode::Enter) => Some(UserInputResponse {
-            declined: false,
-            selected: vec![],
-            text: Some(panel.text.clone()),
-        }),
+        (UserInputMode::Text, KeyCode::Enter) => {
+            if panel.text.trim().is_empty() {
+                None // empty buffer → no-op, keep panel open
+            } else {
+                Some(UserInputResponse {
+                    declined: false,
+                    selected: vec![],
+                    text: Some(panel.text.clone()),
+                })
+            }
+        }
         // Single: Enter on any row (option or custom) tries an immediate submit.
         // On a concrete option row this always succeeds; on the custom row it
         // returns None when custom_text is empty (no-op, keep panel open).

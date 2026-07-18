@@ -253,6 +253,7 @@ const zh = {
   'userInput.submit': '提交',
   'userInput.skip': '跳过',
   'userInput.other': '自己输入 / Other',
+  'userInput.error': '提交失败，请重试',
 
   // Sync toggle
   'sync.toggle': '同步当前会话',
@@ -552,6 +553,7 @@ const en: Record<MsgKey, string> = {
   'userInput.submit': 'Submit',
   'userInput.skip': 'Skip',
   'userInput.other': 'Other (free text)',
+  'userInput.error': 'Submit failed, please retry',
 
   // Sync toggle
   'sync.toggle': 'Sync current session',

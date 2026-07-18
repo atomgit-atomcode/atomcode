@@ -232,6 +232,9 @@ impl UserInputPanel {
                 if !custom.is_empty() {
                     selected.push(custom.to_string());
                 }
+                if selected.is_empty() {
+                    return None; // nothing chosen → Submit is a no-op
+                }
                 Some(UserInputResponse { declined: false, selected, text: None })
             }
             Text => Some(UserInputResponse {

@@ -13,6 +13,7 @@ interface UserInputCardProps {
 export function UserInputCard({ req, onDone }: UserInputCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // single: at most one selected label
   const [singleSelected, setSingleSelected] = useState<string | null>(null);
@@ -29,16 +30,24 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
     });
   }
 
+  // FIX 4 (webui): text mode — disable Submit when textarea is empty.
+  const textEmpty = req.mode === 'text' && freeText.trim() === '';
+
   async function submit() {
     if (loading) return;
     setLoading(true);
+    setError(null);
     try {
       let body: Parameters<typeof postLiveUserInput>[0];
       if (req.mode === 'text') {
         body = { request_id: req.request_id, declined: false, selected: [], text: freeText || null };
       } else if (req.mode === 'single') {
-        const chosen: string[] = singleSelected ? [singleSelected] : [];
-        if (freeText.trim()) chosen.push(freeText.trim());
+        // FIX 5: enforce single semantics — free-text "Other" takes priority over radio.
+        const chosen: string[] = freeText.trim()
+          ? [freeText.trim()]
+          : singleSelected
+            ? [singleSelected]
+            : [];
         body = { request_id: req.request_id, declined: false, selected: chosen, text: null };
       } else {
         // multiple
@@ -47,11 +56,12 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
         body = { request_id: req.request_id, declined: false, selected: chosen, text: null };
       }
       await postLiveUserInput(body);
-    } catch {
-      // Best-effort; dismiss regardless
-    } finally {
-      setLoading(false);
+      // FIX 2: only dismiss on success.
       onDone();
+    } catch {
+      // FIX 2: keep card open on failure, show inline error so user can retry.
+      setLoading(false);
+      setError(t('userInput.error'));
     }
   }
 
@@ -61,7 +71,7 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
     try {
       await postLiveUserInput({ request_id: req.request_id, declined: true, selected: [], text: null });
     } catch {
-      // Best-effort
+      // Best-effort — Skip dismisses even on POST failure (declining is best-effort).
     } finally {
       setLoading(false);
       onDone();
@@ -149,13 +159,17 @@ export function UserInputCard({ req, onDone }: UserInputCardProps) {
               />
             </div>
           )}
+
+          {error && (
+            <p class="user-input-error">{error}</p>
+          )}
         </div>
 
         <div class="modal-footer permission-footer">
           <button class="btn" disabled={loading} onClick={skip}>
             {t('userInput.skip')}
           </button>
-          <button class="btn btn-primary" disabled={loading} onClick={submit}>
+          <button class="btn btn-primary" disabled={loading || textEmpty} onClick={submit}>
             {t('userInput.submit')}
           </button>
         </div>
