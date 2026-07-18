@@ -2364,7 +2364,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let body = match panel.mode {
-            UserInputMode::Single | UserInputMode::Multiple => panel.options.len(),
+            // options + the `✎ 自己输入` custom row + the `✔ 提交` submit row.
+            UserInputMode::Single | UserInputMode::Multiple => panel.options.len() + 2,
             UserInputMode::Text => 1,
         };
         // 1 header (question) + body + 1 hint.
@@ -2401,6 +2402,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         match panel.mode {
             UserInputMode::Single | UserInputMode::Multiple => {
                 let multiple = matches!(panel.mode, UserInputMode::Multiple);
+                // Helper closure to emit one navigable row: marker (cursor),
+                // content, and (when highlighted) full-width reverse padding.
+                let custom_row = panel.options.len();
+                let submit_row = panel.options.len() + 1;
+                // Option rows: single = radio `(•)`/`( )`; multiple = checkbox
+                // `[x]`/`[ ]`. The checked flag now drives BOTH modes (single is
+                // exclusive so at most one is set).
                 for (i, label) in panel.options.iter().enumerate() {
                     let mut row = Vec::new();
                     let selected = i == panel.cursor;
@@ -2409,17 +2417,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         "  "
                     };
-                    // Multiple mode prepends a checkbox; single mode uses the
-                    // positional number (same as approval).
+                    let checked = panel.checked.get(i).copied().unwrap_or(false);
                     let prefix = if multiple {
-                        let checked = panel.checked.get(i).copied().unwrap_or(false);
-                        if checked {
-                            "[x] ".to_string()
-                        } else {
-                            "[ ] ".to_string()
-                        }
+                        if checked { "[x] " } else { "[ ] " }.to_string()
+                    } else if checked {
+                        "(\u{2022}) ".to_string() // (•)
                     } else {
-                        format!("{}. ", i + 1)
+                        "( ) ".to_string()
                     };
                     let prefix_width = crate::width::display_width(&prefix);
                     let style = if selected {
@@ -2432,6 +2436,75 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, marker, &style);
                     push_str_cells(&mut row, &prefix, &style);
                     push_str_cells(&mut row, &lbl, &style);
+                    if selected {
+                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
+                        let pad = screen_width.saturating_sub(current_width);
+                        if pad > 0 {
+                            push_str_cells(&mut row, &" ".repeat(pad), &style);
+                        }
+                    }
+                    out.push(row);
+                }
+
+                // Free-text row: `✎ 自己输入: <custom_text>` (placeholder when
+                // empty). Highlighted when the cursor is on it.
+                {
+                    let selected = panel.cursor == custom_row;
+                    let marker = if selected {
+                        if unicode { "\u{25b8} " } else { "> " }
+                    } else {
+                        "  "
+                    };
+                    let pen = if unicode { "\u{270e} " } else { "* " }; // ✎
+                    let content = if panel.custom_text.is_empty() {
+                        "自己输入…".to_string()
+                    } else {
+                        format!("自己输入: {}", panel.custom_text)
+                    };
+                    let raw = crate::glyph::downgrade_glyphs(&content, unicode);
+                    let style = if selected {
+                        CellStyle { reverse: true, ..CellStyle::default() }
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let prefix_width = crate::width::display_width(pen);
+                    let budget = rule_width.saturating_sub(2 + prefix_width);
+                    let body = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), budget);
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, marker, &style);
+                    push_str_cells(&mut row, &crate::glyph::downgrade_glyphs(pen, unicode), &style);
+                    push_str_cells(&mut row, &body, &style);
+                    if selected {
+                        let current_width: usize = row.iter().map(|c| c.width as usize).sum();
+                        let pad = screen_width.saturating_sub(current_width);
+                        if pad > 0 {
+                            push_str_cells(&mut row, &" ".repeat(pad), &style);
+                        }
+                    }
+                    out.push(row);
+                }
+
+                // Submit row: `✔ 提交`. Highlighted when the cursor is on it.
+                {
+                    let selected = panel.cursor == submit_row;
+                    let marker = if selected {
+                        if unicode { "\u{25b8} " } else { "> " }
+                    } else {
+                        "  "
+                    };
+                    let check = if unicode { "\u{2714} " } else { "+ " }; // ✔
+                    let content = format!("{}提交", check);
+                    let raw = crate::glyph::downgrade_glyphs(&content, unicode);
+                    let style = if selected {
+                        CellStyle { reverse: true, ..CellStyle::default() }
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    let budget = rule_width.saturating_sub(2);
+                    let body = crate::width::truncate_with_ellipsis(&scrub_controls(&raw), budget);
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, marker, &style);
+                    push_str_cells(&mut row, &body, &style);
                     if selected {
                         let current_width: usize = row.iter().map(|c| c.width as usize).sum();
                         let pad = screen_width.saturating_sub(current_width);
@@ -2462,8 +2535,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Hint row: mode-appropriate guidance, muted + glyph-downgraded.
         let hint_raw = match panel.mode {
-            UserInputMode::Single => "↑↓ select · Enter confirm · Esc cancel",
-            UserInputMode::Multiple => "↑↓ move · Space toggle · Enter confirm · Esc cancel",
+            UserInputMode::Single | UserInputMode::Multiple => {
+                "↑↓ 移动 · Enter 选中 · 提交行确认 · Esc 取消"
+            }
             UserInputMode::Text => "type answer · Enter confirm · Esc cancel",
         };
         let hint = crate::glyph::downgrade_glyphs(hint_raw, unicode);
@@ -11947,11 +12021,18 @@ mod tests {
                 mode: UserInputMode::Single,
                 options: vec!["OAuth".into(), "API key".into()],
                 cursor: 1,
-                checked: vec![false, false],
+                checked: vec![false, true],
                 text: String::new(),
+                custom_text: String::new(),
             };
-            // Row count contract: header + options + hint.
-            assert_eq!(r.user_input_panel_row_count(&view), 2 + 2);
+            // Row count contract: header + options + custom + submit + hint,
+            // and it MUST equal the produced row count.
+            assert_eq!(r.user_input_panel_row_count(&view), 2 + 2 + 2);
+            assert_eq!(
+                r.build_user_input_rows(&view, 78, 80).len(),
+                r.user_input_panel_row_count(&view),
+                "row_count must equal build_user_input_rows().len()"
+            );
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
@@ -11960,18 +12041,21 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
             assert!(vterm.any_row(|r| r.contains("Which auth flow?")), "question header\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("1. OAuth")), "numbered option 1\n{dump}");
-            assert!(vterm.any_row(|r| r.contains("2. API key")), "numbered option 2\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("( ) OAuth")), "radio option 1 unchecked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains("(•) API key")), "radio option 2 checked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("▸") && r.contains("API key")), "cursor marker on option 2\n{dump}");
+            assert!(vterm.any_row(|r| r.contains('自')), "custom free-text row\n{dump}");
+            assert!(vterm.any_row(|r| r.contains('提')), "submit row\n{dump}");
         }
 
-        // Multiple: checkbox prefixes reflect the `checked` flags.
+        // Multiple: checkbox prefixes reflect the `checked` flags; custom row
+        // shows the typed buffer; both extra rows are present.
         {
             let (mut r, buf) = new_capturing(80, 24);
             r.caps.colors = true;
             let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
             let mut status = status_basic();
-            status.user_input = Some(crate::render::UserInputPanelView {
+            let view = crate::render::UserInputPanelView {
                 header: "Langs".into(),
                 question: "Pick languages".into(),
                 mode: UserInputMode::Multiple,
@@ -11979,7 +12063,14 @@ mod tests {
                 cursor: 0,
                 checked: vec![true, false],
                 text: String::new(),
-            });
+                custom_text: "Zig".into(),
+            };
+            assert_eq!(
+                r.build_user_input_rows(&view, 78, 80).len(),
+                r.user_input_panel_row_count(&view),
+                "row_count must equal build_user_input_rows().len()"
+            );
+            status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(), cursor_byte: 0, menu: None, status, attachments: Vec::new(),
             });
@@ -11988,6 +12079,8 @@ mod tests {
             let dump = vterm.dump();
             assert!(vterm.any_row(|r| r.contains("[x] Rust")), "Rust checked\n{dump}");
             assert!(vterm.any_row(|r| r.contains("[ ] Go")), "Go unchecked\n{dump}");
+            assert!(vterm.any_row(|r| r.contains('自') && r.contains("Zig")), "custom text shown\n{dump}");
+            assert!(vterm.any_row(|r| r.contains('提')), "submit row\n{dump}");
         }
 
         // Text: a `> {buffer}` input row shows the typed answer.
@@ -12004,6 +12097,7 @@ mod tests {
                 cursor: 0,
                 checked: vec![],
                 text: "atomcode".into(),
+                custom_text: String::new(),
             };
             assert_eq!(r.user_input_panel_row_count(&view), 1 + 2, "header + 1 input row + hint");
             status.user_input = Some(view);

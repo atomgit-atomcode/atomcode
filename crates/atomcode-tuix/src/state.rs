@@ -78,12 +78,18 @@ pub struct UserInputPanel {
     pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
     /// Option labels (single/multiple). Empty for text mode.
     pub options: Vec<String>,
-    /// Highlighted option (single/multiple).
+    /// Highlighted row (single/multiple). Ranges over
+    /// `0..options.len()` (options), `options.len()` (the free-text row), and
+    /// `options.len()+1` (the submit row). See [`UserInputPanel::is_custom_row`]
+    /// / [`UserInputPanel::is_submit_row`].
     pub cursor: usize,
     /// Per-option checked flags (multiple mode only; parallel to `options`).
     pub checked: Vec<bool>,
-    /// Free-form buffer (text mode only).
+    /// Free-form buffer (text mode only) — the standalone `text` mode's input.
     pub text: String,
+    /// Free-text buffer for the folded `✎ 自己输入…` row in single/multiple
+    /// mode. Distinct from `text` (which is the standalone text-mode input).
+    pub custom_text: String,
 }
 
 impl UserInputPanel {
@@ -102,7 +108,21 @@ impl UserInputPanel {
             cursor: 0,
             checked,
             text: String::new(),
+            custom_text: String::new(),
         }
+    }
+    /// Last navigable cursor index for single/multiple mode: the submit row at
+    /// `options.len() + 1` (options, then the custom-text row, then submit).
+    fn last_row(&self) -> usize {
+        self.options.len() + 1
+    }
+    /// Whether `cursor` is on the `✎ 自己输入…` free-text row.
+    pub fn is_custom_row(&self) -> bool {
+        self.cursor == self.options.len()
+    }
+    /// Whether `cursor` is on the `✔ 提交` submit row.
+    pub fn is_submit_row(&self) -> bool {
+        self.cursor == self.options.len() + 1
     }
     pub fn move_up(&mut self) {
         if self.cursor > 0 {
@@ -110,22 +130,61 @@ impl UserInputPanel {
         }
     }
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.options.len() {
+        if self.cursor < self.last_row() {
             self.cursor += 1;
         }
     }
-    pub fn toggle(&mut self) {
-        if let Some(c) = self.checked.get_mut(self.cursor) {
-            *c = !*c;
+    /// Select/toggle the option under the cursor (a no-op on the custom/submit
+    /// rows). Single mode is exclusive: selecting an option clears every other
+    /// option AND the custom-text buffer. Multiple mode toggles independently,
+    /// and coexists with the custom text.
+    pub fn select_current_option(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+        if self.cursor >= self.options.len() {
+            return; // custom / submit rows are not options
+        }
+        match self.mode {
+            Single => {
+                for (i, c) in self.checked.iter_mut().enumerate() {
+                    *c = i == self.cursor;
+                }
+                // Choosing an option supersedes any custom text (exclusive).
+                self.custom_text.clear();
+            }
+            Multiple => {
+                if let Some(c) = self.checked.get_mut(self.cursor) {
+                    *c = !*c;
+                }
+            }
+            Text => {}
         }
     }
-    /// The chosen labels: the highlighted one (single), all checked ones
+    /// Toggle the highlighted option (multiple-mode Space convenience). In
+    /// single mode this behaves like `select_current_option` (exclusive).
+    pub fn toggle(&mut self) {
+        self.select_current_option();
+    }
+    /// Typed characters edit the custom-text buffer. In single mode, typing a
+    /// custom answer supersedes any option selection (exclusive).
+    pub fn push_custom(&mut self, c: char) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+        if matches!(self.mode, Single) {
+            for c in self.checked.iter_mut() {
+                *c = false;
+            }
+        }
+        self.custom_text.push(c);
+    }
+    /// Backspace on the custom-text row.
+    pub fn pop_custom(&mut self) {
+        self.custom_text.pop();
+    }
+    /// The chosen labels: the checked option (single), all checked ones
     /// (multiple), or empty (text — the answer rides `text`, not `selected`).
     pub fn chosen(&self) -> Vec<String> {
         use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
         match self.mode {
-            Single => self.options.get(self.cursor).cloned().into_iter().collect(),
-            Multiple => self
+            Single | Multiple => self
                 .options
                 .iter()
                 .zip(&self.checked)
@@ -133,6 +192,43 @@ impl UserInputPanel {
                 .map(|(l, _)| l.clone())
                 .collect(),
             Text => vec![],
+        }
+    }
+    /// Build the `UserInputResponse` for the current panel state, mapping
+    /// single/multiple option selections + the custom-text row into `selected`.
+    /// Returns `None` when there is nothing to submit (single with neither an
+    /// option nor custom text) so the caller treats Submit as a no-op instead of
+    /// sending an empty answer. Text mode is handled separately by the caller.
+    pub fn build_response(
+        &self,
+    ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
+        use atomcode_capabilities::tools::request_user_input::{UserInputMode::*, UserInputResponse};
+        match self.mode {
+            Single => {
+                let custom = self.custom_text.trim();
+                let selected = if !custom.is_empty() {
+                    vec![custom.to_string()]
+                } else {
+                    self.chosen()
+                };
+                if selected.is_empty() {
+                    return None; // nothing chosen → Submit is a no-op
+                }
+                Some(UserInputResponse { declined: false, selected, text: None })
+            }
+            Multiple => {
+                let mut selected = self.chosen();
+                let custom = self.custom_text.trim();
+                if !custom.is_empty() {
+                    selected.push(custom.to_string());
+                }
+                Some(UserInputResponse { declined: false, selected, text: None })
+            }
+            Text => Some(UserInputResponse {
+                declined: false,
+                selected: vec![],
+                text: Some(self.text.clone()),
+            }),
         }
     }
 }
@@ -2018,20 +2114,42 @@ mod tests {
         let mut p = UserInputPanel::new(7, &single_req);
         assert_eq!(p.request_id, 7);
         assert_eq!(p.cursor, 0);
-        // move_down clamps at the last option (no wrap).
-        p.move_down();
-        p.move_down();
-        p.move_down();
-        p.move_down();
-        assert_eq!(p.cursor, 2, "move_down clamps at last index");
+        // Cursor spans options (0..3), the custom row (3), and the submit row
+        // (4). move_down clamps at the submit row (no wrap).
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert_eq!(p.cursor, 4, "move_down clamps at the submit row (options+1)");
+        assert!(p.is_submit_row());
+        p.move_up();
+        assert!(p.is_custom_row(), "row above submit is the custom-text row");
         // move_up clamps at 0.
-        p.move_up();
-        p.move_up();
-        p.move_up();
+        for _ in 0..10 {
+            p.move_up();
+        }
         assert_eq!(p.cursor, 0, "move_up clamps at 0");
-        p.move_down();
-        // Single: chosen() = the highlighted label only.
+        // Single: selecting an option is exclusive; build_response returns it.
+        p.move_down(); // cursor → "API key"
+        p.select_current_option();
         assert_eq!(p.chosen(), vec!["API key".to_string()]);
+        let resp = p.build_response().expect("single with a selection submits");
+        assert_eq!(resp.selected, vec!["API key".to_string()]);
+        assert_eq!(resp.text, None);
+        // Selecting a different option clears the prior one (exclusive).
+        p.move_up();
+        p.select_current_option(); // "OAuth"
+        assert_eq!(p.chosen(), vec!["OAuth".to_string()], "single is exclusive");
+
+        // Single: typing custom text supersedes the option selection.
+        p.push_custom('h');
+        p.push_custom('i');
+        assert!(p.chosen().is_empty(), "custom text clears option selection");
+        let resp = p.build_response().expect("custom text submits");
+        assert_eq!(resp.selected, vec!["hi".to_string()]);
+
+        // Single with nothing chosen → build_response is None (Submit no-op).
+        let blank = UserInputPanel::new(11, &single_req);
+        assert!(blank.build_response().is_none(), "empty single does not submit");
 
         // Multiple: toggle flips the highlighted option; chosen() = all checked.
         let mut m = UserInputPanel::new(9, &UserInputRequest {
@@ -2045,6 +2163,10 @@ mod tests {
         assert_eq!(m.chosen(), vec!["OAuth".to_string(), "Device".to_string()]);
         m.toggle(); // uncheck "Device"
         assert_eq!(m.chosen(), vec!["OAuth".to_string()], "toggle flips off");
+        // Multiple: custom text is APPENDED to the checked labels.
+        m.push_custom('x');
+        let resp = m.build_response().expect("multiple always submits");
+        assert_eq!(resp.selected, vec!["OAuth".to_string(), "x".to_string()]);
 
         // Text: chosen() is empty (answer rides `text`).
         let mut t = UserInputPanel::new(1, &UserInputRequest {
@@ -2055,6 +2177,7 @@ mod tests {
         t.text.push_str("hello");
         assert!(t.chosen().is_empty(), "text mode has no selected labels");
         assert_eq!(t.text, "hello");
+        assert_eq!(t.build_response().unwrap().text.as_deref(), Some("hello"));
     }
 
     #[test]

@@ -569,9 +569,15 @@ pub struct UserInputPanelView {
     pub question: String,
     pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
     pub options: Vec<String>,
+    /// Highlighted row. For single/multiple this ranges over the option rows,
+    /// then the custom-text row (`options.len()`), then the submit row
+    /// (`options.len()+1`).
     pub cursor: usize,
     pub checked: Vec<bool>,
+    /// Standalone text-mode input buffer.
     pub text: String,
+    /// Folded `✎ 自己输入…` row buffer for single/multiple mode.
+    pub custom_text: String,
 }
 
 /// Progress of the active todo list, rendered as the multi-line footer todo
