@@ -3424,6 +3424,13 @@ struct McpServerStatus {
 #[derive(Serialize)]
 struct McpStatusResponse {
     servers: Vec<McpServerStatus>,
+    /// Whether the current project's `.mcp.json` has been explicitly trusted by
+    /// the user.  False means project-source servers are withheld.
+    trusted: bool,
+    /// Names of project-source MCP servers that are blocked because the project
+    /// is not yet trusted.  Empty when trusted or when no project-source servers
+    /// are configured.
+    blocked: Vec<String>,
 }
 
 /// Merge a registry's known server statuses with the full set of *configured*
@@ -3473,10 +3480,18 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
     // Surface configured-but-not-yet-connected servers as `connecting` so a slow
     // handshake (especially remote HTTP) renders as "connecting", not an empty
     // panel. Names come from the same user + project mcp.json the registry loads.
-    let configured_names: Vec<String> = atomcode_core::mcp::load_mcp_config(&working_dir)
-        .map(|cfgs| cfgs.into_iter().map(|c| c.name).collect())
-        .unwrap_or_default();
+    let all_cfgs = atomcode_core::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+    let configured_names: Vec<String> = all_cfgs.iter().map(|c| c.name.clone()).collect();
     let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
+
+    // Trust / blocked enrichment: re-partition the configs to derive which
+    // project-source servers are withheld from this session (read-only, cheap).
+    let trusted = atomcode_core::mcp::trust::is_project_trusted(&working_dir);
+    let blocked: Vec<String> = atomcode_core::mcp::trust::partition_by_trust(all_cfgs, &working_dir)
+        .blocked
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
 
     // Fetch the tool list once (was previously re-fetched per connected server).
     let tools = registry.list_all_tools().await;
@@ -3500,7 +3515,7 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
             error,
         });
     }
-    Json(McpStatusResponse { servers })
+    Json(McpStatusResponse { servers, trusted, blocked })
 }
 
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -4503,6 +4518,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
         .route("/live/command", post(live_api::live_command))
+        .route("/live/mcp/trust", post(live_api::live_mcp_trust))
         .route("/command", post(commands::run_command))
         .route(
             "/live/switch_session",

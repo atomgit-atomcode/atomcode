@@ -2696,10 +2696,87 @@ pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({ "cancelled": cancelled }))
 }
 
+/// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
+/// are allowed to connect on the next turn. Rebuilds the serving MCP registry
+/// so newly-allowed servers start connecting immediately.
+///
+/// Response on success: `{"ok": true, "trusted": true}`
+/// Response on failure: HTTP 500 + `{"ok": false, "error": "..."}`
+pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoResponse {
+    let fallback = { state.project.read().await.working_dir.clone() };
+    let working_dir = live_current_working_dir(&fallback);
+    match atomcode_core::mcp::trust::trust_project(&working_dir) {
+        Ok(()) => {
+            let new_registry =
+                Arc::new(McpRegistry::from_config_background(&working_dir));
+            *state.mcp_registry.write().await = new_registry;
+            Json(serde_json::json!({ "ok": true, "trusted": true })).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_core::conversation::message::Message;
+
+    /// Trust round-trip at the daemon layer: trust_project → is_project_trusted → partition_by_trust
+    /// clears blocked list.  Uses ATOMCODE_MCP_TRUST_STORE as the test seam so we never touch the
+    /// developer's real trust store.
+    #[test]
+    #[serial_test::serial]
+    fn mcp_trust_round_trip_clears_blocked() {
+        use atomcode_core::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
+        use atomcode_core::mcp::trust::{is_project_trusted, partition_by_trust, trust_project};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: test seam; serial attribute prevents concurrent mutation.
+        unsafe {
+            std::env::set_var(
+                "ATOMCODE_MCP_TRUST_STORE",
+                store_dir.path().join("mcp_trust_daemon_test.json"),
+            );
+        }
+
+        let proj = store_dir.path().join("fake-project");
+
+        // Before trust: project-source server appears in blocked.
+        let project_cfg = McpServerConfig {
+            name: "untrusted-server".to_string(),
+            disabled: false,
+            config: McpTransportConfig::Stdio {
+                command: "true".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            source: McpConfigSource::Project,
+            trust: false,
+            auto_approve: vec![],
+        };
+        let part_before =
+            partition_by_trust(vec![project_cfg.clone()], &proj);
+        assert_eq!(part_before.blocked.len(), 1, "untrusted project: server should be blocked");
+        assert!(part_before.allowed.is_empty());
+        assert!(!is_project_trusted(&proj), "fresh store: project must be untrusted");
+
+        // Trust the project.
+        trust_project(&proj).expect("trust_project must not fail");
+        assert!(is_project_trusted(&proj), "after trust_project: project must be trusted");
+
+        // After trust: same config yields empty blocked.
+        let part_after = partition_by_trust(vec![project_cfg], &proj);
+        assert!(part_after.blocked.is_empty(), "trusted project: blocked must be empty");
+        assert_eq!(part_after.allowed.len(), 1);
+
+        // Cleanup env so other serial tests see a clean state.
+        unsafe { std::env::remove_var("ATOMCODE_MCP_TRUST_STORE") };
+    }
 
     #[test]
     fn real_empty_terminal_snapshot_clears_the_conversation() {
