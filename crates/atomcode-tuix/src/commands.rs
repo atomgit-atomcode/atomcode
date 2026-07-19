@@ -112,7 +112,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false },
     Command { name: "forget", desc: "Remove matching memories", needs_args: true, hidden: false },
     Command { name: "memory", desc: "Show all saved memories", needs_args: false, hidden: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false, hidden: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)", needs_args: false, hidden: false },
     Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true, hidden: false },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true, hidden: false },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false, hidden: false },

@@ -478,6 +478,10 @@ pub enum Msg<'a> {
     // MCP / LSP server connect feedback (event handler output)
     McpServerConnected { name: &'a str },
     McpServerFailed { name: &'a str, error: &'a str },
+    // /mcp trust / untrust
+    McpProjectTrusted,
+    McpProjectUntrusted,
+    McpBlockedUntrusted { n: usize },
     LspServerStarted { name: &'a str, ext: &'a str },
     LspServerFailed { name: &'a str, ext: &'a str, error: &'a str },
 

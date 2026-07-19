@@ -998,6 +998,10 @@ pub struct LoopCtx {
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
+    /// Names of MCP servers withheld because the project is untrusted.
+    /// Accumulated across `BlockedUntrusted` events; cleared when a reload
+    /// begins so a fresh `/mcp trust` → `/mcp reload` shows a clean count.
+    pub mcp_blocked_untrusted: Vec<String>,
     /// Channel for receiving LSP connection status events (Started / Failed
     /// / Warning). Same plumbing as `mcp_connect_rx` — wired in TUI mode
     /// so the manager's start failures land in scrollback as `✗ LSP server
@@ -4718,6 +4722,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
                         }
                     }
+                    McpConnectEvent::BlockedUntrusted { name } => {
+                        ctx.mcp_blocked_untrusted.push(name.clone());
+                        let n = ctx.mcp_blocked_untrusted.len();
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                        ));
+                    }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
@@ -4733,6 +4744,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             p.failed = p.failed.saturating_add(1)
                         }
                         McpConnectEvent::Warning { .. } => {}
+                        McpConnectEvent::BlockedUntrusted { .. } => {}
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
@@ -5172,6 +5184,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
                         }
                     }
+                    McpConnectEvent::BlockedUntrusted { name } => {
+                        ctx.mcp_blocked_untrusted.push(name.clone());
+                        let n = ctx.mcp_blocked_untrusted.len();
+                        renderer.render(UiLine::Warning(
+                            crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                        ));
+                    }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
@@ -5187,6 +5206,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             p.failed = p.failed.saturating_add(1)
                         }
                         McpConnectEvent::Warning { .. } => {}
+                        McpConnectEvent::BlockedUntrusted { .. } => {}
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();

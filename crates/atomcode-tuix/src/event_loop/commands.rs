@@ -2593,7 +2593,34 @@ fn execute_slash_command_impl(
                 return Ok(());
             }
 
+            if sub.eq_ignore_ascii_case("trust") {
+                match atomcode_core::mcp::trust::trust_project(&ctx.working_dir) {
+                    Ok(()) => {
+                        renderer.render(UiLine::CommandOutput(t(Msg::McpProjectTrusted).into_owned()));
+                        renderer.flush();
+                        // Trigger a reload so newly-allowed servers connect immediately.
+                        return execute_slash_command_impl("mcp", "reload", state, ctx, renderer, active_modal, setup_pending);
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!("{:#}", e)));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                }
+            }
+
+            if sub.eq_ignore_ascii_case("untrust") {
+                match atomcode_core::mcp::trust::untrust_project(&ctx.working_dir) {
+                    Ok(()) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
+                    Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
             if sub.eq_ignore_ascii_case("reload") {
+                // Clear accumulated blocked-server list so a re-trust + reload shows fresh state.
+                ctx.mcp_blocked_untrusted.clear();
                 // Preflight: parse merged MCP config so we can show progress immediately.
                 // (Connection attempts happen in background and may take up to timeout_ms.)
                 let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
@@ -5127,6 +5154,40 @@ fn fmt_dur(secs: u64) -> String {
     }
 }
 
+/// Recognised `/mcp` subcommands.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum McpSub {
+    Reload,
+    Tools,
+    Login,
+    Logout,
+    Trust,
+    Untrust,
+}
+
+/// Parse the argument string following `/mcp` into a known subcommand.
+/// Returns `None` for unrecognised inputs (which fall through to status display).
+#[allow(dead_code)]
+pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
+    let s = sub.trim();
+    if s.eq_ignore_ascii_case("reload") {
+        Some(McpSub::Reload)
+    } else if s.eq_ignore_ascii_case("trust") {
+        Some(McpSub::Trust)
+    } else if s.eq_ignore_ascii_case("untrust") {
+        Some(McpSub::Untrust)
+    } else if s.starts_with("tools") {
+        Some(McpSub::Tools)
+    } else if s.starts_with("login") {
+        Some(McpSub::Login)
+    } else if s.starts_with("logout") {
+        Some(McpSub::Logout)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod status_login_tests {
     use super::*;
@@ -6810,5 +6871,37 @@ mod todo_command_tests {
         assert!(out.contains("89"), "cached tokens shown");
         assert!(out.contains('$'), "a cost figure is rendered");
         assert!(!out.contains("$0.0000"), "self-integrated/unknown model must not price to $0");
+    }
+}
+
+#[cfg(test)]
+mod mcp_subcommand_tests {
+    use super::{parse_mcp_subcommand, McpSub};
+
+    #[test]
+    fn mcp_trust_subcommands_recognized() {
+        assert!(matches!(parse_mcp_subcommand("trust"), Some(McpSub::Trust)));
+        assert!(matches!(parse_mcp_subcommand("untrust"), Some(McpSub::Untrust)));
+    }
+
+    #[test]
+    fn mcp_trust_case_insensitive() {
+        assert!(matches!(parse_mcp_subcommand("TRUST"), Some(McpSub::Trust)));
+        assert!(matches!(parse_mcp_subcommand("UnTrust"), Some(McpSub::Untrust)));
+    }
+
+    #[test]
+    fn mcp_existing_subcommands_still_recognized() {
+        assert!(matches!(parse_mcp_subcommand("reload"), Some(McpSub::Reload)));
+        assert!(matches!(parse_mcp_subcommand("tools myserver"), Some(McpSub::Tools)));
+        assert!(matches!(parse_mcp_subcommand("login github"), Some(McpSub::Login)));
+        assert!(matches!(parse_mcp_subcommand("logout github"), Some(McpSub::Logout)));
+    }
+
+    #[test]
+    fn mcp_unknown_subcommand_returns_none() {
+        assert!(parse_mcp_subcommand("").is_none());
+        assert!(parse_mcp_subcommand("status").is_none());
+        assert!(parse_mcp_subcommand("foobar").is_none());
     }
 }
