@@ -34,7 +34,7 @@ pub const PER_SKILL_DESC_CAP: usize = 1024;
 /// reconcile the block in place across `--resume`.
 pub const CATALOG_HEADER: &str = "=== AVAILABLE SKILLS ===";
 
-const GUIDANCE: &str = "Skills are reusable instruction templates for specific tasks. When a task matches a skill's description — not only when the user explicitly names the skill — load it with the `use_skill` tool BEFORE doing the work, then follow its instructions. For example, before creating a feature, building a component, planning, or other design/creative work, load the matching skill first. If several skills match, use each; if none match, proceed normally.";
+const GUIDANCE: &str = "Skills are reusable instruction templates for specific tasks. If a task clearly matches a skill's description — not only when the user names the skill — you MUST load it with the `use_skill` tool and follow it BEFORE doing the work, INCLUDING before asking the user clarifying questions, exploring, or planning (the skill guides those steps). Announce in one line which skill you're using; if you skip an obviously matching skill, say why. For example, before designing or building a feature, a component, or a plan, load the matching skill first. If several skills match, use the minimal set that covers the request; if none match, proceed normally.";
 
 /// One catalog row, already reduced from a crate-specific `Skill`. `source_rank`
 /// is computed via [`source_rank`]; lower = higher priority when budget forces
@@ -150,6 +150,9 @@ mod tests {
         .unwrap();
         assert!(out.starts_with("=== AVAILABLE SKILLS ==="));
         assert!(out.contains("use_skill"));
+        // codex-style anti-bypass framing: mandatory-if-matches + justify a skip.
+        assert!(out.contains("MUST"), "mandatory-if-matches framing");
+        assert!(out.contains("say why"), "accountability: justify skipping an obvious match");
         assert!(out.contains("- brainstorming: before creative work"));
         assert!(out.contains("- seo: search stuff"));
         assert!(!out.contains("not shown"), "no omission under budget: {out}");

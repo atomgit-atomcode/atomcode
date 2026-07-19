@@ -281,11 +281,14 @@ use it for a single quick edit, a one-off command, or a purely informational / c
 /// (the reason a skill like `brainstorming` "basically never appeared"). Always appended
 /// (see `coding_persona`) — degrades gracefully when no skills are installed.
 const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
-When a task matches an installed skill's description — not only when the user names the skill \
-— load it with `use_skill` BEFORE doing the work, then follow its instructions. Installed \
-skills are listed under the '=== AVAILABLE SKILLS ===' section of this system prompt; for \
-example, before creative or design work (a new feature, a component, a plan), load the \
-matching skill first. If several match, use each; if none match, proceed normally.";
+If a task clearly matches an installed skill's description — not only when the user names the \
+skill — you MUST load it with `use_skill` and follow it BEFORE doing the work. Installed skills \
+are listed under the '=== AVAILABLE SKILLS ===' section of this system prompt. This takes \
+priority over asking the user a clarifying question: if a skill matches the request (e.g. \
+brainstorming for a design/build request), load it FIRST and let it drive the questions — do \
+not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
+which skill you're using; if you skip an obviously matching skill, say why. If several match, \
+use the minimal set; if none match, proceed normally.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
 /// `request_user_input` only when the decision is genuinely the user's to make —
@@ -510,6 +513,13 @@ mod tests {
         // Skill-trigger nudge is always present (weak-model reinforcement of the catalog).
         assert!(p.contains("## SKILLS:"), "skill-trigger guidance always present");
         assert!(p.contains("use_skill"), "names the skill-loading tool");
+        // Anti-bypass: a matching skill must win over an ad-hoc clarifying question
+        // (the observed failure: request_user_input pre-empted brainstorming).
+        assert!(
+            p.contains("priority over asking the user a clarifying question"),
+            "SKILLS must out-prioritize ad-hoc clarifying questions"
+        );
+        assert!(p.contains("say why"), "accountability: justify skipping an obvious match");
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
