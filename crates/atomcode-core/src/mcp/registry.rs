@@ -24,6 +24,8 @@ pub enum McpConnectEvent {
     Failed { name: String, error: String },
     /// Non-fatal warning (e.g. tools/list failed after connect).
     Warning { name: String, message: String },
+    /// Server withheld because it comes from an untrusted project's `.mcp.json`.
+    BlockedUntrusted { name: String },
 }
 
 /// Registry of connected MCP servers.
@@ -122,6 +124,16 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        // SECURITY: withhold project-source servers from untrusted projects so a
+        // committed `.mcp.json` cannot auto-spawn a subprocess. Fail-closed.
+        let super::trust::TrustPartition { allowed: configs, blocked } =
+            super::trust::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            if let Some(tx) = &combined_tx {
+                let _ = tx.send(McpConnectEvent::BlockedUntrusted { name: b.name.clone() });
+            }
+        }
 
         if !configs.is_empty() {
             let servers = registry.servers.clone();
@@ -281,6 +293,12 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        let super::trust::TrustPartition { allowed: configs, blocked } =
+            super::trust::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            eprintln!("[mcp] withheld untrusted project server: {}", b.name);
+        }
 
         for config in configs {
             if let Err(e) = registry.add_server(config).await {
@@ -532,6 +550,12 @@ impl McpRegistry {
         let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
     }
 
+    /// Return the names of all currently connected servers.
+    /// Used in tests to verify that blocked servers never entered the connect loop.
+    pub async fn connected_server_names(&self) -> Vec<String> {
+        self.servers.read().await.keys().cloned().collect()
+    }
+
     /// Get an Arc clone for sharing across threads.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
@@ -585,6 +609,47 @@ impl Default for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+
+    /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be
+    /// connected or spawned. The registry must emit `BlockedUntrusted` and leave
+    /// the servers map empty.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn untrusted_project_stdio_server_never_connects() {
+        // Isolated trust store => project is untrusted.
+        let store = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+        // racing on this variable.
+        unsafe {
+            std::env::set_var("ATOMCODE_MCP_TRUST_STORE", store.path().join("s.json"));
+        }
+
+        // A project dir containing a malicious .mcp.json (project-source stdio).
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "evil": { "command": "/nonexistent/pwn", "args": ["x"] } } }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reg = McpRegistry::from_config_background_with_events(proj.path(), Some(tx));
+        // Give the background task a chance to run (it must NOT spawn).
+        reg.wait_for_initial_connections(std::time::Duration::from_millis(500)).await;
+
+        // No server connected.
+        assert!(reg.connected_server_names().await.is_empty(), "no server should connect");
+
+        // A BlockedUntrusted event was emitted for "evil".
+        let mut saw_blocked = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, McpConnectEvent::BlockedUntrusted { ref name } if name == "evil") {
+                saw_blocked = true;
+            }
+        }
+        assert!(saw_blocked, "expected BlockedUntrusted for evil");
+    }
 
     /// `add_server` against a stdio command that cannot be spawned must
     /// still record the failure into `failed_servers`, so the `/mcp`
