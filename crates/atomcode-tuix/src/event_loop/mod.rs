@@ -9360,14 +9360,16 @@ pub(super) fn handle_plugin_job_event(
                 ));
                 renderer.flush();
             }
-            // Startup marketplace auto-update runs in the background and is
-            // NON-FATAL (a failed pull — stale repo, offline, git safe.directory
-            // ownership mismatch — never affects chat). Surface it as a CALM
-            // one-line yellow Warning (first line only, dropping the multi-line
-            // git stderr / "To add an exception…" block) instead of a red
-            // multi-line "错误" dump that reads like a crash. User-initiated plugin
-            // ops keep the red Error so genuine failures stay prominent.
-            if op == "auto-update" {
+            // Startup marketplace auto-install (fresh clone on first launch) and
+            // auto-update (`git pull` on every launch) both run in the background
+            // and are NON-FATAL (a failed clone/pull — offline, upstream down, git
+            // safe.directory ownership mismatch, no working git — never affects
+            // chat). Surface them as a CALM one-line yellow Warning (first line
+            // only, dropping the multi-line git stderr / xcode-select / "To add an
+            // exception…" block) instead of a red multi-line "错误" dump that reads
+            // like a crash on a brand-new install. User-initiated plugin ops keep
+            // the red Error so genuine failures stay prominent.
+            if op == "auto-update" || op == "auto-install" {
                 let detail = msg.lines().next().unwrap_or(msg.as_str());
                 renderer.render(UiLine::Warning(
                     crate::i18n::t(crate::i18n::Msg::PluginAutoUpdateSkipped { detail })

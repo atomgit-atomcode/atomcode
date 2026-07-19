@@ -42,6 +42,16 @@ pub fn find_git() -> Result<PathBuf> {
 
     // 2. Fallback: probe common installation directories that are
     //    frequently missing from the PATH of GUI-launched processes.
+    //
+    //    MUST verify the candidate actually RUNS, not merely that the file
+    //    exists: on macOS WITHOUT the Xcode Command Line Tools installed,
+    //    `/usr/bin/git` is present as a `xcode-select` STUB that fails on
+    //    every invocation ("No developer tools were found, requesting
+    //    install"). An `exists()`-only check treated that stub as a working
+    //    git, so the early GitNotFound guard was skipped and the later
+    //    `git clone` dumped a red, crash-looking error on fresh installs.
+    //    Probing `--version` rejects the stub → callers fall through to the
+    //    friendly "install git (`xcode-select --install`)" hint.
     let candidates: &[&str] = &[
         "/usr/bin/git",               // macOS system (Xcode CLI tools)
         "/usr/local/bin/git",          // macOS Intel Homebrew
@@ -52,7 +62,7 @@ pub fn find_git() -> Result<PathBuf> {
     ];
     for candidate in candidates {
         let p = PathBuf::from(candidate);
-        if p.exists() {
+        if p.exists() && git_runs(&p) {
             return Ok(p);
         }
     }
@@ -93,6 +103,21 @@ fn which_git(name: &str) -> Result<PathBuf> {
         }
     }
     Ok(PathBuf::from(name))
+}
+
+/// Does the git binary at `path` actually run? Runs `<path> --version` and
+/// checks it exits successfully. Distinguishes a working git from a present-
+/// but-nonfunctional stub (notably macOS's `/usr/bin/git` xcode-select shim
+/// before the Command Line Tools are installed, which exists on disk but exits
+/// non-zero on every invocation). Any spawn/exec error counts as "does not run".
+fn git_runs(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Sanitize a name into a path-safe segment (CC convention).
@@ -530,6 +555,40 @@ mod tests {
     use super::*;
     use crate::plugin::test_support::isolated_home;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn git_runs_rejects_present_but_failing_stub() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Present-but-nonfunctional stub (mirrors macOS `/usr/bin/git` with no
+        // Xcode CLT: the file exists but every invocation exits non-zero). It
+        // must NOT be treated as a working git — otherwise the GitNotFound hint
+        // is skipped and a later `git clone` dumps a red xcode-select error.
+        let stub = dir.path().join("git-stub");
+        write!(
+            std::fs::File::create(&stub).unwrap(),
+            "#!/bin/sh\necho 'No developer tools were found' >&2\nexit 1\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!git_runs(&stub), "a stub that exits non-zero must not count as working git");
+
+        // A binary that runs `--version` successfully IS accepted.
+        let ok = dir.path().join("git-ok");
+        write!(
+            std::fs::File::create(&ok).unwrap(),
+            "#!/bin/sh\necho 'git version 2.40.0'\nexit 0\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git_runs(&ok), "a binary whose --version succeeds must count as git");
+
+        // A path that does not exist does not run.
+        assert!(!git_runs(&dir.path().join("does-not-exist")));
+    }
 
     fn make_bare_repo_with_manifest(name: &str, manifest: Option<&str>) -> PathBuf {
         let work = tempfile::tempdir().unwrap().keep();

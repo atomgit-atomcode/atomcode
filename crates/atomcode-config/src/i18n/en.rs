@@ -743,7 +743,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginMarketplaceListFailed { error } =>
             format!("list marketplaces: {error}").into(),
         Msg::PluginAutoUpdateSkipped { detail } =>
-            format!("Marketplace auto-update skipped (chat unaffected): {detail}").into(),
+            format!("Marketplace sync skipped (chat unaffected): {detail}").into(),
         Msg::OfflineModeActive =>
             "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
         Msg::PluginHooksUntrusted { count, names } => format!(
