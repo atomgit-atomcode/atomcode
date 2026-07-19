@@ -41,7 +41,7 @@ pub use oauth::{
     login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, McpOAuthLoginOptions,
     McpOAuthToken, McpTokenStore,
 };
-pub use registry::{McpConnectEvent, McpRegistry};
+pub use registry::{project_trust_key, McpConnectEvent, McpRegistry};
 pub use tool::McpToolAdapter;
 pub use types::*;
 

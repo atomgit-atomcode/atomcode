@@ -113,29 +113,10 @@ async fn adapter_passes_kernel_tool_conformance() {
     report.assert_conformant();
 }
 
-/// Compute the path hash used by the MCP trust store — mirrors core's `hash_path`
-/// and the local `is_project_trusted_local` in capabilities.  Used only in tests
-/// to pre-populate a trust store without a dependency on `atomcode-core`.
-fn path_hash_for_trust(path: &std::path::Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let normalized = path.to_string_lossy();
-    let mut normalized = normalized.replace('\\', "/");
-    if normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
-    let mut hasher = DefaultHasher::new();
-    let p: std::path::PathBuf = std::path::PathBuf::from(normalized);
-    p.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 /// Write a trust store file that marks `project_dir` as trusted.
 /// Mirrors the format written by `atomcode_core::mcp::trust::trust_project`.
 fn write_trusted_store(store_path: &std::path::Path, project_dir: &std::path::Path) {
-    let key = path_hash_for_trust(project_dir);
+    let key = atomcode_capabilities::mcp::registry::project_trust_key(project_dir);
     let store = serde_json::json!({
         "version": 1,
         "projects": {

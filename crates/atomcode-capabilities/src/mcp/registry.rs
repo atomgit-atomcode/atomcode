@@ -49,7 +49,8 @@ fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Compute the trust-store key for `project_dir`, mirroring core's `hash_path` exactly.
+/// Canonical trust-store key for a project dir — mirrors `atomcode_core::session::hash_path`.
+/// Exposed so tests (and any same-store reader) use ONE implementation.
 ///
 /// The algorithm (must stay in sync with `atomcode_core::session::hash_path`):
 /// 1. `strip_verbatim_prefix` on the raw string (BEFORE backslash replacement —
@@ -63,7 +64,7 @@ fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
 /// The cross-engine golden test in this module pins the exact output for a fixed
 /// path; the matching test in `atomcode-core` pins the same literal so any drift
 /// between the two implementations fails CI immediately.
-fn project_trust_key(project_dir: &std::path::Path) -> String {
+pub fn project_trust_key(project_dir: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
