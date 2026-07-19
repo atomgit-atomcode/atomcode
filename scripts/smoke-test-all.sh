@@ -173,6 +173,33 @@ exit 0
 run_scenario "all_pass" "$FAKE_ALL_PASS" 0 \
     "ALL TESTS PASSED" "Status: ALL PASSED"
 
+# ---------- 场景 4：部分 workspace 失败 ----------
+# 模拟 `cargo test --workspace`：某个 crate 的测试全过(有 "test result: ok" + "... ok" 行),
+# 但另一个 crate 编译失败(error[...]),cargo 整体退出非 0。此时 PASSED>0 且 FAILED==0。
+# 校验:退出码 1、终端说明"部分通过但未全部完成"、报告状态不再自相矛盾地写"no tests counted"。
+FAKE_PARTIAL_FAIL='#!/bin/bash
+if [ "$1" = "test" ]; then
+    echo "   Compiling crate-a v0.1.0" >&2
+    echo "     Running unittests src/lib.rs (crate-a)" >&2
+    echo "" >&2
+    echo "running 5 tests" >&2
+    echo "test a1 ... ok" >&2
+    echo "test a2 ... ok" >&2
+    echo "test a3 ... ok" >&2
+    echo "test a4 ... ok" >&2
+    echo "test a5 ... ok" >&2
+    echo "" >&2
+    echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out" >&2
+    echo "   Compiling crate-b v0.1.0" >&2
+    echo "error[E0432]: unresolved import \`crate_b::missing\`" >&2
+    echo "error: could not compile \`crate-b\` due to previous error" >&2
+    exit 101
+fi
+exit 0
+'
+run_scenario "partial_failure" "$FAKE_PARTIAL_FAIL" 1 \
+    "BUILD/RUN FAILED" "build did not fully complete"
+
 # ---------- 总结 ----------
 echo ""
 echo "=== Smoke Test Summary ==="

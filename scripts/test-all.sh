@@ -90,21 +90,33 @@ echo "- **Passed:** $PASSED" >> $REPORT
 echo "- **Failed:** $FAILED" >> $REPORT
 echo "- **Cargo exit:** $cargo_status" >> $REPORT
 
-# 编译失败：cargo 在编译阶段返回非 0，但输出中通常没有 "test result:" 行，
-# 旧脚本会因 PASSED=0/FAILED=0 误报 ALL TESTS PASSED，这里直接拦截。
+# 构建/运行失败：cargo 返回非 0，但没有统计到任何测试失败（FAILED==0）——不是测试红，
+# 而是构建/运行本身出错。旧脚本会因 PASSED=0/FAILED=0 误报 ALL TESTS PASSED，这里拦截。
+# 措辞按是否已跑过测试分流，避免与上面的 Passed 计数自相矛盾：
+#   - PASSED==0：纯编译失败，没有任何 "test result:" 行 → "no tests counted"。
+#   - PASSED>0 ：部分 crate 的测试已通过，但整体构建/运行在别处失败（`--workspace`
+#     里某个 crate 编译失败，或测试跑完后链接失败）→ 说明"部分通过但未全部完成"。
 if [ "$cargo_status" -ne 0 ] && [ "$FAILED" -eq 0 ]; then
     echo "## Build/Run Failure (cargo exit $cargo_status)" >> $REPORT
     echo '```' >> $REPORT
     echo "$output" | grep -E "error\[|error:|panicked|FAILED" | head -20 >> $REPORT
     echo '```' >> $REPORT
     echo "" >> $REPORT
-    echo "- **Status: FAILED (build/run error, no tests counted)**" >> $REPORT
-    echo ""
-    echo "BUILD/RUN FAILED — no test results parsed"
+    if [ "$PASSED" -eq 0 ]; then
+        echo "- **Status: FAILED (build/run error, no tests counted)**" >> $REPORT
+        echo ""
+        echo "BUILD/RUN FAILED — no test results parsed"
+    else
+        echo "- **Status: FAILED (build/run error after $PASSED test(s) passed — build did not fully complete)**" >> $REPORT
+        echo ""
+        echo "BUILD/RUN FAILED — $PASSED test(s) passed but the build/run did not fully complete"
+    fi
     exit 1
 fi
 
-if [ "$FAILED" -gt 0 ] || [ "$cargo_status" -ne 0 ]; then
+# 到这里 cargo_status 若非 0，必然伴随 FAILED>0（FAILED==0 的非 0 已被上面拦截），
+# 所以只需判 FAILED —— 无需再 `|| [ "$cargo_status" -ne 0 ]`（那条恒被 FAILED>0 覆盖）。
+if [ "$FAILED" -gt 0 ]; then
     echo ""
     echo "$output" | grep -E "FAILED|panicked|error\[" | head -10
     echo "- **Status: FAILED**" >> $REPORT
