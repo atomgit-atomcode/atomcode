@@ -22,6 +22,61 @@ pub enum McpConnectEvent {
     Failed { name: String, error: String },
     /// Non-fatal warning (e.g. tools/list failed after connect).
     Warning { name: String, message: String },
+    /// Server withheld because it comes from an untrusted project's `.mcp.json`.
+    BlockedUntrusted { name: String },
+}
+
+/// Check whether `project_dir` is recorded as trusted in the shared MCP trust store.
+///
+/// This is a LOCAL reimplementation of `atomcode_core::mcp::trust::is_project_trusted`
+/// for use within `atomcode-capabilities` (which cannot depend on `atomcode-core` due to
+/// layering constraints). Both implementations read the SAME `mcp_trust.json` file, using
+/// the same hash scheme (normalize path → hash as `PathBuf` via `DefaultHasher` → `{:016x}`),
+/// so core and capabilities agree on trust state at runtime.
+///
+/// Honors `ATOMCODE_MCP_TRUST_STORE` (the same env-var test seam as core).
+fn is_project_trusted_local(project_dir: &std::path::Path) -> bool {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Replicate core's `hash_path` normalization byte-for-byte so the key matches.
+    let normalized = project_dir.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    let mut hasher = DefaultHasher::new();
+    let p: std::path::PathBuf = std::path::PathBuf::from(normalized);
+    p.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+
+    // Locate the trust store (same logic as core's `trust_store_path`).
+    let store_path: std::path::PathBuf = {
+        if let Ok(p) = std::env::var("ATOMCODE_MCP_TRUST_STORE") {
+            if !p.is_empty() {
+                std::path::PathBuf::from(p)
+            } else {
+                super::util::config_dir().join("mcp_trust.json")
+            }
+        } else {
+            super::util::config_dir().join("mcp_trust.json")
+        }
+    };
+
+    // Parse only what we need: `{ "projects": { "<key>": ... } }`.
+    let Ok(bytes) = std::fs::read(&store_path) else {
+        return false; // missing => untrusted (fail-closed)
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false; // corrupt => untrusted (fail-closed)
+    };
+    val.get("projects")
+        .and_then(|p| p.as_object())
+        .map(|m| m.contains_key(&key))
+        .unwrap_or(false)
 }
 
 /// Registry of connected MCP servers.
@@ -112,6 +167,29 @@ impl McpRegistry {
         }
     }
 
+    /// Split configs by project trust. Uses the shared trust store (via the local
+    /// `is_project_trusted_local` mirror), but partitions on the capabilities-local
+    /// `McpConfigSource` (a distinct type from core's). Untrusted => project-source
+    /// servers are withheld.
+    fn partition_by_trust(
+        configs: Vec<McpServerConfig>,
+        project_dir: &std::path::Path,
+    ) -> (Vec<McpServerConfig>, Vec<McpServerConfig>) {
+        if is_project_trusted_local(project_dir) {
+            return (configs, Vec::new());
+        }
+        let (blocked, allowed): (Vec<_>, Vec<_>) = configs
+            .into_iter()
+            .partition(|c| matches!(c.source, super::config::McpConfigSource::Project));
+        (allowed, blocked)
+    }
+
+    /// Return the names of all currently connected servers.
+    /// Used in tests to verify that blocked servers never entered the connect loop.
+    pub async fn connected_server_names(&self) -> Vec<String> {
+        self.servers.read().await.keys().cloned().collect()
+    }
+
     /// Seed trust/auto-approve state from a server's config. Trust is a config
     /// property independent of connection success, so this is safe to call before/
     /// regardless of connecting. Idempotent.
@@ -167,6 +245,14 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        // Gate: withhold project-source servers from untrusted projects.
+        let (configs, blocked) = Self::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            if let Some(tx) = &combined_tx {
+                let _ = tx.send(McpConnectEvent::BlockedUntrusted { name: b.name.clone() });
+            }
+        }
 
         // Seed trust/auto-approve from config up front (the background connect loop
         // below inlines its own connect and never calls `add_server`, so it wouldn't
@@ -286,6 +372,12 @@ impl McpRegistry {
                 return registry;
             }
         };
+
+        // Gate: withhold project-source servers from untrusted projects.
+        let (configs, blocked) = Self::partition_by_trust(configs, project_dir);
+        for b in &blocked {
+            eprintln!("[mcp] withheld untrusted project server: {}", b.name);
+        }
 
         for config in configs {
             if let Err(e) = registry.add_server(config).await {
@@ -550,6 +642,50 @@ impl Default for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be
+    /// connected or spawned. The registry must emit `BlockedUntrusted` and leave
+    /// the servers map empty.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn untrusted_project_stdio_server_never_connects() {
+        // Isolated trust store => project is untrusted.
+        let store = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+        // racing on this variable.
+        unsafe {
+            std::env::set_var("ATOMCODE_MCP_TRUST_STORE", store.path().join("s.json"));
+        }
+
+        // A project dir containing a malicious .mcp.json (project-source stdio).
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "evil": { "command": "/nonexistent/pwn", "args": ["x"] } } }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg =
+            McpRegistry::from_config_background_with_events(proj.path(), Some(tx));
+        // Give the background task a chance to run (it must NOT spawn).
+        reg.wait_for_initial_connections(std::time::Duration::from_millis(500)).await;
+
+        // No server connected.
+        assert!(
+            reg.connected_server_names().await.is_empty(),
+            "no server should connect for an untrusted project"
+        );
+
+        // A BlockedUntrusted event was emitted for "evil".
+        let mut saw_blocked = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, McpConnectEvent::BlockedUntrusted { ref name } if name == "evil") {
+                saw_blocked = true;
+            }
+        }
+        assert!(saw_blocked, "expected BlockedUntrusted for evil");
+    }
 
     /// `add_server` against a stdio command that cannot be spawned must
     /// still record the failure into `failed_servers`, so the `/mcp`
