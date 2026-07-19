@@ -9,8 +9,10 @@ publish = false
 build = "build.rs"
 
 [build-dependencies]
-# Pack the embedded setup seeds (tar.zst) in build.rs. Non-optional: build scripts
-# can't read cargo features, so these are always available to the packer. Light.
+# Pack the embedded setup seeds (tar.zst) in build.rs. Cargo can't feature-gate
+# [build-dependencies], so these compile for every capabilities build; the packer itself
+# is gated on CARGO_FEATURE_SETUP so a lean (no-setup) build skips the packing work. Light,
+# build-only (never shipped in the binary).
 zstd = "0.13"
 tar = "0.4"
 

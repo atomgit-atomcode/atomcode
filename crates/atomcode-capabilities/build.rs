@@ -10,7 +10,14 @@ use std::fs::File;
 use std::path::PathBuf;
 
 fn main() {
-    pack_setup_seeds();
+    // Only pack when the `setup` feature is on — its `seeds.rs` is the sole `include_bytes!`
+    // consumer of the archive, compiled only under that feature. Cargo sets CARGO_FEATURE_SETUP
+    // when the feature is active (build scripts CAN read features). The zstd/tar build-deps
+    // still compile regardless — Cargo can't feature-gate [build-dependencies] — but a lean
+    // (no-setup) build then skips the packing work and the empty-archive I/O.
+    if std::env::var_os("CARGO_FEATURE_SETUP").is_some() {
+        pack_setup_seeds();
+    }
 }
 
 fn pack_setup_seeds() {
