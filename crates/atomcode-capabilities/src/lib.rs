@@ -58,9 +58,10 @@ pub mod compaction;
 #[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
 pub(crate) mod paths;
 
-/// Kernel-only (L0) console-window suppressors — a local copy of
-/// `core::process_utils` so spawn sites here can stop the Windows
-/// console-window flash without `capabilities` depending on `core`.
+/// Shared L1 process utilities (console-window suppression, `shell_command`,
+/// UTF-8 locale, `is_running_as_admin`) — used here and by the CLI/TUI drivers, so
+/// `capabilities` owns them without depending on `core`. `shell_command` +
+/// `is_running_as_admin` mirror core's copies until core is retired (see module doc).
 pub mod process_utils;
 
 /// ONE home for Windows path normalization (native-canonical internally,

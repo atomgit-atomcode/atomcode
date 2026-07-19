@@ -1,6 +1,10 @@
-//! Platform-specific process utilities — a kernel-only (L0) local copy of
-//! `atomcode_core::process_utils`'s console-window suppressors, since
-//! `capabilities` must not depend on `core`.
+//! Platform-specific process utilities (console-window suppression, shell-command
+//! construction, UTF-8 locale, admin check) — the shared L1 home now that
+//! `capabilities` must not depend on `core`. Consumed here plus by the CLI/TUI drivers.
+//!
+//! NOTE: `shell_command` + `is_running_as_admin` are byte-identical copies of the same
+//! fns still in `atomcode_core::process_utils` (core keeps its own for the v1 engine).
+//! Keep the two in sync until core is retired, then core's copy dies with it.
 //!
 //! On Windows, a GUI / **console-less** parent (the atomcode-daemon behind
 //! clawbot/OpenClaw) that spawns a console program (cmd.exe, git, ast-grep, a
