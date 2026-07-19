@@ -4,6 +4,15 @@ version.workspace = true
 edition = "2021"
 description = "L1 capabilities layered on atomcode-kernel (L0): real provider adapters, tools, mcp, skills. Depends ONLY on the kernel."
 publish = false
+# The `setup` capability's seeds.rs `include_bytes!`s an archive that this build
+# script packs from `assets/setup-seeds/` into OUT_DIR.
+build = "build.rs"
+
+[build-dependencies]
+# Pack the embedded setup seeds (tar.zst) in build.rs. Non-optional: build scripts
+# can't read cargo features, so these are always available to the packer. Light.
+zstd = "0.13"
+tar = "0.4"
 
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
@@ -82,6 +91,23 @@ toml = { version = "0.8", optional = true }
 # timestamps, current-date injection, recall date filtering). dirs (already optional)
 # resolves $ATOMCODE_HOME/sessions. Matches production's chrono pin.
 chrono = { version = "0.4", optional = true }
+# `setup` capability deps: file-lock (fs2) for the install lock + typed setup errors
+# (thiserror). anyhow/sha2/chrono/serde/serde_json/tempfile are shared with other
+# capabilities (or already non-optional). Optional so a non-setup embedder skips them.
+fs2 = { version = "0.4", optional = true }
+thiserror = { version = "1", optional = true }
+# `setup`'s fs_atomic writes via a same-dir NamedTempFile → persist. Runtime dep for
+# setup (also a dev-dep below for tests). Optional so non-setup builds skip it.
+tempfile = { version = "3", optional = true }
+# `setup` lock.rs reads host name + process start-time for the advisory install lock
+# sentinel (stale-lock detection). Optional so non-setup builds skip it.
+sysinfo = { version = "0.32", default-features = false, features = ["system"], optional = true }
+# `setup` structured log lines (install skips/failures, lock takeover). Optional.
+tracing = { version = "0.1", optional = true }
+# `setup` seeds.rs decompresses/unpacks the embedded tar.zst seed archive at first
+# run. Same crates as the build-dependencies packer (separate dep trees). Optional.
+zstd = { version = "0.13", optional = true }
+tar = { version = "0.4", optional = true }
 
 [features]
 default = ["provider", "tools"]
@@ -118,6 +144,10 @@ lsp-e2e = ["lsp"]
 # from the config leaf, so it pulls `atomcode-config`. Opt-in (NOT default) — a provider-only
 # embedder skips config→telemetry. Hosts that surface notifications (TUI/CLI) enable it.
 notify = ["dep:atomcode-config"]
+# One-time project setup/install (scan → seed config → atomic writes, file-locked).
+# Pulls the config leaf (i18n + Config) + the light serde/anyhow/sha2/chrono/thiserror/fs2
+# stack. Opt-in (NOT default) — only CLI/TUI hosts that run `atomcode setup` enable it.
+setup = ["dep:atomcode-config", "dep:anyhow", "dep:sha2", "dep:chrono", "chrono/serde", "dep:fs2", "dep:thiserror", "dep:tempfile", "dep:sysinfo", "dep:tracing", "dep:zstd", "dep:tar"]
 # Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
 skills = []
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel

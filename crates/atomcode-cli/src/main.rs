@@ -2559,11 +2559,11 @@ async fn run_headless(
     Ok((exit_code, captured))
 }
 
-/// Drive `atomcode_core::setup::run` end-to-end and return the CLI exit code
+/// Drive `atomcode_capabilities::setup::run` end-to-end and return the CLI exit code
 /// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
 /// run it directly since `Commands::Setup` already runs outside the TUI loop.
 fn run_setup_command(force: bool) -> i32 {
-    use atomcode_core::setup;
+    use atomcode_capabilities::setup;
 
     let project_root = match std::env::current_dir() {
         Ok(p) => p,

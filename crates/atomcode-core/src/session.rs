@@ -12,7 +12,7 @@ use crate::conversation::{
     message::{Message, Role},
     Conversation, ConversationSnapshot,
 };
-use crate::setup::fs_atomic::atomic_write;
+use crate::fs_atomic::atomic_write;
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

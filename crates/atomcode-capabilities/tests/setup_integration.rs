@@ -1,10 +1,11 @@
+#![cfg(feature = "setup")]
 //! End-to-end integration tests for `setup::run`.
 //!
 //! 这些测试通过 `ATOMCODE_HOME` 环境变量把 `Config::config_dir()` 重定向到
 //! tempdir,确保不会污染真实的 `~/.atomcode/`。Env var 是进程全局的,所以全部
 //! 测试都用 `#[serial]` 序列化。
 
-use atomcode_core::setup::{self, RunOptions};
+use atomcode_capabilities::setup::{self, RunOptions};
 use serial_test::serial;
 use std::path::Path;
 
@@ -111,7 +112,7 @@ fn second_run_skips_already_installed() {
         let has_already = report2.summary.skipped.iter().any(|(_, reason)| {
             matches!(
                 reason,
-                atomcode_core::setup::install::SkipReason::AlreadyInstalled
+                atomcode_capabilities::setup::install::SkipReason::AlreadyInstalled
             )
         });
         assert!(
@@ -138,16 +139,16 @@ fn concurrent_runs_second_fails_lock() {
     // invocations — the lock must prevent both from succeeding simultaneously.
     let (r1, r2) = std::thread::scope(|s| {
         let t1 = s.spawn(|| {
-            let o = atomcode_core::setup::RunOptions::new(proj_a);
-            atomcode_core::setup::run(o)
+            let o = atomcode_capabilities::setup::RunOptions::new(proj_a);
+            atomcode_capabilities::setup::run(o)
         });
 
         // Give t1 a head start so it grabs the lock first.
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let t2 = s.spawn(|| {
-            let o = atomcode_core::setup::RunOptions::new(proj_b);
-            atomcode_core::setup::run(o)
+            let o = atomcode_capabilities::setup::RunOptions::new(proj_b);
+            atomcode_capabilities::setup::run(o)
         });
 
         let r1 = t1.join().unwrap();
@@ -175,8 +176,8 @@ fn concurrent_runs_second_fails_lock() {
             assert!(
                 matches!(
                     e,
-                    atomcode_core::setup::SetupError::LockHeld { .. }
-                        | atomcode_core::setup::SetupError::LockIo(_)
+                    atomcode_capabilities::setup::SetupError::LockHeld { .. }
+                        | atomcode_capabilities::setup::SetupError::LockIo(_)
                 ),
                 "if a concurrent run failed, it should be LockHeld or LockIo, got: {e:?}"
             );

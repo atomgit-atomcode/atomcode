@@ -34,7 +34,7 @@ pub mod provider;
 pub mod semantic;
 pub mod session;
 pub mod plugin;
-pub mod setup;
+mod fs_atomic;
 pub mod skill;
 pub mod stream;
 pub mod tool;

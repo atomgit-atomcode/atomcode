@@ -101,6 +101,11 @@ pub mod askpass;
 #[cfg(feature = "notify")]
 pub mod notify;
 
+/// One-time project setup/install: scan → seed config → atomic writes (file-locked).
+/// Reads i18n + Config from the config leaf. Opt-in (NOT default).
+#[cfg(feature = "setup")]
+pub mod setup;
+
 /// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
 /// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic
 /// [`ApprovalMiddleware`](tools::ApprovalMiddleware). Each runs against the kernel's
