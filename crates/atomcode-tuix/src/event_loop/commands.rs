@@ -4489,7 +4489,7 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // (persisted recent_dirs.txt entries from before the fix, or a re-canonicalized
     // bridge value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDir`
     // command, and the webui sync all store the plain form regardless of caller.
-    let path = atomcode_core::tool::strip_verbatim_prefix_path(&path);
+    let path = atomcode_capabilities::pathnorm::strip_verbatim_path(&path);
     ctx.agent
         .cmd_tx
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
@@ -4520,8 +4520,8 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
 pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
     // De-dup case-insensitively on case-insensitive filesystems so `C:\Users`
     // and `C:\users` (same physical dir) don't both linger in the picker.
-    let key = atomcode_core::tool::path_case_key(&new);
-    dirs.retain(|d| atomcode_core::tool::path_case_key(d) != key);
+    let key = atomcode_capabilities::pathnorm::path_case_key(&new);
+    dirs.retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != key);
     dirs.insert(0, new);
     dirs.truncate(MAX_RECENT_DIRS);
 }
@@ -4543,8 +4543,8 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(PathBuf::from)
-        .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
-        .filter(|p| seen.insert(atomcode_core::tool::path_case_key(p)))
+        .map(|p| atomcode_capabilities::pathnorm::strip_verbatim_path(&p))
+        .filter(|p| seen.insert(atomcode_capabilities::pathnorm::path_case_key(p)))
         .collect()
 }
 
@@ -4597,7 +4597,7 @@ pub(crate) fn resolve_cd(
     // already strips before setting its working dir. No-op off Windows / on
     // non-verbatim paths; `hash_path` strips internally so the session bucket is
     // unchanged.
-    let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
+    let canon = atomcode_capabilities::pathnorm::strip_verbatim_path(&canon);
     if !canon.is_dir() {
         return Err(t(Msg::DirNotADirectory {
             path: &canon.display().to_string(),
@@ -6210,7 +6210,7 @@ mod tests {
     /// comparison below would fail on Windows. No-op off Windows.
     fn make_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let strip = atomcode_core::tool::strip_verbatim_prefix_path;
+        let strip = atomcode_capabilities::pathnorm::strip_verbatim_path;
         let cwd = strip(&tmp.path().canonicalize().expect("canon cwd"));
         let sub = cwd.join("sub");
         std::fs::create_dir(&sub).expect("mkdir sub");
@@ -6383,7 +6383,7 @@ mod tests {
         };
         // `resolve_cd` strips the Windows `\\?\` verbatim prefix, so strip the
         // expected value to match (no-op off Windows).
-        let canon_home = atomcode_core::tool::strip_verbatim_prefix_path(&canon_home);
+        let canon_home = atomcode_capabilities::pathnorm::strip_verbatim_path(&canon_home);
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);

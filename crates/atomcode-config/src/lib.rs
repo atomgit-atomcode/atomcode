@@ -15,7 +15,7 @@ pub mod locale;
 pub mod i18n;
 
 /// Vendored leaf helpers (home-dir resolution, vision heuristic) config needs.
-mod util;
+pub mod util;
 
 /// `[network.proxy]` config types + process-env proxy policy. The reqwest-applying
 /// runtime stays in `atomcode-core::proxy` (needs the HTTP stack) and re-exports these.

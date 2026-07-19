@@ -196,10 +196,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "project".to_string());
-                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                     project
                         .recent_dirs
-                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                        .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                     project.recent_dirs.insert(0, dir.clone());
                     project.recent_dirs.truncate(5);
                 }
@@ -214,10 +214,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
-                let new_key = atomcode_core::tool::path_case_key(&dir);
+                let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                 project
                     .recent_dirs
-                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                 project.recent_dirs.insert(0, dir.clone());
                 project.recent_dirs.truncate(5);
             }

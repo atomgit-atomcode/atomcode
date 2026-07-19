@@ -415,7 +415,7 @@ fn resolve_initial_working_dir(
 pub(crate) fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
     match std::fs::canonicalize(&p) {
         Ok(c) => {
-            let c = atomcode_core::tool::strip_verbatim_prefix_path(&c);
+            let c = atomcode_capabilities::pathnorm::strip_verbatim_path(&c);
             if hash_path(&c) == hash_path(&p) {
                 c
             } else {
@@ -1537,7 +1537,7 @@ async fn change_dir(
         } else {
             // Expand ~ and make absolute
             let expanded = if req.path.starts_with('~') {
-                atomcode_core::tool::real_home_dir()
+                atomcode_config::util::real_home_dir()
                     .map(|h| {
                         h.join(
                             req.path
@@ -1582,7 +1582,7 @@ async fn change_dir(
         // Strip any `\\?\` verbatim prefix before it reaches working_dir /
         // session cwd / hash, so a path that round-tripped through a
         // `canonicalize()`-based client still groups with the plain TUI form.
-        let new_path = atomcode_core::tool::strip_verbatim_prefix_path(&new_path);
+        let new_path = atomcode_capabilities::pathnorm::strip_verbatim_path(&new_path);
         // Fold case to the on-disk truth (Windows, bucket-safe) so a `/cd` with a
         // differently-cased path doesn't leave the footer/new sessions drifting.
         let new_path = normalize_working_dir_case(new_path);
@@ -1598,10 +1598,10 @@ async fn change_dir(
 
         // Update recent dirs (max 5, deduplicated case-insensitively on
         // case-insensitive filesystems so two cases of one dir don't both linger).
-        let new_key = atomcode_core::tool::path_case_key(&new_path);
+        let new_key = atomcode_capabilities::pathnorm::path_case_key(&new_path);
         project
             .recent_dirs
-            .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+            .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
         project.recent_dirs.insert(0, new_path.clone());
         project.recent_dirs.truncate(5);
 
@@ -1829,7 +1829,7 @@ async fn create_session(
     // Ensure working directory exists
     if !working_dir.exists() {
         // Create atomchat directory in user's home if default
-        let home = atomcode_core::tool::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = atomcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let atomchat_dir = home.join("atomchat");
         if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
             // Use atomchat directory as working dir
@@ -4191,7 +4191,7 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
 /// 展开 `~`，返回路径（不校验存在性）。复用与 /cd 一致的展开规则。
 pub fn normalize_dir_arg(arg: &str) -> PathBuf {
     if let Some(rest) = arg.strip_prefix('~') {
-        if let Some(home) = atomcode_core::tool::real_home_dir() {
+        if let Some(home) = atomcode_config::util::real_home_dir() {
             return home.join(rest.trim_start_matches('/'));
         }
     }
@@ -4249,7 +4249,7 @@ async fn fs_list(
     // 拿到 `\\?\D:\path` 回传给 /cd，会与 TUI 的 `D:\path` 落进不同的会话 hash 桶。
     let expanded = normalize_dir_arg(&q.path);
     let dir = expanded.canonicalize().unwrap_or(expanded);
-    let dir = atomcode_core::tool::strip_verbatim_prefix_path(&dir);
+    let dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&dir);
     match list_subdirs(&dir) {
         Ok(dirs) => Json(serde_json::json!({
             "path": dir.to_string_lossy(),
@@ -4278,7 +4278,7 @@ async fn fs_mkdir(
             // Strip the Windows `\\?\` prefix (parity with fs_list): the returned
             // path is round-tripped back into /cd, and an unstripped verbatim form
             // would split the session hash bucket.
-            let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
+            let canon = atomcode_capabilities::pathnorm::strip_verbatim_path(&canon);
             Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
         }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
@@ -4713,7 +4713,7 @@ mod fs_list_tests {
 
     #[test]
     fn expands_tilde() {
-        if let Some(home) = atomcode_core::tool::real_home_dir() {
+        if let Some(home) = atomcode_config::util::real_home_dir() {
             assert_eq!(normalize_dir_arg("~"), home);
             assert_eq!(normalize_dir_arg("~/x"), home.join("x"));
         }

@@ -3744,7 +3744,7 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(home) = atomcode_core::tool::real_home_dir() else {
+    let Some(home) = atomcode_config::util::real_home_dir() else {
         return;
     };
     let dir = home.join(".atomcode").join("logs");
@@ -3794,7 +3794,7 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
         // abort, any of which can lose the panic on Windows (see write_crash_log).
         write_crash_log(info);
         restore_terminal_if_tui();
-        let home = atomcode_core::tool::real_home_dir();
+        let home = atomcode_config::util::real_home_dir();
         let cwd = std::env::current_dir().ok();
         let loc = info
             .location()

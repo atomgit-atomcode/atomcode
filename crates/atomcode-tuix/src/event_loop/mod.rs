@@ -11348,7 +11348,7 @@ fn handle_agent_event(
             // `\\?\C:\…` and would otherwise re-verbatim `ctx.working_dir` (and
             // recent_dirs) after `apply_cd` just stripped it. This is the one
             // `working_dir` writer that does not funnel through `apply_cd`.
-            let new_dir = atomcode_core::tool::strip_verbatim_prefix_path(&new_dir);
+            let new_dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&new_dir);
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);

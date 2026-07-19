@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// on stock Windows and sends us down a fallback path that then hits
 /// `/tmp` (also nonexistent on Windows).
 pub fn home_dir() -> Option<PathBuf> {
-    atomcode_core::tool::real_home_dir()
+    atomcode_config::util::real_home_dir()
 }
 
 /// Replace a leading `$HOME` in `path` with `~`. Returns `path`
