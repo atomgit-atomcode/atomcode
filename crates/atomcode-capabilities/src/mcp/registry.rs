@@ -26,6 +26,66 @@ pub enum McpConnectEvent {
     BlockedUntrusted { name: String },
 }
 
+/// Replicate core's `strip_verbatim_prefix` (pure string logic, no core dep).
+///
+/// Windows `canonicalize()` returns extended-length paths like `\\?\C:\proj`.
+/// Core strips this prefix BEFORE the `\\`→`/` replacement, so the prefix
+/// characters `\\?\` are still intact when the strip runs. If we replaced
+/// backslashes first, the prefix would become `//?/` and the strip would
+/// silently no-op. Must run in the same order as core (`strip` → `replace`).
+///
+/// ```text
+/// \\?\UNC\server\share  →  \\server\share
+/// \\?\C:\proj           →  C:\proj
+/// anything else         →  unchanged
+/// ```
+fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+/// Compute the trust-store key for `project_dir`, mirroring core's `hash_path` exactly.
+///
+/// The algorithm (must stay in sync with `atomcode_core::session::hash_path`):
+/// 1. `strip_verbatim_prefix` on the raw string (BEFORE backslash replacement —
+///    the prefix contains backslashes that must still be intact).
+/// 2. Replace `\\` → `/`.
+/// 3. Strip trailing `/` (except a bare root).
+/// 4. Lowercase on Windows (case-insensitive filesystem).
+/// 5. Hash as `PathBuf` via `DefaultHasher` (component-prefix hashing — NOT `str::hash`).
+/// 6. Format as `{:016x}`.
+///
+/// The cross-engine golden test in this module pins the exact output for a fixed
+/// path; the matching test in `atomcode-core` pins the same literal so any drift
+/// between the two implementations fails CI immediately.
+fn project_trust_key(project_dir: &std::path::Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Step 1: strip verbatim prefix BEFORE backslash replacement (order matters).
+    let raw = project_dir.to_string_lossy();
+    let stripped = strip_verbatim_prefix(&raw);
+
+    // Steps 2–4: backslash normalization, trailing-slash trim, Windows lowercase.
+    let mut normalized = stripped.replace('\\', "/");
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    // Steps 5–6: hash via PathBuf (component-prefix hashing, same as core).
+    let mut hasher = DefaultHasher::new();
+    let p: std::path::PathBuf = std::path::PathBuf::from(normalized);
+    p.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Check whether `project_dir` is recorded as trusted in the shared MCP trust store.
 ///
 /// This is a LOCAL reimplementation of `atomcode_core::mcp::trust::is_project_trusted`
@@ -36,22 +96,7 @@ pub enum McpConnectEvent {
 ///
 /// Honors `ATOMCODE_MCP_TRUST_STORE` (the same env-var test seam as core).
 fn is_project_trusted_local(project_dir: &std::path::Path) -> bool {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Replicate core's `hash_path` normalization byte-for-byte so the key matches.
-    let normalized = project_dir.to_string_lossy();
-    let mut normalized = normalized.replace('\\', "/");
-    if normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
-
-    let mut hasher = DefaultHasher::new();
-    let p: std::path::PathBuf = std::path::PathBuf::from(normalized);
-    p.hash(&mut hasher);
-    let key = format!("{:016x}", hasher.finish());
+    let key = project_trust_key(project_dir);
 
     // Locate the trust store (same logic as core's `trust_store_path`).
     let store_path: std::path::PathBuf = {
@@ -712,6 +757,46 @@ mod tests {
         assert!(reg.is_tool_auto_approved("mcp__docs__search"), "already-qualified should match");
         assert!(!reg.is_tool_auto_approved("mcp__docs__other"));
         assert!(!reg.is_server_trusted("docs"), "trust:false must not trust the server");
+    }
+
+    /// `project_trust_key` must produce the same key for a verbatim-prefixed path
+    /// and its canonical (non-verbatim) equivalent, on every platform.
+    /// This is the exact Windows regression this module was patched to fix:
+    /// `canonicalize()` on Windows returns `\\?\C:\proj`; core strips that prefix
+    /// before hashing, so capabilities must do the same or trust granted via the
+    /// TUI/daemon (core) silently fails to unblock the coding agent (capabilities).
+    #[test]
+    fn trust_key_strips_verbatim_prefix_like_core() {
+        use std::path::Path;
+        assert_eq!(
+            project_trust_key(Path::new(r"\\?\C:\proj")),
+            project_trust_key(Path::new(r"C:\proj")),
+            r"`\\?\C:\proj` and `C:\proj` must hash identically"
+        );
+        assert_eq!(
+            project_trust_key(Path::new(r"\\?\UNC\srv\share")),
+            project_trust_key(Path::new(r"\\srv\share")),
+            r"`\\?\UNC\srv\share` and `\\srv\share` must hash identically"
+        );
+    }
+
+    /// Cross-engine drift lock: pin the exact key produced by `project_trust_key`
+    /// for a fixed Unix path so any change to the base algorithm (hasher / format /
+    /// PathBuf component hashing) fails CI in this crate.
+    ///
+    /// The SAME literal is pinned in `atomcode-core`'s `mcp::trust` tests via
+    /// `core::session::hash_path` — both must equal `8b6a67e0b2c06dae` or the
+    /// two engines have drifted and will disagree on trust state at runtime.
+    #[cfg(unix)]
+    #[test]
+    fn trust_key_golden_matches_core_algorithm() {
+        use std::path::Path;
+        // Must equal atomcode_core::session::hash_path(Path::new("/tmp/atomcode-trust-golden")).
+        // If this literal changes, core and capabilities have drifted — fix BOTH crates.
+        assert_eq!(
+            project_trust_key(Path::new("/tmp/atomcode-trust-golden")),
+            "8b6a67e0b2c06dae"
+        );
     }
 
     #[tokio::test]

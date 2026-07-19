@@ -115,6 +115,20 @@ mod tests {
     use super::super::config::McpTransportConfig;
     use serial_test::serial;
 
+    /// Cross-engine drift lock: pin `hash_path` output for the same fixed path
+    /// pinned in `atomcode-capabilities`'s `trust_key_golden_matches_core_algorithm`.
+    /// Both crates must produce `8b6a67e0b2c06dae` or the two implementations have
+    /// drifted and will disagree on trust state at runtime.
+    #[cfg(unix)]
+    #[test]
+    fn golden_key_matches_capabilities_mirror() {
+        assert_eq!(
+            crate::session::hash_path(Path::new("/tmp/atomcode-trust-golden")),
+            "8b6a67e0b2c06dae",
+            "core::session::hash_path diverged from capabilities mirror — fix both crates"
+        );
+    }
+
     // Point the store at a unique temp file for this test process.
     fn with_temp_store(name: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
