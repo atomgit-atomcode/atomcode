@@ -61,7 +61,7 @@ pub(crate) mod paths;
 /// Kernel-only (L0) console-window suppressors — a local copy of
 /// `core::process_utils` so spawn sites here can stop the Windows
 /// console-window flash without `capabilities` depending on `core`.
-pub(crate) mod process_utils;
+pub mod process_utils;
 
 /// ONE home for Windows path normalization (native-canonical internally,
 /// forward-slash at the LLM/UI boundary). `pub` so the v2 drivers that depend on

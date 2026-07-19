@@ -1128,7 +1128,7 @@ async fn run() -> Result<i32> {
     }
     // ── End askpass early exit ────────────────────────────────────────────────
 
-    let is_admin = atomcode_core::process_utils::is_running_as_admin();
+    let is_admin = atomcode_capabilities::process_utils::is_running_as_admin();
 
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
@@ -3018,7 +3018,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     let ctx_json = serde_json::to_string(&ctx)
                         .unwrap_or_else(|_| "{}".to_string());
 
-                    let mut cmd = atomcode_core::process_utils::shell_command(&hook.command);
+                    let mut cmd = atomcode_capabilities::process_utils::shell_command(&hook.command);
                     cmd.env("ATOMCODE_HOOK_EVENT", &event_str)
                         .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
                         .kill_on_drop(true);
@@ -3033,7 +3033,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         cmd.env("ATOMCODE_PLUGIN_ROOT", s);
                     }
 
-                    atomcode_core::process_utils::suppress_console_window(&mut cmd);
+                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd);
 
                     // ── Run with timeout ─────────────────────────────
                     let start = Instant::now();
@@ -3162,7 +3162,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());
 
-                    atomcode_core::process_utils::suppress_console_window(&mut cmd_builder);
+                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd_builder);
 
                     // ── Run with timeout (matching script_runner.rs:80-109) ──
                     let start = Instant::now();
