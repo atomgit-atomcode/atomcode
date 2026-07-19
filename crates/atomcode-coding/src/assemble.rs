@@ -10,7 +10,7 @@ use atomcode_capabilities::tools::{
     coding_tool_names, register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate,
     WriteApprovalGate,
 };
-use atomcode_core::provider::model_name_suggests_vision;
+use atomcode_capabilities::provider::model_suggests_vision as model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, ToolRegistry};

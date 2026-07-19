@@ -35,7 +35,7 @@ use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate, OpenFileWorkspaceGate,
     ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
-use atomcode_core::provider::model_name_suggests_vision;
+use atomcode_capabilities::provider::model_suggests_vision as model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
 use atomcode_kernel::hook::LifecycleHooks;
