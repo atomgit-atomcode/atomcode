@@ -1351,7 +1351,7 @@ impl Bridge {
                 // `!ls` showed a single line — this restores v1's full live output.
                 let chunk_tx = self.ev_tx.clone();
                 let chunk_id = call_id.clone();
-                let outcome = atomcode_core::tool::bash::run_shell(&cmd, &cwd, 300, move |chunk| {
+                let outcome = atomcode_capabilities::tools::bash::run_shell(&cmd, &cwd, 300, move |chunk| {
                     let _ = chunk_tx.send(CoreEv::ToolOutputChunk {
                         call_id: chunk_id.clone(),
                         chunk: chunk.to_string(),
@@ -2361,12 +2361,12 @@ fn xml_escape(s: &str) -> String {
 /// the display goes to the driver as the tool-result row; the `<bash-*>` context
 /// block is injected ahead of the next user message (clamped so `!cat bigfile`
 /// can't blow up the conversation). PURE — execution + live streaming happen in
-/// the `LocalShell` handler via `atomcode_core::tool::bash::run_shell`.
+/// the `LocalShell` handler via `atomcode_capabilities::tools::bash::run_shell`.
 fn format_local_shell(
     cmd: &str,
-    outcome: &atomcode_core::tool::bash::ShellOutcome,
+    outcome: &atomcode_capabilities::tools::bash::ShellOutcome,
 ) -> (String, String, bool) {
-    use atomcode_core::tool::bash::ShellExit;
+    use atomcode_capabilities::tools::bash::ShellExit;
     let stdout = outcome.stdout.trim();
     let stderr = outcome.stderr.trim();
     let (success, code) = match outcome.exit {
@@ -3179,10 +3179,10 @@ mod undo_tests {
 
     #[tokio::test]
     async fn local_shell_runs_streams_and_formats_output() {
-        // End-to-end: the `!cmd` executor now streams via core `run_shell` (v1 parity)
-        // — the chunk_cb must fire (live output) AND format_local_shell wrap the result.
+        // End-to-end: the `!cmd` executor streams via `capabilities::tools::bash::run_shell`
+        // (v1 parity) — the chunk_cb must fire (live output) AND format_local_shell wrap it.
         let chunks = std::sync::Mutex::new(Vec::<String>::new());
-        let outcome = atomcode_core::tool::bash::run_shell(
+        let outcome = atomcode_capabilities::tools::bash::run_shell(
             "echo hello",
             std::path::Path::new("."),
             300,
@@ -3202,7 +3202,7 @@ mod undo_tests {
 
     #[tokio::test]
     async fn local_shell_failure_carries_exit_code() {
-        let outcome = atomcode_core::tool::bash::run_shell(
+        let outcome = atomcode_capabilities::tools::bash::run_shell(
             "exit 3",
             std::path::Path::new("."),
             300,
@@ -3248,7 +3248,7 @@ mod undo_tests {
 
     #[test]
     fn format_local_shell_success_shows_stdout_and_wraps_context() {
-        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        use atomcode_capabilities::tools::bash::{ShellExit, ShellOutcome};
         let outcome = ShellOutcome {
             stdout: "file1\nfile2\n".into(),
             stderr: String::new(),
@@ -3265,7 +3265,7 @@ mod undo_tests {
 
     #[test]
     fn format_local_shell_failure_shows_exit_code_and_stderr() {
-        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        use atomcode_capabilities::tools::bash::{ShellExit, ShellOutcome};
         let outcome = ShellOutcome {
             stdout: String::new(),
             stderr: "boom".into(),
@@ -3281,7 +3281,7 @@ mod undo_tests {
 
     #[test]
     fn format_local_shell_empty_output_falls_back() {
-        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        use atomcode_capabilities::tools::bash::{ShellExit, ShellOutcome};
         let outcome = ShellOutcome {
             stdout: String::new(),
             stderr: String::new(),
@@ -3295,7 +3295,7 @@ mod undo_tests {
 
     #[test]
     fn format_local_shell_timeout_is_marked_failed() {
-        use atomcode_core::tool::bash::{ShellExit, ShellOutcome};
+        use atomcode_capabilities::tools::bash::{ShellExit, ShellOutcome};
         let outcome = ShellOutcome {
             stdout: "partial".into(),
             stderr: String::new(),

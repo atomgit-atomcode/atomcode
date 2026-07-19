@@ -69,7 +69,7 @@ pub use approval::{
 };
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use ast_grep::AstGrepTool;
-pub use bash::BashTool;
+pub use bash::{run_shell, BashTool, ShellExit, ShellOutcome};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
 pub use edit::EditFileTool;
