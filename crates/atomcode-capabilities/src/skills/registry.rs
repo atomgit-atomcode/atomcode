@@ -84,6 +84,23 @@ impl SkillRegistry {
     pub fn list(&self) -> Vec<(String, String)> {
         self.skills.values().map(|s| (s.name.clone(), s.description.clone())).collect()
     }
+
+    /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
+    /// source-ranked), or `None` when no skills are installed. See
+    /// [`super::render`].
+    pub fn render_catalog(&self) -> Option<String> {
+        let entries: Vec<super::render::CatalogEntry> = self
+            .skills
+            .values()
+            .map(|s| super::render::CatalogEntry {
+                name: s.name.clone(),
+                hint: None, // capabilities skills carry no argument hint
+                description: s.description.clone(),
+                source_rank: super::render::source_rank(&s.source_path),
+            })
+            .collect();
+        super::render::render_skill_catalog(&entries)
+    }
 }
 
 impl Default for SkillRegistry {

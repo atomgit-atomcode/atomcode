@@ -132,6 +132,13 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
     }
+    // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
+    // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
+    // models (GLM / DeepSeek) under-weight both and so only ever fire a skill when the
+    // user names it explicitly, never on a description match. Always on: the `use_skill`
+    // tool is unconditionally mounted, and the line degrades gracefully ("if none match,
+    // proceed normally") when no skills are installed. Judgment-framed, not mandatory.
+    p.push_str(SKILLS_USAGE);
     if atomcode_config::config::offline::is_offline_active() {
         p.push_str(&offline_environment_block());
     }
@@ -267,6 +274,18 @@ unrelated multi-step work, call `todowrite` with the new full list to REPLACE th
 than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
 or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
 use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
+
+/// Skill-trigger guidance. Surfaced in the system prompt because weak models under-weight
+/// the `use_skill` tool description and the AVAILABLE SKILLS catalog's own guidance line;
+/// without this they only fire a skill when the user names it, never on a description match
+/// (the reason a skill like `brainstorming` "basically never appeared"). Always appended
+/// (see `coding_persona`) — degrades gracefully when no skills are installed.
+const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
+When a task matches an installed skill's description — not only when the user names the skill \
+— load it with `use_skill` BEFORE doing the work, then follow its instructions. Installed \
+skills are listed under the '=== AVAILABLE SKILLS ===' section of this system prompt; for \
+example, before creative or design work (a new feature, a component, a plan), load the \
+matching skill first. If several match, use each; if none match, proceed normally.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
 /// `request_user_input` only when the decision is genuinely the user's to make —
@@ -488,6 +507,9 @@ mod tests {
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("VERIFY"));
         assert!(p.contains("## RISKY ACTIONS:"));
+        // Skill-trigger nudge is always present (weak-model reinforcement of the catalog).
+        assert!(p.contains("## SKILLS:"), "skill-trigger guidance always present");
+        assert!(p.contains("use_skill"), "names the skill-loading tool");
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".

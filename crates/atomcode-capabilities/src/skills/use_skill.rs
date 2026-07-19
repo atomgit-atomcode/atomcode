@@ -33,7 +33,10 @@ impl Tool for UseSkillTool {
     }
     fn description(&self) -> &str {
         "Invoke a named skill (a reusable prompt/workflow template) and return its content \
-         with your arguments substituted. Run list_skills first to see what's available."
+         with your arguments substituted. Trigger a skill when the task matches its description \
+         — not only when the user names it. Installed skills are listed under \
+         '=== AVAILABLE SKILLS ===' in the system prompt; list_skills shows any lower-priority \
+         ones omitted there."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({

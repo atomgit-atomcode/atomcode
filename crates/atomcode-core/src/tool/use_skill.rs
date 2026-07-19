@@ -29,11 +29,10 @@ impl Tool for UseSkillTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "use_skill",
-            description: "Load a skill's instruction template into context. \
-                Use this when a task matches a skill's purpose — the skill provides \
-                detailed, reusable instructions that guide how to complete the task. \
-                Available skills are listed in the system prompt under 'Available Skills'. \
-                Returns the expanded skill content for you to follow."
+            description: "Load a skill's instruction template into context, then follow it. \
+                Trigger a skill when the task matches its description — not only when the user \
+                names it. Installed skills are listed under '=== AVAILABLE SKILLS ===' in the \
+                system prompt. Returns the expanded skill content for you to follow."
                 .to_string(),
             parameters: json!({
                 "type": "object",

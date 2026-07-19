@@ -36,6 +36,7 @@ pub mod session;
 pub mod plugin;
 mod fs_atomic;
 pub mod skill;
+pub mod skill_render;
 pub mod stream;
 pub mod tool;
 pub mod trace;

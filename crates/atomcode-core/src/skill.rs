@@ -600,6 +600,23 @@ impl SkillRegistry {
         self.skills.values().filter(|s| !s.disable_model_invocation)
     }
 
+    /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
+    /// source-ranked), or `None` when nothing is invocable. Verbatim-aligned twin of
+    /// [`crate::skill_render`]'s capabilities counterpart. Only LLM-invocable skills
+    /// are listed (respects `disable-model-invocation`).
+    pub fn render_catalog(&self) -> Option<String> {
+        let entries: Vec<crate::skill_render::CatalogEntry> = self
+            .invocable_by_llm()
+            .map(|s| crate::skill_render::CatalogEntry {
+                name: s.name.clone(),
+                hint: s.argument_hint.clone(),
+                description: s.description.clone(),
+                source_rank: crate::skill_render::source_rank(&s.source_path),
+            })
+            .collect();
+        crate::skill_render::render_skill_catalog(&entries)
+    }
+
     // -----------------------------------------------------------------------
 
     /// Load all `.md` files from a flat `commands/` directory.
