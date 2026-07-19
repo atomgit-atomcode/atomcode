@@ -1002,6 +1002,10 @@ pub struct LoopCtx {
     /// Accumulated across `BlockedUntrusted` events; cleared when a reload
     /// begins so a fresh `/mcp trust` → `/mcp reload` shows a clean count.
     pub mcp_blocked_untrusted: Vec<String>,
+    /// Set to `true` after the first coalesced blocked-server notice is emitted
+    /// during startup (when `mcp_reload` is not armed). Reset to `false` when a
+    /// `/mcp reload` begins so the next batch can emit its own notice.
+    pub mcp_blocked_notice_emitted: bool,
     /// Channel for receiving LSP connection status events (Started / Failed
     /// / Warning). Same plumbing as `mcp_connect_rx` — wired in TUI mode
     /// so the manager's start failures land in scrollback as `✗ LSP server
@@ -4724,15 +4728,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     McpConnectEvent::BlockedUntrusted { name } => {
                         ctx.mcp_blocked_untrusted.push(name.clone());
-                        let n = ctx.mcp_blocked_untrusted.len();
-                        renderer.render(UiLine::Warning(
-                            crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
-                        ));
+                        // During a `/mcp reload` the coalesced notice is emitted when the
+                        // batch settles (p.done >= p.total below). During startup there is
+                        // no explicit settle point, so we emit ONE notice on the first
+                        // blocked event (flag prevents duplicates for the same batch).
+                        if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
+                            ctx.mcp_blocked_notice_emitted = true;
+                            let n = ctx.mcp_blocked_untrusted.len();
+                            renderer.render(UiLine::Warning(
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                            ));
+                        }
                     }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed), emit a summary line.
+                // terminal state (Connected/Failed/BlockedUntrusted), emit a summary line.
                 if let Some(p) = ctx.mcp_reload.as_mut() {
                     match &ev {
                         McpConnectEvent::Connected { .. } => {
@@ -4744,7 +4755,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             p.failed = p.failed.saturating_add(1)
                         }
                         McpConnectEvent::Warning { .. } => {}
-                        McpConnectEvent::BlockedUntrusted { .. } => {}
+                        // BlockedUntrusted is a terminal outcome — count it so the progress
+                        // counter can reach total even when all servers are blocked.
+                        McpConnectEvent::BlockedUntrusted { .. } => {
+                            p.done = p.done.saturating_add(1);
+                        }
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
@@ -4752,6 +4767,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             "  MCP reload complete: {} connected, {} failed ({}ms)\n",
                             p.connected, p.failed, elapsed_ms
                         )));
+                        // Emit ONE coalesced blocked-server warning for this batch.
+                        let n = ctx.mcp_blocked_untrusted.len();
+                        if n > 0 {
+                            renderer.render(UiLine::Warning(
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                            ));
+                        }
                         ctx.mcp_reload = None;
                     }
                 }
@@ -5186,15 +5208,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     McpConnectEvent::BlockedUntrusted { name } => {
                         ctx.mcp_blocked_untrusted.push(name.clone());
-                        let n = ctx.mcp_blocked_untrusted.len();
-                        renderer.render(UiLine::Warning(
-                            crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
-                        ));
+                        // During a `/mcp reload` the coalesced notice is emitted when the
+                        // batch settles (p.done >= p.total below). During startup there is
+                        // no explicit settle point, so we emit ONE notice on the first
+                        // blocked event (flag prevents duplicates for the same batch).
+                        if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
+                            ctx.mcp_blocked_notice_emitted = true;
+                            let n = ctx.mcp_blocked_untrusted.len();
+                            renderer.render(UiLine::Warning(
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                            ));
+                        }
                     }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
-                // terminal state (Connected/Failed), emit a summary line.
+                // terminal state (Connected/Failed/BlockedUntrusted), emit a summary line.
                 if let Some(p) = ctx.mcp_reload.as_mut() {
                     match &ev {
                         McpConnectEvent::Connected { .. } => {
@@ -5206,7 +5235,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             p.failed = p.failed.saturating_add(1)
                         }
                         McpConnectEvent::Warning { .. } => {}
-                        McpConnectEvent::BlockedUntrusted { .. } => {}
+                        // BlockedUntrusted is a terminal outcome — count it so the progress
+                        // counter can reach total even when all servers are blocked.
+                        McpConnectEvent::BlockedUntrusted { .. } => {
+                            p.done = p.done.saturating_add(1);
+                        }
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
@@ -5214,6 +5247,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             "  MCP reload complete: {} connected, {} failed ({}ms)\n",
                             p.connected, p.failed, elapsed_ms
                         )));
+                        // Emit ONE coalesced blocked-server warning for this batch.
+                        let n = ctx.mcp_blocked_untrusted.len();
+                        if n > 0 {
+                            renderer.render(UiLine::Warning(
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                            ));
+                        }
                         ctx.mcp_reload = None;
                     }
                 }

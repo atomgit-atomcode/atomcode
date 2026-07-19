@@ -2493,283 +2493,289 @@ fn execute_slash_command_impl(
         }
         "mcp" => {
             let sub = arg.trim();
-            if let Some(rest) = sub.strip_prefix("login") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthLoginUsage).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
-                    Ok(configs) => configs,
-                    Err(e) => {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthLoadConfigFailed {
-                                error: &format!("{:#}", e),
-                            })
-                            .into_owned(),
+            match parse_mcp_subcommand(sub) {
+                Some(McpSub::Login) => {
+                    let server = sub.strip_prefix("login").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthLoginUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
                     }
-                };
-                let Some(config) = configs.into_iter().find(|config| config.name == server) else {
-                    renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthServerNotFound { server }).into_owned(),
+                    let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                        Ok(configs) => configs,
+                        Err(e) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::McpOAuthLoadConfigFailed {
+                                    error: &format!("{:#}", e),
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                    let Some(config) = configs.into_iter().find(|config| config.name == server) else {
+                        renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthServerNotFound { server }).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpOAuthStarting { server }).into_owned(),
                     ));
                     renderer.flush();
-                    return Ok(());
-                };
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpOAuthStarting { server }).into_owned(),
-                ));
-                renderer.flush();
-                let is_github_server = matches!(
-                    &config.config,
-                    atomcode_core::mcp::McpTransportConfig::Http {
-                        auth: Some(atomcode_core::mcp::McpHttpAuthConfig::OAuth(auth)),
-                        ..
-                    } if auth.provider.as_deref() == Some("github")
-                );
-                let result = tokio::task::block_in_place(|| {
-                    atomcode_core::mcp::login_mcp_oauth(
-                        &config,
-                        atomcode_core::mcp::McpOAuthLoginOptions {
-                            client_id: if is_github_server {
-                                std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
-                            } else {
-                                None
+                    let is_github_server = matches!(
+                        &config.config,
+                        atomcode_core::mcp::McpTransportConfig::Http {
+                            auth: Some(atomcode_core::mcp::McpHttpAuthConfig::OAuth(auth)),
+                            ..
+                        } if auth.provider.as_deref() == Some("github")
+                    );
+                    let result = tokio::task::block_in_place(|| {
+                        atomcode_core::mcp::login_mcp_oauth(
+                            &config,
+                            atomcode_core::mcp::McpOAuthLoginOptions {
+                                client_id: if is_github_server {
+                                    std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+                                } else {
+                                    None
+                                },
+                                client_secret_env: None,
+                                scopes: Vec::new(),
                             },
-                            client_secret_env: None,
-                            scopes: Vec::new(),
-                        },
-                    )
-                });
-                match result {
-                    Ok(token) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthSaved {
-                            provider: &token.provider,
-                            server,
-                        })
-                        .into_owned(),
-                    )),
-                    Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthFailed {
-                            error: &format!("{:#}", e),
-                        })
-                        .into_owned(),
-                    )),
-                }
-                renderer.flush();
-                return Ok(());
-            }
-
-            if let Some(rest) = sub.strip_prefix("logout") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthLogoutUsage).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-                match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
-                    Ok(true) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
-                    )),
-                    Ok(false) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthNoToken { server }).into_owned(),
-                    )),
-                    Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthLogoutFailed {
-                            error: &format!("{:#}", e),
-                        })
-                        .into_owned(),
-                    )),
-                }
-                renderer.flush();
-                return Ok(());
-            }
-
-            if sub.eq_ignore_ascii_case("trust") {
-                match atomcode_core::mcp::trust::trust_project(&ctx.working_dir) {
-                    Ok(()) => {
-                        renderer.render(UiLine::CommandOutput(t(Msg::McpProjectTrusted).into_owned()));
-                        renderer.flush();
-                        // Trigger a reload so newly-allowed servers connect immediately.
-                        return execute_slash_command_impl("mcp", "reload", state, ctx, renderer, active_modal, setup_pending);
-                    }
-                    Err(e) => {
-                        renderer.render(UiLine::Error(format!("{:#}", e)));
-                        renderer.flush();
-                        return Ok(());
-                    }
-                }
-            }
-
-            if sub.eq_ignore_ascii_case("untrust") {
-                match atomcode_core::mcp::trust::untrust_project(&ctx.working_dir) {
-                    Ok(()) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
-                    Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
-                }
-                renderer.flush();
-                return Ok(());
-            }
-
-            if sub.eq_ignore_ascii_case("reload") {
-                // Clear accumulated blocked-server list so a re-trust + reload shows fresh state.
-                ctx.mcp_blocked_untrusted.clear();
-                // Preflight: parse merged MCP config so we can show progress immediately.
-                // (Connection attempts happen in background and may take up to timeout_ms.)
-                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpReloadFailed {
+                        )
+                    });
+                    match result {
+                        Ok(token) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthSaved {
+                                provider: &token.provider,
+                                server,
+                            })
+                            .into_owned(),
+                        )),
+                        Err(e) => renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthFailed {
                                 error: &format!("{:#}", e),
                             })
                             .into_owned(),
+                        )),
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                Some(McpSub::Logout) => {
+                    let server = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthLogoutUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
                     }
-                };
-
-                let mut header = t(Msg::McpReloading {
-                    count: configs.len(),
-                })
-                .into_owned();
-
-                if !configs.is_empty() {
-                    header.push_str(&t(Msg::McpConnecting));
-                    for c in &configs {
-                        header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
+                    match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
+                        Ok(true) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
+                        )),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthNoToken { server }).into_owned(),
+                        )),
+                        Err(e) => renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthLogoutFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
+                        )),
                     }
-                } else {
-                    header.push_str(&t(Msg::McpNoServersConfigured));
+                    renderer.flush();
+                    return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput(header));
-                renderer.flush();
 
-                // 1) Drop all previously-registered MCP tools so any adapters holding the
-                // old registry Arc are released and stdio child processes can be killed.
-                let removed = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        ctx.agent.tool_registry.unregister_prefix("mcp__").await
+                Some(McpSub::Trust) => {
+                    match atomcode_core::mcp::trust::trust_project(&ctx.working_dir) {
+                        Ok(()) => {
+                            renderer.render(UiLine::CommandOutput(t(Msg::McpProjectTrusted).into_owned()));
+                            renderer.flush();
+                            // Trigger a reload so newly-allowed servers connect immediately.
+                            return execute_slash_command_impl("mcp", "reload", state, ctx, renderer, active_modal, setup_pending);
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!("{:#}", e)));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    }
+                }
+
+                Some(McpSub::Untrust) => {
+                    match atomcode_core::mcp::trust::untrust_project(&ctx.working_dir) {
+                        Ok(()) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
+                        Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                Some(McpSub::Reload) => {
+                    // Clear accumulated blocked-server list and reset the notice flag so
+                    // a re-trust + reload shows a fresh coalesced count.
+                    ctx.mcp_blocked_untrusted.clear();
+                    ctx.mcp_blocked_notice_emitted = false;
+                    // Preflight: parse merged MCP config so we can show progress immediately.
+                    // (Connection attempts happen in background and may take up to timeout_ms.)
+                    let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::McpReloadFailed {
+                                    error: &format!("{:#}", e),
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+
+                    let mut header = t(Msg::McpReloading {
+                        count: configs.len(),
                     })
-                });
+                    .into_owned();
 
-                // 2) Drop old registry + event receiver (stop consuming old events).
-                ctx.mcp_connect_rx = None;
-                ctx.mcp_registry = None;
-                ctx.mcp_reload = None;
-
-                // If no servers are configured, we're done after cleanup.
-                if configs.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpClearedNoServers { removed }).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-
-                // 2.5) Arm progress tracker (event loop prints a summary once all results land).
-                ctx.mcp_reload = Some(super::McpReloadProgress {
-                    total: configs.len(),
-                    done: 0,
-                    connected: 0,
-                    failed: 0,
-                    started_at: std::time::Instant::now(),
-                });
-
-                // 3) Recreate registry and event channel. Connections happen in background
-                // and will stream Connected/Failed events into scrollback (event loop select!).
-                use atomcode_core::mcp::McpConnectEvent;
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-                let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
-                    &ctx.working_dir,
-                    Some(tx),
-                );
-                ctx.mcp_registry = Some(std::sync::Arc::new(registry));
-                ctx.mcp_connect_rx = Some(rx);
-
-                // The driver registry above feeds the palette; the ENGINE binds its own MCP
-                // at prepare time. Ask it to re-prepare so the reloaded servers reach the
-                // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
-                // respawn that re-mounts MCP/skills/hooks.)
-                ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
-
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpClearedReconnecting { removed }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-
-            // `/mcp tools <server>`: list remote tool names for a connected server.
-            // This is intentionally separate from a global `/tools` so we keep the surface minimal.
-            if let Some(rest) = sub.strip_prefix("tools") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
-                    renderer.flush();
-                    return Ok(());
-                }
-                if let Some(registry) = &ctx.mcp_registry {
-                    let server = server.to_string();
-                    let server_for_msg = server.clone();
-                    let registry = registry.clone();
-                    let tx = registry.event_sender();
-                    tokio::spawn(async move {
-                        let list_timeout = registry.list_tools_timeout(&server).await;
-                        let tools = match tokio::time::timeout(
-                            list_timeout,
-                            registry.list_tools_for_server(&server),
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                if let Some(tx) = &tx {
-                                    let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
-                                        name: server.clone(),
-                                        message: format!(
-                                            "tools/list timed out after {}s (server connected but tools not listed yet)",
-                                            list_timeout.as_secs()
-                                        ),
-                                    });
-                                }
-                                return;
-                            }
-                        };
-                        let mut msg = format!("tools:\n");
-                        if tools.is_empty() {
-                            msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
-                        } else {
-                            for t in tools {
-                                msg.push_str(&format!("  - mcp__{}__{}\n", server, t.tool_name));
-                            }
+                    if !configs.is_empty() {
+                        header.push_str(&t(Msg::McpConnecting));
+                        for c in &configs {
+                            header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
                         }
-                        if let Some(tx) = tx {
-                            let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
-                                name: server,
-                                message: msg.trim_end().to_string(),
-                            });
-                        }
-                    });
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsListing {
-                            server: &server_for_msg,
+                    } else {
+                        header.push_str(&t(Msg::McpNoServersConfigured));
+                    }
+                    renderer.render(UiLine::CommandOutput(header));
+                    renderer.flush();
+
+                    // 1) Drop all previously-registered MCP tools so any adapters holding the
+                    // old registry Arc are released and stdio child processes can be killed.
+                    let removed = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            ctx.agent.tool_registry.unregister_prefix("mcp__").await
                         })
-                        .into_owned(),
+                    });
+
+                    // 2) Drop old registry + event receiver (stop consuming old events).
+                    ctx.mcp_connect_rx = None;
+                    ctx.mcp_registry = None;
+                    ctx.mcp_reload = None;
+
+                    // If no servers are configured, we're done after cleanup.
+                    if configs.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpClearedNoServers { removed }).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+
+                    // 2.5) Arm progress tracker (event loop prints a summary once all results land).
+                    ctx.mcp_reload = Some(super::McpReloadProgress {
+                        total: configs.len(),
+                        done: 0,
+                        connected: 0,
+                        failed: 0,
+                        started_at: std::time::Instant::now(),
+                    });
+
+                    // 3) Recreate registry and event channel. Connections happen in background
+                    // and will stream Connected/Failed events into scrollback (event loop select!).
+                    use atomcode_core::mcp::McpConnectEvent;
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+                    let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
+                        &ctx.working_dir,
+                        Some(tx),
+                    );
+                    ctx.mcp_registry = Some(std::sync::Arc::new(registry));
+                    ctx.mcp_connect_rx = Some(rx);
+
+                    // The driver registry above feeds the palette; the ENGINE binds its own MCP
+                    // at prepare time. Ask it to re-prepare so the reloaded servers reach the
+                    // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
+                    // respawn that re-mounts MCP/skills/hooks.)
+                    ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
+
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpClearedReconnecting { removed }).into_owned(),
                     ));
-                } else {
-                    renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
+                    renderer.flush();
+                    return Ok(());
                 }
-                renderer.flush();
-                return Ok(());
+
+                Some(McpSub::Tools) => {
+                    // `/mcp tools <server>`: list remote tool names for a connected server.
+                    // This is intentionally separate from a global `/tools` so we keep the surface minimal.
+                    let server = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if let Some(registry) = &ctx.mcp_registry {
+                        let server = server.to_string();
+                        let server_for_msg = server.clone();
+                        let registry = registry.clone();
+                        let tx = registry.event_sender();
+                        tokio::spawn(async move {
+                            let list_timeout = registry.list_tools_timeout(&server).await;
+                            let tools = match tokio::time::timeout(
+                                list_timeout,
+                                registry.list_tools_for_server(&server),
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    if let Some(tx) = &tx {
+                                        let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                            name: server.clone(),
+                                            message: format!(
+                                                "tools/list timed out after {}s (server connected but tools not listed yet)",
+                                                list_timeout.as_secs()
+                                            ),
+                                        });
+                                    }
+                                    return;
+                                }
+                            };
+                            let mut msg = format!("tools:\n");
+                            if tools.is_empty() {
+                                msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
+                            } else {
+                                for t in tools {
+                                    msg.push_str(&format!("  - mcp__{}__{}\n", server, t.tool_name));
+                                }
+                            }
+                            if let Some(tx) = tx {
+                                let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                    name: server,
+                                    message: msg.trim_end().to_string(),
+                                });
+                            }
+                        });
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpToolsListing {
+                                server: &server_for_msg,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                None => { /* fall through to default status display below */ }
             }
 
             // Default: show status.
@@ -5156,7 +5162,6 @@ fn fmt_dur(secs: u64) -> String {
 
 /// Recognised `/mcp` subcommands.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum McpSub {
     Reload,
     Tools,
@@ -5168,7 +5173,6 @@ pub(crate) enum McpSub {
 
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
-#[allow(dead_code)]
 pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
     let s = sub.trim();
     if s.eq_ignore_ascii_case("reload") {

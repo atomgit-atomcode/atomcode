@@ -616,7 +616,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpProjectUntrusted =>
             "  已撤销本项目信任。\n".into(),
         Msg::McpBlockedUntrusted { n } =>
-            format!("⚠ 已拦截 {n} 个来自不受信任项目的 MCP server。运行 /mcp trust 信任本项目，再 /mcp reload。\n").into(),
+            format!("已拦截 {n} 个来自不受信任项目的 MCP server。运行 /mcp trust 信任本项目，再 /mcp reload。\n").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
