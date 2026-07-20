@@ -475,6 +475,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
+  const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
+  // Mirror of messages state to read the latest value without dependency tracking.
+  const messagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
   // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
@@ -496,12 +503,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
+      const prevId = activeIdRef.current;
+      if (prevId && messagesRef.current.length > 0) {
+        messageCacheRef.current.set(prevId, messagesRef.current);
+      }
+
       activeIdRef.current = sessionId;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
       abortRef.current?.abort();
       setBusy(false);
-      setMessages([]);
+
+      const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
+      if (cached && cached.length > 0) {
+        setMessages(cached);
+      } else {
+        setMessages([]);
+      }
+
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
       setMatchIdx(0);
@@ -509,7 +528,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setHistoryHint(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
       // 无 id（新建）则不加载、直接落地。
-      setLoading(sessionId != null);
+      setLoading(sessionId != null && !cached);
       // sync 模式：本端在侧栏切到另一个（已存在）会话时，通知后端广播会话切换，
       // 使同进程 sync 模式的 TUI 跟随加载该会话历史。
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
@@ -533,7 +552,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // 标记已为该会话发起加载，避免并发/重复。
     loadedForRef.current = sessionId;
-    setLoading(true);
+    const cached = messageCacheRef.current.get(sessionId);
+    if (!cached) {
+      setLoading(true);
+    }
     const loadId = sessionId;
     getSession(projectHash, loadId)
       .then((detail) => {
@@ -541,14 +563,26 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         if (activeIdRef.current !== loadId) return;
         // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
         const loaded = sessionMessagesToDisplay(detail.messages);
-        if (loaded.length > 0) {
-          // A newly loaded session starts at the bottom regardless of prior scroll state.
-          atBottomRef.current = true;
-          setMessages(loaded);
-          setHistoryHint(null);
+        const currentCached = messageCacheRef.current.get(loadId);
+
+        if (currentCached && currentCached.length > 0) {
+          // If the loaded messages from the backend are shorter than the cached messages,
+          // it means the backend task is still running or hasn't saved yet.
+          // Keep the cached messages and do not overwrite them with stale backend history.
+          if (loaded.length >= currentCached.length) {
+            setMessages(loaded);
+            messageCacheRef.current.delete(loadId);
+          }
         } else {
-          // 空会话：不再显示「继续会话」提示，交给落地页（landing）。
-          setHistoryHint(null);
+          if (loaded.length > 0) {
+            // A newly loaded session starts at the bottom regardless of prior scroll state.
+            atBottomRef.current = true;
+            setMessages(loaded);
+            setHistoryHint(null);
+          } else {
+            // 空会话：不再显示「继续会话」提示，交给落地页（landing）。
+            setHistoryHint(null);
+          }
         }
         setLoading(false);
       })
