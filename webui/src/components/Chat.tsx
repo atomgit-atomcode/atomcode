@@ -2,9 +2,9 @@
 // Task 15 — sessionId + cwd lifted to App
 //
 // 本文件承载对话主视图：消息时间线渲染、流式输出、工具调用展示、
-// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索反查定位
-// (search state + visibleMessages + navMatch + .msg-search-bar)、消息发送
-// 时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
+// 输入与发送、技能/@提及、同步模式、权限卡、会话内消息搜索浮动框
+// (Cmd/Ctrl+F 呼出,Esc 关闭,searchOpen/search/visibleMessages/navMatch/.msg-search-float)、
+// 消息发送时间标记 (formatMsgTime/formatMsgTimeFull + .msg-time) 的实现亦在此文件。
 //
 // ─── bot review 已闭环项 (会话内搜索, PR #602) ───
 //   stale closure → ad2f8da6 + cc5afff5 (matchIdxRef + navMatch);
@@ -992,6 +992,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
         setMatchIdx(0);
+        setSearchOpen(false);
         setTokens(null);
         setHistoryHint(null);
       }
@@ -1946,38 +1947,42 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
-  // 会话内搜索: Cmd/Ctrl+F 呼出浮动搜索框,Esc/× 关闭;输入关键词过滤时间线,
-  // Enter/Shift+Enter(或 ↑/↓)在匹配间跳转并滚动到视口中央(反查定位)。关闭态
+  // 会话内搜索: Cmd/Ctrl+F 呼出浮动搜索框,Esc/× 关闭;输入关键词改变字符背景并高亮,
+  // Enter/Shift+Enter(或 ↑/↓)在匹配消息间跳转并滚动定位(反查定位)。关闭态
   // 完全不占布局空间,不挤压消息区。仅前端,不动后端。
-  // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
-  // turnTexts / isLastInTurn(这两个是按原索引算的)。
   const [search, setSearch] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchTrim = search.trim().toLowerCase();
-  // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
-  const visibleMessages = useMemo(() => searchTrim
-    ? messages.map((m, origIdx) => ({ msg: m, origIdx })).filter(({ msg }) => messageText(msg).toLowerCase().includes(searchTrim))
-    : messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages, searchTrim]);
+  // 不过滤时间线，而是展示完整消息流
+  const visibleMessages = useMemo(() => messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages]);
   const lastVisibleIdx = visibleMessages.length - 1;
-  // 匹配消息 idx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
+  // 计算匹配的原始消息索引列表
+  const matchPositions = useMemo(() => {
+    if (!searchOpen || !searchTrim) return [];
+    const positions: number[] = [];
+    messages.forEach((m, idx) => {
+      if (messageText(m).toLowerCase().includes(searchTrim)) {
+        positions.push(idx);
+      }
+    });
+    return positions;
+  }, [messages, searchTrim, searchOpen]);
+  // 匹配消息 origIdx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
   const [matchIdx, setMatchIdxState] = useState(0);
-  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到
-  // 最新值,而非闭包里上一次渲染的旧值 (否则连击超过 React 渲染速率时
-  // newIdx 会基于旧 matchIdx 算出,导航"停滞")。setMatchIdx 同步更新 ref
-  // + state,事件处理器读 ref,渲染读 state。
+  // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到最新值
   const matchIdxRef = useRef(0);
   const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
   const closeSearch = () => { setSearch(''); setMatchIdx(0); setSearchOpen(false); };
-  // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
-  // Enter/↑/↓ 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  // 搜索导航 helper: 算 newIdx → setMatchIdx → 滚动。
   const navMatch = (delta: number) => {
-    const n = visibleMessages.length;
+    const n = matchPositions.length;
     if (n === 0) return;
     const newIdx = (matchIdxRef.current + delta + n) % n;
     setMatchIdx(newIdx);
-    const node = matchRefs.current[newIdx];
+    const targetOrigIdx = matchPositions[newIdx];
+    const node = matchRefs.current[targetOrigIdx];
     if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
 
@@ -2309,66 +2314,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
-        {/* 会话内搜索栏:仅在有历史时显示。sticky 在滚动区顶部,Enter/↑/↓
-            在匹配间跳转并滚动定位(反查定位),清除恢复完整时间线。 */}
-        {messages.length > 0 && (
-          <div class="msg-search-bar">
-            <svg class="msg-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <path d="m21 21-4.3-4.3" />
-            </svg>
-            <input
-              class="msg-search-input"
-              // bot review P3: type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
-              // 与自定义 .msg-search-clear 重复。type="text" 全浏览器一致,清除按钮仅走自定义路径。
-              type="text"
-              value={search}
-              placeholder={t('chat.searchPlaceholder')}
-              onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && searchTrim && visibleMessages.length > 0) {
-                  e.preventDefault();
-                  navMatch(e.shiftKey ? -1 : 1);
-                }
-              }}
-              aria-label={t('chat.searchPlaceholder')}
-            />
-            {searchTrim && (
-              <span class="msg-search-count">
-                {visibleMessages.length > 0 ? `${Math.min(matchIdx + 1, visibleMessages.length)} / ${visibleMessages.length}` : t('chat.searchNoMatch')}
-              </span>
-            )}
-            {/* 零匹配时只显示计数+清除,隐藏无效的 ↑/↓ 导航按钮 (bot review Low) */}
-            {searchTrim && visibleMessages.length > 0 && (
-              <>
-                <button
-                  class="msg-search-nav"
-                  onClick={() => navMatch(-1)}
-                  title={t('chat.searchPrev')}
-                  aria-label={t('chat.searchPrev')}
-                  type="button"
-                >↑</button>
-                <button
-                  class="msg-search-nav"
-                  onClick={() => navMatch(1)}
-                  title={t('chat.searchNext')}
-                  aria-label={t('chat.searchNext')}
-                  type="button"
-                >↓</button>
-              </>
-            )}
-            {searchTrim && (
-              <button
-                class="msg-search-clear"
-                onClick={() => { setSearch(''); setMatchIdx(0); }}
-                title={t('chat.searchClear')}
-                aria-label={t('chat.searchClear')}
-                type="button"
-              >×</button>
-            )}
-          </div>
-        )}
-
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -2383,12 +2328,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               {historyHint}
               <div class="sub">{t('chat.continueHint')}</div>
             </div>
-          </div>
-        )}
-
-        {searchTrim && visibleMessages.length === 0 && (
-          <div class="messages-empty">
-            <div>{t('chat.searchNoMatch')}</div>
           </div>
         )}
 
@@ -2438,19 +2377,33 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
-            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[idx] = el; };
+            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
             const timeLabel = formatMsgTime(msg.ts, t);
             const timeFull = formatMsgTimeFull(msg.ts);
+            const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
+
             if (msg.role === 'user') {
-              return <UserMessageView key={origIdx} msg={msg} searchRef={setMatchRef} timeLabel={timeLabel} timeFull={timeFull} />;
+              return (
+                <UserMessageView
+                  key={origIdx}
+                  msg={msg}
+                  searchRef={setMatchRef}
+                  timeLabel={timeLabel}
+                  timeFull={timeFull}
+                  search={search}
+                  isActiveSearchMatch={isActiveSearchMatch}
+                />
+              );
             }
 
             // system messages render as a standalone notice row (no copy button,
             // no turn grouping, no streaming cursor).
             if (msg.role === 'system') {
+              const fullText = msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('');
+              const sysCls = 'msg-notice command-output' + (isActiveSearchMatch ? ' is-active-search-match' : '');
               return (
-                <div class="msg-notice command-output" key={origIdx} ref={setMatchRef}>
-                  {msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('')}
+                <div class={sysCls} key={origIdx} ref={setMatchRef}>
+                  {highlightText(fullText, search)}
                 </div>
               );
             }
@@ -2476,6 +2429,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 searchRef={setMatchRef}
                 timeLabel={timeLabel}
                 timeFull={timeFull}
+                search={search}
+                isActiveSearchMatch={isActiveSearchMatch}
               />
             );
           });
@@ -2512,6 +2467,86 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
       </div>
 
+      {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
+          长条胶囊、无图标、右侧依次 ↑ ↓ ×。position:absolute 钉在容器右上角,不占布局空间。
+          Enter/↓ 下一条,Shift+Enter/↑ 上一条;零匹配时计数显示提示,导航按钮隐藏。 */}
+      {searchOpen && messages.length > 0 && (
+        <div class="msg-search-float" role="search" aria-label={t('chat.searchPlaceholder')}>
+          <input
+            class="msg-search-input"
+            // type="text" 而非 "search"——后者在 Firefox 仍显示默认清除按钮,
+            // 与自定义 × 重复。type="text" 全浏览器一致,清除仅走自定义路径。
+            type="text"
+            ref={searchInputRef}
+            value={search}
+            placeholder={t('chat.searchPlaceholder')}
+            onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
+            onKeyDown={(e) => {
+              // Enter/↓ = 下一条;Shift+Enter/↑ = 上一条。输入框内 ↑/↓ 不移动光标
+              // (单行输入无光标位置歧义),直接在匹配间跳转。
+              if (e.key === 'Enter') {
+                if (searchTrim && matchPositions.length > 0) {
+                  e.preventDefault();
+                  navMatch(e.shiftKey ? -1 : 1);
+                }
+              } else if (e.key === 'ArrowDown' && searchTrim && matchPositions.length > 0) {
+                e.preventDefault();
+                navMatch(1);
+              } else if (e.key === 'ArrowUp' && searchTrim && matchPositions.length > 0) {
+                e.preventDefault();
+                navMatch(-1);
+              }
+            }}
+            aria-label={t('chat.searchPlaceholder')}
+          />
+          <span class="msg-search-count">
+            {searchTrim
+              ? (matchPositions.length > 0
+                  ? `${matchIdx + 1}/${matchPositions.length}`
+                  : t('chat.searchNoMatch'))
+              : ''}
+          </span>
+          <button
+            class="msg-search-nav"
+            onClick={() => navMatch(-1)}
+            title={t('chat.searchPrev')}
+            aria-label={t('chat.searchPrev')}
+            type="button"
+            disabled={!searchTrim || matchPositions.length === 0}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="19" x2="12" y2="5" />
+              <polyline points="5 12 12 5 19 12" />
+            </svg>
+          </button>
+          <button
+            class="msg-search-nav"
+            onClick={() => navMatch(1)}
+            title={t('chat.searchNext')}
+            aria-label={t('chat.searchNext')}
+            type="button"
+            disabled={!searchTrim || matchPositions.length === 0}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <polyline points="19 12 12 19 5 12" />
+            </svg>
+          </button>
+          <button
+            class="msg-search-close"
+            onClick={closeSearch}
+            title={t('chat.searchClose')}
+            aria-label={t('chat.searchClose')}
+            type="button"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
       {showJumpBtn && (
         <button
@@ -2542,7 +2577,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searchRef, timeLabel, timeFull }: { msg: Message; isLast: boolean; busy: boolean; lastIdx: number; isLastInTurn: boolean; turnText: string; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
+function AssistantMessageView({
+  msg,
+  isLast,
+  busy,
+  isLastInTurn,
+  turnText,
+  searchRef,
+  timeLabel,
+  timeFull,
+  search,
+  isActiveSearchMatch,
+}: {
+  msg: Message;
+  isLast: boolean;
+  busy: boolean;
+  lastIdx: number;
+  isLastInTurn: boolean;
+  turnText: string;
+  searchRef?: (el: HTMLElement | null) => void;
+  timeLabel?: string;
+  timeFull?: string;
+  search: string;
+  isActiveSearchMatch: boolean;
+}) {
   const t = useT();
   const text = messageText(msg);
   const isError =
@@ -2551,7 +2609,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
     text.includes('[Error:') ||
     text.includes('[Connection error:');
   const streaming = isLast && busy;
-  // 终条且简短（无工具、单行）时，去掉多余的"时间线末端"橙点，只留一个起始点。
+  // 终条且简短（无工具、单行）时，去掉多余 of "时间线末端"橙点，只留一个起始点。
   const terse =
     isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
   const dotClass = isError ? 'dot-error' : 'dot-brand';
@@ -2560,7 +2618,8 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
     dotClass +
     (streaming ? ' dot-blink' : '') +
     (isLast ? ' is-last' : '') +
-    (terse ? ' is-terse' : '');
+    (terse ? ' is-terse' : '') +
+    (isActiveSearchMatch ? ' is-active-search-match' : '');
 
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
@@ -2600,14 +2659,14 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
-          {text}
+          {highlightText(text, search)}
           {streaming && <span class="streaming-cursor" />}
         </div>
       ) : (
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts)}
+          {renderAssistantParts(msg.parts, search)}
           {streaming && <span class="streaming-cursor" />}
         </>
       )}
@@ -2622,7 +2681,7 @@ function AssistantMessageView({ msg, isLast, busy, isLastInTurn, turnText, searc
   );
 }
 
-function renderAssistantParts(parts: MsgPart[]): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -2646,26 +2705,68 @@ function renderAssistantParts(parts: MsgPart[]): VNode[] {
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
-          {p.text}
+          {highlightText(p.text, search)}
         </div>,
       );
       i++;
     } else if (p.kind === 'rate_limited') {
       out.push(
         <div class="rate-limited-notice" key={`rl-${i}`}>
-          {p.text}
+          {highlightText(p.text, search)}
         </div>,
       );
       i++;
     } else {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
       i++;
     }
   }
   return out;
 }
 
-function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message; searchRef?: (el: HTMLElement | null) => void; timeLabel?: string; timeFull?: string }) {
+function highlightText(text: string, search: string) {
+  if (!search.trim()) return text;
+  const searchLower = search.toLowerCase();
+  const index = text.toLowerCase().indexOf(searchLower);
+  if (index === -1) return text;
+  
+  const parts: (string | VNode)[] = [];
+  let lastIndex = 0;
+  let idx = index;
+  let key = 0;
+  while (idx !== -1) {
+    if (idx > lastIndex) {
+      parts.push(text.substring(lastIndex, idx));
+    }
+    parts.push(
+      <mark key={key++} class="msg-search-highlight">
+        {text.substring(idx, idx + search.length)}
+      </mark>
+    );
+    lastIndex = idx + search.length;
+    idx = text.toLowerCase().indexOf(searchLower, lastIndex);
+  }
+  if (lastIndex < text.length) {
+    parts.push(text.substring(lastIndex));
+  }
+  return parts;
+}
+
+function UserMessageView({
+  msg,
+  searchRef,
+  timeLabel,
+  timeFull,
+  search,
+  isActiveSearchMatch,
+}: {
+  msg: Message;
+  searchRef?: (el: HTMLElement | null) => void;
+  timeLabel?: string;
+  timeFull?: string;
+  search: string;
+  isActiveSearchMatch: boolean;
+}) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
   const text = messageText(msg);
@@ -2708,9 +2809,11 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
     </button>
   );
 
+  const wrapperClass = 'user-message-wrapper' + (isActiveSearchMatch ? ' is-active-search-match' : '');
+
   if (skillTitle && !expanded) {
     return (
-      <div class="user-message-wrapper" ref={searchRef}>
+      <div class={wrapperClass} ref={searchRef}>
         {images}
         <button
           class="skill-badge"
@@ -2727,7 +2830,7 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
   }
 
   return (
-    <div class="user-message-wrapper" ref={searchRef}>
+    <div class={wrapperClass} ref={searchRef}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
@@ -2737,7 +2840,7 @@ function UserMessageView({ msg, searchRef, timeLabel, timeFull }: { msg: Message
         )}
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
-        {skillTitle ? <Markdown content={text} /> : text}
+        {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
         {copyBtn}

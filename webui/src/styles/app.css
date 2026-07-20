@@ -371,25 +371,24 @@ body {
   color: var(--app-brand);
 }
 
-/* === 会话内搜索栏 (反查定位) === */
-/* sticky 在滚动区顶部,仅在有历史时显示。低对比,不与时间线争抢注意力。 */
-.msg-search-bar {
-  position: sticky;
-  top: 0;
-  z-index: 5;
+/* === 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,反查定位) === */
+/* 仿浏览器 Find-in-page: 右侧依次 ↑ ↓ ×,无图标,× 带独立圆角边框。
+   absolute 钉在消息区右上角,不占布局空间。 */
+.msg-search-float {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  z-index: 21; /* 高于 .jump-to-bottom (20),避免被遮挡 */
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  margin-bottom: 6px;
-  background: var(--app-secondary-background);
-  border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
-}
-.msg-search-icon {
-  flex: 0 0 auto;
-  color: var(--app-secondary-foreground);
-  opacity: 0.7;
+  padding: 6px 6px 6px 16px;
+  height: 48px;
+  width: min(320px, calc(100% - 28px));
+  background: var(--app-primary-background);
+  border: 1px solid var(--app-input-border, rgba(128, 128, 128, 0.2));
+  border-radius: 12px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+  color: var(--app-primary-foreground);
 }
 .msg-search-input {
   flex: 1 1 auto;
@@ -397,48 +396,92 @@ body {
   border: none;
   background: transparent;
   color: var(--app-primary-foreground);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 14px;
+  line-height: 1.4;
   outline: none;
+  padding: 0;
 }
-/* bot review P3: type="text" 无浏览器默认清除按钮,::-webkit-search-cancel-button 伪元素已无目标,删除。 */
-/* 焦点可见性 (WCAG 2.4.7): outline:none 移除默认环后必须给替代视觉,
-   否则键盘 Tab 进入看不到焦点。用 :focus-visible 避免鼠标点击也触发。 */
-.msg-search-input:focus-visible {
-  outline: 2px solid var(--app-brand);
-  outline-offset: -2px;
+/* 焦点可见性:用整框高亮替代输入环,避免内部光环打断胶囊观感。 */
+.msg-search-float:focus-within {
+  border-color: var(--app-brand);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 0 0 2px color-mix(in srgb, var(--app-brand) 25%, transparent);
 }
 .msg-search-count {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--app-secondary-foreground);
-  opacity: 0.85;
   white-space: nowrap;
+  padding: 0 8px;
+  user-select: none;
 }
-.msg-search-nav,
-.msg-search-clear {
+/* ↑ ↓ 按钮:无边框,纯灰图标,hover 圆角矩形灰底。 */
+.msg-search-nav {
   flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
-  background: var(--app-secondary-background);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
   padding: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
-  opacity: 0.7;
+  transition: background 0.12s, color 0.12s;
+  margin: 0 2px;
 }
-.msg-search-nav:hover,
-.msg-search-clear:hover {
-  opacity: 1;
-  background: var(--app-ghost-button-hover-background);
+.msg-search-nav:hover:not(:disabled) {
+  background: var(--app-ghost-button-hover-background, rgba(128, 128, 128, 0.08));
   color: var(--app-primary-foreground);
+}
+.msg-search-nav:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+/* 移除了 ↑ ↓ 与 × 之间的细竖线分隔，将其设为隐藏。 */
+.msg-search-divider {
+  display: none;
+}
+/* × 关闭:独立圆角方框,与图片一致。 */
+.msg-search-close {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--app-input-border, rgba(0, 0, 0, 0.08));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  margin-left: 6px;
+}
+.msg-search-close:hover {
+  background: var(--app-ghost-button-hover-background, rgba(128, 128, 128, 0.08));
+  border-color: var(--app-input-border, rgba(0, 0, 0, 0.15));
+  color: var(--app-primary-foreground);
+}
+
+/* === 字符背景高亮 (搜索定位效果) === */
+.msg-search-highlight {
+  background: color-mix(in srgb, var(--app-brand) 32%, rgba(230, 180, 0, 0.35));
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+/* 当前聚焦定位到的匹配项消息高亮 */
+.is-active-search-match .msg-search-highlight {
+  background: var(--app-brand, #d97757);
+  color: var(--app-brand-ivory, #fff) !important;
+}
+.timeline-message.is-active-search-match,
+.user-message-wrapper.is-active-search-match .user-message-bubble {
+  outline: 2px solid color-mix(in srgb, var(--app-brand) 40%, transparent);
+  outline-offset: 2px;
 }
 
 /* === PR #562: send-time label under each message === */

@@ -763,8 +763,9 @@ fn render_login_line_from_stored_auth() -> String {
 }
 
 fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
+    use atomcode_codingplan::is_auth_expired;
     use atomcode_config::i18n::{t, Msg};
-    if atomcode_core::coding_plan::is_auth_expired(e) {
+    if is_auth_expired(e) {
         t(Msg::StatusCpAuthExpired).into_owned()
     } else {
         fallback()
@@ -773,8 +774,9 @@ fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) ->
 
 fn render_codingplan_status_for_status_cmd() -> String {
     tokio::task::block_in_place(|| {
+        use atomcode_codingplan::setup::format_duration_secs;
+        use atomcode_codingplan::Client;
         use atomcode_config::i18n::{t, Msg};
-        use atomcode_core::coding_plan::client::Client;
 
         let client = match Client::from_stored_auth() {
             Ok(c) => c,
@@ -806,7 +808,6 @@ fn render_codingplan_status_for_status_cmd() -> String {
         })
         .into_owned();
         if !status.rate_limit_windows.is_empty() {
-            use atomcode_core::coding_plan::setup::format_duration_secs;
             for w in status
                 .rate_limit_windows
                 .iter()
@@ -828,9 +829,7 @@ fn render_codingplan_status_for_status_cmd() -> String {
             out.push_str(&t(Msg::StatusCpUsage {
                 usage: &u.display_desc(),
                 reset_at: &u.reset_at_display,
-                duration: &atomcode_core::coding_plan::setup::format_duration_secs(
-                    u.seconds_until_reset,
-                ),
+                duration: &format_duration_secs(u.seconds_until_reset),
             }));
         }
         out
