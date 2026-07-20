@@ -5968,17 +5968,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             let _ = ctx.history.save();
             renderer.render(UiLine::ClearTransient);
             renderer.shutdown();
-            // `renderer.shutdown()` restores mouse / Kitty-keyboard / scroll-region
-            // state, but NOT bracketed paste — disabling that is `TerminalGuard::Drop`'s
-            // job (lib.rs), and `process::exit(0)` skips every Drop. Emit `?2004l`
-            // directly so a force-exit doesn't strand the user's shell wrapping every
-            // paste in literal `200~`/`201~` markers.
-            {
-                use std::io::Write as _;
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(b"\x1b[?2004l");
-                let _ = out.flush();
-            }
+            // `process::exit(0)` skips `TerminalGuard` and `ReaderHandle` drops.
+            // Reuse the complete panic/signal restore contract so focus reporting,
+            // bracketed paste, and every other armed terminal mode are disabled.
+            crate::panic_restore_terminal();
             let _ = crossterm::terminal::disable_raw_mode();
             std::process::exit(0);
         }

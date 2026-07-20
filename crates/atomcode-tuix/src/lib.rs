@@ -249,11 +249,11 @@ impl Drop for TerminalGuard {
 /// CSI-u report (the reported crash artefact).
 ///
 /// Mirrors `RetainedRenderer::Drop` (mouse-mode off, Kitty pop, cursor
-/// show, autowrap on, DECSTBM release), then disables bracketed paste
-/// (`?2004l`) and appends a CRLF so the panic backtrace prints on a fresh
-/// line below the last painted TUI row instead of on top of it. Every
-/// sequence is idempotent, so emitting it after a graceful shutdown that
-/// already sent the same bytes is a harmless no-op.
+/// show, autowrap on, DECSTBM release), then disables focus reporting
+/// (`?1004l`) and bracketed paste (`?2004l`) before appending a CRLF so the
+/// panic backtrace prints on a fresh line below the last painted TUI row
+/// instead of on top of it. Every sequence is idempotent, so emitting it
+/// after a graceful shutdown that already sent the same bytes is harmless.
 ///
 /// Bracketed paste is armed by `TerminalGuard`, not the renderer, so it is
 /// NOT in `RetainedRenderer::Drop` — but the abrupt-exit paths that lean on
@@ -267,7 +267,7 @@ impl Drop for TerminalGuard {
 /// stack), so this stays unconditional and we needn't thread the
 /// `kbd_flags_pushed` state out of `TerminalGuard`.
 pub(crate) fn panic_restore_sequence() -> &'static [u8] {
-    b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\x1b[?2004l\r\n"
+    b"\x1b[?1006l\x1b[?1002l\x1b[?1004l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r\x1b[?2004l\r\n"
 }
 
 /// Emit [`panic_restore_sequence`] to stdout and flush. Best-effort
@@ -904,6 +904,10 @@ mod panic_restore_tests {
         assert!(
             text.contains("\x1b[?2004l"),
             "must disable bracketed paste: {text:?}"
+        );
+        assert!(
+            text.contains("\x1b[?1004l"),
+            "must disable focus reporting: {text:?}"
         );
     }
 }
