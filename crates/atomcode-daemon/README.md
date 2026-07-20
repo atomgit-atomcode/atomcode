@@ -503,7 +503,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "logged_in": true,
-  "auth_path": "/home/user/.atomcode/auth.json",
+  "auth_path": "/home/user/.atomcode/auth.toml",
   "user": {
     "username": "example_user",
     "email": "user@example.com"
@@ -703,5 +703,5 @@ daemon 使用以下配置文件（位于 `~/.atomcode/` 目录）：
 |------|------|
 | `config.toml` | 主配置（Provider、默认工作目录等） |
 | `mcp.json` | MCP 服务器配置 |
-| `auth.json` | 认证信息（OAuth token） |
+| `auth.toml` | 认证信息（OAuth token） |
 | `sessions/` | 会话数据存储目录 |
