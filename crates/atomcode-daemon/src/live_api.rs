@@ -55,6 +55,13 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 /// 进程内单一活动 LiveSession（TUI 与进程内 webui 共享）。
 static LIVE: StdMutex<Option<Arc<atomcode_core::live::LiveSession>>> = StdMutex::new(None);
 
+/// 当前 LiveSession 的具体执行器。与 `LIVE` 同步写入 / 清空（`ensure_live_session_global`），
+/// 用于从 `/live/mcp/trust` 等副作用端点向已建好的 bridge 发 `AgentCommand`（例如
+/// `ReloadHooks`），而无需通过 `LiveSession`（后者不暴露 bridge 的 `cmd_tx`）。
+/// bridge 只在第一次 turn 时懒建，因此 `try_send_agent_command` 在未跑过任何 turn 的
+/// 全新会话上会返回 `false`（best-effort）。
+static LIVE_EXECUTOR: StdMutex<Option<Arc<KernelTurnExecutor>>> = StdMutex::new(None);
+
 /// 当前 LiveSession 的稳定 session_id（字符串），供 /live SSE 端点在 Snapshot 中暴露。
 static LIVE_SESSION_ID: StdMutex<Option<String>> = StdMutex::new(None);
 
@@ -392,13 +399,18 @@ pub(crate) fn ensure_live_session_global(
     // 复用既有会话的分支已在上方提前 return，不会走到这里。
     *LIVE_WORKING_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(working_dir.clone());
     atomcode_core::ctrace!("LIVE", "daemon live turns on the kernel stack");
-    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = Arc::new(KernelTurnExecutor::new(
+    let kernel_executor = Arc::new(KernelTurnExecutor::new(
         working_dir,
         None,
         false,
         session_id,
         telemetry,
     ));
+    // Store a handle to the concrete executor so side-effect endpoints (e.g.
+    // /live/mcp/trust) can send AgentCommands to the running bridge without
+    // going through LiveSession (which does not expose cmd_tx).
+    *LIVE_EXECUTOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(kernel_executor.clone());
+    let executor: Arc<dyn atomcode_core::live::TurnExecutor> = kernel_executor;
     // 历史在锁内、确认要建会话后才求值——既省掉无谓读盘，也避免「锁外判定、锁内已被
     // 别的请求替换」的 TOCTOU：是否新建与用什么历史新建是同一临界区里的决定。
     let (initial_messages, cold_summaries) = initial_session();
@@ -694,6 +706,19 @@ impl KernelTurnExecutor {
             skip_tls_verify: p.skip_tls_verify,
             loop_max_rounds: config.loop_config.max_rounds,
         })
+    }
+
+    /// Send an `AgentCommand` to the persistent bridge runtime if it has
+    /// already been built (i.e. at least one turn has run). Returns `true`
+    /// if the command was dispatched, `false` if the bridge is not yet
+    /// initialised (best-effort — the caller must treat `false` as a no-op,
+    /// not an error).
+    pub(crate) async fn try_send_agent_command(&self, cmd: AgentCommand) -> bool {
+        let guard = self.bridge.lock().await;
+        match guard.as_ref() {
+            Some(state) => state.client.cmd_tx.send(cmd).is_ok(),
+            None => false,
+        }
     }
 }
 
@@ -2714,6 +2739,22 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
             // fresh registry that now allows the just-trusted project servers (the cached
             // entry was built while untrusted, with project servers withheld).
             live_mcp_cache().write().await.remove(&working_dir);
+            // Signal the persistent bridge to respawn(Resume) so it re-runs
+            // connect_and_adapt with the now-trusted project servers — exactly
+            // the same mechanism the TUI uses for `/mcp trust` + reload.
+            // Best-effort: if the bridge hasn't been built yet (no turn has run
+            // this session) or there is no active live session, this is a no-op;
+            // the trust has already been persisted to disk so the next spawn
+            // will pick it up automatically.
+            let executor = LIVE_EXECUTOR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(exec) = executor {
+                let _ = exec
+                    .try_send_agent_command(AgentCommand::ReloadHooks)
+                    .await;
+            }
             Json(serde_json::json!({ "ok": true, "trusted": true })).into_response()
         }
         Err(e) => (
