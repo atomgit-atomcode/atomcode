@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 use atomcode_capabilities::session::{
-    LoadedSession, SessionLease as NativeSessionLease,
-    SessionManager as NativeSessionManager, SessionMeta as NativeSessionMeta,
+    LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
+    SessionMeta as NativeSessionMeta,
 };
 use atomcode_config::config::memory::MemoryStore;
 use atomcode_core::conversation::Conversation;
@@ -231,8 +231,7 @@ fn exec_native_undo(mut session: NativeCommandSession, arg: &str) -> anyhow::Res
         return Ok(CommandResult::Undo { undone: 0 });
     }
     let target = arg.trim().parse::<usize>().ok();
-    let undo =
-        atomcode_coding::runtime::undo_snapshot_to_prompt(&session.loaded.snapshot, target)?;
+    let undo = atomcode_coding::runtime::undo_snapshot_to_prompt(&session.loaded.snapshot, target)?;
     let message_count = undo.snapshot.messages.len();
     session
         .loaded
@@ -385,9 +384,8 @@ async fn exec_context(
         state.telemetry.clone(),
     )
     .await?;
-    let conv = Conversation::from_snapshot(crate::legacy_convert::snapshot_to_core(
-        &session.snapshot,
-    ));
+    let conv =
+        Conversation::from_snapshot(crate::legacy_convert::snapshot_to_core(&session.snapshot));
     let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
     let s = atomcode_core::ctx::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
         .await;
@@ -728,9 +726,7 @@ fn exec_todo(
     })
 }
 
-fn todo_items_from_messages(
-    messages: &[atomcode_kernel::message::Message],
-) -> Vec<TodoItemJson> {
+fn todo_items_from_messages(messages: &[atomcode_kernel::message::Message]) -> Vec<TodoItemJson> {
     // Fold the kernel-native tool-call stream via the canonical reducer. This shows CURRENT
     // statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
     use atomcode_capabilities::tools::todo::{reduce_todos, TodoStatus};

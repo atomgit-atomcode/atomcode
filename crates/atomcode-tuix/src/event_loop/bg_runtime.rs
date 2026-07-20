@@ -1,8 +1,8 @@
 use super::ui_event::UiEvent as AgentEvent;
+use crate::session::Session;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
 use atomcode_daemon::legacy_convert::snapshot_to_core;
-use crate::session::Session;
 
 use super::RuntimeEndpoint;
 
@@ -26,6 +26,7 @@ pub struct RuntimeEvent {
 pub enum RuntimeEventPayload {
     Ui(AgentEvent),
     Native(CodingRuntimeEvent),
+    SequencedNative(atomcode_coding::SequencedRuntimeEvent),
     Driver(DriverEvent),
 }
 
@@ -399,13 +400,15 @@ impl BgRuntimeManager {
         self.backgrounds.drop_slot(slot)
     }
 
-    pub fn apply_background_event(
-        &mut self,
-        runtime_id: RuntimeId,
-        event: RuntimeEventPayload,
-    ) {
+    pub fn apply_background_event(&mut self, runtime_id: RuntimeId, event: RuntimeEventPayload) {
         let Some(slot) = self.backgrounds.slot_for_runtime_id(runtime_id) else {
             return;
+        };
+        let event = match event {
+            RuntimeEventPayload::SequencedNative(envelope) => {
+                RuntimeEventPayload::Native(envelope.event)
+            }
+            event => event,
         };
         let terminal = match event {
             RuntimeEventPayload::Ui(event) => self.backgrounds.apply_event_to_slot(slot, &event),
@@ -436,6 +439,7 @@ impl BgRuntimeManager {
                 false
             }
             RuntimeEventPayload::Native(_) => false,
+            RuntimeEventPayload::SequencedNative(_) => unreachable!("normalized above"),
             RuntimeEventPayload::Driver(_) => false,
         };
         let _ = terminal;

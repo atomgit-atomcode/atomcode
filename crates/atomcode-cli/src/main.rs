@@ -1785,7 +1785,7 @@ fn into_tui_native_runtime(
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::Native(event.event))
+                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
                 .is_err()
             {
                 break;

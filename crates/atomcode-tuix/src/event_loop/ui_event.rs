@@ -5,7 +5,7 @@ use atomcode_core::conversation::message::ImagePart;
 use atomcode_core::conversation::ConversationSnapshot;
 use atomcode_core::stream::TokenUsage;
 use atomcode_core::tool::ToolCall;
-use atomcode_core::turn::event::ToolBatchCall;
+use atomcode_kernel::event::ToolBatchCall;
 
 /// TUI-only presentation events. Runtime and live-session inputs are projected
 /// into this type at the driver boundary; it is not an engine protocol.
@@ -201,4 +201,26 @@ impl UiTurnStopReason {
 pub struct SubAgentTaskInfo {
     pub path: String,
     pub dedup_suffix: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiEvent;
+
+    #[test]
+    fn tool_batch_payload_is_kernel_native() {
+        let calls: Vec<atomcode_kernel::event::ToolBatchCall> =
+            vec![atomcode_kernel::event::ToolBatchCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            }];
+
+        let event = UiEvent::ToolBatchStarted {
+            batch_id: "batch-1".into(),
+            calls,
+        };
+        assert!(matches!(event, UiEvent::ToolBatchStarted { calls, .. } if calls.len() == 1));
+    }
 }

@@ -979,18 +979,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         return bash_execute_background(&parsed.command, &wd, Instant::now()).await;
     }
 
-    let event_tx = ctx.event_tx.clone();
-    let call_id = ctx.current_call_id.clone();
-
-    let outcome = run_shell(&parsed.command, &wd, timeout_secs, |chunk| {
-        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
-            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
-                call_id: id.clone(),
-                chunk: chunk.to_string(),
-            });
-        }
-    })
-    .await;
+    let outcome = run_shell(&parsed.command, &wd, timeout_secs, |_| {}).await;
 
     let stdout_str = outcome.stdout;
     let stderr_str = outcome.stderr;

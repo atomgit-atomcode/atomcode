@@ -23,7 +23,6 @@ pub mod hook;
 // `locale::Locale`); re-export it so core's own `crate::i18n::…` uses and any
 // external `atomcode_core::i18n` consumers keep working during the transition.
 pub use atomcode_config::i18n;
-pub mod live;
 // `locale` fully lives in `atomcode-config` now (re-export shim removed).
 mod fs_atomic;
 pub mod lsp;

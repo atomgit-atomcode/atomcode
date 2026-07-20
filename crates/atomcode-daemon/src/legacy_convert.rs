@@ -618,9 +618,8 @@ fn load_catalog_session_view_in_root(
     }
 
     if entry.presence == CatalogPresence::NativeOnly {
-        let meta = meta.ok_or_else(|| {
-            anyhow::anyhow!("native session {:?} has no metadata", entry.id)
-        })?;
+        let meta =
+            meta.ok_or_else(|| anyhow::anyhow!("native session {:?} has no metadata", entry.id))?;
         if meta.owner != StorageOwner::Unconfirmed {
             anyhow::bail!(
                 "native-only session {:?} has incompatible owner {:?}",
@@ -1256,9 +1255,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionManager::with_root(dir.path());
         let id = "native-missing-presentation";
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            KernelMessage::user("native"),
-        ]);
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("native")]);
         manager.save_snapshot(id, &snapshot).unwrap();
         let mut meta = atomcode_capabilities::session::SessionMeta::new(id, "/p", 1);
         meta.owner = StorageOwner::Native;
@@ -1266,7 +1264,10 @@ mod tests {
         let lease = manager.acquire_lease(id).unwrap();
 
         let error = converge_session(&manager, &lease).unwrap_err();
-        assert!(error.to_string().contains("missing presentation"), "{error:#}");
+        assert!(
+            error.to_string().contains("missing presentation"),
+            "{error:#}"
+        );
         assert_eq!(manager.load_snapshot(id).unwrap(), snapshot);
     }
 
@@ -1333,9 +1334,8 @@ mod tests {
         let id = "native-view";
         let manager = SessionManager::with_root(dir.path().join(bucket));
         let lease = manager.acquire_lease(id).unwrap();
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            KernelMessage::user("native"),
-        ]);
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("native")]);
         let presentation = PresentationFile::default();
         let mut meta = SessionMeta::new(id, "/project", 1);
         meta.owner = StorageOwner::Native;

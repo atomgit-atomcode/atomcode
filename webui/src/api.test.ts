@@ -11,7 +11,7 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init });
-    return new Response('{}', { status: 200 });
+    return new Response('{"accepted":true}', { status: 200 });
   }) as typeof fetch;
 
   try {
@@ -26,6 +26,24 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
       message: 'hello',
       session_id: 'session-1',
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('live control APIs reject protocol-level failures', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ ok: false, error: 'runtime is busy' }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { postLiveSwitchSession } = await import('./api.ts');
+    await assert.rejects(
+      () => postLiveSwitchSession('session-2'),
+      /runtime is busy/,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

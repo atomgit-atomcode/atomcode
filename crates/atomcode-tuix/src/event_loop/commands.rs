@@ -31,11 +31,11 @@ use crate::modals::{
     SessionPicker,
 };
 use crate::render::{Renderer, UiLine};
+use crate::session::{Session, SessionId};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_capabilities::memory::MemoryStore;
 use atomcode_config::config::Config;
-use crate::session::{Session, SessionId};
 
 use crate::markdown::{fence_start, is_closing_fence};
 
@@ -247,187 +247,56 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
     out
 }
 
-/// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
-/// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-pub(crate) fn attach_live_session(
+/// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
+pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    session: std::sync::Arc<atomcode_core::live::LiveSession>,
-    render_snapshot: bool,
-) {
-    // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
-    // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
-    // 工具调用全部重复）。tokio 里 drop JoinHandle 只会分离任务、不会取消，
-    // 所以必须显式 abort 后再 spawn 新转发器。
-    if let Some(h) = ctx.sync_forwarder.take() {
-        h.abort();
-    }
-    // 回放快照：渲染既有消息。`/webui` 用 TUI 当前会话播种 LiveSession，画面里早已有这些
-    // 消息（如 `atomcode -c` 续聊），此时 render_snapshot=false 跳过回放、避免重复刷一遍。
-    if render_snapshot {
-        let snapshot: Vec<atomcode_core::conversation::message::Message> =
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(session.snapshot())
-            });
-        render_live_snapshot_messages(renderer, &snapshot);
-    }
-    let handle = super::live_sync::spawn_live_forwarder(
-        session.clone(),
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
+) -> Result<(), String> {
+    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+        &ctx.current_session.to_conversation_snapshot(),
     );
-    ctx.sync_forwarder = Some(handle);
-    ctx.sync_session = Some(session);
+    let binding = atomcode_daemon::native_live::register_embedded_runtime(
+        ctx.current_session.id.to_string(),
+        ctx.working_dir.clone(),
+        snapshot,
+        std::sync::Arc::new(ctx.runtime.clone()),
+    )
+    .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    ctx.live_binding = Some(binding);
+    let mut remote_commands = atomcode_daemon::native_live::register_remote_command_sink();
+    let runtime_id = ctx.foreground_runtime_id;
+    let event_tx = ctx.runtime_event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(command) = remote_commands.recv().await {
+            if event_tx
+                .send(super::bg_runtime::RuntimeEvent {
+                    runtime_id,
+                    event: super::bg_runtime::RuntimeEventPayload::Ui(
+                        super::ui_event::UiEvent::RemoteSlashCommand(command),
+                    ),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     renderer.render(UiLine::CommandOutput(
-        "已同步当前会话（与浏览器实时互通）".to_string(),
+        "已共享当前会话（与浏览器实时互通）".to_string(),
     ));
+    Ok(())
 }
 
-fn restore_live_forwarder(
-    ctx: &mut LoopCtx,
-    session: std::sync::Arc<atomcode_core::live::LiveSession>,
-    receiver: tokio::sync::broadcast::Receiver<atomcode_core::live::LiveEvent>,
-) {
-    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
-        session,
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
-        receiver,
-    ));
-}
-
-pub(crate) fn rollback_pending_local_runtime_sync(ctx: &mut LoopCtx) -> bool {
-    let Some(pending) = ctx.pending_local_runtime_sync.take() else {
-        return false;
-    };
-    if pending.runtime_id != ctx.foreground_runtime_id
-        || pending.session_id != ctx.current_session.id
-    {
-        return false;
-    }
-    let live_session = pending.live_session;
-    let receiver = pending.handoff.resume_receiver();
-    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
-        live_session.clone(),
-        pending.runtime_id,
-        ctx.runtime_event_tx.clone(),
-        receiver,
-    ));
-    ctx.sync_session = Some(live_session);
-    true
-}
-
-/// Leave sync mode only after handing its authoritative idle snapshot back to
-/// the local runtime. If any step fails, resume the old event forwarder from a
-/// receiver captured at the same boundary so the TUI remains safely attached.
-fn detach_live_session(ctx: &mut LoopCtx) -> Result<bool, String> {
-    if ctx.pending_local_runtime_sync.is_some() {
-        return Err(t(Msg::LocalRuntimeRestorePending).into_owned());
-    }
-    let Some(session) = ctx.sync_session.clone() else {
+fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
+    let Some(binding) = ctx.live_binding.take() else {
         return Ok(false);
     };
-
-    let handoff = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(session.begin_idle_handoff(|| {
-            if let Some(handle) = ctx.sync_forwarder.as_ref() {
-                handle.abort();
-            }
-        }))
-    });
-    let Some(handoff) = handoff else {
-        return Err("同步会话仍在处理消息，请等当前回复结束后再退出同步".to_string());
-    };
-    let snapshot = handoff.snapshot().clone();
-    // The boundary callback already aborted it. Dropping the handle here makes
-    // ownership explicit before either committing the handoff or restoring it.
-    ctx.sync_forwarder.take();
-
-    let mut next_session = ctx.current_session.clone();
-    next_session.update_from_conversation_snapshot(snapshot.clone());
-    next_session.touch();
-    let restore_id = ctx.next_local_runtime_restore_id;
-    ctx.next_local_runtime_restore_id = ctx.next_local_runtime_restore_id.wrapping_add(1).max(1);
-    if let Err(error) = ctx.runtime.restore_snapshot_correlated(
-        atomcode_daemon::legacy_convert::snapshot_to_kernel(&snapshot),
-        restore_id,
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
-    ) {
-        restore_live_forwarder(ctx, session, handoff.resume_receiver());
-        return Err(format!("无法把同步会话交给本地 runtime：{error}"));
-    }
-
-    ctx.current_session = next_session;
-    ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
-    ctx.pending_local_runtime_sync = Some(super::PendingLocalRuntimeSync {
-        restore_id,
-        runtime_id: ctx.foreground_runtime_id,
-        session_id: ctx.current_session.id.clone(),
-        live_session: session,
-        handoff,
-        deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
-    });
-    ctx.sync_session = None;
+    atomcode_daemon::native_live::unregister_embedded_runtime(&binding)
+        .map_err(|error| format!("停止共享当前 runtime 失败：{error:?}"))?;
     Ok(true)
 }
 
-fn render_live_snapshot_messages(
-    renderer: &mut dyn Renderer,
-    snapshot: &[atomcode_core::conversation::message::Message],
-) {
-    use atomcode_core::conversation::message::{MessageContent, Role};
-    renderer.render(UiLine::TurnSeparator {
-        label: "— 同步快照 —".to_string(),
-    });
-    for m in snapshot {
-        match (&m.role, &m.content) {
-            (Role::User, MessageContent::Text(s)) if !m.synthetic => {
-                renderer.render(UiLine::User(s.clone()));
-            }
-            (Role::Assistant, MessageContent::Text(s)) => {
-                if !s.is_empty() {
-                    renderer.render(UiLine::AssistantText(s.clone()));
-                    renderer.render(UiLine::AssistantLineBreak);
-                }
-            }
-            (
-                Role::Assistant,
-                MessageContent::AssistantWithToolCalls {
-                    text, tool_calls, ..
-                },
-            ) => {
-                if let Some(t) = text {
-                    if !t.is_empty() {
-                        renderer.render(UiLine::AssistantText(t.clone()));
-                        renderer.render(UiLine::AssistantLineBreak);
-                    }
-                }
-                for tc in tool_calls {
-                    renderer.render(UiLine::ToolCall {
-                        name: super::display_tool_name(&tc.name),
-                        detail: super::format_tool_detail(&tc.name, &tc.arguments),
-                    });
-                }
-            }
-            (Role::Tool, MessageContent::ToolResult(r)) => {
-                renderer.render(UiLine::ToolResult {
-                    success: r.success,
-                    summary: super::summarise(&r.output),
-                });
-            }
-            _ => {}
-        }
-    }
-    renderer.render(UiLine::TurnSeparator {
-        label: "— 同步快照结束 —".to_string(),
-    });
-}
-
-/// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
-/// 下执行时，文本输出经 LiveSession 广播给手机/webui（"电脑敲 /status，手机
-/// 也能看到"）。其余渲染行为全部透传给真实渲染器。
+/// 捕获 `CommandOutput` / `Error`，同步模式下经 live hub 广播给其他视图。
 struct CaptureRenderer<'a> {
     inner: &'a mut dyn Renderer,
     captured: String,
@@ -473,75 +342,44 @@ impl Renderer for CaptureRenderer<'_> {
 /// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
 const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
 
-/// 同步模式下，TUI 本地切换会话（/new、/session、/resume 选择历史会话等）后，把这次
-/// 切换双向同步：既让所有 webui tab 跟随，也把进程内共享 LiveSession 重绑到新会话。
-/// 与 webui 侧栏切换（postLiveSwitchSession → /live/switch_session）方向对称——补齐了
-/// 此前只有 webui→TUI、没有 TUI→webui 的单向同步缺口。
-///
-/// 顺序要点：必须**先**在「当前（旧）」LiveSession 上广播 SessionSwitched，**再**替换它。
-/// webui 的 /live SSE 是 fetch 流、不会自动重连——只有先收到 session_switched 事件，它才
-/// 会主动停旧流、按新 session_id 重连（见 webui Chat.tsx 的 session_switched 分支）；若反过来
-/// 先替换旧 LiveSession，旧广播通道一关就直接掐断 webui 的流且不再恢复。
-///
-/// 自回声无害：广播经 live_sync 转发器回流成 AgentEvent::SessionSwitched，但此时本地切换
-/// 已完成、`ctx.current_session.id` 已等于目标 id，被该事件臂顶部的守卫 no-op（不重复
-/// 清场/回放/重挂）。与 ProviderChanged / apply_cd 的自回声去重同款。
-///
-/// 非同步模式（`sync_session` 为 None）直接跳过——没有视图需要跟随。
+/// TUI 本地切换会话后，原子替换 hub 的 committed snapshot 并通知其他视图。
 pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-    if ctx.sync_session.is_none() {
+    let Some(binding) = ctx.live_binding.clone() else {
         return;
-    }
-    // 1. 在旧 LiveSession 上广播，使每个 webui tab 的 SSE 重连到新会话（含其历史）。
-    atomcode_daemon::live_switch_session(ctx.current_session.id.to_string());
-    // 2. 用新会话（id + 历史）替换共享 LiveSession，并把 TUI 转发器重挂到它上面，
-    //    使 TUI 之后的输入落到正确的会话（否则仍写进旧会话的 LiveSession）。
-    //    render_snapshot=false：历史已由切换入口（reset_to_new_session / 选择器）回放过。
-    let session = atomcode_daemon::ensure_live_session(
-        ctx.working_dir.clone(),
-        ctx.telemetry.clone(),
-        Some(ctx.current_session.id.clone()),
-        ctx.current_session.to_conversation_snapshot(),
+    };
+    let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+        &ctx.current_session.to_conversation_snapshot(),
     );
-    attach_live_session(ctx, renderer, session, false);
+    match atomcode_daemon::native_live::replace_snapshot(
+        &binding,
+        ctx.current_session.id.to_string(),
+        ctx.working_dir.clone(),
+        snapshot,
+    ) {
+        Ok(binding) => ctx.live_binding = Some(binding),
+        Err(error) => renderer.render(UiLine::Error(format!("同步会话切换失败：{error:?}"))),
+    }
     renderer.flush();
 }
 
 /// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
 /// 模板）到当前生效的对话引擎。
 ///
-/// 同步模式（`sync_session` 为 Some）下投递到共享 LiveSession——使这些命令展开出的回合像
-/// 普通输入一样跑在 daemon 执行器上并广播给 webui，补齐了「TUI 上 /skills 等命令不同步到
-/// webui」的缺口；否则走 TUI 本地 agent（原有行为）。统一收口，避免每个命令各写一遍
-/// sync 分支、再漏一个。
-///
-/// 这些命令的合成文本本身不在本地回显（命令各有自己的 CommandOutput 提示）；同步模式下
-/// LiveSession 会广播 UserMessage，经转发器回成 UserEcho 由两端统一渲染该回合的用户气泡，
-/// 与普通输入在同步模式下的回显路径一致。所有调用点均为纯文本（无图），故只收文本。
+/// 已绑定时经 live hub 投递到同一个 Coding Runtime，否则直接投递本地 runtime。
 pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String) {
-    let submitted = if let Some(live) = &ctx.sync_session {
-        live.send_input(atomcode_core::live::UserInput {
-            text,
-            images: vec![],
-        });
-        true
-    } else {
-        ctx.runtime
-            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
-            .is_ok()
-    };
+    let submitted = submit_agent_text(ctx, text);
     if submitted {
         state.on_submit();
     }
 }
 
-fn compact_sync_guard(sync_active: bool, local_resync_pending: bool) -> Result<(), Msg<'static>> {
-    if sync_active {
-        Err(Msg::CompactUnavailableDuringSync)
-    } else if local_resync_pending {
-        Err(Msg::CompactUnavailableDuringResync)
+fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::submit(atomcode_coding::UserInput::from(text)).is_ok()
     } else {
-        Ok(())
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+            .is_ok()
     }
 }
 
@@ -569,9 +407,6 @@ pub(crate) fn fire_interval_payload(
     active_modal: &mut Option<Box<dyn Modal>>,
     setup_pending: &mut bool,
 ) {
-    if ctx.pending_local_runtime_sync.is_some() {
-        return;
-    }
     let payload = match ctx.loop_ctrl.as_mut() {
         Some(c) => {
             c.round += 1;
@@ -588,11 +423,14 @@ pub(crate) fn fire_interval_payload(
     };
     match payload {
         crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
-            if ctx
-                .runtime
-                .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
-                .is_ok()
-            {
+            let submitted = if ctx.live_binding.is_some() {
+                atomcode_daemon::native_live::submit(text.into()).is_ok()
+            } else {
+                ctx.runtime
+                    .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+                    .is_ok()
+            };
+            if submitted {
                 state.on_submit();
                 if let Some(c) = ctx.loop_ctrl.as_mut() {
                     c.consecutive_failures = 0;
@@ -685,22 +523,9 @@ pub(super) fn execute_slash_command(
     active_modal: &mut Option<Box<dyn Modal>>,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    if ctx.pending_local_runtime_sync.is_some()
-        && !matches!(cmd.to_ascii_lowercase().as_str(), "quit" | "exit")
-    {
-        renderer.render(UiLine::Error(
-            t(Msg::LocalRuntimeRestorePending).into_owned(),
-        ));
-        renderer.flush();
-        return Ok(());
-    }
-    // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
-    // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
-    let mirror = ctx
-        .sync_session
-        .clone()
-        .filter(|_| !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str()));
-    let Some(live) = mirror else {
+    let mirror =
+        ctx.live_binding.is_some() && !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str());
+    if !mirror {
         return execute_slash_command_impl(
             cmd,
             arg,
@@ -718,7 +543,7 @@ pub(super) fn execute_slash_command(
     let result =
         execute_slash_command_impl(cmd, arg, state, ctx, &mut cap, active_modal, setup_pending);
     if !cap.captured.is_empty() {
-        live.notify_command_output(format!(
+        let _ = atomcode_daemon::native_live::publish_command_output(format!(
             "/{}\n{}",
             cmd.trim_start_matches('/'),
             cap.captured
@@ -1710,24 +1535,10 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            if let Err(error) = compact_sync_guard(
-                ctx.sync_session.is_some(),
-                ctx.pending_local_runtime_sync.is_some(),
-            ) {
-                // LiveSession owns the authoritative conversation while attached.
-                // The local runtime is intentionally stale after remote turns.
-                renderer.render(UiLine::Error(t(error).into_owned()));
+            let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            if let Err(error) = ctx.runtime.compact(focus) {
+                renderer.render(UiLine::Error(error.to_string()));
                 renderer.flush();
-            } else {
-                let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-                // The runtime reports the authoritative outcome asynchronously.
-                // Don't pre-render a placeholder: a committed shrink and a
-                // short-conversation no-op produce different output based on the
-                // current runtime state.
-                if let Err(error) = ctx.runtime.compact(focus) {
-                    renderer.render(UiLine::Error(error.to_string()));
-                    renderer.flush();
-                }
             }
         }
         "remember" => {
@@ -1838,14 +1649,11 @@ fn execute_slash_command_impl(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                // #561 修复：先用 TUI 当前会话播种 LiveSession（session_id + 历史），
-                // 再开浏览器——否则浏览器抢先连 /live 会建出空白 LiveSession。
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.to_conversation_snapshot(),
-                );
+                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                    return Ok(());
+                }
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         atomcode_daemon::ensure_server_and_open(
@@ -1855,9 +1663,6 @@ fn execute_slash_command_impl(
                         ),
                     )
                 });
-                // 附着把 TUI 接入同步。画面里已有当前会话（播种来源），故 render_snapshot=false
-                // 跳过快照回放，避免把同一段对话重复刷一遍。
-                attach_live_session(ctx, renderer, session, false);
                 open_msg
             };
             renderer.render(UiLine::CommandOutput(msg));
@@ -1865,26 +1670,17 @@ fn execute_slash_command_impl(
         }
         "sync" => {
             if arg.trim() == "off" {
-                match detach_live_session(ctx) {
-                    Ok(true) => renderer.render(UiLine::CommandOutput(
-                        "已退出同步，正在把最新会话交给本地 runtime".to_string(),
-                    )),
+                match detach_live_runtime(ctx) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput("已停止共享当前会话".into())),
                     Ok(false) => {
                         renderer.render(UiLine::CommandOutput("当前未处于同步模式".to_string()))
                     }
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
-                // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
-                // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
-                // 把它替换为 TUI 的会话。
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.to_conversation_snapshot(),
-                );
-                attach_live_session(ctx, renderer, session, true);
+                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                    renderer.render(UiLine::Error(error));
+                }
             }
             renderer.flush();
         }
@@ -1920,7 +1716,7 @@ fn execute_slash_command_impl(
         }
         "app" => {
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
-            // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
+            // 与 /webui 共用当前 Coding Runtime 和 live hub，
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
             // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
             //
@@ -1965,7 +1761,7 @@ fn execute_slash_command_impl(
                 // Remote access must stop immediately even when the live session
                 // is busy. A failed handoff keeps only the TUI attached so it can
                 // continue receiving the in-flight turn safely.
-                let detach_error = detach_live_session(ctx).err();
+                let detach_error = detach_live_runtime(ctx).err();
                 let killed = ctx
                     .app_relay_child
                     .take()
@@ -2000,20 +1796,7 @@ fn execute_slash_command_impl(
                     // 仅在显式给了空参数（如 `/app --relay`）时可达。
                     None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
                     Some(relay) => {
-                        // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
-                        let initial = ctx.current_session.to_conversation_snapshot();
-                        let sid = (!initial.messages.is_empty()
-                            || !initial.cold_summaries.is_empty())
-                        .then(|| ctx.current_session.id.clone());
-                        // 合并 main 后函数更名为 ensure_live_session,且 session_id
-                        // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
-                        let session = atomcode_daemon::ensure_live_session(
-                            ctx.working_dir.clone(),
-                            ctx.telemetry.clone(),
-                            sid,
-                            initial,
-                        );
-                        // 1.5) 检查登录态：未登录不允许开启远程访问。
+                        // 1) 检查登录态：未登录不允许开启远程访问。
                         if atomcode_auth::oauth::get_stored_auth().is_none() {
                             renderer.render(UiLine::CommandOutput(
                                 "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。"
@@ -2115,8 +1898,13 @@ fn execute_slash_command_impl(
                                                     token,
                                                     m_param
                                                 );
-                                                // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
-                                                attach_live_session(ctx, renderer, session, false);
+                                                // 6) 手机视图复用 TUI 当前 CodingRuntime。
+                                                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                                                    if let Some(mut child) = ctx.app_relay_child.take() {
+                                                        let _ = child.start_kill();
+                                                    }
+                                                    return Err(anyhow::anyhow!(error));
+                                                }
                                                 use base64::Engine;
                                                 let encoded = base64::engine::general_purpose::STANDARD
                                                     .encode(pair_uri.as_bytes());
@@ -3096,11 +2884,7 @@ fn execute_slash_command_impl(
                     state.goal_condition = Some(condition.clone());
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
-                    if ctx
-                        .runtime
-                        .dispatch(atomcode_coding::DriverCommand::Submit(condition.into()))
-                        .is_ok()
-                    {
+                    if submit_agent_text(ctx, condition) {
                         state.on_submit();
                     }
                 }
@@ -3156,11 +2940,7 @@ fn execute_slash_command_impl(
                     state.loop_label = Some(prompt.clone());
                     state.loop_round = 0;
                     state.loop_started_at = Some(std::time::Instant::now());
-                    if ctx
-                        .runtime
-                        .dispatch(atomcode_coding::DriverCommand::Submit(prompt.into()))
-                        .is_ok()
-                    {
+                    if submit_agent_text(ctx, prompt) {
                         state.on_submit();
                     }
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
@@ -3361,16 +3141,7 @@ fn execute_slash_command_impl(
                 .split_whitespace()
                 .next()
                 .is_some_and(|w| w.eq_ignore_ascii_case("clear"));
-            if want_clear && ctx.sync_session.is_some() {
-                // Sync mode: the conversation is owned by the daemon. A local
-                // reseed would target the idle local runtime AND clobber the
-                // daemon's authoritative session snapshot — refuse instead.
-                renderer.render(UiLine::CommandOutput(
-                    "同步模式下暂不支持 /todo clear（会话由服务端维护）——退出同步后再清空。"
-                        .to_string(),
-                ));
-                renderer.flush();
-            } else {
+            {
                 // Only reseed when there's actually something to clear, so a
                 // no-op `/todo clear` doesn't pollute the transcript with an
                 // empty-todowrite pair.
@@ -4623,7 +4394,7 @@ pub(crate) fn reset_to_new_session(
     });
     renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
     renderer.end_sync();
-    // 同步模式：把这次「本地新建会话」双向同步到 webui，并把共享 LiveSession 重绑到新会话。
+    // 同步模式：把新会话的 committed snapshot 发布给其他视图。
     sync_local_session_switch(ctx, renderer);
 }
 
@@ -4649,9 +4420,7 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
     ctx.file_index.reset(path.clone());
-    // 通知 daemon 工作目录已切换：更新 LIVE_WORKING_DIR 静态变量，
-    // 使得后续 app 通过 /live 重连时能在 snapshot 中拿到最新的目录。
-    // 不限于 sync 模式 – TUI 独立使用时 app 也应能跟随。
+    // 同步 daemon 项目视图；Coding Runtime 仍是运行时目录的唯一所有者。
     atomcode_daemon::live_set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
@@ -6497,27 +6266,6 @@ mod expand_cd_target_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn compact_sync_guard_rejects_stale_local_runtime() {
-        assert_eq!(
-            compact_sync_guard(true, false),
-            Err(Msg::CompactUnavailableDuringSync)
-        );
-    }
-
-    #[test]
-    fn compact_sync_guard_waits_for_local_runtime_restore() {
-        assert_eq!(
-            compact_sync_guard(false, true),
-            Err(Msg::CompactUnavailableDuringResync)
-        );
-    }
-
-    #[test]
-    fn compact_sync_guard_allows_restored_local_runtime() {
-        assert_eq!(compact_sync_guard(false, false), Ok(()));
-    }
-
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and
     /// on macOS `/var/folders/...` → `/private/var/folders/...`.
@@ -6534,47 +6282,6 @@ mod tests {
         std::fs::create_dir(&sub).expect("mkdir sub");
         let sub = strip(&sub.canonicalize().expect("canon sub"));
         (tmp, cwd, sub)
-    }
-
-    #[test]
-    fn live_snapshot_replay_skips_synthetic_user_messages() {
-        use atomcode_core::conversation::message::{Message, Role};
-
-        #[derive(Default)]
-        struct Rec {
-            lines: Vec<UiLine>,
-        }
-        impl Renderer for Rec {
-            fn render(&mut self, line: UiLine) {
-                self.lines.push(line);
-            }
-            fn flush(&mut self) {}
-            fn shutdown(&mut self) {}
-            fn reset(&mut self) {}
-            fn clear_screen(&mut self) {}
-            fn suspend_for_external(&mut self) {}
-            fn resume_from_external(&mut self) {}
-            fn flush_deferred(&mut self) {}
-        }
-
-        let snapshot = vec![
-            Message::new(Role::User, "real prompt"),
-            Message::synthetic_user("[Auto-read from error: src/main.rs]"),
-            Message::new(Role::Assistant, "reply"),
-        ];
-        let mut rec = Rec::default();
-
-        render_live_snapshot_messages(&mut rec, &snapshot);
-
-        let users: Vec<&str> = rec
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                UiLine::User(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(users, vec!["real prompt"]);
     }
 
     /// `resolve_cd` must never return a Windows `\\?\` verbatim / extended-length

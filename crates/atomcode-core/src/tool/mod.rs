@@ -999,11 +999,6 @@ pub struct ToolContext {
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Shared LSP manager for diagnostics tool. `None` when LSP is disabled.
     pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
-    /// Optional event sender for real-time tool output streaming (e.g., bash stdout).
-    /// When set, tools like bash can send output chunks as they're produced.
-    pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
-    /// Current tool call ID for event correlation.
-    pub current_call_id: Option<String>,
     /// D3 file content store. read_file pushes large file content
     /// here transparently and consults it on subsequent reads of any
     /// range — disk hit only on first read or after edit. Conversation
@@ -1041,8 +1036,6 @@ impl ToolContext {
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
             telemetry,
             lsp: None,
-            event_tx: None,
-            current_call_id: None,
             file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
         }
     }
@@ -1052,7 +1045,6 @@ impl ToolContext {
     ///
     /// Fields that are NOT copied from the original:
     /// - `read_cache`: reset — subagent re-reads files (acceptable for isolation)
-    /// - `event_tx`: reset — subagent has its own event channel
     /// - `tool_registry`: reset — subagent gets filtered tools
     /// - `first_error_signatures`: reset — subagent has independent error state
     pub async fn isolate(&self) -> Self {

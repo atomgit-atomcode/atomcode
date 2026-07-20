@@ -534,7 +534,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
-        postLiveSwitchSession(sessionId).catch(() => {});
+        postLiveSwitchSession(sessionId).catch((error) => {
+          setSync(false);
+          setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+        });
       }
     }
 
@@ -976,14 +979,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
     // 正常走 getSession 加载（空）历史并清除 historyHint；
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
-    // 重启 SSE 连接：旧连接订阅的是旧 LiveSession，后续 turn 事件不会到达；
-    // 重新连接后 /live handler 会绑定到新 LiveSession。
+    // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
       liveSessionIdRef.current = e.session_id;
       // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
       // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
       // 画布，否则刚 getSession 加载好的历史会被自己的广播回流抹掉（且 sessionId 未变，
-      // 加载 effect 不会重跑，history 永远回不来）。仅把实时流重绑到新 LiveSession 即可。
+      // 加载 effect 不会重跑，history 永远回不来）。仅刷新实时流即可。
       const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
       if (!alreadyViewing) {
@@ -1066,16 +1068,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setSync((prev) => {
       const next = !prev;
       if (next) {
-        // 重新开启同步：先把当前会话广播给 TUI，再启动本端实时流。
-        // 关闭同步期间 webui 可能已切换/新建到别的会话（不广播），此时全局 LiveSession
-        // 仍绑在旧会话、TUI 也订阅着旧实例。若直接 startLiveStream，/live 会以新 session_id
-        // 替换全局 LiveSession 却不通知旧实例的订阅者，TUI 就此被孤立、停在旧会话不跟随。
-        // 故必须先 postLiveSwitchSession：它在「旧」全局实例上广播 SessionSwitched，TUI 据此
-        // 加载本端会话并把实时总线重绑到新实例——与侧栏切换会话的同步路径一致。
-        // 顺序关键：必须等广播发出（落在 TUI 仍订阅的旧实例上）后再启动会替换全局的实时流。
+        // 重新开启同步：先让已绑定的 Coding Runtime 恢复当前会话，再读取 live hub 快照。
         const sid = activeIdRef.current;
         if (sid) {
-          postLiveSwitchSession(sid).catch(() => {}).finally(() => startLiveStream());
+          postLiveSwitchSession(sid)
+            .then(() => startLiveStream())
+            .catch((error) => {
+              setSync(false);
+              setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+            });
         } else {
           startLiveStream();
         }
@@ -1159,8 +1160,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
+    if (!sync) {
+      setProvider(name);
+      return;
+    }
+    const previous = provider;
     setProvider(name);
-    if (sync) void postLiveProvider(name);
+    void postLiveProvider(name).catch((error) => {
+      setProvider(previous);
+      setHistoryHint(t('chat.connError', { msg: String(error) }));
+    });
   }
 
   const slashHandlers: SlashHandlers = useMemo(
@@ -1565,12 +1574,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // ── Sync path: send to /live/message; do NOT locally append (the user
       //    event will arrive back via the live stream, keeping all tabs in sync).
       setBusy(true);
-      await postLiveMessage(
-        text,
-        images.length ? images : undefined,
-        provider ?? undefined,
-        activeIdRef.current,
-      );
+      try {
+        await postLiveMessage(
+          text,
+          images.length ? images : undefined,
+          provider ?? undefined,
+          activeIdRef.current,
+        );
+      } catch (error) {
+        setBusy(false);
+        setQueued([]);
+        setHistoryHint(t('chat.connError', { msg: String(error) }));
+        return;
+      }
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);

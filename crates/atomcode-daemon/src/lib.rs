@@ -33,9 +33,11 @@ pub mod approval_mode;
 mod commands;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
+pub mod live_hub;
 mod login_state;
 #[cfg(test)]
 mod login_state_tests;
+pub mod native_live;
 mod runtime_host;
 pub use kernel_runtime::{
     spawn_native_runtime_for_session_deferred, start_native_runtime,
@@ -46,8 +48,6 @@ pub use runtime_host::{
     installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
-pub use live_api::current_live_session;
-pub use live_api::ensure_live_session;
 pub use live_api::live_set_mode;
 pub use live_api::live_set_provider;
 pub use live_api::live_set_working_dir;
@@ -79,11 +79,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_auth as auth;
 use atomcode_capabilities::session::SessionManager as NativeSessionManager;
+use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
-use atomcode_core::turn::event::TurnEvent;
 use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -1327,12 +1327,14 @@ fn catalog_entry_with_project(
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    Ok(catalog_scan_in_root(&NativeSessionManager::sessions_root())?
-        .entries
-        .iter()
-        .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
-        .map(catalog_entry_to_session_summary)
-        .collect())
+    Ok(
+        catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+            .entries
+            .iter()
+            .filter(|entry| entry.project_bucket == project_hash && entry.message_count > 0)
+            .map(catalog_entry_to_session_summary)
+            .collect(),
+    )
 }
 
 /// List all sessions across all projects
@@ -1592,6 +1594,22 @@ async fn change_dir(
         // differently-cased path doesn't leave the footer/new sessions drifting.
         let new_path = normalize_working_dir_case(new_path);
 
+        // When a native live runtime is attached, it is the working-directory
+        // owner. Reject the HTTP mutation if the runtime cannot accept the same
+        // transition; otherwise the UI state and the executing runtime diverge.
+        if crate::native_live::join().is_ok() {
+            if let Err(error) = crate::native_live::dispatch(
+                atomcode_coding::DriverCommand::ChangeDirectory(new_path.clone()),
+            ) {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Runtime rejected directory change: {error:?}"),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+        }
+
         // Update state
         let old_dir = project.working_dir.clone();
         project.previous_dir = Some(old_dir);
@@ -1629,8 +1647,7 @@ async fn change_dir(
             error_data: None,
         });
 
-        // 广播工作目录变更给同进程视图（sync 模式 TUI 跟随切目录）。无 LiveSession
-        // 附着（headless daemon）时静默跳过。
+        // 同步 daemon 项目视图；已绑定 runtime 已在上方接受原生目录切换。
         crate::live_api::live_set_working_dir(new_path.clone());
         // 手机点开历史对话时带 session_id：再用官方的会话切换原语广播切到该会话，
         // 配合 App 侧 /live?session_id= 重连，两端落到同一会话。空则只切目录。
@@ -1776,7 +1793,8 @@ fn merge_catalog_session_messages_for_display(
         presentation.entry(after_message).or_default().push(entry);
     }
     let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
-    let mut messages = Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
+    let mut messages =
+        Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
         for entry in presentation.remove(&position).unwrap_or_default() {
             messages.push(MessageInfo {
@@ -1964,21 +1982,23 @@ async fn append_session_messages(
 /// Search sessions by name across all projects
 fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let keyword_lower = keyword.to_lowercase();
-    Ok(catalog_scan_in_root(&NativeSessionManager::sessions_root())?
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.message_count > 0
-                && (entry.name.to_lowercase().contains(&keyword_lower)
-                    || entry
-                        .working_dir
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&keyword_lower)
-                    || entry.id.to_lowercase().starts_with(&keyword_lower))
-        })
-        .map(catalog_entry_with_project)
-        .collect())
+    Ok(
+        catalog_scan_in_root(&NativeSessionManager::sessions_root())?
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.message_count > 0
+                    && (entry.name.to_lowercase().contains(&keyword_lower)
+                        || entry
+                            .working_dir
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&keyword_lower)
+                        || entry.id.to_lowercase().starts_with(&keyword_lower))
+            })
+            .map(catalog_entry_with_project)
+            .collect(),
+    )
 }
 
 /// GET /sessions/search?q=keyword - Search sessions by name
@@ -2181,7 +2201,7 @@ pub enum ChatEvent {
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
-        calls: Vec<atomcode_core::turn::event::ToolBatchCall>,
+        calls: Vec<atomcode_kernel::event::ToolBatchCall>,
     },
     /// LLM text delta
     #[serde(rename = "text")]
@@ -2275,6 +2295,99 @@ pub enum ChatEvent {
         #[serde(default)]
         server_message: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod chat_event_type_tests {
+    use super::{ChatEvent, ChatRuntimeProjector};
+
+    #[test]
+    fn tool_batch_payload_is_kernel_native() {
+        let calls: Vec<atomcode_kernel::event::ToolBatchCall> =
+            vec![atomcode_kernel::event::ToolBatchCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            }];
+
+        let event = ChatEvent::ToolBatchStarted { calls };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn native_tool_batch_reaches_chat_without_core_projection() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events =
+            projector.project_agent(atomcode_kernel::event::AgentEvent::ToolBatchStarted {
+                batch_id: "batch-1".into(),
+                calls: vec![atomcode_kernel::event::ToolBatchCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                    parallel_safe: true,
+                }],
+            });
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::ToolBatchStarted { calls }] if calls[0].id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn native_usage_updates_chat_summary() {
+        let mut projector = ChatRuntimeProjector::default();
+        let meta = atomcode_kernel::message::MessageMeta {
+            tokens: atomcode_kernel::stream::TokenUsage {
+                prompt: 7,
+                completion: 5,
+                cached: 2,
+            },
+            ..Default::default()
+        };
+        let events = projector.project_agent(atomcode_kernel::event::AgentEvent::Usage(meta));
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::TokenUsage {
+                prompt: 7,
+                completion: 5,
+                total: 12
+            }]
+        ));
+        assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn native_approval_request_keeps_runtime_correlation() {
+        let mut projector = ChatRuntimeProjector::default();
+        let request = atomcode_coding::RuntimeRequest {
+            id: 42,
+            kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+            payload: serde_json::json!({
+                "call_id": "call-42",
+                "tool": "bash",
+                "args": "{\"command\":\"git status\"}"
+            }),
+            snapshot: None,
+        };
+        let events = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::Request(request),
+            "session-1",
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::PermissionRequest {
+                session_id,
+                call_id,
+                tool_name,
+                ..
+            }] if session_id == "session-1" && call_id == "call-42" && tool_name == "bash"
+        ));
+    }
 }
 
 /// Artifact detector for code blocks and HTML in streaming text
@@ -2579,6 +2692,249 @@ impl ArtifactDetector {
     }
 }
 
+struct ChatRuntimeProjector {
+    artifacts: ArtifactDetector,
+    live_tools: HashMap<String, (String, std::time::Instant)>,
+    total_tokens: usize,
+    tool_call_count: usize,
+}
+
+impl Default for ChatRuntimeProjector {
+    fn default() -> Self {
+        Self {
+            artifacts: ArtifactDetector::new(),
+            live_tools: HashMap::new(),
+            total_tokens: 0,
+            tool_call_count: 0,
+        }
+    }
+}
+
+impl ChatRuntimeProjector {
+    fn project_runtime(
+        &mut self,
+        event: CodingRuntimeEvent,
+        permission_session_id: &str,
+    ) -> Vec<ChatEvent> {
+        use atomcode_coding::runtime::CompactionCompletion;
+        use atomcode_coding::TurnCompletion;
+
+        match event {
+            CodingRuntimeEvent::Agent(event) => self.project_agent(event),
+            CodingRuntimeEvent::Request(request) => {
+                use atomcode_capabilities::tools::{ApprovalRequest, APPROVAL_KIND};
+
+                if request.kind != APPROVAL_KIND {
+                    return Vec::new();
+                }
+                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
+                else {
+                    return Vec::new();
+                };
+                vec![ChatEvent::PermissionRequest {
+                    session_id: permission_session_id.to_string(),
+                    tool_name: approval.tool,
+                    reason: "Requires approval".into(),
+                    call_id: approval.call_id,
+                    arguments: approval.args,
+                }]
+            }
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.committed => vec![ChatEvent::Warning {
+                message: atomcode_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            }],
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.is_manual() => {
+                self.artifacts
+                    .process(&atomcode_config::i18n::format_compaction_noop(
+                        outcome.estimated_tokens_before,
+                        outcome.estimated_tokens_after,
+                        outcome.summary_would_grow(),
+                    ))
+            }
+            CodingRuntimeEvent::CompactionFinished {
+                completion:
+                    CompactionCompletion::Interrupted {
+                        trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                        ..
+                    },
+            } => vec![ChatEvent::Warning {
+                message: atomcode_config::i18n::format_compaction_interrupted(),
+            }],
+            CodingRuntimeEvent::CompactionFinished {
+                completion:
+                    CompactionCompletion::Failed {
+                        trigger: atomcode_kernel::message::CompactTrigger::Manual { .. },
+                        error,
+                    },
+            } => vec![ChatEvent::Error {
+                message: format!("compact failed: {error}"),
+            }],
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                error, ..
+            }) => vec![ChatEvent::Error {
+                message: error.message,
+            }],
+            CodingRuntimeEvent::ControllerWarning(message) => {
+                vec![ChatEvent::Warning { message }]
+            }
+            CodingRuntimeEvent::CompactionStarted { .. }
+            | CodingRuntimeEvent::CompactionFinished { .. }
+            | CodingRuntimeEvent::RuntimeStopped(_)
+            | CodingRuntimeEvent::TurnFinished(_)
+            | CodingRuntimeEvent::ModeChanged { .. }
+            | CodingRuntimeEvent::Reconfiguring { .. }
+            | CodingRuntimeEvent::Reconfigured { .. }
+            | CodingRuntimeEvent::ProviderChanged { .. }
+            | CodingRuntimeEvent::ProviderUnavailable { .. }
+            | CodingRuntimeEvent::SessionNameSuggested { .. }
+            | CodingRuntimeEvent::SessionChanged(_)
+            | CodingRuntimeEvent::WorkingDirectoryChanged(_)
+            | CodingRuntimeEvent::GoalChanged(_)
+            | CodingRuntimeEvent::LoopChanged(_)
+            | CodingRuntimeEvent::UndoFinished(_)
+            | CodingRuntimeEvent::ContextStatsRefreshed(_)
+            | CodingRuntimeEvent::SnapshotRestoreFinished { .. }
+            | CodingRuntimeEvent::ProviderReloadFinished(_)
+            | CodingRuntimeEvent::ProviderDeactivationFinished(_) => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn project_agent(&mut self, event: atomcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
+        use atomcode_kernel::event::AgentEvent as Agent;
+
+        match event {
+            Agent::TextDelta(text) => self.artifacts.process(&text),
+            Agent::Reasoning(content) => vec![ChatEvent::ReasoningDelta { content }],
+            Agent::ToolBatchStarted { calls, .. } => {
+                vec![ChatEvent::ToolBatchStarted { calls }]
+            }
+            Agent::ToolStarted { call } => self.project_tool_started(call),
+            Agent::ToolProgress { call_id, message } => {
+                if let Some(progress) = message.strip_prefix('\u{1e}') {
+                    vec![ChatEvent::ToolProgress {
+                        id: call_id,
+                        progress: progress.to_string(),
+                    }]
+                } else {
+                    vec![ChatEvent::ToolOutputChunk { chunk: message }]
+                }
+            }
+            Agent::ToolResult { result } => {
+                let (name, started) = self
+                    .live_tools
+                    .remove(&result.call_id)
+                    .unwrap_or_else(|| ("tool".into(), std::time::Instant::now()));
+                vec![ChatEvent::ToolCallResult {
+                    id: result.call_id,
+                    name,
+                    output: result.content,
+                    success: !result.is_error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }]
+            }
+            Agent::Usage(meta) => {
+                let prompt = meta.tokens.prompt as usize;
+                let completion = meta.tokens.completion as usize;
+                let total = prompt + completion;
+                self.total_tokens = total;
+                vec![ChatEvent::TokenUsage {
+                    prompt,
+                    completion,
+                    total,
+                }]
+            }
+            Agent::Error { message, .. } => vec![ChatEvent::Error { message }],
+            Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            } => vec![ChatEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            }],
+            Agent::TurnStarted
+            | Agent::ToolCallStreaming { .. }
+            | Agent::ToolBatchCompleted { .. }
+            | Agent::Request { .. }
+            | Agent::Snapshot { .. }
+            | Agent::TurnComplete { .. }
+            | Agent::Cancelled
+            | Agent::Steered { .. }
+            | Agent::CompactionStarted { .. }
+            | Agent::Compacted { .. }
+            | Agent::CompactionFailed { .. } => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn project_tool_started(&mut self, call: atomcode_kernel::tool::ToolCall) -> Vec<ChatEvent> {
+        self.tool_call_count += 1;
+        self.live_tools.insert(
+            call.id.clone(),
+            (call.name.clone(), std::time::Instant::now()),
+        );
+        let mut events = vec![ChatEvent::ToolCallStarted {
+            id: call.id,
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        }];
+
+        if call.name == "create_file" || call.name == "edit_file" {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                if let Some(path) = args.get("file_path").and_then(|value| value.as_str()) {
+                    let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {
+                        "html"
+                    } else if path.ends_with(".svg") {
+                        "svg"
+                    } else {
+                        ""
+                    };
+                    if !artifact_type.is_empty() {
+                        if let Some(content) = args.get("content").and_then(|value| value.as_str())
+                        {
+                            let id = format!("file-{}", uuid::Uuid::new_v4());
+                            let title = PathBuf::from(path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string());
+                            events.push(ChatEvent::ArtifactStart {
+                                id: id.clone(),
+                                artifact_type: artifact_type.to_string(),
+                                language: Some("html".to_string()),
+                                title,
+                            });
+                            events.push(ChatEvent::ArtifactContent {
+                                id: id.clone(),
+                                content: content.to_string(),
+                            });
+                            events.push(ChatEvent::ArtifactEnd { id });
+                        }
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    fn finish(&mut self) -> Option<ChatEvent> {
+        self.artifacts.finish()
+    }
+}
+
 /// Global chat sessions store (in-memory for now)
 type SessionStore = Arc<RwLock<std::collections::HashMap<String, Conversation>>>;
 
@@ -2815,8 +3171,9 @@ async fn process_chat_request(
     // modes and never depend on an approver.
     let registered_permission_responder =
         interactive_permission && approval_mode == crate::approval_mode::ApprovalMode::Build;
-    // Create turn event channel
-    let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
+    // Native runtime observations stay native until this daemon driver projects
+    // them to the HTTP ChatEvent wire model.
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
 
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
@@ -2857,7 +3214,7 @@ async fn process_chat_request(
     let tel_ctx = CurrentContext::current();
 
     // Run turn(s) in a background task on the native kernel stack; the
-    // downstream turn_rx → ChatEvent consumer + persistence only read turn_rx.
+    // downstream native-event → ChatEvent projector shapes the HTTP stream.
     {
         let mut runtime_cfg =
             live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
@@ -2882,7 +3239,7 @@ async fn process_chat_request(
                 live_api::run_chat_turn_v2(
                     runtime_session_id,
                     conv,
-                    turn_tx,
+                    runtime_event_tx,
                     cancel,
                     runtime_cfg,
                     perm_rx,
@@ -2894,187 +3251,15 @@ async fn process_chat_request(
         });
     }
 
-    // Forward turn events to chat events
-    let mut total_tokens = 0usize;
-    let mut tool_call_count = 0usize;
-    let mut artifact_detector = ArtifactDetector::new();
-
-    while let Some(event) = turn_rx.recv().await {
-        match event {
-            TurnEvent::TextDelta(text) => {
-                // Process text through artifact detector
-                for chat_event in artifact_detector.process(&text) {
-                    let _ = event_tx.send(chat_event);
-                }
-            }
-            TurnEvent::ReasoningDelta(text) => {
-                // Forward reasoning/thinking content to client
-                let _ = event_tx.send(ChatEvent::ReasoningDelta { content: text });
-            }
-            TurnEvent::ToolCallStarted {
-                id,
-                name,
-                arguments,
-            } => {
-                tool_call_count += 1;
-                let _ = event_tx.send(ChatEvent::ToolCallStarted {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                });
-
-                // Extract artifacts from write_file/edit_file tool calls
-                if name == "create_file" || name == "edit_file" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
-                        if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let artifact_type = if path.ends_with(".html") || path.ends_with(".htm")
-                            {
-                                "html"
-                            } else if path.ends_with(".svg") {
-                                "svg"
-                            } else {
-                                ""
-                            };
-
-                            if !artifact_type.is_empty() {
-                                if let Some(content) = args.get("content").and_then(|v| v.as_str())
-                                {
-                                    let id = format!("file-{}", uuid::Uuid::new_v4());
-                                    let title = std::path::PathBuf::from(path)
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string());
-
-                                    let _ = event_tx.send(ChatEvent::ArtifactStart {
-                                        id: id.clone(),
-                                        artifact_type: artifact_type.to_string(),
-                                        language: Some("html".to_string()),
-                                        title,
-                                    });
-                                    let _ = event_tx.send(ChatEvent::ArtifactContent {
-                                        id: id.clone(),
-                                        content: content.to_string(),
-                                    });
-                                    let _ = event_tx.send(ChatEvent::ArtifactEnd { id });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            TurnEvent::ToolOutputChunk { call_id, chunk } => {
-                if let Some(progress) = chunk.strip_prefix('\u{1e}') {
-                    let _ = event_tx.send(ChatEvent::ToolProgress {
-                        id: call_id,
-                        progress: progress.to_string(),
-                    });
-                } else {
-                    let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
-                }
-            }
-            TurnEvent::ToolCallResult {
-                call_id,
-                name,
-                output,
-                success,
-                duration,
-            } => {
-                let _ = event_tx.send(ChatEvent::ToolCallResult {
-                    id: call_id,
-                    name,
-                    output,
-                    success,
-                    duration_ms: duration.as_millis() as u64,
-                });
-            }
-            TurnEvent::TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: tt,
-                cached_tokens: _,
-            } => {
-                total_tokens = tt;
-                let _ = event_tx.send(ChatEvent::TokenUsage {
-                    prompt: prompt_tokens,
-                    completion: completion_tokens,
-                    total: tt,
-                });
-            }
-            TurnEvent::Error(e) => {
-                let _ = event_tx.send(ChatEvent::Error { message: e });
-            }
-            TurnEvent::Warning(w) => {
-                // Non-fatal advisory (e.g. "conversation compacted") — send it as its
-                // OWN `warning` event so clients render a muted notice rather than a red
-                // error. (Previously coerced to an Error-shaped event with a "[warning]"
-                // prefix, which the webui painted red as "[错误: …]" inside the reply.)
-                let _ = event_tx.send(ChatEvent::Warning { message: w });
-            }
-            TurnEvent::ContextStats { .. } => {
-                // Ignore context stats in API mode
-            }
-            TurnEvent::ToolCallStreaming { .. } => {
-                // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
-                // API clients receive the complete ToolCallStarted event when args are ready.
-            }
-            TurnEvent::ToolBatchStarted { calls, .. } => {
-                let _ = event_tx.send(ChatEvent::ToolBatchStarted { calls });
-            }
-            TurnEvent::ToolBatchCompleted { .. } => {
-                // Batch events are TUI-only display optimisations. The
-                // per-call ToolCallStarted/Result events still fire and
-                // carry the full payload that HTTP clients consume.
-            }
-            TurnEvent::WorkingDirChanged(_) => {
-                // Daemon/HTTP mode doesn't maintain a TUI footer; the shared
-                // `ctx.working_dir` was already updated in the tool. Clients
-                // that need the cwd can read it from subsequent tool output.
-            }
-            TurnEvent::ApprovalRequested {
-                tool_name,
-                reason,
-                call,
-                ..
-            } => {
-                // Notify the browser that a tool needs approval. The decision
-                // round-trips via POST /chat/permission -> pending_permissions
-                // -> the decider's response channel. We drop the big `messages`
-                // field (TUI-only, for /bg session persistence).
-                let _ = event_tx.send(ChatEvent::PermissionRequest {
-                    session_id: perm_session_key.clone(),
-                    tool_name,
-                    reason,
-                    call_id: call.id,
-                    arguments: call.arguments,
-                });
-            }
-            TurnEvent::RateLimited {
-                reset_at_display,
-                reset_label,
-                secs_until_reset,
-                auto_resuming,
-                server_message,
-            } => {
-                let _ = event_tx.send(ChatEvent::RateLimited {
-                    reset_at_display,
-                    reset_label,
-                    secs_until_reset,
-                    auto_resuming,
-                    server_message,
-                });
-            }
-            TurnEvent::ApprovalResolved { .. } => {
-                // 审批已由任一端决策，HTTP 客户端通过 chat_event 感知后续工具事件即可。
-            }
-            TurnEvent::UserInputRequested { .. } => {
-                // request_user_input (webui stage 1): the responder plumbing is
-                // wired at the LiveSession/KernelTurnExecutor seam. Mapping this
-                // to an SSE/chat event is a later stage — no-op here for now.
-            }
+    let mut projector = ChatRuntimeProjector::default();
+    while let Some(event) = runtime_event_rx.recv().await {
+        for chat_event in projector.project_runtime(event, &perm_session_key) {
+            let _ = event_tx.send(chat_event);
         }
     }
 
     // Finalize any pending artifact
-    if let Some(event) = artifact_detector.finish() {
+    if let Some(event) = projector.finish() {
         let _ = event_tx.send(event);
     }
 
@@ -3114,12 +3299,12 @@ async fn process_chat_request(
 
     // Send done event
     let _ = event_tx.send(ChatEvent::Done {
-        tokens: total_tokens,
-        tool_calls: tool_call_count,
+        tokens: projector.total_tokens,
+        tool_calls: projector.tool_call_count,
         session_id,
     });
-    // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
-    // when the turn task and its turn_tx are dropped). Drop the permission
+    // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
+    // Drop the permission
     // registration so it doesn't leak. Only registered in interactive Build mode.
     if registered_permission_responder {
         pending_permissions.unregister(&perm_session_key);
@@ -3412,16 +3597,11 @@ fn merge_configured_mcp_statuses(
 }
 
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
-    // Report status from the registry that actually SERVES this session's tools,
-    // so the panel reflects reality instead of the daemon's separate startup
-    // registry (which reconnects on the side and can diverge). Preference:
-    //   1. the live session's registry (sync mode / TUI `/webui`),
-    //   2. the per-project chat cache (daemon `/chat`),
-    //   3. the startup registry as a last resort.
+    // Prefer the per-project `/chat` registry when it exists; otherwise report
+    // the daemon registry. Live runtime capability changes are requested through
+    // DriverCommand::ReloadCapabilities and reported on the live event stream.
     let working_dir = state.project.read().await.working_dir.clone();
-    let registry = if let Some(reg) = live_api::live_serving_mcp_registry().await {
-        reg
-    } else if let Some(reg) = state
+    let registry = if let Some(reg) = state
         .mcp_cache
         .read()
         .await
@@ -3879,8 +4059,8 @@ static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex:
 /// `user_id`：可选，桌面端当前登录用户 id。传入后将启用 `X-Atom-User-Id` 请求头校验，
 /// 确保请求来自同一账号的手机 App。
 ///
-/// 与 `/webui` 共用进程内全局 LiveSession（见 [ensure_live_session]），所以
-/// TUI / 浏览器 / App 看到的是**同一段对话**，双向实时同步。
+/// 与 `/webui` 共用 live hub 绑定的 Coding Runtime，所以 TUI / 浏览器 / App
+/// 看到的是同一段对话并双向实时同步。
 pub async fn ensure_app_server(
     host: &str,
     port: u16,

@@ -483,8 +483,8 @@ impl SessionManager {
     pub fn migrate_from_legacy() -> SessionResult<usize> {
         #[cfg(target_os = "macos")]
         {
-            let Some(legacy_root) = dirs::data_local_dir()
-                .map(|path| path.join("atomcode").join("sessions"))
+            let Some(legacy_root) =
+                dirs::data_local_dir().map(|path| path.join("atomcode").join("sessions"))
             else {
                 return Ok(0);
             };
@@ -1403,9 +1403,7 @@ fn migrate_sessions_from(legacy_root: &Path, target_root: &Path) -> SessionResul
     }
 
     let mut copies = Vec::new();
-    for bucket_entry in
-        fs::read_dir(legacy_root).map_err(|error| io_at(legacy_root, error))?
-    {
+    for bucket_entry in fs::read_dir(legacy_root).map_err(|error| io_at(legacy_root, error))? {
         let bucket_entry = bucket_entry.map_err(|error| io_at(legacy_root, error))?;
         let bucket_path = bucket_entry.path();
         let file_type = bucket_entry
@@ -1421,9 +1419,7 @@ fn migrate_sessions_from(legacy_root: &Path, target_root: &Path) -> SessionResul
                 reason: "legacy session bucket is not a 16-character hex id",
             });
         }
-        for file_entry in
-            fs::read_dir(&bucket_path).map_err(|error| io_at(&bucket_path, error))?
-        {
+        for file_entry in fs::read_dir(&bucket_path).map_err(|error| io_at(&bucket_path, error))? {
             let file_entry = file_entry.map_err(|error| io_at(&bucket_path, error))?;
             let source = file_entry.path();
             if !file_entry

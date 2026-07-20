@@ -17,28 +17,25 @@ pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod desktop;
 pub(crate) mod file_index;
-pub(crate) mod live_sync;
 pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
-use commands::{
-    attach_live_session, dispatch_undo, execute_slash_command, format_rate_limited_line,
-};
+use commands::{dispatch_undo, execute_slash_command, format_rate_limited_line};
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::session::{Session, SessionId};
 use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
 use atomcode_daemon::legacy_convert::snapshot_to_core;
-use crate::session::{Session, SessionId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
 use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
@@ -70,6 +67,16 @@ fn runtime_user_input(text: String, images: Vec<ImagePart>) -> atomcode_coding::
             .iter()
             .map(atomcode_daemon::legacy_convert::image_to_kernel)
             .collect(),
+    }
+}
+
+fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::submit(input).is_ok()
+    } else {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Submit(input))
+            .is_ok()
     }
 }
 
@@ -1360,6 +1367,34 @@ impl From<CodingRuntimeHandle> for RuntimeControl {
     }
 }
 
+impl atomcode_daemon::live_hub::LiveRuntimeControl for RuntimeControl {
+    fn status(&self) -> atomcode_coding::RuntimeStatus {
+        match self {
+            Self::Ready(ready) => ready.handle.status(),
+            Self::Deferred(deferred) => match &*deferred.state.borrow() {
+                atomcode_coding::DeferredRuntimeState::Starting => atomcode_coding::RuntimeStatus {
+                    generation: 0,
+                    phase: atomcode_coding::RuntimePhase::Reconfiguring,
+                },
+                atomcode_coding::DeferredRuntimeState::Ready(handle) => handle.status(),
+                atomcode_coding::DeferredRuntimeState::Failed(_) => {
+                    atomcode_coding::RuntimeStatus {
+                        generation: 0,
+                        phase: atomcode_coding::RuntimePhase::Failed,
+                    }
+                }
+            },
+        }
+    }
+
+    fn dispatch(
+        &self,
+        command: atomcode_coding::DriverCommand,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        RuntimeControl::dispatch(self, command)
+    }
+}
+
 /// A newly spawned runtime endpoint and its single-consumer ordered event stream.
 pub struct SpawnedRuntime {
     pub endpoint: RuntimeEndpoint,
@@ -1371,60 +1406,12 @@ pub struct SpawnedRuntime {
 /// `/resume`). The CLI injects the CodingRuntime factory here. It receives the
 /// CURRENT config + working dir (so it tracks `/model` / `/provider` / `/cd`)
 /// and returns the runtime control plane with its event receiver.
-pub type RuntimeSpawnOverride = std::sync::Arc<
-    dyn Fn(&Config, &std::path::Path, &Session) -> SpawnedRuntime
-        + Send
-        + Sync,
->;
-
-/// Runtime-owned handoff state while leaving Live sync mode. Keeping the
-/// fallback receiver and LiveSession here makes rollback an ownership transfer,
-/// not an attempt to reconstruct state after an asynchronous failure.
-pub(crate) struct PendingLocalRuntimeSync {
-    pub(crate) restore_id: u64,
-    pub(crate) runtime_id: bg_runtime::RuntimeId,
-    pub(crate) session_id: SessionId,
-    pub(crate) live_session: std::sync::Arc<atomcode_core::live::LiveSession>,
-    pub(crate) handoff: atomcode_core::live::IdleHandoff,
-    pub(crate) deadline: std::time::Instant,
-}
-
-impl PendingLocalRuntimeSync {
-    fn matches_current(&self, restore_id: u64, ctx: &LoopCtx) -> bool {
-        local_restore_scope_matches(
-            self.restore_id,
-            self.runtime_id,
-            &self.session_id,
-            restore_id,
-            ctx.foreground_runtime_id,
-            &ctx.current_session.id,
-        )
-    }
-
-    fn timed_out(&self) -> bool {
-        std::time::Instant::now() >= self.deadline
-    }
-}
-
-fn local_restore_scope_matches(
-    expected_restore_id: u64,
-    expected_runtime_id: bg_runtime::RuntimeId,
-    expected_session_id: &SessionId,
-    restore_id: u64,
-    runtime_id: bg_runtime::RuntimeId,
-    session_id: &SessionId,
-) -> bool {
-    expected_restore_id == restore_id
-        && expected_runtime_id == runtime_id
-        && expected_session_id == session_id
-}
+pub type RuntimeSpawnOverride =
+    std::sync::Arc<dyn Fn(&Config, &std::path::Path, &Session) -> SpawnedRuntime + Send + Sync>;
 
 #[cfg(test)]
 mod local_restore_scope_tests {
-    use super::{
-        bg_runtime, bg_runtime::RuntimeId, local_restore_scope_matches, RuntimeControl,
-        RuntimeUiAvailability,
-    };
+    use super::{bg_runtime, bg_runtime::RuntimeId, RuntimeControl, RuntimeUiAvailability};
     use atomcode_coding::runtime::{
         coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
         CodingRuntimeControl,
@@ -1432,48 +1419,7 @@ mod local_restore_scope_tests {
     use atomcode_coding::{
         DeferredRuntimeState, DriverCommand, ProviderUnavailableReason, UserInput,
     };
-    use crate::session::SessionId;
     use tokio::sync::{mpsc, watch};
-
-    #[test]
-    fn acknowledgement_requires_restore_runtime_and_session_identity() {
-        let expected_session: SessionId = "session-a".into();
-        let other_session: SessionId = "session-b".into();
-        let runtime = RuntimeId::new(3);
-
-        assert!(local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            runtime,
-            &expected_session,
-        ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            8,
-            runtime,
-            &expected_session,
-        ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            RuntimeId::new(4),
-            &expected_session,
-        ));
-        assert!(!local_restore_scope_matches(
-            7,
-            runtime,
-            &expected_session,
-            7,
-            runtime,
-            &other_session,
-        ));
-    }
 
     #[tokio::test]
     async fn ready_runtime_preserves_undo_before_later_submit() {
@@ -1821,14 +1767,8 @@ pub struct LoopCtx {
     /// stays current without thrashing the system clipboard on every
     /// redraw. Refreshed lazily inside `build_status`.
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
-    /// 同步模式：Some 时输入投 LiveSession、渲染来自 live_sync 转发任务。None=独立（默认）。
-    pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
-    /// live 转发任务句柄（分离同步时 abort）。
-    pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
-    /// Live → local runtime handoff awaiting a tokened runtime read-back.
-    pub(crate) pending_local_runtime_sync: Option<PendingLocalRuntimeSync>,
-    /// Monotonic correlation id for Live → local conversation restores.
-    pub(crate) next_local_runtime_restore_id: u64,
+    /// Bound live-view identity when web/app views share the foreground runtime.
+    pub live_binding: Option<atomcode_daemon::live_hub::LiveBinding>,
     /// `/app` 拉起的 relay-client 子进程。`kill_on_drop(true)`，所以 TUI 退出或
     /// `/app stop` 时随之清理，不留僵尸进程。None=未开启 App 远程访问。
     pub app_relay_child: Option<tokio::process::Child>,
@@ -4624,7 +4564,7 @@ mod tool_format_tests {
     /// bash) must NOT say "in parallel" — they run serially behind the write-lock.
     #[test]
     fn tool_batch_label_serial_calls_omit_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         // Simulate two bash calls — parallel_safe:false (write-lock, serial)
         let calls: Vec<ToolBatchCall> = vec![
             ToolBatchCall {
@@ -4672,7 +4612,7 @@ mod tool_format_tests {
     /// read_file) MUST say "in parallel" — they run concurrently.
     #[test]
     fn tool_batch_label_parallel_safe_calls_include_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         // Simulate two read_file calls — parallel_safe:true (read-lock, concurrent)
         let calls: Vec<ToolBatchCall> = vec![
             ToolBatchCall {
@@ -4720,7 +4660,7 @@ mod tool_format_tests {
     /// fewer than 2 concurrent, so NO "in parallel" even though one is read-only.
     #[test]
     fn tool_batch_label_mixed_one_safe_one_not_omits_in_parallel() {
-        use atomcode_core::turn::event::ToolBatchCall;
+        use atomcode_kernel::event::ToolBatchCall;
         let calls: Vec<ToolBatchCall> = vec![
             ToolBatchCall {
                 id: "1".into(),
@@ -5648,6 +5588,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    publish_live_runtime_event(&ctx, &runtime_event.event);
                     let pre_phase = app.state.phase;
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
@@ -5661,9 +5602,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle)
-                        && ctx.pending_local_runtime_sync.is_none()
-                    {
+                    if matches!(app.state.phase, UiPhase::Idle) {
                         // Turn just ended — drain the type-ahead queue.
                         // Pop the oldest queued message, echo as a User
                         // line, dispatch to the agent, and transition
@@ -5671,25 +5610,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // fire in order on subsequent completions.
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            if let Some(live) = &ctx.sync_session {
-                                // 同步模式：投 LiveSession，不本地渲染用户行。
-                                use atomcode_core::live::UserInput;
-                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                            if submit_foreground_runtime(
+                                &ctx,
+                                runtime_user_input(queued.text, queued.images),
+                            ) {
                                 app.state.on_submit();
                             } else {
-                                if ctx.runtime
-                                    .dispatch(atomcode_coding::DriverCommand::Submit(
-                                        runtime_user_input(queued.text, queued.images),
-                                    ))
-                                    .is_ok()
-                                {
-                                    app.state.on_submit();
-                                } else {
-                                    renderer.render(UiLine::Error(
-                                        crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
-                                            .into_owned(),
-                                    ));
-                                }
+                                renderer.render(UiLine::Error(
+                                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                        .into_owned(),
+                                ));
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -6073,6 +6003,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    publish_live_runtime_event(&ctx, &runtime_event.event);
                     let pre_phase = app.state.phase;
                     handle_runtime_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.setup_pending, &mut app.reasoning_buffer, &mut app.buf);
                     // A turn ending with a password modal still up = orphan (the sudo/ssh
@@ -6086,30 +6017,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle)
-                        && ctx.pending_local_runtime_sync.is_none()
-                    {
+                    if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            if let Some(live) = &ctx.sync_session {
-                                // 同步模式：投 LiveSession，不本地渲染用户行。
-                                use atomcode_core::live::UserInput;
-                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                            if submit_foreground_runtime(
+                                &ctx,
+                                runtime_user_input(queued.text, queued.images),
+                            ) {
                                 app.state.on_submit();
                             } else {
-                                if ctx.runtime
-                                    .dispatch(atomcode_coding::DriverCommand::Submit(
-                                        runtime_user_input(queued.text, queued.images),
-                                    ))
-                                    .is_ok()
-                                {
-                                    app.state.on_submit();
-                                } else {
-                                    renderer.render(UiLine::Error(
-                                        crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
-                                            .into_owned(),
-                                    ));
-                                }
+                                renderer.render(UiLine::Error(
+                                    crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                        .into_owned(),
+                                ));
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -6124,21 +6044,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     );
                 }
             }
-        }
-
-        if ctx
-            .pending_local_runtime_sync
-            .as_ref()
-            .is_some_and(PendingLocalRuntimeSync::timed_out)
-        {
-            let restored_live = commands::rollback_pending_local_runtime_sync(&mut ctx);
-            let message = if restored_live {
-                crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestoreTimedOut).into_owned()
-            } else {
-                "本地 runtime 恢复超时，且当前会话已变化，无法自动接回旧 Live 会话".to_string()
-            };
-            renderer.render(UiLine::Error(message));
-            renderer.flush();
         }
 
         // ── Fixed-interval /loop decision (turn-completion driven) ──
@@ -7156,21 +7061,6 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
-    let restore_blocks_key = ctx.pending_local_runtime_sync.is_some()
-        && pending_restore_blocks_idle_action(
-            code,
-            modifiers,
-            &app.buf.text,
-            menu_for_display(&app.buf, ctx).is_some(),
-            app.state.goal_condition.is_some(),
-        );
-    if restore_blocks_key {
-        renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::LocalRuntimeRestorePending).into_owned(),
-        ));
-        renderer.flush();
-        return Ok(());
-    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -7972,7 +7862,7 @@ fn handle_idle_key(
                 // already cached above from the raw form, so Ctrl+C edit
                 // restores the editable path, not the marker.
                 attach_typed_image_paths(app, ctx, &mut expanded, &mut images, &mut kept_markers);
-                if ctx.sync_session.is_none() {
+                {
                     // Echo the EXACT text the agent receives (`expanded`): the
                     // full pasted body with `[Pasted #N …]` placeholders expanded
                     // and typed image paths already rewritten to `[Image #N]`
@@ -7995,22 +7885,9 @@ fn handle_idle_key(
                 if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                     *slot = None;
                 }
-                if let Some(live) = &ctx.sync_session {
-                    // 同步模式：投递到 LiveSession。
-                    use atomcode_core::live::UserInput;
-                    live.send_input(UserInput {
-                        text: expanded,
-                        images,
-                    });
-                    app.state.on_submit();
-                } else {
-                    // —— 原有逻辑，原样保留 ——
-                    let submitted = ctx
-                        .runtime
-                        .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
-                            expanded, images,
-                        )))
-                        .is_ok();
+                {
+                    let submitted =
+                        submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
                     if submitted {
                         app.state.on_submit();
                         // CodingPlan drift check — fire before every turn sent
@@ -8064,81 +7941,6 @@ fn handle_idle_key(
         }
     }
     Ok(())
-}
-
-fn pending_restore_blocks_idle_action(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-    input: &str,
-    menu_active: bool,
-    goal_active: bool,
-) -> bool {
-    use crossterm::event::KeyModifiers;
-
-    if code == KeyCode::Enter && !modifiers.contains(KeyModifiers::SHIFT) {
-        let safe_exit = parse_slash_line(input).is_some_and(|(command, argument)| {
-            matches!(command.to_ascii_lowercase().as_str(), "quit" | "exit")
-                && argument.trim().is_empty()
-        });
-        return !safe_exit;
-    }
-    if matches!(code, KeyCode::Tab | KeyCode::BackTab) && !menu_active {
-        return true;
-    }
-    if code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) {
-        return true;
-    }
-
-    let bare_escape = code == KeyCode::Esc && modifiers.is_empty() && input.is_empty();
-    let goal_cancel = goal_active
-        && (bare_escape
-            || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL)));
-    goal_cancel || (bare_escape && !menu_active)
-}
-
-#[cfg(test)]
-mod pending_restore_key_tests {
-    use super::{pending_restore_blocks_idle_action, KeyCode};
-    use crossterm::event::KeyModifiers;
-
-    #[test]
-    fn restore_gate_blocks_runtime_actions_but_keeps_explicit_exit() {
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            "hello",
-            false,
-            false,
-        ));
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            "",
-            false,
-            false,
-        ));
-        assert!(pending_restore_blocks_idle_action(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-            "",
-            false,
-            false,
-        ));
-        assert!(!pending_restore_blocks_idle_action(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            "/quit",
-            false,
-            false,
-        ));
-        assert!(!pending_restore_blocks_idle_action(
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            "/qu",
-            true,
-            false,
-        ));
-    }
 }
 
 fn redraw_with_menu(
@@ -8337,17 +8139,13 @@ mod bash_input_hint_tests {
 enum SubmitRoute {
     SendIdle,
     SteerNow,
-    Queue,
 }
 
-/// Where a submitted prompt goes. On the ASYNC kernel path, a submit DURING a
-/// running turn steers (sent to the kernel immediately, folded into the turn).
-/// On the SYNC/LiveSession path, keep the local-queue behavior. Idle → normal send.
-fn midturn_submit_route(streaming: bool, sync: bool) -> SubmitRoute {
-    match (streaming, sync) {
-        (true, false) => SubmitRoute::SteerNow,
-        (true, true) => SubmitRoute::Queue,
-        (false, _) => SubmitRoute::SendIdle,
+/// A submit during a running native turn is steering; an idle submit starts a turn.
+fn midturn_submit_route(streaming: bool) -> SubmitRoute {
+    match streaming {
+        true => SubmitRoute::SteerNow,
+        false => SubmitRoute::SendIdle,
     }
 }
 
@@ -8356,11 +8154,9 @@ mod midturn_submit_route_tests {
     use super::{midturn_submit_route, SubmitRoute};
 
     #[test]
-    fn midturn_submit_steers_on_async_queues_on_sync() {
-        assert_eq!(midturn_submit_route(true, false), SubmitRoute::SteerNow);
-        assert_eq!(midturn_submit_route(true, true), SubmitRoute::Queue);
-        assert_eq!(midturn_submit_route(false, false), SubmitRoute::SendIdle);
-        assert_eq!(midturn_submit_route(false, true), SubmitRoute::SendIdle);
+    fn midturn_submit_steers_native_runtime() {
+        assert_eq!(midturn_submit_route(true), SubmitRoute::SteerNow);
+        assert_eq!(midturn_submit_route(false), SubmitRoute::SendIdle);
     }
 }
 
@@ -9020,7 +8816,7 @@ fn handle_streaming_key(
                     q_markers.push(n);
                 }
             }
-            if ctx.sync_session.is_none() {
+            {
                 // Same as the idle submit path: echo the EXACT text queued for
                 // the agent (`expanded`) — the full pasted body, no
                 // `[Pasted #N …]` placeholder — while history keeps the folded
@@ -9037,18 +8833,12 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            match midturn_submit_route(true, ctx.sync_session.is_some()) {
+            match midturn_submit_route(true) {
                 SubmitRoute::SteerNow => {
                     // Steer into the running turn: the kernel folds this at the next
                     // round boundary (see AgentEvent::Steered). No local queue. Count
                     // it as PENDING now; the Steered event drains it once folded.
-                    if ctx
-                        .runtime
-                        .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
-                            expanded, q_images,
-                        )))
-                        .is_ok()
-                    {
+                    if submit_foreground_runtime(ctx, runtime_user_input(expanded, q_images)) {
                         app.state.on_steer_sent();
                         renderer.render(UiLine::CommandOutput(format!(
                             "  ↳ {}: {}\n",
@@ -9147,19 +8937,10 @@ fn dismiss_orphan_capturing_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut d
     }
 }
 
-/// Cancel the executor that owns the foreground turn.
-///
-/// In sync mode the turn belongs to `LiveSession`; the local runtime is idle, so
-/// dispatching `DriverCommand::Cancel` to it would be a no-op. Outside sync mode
-/// the local runtime owns the turn and receives the native cancel command.
+/// Cancel the bound Coding Runtime through the hub, or the standalone runtime directly.
 fn cancel_active_turn(ctx: &LoopCtx) -> bool {
-    if ctx.sync_forwarder.is_some() {
-        let Some(session) = atomcode_daemon::current_live_session() else {
-            return false;
-        };
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(session.cancel_current_turn())
-        })
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::cancel().is_ok()
     } else {
         ctx.runtime
             .dispatch(atomcode_coding::DriverCommand::Cancel)
@@ -9167,19 +8948,7 @@ fn cancel_active_turn(ctx: &LoopCtx) -> bool {
     }
 }
 
-/// Deliver a tool-approval decision to whichever turn is actually waiting.
-///
-/// In **sync mode** the running turn belongs to the in-process LiveSession
-/// coordinator (`KernelTurnExecutor`), not this TUI's own runtime — so the
-/// decision must go to the LiveSession's approver slot
-/// (`current_live_session().approve`), exactly like the webui's
-/// `/live/permission`. Sending it to the TUI runtime (which isn't running this
-/// turn) leaves the tool blocked forever: the "Running … 141s, and the webui
-/// approval card never closes" bug. `ApproveToolAlways` sends `AllowAlways` so
-/// the LiveSession's decider persists a session grant (grant_session /
-/// grant_session_scope), exactly like the webui's "always allow this session"
-/// path. In normal (non-sync) mode the decision goes to the TUI runtime
-/// as before.
+/// Deliver a tool-approval decision to the pending request on the same runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalChoice {
     Allow,
@@ -9188,14 +8957,7 @@ enum ApprovalChoice {
 }
 
 fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
-    if ctx.sync_forwarder.is_some() {
-        let decision = approval_choice_to_decision(choice);
-        if let Some(session) = atomcode_daemon::current_live_session() {
-            let _ = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(session.approve(decision))
-            });
-        }
-    } else if let Some(id) = ctx.pending_runtime_request_id.take() {
+    if let Some(id) = ctx.pending_runtime_request_id.take() {
         use atomcode_capabilities::tools::ApprovalResponse;
         let response = match choice {
             ApprovalChoice::Allow => ApprovalResponse::allow(),
@@ -9203,9 +8965,13 @@ fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
             ApprovalChoice::Deny => ApprovalResponse::deny(),
         };
         let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
-        ctx.runtime
-            .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
-            .ok();
+        if ctx.live_binding.is_some() {
+            let _ = atomcode_daemon::native_live::respond(id, value);
+        } else {
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+                .ok();
+        }
     }
 }
 
@@ -9219,9 +8985,13 @@ fn deliver_user_input(
     if ctx.pending_runtime_request_id == Some(id) {
         ctx.pending_runtime_request_id = None;
     }
-    ctx.runtime
-        .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
-        .ok();
+    if ctx.live_binding.is_some() {
+        let _ = atomcode_daemon::native_live::respond(id, value);
+    } else {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Respond { id, value })
+            .ok();
+    }
 }
 
 /// Fail-close: respond with `Null` so the tool round-trip resolves as
@@ -9230,12 +9000,16 @@ fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
     if ctx.pending_runtime_request_id == Some(id) {
         ctx.pending_runtime_request_id = None;
     }
-    ctx.runtime
-        .dispatch(atomcode_coding::DriverCommand::Respond {
-            id,
-            value: serde_json::Value::Null,
-        })
-        .ok();
+    if ctx.live_binding.is_some() {
+        let _ = atomcode_daemon::native_live::respond(id, serde_json::Value::Null);
+    } else {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Respond {
+                id,
+                value: serde_json::Value::Null,
+            })
+            .ok();
+    }
 }
 
 /// Pure predicate: should a `request_user_input` tool call be auto-skipped
@@ -9250,10 +9024,8 @@ pub(crate) fn user_input_should_auto_skip(mode: crate::state::AgentMode) -> bool
     mode.is_auto()
 }
 
-/// Map an approval `AgentCommand` to the `PermissionDecision` the sync-mode
-/// LiveSession applies. Pulled out of `deliver_approval` as a pure function so
-/// the command↔decision contract (notably that an auto-approve sends `Allow`,
-/// not `Deny`/`Ask`) is unit-testable without building a `LoopCtx`.
+/// Pure mapping used by approval compatibility tests.
+#[cfg(test)]
 fn approval_choice_to_decision(choice: ApprovalChoice) -> atomcode_core::tool::PermissionDecision {
     use atomcode_core::tool::PermissionDecision;
     match choice {
@@ -10869,18 +10641,9 @@ fn project_kernel_event(
             name: name.unwrap_or_else(|| "tool".into()),
             hint: arguments.chars().take(80).collect(),
         }),
-        Kernel::ToolBatchStarted { batch_id, calls } => Some(AgentEvent::ToolBatchStarted {
-            batch_id,
-            calls: calls
-                .into_iter()
-                .map(|call| atomcode_core::turn::event::ToolBatchCall {
-                    id: call.id,
-                    name: call.name,
-                    arguments: call.arguments,
-                    parallel_safe: call.parallel_safe,
-                })
-                .collect(),
-        }),
+        Kernel::ToolBatchStarted { batch_id, calls } => {
+            Some(AgentEvent::ToolBatchStarted { batch_id, calls })
+        }
         Kernel::ToolBatchCompleted {
             batch_id,
             ok,
@@ -10967,6 +10730,17 @@ fn handle_runtime_event(
     buf: &mut Buffer,
 ) {
     match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => handle_runtime_event(
+            bg_runtime::RuntimeEventPayload::Native(envelope.event),
+            state,
+            think,
+            renderer,
+            pending_tools,
+            ctx,
+            setup_pending,
+            reasoning_buffer,
+            buf,
+        ),
         bg_runtime::RuntimeEventPayload::Ui(event) => handle_agent_event(
             event,
             state,
@@ -11168,6 +10942,18 @@ fn handle_runtime_event(
                     );
                     return;
                 }
+                CodingRuntimeEvent::SessionChanged(changed) => {
+                    if let Some(session_id) = changed.session_id {
+                        apply_native_session_changed(
+                            session_id,
+                            changed.working_dir,
+                            state,
+                            renderer,
+                            ctx,
+                        );
+                    }
+                    return;
+                }
                 CodingRuntimeEvent::SessionNameSuggested { name } => {
                     handle_agent_event(
                         AgentEvent::SessionRenamed { name },
@@ -11280,13 +11066,7 @@ fn handle_runtime_event(
                     }
                     return;
                 }
-                CodingRuntimeEvent::SnapshotRestoreFinished {
-                    correlation_id,
-                    result,
-                } => {
-                    handle_snapshot_restore_finished(correlation_id, result, ctx, renderer);
-                    return;
-                }
+                CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
                 CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
                     renderer.render(UiLine::Error(format!("provider reload failed: {error}")));
                     renderer.flush();
@@ -11313,7 +11093,6 @@ fn handle_runtime_event(
                 event => {
                     let mirror_persisted =
                         persist_native_compaction_snapshot(&event, ctx, renderer);
-                    mirror_compaction_finished_event(&event, ctx);
                     handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
                     return;
                 }
@@ -11329,6 +11108,123 @@ fn handle_runtime_event(
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
+        }
+    }
+}
+
+fn publish_live_runtime_event(ctx: &LoopCtx, event: &bg_runtime::RuntimeEventPayload) {
+    let Some(binding) = &ctx.live_binding else {
+        return;
+    };
+    match event {
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
+            let _ = atomcode_daemon::native_live::publish(binding, envelope.clone());
+        }
+        bg_runtime::RuntimeEventPayload::Native(event) => {
+            let _ = atomcode_daemon::native_live::publish_unsequenced(binding, event.clone());
+        }
+        _ => {}
+    }
+}
+
+fn apply_native_session_changed(
+    session_id: String,
+    working_dir: PathBuf,
+    state: &mut UiState,
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) {
+    if ctx.current_session.id == session_id {
+        return;
+    }
+    let session = match atomcode_daemon::legacy_convert::find_catalog_session_view(&session_id) {
+        Ok(Some(session)) => match Session::from_catalog_view(session) {
+            Ok(session) => session,
+            Err(error) => {
+                renderer.render(UiLine::Error(format!(
+                    "Failed to decode session {session_id}: {error}"
+                )));
+                renderer.flush();
+                return;
+            }
+        },
+        Ok(None) => {
+            renderer.render(UiLine::Error(format!(
+                "Session {session_id} disappeared after runtime switch"
+            )));
+            renderer.flush();
+            return;
+        }
+        Err(error) => {
+            renderer.render(UiLine::Error(format!(
+                "Failed to resolve session {session_id}: {error}"
+            )));
+            renderer.flush();
+            return;
+        }
+    };
+
+    if ctx.working_dir != working_dir {
+        ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
+        ctx.file_index.reset(working_dir.clone());
+        commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
+        commands::save_recent_dirs(&ctx.recent_dirs);
+    }
+    ctx.current_session_id = Some(session_id.clone());
+    ctx.loop_ctrl = None;
+    state.loop_label = None;
+    state.loop_round = 0;
+    state.loop_started_at = None;
+    state.total_tokens = 0;
+    state.prompt_tokens = 0;
+    state.completion_tokens = 0;
+    state.cached_tokens = 0;
+    state.last_context = None;
+    state.pending_context_render = None;
+    state.thinking_idx = 0;
+    state.on_turn_complete();
+    state.active_todos = None;
+    sync_todo_titles(state);
+    state.approval_panel = None;
+    commands::bind_telemetry_to_session(ctx, &session);
+    ctx.current_session = session;
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+
+    renderer.begin_sync();
+    renderer.reset();
+    if ctx.current_session.messages.is_empty() {
+        let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+        renderer.render(UiLine::Welcome {
+            model: ctx.model_name.clone(),
+            working_dir: dir_display,
+        });
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+        ));
+    } else {
+        crate::modals::session_picker::replay_session(renderer, state, &ctx.current_session, true);
+    }
+    renderer.flush();
+    renderer.end_sync();
+
+    if let Some(binding) = ctx.live_binding.clone() {
+        let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
+            &ctx.current_session.to_conversation_snapshot(),
+        );
+        match atomcode_daemon::native_live::commit_runtime_snapshot(
+            &binding,
+            session_id,
+            working_dir,
+            snapshot,
+        ) {
+            Ok(binding) => ctx.live_binding = Some(binding),
+            Err(error) => {
+                renderer.render(UiLine::Error(format!(
+                    "Failed to update live session snapshot: {error:?}"
+                )));
+                renderer.flush();
+            }
         }
     }
 }
@@ -11447,54 +11343,6 @@ fn handle_undo_failure(requested: usize, available: usize, renderer: &mut dyn Re
     renderer.flush();
 }
 
-fn handle_snapshot_restore_finished(
-    correlation_id: u64,
-    result: Result<
-        std::sync::Arc<atomcode_kernel::message::SessionSnapshot>,
-        atomcode_coding::RuntimeError,
-    >,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-) {
-    let matches = ctx
-        .pending_local_runtime_sync
-        .as_ref()
-        .is_some_and(|pending| pending.matches_current(correlation_id, ctx));
-    if !matches {
-        crate::tuix_trace!(
-            "SYNC",
-            "ignored stale native snapshot restore id={}",
-            correlation_id
-        );
-        return;
-    }
-    match result {
-        Ok(snapshot) => {
-            let _completed = ctx.pending_local_runtime_sync.take();
-            ctx.current_session
-                .update_from_conversation_snapshot(snapshot_to_core(snapshot.as_ref()));
-            ctx.current_session.touch();
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            renderer.render(UiLine::CommandOutput(
-                "本地会话已接管 runtime 实际快照".to_string(),
-            ));
-        }
-        Err(error) => {
-            let restored_live = commands::rollback_pending_local_runtime_sync(ctx);
-            let suffix = if restored_live {
-                "；已恢复 Live 同步"
-            } else {
-                "；原 Live 会话上下文已变化，无法自动恢复"
-            };
-            renderer.render(UiLine::Error(format!(
-                "本地 runtime 接管失败：{error}{suffix}"
-            )));
-        }
-    }
-    renderer.flush();
-}
-
 /// Persist the exact committed kernel working set into the TUI's transitional
 /// core session mirror before the UI reports manual-compaction success.
 fn persist_native_compaction_snapshot(
@@ -11521,43 +11369,6 @@ fn persist_native_compaction_snapshot(
 
     let core_snapshot = snapshot_to_core(snapshot);
     persist_current_session(ctx, core_snapshot, renderer)
-}
-
-fn mirror_compaction_finished_event(event: &CodingRuntimeEvent, ctx: &LoopCtx) {
-    let Some(live) = &ctx.sync_session else {
-        return;
-    };
-    let CodingRuntimeEvent::CompactionFinished { completion } = event else {
-        return;
-    };
-    let text = match completion {
-        CompactionCompletion::Completed(outcome) if outcome.committed => {
-            Some(atomcode_config::i18n::format_compaction_mark(
-                outcome.removed_messages,
-                outcome.estimated_tokens_before,
-                outcome.estimated_tokens_after,
-            ))
-        }
-        CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
-            Some(atomcode_config::i18n::format_compaction_noop(
-                outcome.estimated_tokens_before,
-                outcome.estimated_tokens_after,
-                outcome.summary_would_grow(),
-            ))
-        }
-        CompactionCompletion::Interrupted {
-            trigger: CompactTrigger::Manual { .. },
-            ..
-        } => Some(atomcode_config::i18n::format_compaction_interrupted()),
-        CompactionCompletion::Failed {
-            trigger: CompactTrigger::Manual { .. },
-            error,
-        } => Some(format!("compact failed: {error}")),
-        _ => None,
-    };
-    if let Some(txt) = text {
-        live.notify_command_output(txt);
-    }
 }
 
 fn handle_coding_runtime_event(
@@ -11708,9 +11519,9 @@ mod coding_runtime_event_tests {
             provider: Some("anthropic".into()),
         }];
 
-        let projected = snapshot_to_core(
-            &atomcode_kernel::message::SessionSnapshot::new(vec![message]),
-        )
+        let projected = snapshot_to_core(&atomcode_kernel::message::SessionSnapshot::new(vec![
+            message,
+        ]))
         .messages
         .into_iter()
         .next()
@@ -12377,17 +12188,8 @@ fn handle_agent_event(
                 return;
             }
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
-            // skip the prompt entirely. In LOCAL mode the core decider already
-            // short-circuits, so this event never fires there. But in SYNC mode
-            // the daemon's LiveSession runs an InteractivePermissionDecider
-            // (auto_approve=false, see live_api.rs) that ALWAYS asks and forwards
-            // ApprovalRequested → here (live_sync.rs); the TUI's bypass flag would
-            // otherwise be ignored, surfacing prompts whenever a turn drives tool
-            // calls — e.g. a `/skills` expansion. Honor bypass at the TUI seam
-            // rather than flipping the shared daemon executor (which would leak
-            // bypass to webui peers attached to the same LiveSession).
-            // `deliver_approval` routes to LiveSession.approve(Allow) in sync mode
-            // and to the local agent otherwise.
+            // skip the prompt. The response goes through the hub when shared, so
+            // all views observe the same pending request lifecycle.
             if state.agent_mode.is_auto() {
                 deliver_approval(ctx, bypass_approval_choice());
                 return;
@@ -12885,17 +12687,15 @@ fn handle_agent_event(
                     renderer.render(UiLine::CommandOutput(format!("（手机端执行 {display}）")));
                     renderer.render(UiLine::CommandOutput(txt.clone()));
                     renderer.flush();
-                    if let Some(live) = &ctx.sync_session {
-                        live.notify_command_output(format!("{display}\n{txt}"));
-                    }
+                    let _ = atomcode_daemon::native_live::publish_command_output(format!(
+                        "{display}\n{txt}"
+                    ));
                 }
                 None => {
-                    if let Some(live) = &ctx.sync_session {
-                        live.notify_command_output(format!(
-                            "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
-                             /status /cost /whoami /diff）"
-                        ));
-                    }
+                    let _ = atomcode_daemon::native_live::publish_command_output(format!(
+                        "{display}\n  该命令需要在桌面端执行（手机端仅支持 \
+                         /status /cost /whoami /diff）"
+                    ));
                 }
             }
         }
@@ -13327,67 +13127,13 @@ fn handle_agent_event(
             // recover the conversation state. A correlated native restore has its
             // own completion event; ignore a stale generic sync while that handoff
             // owns the session boundary.
-            if ctx.pending_local_runtime_sync.is_none()
-                && (!snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty())
-            {
+            if !snapshot.messages.is_empty() || !snapshot.cold_summaries.is_empty() {
                 apply_session_snapshot(&mut ctx.current_session, snapshot);
                 ctx.bg_manager
                     .set_foreground_session(ctx.current_session.clone());
             }
         }
-        AgentEvent::ConversationRestored {
-            restore_id,
-            snapshot,
-        } => {
-            let matches = ctx
-                .pending_local_runtime_sync
-                .as_ref()
-                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
-            if !matches {
-                crate::tuix_trace!(
-                    "SYNC",
-                    "ignored stale conversation restore id={}",
-                    restore_id
-                );
-                return;
-            }
-
-            let _completed = ctx.pending_local_runtime_sync.take();
-            ctx.current_session
-                .update_from_conversation_snapshot(snapshot);
-            ctx.current_session.touch();
-            ctx.bg_manager
-                .set_foreground_session(ctx.current_session.clone());
-            renderer.render(UiLine::CommandOutput(
-                "本地会话已接管 runtime 实际快照".to_string(),
-            ));
-            renderer.flush();
-        }
-        AgentEvent::ConversationRestoreFailed { restore_id, error } => {
-            let matches = ctx
-                .pending_local_runtime_sync
-                .as_ref()
-                .is_some_and(|pending| pending.matches_current(restore_id, ctx));
-            if !matches {
-                crate::tuix_trace!(
-                    "SYNC",
-                    "ignored stale conversation restore failure id={}: {}",
-                    restore_id,
-                    error
-                );
-                return;
-            }
-            let restored_live = commands::rollback_pending_local_runtime_sync(ctx);
-            let suffix = if restored_live {
-                "；已恢复 Live 同步"
-            } else {
-                "；原 Live 会话上下文已变化，无法自动恢复"
-            };
-            renderer.render(UiLine::Error(format!(
-                "本地 runtime 接管失败：{error}{suffix}"
-            )));
-            renderer.flush();
-        }
+        AgentEvent::ConversationRestored { .. } | AgentEvent::ConversationRestoreFailed { .. } => {}
         AgentEvent::UserEcho(text) => {
             let markers = image_markers_in_order(&text);
             renderer.render(UiLine::UserWithAttachments {
@@ -13471,9 +13217,9 @@ fn handle_agent_event(
             // 到「按指定 id 建空白会话」的旧行为。
             crate::tuix_trace!(
                 "TUI",
-                "SessionSwitched: session_id={}, sync_session={}",
+                "SessionSwitched: session_id={}, live_binding={}",
                 session_id,
-                ctx.sync_session.is_some()
+                ctx.live_binding.is_some()
             );
             let sid = session_id;
             // 自回声守卫：TUI 自己发起的切换（/new、/resume 等，见 sync_local_session_switch）
@@ -13489,9 +13235,7 @@ fn handle_agent_event(
                 return;
             }
             let loaded = match atomcode_daemon::legacy_convert::find_catalog_session_view(&sid) {
-                Ok(session) => session
-                    .map(Session::from_catalog_view)
-                    .transpose(),
+                Ok(session) => session.map(Session::from_catalog_view).transpose(),
                 Err(error) => {
                     renderer.render(UiLine::Error(format!(
                         "Failed to resolve session {}: {error}",
@@ -13590,23 +13334,7 @@ fn handle_agent_event(
             renderer.flush();
             renderer.end_sync();
 
-            // 同步模式：用「带历史」的 session_id 重新附着 LiveSession，使三端
-            // （TUI / webui / 磁盘）落到同一会话、同一对话。render_snapshot=false：
-            // 历史已在上面 replay 过，避免重复刷。
-            if ctx.sync_session.is_some() {
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.to_conversation_snapshot(),
-                );
-                crate::tuix_trace!(
-                    "TUI",
-                    "SessionSwitched: attaching LiveSession ptr={:#x}",
-                    std::sync::Arc::as_ptr(&session) as usize
-                );
-                attach_live_session(ctx, renderer, session, false);
-            }
+            commands::sync_local_session_switch(ctx, renderer);
         }
         AgentEvent::SessionRenamed { name } => {
             // AI session-namer renamed the active session (fire-and-forget after
@@ -13760,9 +13488,7 @@ mod session_naming_tests {
     #[test]
     fn apply_session_snapshot_renames_from_first_real_user() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         let messages = vec![
             Message::new(Role::User, "[System meta · not a user message]\nread this"),
             Message::new(Role::User, "implement background sessions\nwith tests"),
@@ -13783,9 +13509,7 @@ mod session_naming_tests {
     #[test]
     fn apply_session_snapshot_preserves_custom_name() {
         use atomcode_core::conversation::message::{Message, Role};
-        let mut session = Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.name = "manual name".to_string();
 
         apply_session_snapshot(
@@ -13805,9 +13529,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
 
         apply_session_snapshot(
             &mut session,
@@ -13826,9 +13548,7 @@ mod session_naming_tests {
             message::{Message, Role},
             ConversationSnapshot,
         };
-        let mut session = Session::default_session(
-            std::path::PathBuf::from("/tmp/project"),
-        );
+        let mut session = Session::default_session(std::path::PathBuf::from("/tmp/project"));
         session.messages = vec![Message::new(Role::User, "stale recent turn")];
 
         apply_session_snapshot(

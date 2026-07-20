@@ -8,8 +8,8 @@
 // Esc cancels, printable chars + Backspace edit the filter query.
 // F2 renames the selected session.
 
-use anyhow::Result;
 use crate::session::{Session, SessionMeta, TurnStat};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
@@ -135,10 +135,7 @@ impl Modal for SessionPicker {
                     if let Some(idx) = self.filtered.get(self.selected).copied() {
                         if let Some(session_meta) = self.sessions.get(idx) {
                             let id = session_meta.id.clone();
-                            match perform_session_rename(
-                                &id,
-                                &self.rename_buffer,
-                            ) {
+                            match perform_session_rename(&id, &self.rename_buffer) {
                                 Ok((old_name, new_name)) => {
                                     // Update the session name in our local list
                                     if let Some(s) = self.sessions.get_mut(idx) {
@@ -313,12 +310,10 @@ impl Modal for SessionPicker {
                 };
                 match atomcode_daemon::legacy_convert::find_catalog_session_view(id.as_str())
                     .and_then(|view| {
-                        let view = view.ok_or_else(|| {
-                            anyhow::anyhow!("session {} not found", id.as_str())
-                        })?;
+                        let view = view
+                            .ok_or_else(|| anyhow::anyhow!("session {} not found", id.as_str()))?;
                         Session::from_catalog_view(view)
-                    })
-                {
+                    }) {
                     Ok(session) => {
                         ctx.current_session_id = Some(id);
                         replay_session(renderer, state, &session, true);
@@ -340,7 +335,7 @@ impl Modal for SessionPicker {
                             .set_foreground_session(ctx.current_session.clone());
                         state.on_turn_complete();
                         // 同步模式：把这次「本地切换到历史会话」双向同步到 webui，并把
-                        // 共享 LiveSession 重绑到该会话（含其历史）。非同步模式下为 no-op。
+                        // 已共享时用新的 committed snapshot 原子更新 live hub。
                         crate::event_loop::commands::sync_local_session_switch(ctx, renderer);
                         Ok(ModalAction::Close)
                     }

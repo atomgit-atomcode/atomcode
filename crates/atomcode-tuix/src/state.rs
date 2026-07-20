@@ -390,7 +390,7 @@ pub const DONE_LABELS: &[&str] = &[
 /// Snapshot of the agent's context budget, cached from `AgentEvent::ContextStats`
 /// and surfaced by the `/context` command.
 ///
-/// Merged across two emission paths: the narrow TurnEvent-forwarded one
+/// Merged across runtime emission paths
 /// (system/sent/total_messages) and the rich one from `handle_send_message`
 /// (tool_defs / cold_zone / ctx_window / ctx_name). Each path leaves the
 /// fields it doesn't know at 0 / empty, so we merge by keeping non-zero

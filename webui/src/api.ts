@@ -656,7 +656,7 @@ export async function postLiveMessage(
   provider?: string,
   sessionId?: string | null,
 ): Promise<void> {
-  await fetch('/live/message', {
+  const resp = await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -666,6 +666,9 @@ export async function postLiveMessage(
       ...(sessionId ? { session_id: sessionId } : {}),
     }),
   });
+  if (!resp.ok) throw new Error(`send live message failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean; error?: string };
+  if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
 }
 
 export async function postLiveStop(): Promise<void> {
@@ -676,26 +679,29 @@ export async function postLiveStop(): Promise<void> {
   if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
 }
 
-/** Sync-mode session switch: notify the daemon when the user selects a
- *  different (existing) session in the sidebar, so the same-process TUI
- *  follows — loading that session's history. Broadcasts via the same path
- *  as new-session creation; a no-op server-side when no view is attached. */
+/** Ask the bound native runtime to resume an existing session. */
 export async function postLiveSwitchSession(sessionId: string): Promise<void> {
-  await fetch('/live/switch_session', {
+  const resp = await fetch('/live/switch_session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
+  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the session switch');
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
  *  changes (not just on send), so the TUI header and other tabs follow. */
 export async function postLiveProvider(provider: string): Promise<void> {
-  await fetch('/live/provider', {
+  const resp = await fetch('/live/provider', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider }),
   });
+  if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the provider switch');
 }
 
 // --- /command endpoint ---
@@ -759,7 +765,7 @@ export async function postLiveReasoningEffort(
   effort: string | null,
   provider?: string,
 ): Promise<void> {
-  await fetch('/live/reasoning_effort', {
+  const resp = await fetch('/live/reasoning_effort', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -767,6 +773,9 @@ export async function postLiveReasoningEffort(
       ...(provider ? { provider } : {}),
     }),
   });
+  if (!resp.ok) throw new Error(`set live reasoning effort failed: ${resp.status}`);
+  const body = await resp.json() as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected reasoning effort');
 }
 
 export async function postLivePermission(

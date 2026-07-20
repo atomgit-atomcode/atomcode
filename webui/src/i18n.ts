@@ -261,6 +261,7 @@ const zh = {
   'sync.toggle': '同步当前会话',
   'sync.on': '已同步（多端实时）',
   'sync.off': '独立会话',
+  'sync.switchFailed': '实时同步切换失败：{error}',
 
   // Copy button
   'copy.copy': '复制',
@@ -563,6 +564,7 @@ const en: Record<MsgKey, string> = {
   'sync.toggle': 'Sync current session',
   'sync.on': 'Synced (live)',
   'sync.off': 'Independent',
+  'sync.switchFailed': 'Live sync switch failed: {error}',
 
   // Copy button
   'copy.copy': 'Copy',

@@ -116,7 +116,7 @@ pub enum StreamEvent {
     /// `Error`, the stream and the turn continue normally — the warning
     /// is a heads-up (e.g. "your proxy looks like it's truncating
     /// input"), not a failure. The runner forwards it to
-    /// `TurnEvent::Warning` so the TUI can render it without aborting.
+    /// a non-fatal warning so drivers can render it without aborting.
     Warning(String),
 }
 
