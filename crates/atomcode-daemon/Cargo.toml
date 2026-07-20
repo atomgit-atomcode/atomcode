@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system (leaf crate, extracted from core) — used directly, not via the
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }

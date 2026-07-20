@@ -53,7 +53,7 @@ impl RateLimitWindowSource for CodingPlanRateLimitSource {
 
     async fn fetch_windows(&self) -> Result<Vec<RateLimitWindow>, String> {
         tokio::task::spawn_blocking(|| {
-            let client = atomcode_core::coding_plan::Client::from_stored_auth()
+            let client = atomcode_codingplan::Client::from_stored_auth()
                 .map_err(|error| error.to_string())?;
             let status = client.status_v2().map_err(|error| error.to_string())?;
             Ok(status
