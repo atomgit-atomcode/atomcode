@@ -318,6 +318,7 @@ dependencies = [
  "assert_cmd",
  "atomcode-capabilities",
  "atomcode-coding",
+ "atomcode-codingplan",
  "atomcode-config",
  "atomcode-core",
  "atomcode-daemon",

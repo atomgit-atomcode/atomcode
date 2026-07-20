@@ -3460,7 +3460,7 @@ fn run_codingplan_core(
     // the user sees the report ending in "claim failed — run `atomcode
     // login` again" and has to do manually what `codingplan` could
     // do itself.
-    let mut report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    let mut report = atomcode_codingplan::run(&mut config, telemetry)?;
     if report.auth_expired {
         use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
@@ -3468,7 +3468,7 @@ fn run_codingplan_core(
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+                report = atomcode_codingplan::run(&mut config, telemetry)?;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed Ctrl+C, network
@@ -3493,7 +3493,7 @@ fn run_codingplan_core(
         // marker write is non-fatal — the config already landed; only
         // the 24h hint would be miscounted, which self-corrects on the
         // next successful run.
-        if let Err(e) = atomcode_core::coding_plan::write_last_sync_now() {
+        if let Err(e) = atomcode_codingplan::write_last_sync_now() {
             eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
         }
     }
