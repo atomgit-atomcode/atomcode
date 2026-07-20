@@ -293,9 +293,6 @@ pub async fn run(
     mcp_connect_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>,
     >,
-    lsp_connect_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>,
-    >,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
     is_admin: bool,
@@ -761,7 +758,6 @@ pub async fn run(
         mcp_reload: None,
         mcp_blocked_untrusted: Vec::new(),
         mcp_blocked_notice_emitted: false,
-        lsp_connect_rx,
         telemetry,
         worktree_original_dir: None,
         custom_commands,

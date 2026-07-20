@@ -27,7 +27,6 @@ fn _isolate_atomcode_home() {
 
 use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_config::config::Config;
-use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpRegistry,
@@ -1587,18 +1586,6 @@ async fn run() -> Result<i32> {
         (Some(mcp_registry), Some(rx))
     };
 
-    // Build the core LSP manager. CodingRuntime uses the separate
-    // capabilities LSP; this manager exists only to drive `lsp_connect_rx`, whose
-    // events the TUI renders as ✓/✗ status lines. `_lsp_manager` is bound (not
-    // dropped) so its event channel keeps receiving until the TUI exits.
-    let (_lsp_manager, lsp_connect_rx) = if is_headless {
-        (build_lsp_manager(&config.lsp, &working_dir), None)
-    } else {
-        match atomcode_core::lsp::build_lsp_manager_with_events(&config.lsp, &working_dir) {
-            Some((mgr, rx)) => (Some(mgr), Some(rx)),
-            None => (None, None),
-        }
-    };
 
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
@@ -1815,7 +1802,6 @@ async fn run() -> Result<i32> {
                 session_to_continue,
                 mcp_registry,
                 mcp_connect_rx,
-                lsp_connect_rx,
                 telemetry.clone(),
                 cli.dangerously_skip_permissions,
                 is_admin,
