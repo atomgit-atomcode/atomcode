@@ -18,7 +18,8 @@ atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system (leaf crate, extracted from core) — used directly, not via the
 # transitional atomcode_core::config re-export shim.
 atomcode-config = { path = "../atomcode-config" }
-atomcode-capabilities = { path = "../atomcode-capabilities" }
+atomcode-auth = { path = "../atomcode-auth" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin"] }
 # Unified native runtime used by daemon live/chat/session paths.
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }

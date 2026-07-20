@@ -571,6 +571,7 @@ version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-codingplan",

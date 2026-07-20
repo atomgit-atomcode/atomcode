@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use atomcode_core::auth;
+use atomcode_auth as auth;
 use atomcode_codingplan as coding_plan;
 use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
 

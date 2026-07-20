@@ -75,7 +75,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_config::config::Config;
-use atomcode_core::auth;
+use atomcode_auth as auth;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
@@ -133,7 +133,7 @@ pub(crate) struct ProviderInfo {
 
 /// In-flight OAuth login session stored in daemon memory.
 pub struct LoginSessionEntry {
-    pub session: atomcode_core::auth::LoginSession,
+    pub session: atomcode_auth::LoginSession,
     pub created_at: std::time::Instant,
 }
 
@@ -3864,7 +3864,7 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
         "http://{}:{}/?token={}{}",
         open_host, actual_port, token, sync_suffix
     );
-    let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
+    let opened = atomcode_auth::oauth::open_browser(&local_url).is_ok();
     let mut msg = if opened {
         format!("已在浏览器打开 webui：{local_url}")
     } else {
