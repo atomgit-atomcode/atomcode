@@ -36,7 +36,9 @@ mod util;
 
 pub use client::{McpClient, McpToolInfo};
 pub use config::{
-    load_mcp_config, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+    load_mcp_config, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig,
+    McpTransportConfig,
 };
 pub use oauth::{
     login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, McpOAuthLoginOptions,

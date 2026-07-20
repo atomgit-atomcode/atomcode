@@ -27,7 +27,7 @@ fn _isolate_atomcode_home() {
 
 use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_config::config::Config;
-use atomcode_core::mcp::{
+use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpRegistry,
     McpTokenStore, McpTransportConfig,
@@ -1582,7 +1582,7 @@ async fn run() -> Result<i32> {
     } else {
         // TUI: start in background; the event channel lets the TUI display
         // connection status in scrollback as servers connect.
-        use atomcode_core::mcp::McpConnectEvent;
+        use atomcode_capabilities::mcp::McpConnectEvent;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
         let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
         let mcp_registry = std::sync::Arc::new(registry);
