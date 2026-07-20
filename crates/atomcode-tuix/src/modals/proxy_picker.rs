@@ -1,5 +1,5 @@
 use anyhow::Result;
-use atomcode_core::proxy::{self, ProxyMode};
+use atomcode_config::proxy::{self, ProxyMode};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};

@@ -8343,7 +8343,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
-            atomcode_core::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+            atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
             let _ = reload_runtime_provider(ctx);
         }
         Err(e) => {
