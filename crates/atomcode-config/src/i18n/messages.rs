@@ -376,6 +376,7 @@ pub enum Msg<'a> {
     CmdNoChanges,
     CmdCheckingUpdate,
     CmdNoActiveProvider,
+    CmdProviderUnavailable,
 
     // ── Approval prompt ──
     ApprovalPromptAlt { tool: &'a str, detail: &'a str },

@@ -453,7 +453,12 @@ async fn open_stream(
             .body(body_bytes.to_vec());
         match signer {
             Some(signer) => {
-                let auth = signer.sign(body_bytes);
+                let auth = signer.sign(body_bytes).map_err(|error| ProviderError {
+                    retryable: false,
+                    message: error.to_string(),
+                    code: Some(error.code().to_string()),
+                    ..Default::default()
+                })?;
                 req = req.bearer_auth(auth.bearer.as_deref().unwrap_or(api_key));
                 for (name, value) in auth.headers {
                     req = req.header(name, value);

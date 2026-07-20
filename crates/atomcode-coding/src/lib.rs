@@ -78,11 +78,12 @@ pub use provider_factory::{
 pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
-    CodingRuntimeStart, DriverCommand, LocalContextInput, ReconfigureKind, ReprepareInput, RuntimeContextStats,
-    RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase,
-    RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus,
-    RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt,
-    TurnCompletion, UndoResult, UserInput,
+    CodingRuntimeStart, DriverCommand, LocalContextInput, ProviderBootstrap,
+    ProviderUnavailableReason, ReconfigureKind, ReprepareInput, RuntimeContextStats, RuntimeError,
+    RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
+    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
+    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
+    UndoResult, UserInput,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;

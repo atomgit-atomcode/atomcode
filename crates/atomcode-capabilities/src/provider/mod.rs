@@ -29,7 +29,7 @@ pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 pub use retry::RetryPolicy;
-pub use sign::{RequestSigner, SignedAuth};
+pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};

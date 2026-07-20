@@ -89,6 +89,14 @@ fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::Runtime
     )
 }
 
+fn deactivate_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    ctx.runtime.deactivate_provider(
+        atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
@@ -838,6 +846,11 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    DeactivateProvider {
+        reason: atomcode_coding::ProviderUnavailableReason,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
 }
 
 impl ReadyRuntimeControl {
@@ -883,6 +896,25 @@ impl ReadyRuntimeControl {
         request: ReadyRuntimeRequest,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
         if self.handle.is_stopped() {
+            return Err(atomcode_coding::RuntimeUnavailable);
+        }
+        let phase = self.handle.status().phase;
+        let provider_available = matches!(
+            phase,
+            atomcode_coding::RuntimePhase::Ready
+                | atomcode_coding::RuntimePhase::InTurn
+                | atomcode_coding::RuntimePhase::WaitingApproval
+        );
+        if !provider_available
+            && !matches!(
+                &request,
+                ReadyRuntimeRequest::ReloadProvider { .. }
+                    | ReadyRuntimeRequest::DeactivateProvider { .. }
+                    | ReadyRuntimeRequest::Dispatch(
+                        atomcode_coding::DriverCommand::Shutdown
+                    )
+            )
+        {
             return Err(atomcode_coding::RuntimeUnavailable);
         }
         let should_spawn = {
@@ -980,6 +1012,18 @@ impl ReadyRuntimeControl {
                         CodingRuntimeEvent::ProviderReloadFinished(result),
                     );
                 }
+                ReadyRuntimeRequest::DeactivateProvider {
+                    reason,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self.handle.deactivate_provider(reason).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ProviderDeactivationFinished(result),
+                    );
+                }
             }
         }
     }
@@ -1007,6 +1051,21 @@ impl RuntimeControl {
         match self {
             Self::Ready(ready) => ready.handle.is_stopped(),
             Self::Starting(sender) => sender.is_closed(),
+        }
+    }
+
+    fn provider_is_unavailable(&self) -> bool {
+        match self {
+            Self::Ready(ready) => matches!(
+                ready.handle.status().phase,
+                atomcode_coding::RuntimePhase::AwaitingProvider
+                    | atomcode_coding::RuntimePhase::Failed
+                    | atomcode_coding::RuntimePhase::Stopped
+            ),
+            // No status snapshot exists until asynchronous preparation installs
+            // the ready handle. Preserve the config/auth fallback during that
+            // short startup window.
+            Self::Starting(_) => false,
         }
     }
 
@@ -1119,6 +1178,24 @@ impl RuntimeControl {
                 .map_err(|_| atomcode_coding::RuntimeUnavailable),
         }
     }
+
+    pub fn deactivate_provider(
+        &self,
+        reason: atomcode_coding::ProviderUnavailableReason,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::DeactivateProvider {
+                reason,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Starting(sender) => sender
+                .send(atomcode_coding::DriverCommand::DeactivateProvider(reason))
+                .map_err(|_| atomcode_coding::RuntimeUnavailable),
+        }
+    }
 }
 
 impl From<CodingRuntimeHandle> for RuntimeControl {
@@ -1190,8 +1267,11 @@ fn local_restore_scope_matches(
 #[cfg(test)]
 mod local_restore_scope_tests {
     use super::{bg_runtime, bg_runtime::RuntimeId, local_restore_scope_matches, RuntimeControl};
-    use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
-    use atomcode_coding::{DriverCommand, UserInput};
+    use atomcode_coding::runtime::{
+        coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
+        CodingRuntimeControl,
+    };
+    use atomcode_coding::{DriverCommand, ProviderUnavailableReason, UserInput};
     use atomcode_core::session::SessionId;
     use tokio::sync::mpsc;
 
@@ -1298,6 +1378,41 @@ mod local_restore_scope_tests {
             tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await,
             Ok(None)
         ));
+    }
+
+    #[tokio::test]
+    async fn ready_runtime_rejects_submit_before_ui_enters_streaming() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let runtime = RuntimeControl::from(handle);
+
+        assert!(runtime.provider_is_unavailable());
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_ready_runtime_still_accepts_shutdown() {
+        let (handle, owner) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner(noop_agent_handle(), owner, runtime_tx, true);
+        handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let runtime = RuntimeControl::from(handle);
+
+        assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
+
+        adapter.shutdown().await.unwrap();
     }
 }
 
@@ -5346,12 +5461,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                ctx.runtime
+                                if ctx.runtime
                                     .dispatch(atomcode_coding::DriverCommand::Submit(
                                         runtime_user_input(queued.text, queued.images),
                                     ))
-                                    .ok();
-                                app.state.on_submit();
+                                    .is_ok()
+                                {
+                                    app.state.on_submit();
+                                } else {
+                                    renderer.render(UiLine::Error(
+                                        crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                            .into_owned(),
+                                    ));
+                                }
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -5760,12 +5882,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                 live.send_input(UserInput { text: queued.text, images: queued.images });
                                 app.state.on_submit();
                             } else {
-                                ctx.runtime
+                                if ctx.runtime
                                     .dispatch(atomcode_coding::DriverCommand::Submit(
                                         runtime_user_input(queued.text, queued.images),
                                     ))
-                                    .ok();
-                                app.state.on_submit();
+                                    .is_ok()
+                                {
+                                    app.state.on_submit();
+                                } else {
+                                    renderer.render(UiLine::Error(
+                                        crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable)
+                                            .into_owned(),
+                                    ));
+                                }
                             }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -7669,30 +7798,42 @@ fn handle_idle_key(
                     app.state.on_submit();
                 } else {
                     // —— 原有逻辑，原样保留 ——
-                    ctx.runtime
+                    let submitted = ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
                             expanded, images,
                         )))
-                        .ok();
-                    app.state.on_submit();
-                    // CodingPlan drift check — fire before every turn sent
-                    // to a CodingPlan-managed provider, gated by a 15-min
-                    // cooldown so rapid-fire messages don't spam the API.
-                    // Non-CodingPlan users skip entirely (zero network).
-                    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
-                        let cooled = ctx
-                            .monitor_last_check_at
-                            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
-                            .unwrap_or(true);
-                        if cooled {
-                            ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                            monitor::spawn_check(
-                                ctx.config.clone(),
-                                ctx.model_name.clone(),
-                                ctx.monitor_warning.clone(),
-                                ctx.wake_tx.clone(),
-                            );
+                        .is_ok();
+                    if submitted {
+                        app.state.on_submit();
+                        // CodingPlan drift check — fire before every turn sent
+                        // to a CodingPlan-managed provider, gated by a 15-min
+                        // cooldown so rapid-fire messages don't spam the API.
+                        // Non-CodingPlan users skip entirely (zero network).
+                        if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                            let cooled = ctx
+                                .monitor_last_check_at
+                                .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                                .unwrap_or(true);
+                            if cooled {
+                                ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                                monitor::spawn_check(
+                                    ctx.config.clone(),
+                                    ctx.model_name.clone(),
+                                    ctx.monitor_warning.clone(),
+                                    ctx.wake_tx.clone(),
+                                );
+                            }
                         }
+                    } else {
+                        app.state.on_submit_rejected();
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
+                        ));
+                        // Commit cleared the input buffer before dispatch. Render that
+                        // empty prompt so the retained renderer does not keep displaying
+                        // the pre-commit text after the synchronous rejection.
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        renderer.flush();
                     }
                 }
             }
@@ -8693,17 +8834,23 @@ fn handle_streaming_key(
                     // Steer into the running turn: the kernel folds this at the next
                     // round boundary (see AgentEvent::Steered). No local queue. Count
                     // it as PENDING now; the Steered event drains it once folded.
-                    ctx.runtime
+                    if ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(runtime_user_input(
                             expanded, q_images,
                         )))
-                        .ok();
-                    app.state.on_steer_sent();
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  ↳ {}: {}\n",
-                        crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
-                        line
-                    )));
+                        .is_ok()
+                    {
+                        app.state.on_steer_sent();
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ↳ {}: {}\n",
+                            crate::i18n::t(crate::i18n::Msg::SteerFoldedHint),
+                            line
+                        )));
+                    } else {
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::CmdProviderUnavailable).into_owned(),
+                        ));
+                    }
                 }
                 _ => {
                     app.message_queue.push_back(crate::state::QueuedMessage {
@@ -10877,6 +11024,26 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::ProviderReloadFinished(Ok(_)) => return,
+                CodingRuntimeEvent::ProviderDeactivationFinished(Ok(_)) => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdLogoutDone).into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::ProviderDeactivationFinished(Err(error)) => {
+                    let message = format!(
+                        "credentials removed, but provider deactivation failed: {error}"
+                    );
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdLogoutFailed {
+                            error: &message,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    return;
+                }
                 event => {
                     let mirror_persisted =
                         persist_native_compaction_snapshot(&event, ctx, renderer);
@@ -11311,6 +11478,18 @@ fn handle_coding_runtime_event(
                 state.phase = UiPhase::Idle;
                 state.spinner_label.clear();
             }
+        }
+        CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
+            let message = match reason {
+                atomcode_coding::ProviderUnavailableReason::NotConfigured => {
+                    crate::i18n::t(crate::i18n::Msg::CmdNoActiveProvider)
+                }
+                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired => {
+                    crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn)
+                }
+            };
+            renderer.render(UiLine::CommandOutput(message.into_owned()));
+            renderer.flush();
         }
         _ => {}
     }
@@ -13567,14 +13746,14 @@ fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
-    //   1. No provider configured + not logged in — show "configure" nudge.
-    //      This wins over the upgrade hint because without a provider the
+    //   1. Provider unavailable at runtime (or absent from config/auth) — show
+    //      the configure nudge. This wins over the upgrade hint because the
     //      app literally cannot answer any message; the user needs to know
     //      why before they're told to upgrade.
     //   2. Upgrade-available hint (existing behavior).
     //   3. None.
-    let no_provider =
-        ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none();
+    let no_provider = ctx.runtime.provider_is_unavailable()
+        || (ctx.config.providers.is_empty() && atomcode_auth::get_stored_auth().is_none());
     // Open-source build pointed at an AtomGit gateway: any chat will
     // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
     // up front (red, beats every other hint) so the user doesn't have

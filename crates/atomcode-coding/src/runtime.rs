@@ -64,6 +64,10 @@ pub enum CodingRuntimeEvent {
         provider: String,
         model: String,
     },
+    ProviderUnavailable {
+        reason: ProviderUnavailableReason,
+        forced: bool,
+    },
     SessionNameSuggested {
         name: String,
     },
@@ -78,6 +82,7 @@ pub enum CodingRuntimeEvent {
         result: Result<Arc<SessionSnapshot>, RuntimeError>,
     },
     ProviderReloadFinished(Result<RuntimeGeneration, RuntimeError>),
+    ProviderDeactivationFinished(Result<RuntimeGeneration, RuntimeError>),
     ControllerWarning(String),
 }
 
@@ -269,6 +274,7 @@ pub enum DriverCommand {
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
     ReloadProvider(CodingAgentConfig),
+    DeactivateProvider(ProviderUnavailableReason),
     UndoToPrompt(Option<usize>),
     RefreshContextStats,
     FreshSession,
@@ -314,6 +320,7 @@ pub enum RuntimeError {
     StaleRequest { id: RequestId },
     DeliveryFailed,
     Unavailable,
+    ProviderUnavailable(ProviderUnavailableReason),
     SnapshotUnavailable(String),
     ReconfigureFailed(String),
     InvalidWorkingDirectory(String),
@@ -327,6 +334,7 @@ impl fmt::Display for RuntimeError {
             Self::StaleRequest { id } => write!(f, "runtime request {id} is stale"),
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
+            Self::ProviderUnavailable(reason) => write!(f, "provider unavailable: {reason}"),
             Self::SnapshotUnavailable(message) => write!(f, "snapshot unavailable: {message}"),
             Self::ReconfigureFailed(message) => {
                 write!(f, "runtime reconfiguration failed: {message}")
@@ -344,6 +352,30 @@ impl fmt::Display for RuntimeError {
 }
 
 impl Error for RuntimeError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderUnavailableReason {
+    NotConfigured,
+    AuthenticationRequired,
+}
+
+impl fmt::Display for ProviderUnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("no provider configured — run /login or /provider"),
+            Self::AuthenticationRequired => {
+                f.write_str("provider authentication required — run /login")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderBootstrap {
+    Required,
+    RecoverAuthentication,
+    Unavailable(ProviderUnavailableReason),
+}
 
 /// One totally ordered event emitted by a runtime instance.
 #[derive(Clone, Debug)]
@@ -701,7 +733,14 @@ impl CodingRuntimeHandle {
 
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
         let state = self.state.load(Ordering::Acquire);
-        if !runtime_state_available(state) && !matches!(command, DriverCommand::Shutdown) {
+        if !runtime_state_available(state)
+            && !matches!(
+                command,
+                DriverCommand::ReloadProvider(_)
+                    | DriverCommand::DeactivateProvider(_)
+                    | DriverCommand::Shutdown
+            )
+        {
             return Err(RuntimeUnavailable);
         }
         let generation = runtime_state_generation(state);
@@ -766,6 +805,14 @@ impl CodingRuntimeHandle {
                 CodingRuntimeControl::ReassembleProvider {
                     generation,
                     next,
+                    done,
+                }
+            }
+            DriverCommand::DeactivateProvider(reason) => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::DeactivateProvider {
+                    generation,
+                    reason,
                     done,
                 }
             }
@@ -958,6 +1005,22 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn deactivate_provider(
+        &self,
+        reason: ProviderUnavailableReason,
+    ) -> Result<RuntimeGeneration, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::DeactivateProvider {
+                generation: runtime_state_generation(state),
+                reason,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn reprepare(&self, input: ReprepareInput) -> Result<SessionChanged, RuntimeError> {
         self.reprepare_target(ReprepareTarget::Exact(input)).await
     }
@@ -1130,6 +1193,13 @@ impl CodingRuntime {
     /// Build and start a native runtime. Startup errors are explicit; no inert handle is
     /// returned.
     pub async fn start(input: CodingRuntimeStart) -> Result<Self, RuntimeStartError> {
+        Self::start_with_bootstrap(input, ProviderBootstrap::Required).await
+    }
+
+    pub async fn start_with_bootstrap(
+        input: CodingRuntimeStart,
+        bootstrap: ProviderBootstrap,
+    ) -> Result<Self, RuntimeStartError> {
         let CodingRuntimeStart {
             mut agent,
             prepare,
@@ -1159,21 +1229,41 @@ impl CodingRuntime {
             resumed: binding.resume.is_some(),
         });
         let mcp_events = parts.mcp_events.clone();
-        let provider = provider_factory
-            .build(&agent, session_id)
-            .map_err(RuntimeStartError::Provider)?;
-        let kernel_agent = assemble(&mut parts, &agent, provider)
-            .map_err(RuntimeStartError::Assemble)?
-            .spawn();
+        let (kernel_agent, unavailable_reason) = match bootstrap {
+            ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
+            ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
+                match provider_factory.build(&agent, session_id) {
+                    Ok(provider) => (
+                        Some(
+                            assemble(&mut parts, &agent, provider)
+                                .map_err(RuntimeStartError::Assemble)?
+                                .spawn(),
+                        ),
+                        None,
+                    ),
+                    Err(crate::ProviderBuildError::Authentication(_))
+                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
+                    {
+                        (None, Some(ProviderUnavailableReason::AuthenticationRequired))
+                    }
+                    Err(error) => return Err(RuntimeStartError::Provider(error)),
+                }
+            }
+        };
 
         let (handle, controls) = coding_runtime_control_channel();
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
-        let adapter = spawn_runtime_owner_with_protocol(
+        let adapter = spawn_runtime_owner_with_optional_agent(
             kernel_agent,
             controls,
             raw_event_tx,
-            true,
+            if unavailable_reason.is_some() {
+                RuntimePhase::AwaitingProvider
+            } else {
+                RuntimePhase::Ready
+            },
+            unavailable_reason,
             true,
             Some(tagged_event_tx),
             Some(RuntimeResources {
@@ -1283,6 +1373,7 @@ pub enum RuntimePhase {
     InTurn,
     WaitingApproval,
     Reconfiguring,
+    AwaitingProvider,
     ShuttingDown,
     Stopped,
     Failed,
@@ -1374,6 +1465,11 @@ pub enum CodingRuntimeControl {
     ReassembleProvider {
         generation: u64,
         next: CodingAgentConfig,
+        done: oneshot::Sender<Result<RuntimeGeneration, RuntimeError>>,
+    },
+    DeactivateProvider {
+        generation: u64,
+        reason: ProviderUnavailableReason,
         done: oneshot::Sender<Result<RuntimeGeneration, RuntimeError>>,
     },
     Reprepare {
@@ -1473,6 +1569,7 @@ fn phase_code(phase: RuntimePhase) -> u64 {
         RuntimePhase::ShuttingDown => 4,
         RuntimePhase::Stopped => 5,
         RuntimePhase::Failed => 6,
+        RuntimePhase::AwaitingProvider => 7,
     }
 }
 
@@ -1484,7 +1581,8 @@ fn runtime_status(state: u64) -> RuntimeStatus {
         3 => RuntimePhase::Reconfiguring,
         4 => RuntimePhase::ShuttingDown,
         5 => RuntimePhase::Stopped,
-        _ => RuntimePhase::Failed,
+        6 => RuntimePhase::Failed,
+        _ => RuntimePhase::AwaitingProvider,
     };
     RuntimeStatus {
         generation: runtime_state_generation(state),
@@ -1673,9 +1771,37 @@ pub fn spawn_runtime_owner(
 
 fn spawn_runtime_owner_with_protocol(
     initial: AgentHandle,
-    mut controls: CodingRuntimeControlReceiver,
+    controls: CodingRuntimeControlReceiver,
     runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
     initial_agent_available: bool,
+    native_protocol: bool,
+    tagged_event_tx: Option<mpsc::UnboundedSender<GenerationTaggedRuntimeEvent>>,
+    resources: Option<RuntimeResources>,
+    wakeup_rx: Option<mpsc::UnboundedReceiver<WakeupRequest>>,
+) -> KernelRuntimeAdapter {
+    spawn_runtime_owner_with_optional_agent(
+        Some(initial),
+        controls,
+        runtime_event_tx,
+        if initial_agent_available {
+            RuntimePhase::Ready
+        } else {
+            RuntimePhase::Failed
+        },
+        None,
+        native_protocol,
+        tagged_event_tx,
+        resources,
+        wakeup_rx,
+    )
+}
+
+fn spawn_runtime_owner_with_optional_agent(
+    initial: Option<AgentHandle>,
+    mut controls: CodingRuntimeControlReceiver,
+    runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
+    initial_phase: RuntimePhase,
+    initial_unavailable_reason: Option<ProviderUnavailableReason>,
     native_protocol: bool,
     tagged_event_tx: Option<mpsc::UnboundedSender<GenerationTaggedRuntimeEvent>>,
     mut resources: Option<RuntimeResources>,
@@ -1696,10 +1822,9 @@ fn spawn_runtime_owner_with_protocol(
         tagged: tagged_event_tx,
         generation: Arc::clone(&event_generation),
     };
-    controls.state.store(
-        runtime_state(generation, initial_agent_available),
-        Ordering::Release,
-    );
+    controls
+        .state
+        .store(runtime_phase_state(generation, initial_phase), Ordering::Release);
 
     let owner_task = tokio::spawn(async move {
         // Keep the fallback receiver pending for transitional owner tests/adapters
@@ -1709,7 +1834,8 @@ fn spawn_runtime_owner_with_protocol(
         let mut observed_tokens = None;
         let mut controls_open = true;
         let mut compaction_suspended = false;
-        let mut agent_available = initial_agent_available;
+        let mut agent_available = matches!(initial_phase, RuntimePhase::Ready);
+        let mut provider_unavailable_reason = initial_unavailable_reason;
         let mut compactions = CompactionTracker::default();
         let mut shutdown_was_handled = false;
         let mut forced_shutdown = false;
@@ -1729,6 +1855,12 @@ fn spawn_runtime_owner_with_protocol(
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
         let mut ai_name_attempted = false;
+        if let Some(reason) = provider_unavailable_reason {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
+                reason,
+                forced: false,
+            });
+        }
         loop {
             tokio::select! {
                 biased;
@@ -1789,7 +1921,7 @@ fn spawn_runtime_owner_with_protocol(
                             CompactionInterruption::RuntimeReconfigured,
                         )
                         .await;
-                        agent = noop_agent_handle();
+                        agent = None;
                         agent_available = false;
                         observed_tokens = None;
                         let _ = done.send(());
@@ -1825,7 +1957,7 @@ fn spawn_runtime_owner_with_protocol(
                             CompactionInterruption::RuntimeReconfigured,
                         )
                         .await;
-                        agent = replacement;
+                        agent = Some(replacement);
                         agent_available = true;
                         observed_tokens = None;
                         if resume_after_replace {
@@ -1964,7 +2096,7 @@ fn spawn_runtime_owner_with_protocol(
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else if let Some(text) = continuation {
-                        if agent.commands.send(AgentCommand::SendMessage { text, images: vec![] }).is_ok() {
+                        if send_agent_command(&agent, AgentCommand::SendMessage { text, images: vec![] }) {
                             held_turn = None;
                             terminal_reason = None;
                             turn_stats = RuntimeTurnStats::default();
@@ -2019,7 +2151,7 @@ fn spawn_runtime_owner_with_protocol(
                             state.last_reason = Some(wakeup.reason);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(state.progress()));
                         }
-                        if agent.commands.send(AgentCommand::SendMessage { text: wakeup.prompt, images: vec![] }).is_ok() {
+                        if send_agent_command(&agent, AgentCommand::SendMessage { text: wakeup.prompt, images: vec![] }) {
                             held_turn = None;
                             terminal_reason = None;
                             turn_stats = RuntimeTurnStats::default();
@@ -2064,7 +2196,7 @@ fn spawn_runtime_owner_with_protocol(
                                 trigger,
                                 CompactionInterruption::RuntimeUnavailable,
                             );
-                        } else if agent.commands.send(AgentCommand::Compact { focus }).is_ok() {
+                        } else if send_agent_command(&agent, AgentCommand::Compact { focus }) {
                             compactions.accepted_manual(trigger);
                         } else {
                             agent_available = false;
@@ -2086,8 +2218,15 @@ fn spawn_runtime_owner_with_protocol(
                         mut input,
                         done,
                     }) => {
-                        if !native_protocol || request_generation != generation || !agent_available {
+                        if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        if !agent_available {
+                            let error = provider_unavailable_reason
+                                .map(RuntimeError::ProviderUnavailable)
+                                .unwrap_or(RuntimeError::Unavailable);
+                            let _ = done.send(Err(error));
                             continue;
                         }
                         let receipt = if let Some(turn_id) = active_turn {
@@ -2113,13 +2252,13 @@ fn spawn_runtime_owner_with_protocol(
                                 format!("{prefix}\n\n{}", input.text)
                             };
                         }
-                        if agent
-                            .commands
-                            .send(AgentCommand::SendMessage {
+                        if send_agent_command(
+                            &agent,
+                            AgentCommand::SendMessage {
                                 text: input.text,
                                 images: input.images,
-                            })
-                            .is_ok()
+                            },
+                        )
                         {
                             let _ = done.send(Ok(receipt));
                         } else {
@@ -2142,7 +2281,7 @@ fn spawn_runtime_owner_with_protocol(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if !pending_requests.remove(&id) {
                             let _ = done.send(Err(RuntimeError::StaleRequest { id }));
-                        } else if agent.commands.send(AgentCommand::Respond { id, value }).is_err() {
+                        } else if !send_agent_command(&agent, AgentCommand::Respond { id, value }) {
                             agent_available = false;
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::Failed),
@@ -2168,7 +2307,7 @@ fn spawn_runtime_owner_with_protocol(
                         } else {
                             snapshot_waiters.push(done);
                             if active_turn.is_none() && !snapshot_in_flight {
-                                if agent.commands.send(AgentCommand::Snapshot).is_ok() {
+                                if send_agent_command(&agent, AgentCommand::Snapshot) {
                                     snapshot_in_flight = true;
                                 } else {
                                     agent_available = false;
@@ -2241,13 +2380,13 @@ fn spawn_runtime_owner_with_protocol(
                             }
                             pending_wakeup = None;
                             for id in pending_requests.iter().copied() {
-                                let _ = agent.commands.send(AgentCommand::Respond {
+                                let _ = send_agent_command(&agent, AgentCommand::Respond {
                                     id,
                                     value: serde_json::Value::Null,
                                 });
                             }
                             pending_requests.clear();
-                            if agent.commands.send(AgentCommand::Cancel).is_ok() {
+                            if send_agent_command(&agent, AgentCommand::Cancel) {
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
@@ -2397,6 +2536,7 @@ fn spawn_runtime_owner_with_protocol(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::Provider,
                         });
+                        let had_active_agent = agent_available;
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
@@ -2432,10 +2572,11 @@ fn spawn_runtime_owner_with_protocol(
                                     );
                                 }
                                 runtime.config = next;
-                                agent = candidate.spawn();
+                                agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 agent_available = true;
+                                provider_unavailable_reason = None;
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
                                 compaction_suspended = false;
@@ -2458,18 +2599,32 @@ fn spawn_runtime_owner_with_protocol(
                             }
                             Err(candidate_error) => {
                                 runtime.config = old_config;
-                                match assemble_runtime_resources(&mut runtime) {
-                                    Ok(rollback) => {
-                                        agent = rollback;
+                                match had_active_agent
+                                    .then(|| assemble_runtime_resources(&mut runtime))
+                                    .transpose()
+                                {
+                                    Ok(None) => {
+                                        agent = None;
+                                        agent_available = false;
+                                        provider_unavailable_reason = None;
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Failed),
+                                            Ordering::Release,
+                                        );
+                                    }
+                                    Ok(Some(rollback)) => {
+                                        agent = Some(rollback);
                                         agent_available = true;
+                                        provider_unavailable_reason = None;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Ready),
                                             Ordering::Release,
                                         );
                                     }
                                     Err(rollback_error) => {
-                                        agent = noop_agent_handle();
+                                        agent = None;
                                         agent_available = false;
+                                        provider_unavailable_reason = None;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
                                             Ordering::Release,
@@ -2491,6 +2646,92 @@ fn spawn_runtime_owner_with_protocol(
                                 )));
                             }
                         }
+                    }
+                    Some(CodingRuntimeControl::DeactivateProvider {
+                        generation: request_generation,
+                        reason,
+                        done,
+                    }) => {
+                        if request_generation != generation || compaction_suspended {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        if !agent_available && provider_unavailable_reason == Some(reason) {
+                            let _ = done.send(Ok(RuntimeGeneration(generation)));
+                            continue;
+                        }
+
+                        controls.state.store(
+                            runtime_phase_state(generation, RuntimePhase::Reconfiguring),
+                            Ordering::Release,
+                        );
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
+                            operation: ReconfigureKind::Provider,
+                        });
+                        cancel_controllers_and_finish_held(
+                            &mut goal,
+                            &mut loop_state,
+                            &mut pending_wakeup,
+                            &mut held_turn,
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            resources
+                                .as_ref()
+                                .map(|runtime| runtime.loop_active.as_ref()),
+                            controls.state.as_ref(),
+                            generation,
+                            RuntimePhase::Reconfiguring,
+                            &runtime_event_tx,
+                            "provider deactivated",
+                        );
+                        fail_close_pending_requests(
+                            &agent,
+                            &mut pending_requests,
+                            active_turn.is_some(),
+                        );
+                        let stop_report = stop_current_agent(
+                            &mut agent,
+                            &mut compactions,
+                            &mut observed_tokens,
+                            &runtime_event_tx,
+                            CompactionInterruption::RuntimeReconfigured,
+                        )
+                        .await;
+                        finish_stopped_native_turn(
+                            &stop_report,
+                            resources.as_ref(),
+                            &mut active_turn,
+                            &mut terminal_reason,
+                            &mut turn_stats,
+                            &mut snapshot_waiters,
+                            &runtime_event_tx,
+                        );
+                        if let Some(runtime) = resources.as_mut() {
+                            preserve_sessionless_snapshot(runtime, &stop_report);
+                            if let Some(provider) = runtime.config.subagent_fast_provider.as_ref() {
+                                provider.reset(Arc::new(|| None));
+                            }
+                            if let Some(provider) =
+                                runtime.config.subagent_capable_provider.as_ref()
+                            {
+                                provider.reset(Arc::new(|| None));
+                            }
+                        }
+                        generation = generation.wrapping_add(1);
+                        event_generation.store(generation, Ordering::Release);
+                        agent_available = false;
+                        provider_unavailable_reason = Some(reason);
+                        observed_tokens = None;
+                        snapshot_in_flight = false;
+                        controls.state.store(
+                            runtime_phase_state(generation, RuntimePhase::AwaitingProvider),
+                            Ordering::Release,
+                        );
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
+                            reason,
+                            forced: stop_report.forced,
+                        });
+                        let _ = done.send(Ok(RuntimeGeneration(generation)));
                     }
                     Some(CodingRuntimeControl::Reprepare {
                         generation: request_generation,
@@ -2620,7 +2861,7 @@ fn spawn_runtime_owner_with_protocol(
                         match candidate_result {
                             Ok((candidate, replacement)) => {
                                 runtime = candidate;
-                                agent = replacement;
+                                agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 agent_available = true;
@@ -2657,7 +2898,7 @@ fn spawn_runtime_owner_with_protocol(
                             Err(candidate_error) => {
                                 match assemble_runtime_resources(&mut runtime) {
                                     Ok(rollback) => {
-                                        agent = rollback;
+                                        agent = Some(rollback);
                                         agent_available = true;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -2665,7 +2906,7 @@ fn spawn_runtime_owner_with_protocol(
                                         );
                                     }
                                     Err(rollback_error) => {
-                                        agent = noop_agent_handle();
+                                        agent = None;
                                         agent_available = false;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
@@ -2728,7 +2969,7 @@ fn spawn_runtime_owner_with_protocol(
                         .await;
                         match assemble_runtime_resources(&mut runtime) {
                             Ok(replacement) => {
-                                agent = replacement;
+                                agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 agent_available = true;
@@ -2761,7 +3002,7 @@ fn spawn_runtime_owner_with_protocol(
                                 .err();
                                 match assemble_runtime_resources(&mut runtime) {
                                     Ok(rollback) => {
-                                        agent = rollback;
+                                        agent = Some(rollback);
                                         agent_available = true;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -2769,7 +3010,7 @@ fn spawn_runtime_owner_with_protocol(
                                         );
                                     }
                                     Err(rollback_error) => {
-                                        agent = noop_agent_handle();
+                                        agent = None;
                                         agent_available = false;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
@@ -2848,7 +3089,7 @@ fn spawn_runtime_owner_with_protocol(
                             .and_then(|_| assemble_runtime_resources(&mut runtime));
                         match candidate {
                             Ok(replacement) => {
-                                agent = replacement;
+                                agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 agent_available = true;
@@ -2878,7 +3119,7 @@ fn spawn_runtime_owner_with_protocol(
                                     });
                                 match assemble_runtime_resources(&mut runtime) {
                                     Ok(rollback) => {
-                                        agent = rollback;
+                                        agent = Some(rollback);
                                         agent_available = true;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -2886,7 +3127,7 @@ fn spawn_runtime_owner_with_protocol(
                                         );
                                     }
                                     Err(rollback_error) => {
-                                        agent = noop_agent_handle();
+                                        agent = None;
                                         agent_available = false;
                                         controls.state.store(
                                             runtime_phase_state(generation, RuntimePhase::Failed),
@@ -2964,7 +3205,7 @@ fn spawn_runtime_owner_with_protocol(
                             current.last_reason = Some("cleared by user".into());
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
                         }
-                        if active_turn.is_some() { let _ = agent.commands.send(AgentCommand::Cancel); }
+                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
@@ -3025,7 +3266,7 @@ fn spawn_runtime_owner_with_protocol(
                         }
                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                         pending_wakeup = None;
-                        if active_turn.is_some() { let _ = agent.commands.send(AgentCommand::Cancel); }
+                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
@@ -3082,11 +3323,11 @@ fn spawn_runtime_owner_with_protocol(
                 },
                 command = kernel_command_rx.recv() => match command {
                     Some(command) => {
-                        let _ = agent.commands.send(command);
+                        let _ = send_agent_command(&agent, command);
                     }
                     None => break,
                 },
-                event = agent.events.recv() => match event {
+                event = receive_agent_event(&mut agent) => match event {
                     Some(event) => match handle_compaction_event(
                         event,
                         &mut compactions,
@@ -3130,7 +3371,7 @@ fn spawn_runtime_owner_with_protocol(
                                     .unwrap_or_default();
                                 terminal_reason = Some(reason);
                                 if !snapshot_in_flight {
-                                    if agent.commands.send(AgentCommand::Snapshot).is_ok() {
+                                    if send_agent_command(&agent, AgentCommand::Snapshot) {
                                         snapshot_in_flight = true;
                                     } else {
                                         let turn_id = active_turn.take().unwrap_or_default();
@@ -3278,7 +3519,7 @@ fn spawn_runtime_owner_with_protocol(
                                                     &state.condition,
                                                 );
                                                 held_turn = None;
-                                                if agent.commands.send(AgentCommand::SendMessage { text, images: vec![] }).is_ok() {
+                                                if send_agent_command(&agent, AgentCommand::SendMessage { text, images: vec![] }) {
                                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                     continue;
                                                 }
@@ -3509,7 +3750,8 @@ fn interrupt_queued_controls(
             CodingRuntimeControl::ContextStats { done, .. } => {
                 let _ = done.send(Err(RuntimeError::Unavailable));
             }
-            CodingRuntimeControl::ReassembleProvider { done, .. } => {
+            CodingRuntimeControl::ReassembleProvider { done, .. }
+            | CodingRuntimeControl::DeactivateProvider { done, .. } => {
                 let _ = done.send(Err(RuntimeError::Unavailable));
             }
             CodingRuntimeControl::Reprepare { done, .. } => {
@@ -3532,19 +3774,34 @@ fn interrupt_queued_controls(
 }
 
 fn fail_close_pending_requests(
-    agent: &AgentHandle,
+    agent: &Option<AgentHandle>,
     pending_requests: &mut BTreeSet<RequestId>,
     cancel_turn: bool,
 ) {
-    for id in pending_requests.iter().copied() {
-        let _ = agent.commands.send(AgentCommand::Respond {
-            id,
-            value: serde_json::Value::Null,
-        });
+    if let Some(agent) = agent.as_ref() {
+        for id in pending_requests.iter().copied() {
+            let _ = agent.commands.send(AgentCommand::Respond {
+                id,
+                value: serde_json::Value::Null,
+            });
+        }
+        if cancel_turn {
+            let _ = agent.commands.send(AgentCommand::Cancel);
+        }
     }
     pending_requests.clear();
-    if cancel_turn {
-        let _ = agent.commands.send(AgentCommand::Cancel);
+}
+
+fn send_agent_command(agent: &Option<AgentHandle>, command: AgentCommand) -> bool {
+    agent
+        .as_ref()
+        .is_some_and(|agent| agent.commands.send(command).is_ok())
+}
+
+async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEvent> {
+    match agent.as_mut() {
+        Some(agent) => agent.events.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -3775,12 +4032,16 @@ struct StopReport {
 }
 
 async fn stop_current_agent(
-    agent: &mut AgentHandle,
+    agent: &mut Option<AgentHandle>,
     compactions: &mut CompactionTracker,
     observed_tokens: &mut Option<usize>,
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
 ) -> StopReport {
+    let Some(mut agent) = agent.take() else {
+        compactions.interrupt_all(reason, runtime_event_tx);
+        return StopReport::default();
+    };
     let _ = agent.commands.send(AgentCommand::Shutdown);
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
     tokio::pin!(timeout);
@@ -3989,6 +4250,26 @@ mod tests {
 
     struct TestProviderFactory {
         fail: bool,
+    }
+
+    struct RecoverableAuthFactory {
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl CodingProviderFactory for RecoverableAuthFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            if self.fail.load(Ordering::Acquire) {
+                Err(crate::ProviderBuildError::Authentication(
+                    "login required".into(),
+                ))
+            } else {
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![])))
+            }
+        }
     }
 
     impl CodingProviderFactory for TestProviderFactory {
@@ -4810,6 +5091,84 @@ mod tests {
             Err(RuntimeStartError::Provider(crate::ProviderBuildError::Adapter(message)))
                 if message == "expected failure"
         ));
+    }
+
+    #[tokio::test]
+    async fn recoverable_auth_gap_starts_awaiting_provider_and_can_reassemble() {
+        let factory = Arc::new(RecoverableAuthFactory {
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut start = native_start(false);
+        start.provider_factory = factory.clone();
+
+        let runtime = CodingRuntime::start_with_bootstrap(
+            start,
+            ProviderBootstrap::RecoverAuthentication,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::AwaitingProvider);
+        assert!(matches!(
+            runtime.handle.submit(UserInput::from("blocked")).await,
+            Err(RuntimeError::ProviderUnavailable(
+                ProviderUnavailableReason::AuthenticationRequired
+            ))
+        ));
+
+        factory.fail.store(false, Ordering::Release);
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "ready", ".");
+        assert_eq!(
+            runtime.handle.reassemble_provider(next).await.unwrap(),
+            RuntimeGeneration(1)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deactivate_provider_drops_ready_agent_and_allows_recovery() {
+        let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .handle
+                .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+                .await
+                .unwrap(),
+            RuntimeGeneration(1)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::AwaitingProvider);
+        let unavailable = loop {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                runtime.events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if let CodingRuntimeEvent::ProviderUnavailable { reason, forced } = event.event {
+                break (reason, forced);
+            }
+        };
+        assert_eq!(
+            unavailable,
+            (ProviderUnavailableReason::AuthenticationRequired, false)
+        );
+        assert!(matches!(
+            runtime.handle.submit(UserInput::from("blocked")).await,
+            Err(RuntimeError::ProviderUnavailable(
+                ProviderUnavailableReason::AuthenticationRequired
+            ))
+        ));
+
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "ready", ".");
+        assert_eq!(
+            runtime.handle.reassemble_provider(next).await.unwrap(),
+            RuntimeGeneration(2)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]

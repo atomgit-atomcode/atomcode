@@ -23,6 +23,20 @@ pub async fn start_native_runtime_with_session(
     session: SessionMode,
 ) -> Result<(atomcode_coding::CodingRuntime, CodingAgentConfig), atomcode_coding::RuntimeStartError>
 {
+    start_native_runtime_with_session_bootstrap(
+        cfg,
+        session,
+        atomcode_coding::ProviderBootstrap::Required,
+    )
+    .await
+}
+
+async fn start_native_runtime_with_session_bootstrap(
+    cfg: CodingRuntimeConfig,
+    session: SessionMode,
+    bootstrap: atomcode_coding::ProviderBootstrap,
+) -> Result<(atomcode_coding::CodingRuntime, CodingAgentConfig), atomcode_coding::RuntimeStartError>
+{
     let coding_cfg = coding_config_from_runtime(&cfg);
     let prepare = PrepareOptions {
         session,
@@ -34,12 +48,15 @@ pub async fn start_native_runtime_with_session(
         review: true,
         rate_limit_source: Some(crate::coding_plan_rate_limit_source()),
     };
-    let runtime = atomcode_coding::CodingRuntime::start(atomcode_coding::CodingRuntimeStart {
-        agent: coding_cfg.clone(),
-        prepare,
-        provider_factory: crate::coding_provider_factory(),
-        plugin_hooks: crate::installed_plugin_hook_source(),
-    })
+    let runtime = atomcode_coding::CodingRuntime::start_with_bootstrap(
+        atomcode_coding::CodingRuntimeStart {
+            agent: coding_cfg.clone(),
+            prepare,
+            provider_factory: crate::coding_provider_factory(),
+            plugin_hooks: crate::installed_plugin_hook_source(),
+        },
+        bootstrap,
+    )
     .await?;
     Ok((runtime, coding_cfg))
 }
@@ -57,9 +74,19 @@ pub fn spawn_native_runtime_for_session_deferred(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let runtime =
-            start_native_runtime_with_session(cfg, SessionMode::ExternalSnapshot { id, snapshot })
-                .await;
+        let bootstrap = if cfg.model.is_empty() {
+            atomcode_coding::ProviderBootstrap::Unavailable(
+                atomcode_coding::ProviderUnavailableReason::NotConfigured,
+            )
+        } else {
+            atomcode_coding::ProviderBootstrap::RecoverAuthentication
+        };
+        let runtime = start_native_runtime_with_session_bootstrap(
+            cfg,
+            SessionMode::ExternalSnapshot { id, snapshot },
+            bootstrap,
+        )
+        .await;
         let (runtime, _) = match runtime {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -123,6 +150,11 @@ pub fn spawn_native_runtime_for_session_deferred(
                         atomcode_coding::DriverCommand::ReloadProvider(next) => Some(
                             CodingRuntimeEvent::ProviderReloadFinished(
                                 handle.reassemble_provider(next).await,
+                            ),
+                        ),
+                        atomcode_coding::DriverCommand::DeactivateProvider(reason) => Some(
+                            CodingRuntimeEvent::ProviderDeactivationFinished(
+                                handle.deactivate_provider(reason).await,
                             ),
                         ),
                         control => {

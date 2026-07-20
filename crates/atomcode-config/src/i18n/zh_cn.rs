@@ -455,6 +455,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  正在检查更新...\n".into(),
         Msg::CmdNoActiveProvider =>
             "未配置活跃的 Provider。使用 /provider 添加一个。".into(),
+        Msg::CmdProviderUnavailable =>
+            "Provider 当前不可用。请使用 /login 登录，或用 /provider 配置。".into(),
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>

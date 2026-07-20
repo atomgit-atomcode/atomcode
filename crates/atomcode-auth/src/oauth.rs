@@ -145,6 +145,14 @@ pub struct UserInfo {
     pub avatar_url: Option<String>,
 }
 
+/// Minimal, internally coherent credentials needed to authenticate one gateway request.
+/// The refresh token and profile fields never leave the auth owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidAuthSession {
+    pub access_token: String,
+    pub user_id: String,
+}
+
 // ============================================================================
 // Platform API types
 // ============================================================================
@@ -1026,9 +1034,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     Ok(new_auth)
 }
 
-/// Get a valid access token, refreshing automatically if expired.
-/// Returns the access token string ready to use.
-pub fn get_valid_token() -> Result<String> {
+fn get_valid_auth_info() -> Result<AuthInfo> {
     let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
     // Check if token is expired (with 5-minute safety margin)
@@ -1046,7 +1052,7 @@ pub fn get_valid_token() -> Result<String> {
         if now >= expires_at - 300 {
             // Token expired or about to expire — try refresh
             match refresh_access_token(&auth) {
-                Ok(new_auth) => return Ok(new_auth.access_token),
+                Ok(new_auth) => return Ok(new_auth),
                 Err(e) => anyhow::bail!("Token expired and refresh failed: {}", e),
             }
         }
@@ -1055,11 +1061,35 @@ pub fn get_valid_token() -> Result<String> {
         // try refresh if refresh_token is available, otherwise use as-is
         if auth.refresh_token.is_some() {
             if let Ok(new_auth) = refresh_access_token(&auth) {
-                return Ok(new_auth.access_token);
+                return Ok(new_auth);
             }
         }
     }
 
+    Ok(auth)
+}
+
+/// Get a valid token and its matching user identity from one auth snapshot.
+/// Refresh, when needed, happens before either value is projected so callers cannot
+/// accidentally combine a new token with a stale user id.
+pub fn get_valid_auth_session() -> Result<ValidAuthSession> {
+    let auth = get_valid_auth_info()?;
+    if auth.access_token.trim().is_empty() || auth.user.id.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
+    Ok(ValidAuthSession {
+        access_token: auth.access_token,
+        user_id: auth.user.id,
+    })
+}
+
+/// Get a valid access token, refreshing automatically if expired.
+/// Returns the access token string ready to use.
+pub fn get_valid_token() -> Result<String> {
+    let auth = get_valid_auth_info()?;
+    if auth.access_token.trim().is_empty() {
+        anyhow::bail!("Invalid auth.toml — please use /login first");
+    }
     Ok(auth.access_token)
 }
 

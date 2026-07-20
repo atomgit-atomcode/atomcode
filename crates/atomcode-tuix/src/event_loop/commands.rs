@@ -21,7 +21,9 @@
 
 use std::path::PathBuf;
 
-use super::{bg_runtime, reload_runtime_provider, save_and_reload, LoopCtx};
+use super::{
+    bg_runtime, deactivate_runtime_provider, reload_runtime_provider, save_and_reload, LoopCtx,
+};
 use crate::i18n::{t, Msg};
 use crate::modals::{
     DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
@@ -545,17 +547,20 @@ pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Re
 /// LiveSession 会广播 UserMessage，经转发器回成 UserEcho 由两端统一渲染该回合的用户气泡，
 /// 与普通输入在同步模式下的回显路径一致。所有调用点均为纯文本（无图），故只收文本。
 pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String) {
-    if let Some(live) = &ctx.sync_session {
+    let submitted = if let Some(live) = &ctx.sync_session {
         live.send_input(atomcode_core::live::UserInput {
             text,
             images: vec![],
         });
+        true
     } else {
         ctx.runtime
             .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
-            .ok();
+            .is_ok()
+    };
+    if submitted {
+        state.on_submit();
     }
-    state.on_submit();
 }
 
 fn compact_sync_guard(
@@ -614,12 +619,17 @@ pub(crate) fn fire_interval_payload(
     };
     match payload {
         crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
-            ctx.runtime
+            if ctx
+                .runtime
                 .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
-                .ok();
-            state.on_submit();
-            if let Some(c) = ctx.loop_ctrl.as_mut() {
-                c.consecutive_failures = 0;
+                .is_ok()
+            {
+                state.on_submit();
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.consecutive_failures = 0;
+                }
+            } else if let Some(c) = ctx.loop_ctrl.as_mut() {
+                c.consecutive_failures = c.consecutive_failures.saturating_add(1);
             }
         }
         crate::event_loop::loop_ctrl::LoopPayload::Slash { cmd, arg } => {
@@ -2103,12 +2113,9 @@ fn execute_slash_command_impl(
             run_login_flow(renderer, ctx)?;
         }
         "logout" => {
-            // /logout only invalidates the OAuth token on disk.
-            // Provider config is a user asset and stays in config.toml
-            // untouched — if the user's default is an AtomGit* provider,
-            // the next LLM request fails with a "re-run /codingplan"
-            // hint instead of the TUI crashing on next startup because
-            // `default_provider` got cleared.
+            // Provider config is a user asset and stays in config.toml. Logout removes
+            // credentials first, then asks the runtime owner to destroy the live provider;
+            // a later /login can reassemble it without losing the user's provider choice.
             //
             // 安全：登出时自动关闭 App 远程访问，防止隧道仍在线。
             if ctx.app_relay_child.take().map_or(false, |mut c| c.start_kill().is_ok()) {
@@ -2118,8 +2125,14 @@ fn execute_slash_command_impl(
             match atomcode_auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);
-                    let _ = reload_runtime_provider(ctx);
-                    renderer.render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned()));
+                    if let Err(error) = deactivate_runtime_provider(ctx) {
+                        let message = format!(
+                            "credentials removed, but provider deactivation failed: {error}"
+                        );
+                        renderer.render(UiLine::Error(
+                            t(Msg::CmdLogoutFailed { error: &message }).into_owned(),
+                        ));
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
@@ -3006,18 +3019,25 @@ fn execute_slash_command_impl(
                     // (Empty input is unreachable here — `head` would be ""
                     // and the `"" | "status"` arm above would have matched.)
                     let condition = trimmed.to_owned();
-                    ctx.runtime
+                    if ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::StartGoal(
                             condition.clone(),
                         ))
-                        .ok();
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     state.goal_condition = Some(condition.clone());
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
-                    ctx.runtime
+                    if ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(condition.into()))
-                        .ok();
-                    state.on_submit();
+                        .is_ok()
+                    {
+                        state.on_submit();
+                    }
                 }
             }
         }
@@ -3059,16 +3079,23 @@ fn execute_slash_command_impl(
                     // Replace any existing loop (both self-paced core and
                     // fixed-interval TUI controller) before setting a new one.
                     stop_active_loop(state, ctx);
-                    ctx.runtime
+                    if ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::StartLoop(prompt.clone()))
-                        .ok();
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     state.loop_label = Some(prompt.clone());
                     state.loop_round = 0;
                     state.loop_started_at = Some(std::time::Instant::now());
-                    ctx.runtime
+                    if ctx.runtime
                         .dispatch(atomcode_coding::DriverCommand::Submit(prompt.into()))
-                        .ok();
-                    state.on_submit();
+                        .is_ok()
+                    {
+                        state.on_submit();
+                    }
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
                     // user it won't come back after a restart/resume.
                     renderer.render(UiLine::CommandOutput(

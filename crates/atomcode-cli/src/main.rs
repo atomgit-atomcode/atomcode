@@ -25,14 +25,12 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_config::config::Config;
 use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpRegistry,
     McpTokenStore, McpTransportConfig,
 };
-use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 
 use atomcode_auth as auth;
@@ -1448,115 +1446,12 @@ async fn run() -> Result<i32> {
     // background task fires on completion, so the slash menu refreshes
     // without a restart.
 
-    let unavailable_reason = if config.providers.is_empty() {
-        Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
-    } else {
-        None
-    };
-
-    /// Build the placeholder `ProviderConfig` used when no real provider is
-    /// available.  The TUI still boots — the Welcome wizard / status-row
-    /// hints nudge the user to `/login`, and a successful
-    /// auth flow rebuilds the real provider via `rebuild_provider`.
-    fn dummy_provider_config() -> (ProviderConfig, String) {
-        (
-            ProviderConfig {
-                provider_type: "openai".to_string(),
-                api_key: Some("unavailable".to_string()),
-                model: String::new(),
-                base_url: None,
-                system_prompt: None,
-                user_agent: None,
-                context_window: default_context_window_for("openai"),
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: false,
-                capable_model: None,
-            },
-            String::new(),
-        )
+    if let Some(ref model) = cli.model {
+        let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
+        if let Some(provider) = config.providers.get_mut(provider_name) {
+            provider.model = model.clone();
+        }
     }
-
-    let (provider_config, model_name) = if unavailable_reason.is_some() {
-        dummy_provider_config()
-    } else {
-        if let Some(ref model) = cli.model {
-            let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
-            if let Some(p) = config.providers.get_mut(provider_name) {
-                p.model = model.clone();
-            }
-        }
-        // Keep api_key as None here so `create_provider()` auto-loads
-        // from `~/.atomcode/auth.toml`. Setting "not-configured" would
-        // bypass that path and force the user to manually provide a key.
-        //
-        // `active_provider` already falls back to the first available
-        // provider when `default_provider` points to a deleted section,
-        // but as a defence-in-depth measure we catch any remaining
-        // errors and swap in the dummy so the TUI still boots.
-        match config.active_provider(cli.provider.as_deref()) {
-            Ok(pc) => {
-                let name = pc.model.clone();
-                (pc.clone(), name)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: could not resolve active provider ({}). \
-                     Launching TUI in onboarding mode — use /login to set up.",
-                    e
-                );
-                dummy_provider_config()
-            }
-        }
-    };
-
-    // `create_provider` may need to load an OAuth token from
-    // `~/.atomcode/auth.toml`. Pre-v4.20 this was a fatal startup
-    // error — if the user had a config.toml with an `AtomGit*` entry
-    // (from an older `/login` that auto-registered one) but no
-    // auth.toml (fresh machine, or auth.toml was deleted), the CLI
-    // bailed before the TUI could load, leaving the user stuck:
-    // they wanted to `/login` but couldn't start the app to run it.
-    //
-    // Graceful fallback: if provider construction fails because the
-    // token is unavailable, swap in the same dummy used on first-run
-    // so the TUI boots. The Welcome-wizard / status-row hints will
-    // nudge the user to `/login`, and a successful
-    // auth flow rebuilds the real provider via `rebuild_provider`.
-    // This binding resolves `model_name` and detects the onboarding
-    // (empty model_name) case. The provider object itself is unused.
-    let (_provider, model_name) = if let Some(reason) = unavailable_reason {
-        (unavailable_provider(reason), model_name)
-    } else {
-        match create_provider(&provider_config) {
-            Ok(p) => (p, model_name),
-            Err(e) => {
-                let msg = format!("{:#}", e);
-                if is_auth_gap_error(&msg) {
-                    eprintln!(
-                        "Note: provider credentials not available ({}). \
-                         Launching TUI in onboarding mode — use /login to set up.",
-                        msg
-                    );
-                    (
-                        unavailable_provider(format!(
-                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
-                            msg
-                        )),
-                        String::new(),
-                    )
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    };
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
@@ -1619,6 +1514,16 @@ async fn run() -> Result<i32> {
         // fail-closed timeout so an unanswered approval can't park the run forever.
         !is_headless,
     );
+    let model_name = runtime_cfg.model.clone();
+    let provider_bootstrap = if is_headless {
+        atomcode_coding::ProviderBootstrap::Required
+    } else if config.providers.is_empty() {
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::NotConfigured,
+        )
+    } else {
+        atomcode_coding::ProviderBootstrap::RecoverAuthentication
+    };
     eprintln!("[engine] active (model {})", runtime_cfg.model);
     let external_session = session_to_continue.as_ref().map(|session| {
         (
@@ -1629,7 +1534,7 @@ async fn run() -> Result<i32> {
         )
     });
     let (native_runtime, native_coding_cfg) =
-        spawn_native_cli_runtime(&runtime_cfg, external_session).await?;
+        spawn_native_cli_runtime(&runtime_cfg, external_session, provider_bootstrap).await?;
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -1996,6 +1901,7 @@ fn runtime_config_from(
 async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     external_session: Option<(String, atomcode_kernel::message::SessionSnapshot)>,
+    bootstrap: atomcode_coding::ProviderBootstrap,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
@@ -2013,12 +1919,15 @@ async fn spawn_native_cli_runtime(
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
     };
-    let runtime = atomcode_coding::CodingRuntime::start(atomcode_coding::CodingRuntimeStart {
-        agent: agent.clone(),
-        prepare,
-        provider_factory: atomcode_daemon::coding_provider_factory(),
-        plugin_hooks: atomcode_daemon::installed_plugin_hook_source(),
-    })
+    let runtime = atomcode_coding::CodingRuntime::start_with_bootstrap(
+        atomcode_coding::CodingRuntimeStart {
+            agent: agent.clone(),
+            prepare,
+            provider_factory: atomcode_daemon::coding_provider_factory(),
+            plugin_hooks: atomcode_daemon::installed_plugin_hook_source(),
+        },
+        bootstrap,
+    )
     .await
     .map_err(anyhow::Error::new)?;
     if cfg.dangerously_skip_permissions {
@@ -3602,47 +3511,11 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     }));
 }
 
-/// Classify a `create_provider` error display string as an "auth gap" —
-/// i.e. the user has no usable OAuth token (file missing, malformed,
-/// access_token expired, refresh_token expired/missing, refresh network
-/// error, etc.). Auth-gap errors must NOT abort startup; they should
-/// fall back to the onboarding TUI so the user can run `/login` from
-/// within the app.
-///
-/// Implementation note — substring matching, not typed errors:
-///
-/// `create_provider` returns `anyhow::Error` and the auth-gap producers
-/// live in three modules (`provider::mod::load_auth_token`,
-/// `provider::mod::refresh_and_save`, `auth::oauth::get_valid_token`).
-/// Threading a typed sentinel through all of them is invasive; instead
-/// we match on a stable convention: **every auth-gap error message in
-/// the codebase ends with the substring `"/login"`** (either
-/// `"please /login"` or `"please use /login"`). That hint is part of
-/// the user-facing contract — any future auth-gap producer that wants
-/// graceful fallback simply has to follow the same convention.
-///
-/// The three legacy substrings (`Not logged in` / `Invalid auth.toml`
-/// / `Token expired`) are retained as belt-and-braces: they were the
-/// original matches before the `"/login"` rule was extracted, and
-/// keeping them ensures the test for the historical contract stays
-/// green even if some future refactor temporarily strips the `/login`
-/// suffix from a specific message.
-///
-/// Non-auth errors (config parse failure, network issues unrelated to
-/// the refresh endpoint, provider validation rejects model name, etc.)
-/// fall through to `return Err(e)` and abort startup as designed.
-fn is_auth_gap_error(msg: &str) -> bool {
-    msg.contains("/login")
-        || msg.contains("Not logged in")
-        || msg.contains("Invalid auth.toml")
-        || msg.contains("Token expired")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         runtime_config_from, close_thinking_chunk, format_thinking_chunk, format_verbose_tool_chunk,
-        is_auth_gap_error, resolve_working_dir, truncate_log_line,
+        resolve_working_dir, truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -3881,86 +3754,4 @@ mod tests {
         );
     }
 
-    // ── is_auth_gap_error ────────────────────────────────────────────
-    //
-    // Regression set for the "both access_token AND refresh_token
-    // expired → CLI bails before TUI loads" bug. Pre-fix catch list
-    // only matched `Not logged in` / `Invalid auth.toml` / `Token
-    // expired`, missing the 4 paths below — user landed in an
-    // unrecoverable startup error because they couldn't get into the
-    // TUI to run `/login`. Post-fix every auth-gap error's `/login`
-    // suffix triggers graceful fallback to onboarding mode.
-
-    #[test]
-    fn auth_gap_catches_historical_three() {
-        // Pre-existing matches — must stay green.
-        assert!(is_auth_gap_error("Not logged in — please use /login"));
-        assert!(is_auth_gap_error("Invalid auth.toml — please use /login"));
-        assert!(is_auth_gap_error("Token expired — please use /login"));
-    }
-
-    #[test]
-    fn auth_gap_catches_refresh_http_failure() {
-        // The actual user-reported scenario: access_token expired,
-        // `refresh_and_save` POSTs the (also-expired) refresh_token to
-        // the broker, broker returns 401, `provider::mod::refresh_and_save`
-        // bails with this message. Pre-fix catch list MISSED this —
-        // none of the 3 historical substrings appeared, so CLI fell
-        // through to `return Err(e)` and aborted startup.
-        assert!(is_auth_gap_error(
-            "Token refresh failed (401 Unauthorized) — please /login"
-        ));
-        assert!(is_auth_gap_error(
-            "Token refresh failed (400 Bad Request) — please /login"
-        ));
-    }
-
-    #[test]
-    fn auth_gap_catches_refresh_network_failure() {
-        // `refresh_and_save` network-layer error path (broker host
-        // unreachable, DNS failure, TLS error, etc.). Same root cause
-        // as the HTTP path — token can't be refreshed → user needs
-        // `/login`. Onboarding TUI is the only way they can run it.
-        assert!(is_auth_gap_error(
-            "Token refresh failed: connection refused — please /login"
-        ));
-    }
-
-    #[test]
-    fn auth_gap_catches_refresh_parse_failure() {
-        // Broker returned 200 but body wasn't valid refresh-token
-        // JSON. Treated as auth gap because there's no usable token
-        // either way.
-        assert!(is_auth_gap_error(
-            "Token refresh parse error: missing field `access_token` — please /login"
-        ));
-    }
-
-    #[test]
-    fn auth_gap_catches_missing_refresh_token() {
-        // `auth/oauth.rs::refresh_access_token` when stored auth.toml
-        // has access_token but no refresh_token field. Suffix is
-        // "please /login again" — still ends in `/login`, so the new
-        // substring rule catches it.
-        assert!(is_auth_gap_error(
-            "No refresh_token available — please /login again"
-        ));
-    }
-
-    #[test]
-    fn auth_gap_does_not_swallow_non_auth_errors() {
-        // Non-auth errors must NOT trigger the onboarding fallback —
-        // the user should see the real failure, not a generic "please
-        // /login" prompt that doesn't apply.
-        assert!(!is_auth_gap_error(
-            "Config parse error: invalid TOML at line 12"
-        ));
-        assert!(!is_auth_gap_error(
-            "Provider rejected model name 'foo-bar-9000': unknown model"
-        ));
-        assert!(!is_auth_gap_error(
-            "HTTP request to https://api.example.com failed: timeout"
-        ));
-        assert!(!is_auth_gap_error(""));
-    }
 }

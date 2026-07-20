@@ -1018,6 +1018,13 @@ impl UiState {
         self.steer_pending = 0;
     }
 
+    /// The runtime rejected the turn before accepting it. Keep the UI idle and
+    /// discard the cancel-only restore stash; the committed text remains
+    /// available through input history.
+    pub(crate) fn on_submit_rejected(&mut self) {
+        self.last_submitted_message = None;
+    }
+
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
@@ -2287,5 +2294,16 @@ mod tests {
         st.on_steer_sent();
         st.on_submit();
         assert_eq!(st.steer_pending, 0, "a fresh turn starts at 0");
+    }
+
+    #[test]
+    fn rejected_submit_discards_cancel_restore_without_entering_streaming() {
+        let mut st = UiState::new();
+        st.last_submitted_message = Some("not accepted".to_string());
+
+        st.on_submit_rejected();
+
+        assert_eq!(st.phase, UiPhase::Idle);
+        assert!(st.last_submitted_message.is_none());
     }
 }
