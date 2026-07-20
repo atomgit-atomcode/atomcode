@@ -138,7 +138,7 @@ pub fn launch(c: &Candidate) -> std::io::Result<()> {
     // On Windows, spawning the .exe directly would flash a console window;
     // suppress it with CREATE_NO_WINDOW (no-op on other platforms). Mirrors
     // what `atomcode_core::tool::open_file` does for the same reason.
-    atomcode_core::process_utils::suppress_console_window_sync(&mut cmd);
+    atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
     cmd.spawn().map(|_| ())
 }
 

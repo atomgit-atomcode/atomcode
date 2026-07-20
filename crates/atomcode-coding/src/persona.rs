@@ -27,9 +27,9 @@ pub(crate) fn todo_switch_enabled() -> bool {
 }
 
 /// Resolve the `request_user_input` tool switch for every `coding_persona` call site
-/// (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF).  Delegates to
-/// `atomcode_config::config::request_user_input_enabled_from_env` so the persona gate
-/// and the config helper always agree.
+/// (`ATOMCODE_REQUEST_USER_INPUT` env, default ON — opt-out via `=0`/`false`/`off`).
+/// Delegates to `atomcode_config::config::request_user_input_enabled_from_env` so the
+/// persona gate and the config helper always agree.
 ///
 /// NOTE: the tool-registration gate in `atomcode-capabilities/src/tools/mod.rs` contains
 /// an INTENTIONAL DUPLICATE of the same env logic — it cannot call this helper (or the
@@ -122,15 +122,23 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // `request_user_input` tool usage guidance — surfaced in the system prompt so weak models
     // (GLM / DeepSeek) that under-weight tool descriptions still see the judgment line.
     // MUST stay gated on the SAME condition as the tool registration in `atomcode-capabilities`
-    // (`ATOMCODE_REQUEST_USER_INPUT` env, default OFF): instructing the model to call a tool
-    // that isn't mounted provokes phantom tool calls. `request_user_input_enabled` is that
-    // switch, resolved by the caller via `request_user_input_switch_enabled()`.
+    // (`ATOMCODE_REQUEST_USER_INPUT` env, default ON — opt-out via =0/false/off): instructing
+    // the model to call a tool that isn't mounted provokes phantom tool calls.
+    // `request_user_input_enabled` is that switch, resolved by the caller via
+    // `request_user_input_switch_enabled()`.
     if request_user_input_enabled {
         p.push_str(REQUEST_USER_INPUT_USAGE);
     }
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
     }
+    // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
+    // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
+    // models (GLM / DeepSeek) under-weight both and so only ever fire a skill when the
+    // user names it explicitly, never on a description match. Always on: the `use_skill`
+    // tool is unconditionally mounted, and the line degrades gracefully ("if none match,
+    // proceed normally") when no skills are installed. Judgment-framed, not mandatory.
+    p.push_str(SKILLS_USAGE);
     if atomcode_config::config::offline::is_offline_active() {
         p.push_str(&offline_environment_block());
     }
@@ -266,6 +274,21 @@ unrelated multi-step work, call `todowrite` with the new full list to REPLACE th
 than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
 or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
 use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
+
+/// Skill-trigger guidance. Surfaced in the system prompt because weak models under-weight
+/// the `use_skill` tool description and the AVAILABLE SKILLS catalog's own guidance line;
+/// without this they only fire a skill when the user names it, never on a description match
+/// (the reason a skill like `brainstorming` "basically never appeared"). Always appended
+/// (see `coding_persona`) — degrades gracefully when no skills are installed.
+const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
+If a task clearly matches an installed skill's description — not only when the user names the \
+skill — you MUST load it with `use_skill` and follow it BEFORE doing the work. Installed skills \
+are listed under the '=== AVAILABLE SKILLS ===' section of this system prompt. This takes \
+priority over asking the user a clarifying question: if a skill matches the request (e.g. \
+brainstorming for a design/build request), load it FIRST and let it drive the questions — do \
+not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
+which skill you're using; if you skip an obviously matching skill, say why. If several match, \
+use the minimal set; if none match, proceed normally.";
 
 /// Asking-the-user guidance for the system prompt. Judgment-framed: call
 /// `request_user_input` only when the decision is genuinely the user's to make —
@@ -487,6 +510,16 @@ mod tests {
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("VERIFY"));
         assert!(p.contains("## RISKY ACTIONS:"));
+        // Skill-trigger nudge is always present (weak-model reinforcement of the catalog).
+        assert!(p.contains("## SKILLS:"), "skill-trigger guidance always present");
+        assert!(p.contains("use_skill"), "names the skill-loading tool");
+        // Anti-bypass: a matching skill must win over an ad-hoc clarifying question
+        // (the observed failure: request_user_input pre-empted brainstorming).
+        assert!(
+            p.contains("priority over asking the user a clarifying question"),
+            "SKILLS must out-prioritize ad-hoc clarifying questions"
+        );
+        assert!(p.contains("say why"), "accountability: justify skipping an obvious match");
         // Every mounted tool the discipline/model relies on must be advertised, so the
         // model knows it exists. edit_file in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
@@ -922,5 +955,43 @@ mod tests {
         let p = coding_persona("glm-5.2", true, false);
         assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
         std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+    }
+
+    // request_user_input_switch_enabled() is now default ON: unset → true, =0/false/off → false.
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_switch_enabled_default_on() {
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        assert!(
+            request_user_input_switch_enabled(),
+            "unset ATOMCODE_REQUEST_USER_INPUT must default to ON"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_switch_enabled_opt_out() {
+        std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "0");
+        assert!(
+            !request_user_input_switch_enabled(),
+            "ATOMCODE_REQUEST_USER_INPUT=0 must disable the tool"
+        );
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_request_user_input_env)]
+    fn request_user_input_guidance_present_by_default() {
+        // With the env unset the switch is ON, so the ASKING THE USER section should
+        // appear in the persona produced by coding_persona with enabled=true.
+        // (coding_persona itself takes an explicit bool; the test verifies the
+        // content gate — the full env→bool path is covered by switch_enabled tests.)
+        std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
+        let enabled = request_user_input_switch_enabled();
+        let p = coding_persona("glm-5.2", false, enabled);
+        assert!(
+            p.contains("## ASKING THE USER"),
+            "guidance must be present when switch is default-on: {p}"
+        );
     }
 }

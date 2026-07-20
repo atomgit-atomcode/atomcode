@@ -572,9 +572,11 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
     }
 }
 
-/// Resolve the effective `request_user_input` tool switch: DEFAULT-OFF semantics.
-/// Returns `true` only when `env` is `Some` and NOT one of `""`/`"0"`/`"false"`/`"off"`
-/// (case-insensitive, trimmed). `None` → `false`.
+/// Resolve the effective `request_user_input` tool switch: DEFAULT-ON semantics.
+/// Returns `false` only when `env` is `Some("")`/`"0"`/`"false"`/`"off"` (case-insensitive,
+/// trimmed).  `None` (unset) or any other value → `true`.
+///
+/// Opt-out: set `ATOMCODE_REQUEST_USER_INPUT=0` (or `false`/`off`) to disable.
 ///
 /// Called by `atomcode-coding`'s persona gate (`request_user_input_switch_enabled`).
 ///
@@ -586,9 +588,8 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
 /// vice versa.
 pub fn request_user_input_enabled_from_env(env: Option<&str>) -> bool {
     match env.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
-        Some(v) if v.is_empty() || v == "0" || v == "false" || v == "off" => false,
-        Some(_) => true,
+        Some(v) if v == "0" || v == "false" || v == "off" || v.is_empty() => false,
+        _ => true, // default ON — unset, or any other value
     }
 }
 
@@ -1149,10 +1150,10 @@ mod tests {
     }
 
     #[test]
-    fn request_user_input_enabled_default_off() {
-        // None → false (default-off)
-        assert!(!super::request_user_input_enabled_from_env(None));
-        // Falsy values → false
+    fn request_user_input_enabled_default_on() {
+        // None (unset) → true (default-ON)
+        assert!(super::request_user_input_enabled_from_env(None));
+        // Explicit opt-out values → false
         assert!(!super::request_user_input_enabled_from_env(Some("")));
         assert!(!super::request_user_input_enabled_from_env(Some("0")));
         assert!(!super::request_user_input_enabled_from_env(Some("false")));
@@ -1160,7 +1161,7 @@ mod tests {
         assert!(!super::request_user_input_enabled_from_env(Some("off")));
         assert!(!super::request_user_input_enabled_from_env(Some("OFF")));
         assert!(!super::request_user_input_enabled_from_env(Some("  off  ")));
-        // Truthy values → true
+        // Any other value (truthy) → true
         assert!(super::request_user_input_enabled_from_env(Some("1")));
         assert!(super::request_user_input_enabled_from_env(Some("true")));
         assert!(super::request_user_input_enabled_from_env(Some("yes")));

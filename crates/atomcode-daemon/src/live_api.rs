@@ -181,10 +181,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "project".to_string());
-                    let new_key = atomcode_core::tool::path_case_key(&dir);
+                    let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                     project
                         .recent_dirs
-                        .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                        .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                     project.recent_dirs.insert(0, dir.clone());
                     project.recent_dirs.truncate(5);
                 }
@@ -199,10 +199,10 @@ pub fn live_set_working_dir(dir: std::path::PathBuf) {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
-                let new_key = atomcode_core::tool::path_case_key(&dir);
+                let new_key = atomcode_capabilities::pathnorm::path_case_key(&dir);
                 project
                     .recent_dirs
-                    .retain(|d| atomcode_core::tool::path_case_key(d) != new_key);
+                    .retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != new_key);
                 project.recent_dirs.insert(0, dir.clone());
                 project.recent_dirs.truncate(5);
             }
@@ -771,6 +771,7 @@ impl TurnExecutor for KernelTurnExecutor {
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
         approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
         cancel: CancellationToken,
     ) {
         let emit = |te: TurnEvent| {
@@ -987,6 +988,16 @@ impl TurnExecutor for KernelTurnExecutor {
             None
         };
 
+        // request_user_input: register the responder so any view's
+        // `LiveSession.respond(id, value)` is drained below into
+        // the native runtime's `respond(id, value)`. Independent of approval mode —
+        // the tool can raise a question in any mode.
+        let mut responder_rx = {
+            let (tx, rx) = mpsc::unbounded_channel::<(u64, serde_json::Value)>();
+            *responder.lock().await = Some(tx);
+            rx
+        };
+
         let state = guard.as_mut().unwrap();
         let mut cancelled = false;
         let mut runtime_dead = false;
@@ -1000,6 +1011,14 @@ impl TurnExecutor for KernelTurnExecutor {
                         _ = cancel.cancelled(), if !cancelled => {
                             cancelled = true;
                             let _ = runtime.cancel().await;
+                            continue;
+                        }
+                        Some((id, value)) = responder_rx.recv() => {
+                            if let Err(error) = runtime.respond(id, value).await {
+                                emit(TurnEvent::Warning(format!(
+                                    "user input response delivery failed: {error}"
+                                )));
+                            }
                             continue;
                         }
                         event = state.events.recv() => event,
@@ -1021,6 +1040,10 @@ impl TurnExecutor for KernelTurnExecutor {
                             use atomcode_capabilities::tools::{
                                 ApprovalRequest, ApprovalResponse, APPROVAL_KIND,
                             };
+                            if let Some(event) = request_user_input_to_turn(&request) {
+                                emit(event);
+                                continue;
+                            }
                             if request.kind != APPROVAL_KIND {
                                 let _ = runtime.respond(request.id, serde_json::Value::Null).await;
                                 continue;
@@ -1238,12 +1261,16 @@ impl TurnExecutor for KernelTurnExecutor {
                 event @ TurnEvent::ToolBatchStarted { .. }
                 | event @ TurnEvent::ToolBatchCompleted { .. }
                 | event @ TurnEvent::ApprovalRequested { .. }
-                | event @ TurnEvent::ApprovalResolved { .. } => emit(event),
+                | event @ TurnEvent::ApprovalResolved { .. }
+                | event @ TurnEvent::UserInputRequested { .. } => emit(event),
             }
         };
 
         // The approval slot is per-turn; clear it so a stale sender can't leak.
         *approver.lock().await = None;
+        // The request_user_input responder slot is per-turn; clear it too so a
+        // stale sender can't leak into the next turn.
+        *responder.lock().await = None;
 
         // Writeback + AUTHORITATIVE terminal persist — the engine's snapshot becomes the
         // conversation of record, and we overwrite the stable `<id>.json` with it (so
@@ -1623,6 +1650,40 @@ impl KernelTurnProjector {
     }
 }
 
+/// Convert the driver-neutral request emitted by the native coding runtime into
+/// the live/web event. Other request kinds remain owned by their protocol paths.
+fn request_user_input_to_turn(request: &atomcode_coding::RuntimeRequest) -> Option<TurnEvent> {
+    use atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND;
+
+    if request.kind != REQUEST_USER_INPUT_KIND {
+        return None;
+    }
+    let payload = &request.payload;
+    Some(TurnEvent::UserInputRequested {
+        request_id: request.id,
+        header: payload
+            .get("header")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        question: payload
+            .get("question")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        mode: payload
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("single")
+            .to_string(),
+        options: payload
+            .get("options")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
 /// Convert driver-neutral coding runtime events to the daemon streaming surface.
 pub(crate) fn coding_runtime_to_turn(ev: CodingRuntimeEvent) -> Option<TurnEvent> {
     match ev {
@@ -1868,6 +1929,9 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::Request(request) => {
+                // `/chat` has no interactive user-input endpoint. Fail closed so
+                // request_user_input returns its graceful unsupported result instead
+                // of leaving the native runtime parked forever.
                 let _ = handle.respond(request.id, serde_json::Value::Null).await;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
@@ -2022,6 +2086,14 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "permission_resolved")]
     PermissionResolved { call_id: String, decision: String },
+    #[serde(rename = "user_input_request")]
+    UserInputRequest {
+        request_id: u64,
+        header: String,
+        question: String,
+        mode: String,
+        options: Vec<serde_json::Value>,
+    },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -2163,6 +2235,19 @@ fn to_wire(ev: LiveEvent) -> Option<LiveWireEvent> {
                 secs_until_reset,
                 auto_resuming,
                 server_message,
+            },
+            TE::UserInputRequested {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            } => LiveWireEvent::UserInputRequest {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
             },
             TE::ToolCallStreaming { .. }
             | TE::ToolBatchStarted { .. }
@@ -2661,6 +2746,38 @@ pub(crate) async fn live_permission(
         }
     };
     Json(serde_json::json!({ "accepted": ok }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserInputAnswerReq {
+    pub request_id: u64,
+    pub declined: bool,
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// POST /live/user-input — Deliver the user's answer to a pending `request_user_input`
+/// question raised by the agent. First-come-first-served via `LiveSession.respond`.
+///
+/// Request body: `{ "request_id": u64, "declined": bool, "selected": [string], "text": string|null }`
+/// Response: `{ "accepted": bool }` — false if there is no live session or no pending request
+/// with that id.
+pub(crate) async fn live_user_input(
+    State(_state): State<AppState>,
+    Json(req): Json<UserInputAnswerReq>,
+) -> impl IntoResponse {
+    let value = serde_json::json!({
+        "declined": req.declined,
+        "selected": req.selected,
+        "text": req.text,
+    });
+    let ok = match current_live_session() {
+        Some(s) => s.respond(req.request_id, value).await,
+        None => false,
+    };
+    axum::Json(serde_json::json!({ "accepted": ok }))
 }
 
 #[derive(serde::Deserialize)]
@@ -3179,6 +3296,115 @@ mod tests {
         assert!(snapshot.cold_summaries.is_empty());
     }
 
+    // 回归：native kernel 事件投影必须保留限流字段。
+    #[test]
+    fn kernel_projector_rate_limited_is_forwarded_not_dropped() {
+        let mut projector = KernelTurnProjector::default();
+        let result = projector.project(atomcode_kernel::event::AgentEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+            auto_resuming: false,
+            server_message: None,
+        });
+        match result {
+            Some(TurnEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                ..
+            }) => {
+                assert_eq!(reset_at_display, "18:09");
+                assert_eq!(reset_label, "5h");
+                assert_eq!(secs_until_reset, Some(7200));
+                assert!(!auto_resuming);
+            }
+            other => panic!(
+                "expected Some(TurnEvent::RateLimited{{..}}), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // Native RuntimeRequest must map to the live request while keeping payload fields opaque.
+    #[test]
+    fn native_request_user_input_maps_to_user_input_requested() {
+        let payload = serde_json::json!({
+            "header": "Choose wisely",
+            "question": "Which option?",
+            "mode": "single",
+            "options": [
+                { "label": "Alpha", "description": "First choice" },
+                { "label": "Beta" }
+            ]
+        });
+        let result = request_user_input_to_turn(&atomcode_coding::RuntimeRequest {
+            id: 7,
+            kind: "request_user_input".into(),
+            payload,
+            snapshot: None,
+        });
+        match result {
+            Some(TurnEvent::UserInputRequested {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            }) => {
+                assert_eq!(request_id, 7);
+                assert_eq!(header, "Choose wisely");
+                assert_eq!(question, "Which option?");
+                assert_eq!(mode, "single");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].get("label").and_then(|v| v.as_str()), Some("Alpha"));
+            }
+            other => panic!(
+                "expected Some(TurnEvent::UserInputRequested{{..}}), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // UserInputRequest must serialize with `"type":"user_input_request"` and carry
+    // `request_id` so the frontend can correlate the pending question.
+    #[test]
+    fn user_input_request_serializes_as_correct_type() {
+        let wire = to_wire(LiveEvent::Turn(TurnEvent::UserInputRequested {
+            request_id: 42,
+            header: "Pick one".into(),
+            question: "Red or blue?".into(),
+            mode: "single".into(),
+            options: vec![
+                serde_json::json!({ "label": "Red" }),
+                serde_json::json!({ "label": "Blue" }),
+            ],
+        }))
+        .expect("UserInputRequested must produce a wire event");
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(
+            json.contains(r#""type":"user_input_request""#),
+            "wire type must be user_input_request: {json}"
+        );
+        assert!(json.contains(r#""request_id":42"#), "{json}");
+        assert!(json.contains(r#""mode":"single""#), "{json}");
+        assert!(json.contains("Red"), "{json}");
+    }
+
+    #[test]
+    fn native_unknown_request_is_not_exposed_as_user_input() {
+        let unknown = request_user_input_to_turn(&atomcode_coding::RuntimeRequest {
+            id: 1,
+            kind: "unknown_future_kind".into(),
+            payload: serde_json::Value::Null,
+            snapshot: None,
+        });
+        assert!(
+            unknown.is_none(),
+            "unknown runtime request must remain protocol-owned: {unknown:?}"
+        );
+    }
     // 限流事件必须作为独立的 rate_limited 线事件下发，带 reset_at_display/reset_label/
     // secs_until_reset 字段，供 webui 渲染倒计时提示而非普通错误。
     #[test]

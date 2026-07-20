@@ -1964,6 +1964,89 @@ body {
   padding: 0 18px;
 }
 
+/* === UserInputCard (request_user_input tool) === */
+/* Option row: wraps a radio/checkbox + label body inline; the whole label is
+   clickable (native label-for semantics via wrapping). */
+.user-input-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--corner-radius-small);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.user-input-option:hover { background: var(--app-list-hover-background); }
+.user-input-option input[type="radio"],
+.user-input-option input[type="checkbox"] {
+  flex-shrink: 0;
+  margin-top: 2px; /* optical alignment with the first line of label text */
+  cursor: pointer;
+  accent-color: var(--app-brand);
+}
+/* Body block: label text + optional description stacked vertically. */
+.user-input-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.user-input-option-label {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--app-primary-foreground);
+  line-height: 1.4;
+}
+.user-input-option-desc {
+  font-size: 12px;
+  color: var(--app-secondary-foreground);
+  line-height: 1.4;
+}
+
+/* Single-line text input (Other option in single/multiple mode). */
+.user-input-text {
+  width: 100%;
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+.user-input-text::placeholder { color: var(--app-input-placeholder-foreground); }
+.user-input-text:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-text:disabled { opacity: 0.5; cursor: default; }
+
+/* Multi-line textarea (text mode). */
+.user-input-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+.user-input-textarea::placeholder { color: var(--app-input-placeholder-foreground); }
+.user-input-textarea:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-textarea:disabled { opacity: 0.5; cursor: default; }
+
+/* Inline error message below the options/input. */
+.user-input-error {
+  font-size: 12px;
+  color: var(--app-error-foreground);
+  margin: 0;
+}
+
 /* === Tool detail (expanded args + output) === */
 .tool-chevron {
   font-size: 10px;

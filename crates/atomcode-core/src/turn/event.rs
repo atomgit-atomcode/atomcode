@@ -107,6 +107,19 @@ pub enum TurnEvent {
     },
     /// 任一端批准/拒绝了工具审批，广播给所有视图同步卡片状态。
     ApprovalResolved { call_id: String, decision: String },
+    /// A tool (currently `request_user_input`) raised a structured question a view must
+    /// render and answer through the native runtime response seam. `request_id` is
+    /// the correlation id passed to `CodingRuntimeHandle::respond`.
+    ///
+    /// `options` are raw `{ label, description? }` objects kept as opaque
+    /// `serde_json::Value` so core carries no capabilities coupling.
+    UserInputRequested {
+        request_id: u64,
+        header: String,
+        question: String,
+        mode: String,
+        options: Vec<serde_json::Value>,
+    },
 }
 
 /// One call inside a `ToolBatchStarted` payload. Carries everything the UI
@@ -119,4 +132,46 @@ pub struct ToolBatchCall {
     /// True if this call may run concurrently (read-only); false → serialized
     /// behind the write-lock. Drives the UI's honest "in parallel" label.
     pub parallel_safe: bool,
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape test for the `request_user_input` webui event: fields round-trip
+    /// through construction/pattern-match and `options` stays opaque JSON so
+    /// core needs no capabilities coupling. `request_id` pairs with the
+    /// native runtime's `DriverCommand::Respond { id, .. }`.
+    #[test]
+    fn user_input_requested_carries_opaque_options() {
+        let ev = TurnEvent::UserInputRequested {
+            request_id: 42,
+            header: "Choose".into(),
+            question: "Which one?".into(),
+            mode: "select".into(),
+            options: vec![
+                serde_json::json!({ "label": "A", "description": "first" }),
+                serde_json::json!({ "label": "B" }),
+            ],
+        };
+        match ev {
+            TurnEvent::UserInputRequested {
+                request_id,
+                header,
+                question,
+                mode,
+                options,
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(header, "Choose");
+                assert_eq!(question, "Which one?");
+                assert_eq!(mode, "select");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0]["label"], serde_json::json!("A"));
+                assert_eq!(options[0]["description"], serde_json::json!("first"));
+                assert_eq!(options[1]["label"], serde_json::json!("B"));
+                assert!(options[1].get("description").is_none());
+            }
+            _ => panic!("expected UserInputRequested"),
+        }
+    }
 }

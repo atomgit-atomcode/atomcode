@@ -76,18 +76,22 @@ pub struct UserInputPanel {
     pub header: String,
     pub question: String,
     pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
-    /// Option labels (single/multiple). Empty for text mode.
-    pub options: Vec<String>,
-    /// Highlighted row (single/multiple). Ranges over
-    /// `0..options.len()` (options), `options.len()` (the free-text row), and
-    /// `options.len()+1` (the submit row). See [`UserInputPanel::is_custom_row`]
-    /// / [`UserInputPanel::is_submit_row`].
+    /// Concrete options (single/multiple): label + optional model-provided
+    /// description (rendered as a faint second line). Empty for text mode.
+    /// Does NOT include the always-appended "Other" free-text option — that is
+    /// synthesized at index `options.len()`.
+    pub options: Vec<(String, Option<String>)>,
+    /// Highlighted row (single/multiple). Ranges over `0..options.len()`
+    /// (concrete options) and `options.len()` (the always-appended "Other"
+    /// free-text row). There is NO separate submit row. See
+    /// [`UserInputPanel::is_other_row`].
     pub cursor: usize,
-    /// Per-option checked flags (multiple mode only; parallel to `options`).
+    /// Per-row checked flags (multiple mode only). Length `options.len() + 1`:
+    /// one slot per concrete option PLUS a trailing slot for the "Other" row.
     pub checked: Vec<bool>,
     /// Free-form buffer (text mode only) — the standalone `text` mode's input.
     pub text: String,
-    /// Free-text buffer for the folded `✎ 自己输入…` row in single/multiple
+    /// Free-text buffer for the always-appended "Other" row in single/multiple
     /// mode. Distinct from `text` (which is the standalone text-mode input).
     pub custom_text: String,
 }
@@ -97,8 +101,10 @@ impl UserInputPanel {
         request_id: u64,
         r: &atomcode_capabilities::tools::request_user_input::UserInputRequest,
     ) -> Self {
-        let options: Vec<String> = r.options.iter().map(|o| o.label.clone()).collect();
-        let checked = vec![false; options.len()];
+        let options: Vec<(String, Option<String>)> =
+            r.options.iter().map(|o| (o.label.clone(), o.description.clone())).collect();
+        // One checkbox slot per concrete option PLUS the trailing "Other" row.
+        let checked = vec![false; options.len() + 1];
         Self {
             request_id,
             header: r.header.clone(),
@@ -111,28 +117,41 @@ impl UserInputPanel {
             custom_text: String::new(),
         }
     }
-    /// Last navigable cursor index for single/multiple mode.
-    /// Single: the custom-text row at `options.len()` (no submit row).
-    /// Multiple: the submit row at `options.len() + 1` (custom then submit).
+    /// Index of the always-appended "Other" free-text row (`options.len()`).
+    pub fn other_index(&self) -> usize {
+        self.options.len()
+    }
+    /// Index of the Submit row (multiple mode only: `options.len() + 1`).
+    /// Returns `None` for single mode (no submit row).
+    pub fn submit_index(&self) -> Option<usize> {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        if matches!(self.mode, UserInputMode::Multiple) {
+            Some(self.options.len() + 1)
+        } else {
+            None
+        }
+    }
+    /// Last navigable cursor index.
+    /// - Single: `options.len()` (the "Other" row is last; no submit row).
+    /// - Multiple: `options.len() + 1` (Submit row is last, after Other).
     fn last_row(&self) -> usize {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         match self.mode {
-            UserInputMode::Single => self.options.len(),
-            _ => self.options.len() + 1,
+            UserInputMode::Multiple => self.options.len() + 1,
+            _ => self.other_index(),
         }
     }
-    /// Whether `cursor` is on the `✎ 自己输入…` free-text row.
-    pub fn is_custom_row(&self) -> bool {
-        self.cursor == self.options.len()
+    /// Whether `cursor` is on the always-appended "Other" free-text row.
+    pub fn is_other_row(&self) -> bool {
+        self.cursor == self.other_index()
     }
-    /// Whether `cursor` is on the `✔ 提交` submit row.
-    /// In single mode there is no submit row — always returns `false`.
+    /// Whether `cursor` is on the Submit row (multiple mode only).
     pub fn is_submit_row(&self) -> bool {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode;
-        match self.mode {
-            UserInputMode::Single => false,
-            _ => self.cursor == self.options.len() + 1,
-        }
+        self.submit_index().is_some_and(|i| self.cursor == i)
+    }
+    /// Back-compat alias for the "Other" row (formerly `✎ 自己输入…`).
+    pub fn is_custom_row(&self) -> bool {
+        self.is_other_row()
     }
     pub fn move_up(&mut self) {
         if self.cursor > 0 {
@@ -144,22 +163,19 @@ impl UserInputPanel {
             self.cursor += 1;
         }
     }
-    /// Select/toggle the option under the cursor (a no-op on the custom/submit
-    /// rows). Single mode is exclusive: selecting an option clears every other
-    /// option AND the custom-text buffer. Multiple mode toggles independently,
-    /// and coexists with the custom text.
+    /// Select/toggle the option under the cursor. Single mode is exclusive:
+    /// the cursor IS the radio selection, so this only clears the custom text
+    /// when landing on a concrete option. Multiple mode toggles the row's
+    /// checkbox (including the "Other" row).
     pub fn select_current_option(&mut self) {
         use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
-        if self.cursor >= self.options.len() {
-            return; // custom / submit rows are not options
-        }
         match self.mode {
             Single => {
-                for (i, c) in self.checked.iter_mut().enumerate() {
-                    *c = i == self.cursor;
+                // Single: the cursor row IS the selection (radio). Choosing a
+                // concrete option supersedes any typed custom text.
+                if self.cursor < self.options.len() {
+                    self.custom_text.clear();
                 }
-                // Choosing an option supersedes any custom text (exclusive).
-                self.custom_text.clear();
             }
             Multiple => {
                 if let Some(c) = self.checked.get_mut(self.cursor) {
@@ -169,68 +185,89 @@ impl UserInputPanel {
             Text => {}
         }
     }
-    /// Toggle the highlighted option (multiple-mode Space convenience). In
-    /// single mode this behaves like `select_current_option` (exclusive).
+    /// Toggle the highlighted row (multiple-mode Space / number convenience).
+    /// In single mode this is a no-op beyond clearing custom text on a concrete
+    /// option (the cursor is the radio).
     pub fn toggle(&mut self) {
         self.select_current_option();
     }
-    /// Typed characters edit the custom-text buffer. In single mode, typing a
-    /// custom answer supersedes any option selection (exclusive).
-    pub fn push_custom(&mut self, c: char) {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
-        if matches!(self.mode, Single) {
-            for c in self.checked.iter_mut() {
-                *c = false;
-            }
+    /// Toggle a specific row by index (multiple mode). Single mode moves the
+    /// cursor to it instead (the cursor is the radio) — handled by the caller.
+    pub fn toggle_index(&mut self, i: usize) {
+        if let Some(c) = self.checked.get_mut(i) {
+            *c = !*c;
         }
+    }
+    /// Typed characters edit the "Other" custom-text buffer. In single mode
+    /// this supersedes any concrete-option radio selection (the cursor should
+    /// already be on the "Other" row). Inclusion of the custom answer is derived
+    /// from `custom_text.trim()` being non-empty — no separate checkbox state.
+    pub fn push_custom(&mut self, c: char) {
         self.custom_text.push(c);
     }
-    /// Backspace on the custom-text row.
+    /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
         self.custom_text.pop();
     }
-    /// The chosen labels: the checked option (single), all checked ones
-    /// (multiple), or empty (text — the answer rides `text`, not `selected`).
+    /// The chosen concrete-option labels for MULTIPLE mode (all checked
+    /// concrete rows; the "Other" row is handled separately via `custom_text`).
+    /// For single mode this reads the cursor as the radio.
     pub fn chosen(&self) -> Vec<String> {
         use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
         match self.mode {
-            Single | Multiple => self
+            Single => {
+                // Cursor-as-radio: a concrete option row → that label.
+                if self.cursor < self.options.len() {
+                    vec![self.options[self.cursor].0.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            Multiple => self
                 .options
                 .iter()
-                .zip(&self.checked)
-                .filter(|(_, c)| **c)
-                .map(|(l, _)| l.clone())
+                .enumerate()
+                .filter(|(i, _)| self.checked.get(*i).copied().unwrap_or(false))
+                .map(|(_, (l, _))| l.clone())
                 .collect(),
             Text => vec![],
         }
     }
-    /// Build the `UserInputResponse` for the current panel state, mapping
-    /// single/multiple option selections + the custom-text row into `selected`.
-    /// Returns `None` when there is nothing to submit (single with neither an
-    /// option nor custom text) so the caller treats Submit as a no-op instead of
-    /// sending an empty answer. Text mode is handled separately by the caller.
+    /// Build the `UserInputResponse` for the current panel state.
+    /// - single: the cursor row → its label, OR (cursor on "Other")
+    ///   `custom_text.trim()` when non-empty; `None` when nothing to submit.
+    /// - multiple: all checked concrete labels, PLUS `custom_text.trim()` when
+    ///   non-empty (inclusion is text-derived, NOT from `checked[other_index]`);
+    ///   `None` when nothing selected.
+    /// Text mode is handled separately by the caller.
     pub fn build_response(
         &self,
     ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
         use atomcode_capabilities::tools::request_user_input::{UserInputMode::*, UserInputResponse};
         match self.mode {
             Single => {
-                let custom = self.custom_text.trim();
-                let selected = if !custom.is_empty() {
-                    vec![custom.to_string()]
+                let selected = if self.cursor < self.options.len() {
+                    vec![self.options[self.cursor].0.clone()]
                 } else {
-                    self.chosen()
+                    let custom = self.custom_text.trim();
+                    if custom.is_empty() {
+                        return None; // cursor on "Other" with no text → no-op
+                    }
+                    vec![custom.to_string()]
                 };
-                if selected.is_empty() {
-                    return None; // nothing chosen → Submit is a no-op
-                }
                 Some(UserInputResponse { declined: false, selected, text: None })
             }
             Multiple => {
                 let mut selected = self.chosen();
+                // Inclusion of the custom answer is derived from the text itself,
+                // NOT from a separate checked flag — so Enter on the Other row
+                // (which is a no-op) can never desync the checkbox from the text.
                 let custom = self.custom_text.trim();
                 if !custom.is_empty() {
                     selected.push(custom.to_string());
+                }
+                if selected.is_empty() {
+                    return None; // nothing chosen → Submit is a no-op
                 }
                 Some(UserInputResponse { declined: false, selected, text: None })
             }
@@ -242,39 +279,19 @@ impl UserInputPanel {
         }
     }
 
-    /// For **single** mode only: if the cursor is on a concrete option row,
-    /// return an immediate `{selected:[label]}` response; if the cursor is on
-    /// the custom row AND `custom_text` (trimmed) is non-empty, return
-    /// `{selected:[custom_text]}`; otherwise `None` (no-op, keep open).
-    ///
-    /// Multiple and text mode always return `None` — they use the submit-row /
-    /// Enter-buffer flow instead.
+    /// For **single** mode only: Enter confirms the cursor row. On a concrete
+    /// option → `{selected:[label]}`; on the "Other" row → `{selected:[custom]}`
+    /// when non-empty, else `None` (no-op). Multiple / text return `None`
+    /// (their Enter path is handled differently: multiple Enter on the Submit row
+    /// calls `build_response()` directly; Enter on option/Other rows toggles).
     pub fn try_immediate_response(
         &self,
     ) -> Option<atomcode_capabilities::tools::request_user_input::UserInputResponse> {
-        use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
         if !matches!(self.mode, UserInputMode::Single) {
             return None;
         }
-        if self.cursor < self.options.len() {
-            // Concrete option row.
-            let label = self.options[self.cursor].clone();
-            Some(UserInputResponse { declined: false, selected: vec![label], text: None })
-        } else if self.is_custom_row() {
-            // Custom-text row: submit only when there is something typed.
-            let custom = self.custom_text.trim();
-            if custom.is_empty() {
-                None // no-op
-            } else {
-                Some(UserInputResponse {
-                    declined: false,
-                    selected: vec![custom.to_string()],
-                    text: None,
-                })
-            }
-        } else {
-            None
-        }
+        self.build_response()
     }
 }
 
@@ -2158,41 +2175,44 @@ mod tests {
         let mut p = UserInputPanel::new(7, &single_req);
         assert_eq!(p.request_id, 7);
         assert_eq!(p.cursor, 0);
-        // Single: cursor spans options (0..3) and the custom row (3) — NO submit
-        // row. move_down clamps at the custom row (options.len()).
+        // Single: cursor spans concrete options (0..3) and the always-appended
+        // "Other" row (3). No submit row. move_down clamps at the "Other" row.
         for _ in 0..10 {
             p.move_down();
         }
-        assert_eq!(p.cursor, 3, "single move_down clamps at the custom row (options.len())");
-        assert!(p.is_custom_row(), "single cursor clamps at the custom-text row");
-        assert!(!p.is_submit_row(), "single has no submit row");
+        assert_eq!(p.cursor, 3, "single move_down clamps at the Other row (options.len())");
+        assert!(p.is_other_row(), "single cursor clamps at the Other row");
         // move_up clamps at 0.
         for _ in 0..10 {
             p.move_up();
         }
         assert_eq!(p.cursor, 0, "move_up clamps at 0");
-        // Single: selecting an option is exclusive; build_response returns it.
+        // Single is cursor-as-radio: chosen() reads the cursor row's label.
         p.move_down(); // cursor → "API key"
-        p.select_current_option();
         assert_eq!(p.chosen(), vec!["API key".to_string()]);
-        let resp = p.build_response().expect("single with a selection submits");
+        let resp = p.build_response().expect("single with a cursor selection submits");
         assert_eq!(resp.selected, vec!["API key".to_string()]);
         assert_eq!(resp.text, None);
-        // Selecting a different option clears the prior one (exclusive).
+        // Moving the cursor changes the radio selection.
         p.move_up();
-        p.select_current_option(); // "OAuth"
-        assert_eq!(p.chosen(), vec!["OAuth".to_string()], "single is exclusive");
+        assert_eq!(p.chosen(), vec!["OAuth".to_string()], "single radio follows the cursor");
 
-        // Single: typing custom text supersedes the option selection.
+        // Single: cursor on the "Other" row + typed custom text submits it.
+        for _ in 0..10 {
+            p.move_down();
+        }
+        assert!(p.is_other_row());
         p.push_custom('h');
         p.push_custom('i');
-        assert!(p.chosen().is_empty(), "custom text clears option selection");
         let resp = p.build_response().expect("custom text submits");
         assert_eq!(resp.selected, vec!["hi".to_string()]);
-
-        // Single with nothing chosen → build_response is None (Submit no-op).
-        let blank = UserInputPanel::new(11, &single_req);
-        assert!(blank.build_response().is_none(), "empty single does not submit");
+        // "Other" row with empty custom text → no-op.
+        let mut other_empty = UserInputPanel::new(12, &single_req);
+        for _ in 0..10 {
+            other_empty.move_down();
+        }
+        assert!(other_empty.is_other_row());
+        assert!(other_empty.build_response().is_none(), "empty Other on single does not submit");
 
         // Multiple: toggle flips the highlighted option; chosen() = all checked.
         let mut m = UserInputPanel::new(9, &UserInputRequest {
@@ -2206,7 +2226,8 @@ mod tests {
         assert_eq!(m.chosen(), vec!["OAuth".to_string(), "Device".to_string()]);
         m.toggle(); // uncheck "Device"
         assert_eq!(m.chosen(), vec!["OAuth".to_string()], "toggle flips off");
-        // Multiple: custom text is APPENDED to the checked labels.
+        // Multiple: custom text is APPENDED whenever non-empty (text-derived,
+        // no separate checked flag needed).
         m.push_custom('x');
         let resp = m.build_response().expect("multiple always submits");
         assert_eq!(resp.selected, vec!["OAuth".to_string(), "x".to_string()]);

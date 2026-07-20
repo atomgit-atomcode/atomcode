@@ -15,10 +15,22 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::borrow::Cow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
+
+/// How long a process can be silent (no new stdout/stderr) AFTER having emitted
+/// something, before we kill it. Bumped from 30→90 to tolerate legitimate silent
+/// phases (file lock waits, dependency downloads, linker blocking, large file
+/// reads). This is NOT tool- or language-specific — any process with these
+/// patterns benefits. Tradeoff: genuine deadlocks wait 60s longer than before.
+const SILENT_KILL_SECS: u64 = 90;
 
 #[derive(Default)]
 pub struct BashTool;
@@ -1768,6 +1780,327 @@ fn redirect_is_readonly(redirect_node: tree_sitter::Node, src: &[u8]) -> bool {
     true
 }
 
+/// A `tokio::process::Child` whose whole process group is cleaned up on Drop
+/// and via explicit `terminate()`. `setsid()` in `pre_exec` makes the child a
+/// pgroup leader (pgid == pid); killing the pgroup catches grandchildren the
+/// direct-child `kill_on_drop` misses (cargo, ssh, dev servers). The wrapper's
+/// `Drop` issues a final SIGKILL to the pgroup on cancel; `terminate()` does a
+/// graceful SIGTERM → grace → SIGKILL for the timeout/idle paths where we can
+/// await. Idempotent: a Drop after `terminate()` issues a second SIGKILL to a
+/// pgroup that's already empty. `killpg` returns ESRCH which we ignore.
+/// A `terminated` flag short-circuits the Drop signal to avoid the
+/// tiny PID-reuse window between `wait()` reaping the leader and Drop.
+#[cfg(not(target_os = "windows"))]
+struct PgroupChild {
+    child: tokio::process::Child,
+    pgid: i32,
+    terminated: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl PgroupChild {
+    fn new(child: tokio::process::Child) -> Self {
+        // setsid() in pre_exec makes the child its own pgroup leader,
+        // so pgid == pid. id() is Some() until try_wait()/wait() reaps,
+        // and we always read it pre-reap.
+        let pgid = child
+            .id()
+            .expect("PgroupChild::new called after the child was reaped") as i32;
+        Self { child, pgid, terminated: false }
+    }
+
+    /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
+    /// Call from explicit cleanup paths (timeout/idle) where we can await.
+    async fn terminate(&mut self) {
+        unsafe {
+            killpg(self.pgid, SIGTERM);
+        }
+        // 200ms is empirically: long enough for well-behaved servers
+        // (uvicorn, vite, cargo-watch) to release ports and flush logs,
+        // short enough that Ctrl-C still feels instant.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        unsafe {
+            killpg(self.pgid, SIGKILL);
+        }
+        // Reap the bash leader so its zombie doesn't linger.
+        let _ = self.child.wait().await;
+        self.terminated = true;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::ops::Deref for PgroupChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::ops::DerefMut for PgroupChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for PgroupChild {
+    fn drop(&mut self) {
+        // Skip if terminate() already ran: the pgroup is empty and the
+        // pid we hold may now belong to an unrelated process (PID reuse
+        // window between wait() reaping the leader and Drop running).
+        if self.terminated {
+            return;
+        }
+        unsafe {
+            killpg(self.pgid, SIGKILL);
+        }
+        // The wrapped Child has kill_on_drop=true, so its own Drop will
+        // SIGKILL the direct PID and reap. We just covered grandchildren.
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+extern "C" {
+    fn killpg(pgid: i32, sig: i32) -> i32;
+}
+
+// Standard POSIX signal numbers — identical on Linux, macOS, BSD.
+#[cfg(not(target_os = "windows"))]
+const SIGTERM: i32 = 15;
+#[cfg(not(target_os = "windows"))]
+const SIGKILL: i32 = 9;
+
+/// Result of running a shell command, decoupled from tool-result framing.
+/// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
+/// (user-invoked `!` mode) both build on this.
+pub struct ShellOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit: ShellExit,
+    pub elapsed_secs: f64,
+}
+
+/// How the child process ended. Mirrors the three branches the old
+/// `bash_execute` match handled: clean exit, idle-kill, hard-timeout-kill.
+pub enum ShellExit {
+    /// Process exited on its own. `success` is `status.success()`,
+    /// `code` is the numeric exit code (None = terminated by signal).
+    Exited { success: bool, code: Option<i32> },
+    /// Readers hit EOF/idle but the child never reaped — killed as stuck.
+    KilledIdle,
+    /// Hard wall-clock timeout — killed.
+    KilledTimeout,
+}
+
+/// NOTE: transitional DUPLICATE of `atomcode_core::tool::bash::run_shell` — core keeps its
+/// copy while its v1 engine lives; this is the one v2 (bridge `!cmd`) uses. Delete core's copy
+/// when the v1 engine is retired. A behavior fix here must be mirrored there until then. (This
+/// copy reuses capabilities' own `sanitize_terminal_output`, a deliberate SUPERSET of core's —
+/// it additionally strips DCS/SOS/PM/APC + 8-bit C1 introducers, so `!cmd` output is cleaner.)
+///
+/// Spawn `command` in `wd`, stream output via `chunk_cb`, return raw outcome.
+/// No ToolResult framing, no git snapshot, no error-signature tracking —
+/// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
+/// and stderr chunks prefixed with `[stderr] `.
+pub async fn run_shell(
+    command: &str,
+    wd: &std::path::Path,
+    timeout_secs: u64,
+    chunk_cb: impl Fn(&str),
+) -> ShellOutcome {
+    let start_instant = Instant::now();
+
+    // Platform-aware shell: cmd.exe on Windows, bash on Unix
+    #[cfg(target_os = "windows")]
+    let mut child = {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(command);
+        cmd.current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop covers the direct cmd.exe PID on `tokio::select!`
+            // cancel / hard timeout. NOTE: Windows process trees still leak
+            // grandchildren — that's #3's Job Object work.
+            .kill_on_drop(true);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = {
+        #[cfg(not(target_env = "ohos"))]
+        let mut cmd = Command::new("bash");
+        #[cfg(target_env = "ohos")]
+        let mut cmd = Command::new("sh");
+
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop ensures bash itself dies if the tool future is
+            // dropped mid-flight. PgroupChild::Drop below extends that
+            // to bash's whole process group (cargo / ssh / dev-server
+            // grandchildren that setsid() detached from us).
+            .kill_on_drop(true);
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
+        // Detach child from the controlling terminal so neither it nor any
+        // grandchild (ssh, git credential helpers, server-side hook output
+        // rendered by git) can write directly to /dev/tty.  Without this,
+        // programs that open /dev/tty bypass our piped stdout/stderr and
+        // scribble ANSI escape sequences onto the TUI — producing artifacts
+        // like the [PASSED] box from AtomGit push hooks.
+        unsafe {
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                    fn open(path: *const i8, oflag: i32, ...) -> i32;
+                    fn close(fd: i32) -> i32;
+                    fn ioctl(fd: i32, request: u64, ...) -> i32;
+                }
+                setsid();
+                const O_RDWR: i32 = 2;
+                #[cfg(target_os = "macos")]
+                const TIOCNOTTY: u64 = 0x20007471;
+                #[cfg(not(target_os = "macos"))]
+                const TIOCNOTTY: u64 = 0x5422;
+                let tty_fd = open(b"/dev/tty\0".as_ptr() as *const i8, O_RDWR);
+                if tty_fd >= 0 {
+                    ioctl(tty_fd, TIOCNOTTY);
+                    close(tty_fd);
+                }
+                Ok(())
+            });
+        }
+        // Wrap the spawned child so pgroup cleanup runs on Drop (cancel)
+        // and via the explicit terminate() calls below (timeout/idle).
+        match cmd.spawn() {
+            Ok(c) => PgroupChild::new(c),
+            Err(e) => {
+                return ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn: {e}"),
+                    exit: ShellExit::Exited { success: false, code: None },
+                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
+                };
+            }
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
+    let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let has_out_1 = has_any_output.clone();
+    let has_out_2 = has_any_output.clone();
+    let chunk_cb = &chunk_cb;
+
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        let (_, _) = tokio::join!(
+            async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            let chunk =
+                                decode_output(&buf[..n]);
+                            stdout_buf.extend_from_slice(&buf[..n]);
+                            has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                            chunk_cb(&sanitize_terminal_output(&chunk));
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            let chunk =
+                                decode_output(&buf[..n]);
+                            stderr_buf.extend_from_slice(&buf[..n]);
+                            has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
+                            chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            if has_out_2.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        match child.try_wait() {
+            Ok(Some(status)) => Some((status.success(), status.code())),
+            _ => match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
+                Ok(Ok(status)) => Some((status.success(), status.code())),
+                _ => None,
+            },
+        }
+    })
+    .await;
+
+    let stdout_str = decode_output(&stdout_buf);
+    let stderr_str = decode_output(&stderr_buf);
+    let elapsed_secs = start_instant.elapsed().as_secs_f64();
+
+    let exit = match result {
+        Ok(Some((success, code))) => ShellExit::Exited { success, code },
+        Ok(None) => {
+            // Readers hit idle/EOF but the child never reaped — kill it.
+            // terminate() on Unix walks the pgroup (SIGTERM → 200ms → SIGKILL);
+            // Windows keeps the direct-child kill (process-tree cleanup is #3).
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledIdle
+        }
+        Err(_) => {
+            // Hard wall-clock timeout — same pgroup-aware path as idle.
+            #[cfg(not(target_os = "windows"))]
+            child.terminate().await;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = child.kill().await;
+            }
+            ShellExit::KilledTimeout
+        }
+    };
+
+    ShellOutcome { stdout: stdout_str, stderr: stderr_str, exit, elapsed_secs }
+}
+
 #[cfg(all(test, unix))]
 #[test]
 fn apply_askpass_env_sets_sudo_ssh_vars() {
@@ -1789,6 +2122,83 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    // `run_shell` — the streaming shell executor (owned here since bridge's `!cmd` handler
+    // moved off `core::tool::bash`). Direct unit coverage of capture/exit/streaming/UTF-8.
+    #[tokio::test]
+    async fn run_shell_captures_stdout_and_exit_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_shell("echo hello", dir.path(), 30, |_| {}).await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, code: Some(0) }));
+        assert!(outcome.stdout.contains("hello"), "stdout was: {:?}", outcome.stdout);
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))] // `>&2` redirect + `;` sequencing are bash-isms (cmd.exe differs)
+    async fn run_shell_captures_stderr_and_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_shell("echo boom >&2; exit 2", dir.path(), 30, |_| {}).await;
+        match outcome.exit {
+            ShellExit::Exited { success, code } => {
+                assert!(!success);
+                assert_eq!(code, Some(2));
+            }
+            _ => panic!("expected Exited, got other variant"),
+        }
+        assert!(outcome.stderr.contains("boom"), "stderr was: {:?}", outcome.stderr);
+    }
+
+    #[tokio::test]
+    async fn run_shell_streams_chunks() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        let outcome = run_shell("echo streamed", dir.path(), 30, move |c| {
+            seen2.lock().unwrap().push_str(c);
+        })
+        .await;
+        assert!(matches!(outcome.exit, ShellExit::Exited { success: true, .. }));
+        assert!(seen.lock().unwrap().contains("streamed"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))] // uses `sleep`; exercises the pgroup terminate() path
+    async fn run_shell_hard_timeout_kills_and_reports() {
+        // A command that outlives `timeout_secs` must be killed and reported as KilledTimeout —
+        // covers the wall-clock-timeout branch + `PgroupChild::terminate()` (SIGTERM→SIGKILL).
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_shell("sleep 5", dir.path(), 1, |_| {}).await;
+        assert!(
+            matches!(outcome.exit, ShellExit::KilledTimeout),
+            "expected KilledTimeout, got {:?} after {:.1}s",
+            std::mem::discriminant(&outcome.exit),
+            outcome.elapsed_secs
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_shell_preserves_utf8_paths_when_parent_locale_is_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = r#"
+            mkdir -p "产品需求/流水线/帮助文档"
+            printf 'line\n' > "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+            wc -l "产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"
+        "#;
+
+        let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("LANG", "C");
+        std::env::set_var("LC_CTYPE", "C");
+        let outcome = run_shell(command, dir.path(), 30, |_| {}).await;
+
+        assert!(
+            outcome.stdout.contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),
+            "stdout was: {:?}",
+            outcome.stdout
+        );
+    }
 
     /// PROBE (kept as a living record): dumps the node kinds tree-sitter-bash produces
     /// for representative commands, so ALLOWED_KINDS in `is_read_only_bash` is derived

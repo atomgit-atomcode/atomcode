@@ -117,6 +117,7 @@ pub trait TurnExecutor: Send + Sync {
         conv: &Arc<Mutex<Conversation>>,
         events: broadcast::Sender<LiveEvent>,
         approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+        responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
         cancel: CancellationToken,
     );
 
@@ -143,6 +144,10 @@ pub struct LiveSession {
     /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
     /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    /// 当前 turn 的用户输入（`request_user_input`）响应通道。执行器在 turn 开始时
+    /// 注册（经 run_turn 的 responder 参数）；任一视图调用 [`LiveSession::respond`]
+    /// 先到先得地投递 `(request_id, value)`，daemon 端据此发 `AgentCommand::Respond`。
+    responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
     /// 当前运行中 turn 的取消令牌。协调器在 turn 开始时填入、结束时清空；
     /// 任一视图调用 [`LiveSession::cancel_turn`] 即可中断正在跑的回合(停止生成)。
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
@@ -176,6 +181,7 @@ impl LiveSession {
         let handoff_pending = Arc::new(AtomicBool::new(false));
         let current_cancel = Arc::new(Mutex::new(None));
         let approver = Arc::new(Mutex::new(None));
+        let responder = Arc::new(Mutex::new(None));
         let turn_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let session = Arc::new(Self {
@@ -186,6 +192,7 @@ impl LiveSession {
             handoff_pending: handoff_pending.clone(),
             current_cancel: current_cancel.clone(),
             approver: approver.clone(),
+            responder: responder.clone(),
             turn_buffer: turn_buffer.clone(),
         });
 
@@ -199,6 +206,7 @@ impl LiveSession {
             handoff_pending,
             current_cancel,
             approver,
+            responder,
             turn_buffer,
         ));
 
@@ -302,6 +310,12 @@ impl LiveSession {
         *self.approver.lock().await = Some(tx);
     }
 
+    /// 执行器在 turn 开始时注册用户输入（`request_user_input`）响应通道（也供测试
+    /// 直接用）。镜像 [`LiveSession::register_approver`]。
+    pub async fn register_responder(&self, tx: mpsc::UnboundedSender<(u64, serde_json::Value)>) {
+        *self.responder.lock().await = Some(tx);
+    }
+
     /// 广播一次模型切换给所有视图（不触碰 turn 状态）。任一端切换模型时调用，
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
@@ -360,6 +374,18 @@ impl LiveSession {
         }
     }
 
+    /// 任一视图回答一个待处理的 `request_user_input` 往返，投递 `(request_id, value)`
+    /// 到执行器持有的响应通道；daemon 端据此发 `AgentCommand::Respond { id, value }`。
+    /// 镜像 [`LiveSession::approve`]：槽为空（回合外/无待答问题）或通道已关闭时返回
+    /// false。`id` 必须与 [`TurnEvent::UserInputRequested::request_id`] 一致。
+    pub async fn respond(&self, id: u64, value: serde_json::Value) -> bool {
+        if let Some(tx) = self.responder.lock().await.as_ref() {
+            tx.send((id, value)).is_ok()
+        } else {
+            false
+        }
+    }
+
     /// 取消当前正在运行的 turn(停止生成)。无运行中 turn 时返回 false。
     /// 真正的中断由协调器为本回合登记的 [`CancellationToken`] 驱动 —— 执行器
     /// 的 `run_turn` 把它透传给 runtime，模型流随之中止。任一视图（手机 /
@@ -385,6 +411,7 @@ async fn coordinator(
     handoff_pending: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+    responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
     turn_buffer: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
 ) {
     // Diagnostics via `ctrace!` (file sink, gated by ATOMCODE_TRACE), never
@@ -505,7 +532,13 @@ async fn coordinator(
         let cancel = CancellationToken::new();
         *current_cancel.lock().await = Some(cancel.clone());
         executor
-            .run_turn(&conversation, tap_tx.clone(), approver.clone(), cancel)
+            .run_turn(
+                &conversation,
+                tap_tx.clone(),
+                approver.clone(),
+                responder.clone(),
+                cancel,
+            )
             .await;
         *current_cancel.lock().await = None;
         // 关闭 tap 并等转发器排干：保证本回合事件都已入缓冲/广播，
@@ -513,8 +546,9 @@ async fn coordinator(
         drop(tap_tx);
         let _ = forwarder.await;
 
-        // turn 结束：清空审批槽（防止旧通道被下一个 turn 误用）。
+        // turn 结束：清空审批槽 + 用户输入响应槽（防止旧通道被下一个 turn 误用）。
         *approver.lock().await = None;
+        *responder.lock().await = None;
 
         // turn 结束：刷新已提交快照、清回放缓冲（同临界区——回合内容此刻起
         // 由 snapshot 承载，晚加入者拿到「全量快照 + 空回放」，不会重复）。
@@ -565,6 +599,7 @@ mod tests {
             _conv: &Arc<Mutex<Conversation>>,
             _events: broadcast::Sender<LiveEvent>,
             _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+            _responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
             cancel: CancellationToken,
         ) {
             cancel.cancelled().await;
@@ -578,6 +613,7 @@ mod tests {
             conv: &Arc<Mutex<Conversation>>,
             events: broadcast::Sender<LiveEvent>,
             _approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
+            _responder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, serde_json::Value)>>>>,
             _cancel: CancellationToken,
         ) {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -862,5 +898,27 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
         assert!(matches!(rx.recv().await, Some(PermissionDecision::Deny)));
         assert!(matches!(rx.recv().await, Some(PermissionDecision::Allow)));
+    }
+
+    #[tokio::test]
+    async fn respond_delivers_id_and_value_on_registered_responder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = LiveSession::new(fake(calls), Vec::new());
+
+        // 无待答问题（未注册 responder）：投递失败。
+        assert!(!session.respond(7, serde_json::json!({"picked": "a"})).await);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, serde_json::Value)>();
+        session.register_responder(tx).await;
+
+        // 注册后：`(request_id, value)` 原样投递到执行器持有的响应通道。
+        assert!(session.respond(7, serde_json::json!({"picked": "a"})).await);
+        assert!(session.respond(9, serde_json::json!("free text")).await);
+
+        assert_eq!(
+            rx.recv().await,
+            Some((7, serde_json::json!({"picked": "a"})))
+        );
+        assert_eq!(rx.recv().await, Some((9, serde_json::json!("free text"))));
     }
 }

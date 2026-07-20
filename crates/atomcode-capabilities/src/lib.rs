@@ -58,10 +58,11 @@ pub mod compaction;
 #[cfg(any(feature = "mcp", feature = "session", feature = "memory", feature = "provider"))]
 pub(crate) mod paths;
 
-/// Kernel-only (L0) console-window suppressors — a local copy of
-/// `core::process_utils` so spawn sites here can stop the Windows
-/// console-window flash without `capabilities` depending on `core`.
-pub(crate) mod process_utils;
+/// Shared L1 process utilities (console-window suppression, `shell_command`,
+/// UTF-8 locale, `is_running_as_admin`) — used here and by the CLI/TUI drivers, so
+/// `capabilities` owns them without depending on `core`. `shell_command` +
+/// `is_running_as_admin` mirror core's copies until core is retired (see module doc).
+pub mod process_utils;
 
 /// ONE home for Windows path normalization (native-canonical internally,
 /// forward-slash at the LLM/UI boundary). `pub` so native drivers and L2 crates
@@ -100,6 +101,11 @@ pub mod askpass;
 /// `NotificationConfig` from the config leaf; carries no dependency on any engine crate.
 #[cfg(feature = "notify")]
 pub mod notify;
+
+/// One-time project setup/install: scan → seed config → atomic writes (file-locked).
+/// Reads i18n + Config from the config leaf. Opt-in (NOT default).
+#[cfg(feature = "setup")]
+pub mod setup;
 
 /// Real, NEUTRAL coding [`Tool`](atomcode_kernel::tool::Tool)s — fs `read`/`write`/
 /// `edit`/`list` + `bash` + `grep`/`glob` — plus a generic

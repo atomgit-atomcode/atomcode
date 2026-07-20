@@ -233,7 +233,7 @@ pub struct SetupReport {
 
 impl SetupReport {
     pub fn render_cli(&self) -> String {
-        use crate::i18n::{t, Msg};
+        use atomcode_config::i18n::{t, Msg};
 
         let kind_str = |k: &RecKind| format!("{:?}", k).to_lowercase();
 
@@ -285,8 +285,8 @@ mod tests {
 
     #[test]
     fn render_includes_installed_count() {
-        let _g = crate::i18n::test_lock();
-        crate::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+        let _g = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
 
         let mut sum = InstalledSummary::default();
         sum.installed

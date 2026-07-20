@@ -249,6 +249,12 @@ const zh = {
   'perm.alwaysAllow': '本会话总是允许',
   'perm.allowPersist': '永久允许此工具',
 
+  // User input card
+  'userInput.submit': '提交',
+  'userInput.skip': '跳过',
+  'userInput.other': 'Other',
+  'userInput.error': '提交失败，请重试',
+
   // Sync toggle
   'sync.toggle': '同步当前会话',
   'sync.on': '已同步（多端实时）',
@@ -542,6 +548,12 @@ const en: Record<MsgKey, string> = {
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
   'perm.allowPersist': 'Always allow this tool',
+
+  // User input card
+  'userInput.submit': 'Submit',
+  'userInput.skip': 'Skip',
+  'userInput.other': 'Other',
+  'userInput.error': 'Submit failed, please retry',
 
   // Sync toggle
   'sync.toggle': 'Sync current session',

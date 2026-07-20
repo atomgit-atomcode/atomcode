@@ -37,7 +37,7 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 agent-client-protocol = { workspace = true }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding" }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"

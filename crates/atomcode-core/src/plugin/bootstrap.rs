@@ -211,10 +211,7 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
                 }
             }
             Err(e) => {
-                let msg = format!(
-                    "auto-install of marketplace `{url}` failed: {e:#}. \
-                     Run `/plugin marketplace add {url}` manually when ready."
-                );
+                let msg = auto_install_failure_msg(url, &e);
                 log_to_file(&format!("⚠ {msg}"));
                 events.push(PluginJobEvent::Failed {
                     op: "auto-install".into(),
@@ -229,6 +226,19 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
     // probe. The user can delete the marker to force a retry.
     touch_marker();
     events
+}
+
+/// Build the message for a failed marketplace auto-install. The actionable
+/// recovery hint (`/plugin marketplace add …`) is placed FIRST, before the
+/// `{e:#}` error chain — the driver renders this as a CALM one-line yellow
+/// Warning via `msg.lines().next()`, and `{e:#}` is often multi-line (git
+/// stderr), so anything after it would be dropped. Keeping the hint on line 1
+/// guarantees the user still sees how to recover.
+fn auto_install_failure_msg(url: &str, err: &anyhow::Error) -> String {
+    format!(
+        "marketplace `{url}` not installed yet — run \
+         `/plugin marketplace add {url}` when ready. Cause: {err:#}"
+    )
 }
 
 /// Install each plugin from a marketplace's manifest. Failures for
@@ -351,6 +361,24 @@ mod tests {
     #[test]
     fn short_commit_truncates_long_shas() {
         assert_eq!(short_commit("0123456789abcdef"), "0123456");
+    }
+
+    #[test]
+    fn auto_install_failure_msg_keeps_recovery_hint_on_first_line() {
+        // The driver renders this as a one-line Warning (`msg.lines().next()`),
+        // and `{e:#}` is often multi-line git stderr — the actionable
+        // `/plugin marketplace add` hint MUST survive on line 1.
+        let err = anyhow::anyhow!("git clone failed")
+            .context("stderr line 1\nstderr line 2\nstderr line 3");
+        let msg = auto_install_failure_msg("https://atomgit.com/x/y.git", &err);
+        let first = msg.lines().next().unwrap();
+        assert!(
+            first.contains("/plugin marketplace add https://atomgit.com/x/y.git"),
+            "recovery hint must be on the first line: {first:?}"
+        );
+        assert!(first.contains("when ready"), "first line: {first:?}");
+        // The error detail is still present (later in the message) — nothing lost.
+        assert!(msg.contains("stderr line 3"), "full error retained: {msg:?}");
     }
 
     #[test]

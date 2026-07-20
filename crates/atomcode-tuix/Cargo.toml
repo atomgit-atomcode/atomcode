@@ -16,7 +16,7 @@ atomcode-config = { path = "../atomcode-config" }
 atomcode-updater = { path = "../atomcode-updater" }
 # Askpass lives in atomcode-capabilities (`::askpass`, unix-only); the TUI drives the
 # server + password modal via that path.
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify", "setup"] }
 atomcode-core = { path = "../atomcode-core" }
 # INIT_PROMPT: LLM-driven /init submits this constant as a user turn so the
 # coding agent explores the repo and writes AGENTS.md via its tools.

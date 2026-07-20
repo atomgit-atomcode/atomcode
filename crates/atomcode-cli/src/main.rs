@@ -1123,7 +1123,7 @@ async fn run() -> Result<i32> {
     }
     // ── End askpass early exit ────────────────────────────────────────────────
 
-    let is_admin = atomcode_core::process_utils::is_running_as_admin();
+    let is_admin = atomcode_capabilities::process_utils::is_running_as_admin();
 
     // ── Telemetry init ────────────────────────────────────────────────────────
     // Load config early (before subcommand dispatch) so we can read the
@@ -2298,9 +2298,11 @@ async fn run_native_headless(
     Ok((exit_code, captured))
 }
 
+/// Drive `atomcode_capabilities::setup::run` end-to-end and return the CLI exit code
+/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
 /// run it directly since `Commands::Setup` already runs outside the TUI loop.
 fn run_setup_command(force: bool) -> i32 {
-    use atomcode_core::setup;
+    use atomcode_capabilities::setup;
 
     let project_root = match std::env::current_dir() {
         Ok(p) => p,
@@ -2769,7 +2771,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     // ── Build the command ────────────────────────────
                     let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
 
-                    let mut cmd = atomcode_core::process_utils::shell_command(&hook.command);
+                    let mut cmd = atomcode_capabilities::process_utils::shell_command(&hook.command);
                     cmd.env("ATOMCODE_HOOK_EVENT", &event_str)
                         .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
                         .kill_on_drop(true);
@@ -2784,7 +2786,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         cmd.env("ATOMCODE_PLUGIN_ROOT", s);
                     }
 
-                    atomcode_core::process_utils::suppress_console_window(&mut cmd);
+                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd);
 
                     // ── Run with timeout ─────────────────────────────
                     let start = Instant::now();
@@ -2925,7 +2927,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());
 
-                    atomcode_core::process_utils::suppress_console_window(&mut cmd_builder);
+                    atomcode_capabilities::process_utils::suppress_console_window(&mut cmd_builder);
 
                     // ── Run with timeout (matching script_runner.rs:80-109) ──
                     let start = Instant::now();
@@ -3519,7 +3521,7 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(home) = atomcode_core::tool::real_home_dir() else {
+    let Some(home) = atomcode_config::util::real_home_dir() else {
         return;
     };
     let dir = home.join(".atomcode").join("logs");
@@ -3569,7 +3571,7 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
         // abort, any of which can lose the panic on Windows (see write_crash_log).
         write_crash_log(info);
         restore_terminal_if_tui();
-        let home = atomcode_core::tool::real_home_dir();
+        let home = atomcode_config::util::real_home_dir();
         let cwd = std::env::current_dir().ok();
         let loc = info
             .location()

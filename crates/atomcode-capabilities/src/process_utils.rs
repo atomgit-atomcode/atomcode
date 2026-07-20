@@ -1,6 +1,10 @@
-//! Platform-specific process utilities — a kernel-only (L0) local copy of
-//! `atomcode_core::process_utils`'s console-window suppressors, since
-//! `capabilities` must not depend on `core`.
+//! Platform-specific process utilities (console-window suppression, shell-command
+//! construction, UTF-8 locale, admin check) — the shared L1 home now that
+//! `capabilities` must not depend on `core`. Consumed here plus by the CLI/TUI drivers.
+//!
+//! NOTE: `shell_command` + `is_running_as_admin` are byte-identical copies of the same
+//! fns still in `atomcode_core::process_utils` (core keeps its own for the v1 engine).
+//! Keep the two in sync until core is retired, then core's copy dies with it.
 //!
 //! On Windows, a GUI / **console-less** parent (the atomcode-daemon behind
 //! clawbot/OpenClaw) that spawns a console program (cmd.exe, git, ast-grep, a
@@ -18,25 +22,116 @@
 /// elsewhere. `tokio`'s `creation_flags` is an inherent method on Windows, so
 /// (unlike the `_sync` std variant) no `CommandExt` import is needed.
 #[cfg(target_os = "windows")]
-pub(crate) fn suppress_console_window(cmd: &mut tokio::process::Command) {
+pub fn suppress_console_window(cmd: &mut tokio::process::Command) {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn suppress_console_window(_cmd: &mut tokio::process::Command) {}
+pub fn suppress_console_window(_cmd: &mut tokio::process::Command) {}
 
 /// Apply `CREATE_NO_WINDOW` to a `std::process::Command` on Windows; no-op
 /// elsewhere. The std `creation_flags` requires `CommandExt` in scope.
 #[cfg(target_os = "windows")]
-pub(crate) fn suppress_console_window_sync(cmd: &mut std::process::Command) {
+pub fn suppress_console_window_sync(cmd: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn suppress_console_window_sync(_cmd: &mut std::process::Command) {}
+pub fn suppress_console_window_sync(_cmd: &mut std::process::Command) {}
+
+/// Build a shell command that runs `command` through the platform shell.
+///
+/// - Windows: `cmd.exe /C <command>` — the command string is passed via
+///   `raw_arg` so cmd.exe receives it **verbatim**. Using the normal `.arg()`
+///   would apply std's `CommandLineToArgvW` quoting, which cmd.exe does NOT
+///   follow — embedded quotes / `%VAR%` / `^` etc. would be mangled. This
+///   mirrors the spawn in `tool/bash.rs` (and `auth/oauth.rs`).
+/// - Other: `sh -c <command>`.
+///
+/// Caller still chains env/stdio/`kill_on_drop` and `suppress_console_window`
+/// as needed; this only fixes the program + command-string wiring.
+#[cfg(target_os = "windows")]
+pub fn shell_command(command: &str) -> tokio::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = tokio::process::Command::new("cmd.exe");
+    cmd.arg("/C");
+    cmd.as_std_mut().raw_arg(command);
+    cmd
+}
+
+/// See the Windows variant above.
+#[cfg(not(target_os = "windows"))]
+pub fn shell_command(command: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command);
+    #[cfg(unix)]
+    apply_utf8_locale_env(&mut cmd);
+    cmd
+}
+
+/// Detect whether the current process is running with administrator/root
+/// privileges.
+///
+/// - Windows: calls `CheckTokenMembership(NULL, BUILTIN\Administrators)`
+///   which correctly handles UAC split-token (returns `false` when NOT
+///   elevated). This is the recommended replacement for the deprecated
+///   `IsUserAnAdmin()`.
+/// - Unix: checks `geteuid() == 0` (root).
+/// - Other platforms: returns `false` (safe default — a missed warning is
+///   preferable to a false alarm).
+#[cfg(target_os = "windows")]
+pub fn is_running_as_admin() -> bool {
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid,
+        SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, PSID,
+    };
+
+    unsafe {
+        let mut sid: PSID = std::ptr::null_mut();
+        let authority: SID_IDENTIFIER_AUTHORITY = SECURITY_NT_AUTHORITY;
+
+        // S-1-5-32-544: BUILTIN\Administrators group.
+        // Uses literal RIDs 32 (SECURITY_BUILTIN_DOMAIN_RID) and 544
+        // (DOMAIN_ALIAS_RID_ADMINS) to avoid pulling in the
+        // Win32_System_SystemServices feature flag.
+        let result = AllocateAndInitializeSid(
+            &authority,
+            2,     // nSubAuthorityCount
+            32,    // SECURITY_BUILTIN_DOMAIN_RID
+            544,   // DOMAIN_ALIAS_RID_ADMINS
+            0, 0, 0, 0, 0, 0,
+            &mut sid,
+        );
+
+        if result == 0 {
+            return false;
+        }
+
+        let mut is_member: i32 = 0;
+        // NULL token handle = current thread's effective token
+        if CheckTokenMembership(std::ptr::null_mut(), sid, &mut is_member) == 0 {
+            FreeSid(sid);
+            return false;
+        }
+
+        FreeSid(sid);
+
+        is_member != 0
+    }
+}
+
+#[cfg(unix)]
+pub fn is_running_as_admin() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+pub fn is_running_as_admin() -> bool {
+    false
+}
 
 #[cfg(test)]
 pub(crate) struct EnvVarGuard {

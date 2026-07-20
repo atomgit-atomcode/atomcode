@@ -413,30 +413,43 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                         // dumb TTY can still answer.
                         if let Some(panel) = &status.user_input {
                             use atomcode_capabilities::tools::request_user_input::UserInputMode;
+                            if !panel.header.trim().is_empty() {
+                                let _ = writeln!(self.out, "{}", scrub_controls(&panel.header));
+                            }
                             let _ = writeln!(self.out, "{}", scrub_controls(&panel.question));
-                            for (i, label) in panel.options.iter().enumerate() {
+                            for (i, (label, desc)) in panel.options.iter().enumerate() {
                                 let _ = writeln!(
                                     self.out,
                                     "  {}. {}",
                                     i + 1,
                                     scrub_controls(label)
                                 );
+                                if let Some(d) = desc {
+                                    if !d.trim().is_empty() {
+                                        let _ = writeln!(self.out, "       {}", scrub_controls(d));
+                                    }
+                                }
                             }
-                            // For single/multiple, also surface the folded
-                            // free-text option + how to submit so a human on a
-                            // dumb TTY understands the navigable list contract.
+                            // For single/multiple, append the always-on custom-answer
+                            // row (index N, number N+1) as a ONE-LINE inline input so a
+                            // human on a dumb TTY can type a custom answer. No "Other"
+                            // label / subtitle — the typed text (or a faint placeholder)
+                            // is shown directly.
                             if matches!(
                                 panel.mode,
                                 UserInputMode::Single | UserInputMode::Multiple
                             ) {
-                                if !panel.custom_text.is_empty() {
-                                    let _ = writeln!(
-                                        self.out,
-                                        "  * custom: {}",
-                                        scrub_controls(&panel.custom_text)
-                                    );
+                                let other_no = panel.options.len() + 1;
+                                let custom = if panel.custom_text.trim().is_empty() {
+                                    "输入自己的答案\u{2026}".to_string()
+                                } else {
+                                    scrub_controls(&panel.custom_text)
+                                };
+                                let _ = writeln!(self.out, "  {}. {}", other_no, custom);
+                                // Multiple: explicit Submit row after Other.
+                                if matches!(panel.mode, UserInputMode::Multiple) {
+                                    let _ = writeln!(self.out, "  + Submit");
                                 }
-                                let _ = writeln!(self.out, "  + submit");
                             }
                         }
                         // Real TTY — write `❯ ` so the user can see we

@@ -29,7 +29,9 @@ use atomcode_capabilities::session::{
     RecallTool, SessionContextHook, SessionManager, SnapshotHook, StatusReminderHook,
     TranscriptHook,
 };
-use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
+use atomcode_capabilities::skills::{
+    register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
+};
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate,
     OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool,
@@ -365,6 +367,10 @@ pub async fn prepare_with_plugin_hooks(
         standard_skill_dirs(&home, &cfg.working_dir)
     });
     let skills = Arc::new(SkillRegistry::load(&skill_dirs));
+    // Render the catalog BEFORE the registry is moved into the tools; injected as a
+    // leading system message by SkillCatalogHook below (without it the model never
+    // learns which skills exist — only the use_skill/list_skills tools were mounted).
+    let skill_catalog = skills.render_catalog();
     register_skill_tools(&mut registry, skills);
     names.extend(
         atomcode_capabilities::skills::skill_tool_names()
@@ -431,6 +437,8 @@ pub async fn prepare_with_plugin_hooks(
     // 2. MemoryHook    — session_start: inject memory.md after the leading-system run
     //    (fresh inject / resume reconcile). Both 1 and 2 reconcile by their own header
     //    prefix, so they compose (the insert position is computed live each time).
+    // 2b. SkillCatalogHook — session_start: inject the AVAILABLE SKILLS catalog after
+    //    memory (persona → context → memory → skills). Same header-prefix reconcile.
     // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
     // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
     //    3 — the order is fixed purely for determinism.)
@@ -445,6 +453,10 @@ pub async fn prepare_with_plugin_hooks(
     if opts.memory {
         hooks.push(Arc::new(MemoryHook::for_project(&cfg.working_dir)));
     }
+    // Skill catalog — leading system message (persona → context → memory → skills), so
+    // the model sees which skills are installed and can trigger one on a description
+    // match. `None` (no skills) makes the hook a no-op. Reconciles in place on resume.
+    hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd));
