@@ -505,27 +505,20 @@ mod tests {
                         if is_dir && has_skill_md {
                             let content = std::fs::read_to_string(p.join("SKILL.md")).unwrap();
                             eprintln!("        SKILL.md first 100 chars: {:?}", &content.chars().take(100).collect::<String>());
-                            let _result = crate::skill::SkillRegistry::new();
                             // Try parsing just this one skill
-                            let mut tmp_reg = crate::skill::SkillRegistry::new();
-                            let mut warnings = Vec::new();
-                            tmp_reg.load_skills_dir(&sd, Some("__test__"), &mut warnings);
-                            for w in &warnings {
-                                eprintln!("        WARNING: {}", w);
-                            }
+                            let mut tmp_reg = crate::skills::SkillRegistry::new();
+                            tmp_reg.load_dir(&sd, Some("__test__"));
                         }
                     }
                 }
             }
         }
-        let mut reg = crate::skill::SkillRegistry::new();
-        let warnings = reg.reload(std::path::Path::new("/tmp"));
-        eprintln!("=== DEBUG: {} skills loaded, {} warnings ===", reg.all().count(), warnings.len());
-        for w in &warnings {
-            eprintln!("  WARNING: {}", w);
-        }
-        for s in reg.all() {
-            eprintln!("  SKILL: {} - {}", s.name, s.description.chars().take(60).collect::<String>());
+        let mut reg = crate::skills::SkillRegistry::new();
+        reg.load_dir(std::path::Path::new("/tmp"), None);
+        let skills = reg.list();
+        eprintln!("=== DEBUG: {} skills loaded ===", skills.len());
+        for (name, description) in &skills {
+            eprintln!("  SKILL: {} - {}", name, description.chars().take(60).collect::<String>());
         }
     }
 }

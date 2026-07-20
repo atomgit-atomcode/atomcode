@@ -88,6 +88,13 @@ pub(crate) mod pathutil;
 #[cfg(feature = "plugin")]
 pub mod fs;
 
+/// Plugin subsystem: loader / installer / marketplace / manifest / trust store.
+/// Faithful port of `core::plugin` as a v2 migration target for the front-ends.
+/// Synchronous (shells out to `git` via `std::process` — no async runtime).
+/// Opt-in behind `feature = "plugin"`.
+#[cfg(feature = "plugin")]
+pub mod plugin;
+
 #[cfg(feature = "provider")]
 pub mod provider;
 

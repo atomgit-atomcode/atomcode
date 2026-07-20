@@ -192,6 +192,7 @@ offline = ["dep:atomcode-config"]
 # loader can build a SkillRegistry, plus the auth/config leaves and fs/home helpers.
 plugin = [
     "dep:anyhow", "dep:sha2", "dep:url", "dep:toml", "dep:dirs", "dep:tempfile",
+    "dep:chrono",
     "dep:atomcode-auth", "dep:atomcode-config",
     "skills",
 ]

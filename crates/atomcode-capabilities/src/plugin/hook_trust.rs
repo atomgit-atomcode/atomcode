@@ -64,7 +64,7 @@ fn save_trust(map: &TrustMap) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let json = serde_json::to_vec_pretty(map).context("serialize trust map")?;
-    crate::fs_atomic::atomic_write(&path, &json, 0o600).context("write trust store")
+    crate::fs::atomic_write(&path, &json, 0o600).context("write trust store")
 }
 
 pub fn trust(plugin_id: &str, hash: &str) -> Result<()> {

@@ -298,8 +298,8 @@ fn extra_header_config(url: &str, header: &str) -> String {
 /// Fetch (username, fresh access token) from the stored login, refreshing the
 /// token if expired. None when not logged in or refresh fails.
 fn live_credentials() -> Option<(String, String)> {
-    let auth = crate::auth::get_stored_auth()?;
-    let token = crate::auth::get_valid_token().ok()?;
+    let auth = atomcode_auth::get_stored_auth()?;
+    let token = atomcode_auth::get_valid_token().ok()?;
     if token.is_empty() {
         return None;
     }
@@ -342,7 +342,7 @@ fn auth_required_message(verb: &str, url: &str, stderr: &str) -> String {
              或先用 git 配置好凭证后重试。\n原始错误：{stderr}"
         );
     }
-    if crate::auth::get_stored_auth().is_some() {
+    if atomcode_auth::get_stored_auth().is_some() {
         format!(
             "{verb}失败：登录已过期或凭证无效，请运行 /login 重新登录后重试。\n原始错误：{stderr}"
         )
