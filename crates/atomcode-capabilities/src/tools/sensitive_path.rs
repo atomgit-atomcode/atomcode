@@ -1,10 +1,10 @@
 //! `SensitivePathGate` — require approval before a normally-Safe READ tool touches a
 //! sensitive path (SSH keys, cloud creds, `.env`, …).
 //!
-//! v2's approval is risk-based: `read_file` / `grep` / `glob` / `list_dir` are `Safe`, so
+//! Kernel approval is risk-based: `read_file` / `grep` / `glob` / `list_dir` are `Safe`, so
 //! they NEVER prompt — meaning an agent can silently read `~/.ssh/id_rsa` or `.env` and the
 //! contents ride a tool result straight to the LLM provider (secret exfiltration). This
-//! gate restores the per-path protection the legacy engine had, in v2's middleware idiom:
+//! gate preserves the existing per-path protection in a native middleware:
 //! it acts ONLY on tools that would otherwise bypass approval (`Safe`) AND whose args name
 //! a sensitive path, then runs the SAME approval round-trip as [`ApprovalMiddleware`]
 //! (allow-once / allow-always / deny). `Risky` tools already go through approval, so this

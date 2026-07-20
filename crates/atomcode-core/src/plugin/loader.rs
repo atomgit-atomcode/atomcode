@@ -46,10 +46,9 @@ impl InstalledPluginAssets {
 }
 
 /// A single CC hook contributed INLINE by an installed plugin's `plugin.json`, in a
-/// neutral (engine-agnostic) shape. The legacy engine maps these via
-/// `crate::hook::json_config::cc_hooks_to_atomcode`; the new (kernel) stack — which
-/// cannot depend on this crate's manifest types — consumes this DTO through the bridge
-/// and maps it onto `atomcode_capabilities::cc_hooks::HookConfig`.
+/// neutral (engine-agnostic) shape. Host adapters map this DTO onto
+/// `atomcode_capabilities::cc_hooks::HookConfig` before starting CodingRuntime, so
+/// the kernel stack does not depend on this crate's manifest types.
 #[derive(Debug, Clone)]
 pub struct PluginCcHook {
     /// CC PascalCase event name (`PreToolUse`, `UserPromptSubmit`, ...).

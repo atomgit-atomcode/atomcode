@@ -7,7 +7,6 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-pub mod agent;
 // `auth` (OAuth login + secure chmod-600 token file) fully lives in the leaf `atomcode-auth`
 // crate now; re-export it so core's own `crate::auth::…` uses and external
 // `atomcode_core::auth` consumers keep working during the transition.

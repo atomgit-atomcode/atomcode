@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Low-level events emitted by TurnRunner during execution.
-/// Does not contain approval events — approval is handled internally via PermissionDecider.
+/// Live-session turn events broadcast to daemon, web, and TUI consumers.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// LLM streaming text output
@@ -109,7 +108,8 @@ pub enum TurnEvent {
     /// 任一端批准/拒绝了工具审批，广播给所有视图同步卡片状态。
     ApprovalResolved { call_id: String, decision: String },
     /// A tool (currently `request_user_input`) raised a structured question a view must
-    /// render and answer with `AgentCommand::Respond { id, .. }`. `request_id` == `Respond.id`.
+    /// render and answer through the native runtime response seam. `request_id` is
+    /// the correlation id passed to `CodingRuntimeHandle::respond`.
     ///
     /// `options` are raw `{ label, description? }` objects kept as opaque
     /// `serde_json::Value` so core carries no capabilities coupling.
@@ -133,44 +133,14 @@ pub struct ToolBatchCall {
     /// behind the write-lock. Drives the UI's honest "in parallel" label.
     pub parallel_safe: bool,
 }
-
-/// Result of a single turn execution
-#[derive(Debug)]
-pub enum TurnResult {
-    /// LLM produced text only, no tool calls.
-    /// `truncated` = true means finish_reason was "length" (model hit max_tokens).
-    Responded {
-        text: String,
-        tokens: usize,
-        truncated: bool,
-    },
-    /// LLM called tools, results added to conversation — ready for next turn
-    UsedTools {
-        text: Option<String>,
-        tool_count: usize,
-        tokens: usize,
-    },
-    /// Unrecoverable error
-    Failed(String),
-    /// Cancelled by caller
-    Cancelled,
-}
-
-impl TurnResult {
-    /// Returns true if this result represents an error condition (used by telemetry).
-    pub fn is_failed(&self) -> bool {
-        matches!(self, TurnResult::Failed(_))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Shape test for the `request_user_input` webui event: fields round-trip
     /// through construction/pattern-match and `options` stays opaque JSON so
-    /// core needs no capabilities coupling. `request_id` pairs with
-    /// `AgentCommand::Respond { id, .. }`.
+    /// core needs no capabilities coupling. `request_id` pairs with the
+    /// native runtime's `DriverCommand::Respond { id, .. }`.
     #[test]
     fn user_input_requested_carries_opaque_options() {
         let ev = TurnEvent::UserInputRequested {

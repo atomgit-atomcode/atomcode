@@ -62,11 +62,11 @@ pub enum ReasoningPolicy {
 /// already preserves *real* reasoning, so this sentinel only fires when the
 /// model genuinely emitted none — this keeps that residual filler invisible.
 ///
-/// `TurnRunner::Done` strips this exact value (`is_only_placeholder_filler`)
-/// and refuses to promote a buffer that is only copies of it into the
+/// The kernel agent strips this exact value and refuses to promote a buffer
+/// that is only copies of it into the
 /// assistant text channel — without that gate a gateway echoing it back caused
 /// the silent mid-task stops above. Both send sites (`format_messages`) and
-/// that guard route through this one constant, so the value can change here
+/// kernel guard route through this one constant, so the value can change here
 /// without desyncing them.
 pub const REASONING_PLACEHOLDER: &str = "·";
 

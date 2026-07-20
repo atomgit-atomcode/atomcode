@@ -16,6 +16,7 @@
 //!     echoed back ([`ReasoningPolicy`]).
 
 mod anthropic;
+mod atomgit_sign;
 mod ollama;
 mod openai_compat;
 mod reasoning;
@@ -23,6 +24,7 @@ mod retry;
 mod sign;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use atomgit_sign::{atomgit_request_signer, is_atomgit_gateway, signer_available};
 pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
@@ -35,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Fallback User-Agent when a provider config carries no explicit `user_agent`.
 /// Bare (no version) on purpose: this crate is versioned independently of the
 /// product (`0.0.0`), so a local `CARGO_PKG_VERSION` would be MISLEADING. The
-/// driver (bridge) injects the real `atomcode/<version>` via `*Config::user_agent`;
+/// host adapter injects the real `atomcode/<version>` via `*Config::user_agent`;
 /// this fallback only applies to direct/test construction.
 pub(crate) const DEFAULT_USER_AGENT: &str = "atomcode";
 
@@ -74,7 +76,13 @@ fn wire_dump_to(dir: &std::path::Path, model: &str, body: &Value) {
     let seq = WIRE_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let safe_model: String = model
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{seq:06}-{ts}-{safe_model}.req.json"));
     if let Ok(s) = serde_json::to_string_pretty(body) {
@@ -122,11 +130,18 @@ mod coalesce_tests {
         let mut out = Vec::new();
         push_system_coalesced(&mut out, "persona");
         push_system_coalesced(&mut out, "memory");
-        assert_eq!(out, vec![json!({"role":"system","content":"persona\n\nmemory"})]);
+        assert_eq!(
+            out,
+            vec![json!({"role":"system","content":"persona\n\nmemory"})]
+        );
         // A non-system entry breaks the run: a later system would start a fresh block.
         out.push(json!({"role":"user","content":"hi"}));
         push_system_coalesced(&mut out, "late");
-        assert_eq!(out.len(), 3, "system after a user is NOT merged into the leading block");
+        assert_eq!(
+            out.len(),
+            3,
+            "system after a user is NOT merged into the leading block"
+        );
         assert_eq!(out[2], json!({"role":"system","content":"late"}));
     }
 
@@ -179,7 +194,13 @@ mod wire_dump_tests {
             .file_name()
             .to_string_lossy()
             .into_owned();
-        assert!(!name.contains('/') && !name.contains(':'), "unsafe chars stripped: {name}");
-        assert!(name.contains("org_model_v1"), "sanitized model retained: {name}");
+        assert!(
+            !name.contains('/') && !name.contains(':'),
+            "unsafe chars stripped: {name}"
+        );
+        assert!(
+            name.contains("org_model_v1"),
+            "sanitized model retained: {name}"
+        );
     }
 }

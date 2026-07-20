@@ -12,7 +12,6 @@ pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
 pub mod open_file;
-pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
@@ -980,13 +979,6 @@ pub struct ToolContext {
     pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
     pub file_history: Arc<Mutex<file_history::FileHistory>>,
     pub graph: Arc<RwLock<crate::graph::CodeGraph>>,
-    /// Remaining context tokens budget. Set by TurnRunner before each tool batch.
-    /// read_file uses this to decide full content vs skeleton.
-    pub ctx_budget_hint: Arc<std::sync::atomic::AtomicUsize>,
-    /// Per-file token budget for read_file. Set by runner.rs Layer B before each
-    /// tool batch: `ctx_budget / (5 * num_reads)`. read.rs compares file_tokens
-    /// against this to decide full vs skeleton. Defaults to ctx_budget/5 (single file).
-    pub read_budget_tokens: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-session read-file output cache. Hit is valid only when on-disk mtime
     /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
     /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
@@ -1015,14 +1007,6 @@ pub struct ToolContext {
     pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
     /// Current tool call ID for event correlation.
     pub current_call_id: Option<String>,
-    /// Shared registry handle for tools that dispatch fork sub-agents
-    /// (currently only `parallel_edit_files`). Set by `AgentLoop::new`
-    /// after the registry is wrapped in `Arc`. Reading the registry via
-    /// `ctx` instead of holding it in the tool struct avoids creating a
-    /// `Tool ↔ Registry` `Arc` cycle that would otherwise leak memory
-    /// for the lifetime of the process. `None` in headless / test
-    /// contexts that don't need fork dispatch.
-    pub tool_registry: Option<Arc<ToolRegistry>>,
     /// D3 file content store. read_file pushes large file content
     /// here transparently and consults it on subsequent reads of any
     /// range — disk hit only on first read or after edit. Conversation
@@ -1055,8 +1039,6 @@ impl ToolContext {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
-            ctx_budget_hint: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
-            read_budget_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
@@ -1064,7 +1046,6 @@ impl ToolContext {
             lsp: None,
             event_tx: None,
             current_call_id: None,
-            tool_registry: None,
             file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
         }
     }
@@ -1077,8 +1058,6 @@ impl ToolContext {
     /// - `event_tx`: reset — subagent has its own event channel
     /// - `tool_registry`: reset — subagent gets filtered tools
     /// - `first_error_signatures`: reset — subagent has independent error state
-    /// - `ctx_budget_hint`: reset to MAX — subagent has its own budget
-    /// - `read_budget_tokens`: reset to MAX — subagent has own budget
     pub async fn isolate(&self) -> Self {
         let wd = self.working_dir.read().await.clone();
         let mut ctx = Self::new(wd);

@@ -1240,7 +1240,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::UsageCodingPlanOnly =>
             "Usage is only available on CodingPlan — run /login.".into(),
 
-        // ── engine v2 provider init (atomcode-bridge) ──
+        // ── CodingRuntime provider init ──
         Msg::ProviderInitFailed { detail } =>
             format!("provider init failed: {detail}").into(),
         Msg::ProviderInitNeedsLogin =>

@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use super::{bg_runtime, save_and_reload, LoopCtx};
+use super::{bg_runtime, reload_runtime_provider, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{
     DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
@@ -32,7 +32,6 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_capabilities::memory::MemoryStore;
-use atomcode_core::agent::AgentCommand;
 use atomcode_config::config::Config;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
@@ -71,9 +70,12 @@ pub(super) fn dispatch_undo(arg: &str, state: &UiState, ctx: &LoopCtx, renderer:
     };
     match parsed {
         Ok(nth) => {
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::UndoToPrompt { nth })
+            ctx.runtime
+                .undo_to_prompt(
+                    nth,
+                    ctx.foreground_runtime_id,
+                    ctx.runtime_event_tx.clone(),
+                )
                 .ok();
         }
         Err(()) => {
@@ -95,14 +97,6 @@ pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
-    // Mirror the session's persistent id onto the agent so the
-    // `x-atomcode-session-id` header tracks the conversation identity —
-    // resuming a saved session reuses its original id for gateway prefix-
-    // cache affinity, instead of minting a fresh per-process uuid.
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
-        .ok();
 }
 
 /// Scan session messages for a pending tool approval — an
@@ -156,10 +150,10 @@ fn spawn_runtime(
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    // Spawn through the injected engine-v2 bridge so in-TUI session switches run
-    // on the new stack too. It reads the CURRENT config/working_dir, keeping
+    // Spawn through the injected CodingRuntime factory. It reads the CURRENT
+    // config/working_dir, keeping
     // /model /provider /cd honoured.
-    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
+    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir, &session);
     bg_runtime::spawn_event_forwarder(
         runtime_id,
         spawned.event_rx,
@@ -180,7 +174,6 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
         super::RuntimeEndpoint {
-            legacy: ctx.agent.clone(),
             native: ctx.runtime.clone(),
         },
         ctx.current_session.clone(),
@@ -379,10 +372,12 @@ fn detach_live_session(ctx: &mut LoopCtx) -> Result<bool, String> {
     }
     let restore_id = ctx.next_local_runtime_restore_id;
     ctx.next_local_runtime_restore_id = ctx.next_local_runtime_restore_id.wrapping_add(1).max(1);
-    if let Err(error) = ctx.agent.cmd_tx.send(AgentCommand::SetConversation {
-        snapshot,
-        restore_id: Some(restore_id),
-    }) {
+    if let Err(error) = ctx.runtime.restore_snapshot_correlated(
+        crate::runtime_convert::snapshot_to_kernel(&snapshot),
+        restore_id,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    ) {
         restore_live_forwarder(ctx, session, handoff.resume_receiver());
         return Err(format!("无法把同步会话交给本地 runtime：{error}"));
     }
@@ -556,13 +551,8 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
             images: vec![],
         });
     } else {
-        ctx.agent
-            .cmd_tx
-            .send(AgentCommand::SendMessage {
-                text,
-                images: vec![],
-                image_markers: vec![],
-            })
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
             .ok();
     }
     state.on_submit();
@@ -624,13 +614,8 @@ pub(crate) fn fire_interval_payload(
     };
     match payload {
         crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text,
-                    images: vec![],
-                    image_markers: vec![],
-                })
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
                 .ok();
             state.on_submit();
             if let Some(c) = ctx.loop_ctrl.as_mut() {
@@ -664,7 +649,9 @@ pub(crate) fn fire_interval_payload(
 /// all three mirror fields. Idempotent — safe to call when no loop is active.
 pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
     if ctx.loop_ctrl.is_some() || state.loop_label.is_some() {
-        ctx.agent.cmd_tx.send(AgentCommand::ClearLoop).ok();
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::StopLoop)
+            .ok();
         ctx.loop_ctrl = None;
         state.loop_label = None;
         state.loop_round = 0;
@@ -1402,7 +1389,11 @@ fn execute_slash_command_impl(
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
-            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Plan)).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Plan,
+                ))
+                .ok();
             atomcode_daemon::live_set_mode(AgentMode::Plan);
             renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedPlanMode).into_owned()));
             renderer.flush();
@@ -1410,23 +1401,31 @@ fn execute_slash_command_impl(
         "build" => {
             state.agent_mode = AgentMode::Build;
             state.build_badge_visible = true;
-            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Build)).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Build,
+                ))
+                .ok();
             atomcode_daemon::live_set_mode(AgentMode::Build);
             renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedBuildMode).into_owned()));
             renderer.flush();
         }
         "auto" => {
             state.agent_mode = AgentMode::Auto;
-            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Auto)).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Auto,
+                ))
+                .ok();
             atomcode_daemon::live_set_mode(AgentMode::Auto);
             renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedAutoMode).into_owned()));
             renderer.flush();
         }
         "review" => {
-            // Trigger the v2 coding agent's `code_review` sub-agent tool. Map the optional
+            // Trigger the coding agent's `code_review` sub-agent tool. Map the optional
             // arg to the tool's scope (default = working-tree changes; `staged`; or a base
             // ref), then the model calls the tool and summarizes its findings. If the
-            // running engine lacks the tool (e.g. legacy v1), the model simply says so.
+            // configured runtime lacks the tool, the model simply says so.
             let scope = arg.trim();
             let text = if scope.is_empty() {
                 "Review my current uncommitted changes: call the `code_review` tool with no \
@@ -1497,10 +1496,7 @@ fn execute_slash_command_impl(
                     // Enter handler) — no turn fires here either, so the cached
                     // snapshot's denominator would otherwise stay on the old model.
                     state.on_model_window_changed(ctx.config.default_context_window());
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::ReloadConfig(new_cfg))
-                        .ok();
+                    reload_runtime_provider(ctx).ok();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
                             provider: &new_default,
@@ -1693,9 +1689,11 @@ fn execute_slash_command_impl(
             // serves the render — still fresh, just a tick later.
             let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
             state.pending_context_render = Some(show_prompt);
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::RefreshContextStats)
+            ctx.runtime
+                .refresh_context_stats(
+                    ctx.foreground_runtime_id,
+                    ctx.runtime_event_tx.clone(),
+                )
                 .ok();
         }
         "compact" => {
@@ -2120,10 +2118,7 @@ fn execute_slash_command_impl(
             match atomcode_core::auth::logout() {
                 Ok(()) => {
                     ctx.telemetry.set_account_id(None);
-                    let _ = ctx
-                        .agent
-                        .cmd_tx
-                        .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+                    let _ = reload_runtime_provider(ctx);
                     renderer.render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned()));
                 }
                 Err(e) => {
@@ -2277,7 +2272,6 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
                     };
 
-                    ctx.agent = endpoint.legacy;
                     ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
@@ -2345,7 +2339,6 @@ fn execute_slash_command_impl(
                     // session (and clear the stale footer). ClearLoop reaches the outgoing
                     // agent before the swap below.
                     stop_active_loop(state, ctx);
-                    ctx.agent = endpoint.legacy;
                     ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
@@ -2408,7 +2401,10 @@ fn execute_slash_command_impl(
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
                         if let Some(endpoint) = dropped.endpoint.as_ref() {
-                            endpoint.legacy.cmd_tx.send(AgentCommand::Cancel).ok();
+                            endpoint
+                                .native
+                                .dispatch(atomcode_coding::DriverCommand::Cancel)
+                                .ok();
                         }
                     }
                     if !dropped.session.messages.is_empty() {
@@ -2466,13 +2462,8 @@ fn execute_slash_command_impl(
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
             };
             endpoint
-                .legacy
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: task.to_string(),
-                    images: Vec::new(),
-                    image_markers: Vec::new(),
-                })
+                .native
+                .dispatch(atomcode_coding::DriverCommand::Submit(task.to_string().into()))
                 .ok();
             renderer.render(UiLine::CommandOutput(
                 t(Msg::BgTaskStarted {
@@ -2656,13 +2647,10 @@ fn execute_slash_command_impl(
                     renderer.render(UiLine::CommandOutput(header));
                     renderer.flush();
 
-                    // 1) Drop all previously-registered MCP tools so any adapters holding the
-                    // old registry Arc are released and stdio child processes can be killed.
-                    let removed = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            ctx.agent.tool_registry.unregister_prefix("mcp__").await
-                        })
-                    });
+                    // CodingRuntime owns the model-facing tool registry. ReloadCapabilities
+                    // replaces the prepared capability set, so the TUI has no parallel
+                    // model-facing registry to mutate or count here.
+                    let removed = 0;
 
                     // 2) Drop old registry + event receiver (stop consuming old events).
                     ctx.mcp_connect_rx = None;
@@ -2698,11 +2686,12 @@ fn execute_slash_command_impl(
                     ctx.mcp_registry = Some(std::sync::Arc::new(registry));
                     ctx.mcp_connect_rx = Some(rx);
 
-                    // The driver registry above feeds the palette; the ENGINE binds its own MCP
-                    // at prepare time. Ask it to re-prepare so the reloaded servers reach the
-                    // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
-                    // respawn that re-mounts MCP/skills/hooks.)
-                    ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
+                    // The driver registry above feeds the palette; CodingRuntime binds its own
+                    // MCP set at prepare time. Re-prepare the current session so the reloaded
+                    // servers are re-mounted together with skills and hooks.
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::ReloadCapabilities)
+                        .ok();
 
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::McpClearedReconnecting { removed }).into_owned(),
@@ -2981,7 +2970,9 @@ fn execute_slash_command_impl(
                     renderer.flush();
                 }
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
-                    ctx.agent.cmd_tx.send(AgentCommand::ClearGoal).ok();
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::StopGoal)
+                        .ok();
                     state.goal_condition = None;
                     state.goal_round = 0;
                     state.goal_started_at = None;
@@ -3001,20 +2992,16 @@ fn execute_slash_command_impl(
                     // (Empty input is unreachable here — `head` would be ""
                     // and the `"" | "status"` arm above would have matched.)
                     let condition = trimmed.to_owned();
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SetGoal { condition: condition.clone() })
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::StartGoal(
+                            condition.clone(),
+                        ))
                         .ok();
                     state.goal_condition = Some(condition.clone());
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: condition,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::Submit(condition.into()))
                         .ok();
                     state.on_submit();
                 }
@@ -3058,20 +3045,14 @@ fn execute_slash_command_impl(
                     // Replace any existing loop (both self-paced core and
                     // fixed-interval TUI controller) before setting a new one.
                     stop_active_loop(state, ctx);
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SetLoop { prompt: prompt.clone() })
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::StartLoop(prompt.clone()))
                         .ok();
                     state.loop_label = Some(prompt.clone());
                     state.loop_round = 0;
                     state.loop_started_at = Some(std::time::Instant::now());
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: prompt,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::Submit(prompt.into()))
                         .ok();
                     state.on_submit();
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
@@ -4465,7 +4446,9 @@ pub(crate) fn reset_to_new_session(
     state: &mut UiState,
     renderer: &mut dyn Renderer,
 ) {
-    ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::FreshSession)
+        .ok();
     // /clear and /session must also halt any active /loop (both self-paced
     // core and fixed-interval TUI controller).  stop_active_loop sends its
     // own ClearLoop which is harmless to duplicate — it arrives after
@@ -4520,12 +4503,11 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // but the dir-picker's recent-list branch and the webui `ProjectSwitched` event
     // reach here WITHOUT going through it, carrying a canonicalized `\\?\C:\…` path
     // (persisted recent_dirs.txt entries from before the fix, or a re-canonicalized
-    // bridge value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDir`
+    // runtime value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDirectory`
     // command, and the webui sync all store the plain form regardless of caller.
     let path = atomcode_capabilities::pathnorm::strip_verbatim_path(&path);
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::ChangeDirectory(path.clone()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
     // Re-index the @-mention file index for the new working directory.
@@ -4623,7 +4605,7 @@ pub(crate) fn resolve_cd(
     // On Windows `canonicalize` returns a `\\?\` verbatim / extended-length path.
     // Strip it here at the SOURCE so every downstream sink carries the plain
     // `C:\…` form: the "已切换到 …" confirmation (uses this value directly), the
-    // stored `working_dir`, the `AgentCommand::ChangeDir` sent to the runtime, the
+    // stored `working_dir`, the `DriverCommand::ChangeDirectory` sent to the runtime, the
     // webui footer sync (`live_set_working_dir`), and `recent_dirs.txt`. Only the
     // status-row `collapse_home` stripped before, so those other sites leaked the
     // raw `\\?\C:\Users\hao\atomcode`. Mirrors the daemon's `change_dir`, which
@@ -5771,8 +5753,8 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // Update `ctx.model_name` to reflect the new default provider from
         // the just-completed login/setup. This ensures the status line shows
         // the current model immediately rather than the pre-login value.
-        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
-        // above) — if the bridge fails to switch (e.g. gateway signer
+        // Runtime reassembly is asynchronous (started by `save_and_reload`
+        // above) — if it fails to switch (e.g. gateway signer
         // unavailable), the user will see the error on their next chat turn
         // and can fall back to `/model`. This matches `/model`'s approach
         // which also updates `ctx.model_name` optimistically.
@@ -5852,12 +5834,10 @@ fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
     let id = format!("todo-clear-{}", ctx.current_session.messages.len());
     let mut snapshot = ctx.current_session.to_conversation_snapshot();
     snapshot.messages.extend(todo_clear_messages(id));
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::SetConversation {
-            snapshot: snapshot.clone(),
-            restore_id: None,
-        })
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
+            crate::runtime_convert::snapshot_to_kernel(&snapshot),
+        ))
         .ok();
     ctx.current_session.update_from_conversation_snapshot(snapshot);
     ctx.current_session.touch();
@@ -6429,6 +6409,8 @@ mod tests {
 
     #[test]
     fn file_path_rejected_with_not_a_directory() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");

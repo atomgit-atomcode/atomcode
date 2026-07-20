@@ -505,7 +505,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     content: Option<String>,
     /// MiniMax M2.7 / DeepSeek R1 send thinking via this field. We forward
-    /// it as `StreamEvent::Reasoning` so `TurnRunner` can promote it to
+    /// it as `StreamEvent::Reasoning` so the kernel agent can promote it to
     /// the final text if `content` ends up empty — some gateways route
     /// *entire* responses to `reasoning_content` for these models, which
     /// previously showed up as a silent 0-token "Nailed it" turn.
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn placeholder_send_side_matches_shared_constant() {
-        // `TurnRunner::Done` skips reasoning→text promotion when the
+        // The kernel agent skips reasoning→text promotion when the
         // accumulated reasoning_buf equals exactly this placeholder.
         // Send-side (format_messages, three call sites) MUST emit the
         // same byte string — otherwise a buggy gateway echoing it

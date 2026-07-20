@@ -19,6 +19,7 @@ tar = "0.4"
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-auth = { path = "../atomcode-auth", optional = true }
 # Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
 # the config crate is explicitly designed so every stack layer can read config without an
 # atomcode-core dep. Optional + behind the `notify` feature so a provider-only / lean
@@ -40,6 +41,8 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], defau
 # RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
 # Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
 httpdate = { version = "1", optional = true }
+getrandom = { version = "0.2", optional = true }
+tracing = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 # `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
@@ -104,8 +107,7 @@ tempfile = { version = "3", optional = true }
 # `setup` lock.rs reads host name + process start-time for the advisory install lock
 # sentinel (stale-lock detection). Optional so non-setup builds skip it.
 sysinfo = { version = "0.32", default-features = false, features = ["system"], optional = true }
-# `setup` structured log lines (install skips/failures, lock takeover). Optional.
-tracing = { version = "0.1", optional = true }
+# `setup` structured log lines reuse the optional `tracing` dependency declared above.
 # `setup` seeds.rs decompresses/unpacks the embedded tar.zst seed archive at first
 # run. Same crates as the build-dependencies packer (separate dep trees). Optional.
 zstd = { version = "0.13", optional = true }
@@ -115,7 +117,7 @@ tar = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate"]
+provider = ["dep:reqwest", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:getrandom", "dep:tracing"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "tokio/fs", "tokio/process", "tokio/io-util"]

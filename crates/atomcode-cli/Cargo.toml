@@ -27,8 +27,6 @@ atomcode-core = { path = "../atomcode-core" }
 atomcode-config = { path = "../atomcode-config" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
-# Engine v2: the new stack presented through the legacy channel protocol.
-atomcode-bridge = { path = "../atomcode-bridge" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }

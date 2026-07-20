@@ -124,8 +124,8 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 /// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
 /// image file back to the model as an actual picture (a VISION model SEES it) instead
 /// of the "binary, cannot display" text. The caller decides the flag from the model
-/// (the coding layer uses `atomcode_core::provider::model_name_suggests_vision`, the
-/// same detector as the user-paste path) — kept out of this crate so it stays core-free.
+/// using [`crate::provider::model_suggests_vision`], the same detector used by the
+/// provider image encoder.
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool));
@@ -524,8 +524,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(request_user_input_env)]
     fn request_user_input_gated_on_by_default_off_when_opt_out() {
-        // default (unset) → NOW registered (default ON)
+        // default (unset) → registered (default ON)
         std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut reg = ToolRegistry::new();
         register_coding_tools_with_vision(&mut reg, false);
@@ -576,6 +577,7 @@ mod tests {
     /// but absent from `coding_tool_names()`, so `mount()` never selected it and the model
     /// never saw it.
     #[test]
+    #[serial_test::serial(request_user_input_env)]
     fn request_user_input_default_on_reaches_mounted_defs() {
         std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut reg = ToolRegistry::new();
@@ -589,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(request_user_input_env)]
     fn request_user_input_absent_from_defs_when_opt_out() {
         std::env::set_var("ATOMCODE_REQUEST_USER_INPUT", "0");
         let mut reg = ToolRegistry::new();

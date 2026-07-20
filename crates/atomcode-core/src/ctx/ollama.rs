@@ -14,7 +14,7 @@
 //!
 //! - **不砍 system prompt**：tool schema 作为独立参数传给 LLM API，
 //!   不在 `system_prompt: &str` 里。真要简化 system prompt 需要在
-//!   [`crate::agent::prompt`] 层面做。
+//!   coding runtime 的 prompt 组装层做。
 //! - **不改工具集筛选**：哪些工具暴露给模型是 [`crate::tool::ToolRegistry`]
 //!   的职责,与 ctx 无关。
 //! - **不重写 render 管道**：`build_messages`

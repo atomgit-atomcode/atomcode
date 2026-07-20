@@ -1,8 +1,8 @@
-//! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 既有的 AgentEvent，
+//! 同步模式：把 LiveSession 的 LiveEvent 映射成 TUI 展示事件，
 //! 投进现有 runtime_event_tx，复用 handle_agent_event 渲染。
 
 use super::bg_runtime::{RuntimeEvent, RuntimeEventPayload, RuntimeId};
-use atomcode_core::agent::AgentEvent;
+use super::ui_event::UiEvent as AgentEvent;
 use atomcode_core::live::{LiveEvent, LiveSession};
 use atomcode_core::turn::event::TurnEvent;
 use std::sync::Arc;
@@ -172,7 +172,7 @@ fn spawn_live_forwarder_with_receiver(
                         if fan_tx
                             .send(RuntimeEvent {
                                 runtime_id,
-                                event: RuntimeEventPayload::Legacy(ae),
+                                event: RuntimeEventPayload::Ui(ae),
                             })
                             .is_err()
                         {
@@ -186,7 +186,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::UserEcho(text)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::UserEcho(text)),
                         })
                         .is_err()
                     {
@@ -199,7 +199,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::PeerBusy(running)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::PeerBusy(running)),
                         })
                         .is_err()
                     {
@@ -211,7 +211,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::ProviderChanged(provider)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::ProviderChanged(provider)),
                         })
                         .is_err()
                     {
@@ -226,7 +226,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::ProjectSwitched(dir)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::ProjectSwitched(dir)),
                         })
                         .is_err()
                     {
@@ -239,7 +239,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionSwitched(session_id)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::SessionSwitched(session_id)),
                         })
                         .is_err()
                     {
@@ -256,7 +256,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::SessionRenamed { name }),
+                            event: RuntimeEventPayload::Ui(AgentEvent::SessionRenamed { name }),
                         })
                         .is_err()
                     {
@@ -270,7 +270,7 @@ fn spawn_live_forwarder_with_receiver(
                     if fan_tx
                         .send(RuntimeEvent {
                             runtime_id,
-                            event: RuntimeEventPayload::Legacy(AgentEvent::RemoteSlashCommand(line)),
+                            event: RuntimeEventPayload::Ui(AgentEvent::RemoteSlashCommand(line)),
                         })
                         .is_err()
                     {
@@ -286,7 +286,7 @@ fn spawn_live_forwarder_with_receiver(
                         if fan_tx
                             .send(RuntimeEvent {
                                 runtime_id,
-                                event: RuntimeEventPayload::Legacy(event),
+                                event: RuntimeEventPayload::Ui(event),
                             })
                             .is_err()
                         {

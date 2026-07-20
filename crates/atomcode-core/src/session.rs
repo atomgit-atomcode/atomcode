@@ -124,7 +124,7 @@ pub struct Session {
     pub user_renamed: bool,
     /// True once the AI session-namer has set this session's name (see
     /// `agent::session_title`). Persisted so the one-shot naming survives
-    /// reconnects/restarts: a fresh bridge instance re-arms its in-memory
+    /// reconnects/restarts: a fresh runtime generation re-arms its in-memory
     /// `ai_name_attempted` flag, so without this durable marker every
     /// `/resume`-then-message would re-run the namer and overwrite a perfectly
     /// good AI name. Gates `should_accept_ai_name`. A deliberate `/rename`
@@ -1159,4 +1159,3 @@ mod tests {
         );
     }
 }
-

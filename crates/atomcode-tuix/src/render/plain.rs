@@ -874,6 +874,8 @@ mod tests {
     /// selectable-panel refactor (Task 4).
     #[test]
     fn approval_panel_printed_before_chevron_in_interactive_mode() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut buf = Vec::new();
         let mut r = PlainRenderer::with_writer_caps_and_interactive(
             &mut buf,

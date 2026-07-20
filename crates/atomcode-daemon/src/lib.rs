@@ -31,7 +31,16 @@ mod api_config;
 mod api_provider;
 pub mod approval_mode;
 mod commands;
+pub mod legacy_convert;
+mod runtime_host;
 pub(crate) mod kernel_runtime;
+pub use kernel_runtime::{
+    spawn_native_runtime_for_session_deferred, start_native_runtime,
+    start_native_runtime_with_session,
+};
+pub use runtime_host::{
+    coding_plan_rate_limit_source, coding_provider_factory, installed_plugin_hook_source,
+};
 pub(crate) mod live_api;
 pub use live_api::current_live_session;
 pub use live_api::ensure_live_session;
@@ -64,14 +73,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use atomcode_core::auth;
 use atomcode_config::config::Config;
+use atomcode_core::auth;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::McpRegistry;
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
-use atomcode_telemetry::detect_repo_origin;
 use atomcode_core::turn::event::TurnEvent;
+use atomcode_telemetry::detect_repo_origin;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
@@ -293,7 +302,8 @@ pub(crate) fn atomcode_home_test_lock() -> &'static std::sync::Mutex<()> {
 
 type ProjectStateStore = Arc<RwLock<ProjectState>>;
 
-pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> = std::sync::Mutex::new(None);
+pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> =
+    std::sync::Mutex::new(None);
 
 /// Active chat tasks (session_id -> cancellation token)
 type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
@@ -1103,7 +1113,10 @@ fn is_system_temp_dir(path: &std::path::Path) -> bool {
         return true;
     }
     // Windows temp dirs
-    if path_str.contains("\\Temp\\") || path_str.contains("\\TEMP\\") || path_str.ends_with("\\Temp") || path_str.ends_with("\\TEMP")
+    if path_str.contains("\\Temp\\")
+        || path_str.contains("\\TEMP\\")
+        || path_str.ends_with("\\Temp")
+        || path_str.ends_with("\\TEMP")
     {
         return true;
     }
@@ -2200,9 +2213,9 @@ pub struct ChatRequest {
     /// this is available during the first turn of a brand-new conversation.
     #[serde(default)]
     pub request_id: Option<String>,
-    /// Attached images (base64). Empty = text-only. When the active model is
-    /// not vision-capable, these are routed through the configured VL model
-    /// (vision_preprocessor) and turned into text, mirroring the TUI.
+    /// Attached images (base64). Empty = text-only. The native `/chat` path forwards
+    /// them to vision-capable models and uses the configured VL preprocessor when the
+    /// active model is text-only, matching `/live` and the TUI.
     #[serde(default)]
     pub images: Vec<ImageInput>,
     /// Optional per-request approval mode. When absent, the daemon falls back
@@ -2749,7 +2762,7 @@ async fn process_chat_request(
     cancel_token: CancellationToken,
     cancellation_key: String,
     stopped_sessions: StoppedSessionsStore,
-    // The engine-v2 bridge builds its own MCP; this per-project cache is warmed by
+    // CodingRuntime builds its own MCP; this per-project cache is warmed by
     // the /context, /compact and /live paths, not the chat turn.
     _mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
@@ -2772,9 +2785,9 @@ async fn process_chat_request(
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
 
     // Pre-flight: validate the selected provider config up front so a bad
-    // provider surfaces a clean error here rather than deep in the bridge. The
-    // engine-v2 bridge builds its own provider for the actual turn.
-    let _provider = provider::create_provider(provider_config)?;
+    // provider surfaces a clean error here rather than deep in the runtime. The
+    // runtime builds its own provider for the actual turn.
+    let active_provider = provider::create_provider(provider_config)?;
 
     // Get working directory
     let working_dir = req
@@ -2801,6 +2814,10 @@ async fn process_chat_request(
         Session::new(working_dir.clone())
     };
 
+    // Bind the persisted conversation id to the one-off active provider used by the
+    // VL preprocessor, preserving the same gateway affinity as the main chat turn.
+    active_provider.set_session_id(session.id.as_str());
+
     // Key used to route interactive permission decisions back to this turn's
     // decider. We use the *actual* session id (not req.session_id, which may be
     // empty for brand-new chats and would collide across concurrent new
@@ -2810,11 +2827,9 @@ async fn process_chat_request(
 
     // Create conversation from session messages
     let conversation = Arc::new(tokio::sync::Mutex::new(session.to_conversation()));
-    // 构造用户消息：带图走 MultiPart（vision）。跳过 VL 预处理——bridge 的
-    // on_command 会在收到 SendMessage 时调用 maybe_preprocess，此时再做一次是
-    // 冗余的（VL 模型会被多调一次）。直接把原文 + 原图写入 MultiPart，bridge
-    // 收到后负责 VL 转换并清空 images 发给 kernel；conversation 中保留原图用于
-    // webui 缩略图渲染。无图则纯文本。
+    // Keep the original images in the persisted/display conversation, but preprocess the
+    // runtime caption first when the active model is text-only. `run_chat_turn_v2` detects
+    // the marker and omits the already-described image bytes from the kernel input.
     {
         use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
 
@@ -2826,21 +2841,22 @@ async fn process_chat_request(
                 data: i.data.clone(),
             })
             .collect();
+        let runtime_text =
+            live_api::preprocess_image_caption(&config, &*active_provider, &req.message, &images)
+                .await;
 
         let mut conv = conversation.lock().await;
         if images.is_empty() {
-            conv.add_user_message(&req.message);
+            conv.add_user_message(&runtime_text);
         } else {
-            // 跳过 VL 预处理，直接用原文 + 原图写入 MultiPart。bridge 的
-            // on_command 会负责 VL 预处理并清空发给 kernel 的 images。
             let idx = conv.messages.len();
             conv.messages.push(Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if req.message.is_empty() {
+                    text: if runtime_text.is_empty() {
                         None
                     } else {
-                        Some(req.message.clone())
+                        Some(runtime_text)
                     },
                     images,
                 },
@@ -2852,7 +2868,7 @@ async fn process_chat_request(
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
     // channel, VSCode, JetBrains) in Build mode route `/chat/permission`
-    // decisions back to the engine-v2 producer via `pending_permissions` (see
+    // decisions back to the native runtime producer via `pending_permissions` (see
     // the registration in the turn task below). Plan and Bypass are explicit
     // modes and never depend on an approver.
     let registered_permission_responder =
@@ -2897,17 +2913,17 @@ async fn process_chat_request(
     // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
     let tel_ctx = CurrentContext::current();
 
-    // Run turn(s) in a background task on the kernel stack via atomcode-bridge; the
+    // Run turn(s) in a background task on the native kernel stack; the
     // downstream turn_rx → ChatEvent consumer + persistence only read turn_rx.
     {
-        let mut bridge_cfg =
-            live_api::chat_bridge_config(&config, &provider_name, &working_dir, telemetry.clone());
-        bridge_cfg.dangerously_skip_permissions = approval_mode
+        let mut runtime_cfg =
+            live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
+        runtime_cfg.dangerously_skip_permissions = approval_mode
             == crate::approval_mode::ApprovalMode::Auto
             || (approval_mode == crate::approval_mode::ApprovalMode::Build
                 && !interactive_permission);
-        // Interactive approval: route /chat/permission decisions to the v2 producer
-        // (this re-registration supersedes the v1 decider's, which never runs here).
+        // Interactive approval: route /chat/permission decisions to the native runtime
+        // request waiting for this turn.
         let perm_rx = if registered_permission_responder {
             let (tx, rx) = mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
             pending_permissions.register(perm_session_key.clone(), tx);
@@ -2923,7 +2939,7 @@ async fn process_chat_request(
                     conv,
                     turn_tx,
                     cancel,
-                    bridge_cfg,
+                    runtime_cfg,
                     perm_rx,
                     approval_mode,
                 )
@@ -3231,7 +3247,8 @@ pub(crate) fn build_api_system_prompt(
 
     // Layered instructions (global → project → user).
     // Pure file reads, no side effects, < 1ms.
-    let instructions = atomcode_config::config::instructions::LayeredInstructions::load(working_dir);
+    let instructions =
+        atomcode_config::config::instructions::LayeredInstructions::load(working_dir);
     let merged_instructions = instructions.merged();
     if !merged_instructions.is_empty() {
         prompt.push_str(&format!("\n{}\n", merged_instructions));
@@ -4758,6 +4775,131 @@ mod fs_list_tests {
 mod tests {
     use super::*;
 
+    struct ScopedChatHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ScopedChatHome {
+        fn new() -> Self {
+            let lock = atomcode_home_test_lock()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = std::env::var_os("ATOMCODE_HOME");
+            let dir = tempfile::tempdir().expect("chat test home");
+            std::env::set_var("ATOMCODE_HOME", dir.path());
+            Self {
+                _lock: lock,
+                previous,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for ScopedChatHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+        }
+    }
+
+    async fn spawn_openai_sse(
+        response_text: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let payload = serde_json::json!({
+            "choices": [{
+                "delta": { "content": response_text },
+                "finish_reason": null
+            }]
+        });
+        let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept provider request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read provider request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write provider response");
+        });
+        (format!("http://{address}/v1"), request_rx, task)
+    }
+
+    fn test_provider(
+        model: &str,
+        base_url: String,
+    ) -> atomcode_config::config::provider::ProviderConfig {
+        atomcode_config::config::provider::ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("test-key".into()),
+            model: model.into(),
+            base_url: Some(base_url),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: Some(1024),
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+        }
+    }
+
     // 回归：远程 HTTP MCP 服务器在 `/mcp/status` 面板显示为空。根因之一是 in-flight
     // （仍在 initialize() 途中）的服务器既不在 servers、也不在 failed_servers → 被
     // server_statuses() 略过 → 面板空。修复：把配置里有、但 registry 尚未记录的服务器
@@ -4767,7 +4909,10 @@ mod tests {
         use atomcode_core::mcp::ServerStatus;
         let statuses = vec![
             ("connected-srv".to_string(), ServerStatus::Connected),
-            ("failed-srv".to_string(), ServerStatus::Failed("boom".to_string())),
+            (
+                "failed-srv".to_string(),
+                ServerStatus::Failed("boom".to_string()),
+            ),
         ];
         let configured = vec![
             "connected-srv".to_string(),
@@ -4779,10 +4924,19 @@ mod tests {
                 .into_iter()
                 .collect();
         assert_eq!(merged.len(), 3);
-        assert!(matches!(merged.get("connected-srv"), Some(ServerStatus::Connected)));
-        assert!(matches!(merged.get("failed-srv"), Some(ServerStatus::Failed(_))));
+        assert!(matches!(
+            merged.get("connected-srv"),
+            Some(ServerStatus::Connected)
+        ));
+        assert!(matches!(
+            merged.get("failed-srv"),
+            Some(ServerStatus::Failed(_))
+        ));
         // The not-yet-connected configured server is visible as connecting, not dropped.
-        assert!(matches!(merged.get("pending-srv"), Some(ServerStatus::Connecting)));
+        assert!(matches!(
+            merged.get("pending-srv"),
+            Some(ServerStatus::Connecting)
+        ));
     }
 
     #[test]
@@ -4801,10 +4955,8 @@ mod tests {
     #[test]
     fn merge_no_config_is_identity() {
         use atomcode_core::mcp::ServerStatus;
-        let merged = merge_configured_mcp_statuses(
-            vec![("s".to_string(), ServerStatus::Connected)],
-            &[],
-        );
+        let merged =
+            merge_configured_mcp_statuses(vec![("s".to_string(), ServerStatus::Connected)], &[]);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].1, ServerStatus::Connected));
     }
@@ -4892,6 +5044,79 @@ mod tests {
             json,
             r#"{"type":"warning","message":"conversation compacted"}"#
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_preprocesses_images_before_submitting_to_a_text_only_model() {
+        let home = ScopedChatHome::new();
+        let (main_url, main_request, main_task) = spawn_openai_sse("main response").await;
+        let (vl_url, vl_request, vl_task) = spawn_openai_sse("recognized screenshot text").await;
+
+        let mut config = Config::with_default_provider("main");
+        config
+            .providers
+            .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+        config
+            .providers
+            .insert("vl".into(), test_provider("qwen3-vl-plus", vl_url));
+        config.vision_preprocessor_provider = Some("vl".into());
+        config
+            .save(&Config::default_path())
+            .expect("save chat test config");
+
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::ResolvedConfig {
+                state: atomcode_telemetry::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: home._dir.path().to_path_buf(),
+            },
+            "test".into(),
+        );
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        process_chat_request(
+            ChatRequest {
+                message: "explain this screenshot".into(),
+                working_dir: Some(home._dir.path().to_path_buf()),
+                provider: Some("main".into()),
+                session_id: None,
+                request_id: Some("chat-vl-regression".into()),
+                images: vec![ImageInput {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+            },
+            event_tx,
+            CancellationToken::new(),
+            "chat-vl-regression".into(),
+            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            telemetry,
+            permission_bridge::PermissionResponders::new(),
+            false,
+        )
+        .await
+        .expect("chat request succeeds");
+
+        let vl_request = tokio::time::timeout(std::time::Duration::from_secs(2), vl_request)
+            .await
+            .expect("configured VL provider must be called")
+            .expect("VL request captured");
+        let main_request = tokio::time::timeout(std::time::Duration::from_secs(2), main_request)
+            .await
+            .expect("main provider must be called")
+            .expect("main request captured");
+        assert!(
+            vl_request.contains("aW1hZ2U="),
+            "VL request must carry the image"
+        );
+        assert!(
+            main_request.contains("recognized screenshot text"),
+            "main text-only provider must receive the VL description: {main_request}"
+        );
+
+        main_task.await.expect("main provider task");
+        vl_task.await.expect("VL provider task");
     }
 
     // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），
@@ -5318,7 +5543,12 @@ mod channel_mode_tests {
 
     // ---- Offline parity: build_api_system_prompt must emit OFFLINE ENVIRONMENT ----
 
-    fn minimal_build_api_system_prompt_fixture() -> (PathBuf, atomcode_config::config::Config, atomcode_config::config::provider::ProviderConfig, Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>) {
+    fn minimal_build_api_system_prompt_fixture() -> (
+        PathBuf,
+        atomcode_config::config::Config,
+        atomcode_config::config::provider::ProviderConfig,
+        Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    ) {
         let working_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let config = atomcode_config::config::Config::default();
         let provider_config = atomcode_config::config::provider::ProviderConfig {
@@ -5349,7 +5579,9 @@ mod channel_mode_tests {
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn build_api_system_prompt_emits_offline_block_when_offline() {
-        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::On, None);
         let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();
@@ -5364,7 +5596,9 @@ mod channel_mode_tests {
     #[test]
     #[serial_test::serial(offline_verdict)]
     fn build_api_system_prompt_omits_offline_block_when_online() {
-        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
         reset_offline_verdict_for_test();
         seed_offline_verdict(OfflineMode::Off, None);
         let (wd, cfg, pcfg, sr) = minimal_build_api_system_prompt_fixture();

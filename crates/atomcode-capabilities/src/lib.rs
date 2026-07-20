@@ -41,7 +41,7 @@ pub mod reminder;
 
 /// Claude-Code-compatible EXTERNAL hooks ([`cc_hooks::CCExternalHooks`]) — runs the
 /// user's `hooks.json` commands on the kernel's [`LifecycleHooks`]/[`ToolMiddleware`]
-/// seams (the port of core's hook engine onto the v2 engine). Opt-in: spawns
+/// seams (the port of core's hook engine onto the native stack). Opt-in: spawns
 /// subprocesses, so it pulls `tokio/process` + `dirs`.
 #[cfg(feature = "cc-hooks")]
 pub mod cc_hooks;
@@ -65,13 +65,13 @@ pub(crate) mod paths;
 pub mod process_utils;
 
 /// ONE home for Windows path normalization (native-canonical internally,
-/// forward-slash at the LLM/UI boundary). `pub` so the v2 drivers that depend on
-/// capabilities (`review`, `clix`, `bridge`) can reuse it. Local copy of
+/// forward-slash at the LLM/UI boundary). `pub` so native drivers and L2 crates
+/// (`review`, `clix`, `coding`) can reuse it. Local copy of
 /// `core::tool::strip_verbatim_prefix` (L1 must not depend on `core`).
 pub mod pathnorm;
 
 /// Proxy policy for outbound HTTP clients — a self-contained mirror of
-/// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so v2 clients
+/// `core::proxy` (reads the process `ATOMCODE_PROXY_MODE` env) so native clients
 /// honor `no_proxy` without `capabilities` depending on `core`. Compiled
 /// whenever a reqwest-using capability is enabled.
 #[cfg(any(feature = "provider", feature = "web", feature = "atomgit", feature = "mcp"))]

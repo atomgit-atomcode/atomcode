@@ -3,7 +3,7 @@
 //! 模型：一个活动会话，多个视图（TUI / webui）。`LiveSession` 是单一数据源
 //! （`Conversation`）+ 事件扇出（`broadcast`）+ 单一输入入口（`mpsc`）+ 单写者
 //! turn 守卫。turn 的实际执行通过 [`TurnExecutor`] 注入，便于单测（`FakeExecutor`）
-//! 与后续接真实 `TurnRunner`（阶段②）。
+//! 和接入 `CodingRuntime`。
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -108,8 +108,8 @@ pub enum LiveEvent {
 }
 
 /// turn 执行策略。实现者负责对 `conv` 跑一次完整 turn（含工具循环），并把过程
-/// 事件作为 [`LiveEvent::Turn`] 发到 `events`。本阶段单测用 `FakeExecutor`；
-/// 阶段② 提供包裹 `TurnRunner` 的真实实现。
+/// 事件作为 [`LiveEvent::Turn`] 发到 `events`。单测使用 `FakeExecutor`，生产实现接入
+/// `CodingRuntime`。
 #[async_trait]
 pub trait TurnExecutor: Send + Sync {
     async fn run_turn(
@@ -358,7 +358,7 @@ impl LiveSession {
 
     /// 任一视图批准/拒绝，投递决定到执行器持有的审批通道。
     ///
-    /// 通道在整个回合内保持注册（**不**取走 sender）：同一回合里 TurnRunner 可能
+    /// 通道在整个回合内保持注册（**不**取走 sender）：同一回合里 runtime 可能
     /// 顺序触发多个工具审批，它们复用执行器在 `run_turn` 起始注册的同一个
     /// `perm_resp_rx`。早先这里用 `.take()` 投递一次后即 drop sender，导致通道
     /// 关闭，回合内第二个及之后的工具在 `InteractivePermissionDecider::decide()`
@@ -388,7 +388,7 @@ impl LiveSession {
 
     /// 取消当前正在运行的 turn(停止生成)。无运行中 turn 时返回 false。
     /// 真正的中断由协调器为本回合登记的 [`CancellationToken`] 驱动 —— 执行器
-    /// 的 `run_turn` 把它透传给 TurnRunner,模型流随之中止。任一视图(手机 /
+    /// 的 `run_turn` 把它透传给 runtime，模型流随之中止。任一视图（手机 /
     /// webui / TUI)都可调用,先到先停。
     pub async fn cancel_turn(&self) -> bool {
         if let Some(tok) = self.current_cancel.lock().await.as_ref() {
@@ -511,8 +511,8 @@ async fn coordinator(
         //
         // 执行器的事件经 tap 通道转发：先记入回放缓冲、再上公共广播——与
         // join_with_replay 持同一把 turn_buffer 锁，晚加入者拿到的「缓冲克隆 +
-        // 订阅」不丢不重。run_turn 返回前会排干自己的内部转发（见
-        // DaemonTurnExecutor），届时 tap 发送端全部释放、本转发器随之退出。
+        // 订阅」不丢不重。KernelTurnExecutor::run_turn 返回前会排干自己的内部转发，
+        // 届时 tap 发送端全部释放、本转发器随之退出。
         let (tap_tx, mut tap_rx) = broadcast::channel::<LiveEvent>(BROADCAST_CAPACITY);
         let fwd_buffer = turn_buffer.clone();
         let fwd_events = events.clone();

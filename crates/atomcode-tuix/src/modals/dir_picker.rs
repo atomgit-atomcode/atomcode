@@ -352,6 +352,8 @@ mod tests {
 
     #[test]
     fn menu_payload_marks_current_dir() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/b"));
         let payload = build_menu_payload(&p);
         assert_eq!(payload.items[0].1, "");

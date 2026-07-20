@@ -60,7 +60,7 @@ pub struct OpenAiCompatConfig {
     /// `bearer_auth(api_key)`. See [`RequestSigner`].
     pub request_signer: Option<std::sync::Arc<dyn RequestSigner>>,
     /// User-Agent sent on every request. `None` ⇒ the generic [`super::DEFAULT_USER_AGENT`]
-    /// fallback; the driver (bridge) sets this to `atomcode/<version>` so a forwarding
+    /// fallback; the host adapter sets this to `atomcode/<version>` so a forwarding
     /// gateway can attribute traffic by product version (analytics + per-version cache-hit
     /// slicing). This crate is versioned independently of the product, so the real version
     /// MUST be injected here rather than read from a local `CARGO_PKG_VERSION`.
@@ -74,21 +74,14 @@ pub struct OpenAiCompatConfig {
     /// array — re-sending a historical image to a text-only model 400s the whole
     /// request (`glm-5.2 is not a multimodal model`) on every resumed turn.
     /// `new()` DEFAULTS this from the model name (`model_suggests_vision`), so
-    /// every construction site — including the core-decoupled acp/review/clix
-    /// drivers — is correct without extra wiring; core-aware callers (bridge,
-    /// coding assemble) override it with core's authoritative copy. Mirrors v1
-    /// `supports_vision`.
+    /// every construction site — including ACP/review/clix and coding assembly —
+    /// is correct without extra wiring.
     pub supports_vision: bool,
 }
 
-/// Heuristic: does this model name look vision-capable? A VERBATIM copy of
-/// `atomcode_core::provider::model_name_suggests_vision` — this L0 crate cannot
-/// depend on core, so it is duplicated (like `session::hash_path` is in the
-/// daemon). MUST stay in sync: it also gates the live VL-preprocess and the
-/// `read_file` vision path; a drift silently drops (or wrongly forwards) images.
-/// `pub` so the v2 `bridge` reuses THIS copy for its resumed-image vision gate
-/// (dropping its former `atomcode_core::provider::model_name_suggests_vision`
-/// dependency) — one authority as the v1 stack is retired.
+/// Canonical native-stack heuristic for whether a model name looks vision-capable.
+/// It gates provider image encoding and the `read_file` vision path; daemon live
+/// preprocessing also uses it. A drift would silently drop or wrongly forward images.
 pub fn model_suggests_vision(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("vision")
@@ -1107,11 +1100,8 @@ struct PromptTokensDetails {
 mod tests {
     use super::*;
 
-    // Parity lock: `model_suggests_vision` MUST classify identically to
-    // `atomcode_core::provider::model_name_suggests_vision` (verbatim copy). The
-    // v2 `bridge` now depends on THIS copy, so a drift would silently change the
-    // resumed-image vision gate. Covers every match rule (in core's list order)
-    // plus a representative text-only negative.
+    // Classification lock for every supported vision naming rule plus a
+    // representative text-only negative.
     #[test]
     fn model_suggests_vision_matches_core_classifications() {
         for m in [

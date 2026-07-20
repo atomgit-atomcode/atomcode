@@ -540,9 +540,13 @@ async fn exec_context(
         cold_summaries: session.cold_summaries.clone(),
     });
     let (msgs, _) = parts.ctx.build_messages(&conv, &parts.system_prompt, "");
-    let s =
-        atomcode_core::agent::compute_rich_context_stats(&conv, &msgs, &parts.tools, &*parts.ctx)
-            .await;
+    let s = atomcode_core::ctx::compute_rich_context_stats(
+        &conv,
+        &msgs,
+        &parts.tools,
+        &*parts.ctx,
+    )
+    .await;
     Ok(CommandResult::Context {
         system_tokens: s.system_tokens,
         sent_tokens: s.sent_tokens,

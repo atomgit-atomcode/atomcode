@@ -6,8 +6,8 @@
 //! own risk metadata already marks the mutating ones: write/edit/bash). Read-only
 //! tools (read_file, grep, list_*, symbols, web, …) stay available.
 //!
-//! The flag is an `Arc<AtomicBool>` so the driver can toggle it live (the bridge maps
-//! `SetPlanMode` onto it) without a respawn — like the shared cwd handle.
+//! The flag is an `Arc<AtomicBool>` so `CodingRuntime::set_mode` can toggle it live
+//! without a respawn — like the shared cwd handle.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
