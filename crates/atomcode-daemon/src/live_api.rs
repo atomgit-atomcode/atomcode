@@ -488,8 +488,15 @@ pub(crate) async fn build_turn_parts(
         .get(&resolved_provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved_provider_name))?;
 
-    // Create provider instance
-    let provider = provider::create_provider(provider_config)?;
+    // Create provider instance. `create_provider` may do blocking auth I/O
+    // (OAuth token refresh) — run it off the async runtime so a slow/unreachable
+    // auth host can't block a worker thread.
+    let provider = {
+        let cfg = provider_config.clone();
+        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
+            .await
+            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
+    };
 
     // Build tool context — use "live" as session-id label
     let mut tool_context =

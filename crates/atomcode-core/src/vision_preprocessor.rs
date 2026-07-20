@@ -71,12 +71,19 @@ pub async fn maybe_preprocess(
     };
 
     // Build a one-off VL provider. `create_provider` handles auth-token
-    // loading (api_key=None) for the AtomGit gateway case.
-    let vl_provider = match create_provider(&vl_cfg) {
-        Ok(p) => p,
-        Err(e) => {
+    // loading (api_key=None) for the AtomGit gateway case, which may do blocking
+    // auth I/O — run it off the async runtime so a slow auth host can't block a
+    // worker thread.
+    let vl_provider = match tokio::task::spawn_blocking(move || create_provider(&vl_cfg)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
             return PreprocessOutcome::Failed {
                 reason: format!("VL provider build failed: {e:#}"),
+            };
+        }
+        Err(e) => {
+            return PreprocessOutcome::Failed {
+                reason: format!("VL provider build task panicked: {e}"),
             };
         }
     };

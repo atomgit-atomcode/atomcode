@@ -2788,7 +2788,14 @@ async fn process_chat_request(
     // Pre-flight: validate the selected provider config up front so a bad
     // provider surfaces a clean error here rather than deep in the runtime. The
     // runtime builds its own provider for the actual turn.
-    let active_provider = provider::create_provider(provider_config)?;
+    // `create_provider` may do blocking auth I/O (OAuth token refresh) — run it
+    // off the async runtime so a slow/unreachable auth host can't block a worker.
+    let active_provider = {
+        let cfg = provider_config.clone();
+        tokio::task::spawn_blocking(move || provider::create_provider(&cfg))
+            .await
+            .map_err(|e| anyhow::anyhow!("provider construction task panicked: {e}"))??
+    };
 
     // Get working directory
     let working_dir = req
