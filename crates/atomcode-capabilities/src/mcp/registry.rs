@@ -26,29 +26,6 @@ pub enum McpConnectEvent {
     BlockedUntrusted { name: String },
 }
 
-/// Replicate core's `strip_verbatim_prefix` (pure string logic, no core dep).
-///
-/// Windows `canonicalize()` returns extended-length paths like `\\?\C:\proj`.
-/// Core strips this prefix BEFORE the `\\`→`/` replacement, so the prefix
-/// characters `\\?\` are still intact when the strip runs. If we replaced
-/// backslashes first, the prefix would become `//?/` and the strip would
-/// silently no-op. Must run in the same order as core (`strip` → `replace`).
-///
-/// ```text
-/// \\?\UNC\server\share  →  \\server\share
-/// \\?\C:\proj           →  C:\proj
-/// anything else         →  unchanged
-/// ```
-fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        std::borrow::Cow::Owned(format!(r"\\{rest}"))
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        std::borrow::Cow::Borrowed(rest)
-    } else {
-        std::borrow::Cow::Borrowed(path)
-    }
-}
-
 /// Canonical trust-store key for a project dir — mirrors `atomcode_core::session::hash_path`.
 /// Exposed so tests (and any same-store reader) use ONE implementation.
 ///
@@ -70,7 +47,7 @@ pub fn project_trust_key(project_dir: &std::path::Path) -> String {
 
     // Step 1: strip verbatim prefix BEFORE backslash replacement (order matters).
     let raw = project_dir.to_string_lossy();
-    let stripped = strip_verbatim_prefix(&raw);
+    let stripped = crate::pathnorm::strip_verbatim(&raw);
 
     // Steps 2–4: backslash normalization, trailing-slash trim, Windows lowercase.
     let mut normalized = stripped.replace('\\', "/");
