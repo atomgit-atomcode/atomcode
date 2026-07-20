@@ -189,6 +189,11 @@ export class DaemonProcess {
 
   private async start(): Promise<boolean> {
     const port = this.defaultPort;
+    // Recovery: if a PREVIOUS daemon wedged and is squatting the port (health fails but
+    // the process is alive), reap it before spawning so our fresh daemon can bind. Such
+    // a daemon isn't our owned child, so shutdownDaemon() can't SIGKILL it — leaving the
+    // port stuck ("started but not responding") across restarts and even reinstalls.
+    await this.reapWedgedDaemon(port);
     const binary = this.findBinary(port);
     if (!binary) {
       vscode.window.showErrorMessage(
@@ -222,6 +227,104 @@ export class DaemonProcess {
       `AtomCode daemon started but not responding. Check if port ${port} is available.`
     );
     return false;
+  }
+
+  /** `$ATOMCODE_HOME` or `~/.atomcode` — mirrors the daemon's `Config::config_dir()`. */
+  private atomcodeHome(): string {
+    const env = process.env.ATOMCODE_HOME;
+    return env && env.length > 0 ? env : path.join(os.homedir(), '.atomcode');
+  }
+
+  /** Pidfile the daemon writes: `<home>/daemon-<port>.json`, keyed by port. */
+  private pidfilePath(port: number): string {
+    return path.join(this.atomcodeHome(), `daemon-${port}.json`);
+  }
+
+  /**
+   * Reap a WEDGED daemon that squats `port` but no longer answers /health. It may have
+   * been started by a previous VS Code session (not our owned child), so shutdownDaemon()
+   * can't kill it — the recovery gap that made the port stay stuck through restarts and
+   * reinstalls. Uses the daemon's own pidfile to identify the target and force-kills it
+   * ONLY after validating (a) health is genuinely dead now — a transient blip must not
+   * kill a daemon other windows are using, and (b) the pid is live AND an atomcode image
+   * — so a reused pid is never mis-killed. Best-effort; any failure falls through to a
+   * normal spawn (no worse than today).
+   */
+  private async reapWedgedDaemon(port: number): Promise<void> {
+    // (a) Only reap if the daemon is genuinely unresponsive. Retry a few times so a
+    // momentary hiccup doesn't kill a healthy daemon.
+    for (let i = 0; i < 3; i++) {
+      if (await this.client.isRunning()) {
+        return; // responded → healthy, do not touch
+      }
+      await sleep(200);
+    }
+
+    let pid: number | undefined;
+    try {
+      const info = JSON.parse(fs.readFileSync(this.pidfilePath(port), 'utf-8')) as { pid?: number };
+      pid = info.pid;
+    } catch {
+      return; // no/garbage pidfile → nothing to reap
+    }
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+      return;
+    }
+
+    // (b) Is the process alive? kill(pid, 0) throws (ESRCH) when it isn't.
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return; // dead pid → stale pidfile, ignore
+    }
+    // (b) Validate it's actually an atomcode daemon before killing (PID-reuse guard).
+    if (!this.isAtomcodeProcess(pid)) {
+      return;
+    }
+
+    console.warn(`[AtomCode] Reaping wedged daemon pid=${pid} squatting port ${port}`);
+    try {
+      if (process.platform === 'win32') {
+        // /F force, /T also terminate any child tree.
+        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      } else {
+        process.kill(pid, 'SIGKILL');
+      }
+    } catch {
+      // Best effort — if the kill fails, the spawn below will still surface the error.
+    }
+
+    // Wait for the OS to reap the process (and release the port) — up to ~5s, since a
+    // force-kill + socket teardown can lag on a loaded Windows box. If it outlasts this,
+    // the spawn below fails and the user's next attempt reaps again (pid now gone).
+    for (let i = 0; i < 50; i++) {
+      await sleep(100);
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return; // pid gone → port should now be free
+      }
+    }
+  }
+
+  /** Best-effort check that `pid`'s image is an atomcode daemon (guards PID reuse). */
+  private isAtomcodeProcess(pid: number): boolean {
+    try {
+      if (process.platform === 'win32') {
+        const out = child_process.execFileSync(
+          'tasklist',
+          ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+          { encoding: 'utf-8' }
+        );
+        return /atomcode/i.test(out);
+      }
+      const out = child_process.execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
+        encoding: 'utf-8',
+      });
+      return /atomcode/i.test(out);
+    } catch {
+      return false; // can't verify → don't kill (safe default)
+    }
   }
 
   /**
