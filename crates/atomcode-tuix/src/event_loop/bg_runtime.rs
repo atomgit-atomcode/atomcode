@@ -860,6 +860,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn committed_manual_compaction_updates_background_session_mirror() {
         use atomcode_coding::runtime::CompactionOutcome;
         use atomcode_kernel::message::{CompactTrigger, Message, SessionSnapshot};

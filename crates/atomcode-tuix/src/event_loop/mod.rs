@@ -10931,6 +10931,7 @@ fn handle_runtime_event(
                 event => {
                     let mirror_persisted =
                         persist_native_compaction_snapshot(&event, ctx, renderer);
+                    mirror_compaction_finished_event(&event, ctx);
                     handle_coding_runtime_event(event, state, think, renderer, mirror_persisted);
                     return;
                 }
@@ -11154,6 +11155,50 @@ fn persist_native_compaction_snapshot(
 
     let core_snapshot = kernel_snapshot_to_core(snapshot);
     persist_current_session(ctx, core_snapshot, renderer)
+}
+
+fn mirror_compaction_finished_event(
+    event: &CodingRuntimeEvent,
+    ctx: &LoopCtx,
+) {
+    let Some(live) = &ctx.sync_session else {
+        return;
+    };
+    let CodingRuntimeEvent::CompactionFinished { completion } = event else {
+        return;
+    };
+    let text = match completion {
+        CompactionCompletion::Completed(outcome) if outcome.committed => {
+            Some(atomcode_config::i18n::format_compaction_mark(
+                outcome.removed_messages,
+                outcome.estimated_tokens_before,
+                outcome.estimated_tokens_after,
+            ))
+        }
+        CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
+            Some(atomcode_config::i18n::format_compaction_noop(
+                outcome.estimated_tokens_before,
+                outcome.estimated_tokens_after,
+                outcome.summary_would_grow(),
+            ))
+        }
+        CompactionCompletion::Interrupted {
+            trigger: CompactTrigger::Manual { .. },
+            ..
+        } => {
+            Some(atomcode_config::i18n::format_compaction_interrupted())
+        }
+        CompactionCompletion::Failed {
+            trigger: CompactTrigger::Manual { .. },
+            error,
+        } => {
+            Some(format!("compact failed: {error}"))
+        }
+        _ => None,
+    };
+    if let Some(txt) = text {
+        live.notify_command_output(txt);
+    }
 }
 
 fn kernel_snapshot_to_core(

@@ -4042,77 +4042,80 @@ fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) ->
 /// quick-glance command, so any fetch problem degrades into a visible
 /// note instead of aborting the whole command.
 fn render_codingplan_status_for_status_cmd() -> String {
-    use atomcode_codingplan::client::Client;
+    tokio::task::block_in_place(|| {
+        use atomcode_codingplan::client::Client;
 
-    let client = match Client::from_stored_auth() {
-        Ok(c) => c,
-        // Expired login → clear re-login prompt; genuinely not signed in → the
-        // not-signed-in hint. Without this split a dead token showed "not signed in"
-        // while the Login line above said "signed in as X" — contradictory.
-        Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
-    };
-    let status = match client.status_v2() {
-        Ok(s) => s,
-        Err(e) => {
-            return render_cp_auth_error(&e, || {
-                t(Msg::StatusCpFetchFailed {
-                    error: &format!("{:#}", e),
+        let client = match Client::from_stored_auth() {
+            Ok(c) => c,
+            // Expired login → clear re-login prompt; genuinely not signed in → the
+            // not-signed-in hint. Without this split a dead token showed "not signed in"
+            // while the Login line above said "signed in as X" — contradictory.
+            Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
+        };
+        let status = match client.status_v2() {
+            Ok(s) => s,
+            Err(e) => {
+                return render_cp_auth_error(&e, || {
+                    t(Msg::StatusCpFetchFailed {
+                        error: &format!("{:#}", e),
+                    })
+                    .into_owned()
                 })
-                .into_owned()
-            })
-        }
-    };
-    let plan = match &status.codingplan_free {
-        Some(p) => p,
-        None => {
-            return t(Msg::StatusCpNoActive).into_owned();
-        }
-    };
+            }
+        };
+        let plan = match &status.codingplan_free {
+            Some(p) => p,
+            None => {
+                return t(Msg::StatusCpNoActive).into_owned();
+            }
+        };
 
-    let mut out = t(Msg::StatusCpLine {
-        plan: &plan.plan_name,
-        expires_at: &plan.expires_at,
-        remaining_days: plan.remaining_days,
-        total_days: plan.total_days,
-    })
-    .into_owned();
-    // Prefer the per-window `rate_limit_windows` schema when present, mirroring
-    // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
-    if !status.rate_limit_windows.is_empty() {
-        use atomcode_codingplan::setup::format_duration_secs;
-        for w in status
-            .rate_limit_windows
-            .iter()
-            .filter(|w| w.show_enable == 1)
-        {
+        let mut out = t(Msg::StatusCpLine {
+            plan: &plan.plan_name,
+            expires_at: &plan.expires_at,
+            remaining_days: plan.remaining_days,
+            total_days: plan.total_days,
+        })
+        .into_owned();
+        // Prefer the per-window `rate_limit_windows` schema when present, mirroring
+        // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
+        if !status.rate_limit_windows.is_empty() {
+            use atomcode_codingplan::setup::format_duration_secs;
+            for w in status
+                .rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+            {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        } else if status.window_quota_exhausted {
+            // Legacy backward-compat path (old server, no `rate_limit_windows`):
+            // when `window_quota_exhausted` is set we suppress the usage line
+            // (which the server often reports as 0% for a freshly-reset short
+            // window even while the longer quota is exhausted). Showing both
+            // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
+            // user surfaced as the "v4.23.2 still displays it this way" report.
+            if let Some(hint) = &status.window_quota_hint {
+                out.push_str(&t(Msg::StatusCpWindowHint { hint }));
+            } else {
+                out.push_str(&t(Msg::StatusCpWindowExhausted));
+            }
+        } else if let Some(u) = &status.current_usage {
             out.push_str(&t(Msg::StatusCpUsage {
-                usage: &w.usage_status_desc,
-                reset_at: &w.reset_at_display,
-                duration: &format_duration_secs(w.seconds_until_reset),
+                usage: &u.display_desc(),
+                reset_at: &u.reset_at_display,
+                duration: &atomcode_codingplan::setup::format_duration_secs(
+                    u.seconds_until_reset,
+                ),
             }));
         }
-    } else if status.window_quota_exhausted {
-        // Legacy backward-compat path (old server, no `rate_limit_windows`):
-        // when `window_quota_exhausted` is set we suppress the usage line
-        // (which the server often reports as 0% for a freshly-reset short
-        // window even while the longer quota is exhausted). Showing both
-        // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
-        // user surfaced as the "v4.23.2 still displays it this way" report.
-        if let Some(hint) = &status.window_quota_hint {
-            out.push_str(&t(Msg::StatusCpWindowHint { hint }));
-        } else {
-            out.push_str(&t(Msg::StatusCpWindowExhausted));
-        }
-    } else if let Some(u) = &status.current_usage {
-        out.push_str(&t(Msg::StatusCpUsage {
-            usage: &u.display_desc(),
-            reset_at: &u.reset_at_display,
-            duration: &atomcode_codingplan::setup::format_duration_secs(
-                u.seconds_until_reset,
-            ),
-        }));
-    }
-    out
+        out
+    })
+}
 }
 
 /// Pure-function core of `/context` — testable without constructing
@@ -4376,40 +4379,42 @@ fn open_usage(
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
 ) {
-    let client = match atomcode_codingplan::client::Client::from_stored_auth() {
-        Ok(c) => c,
-        Err(_) => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::UsageCodingPlanOnly).into_owned(),
-            ));
-            renderer.flush();
-            return;
-        }
-    };
-    let status = client.status_v2().ok();
-    let window = status.as_ref().and_then(|s| {
-        s.rate_limit_windows
-            .iter()
-            .filter(|w| w.show_enable == 1)
-            .filter(|w| w.window_hours > 0)
-            .min_by_key(|w| w.window_hours)
-            .cloned()
-    });
-    let plan = status.and_then(|s| s.codingplan_free);
-    let (usage, error) = match client.usage() {
-        Ok(u) => (Some(u), None),
-        Err(e) => (None, Some(format!("{e}"))),
-    };
-    let overview = usage
-        .as_ref()
-        .map(atomcode_codingplan::usage::compute_overview);
-    *active_modal = Some(Box::new(UsageModal::new(UsageData {
-        window,
-        plan,
-        usage,
-        overview,
-        error,
-    })));
+    tokio::task::block_in_place(|| {
+        let client = match atomcode_codingplan::client::Client::from_stored_auth() {
+            Ok(c) => c,
+            Err(_) => {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::UsageCodingPlanOnly).into_owned(),
+                ));
+                renderer.flush();
+                return;
+            }
+        };
+        let status = client.status_v2().ok();
+        let window = status.as_ref().and_then(|s| {
+            s.rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+                .filter(|w| w.window_hours > 0)
+                .min_by_key(|w| w.window_hours)
+                .cloned()
+        });
+        let plan = status.and_then(|s| s.codingplan_free);
+        let (usage, error) = match client.usage() {
+            Ok(u) => (Some(u), None),
+            Err(e) => (None, Some(format!("{e}"))),
+        };
+        let overview = usage
+            .as_ref()
+            .map(atomcode_codingplan::usage::compute_overview);
+        *active_modal = Some(Box::new(UsageModal::new(UsageData {
+            window,
+            plan,
+            usage,
+            overview,
+            error,
+        })));
+    })
 }
 
 /// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查

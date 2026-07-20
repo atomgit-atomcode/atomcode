@@ -579,6 +579,19 @@ body {
   white-space: pre-wrap;
 }
 
+.msg-notice.command-output {
+  color: var(--app-primary-foreground);
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  border: 1px solid var(--app-input-border);
+  font-family: var(--app-monospace-font-family);
+  font-size: 13px;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
 /* === Todo task list === */
 /* The `todo` tool renders as a live checklist panel (☑/▸/☐) instead of a plain
    tool row — mirrors the TUI / Claude Code task-progress widget. */

@@ -36,7 +36,8 @@ export type SSEEvent =
   // these, code block content is silently lost in the WebUI while the TUI sees it fine.
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null }
   | { type: 'artifact_content'; id: string; content: string }
-  | { type: 'artifact_end'; id: string };
+  | { type: 'artifact_end'; id: string }
+  | { type: 'command_output'; text: string };
 
 export interface ModelInfo {
   provider: string;
@@ -615,7 +616,8 @@ export type LiveWireEvent =
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
-  | { type: 'working_dir'; working_dir: string };
+  | { type: 'working_dir'; working_dir: string }
+  | { type: 'command_output'; text: string };
 
 export async function streamLive(
   onEvent: (e: LiveWireEvent) => void,
@@ -706,7 +708,7 @@ export type CommandResult =
   | { kind: 'context'; system_tokens: number; sent_tokens: number; total_messages: number; tool_defs_tokens: number; cold_zone_tokens: number; ctx_window: number; ctx_name: string }
   | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
-  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string }
+  | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }
   | { kind: 'config'; path: string; provider: string }
   | { kind: 'diff'; stat: string }
   | { kind: 'cost'; total_tokens: number; turn_count: number }

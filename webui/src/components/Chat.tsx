@@ -898,6 +898,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // into artifact_* events, which handleEvent reconstructs. If the live path
       // ever adopts the ArtifactDetector, add artifact_start/content/end here or
       // /sync will silently drop fenced code again.
+      case 'command_output': return { type: 'command_output', text: e.text };
       default: return null;
     }
   }
@@ -1280,10 +1281,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             return;
           }
           if (res.kind === 'status') {
-            pushCommandNotice(t('cmd.status.body', {
-              model: res.model || '—', dir: res.working_dir, provider: res.provider || '—',
-              login: res.logged_in ? (res.username ?? '') : t('cmd.status.notLoggedIn'), config: res.config_path,
-            }));
+            pushCommandNotice(res.text);
             return;
           }
           if (res.kind === 'config') { pushCommandNotice(t('cmd.config.body', { path: res.path, provider: res.provider || '—' })); return; }
@@ -1382,6 +1380,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
+      case 'command_output':
+        pushCommandNotice(event.text);
+        break;
+
       case 'text':
         appendToLastAssistant(event.content);
         break;
@@ -1944,11 +1946,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   const lastIdx = messages.length - 1;
 
-  // 会话内搜索反查定位:输入关键词过滤时间线到包含该词的消息;↑/↓/Enter 在
-  // 匹配间跳转并滚动到视口中央;清除恢复完整视图。仅前端,不动后端。
+  // 会话内搜索: Cmd/Ctrl+F 呼出浮动搜索框,Esc/× 关闭;输入关键词过滤时间线,
+  // Enter/Shift+Enter(或 ↑/↓)在匹配间跳转并滚动到视口中央(反查定位)。关闭态
+  // 完全不占布局空间,不挤压消息区。仅前端,不动后端。
   // visibleMessages 保留 origIdx(原 messages 数组索引),以便过滤后仍能查
   // turnTexts / isLastInTurn(这两个是按原索引算的)。
   const [search, setSearch] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchTrim = search.trim().toLowerCase();
   // bot review P3: 用 useMemo 避免每次渲染重建数组，搜索激活时含 filter 遍历更重。
   const visibleMessages = useMemo(() => searchTrim
@@ -1964,8 +1969,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // + state,事件处理器读 ref,渲染读 state。
   const matchIdxRef = useRef(0);
   const setMatchIdx = (v: number) => { matchIdxRef.current = v; setMatchIdxState(v); };
+  const closeSearch = () => { setSearch(''); setMatchIdx(0); setSearchOpen(false); };
   // 搜索导航 helper (bot review P3 重复代码): 算 newIdx → setMatchIdx → 滚动。
-  // 三处 (Enter/↑/↓) 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
+  // Enter/↑/↓ 共用,保证 stale-closure 修复 (读 ref) 与滚动逻辑一致。
   const navMatch = (delta: number) => {
     const n = visibleMessages.length;
     if (n === 0) return;
@@ -1974,6 +1980,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const node = matchRefs.current[newIdx];
     if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
+
+  // Cmd/Ctrl+F 打开搜索并聚焦;Esc 关闭。绑定在 window 层级,焦点在输入框/按钮/
+  // 消息气泡时都生效;阻止浏览器默认查找以免误触原生 UI。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === 'f') {
+        if (messages.length === 0) return;
+        e.preventDefault();
+        setSearchOpen(true);
+        // 下一帧再聚焦,等 input 挂载。
+        requestAnimationFrame(() => searchInputRef.current?.focus());
+      } else if (e.key === 'Escape' && searchOpen) {
+        e.preventDefault();
+        closeSearch();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen, messages.length]);
 
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
@@ -2422,7 +2449,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             // no turn grouping, no streaming cursor).
             if (msg.role === 'system') {
               return (
-                <div class="msg-notice" key={origIdx} ref={setMatchRef}>
+                <div class="msg-notice command-output" key={origIdx} ref={setMatchRef}>
                   {msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('')}
                 </div>
               );

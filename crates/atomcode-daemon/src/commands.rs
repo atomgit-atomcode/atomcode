@@ -463,6 +463,7 @@ pub(crate) enum CommandResult {
         model: String,
         working_dir: String,
         config_path: String,
+        text: String,
     },
     Config {
         path: String,
@@ -717,10 +718,149 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
+fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::LayeredInstructions;
+    use atomcode_config::i18n::{t, Msg};
+    let instructions = LayeredInstructions::load(working_dir);
+    let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
+    for (level, path) in instructions.status_lines() {
+        match path {
+            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &p.display().to_string(),
+                label: level.label(),
+            })),
+            None => out.push_str(&t(Msg::StatusInstructionMissing {
+                label: level.label(),
+            })),
+        }
+    }
+    out
+}
+
+fn render_login_line(user: Option<&str>) -> String {
+    use atomcode_config::i18n::{t, Msg};
+    match user {
+        Some(u) => t(Msg::StatusLoginLoggedIn { user: u }).into_owned(),
+        None => t(Msg::StatusLoginNotSignedIn).into_owned(),
+    }
+}
+
+fn format_login_identity(name: Option<&str>, username: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty() && *n != username) {
+        Some(n) => format!("{n}({username})"),
+        None => username.to_string(),
+    }
+}
+
+fn render_login_line_from_stored_auth() -> String {
+    match atomcode_core::auth::get_stored_auth() {
+        Some(a) => {
+            let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
+            render_login_line(Some(&identity))
+        }
+        None => render_login_line(None),
+    }
+}
+
+fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
+    use atomcode_config::i18n::{t, Msg};
+    if atomcode_core::coding_plan::is_auth_expired(e) {
+        t(Msg::StatusCpAuthExpired).into_owned()
+    } else {
+        fallback()
+    }
+}
+
+fn render_codingplan_status_for_status_cmd() -> String {
+    tokio::task::block_in_place(|| {
+        use atomcode_config::i18n::{t, Msg};
+        use atomcode_core::coding_plan::client::Client;
+
+        let client = match Client::from_stored_auth() {
+            Ok(c) => c,
+            Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
+        };
+        let status = match client.status_v2() {
+            Ok(s) => s,
+            Err(e) => {
+                return render_cp_auth_error(&e, || {
+                    t(Msg::StatusCpFetchFailed {
+                        error: &format!("{:#}", e),
+                    })
+                    .into_owned()
+                })
+            }
+        };
+        let plan = match &status.codingplan_free {
+            Some(p) => p,
+            None => {
+                return t(Msg::StatusCpNoActive).into_owned();
+            }
+        };
+
+        let mut out = t(Msg::StatusCpLine {
+            plan: &plan.plan_name,
+            expires_at: &plan.expires_at,
+            remaining_days: plan.remaining_days,
+            total_days: plan.total_days,
+        })
+        .into_owned();
+        if !status.rate_limit_windows.is_empty() {
+            use atomcode_core::coding_plan::setup::format_duration_secs;
+            for w in status
+                .rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+            {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        } else if status.window_quota_exhausted {
+            if let Some(hint) = &status.window_quota_hint {
+                out.push_str(&t(Msg::StatusCpWindowHint { hint }));
+            } else {
+                out.push_str(&t(Msg::StatusCpWindowExhausted));
+            }
+        } else if let Some(u) = &status.current_usage {
+            out.push_str(&t(Msg::StatusCpUsage {
+                usage: &u.display_desc(),
+                reset_at: &u.reset_at_display,
+                duration: &atomcode_core::coding_plan::setup::format_duration_secs(
+                    u.seconds_until_reset,
+                ),
+            }));
+        }
+        out
+    })
+}
+
+fn assemble_status(
+    login: &str,
+    body: &str,
+    codingplan: &str,
+    proxy: &str,
+    instructions: &str,
+) -> String {
+    let mut txt = String::with_capacity(
+        login.len() + body.len() + codingplan.len() + proxy.len() + instructions.len() + 16,
+    );
+    txt.push_str(login);
+    txt.push_str(body);
+    txt.push_str(codingplan);
+    txt.push_str(proxy);
+    txt.push('\n');
+    txt.push_str(instructions);
+    txt
+}
+
 fn exec_status(
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
+    use atomcode_config::i18n::{t, Msg};
     let config_path = atomcode_config::config::Config::default_path();
     let config = atomcode_config::config::Config::load(&config_path).ok();
     let provider_name = provider
@@ -733,6 +873,27 @@ fn exec_status(
         .map(|p| p.model.clone())
         .unwrap_or_default();
     let auth = atomcode_core::auth::get_stored_auth();
+
+    let body = t(Msg::StatusBody {
+        model: &model,
+        dir: &working_dir.display().to_string(),
+        config: &config_path.display().to_string(),
+    })
+    .into_owned();
+    let proxy_summary = config
+        .as_ref()
+        .map(|c| c.network.proxy.summary())
+        .unwrap_or_else(|| "follow_system".to_string());
+    let proxy_line = format!("  Proxy:  {}\n", proxy_summary);
+
+    let text = assemble_status(
+        &render_login_line_from_stored_auth(),
+        &body,
+        &render_codingplan_status_for_status_cmd(),
+        &proxy_line,
+        &render_instruction_status_block(working_dir),
+    );
+
     Ok(CommandResult::Status {
         logged_in: auth.is_some(),
         username: auth.map(|a| a.user.username),
@@ -740,6 +901,7 @@ fn exec_status(
         model,
         working_dir: working_dir.display().to_string(),
         config_path: config_path.display().to_string(),
+        text,
     })
 }
 
