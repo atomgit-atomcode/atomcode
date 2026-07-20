@@ -1163,6 +1163,31 @@ impl LlmProvider for OpenAiProvider {
                                                     Some(StreamEvent::Done { truncated: true });
                                             }
                                             "stop" | _ => {
+                                                // Flush any accumulated tool calls even on a
+                                                // non-`tool_calls` finish_reason. Non-standard
+                                                // gateways (confirmed: SenseNova's free
+                                                // `deepseek-v4-flash`) terminate a tool-calling
+                                                // response with `finish_reason:"stop"` instead of
+                                                // the OpenAI-standard `"tool_calls"`; without this
+                                                // the accumulated calls were dropped and the model
+                                                // showed "0 工具" / text-only. Safe for compliant
+                                                // providers: the `"tool_calls"` arm already
+                                                // cleared `tool_calls`, and pure-text turns leave
+                                                // it empty, so this only fires for the
+                                                // non-compliant case. Mirrors opencode's
+                                                // stop→tool-calls reclassification and the
+                                                // `"length"` / abrupt-close arms here.
+                                                for (id, name, args) in &tool_calls {
+                                                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                        crate::tool::ToolCall {
+                                                            id: id.clone(),
+                                                            name: name.clone(),
+                                                            arguments: args.clone(),
+                                                        },
+                                                    )));
+                                                }
+                                                tool_calls.clear();
+                                                tool_start_emitted.clear();
                                                 pending_finish =
                                                     Some(StreamEvent::Done { truncated: false });
                                             }
@@ -2532,6 +2557,51 @@ mod tests {
             "abrupt close on tiny error blob must NOT emit the [stream ended …] marker delta: {:?}",
             events
         );
+    }
+
+    /// Non-standard gateways (confirmed: SenseNova's free `deepseek-v4-flash`)
+    /// terminate a tool-calling response with `finish_reason:"stop"` instead
+    /// of the OpenAI-standard `"tool_calls"`. The accumulated tool call must
+    /// still be flushed — the `"length"` and abrupt-close paths already do
+    /// this; the `"stop"` arm used to drop it, so the model appeared to make
+    /// "0 工具" and just answered in text. Mirrors opencode's stop→tool-calls
+    /// reclassification (`packages/llm/src/protocols/openai-chat.ts`) and
+    /// codex's finish_reason-agnostic finalization.
+    #[tokio::test]
+    async fn tool_calls_flushed_on_stop_finish_reason() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let tc = events.iter().find_map(|e| match e {
+            StreamEvent::ToolCallDone(tc) => Some(tc),
+            _ => None,
+        });
+        assert!(
+            tc.is_some(),
+            "tool call terminated with finish_reason:stop must still be \
+             emitted as ToolCallDone, got: {:?}",
+            events
+        );
+        let tc = tc.unwrap();
+        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.arguments, r#"{"path":"a.txt"}"#);
     }
 
     const CLEAN_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
