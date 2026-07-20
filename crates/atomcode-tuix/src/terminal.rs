@@ -143,7 +143,17 @@ pub struct TerminalCaps {
 
 impl TerminalCaps {
     pub fn from_env(env: EnvView) -> Self {
-        let is_dumb = env.term.as_deref() == Some("dumb");
+        // `TERM=dumb` means "no escape sequences, no raw mode" on Unix
+        // (Emacs `M-x shell`, some CI wrappers). But TERM is a Unix
+        // terminfo concept: on Windows crossterm drives the console via the
+        // Win32 console API and ignores TERM entirely, so a stray
+        // `TERM=dumb` — commonly leaked into the environment by Git / MSYS /
+        // SSH tooling — does NOT mean the console lacks raw mode, colours,
+        // or VT processing. Honouring it there wrongly zeroed `raw_mode`,
+        // dropping atomcode into the cooked LINE-input fallback where arrow
+        // keys never reach menus (you could only Enter-select the first
+        // item). Scope the dumb check to non-Windows.
+        let is_dumb = !env.is_windows && env.term.as_deref() == Some("dumb");
         let tty = env.is_stdout_tty;
 
         // LC_ALL wins over LANG per POSIX; either being one of the
@@ -306,7 +316,9 @@ mod tests {
 
     #[test]
     fn dumb_term_disables_spinner_and_colors() {
+        // Non-Windows: TERM=dumb is authoritative (Emacs `M-x shell`, etc.).
         let caps = TerminalCaps::from_env(EnvView {
+            is_windows: false,
             term: Some("dumb".to_string()),
             colorterm: None,
             ..env()
@@ -314,7 +326,37 @@ mod tests {
         assert!(caps.tty);
         assert!(!caps.colors);
         assert!(!caps.spinner);
+        assert!(!caps.raw_mode, "dumb TERM on Unix has no raw mode");
         assert!(!caps.unicode_symbols, "dumb TERM forces ASCII fallback");
+    }
+
+    // Regression: a Windows user reported that arrow keys couldn't navigate
+    // any menu (/model list, approval options) — only Enter worked, always
+    // picking the first item — in BOTH cmd.exe and Windows Terminal. A
+    // tuix.log showed input arriving as `paste(<line>)` + `key(Press,Enter)`
+    // with zero `[ RD]` reader traces: the cooked LINE reader was running,
+    // not the raw-mode reader, so arrow keys were swallowed by the console's
+    // own line editor and never reached the app. Cause: a stray `TERM=dumb`
+    // in the environment (Git/MSYS/SSH tooling leaks it) forced
+    // `raw_mode=false`. But TERM is a Unix terminfo concept; crossterm drives
+    // the Windows console via the Win32 API and ignores TERM entirely, so on
+    // Windows a dumb TERM must NOT disable raw mode / interactivity.
+    #[test]
+    fn dumb_term_is_ignored_on_windows() {
+        let caps = TerminalCaps::from_env(EnvView {
+            is_windows: true,
+            term: Some("dumb".to_string()),
+            colorterm: None,
+            ..env()
+        });
+        assert!(caps.tty);
+        assert!(
+            caps.raw_mode,
+            "Windows console raw mode is independent of TERM — a stray \
+             TERM=dumb must not drop us into the cooked line reader"
+        );
+        assert!(caps.bracketed_paste);
+        assert!(caps.scroll_region);
     }
 
     #[test]
