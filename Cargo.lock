@@ -517,7 +517,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomcode-auth",
- "atomcode-codingplan",
  "atomcode-config",
  "atomcode-kernel",
  "atomcode-telemetry",

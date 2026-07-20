@@ -12,10 +12,6 @@ fn _isolate_atomcode_home() {
 // `atomcode_core::auth` consumers keep working during the transition.
 pub use atomcode_auth as auth;
 pub mod process_utils;
-// TEMP shim during the atomcode-codingplan extraction — lets consumers keep using
-// `atomcode_core::coding_plan::…` until each is switched to `atomcode_codingplan::…`.
-// REMOVED in the final task (no shim in the end state; core itself no longer uses it).
-pub use atomcode_codingplan as coding_plan;
 // `config` fully lives in the leaf `atomcode-config` crate now; core code (and its
 // tests) use `atomcode_config::config` directly, so the transitional re-export shim
 // is gone.
