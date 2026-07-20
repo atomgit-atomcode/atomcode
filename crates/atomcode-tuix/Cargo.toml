@@ -16,7 +16,7 @@ atomcode-config = { path = "../atomcode-config" }
 atomcode-updater = { path = "../atomcode-updater" }
 # Askpass lives in atomcode-capabilities (`::askpass`, unix-only); the TUI drives the
 # server + password modal via that path.
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify", "setup", "plugin"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["tools", "memory", "notify", "setup", "plugin", "mcp"] }
 atomcode-auth = { path = "../atomcode-auth" }
 atomcode-core = { path = "../atomcode-core" }
 atomcode-codingplan = { path = "../atomcode-codingplan" }

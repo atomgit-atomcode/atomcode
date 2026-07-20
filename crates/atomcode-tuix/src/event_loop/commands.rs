@@ -2495,7 +2495,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                    let configs = match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
                         Ok(configs) => configs,
                         Err(e) => {
                             renderer.render(UiLine::Error(
@@ -2521,15 +2521,15 @@ fn execute_slash_command_impl(
                     renderer.flush();
                     let is_github_server = matches!(
                         &config.config,
-                        atomcode_core::mcp::McpTransportConfig::Http {
-                            auth: Some(atomcode_core::mcp::McpHttpAuthConfig::OAuth(auth)),
+                        atomcode_capabilities::mcp::McpTransportConfig::Http {
+                            auth: Some(atomcode_capabilities::mcp::McpHttpAuthConfig::OAuth(auth)),
                             ..
                         } if auth.provider.as_deref() == Some("github")
                     );
                     let result = tokio::task::block_in_place(|| {
-                        atomcode_core::mcp::login_mcp_oauth(
+                        atomcode_capabilities::mcp::login_mcp_oauth(
                             &config,
-                            atomcode_core::mcp::McpOAuthLoginOptions {
+                            atomcode_capabilities::mcp::McpOAuthLoginOptions {
                                 client_id: if is_github_server {
                                     std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
                                 } else {
@@ -2568,7 +2568,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
+                    match atomcode_capabilities::mcp::McpTokenStore::default().delete_token(server) {
                         Ok(true) => renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
                         )),
@@ -2587,7 +2587,7 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Trust) => {
-                    match atomcode_core::mcp::trust::trust_project(&ctx.working_dir) {
+                    match atomcode_capabilities::mcp::trust::trust_project(&ctx.working_dir) {
                         Ok(()) => {
                             renderer.render(UiLine::CommandOutput(t(Msg::McpProjectTrusted).into_owned()));
                             renderer.flush();
@@ -2603,7 +2603,7 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Untrust) => {
-                    match atomcode_core::mcp::trust::untrust_project(&ctx.working_dir) {
+                    match atomcode_capabilities::mcp::trust::untrust_project(&ctx.working_dir) {
                         Ok(true) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
                         Ok(false) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectNotTrusted).into_owned())),
                         Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
@@ -2619,7 +2619,7 @@ fn execute_slash_command_impl(
                     ctx.mcp_blocked_notice_emitted = false;
                     // Preflight: parse merged MCP config so we can show progress immediately.
                     // (Connection attempts happen in background and may take up to timeout_ms.)
-                    let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                    let configs = match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
                         Ok(c) => c,
                         Err(e) => {
                             renderer.render(UiLine::Error(
@@ -2636,7 +2636,7 @@ fn execute_slash_command_impl(
                     // Partition by trust so the preflight header only lists servers that will
                     // actually be attempted (project-source servers from untrusted projects are
                     // withheld and should not appear in the "connecting to:" list).
-                    let partition = atomcode_core::mcp::trust::partition_by_trust(
+                    let partition = atomcode_capabilities::mcp::trust::partition_by_trust(
                         configs.clone(),
                         &ctx.working_dir,
                     );
@@ -2691,9 +2691,9 @@ fn execute_slash_command_impl(
 
                     // 3) Recreate registry and event channel. Connections happen in background
                     // and will stream Connected/Failed events into scrollback (event loop select!).
-                    use atomcode_core::mcp::McpConnectEvent;
+                    use atomcode_capabilities::mcp::McpConnectEvent;
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-                    let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
+                    let registry = atomcode_capabilities::mcp::McpRegistry::from_config_background_with_events(
                         &ctx.working_dir,
                         Some(tx),
                     );
@@ -2739,7 +2739,7 @@ fn execute_slash_command_impl(
                                 Ok(v) => v,
                                 Err(_) => {
                                     if let Some(tx) = &tx {
-                                        let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                        let _ = tx.send(atomcode_capabilities::mcp::McpConnectEvent::Warning {
                                             name: server.clone(),
                                             message: format!(
                                                 "tools/list timed out after {}s (server connected but tools not listed yet)",
@@ -2759,7 +2759,7 @@ fn execute_slash_command_impl(
                                 }
                             }
                             if let Some(tx) = tx {
-                                let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                let _ = tx.send(atomcode_capabilities::mcp::McpConnectEvent::Warning {
                                     name: server,
                                     message: msg.trim_end().to_string(),
                                 });

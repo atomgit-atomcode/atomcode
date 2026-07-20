@@ -289,9 +289,9 @@ pub async fn run(
     runtime_spawn_override: RuntimeSpawnOverride,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
-    mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
+    mcp_registry: Option<std::sync::Arc<atomcode_capabilities::mcp::McpRegistry>>,
     mcp_connect_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>,
     >,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,

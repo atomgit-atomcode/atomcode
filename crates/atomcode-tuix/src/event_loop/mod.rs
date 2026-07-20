@@ -1437,11 +1437,11 @@ pub struct LoopCtx {
     pub pending_open_provider_wizard: bool,
     /// MCP server registry for `/mcp` status display. `None` when no MCP
     /// servers are configured or all failed to connect.
-    pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
+    pub mcp_registry: Option<std::sync::Arc<atomcode_capabilities::mcp::McpRegistry>>,
     /// Channel for receiving MCP connection status events (Connected/Failed).
     /// Events are rendered into scrollback as they arrive during startup.
     pub mcp_connect_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>>,
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
@@ -5177,7 +5177,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     None
                 }
             }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_core::mcp::McpConnectEvent;
+                use atomcode_capabilities::mcp::McpConnectEvent;
                 match &ev {
                     McpConnectEvent::Connected { name: _ } => {
                         // Silent on success (parity with codex/opencode: they never
@@ -5597,7 +5597,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     None
                 }
             }, if ctx.mcp_connect_rx.is_some() => {
-                use atomcode_core::mcp::McpConnectEvent;
+                use atomcode_capabilities::mcp::McpConnectEvent;
                 match &ev {
                     McpConnectEvent::Connected { name } => {
                         renderer.render(UiLine::CommandOutput(
