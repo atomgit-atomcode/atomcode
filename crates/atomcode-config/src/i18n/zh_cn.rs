@@ -343,6 +343,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
+        Msg::SessionPickerHint =>
+            "Enter 打开 · F2 改名 · Ctrl+D 删除".into(),
         Msg::SessionDeleted { name } =>
             format!("「{name}」已删除").into(),
         Msg::SessionDeleteConfirm { name } =>

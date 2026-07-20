@@ -270,6 +270,9 @@ pub enum Msg<'a> {
     SessionDeleteConfirm { name: &'a str },
     SessionDeleteFailed { error: &'a str },
     SessionNoneSelected,
+    /// Persistent footer hint in the `/resume` picker advertising the key
+    /// actions (open / rename / delete) so they're discoverable.
+    SessionPickerHint,
     SessionRenameEditing { buffer: &'a str },
 
     // ── Dir picker ──

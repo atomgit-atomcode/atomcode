@@ -90,6 +90,25 @@ impl SessionPicker {
         let i = *self.filtered.get(self.selected)?;
         self.sessions.get(i).map(|s| s.id.clone())
     }
+
+    /// The static key-legend hint advertising the picker's actions
+    /// (`Enter open · F2 rename · Ctrl+D delete`), or `None` when it shouldn't
+    /// show. Suppressed during rename editing (the selected item label already
+    /// carries the `[Enter: confirm, Esc: cancel]` hint) and for an empty list
+    /// (nothing to act on). Existence of this legend is the reported gap: users
+    /// couldn't tell how to delete a session because the picker showed no keys.
+    ///
+    /// NOTE: this is LOWER priority than a `build_status` warning — the caller
+    /// only fills it when the status hint slot is otherwise empty, so opening
+    /// `/resume` never clobbers a no-provider / official-build / usage warning.
+    /// The transient `delete_status` (the user's own Ctrl+D confirmation) is a
+    /// separate, higher-priority channel handled in `draw`.
+    fn browse_hint(&self) -> Option<String> {
+        if self.rename_editing || self.filtered.is_empty() {
+            return None;
+        }
+        Some(crate::i18n::t(crate::i18n::Msg::SessionPickerHint).into_owned())
+    }
 }
 
 impl Modal for SessionPicker {
@@ -324,7 +343,11 @@ impl Modal for SessionPicker {
             }
             KeyCode::Esc => {
                 if self.confirm_delete.is_some() {
+                    // Cancel the pending delete. Clear the confirm prompt too,
+                    // otherwise the "Press Ctrl+D again…" footer lingers (and
+                    // suppresses the key legend) until the next Up/Down/edit.
                     self.confirm_delete = None;
+                    self.delete_status = None;
                     self.draw(buf, state, ctx, renderer);
                     Ok(ModalAction::Continue)
                 } else {
@@ -361,8 +384,16 @@ impl Modal for SessionPicker {
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
         let mut status = build_status(state, ctx);
+        // Delete confirmation/result is the user's own active interaction — it
+        // must always show, overriding any build_status warning. The static key
+        // legend is lowest priority: only fill an otherwise-empty hint slot so a
+        // no-provider / official-build / usage warning stays visible in the picker.
         if let Some(msg) = &self.delete_status {
             status.hint = Some((msg.clone(), crate::render::HintSeverity::Info));
+        } else if status.hint.is_none() {
+            if let Some(msg) = self.browse_hint() {
+                status.hint = Some((msg, crate::render::HintSeverity::Info));
+            }
         }
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
@@ -799,6 +830,30 @@ mod tests {
         assert_eq!(last_assistant_reply_markdown(&[]), "");
         let only_user = vec![Message::new(Role::User, "hi")];
         assert_eq!(last_assistant_reply_markdown(&only_user), "");
+    }
+
+    #[test]
+    fn browse_hint_advertises_key_actions() {
+        // Discoverability: the picker must surface the delete/rename shortcuts,
+        // else users can't tell how to delete a session (the reported gap).
+        let p = SessionPicker::open(vec![meta("a", 1)]);
+        let h = p.browse_hint().expect("browse mode advertises key actions");
+        // Locale-independent: the literal shortcuts appear in both en and zh.
+        assert!(h.contains("Ctrl+D"), "delete shortcut must be shown: {h:?}");
+        assert!(h.contains("F2"), "rename shortcut must be shown: {h:?}");
+        assert!(h.contains("Enter"), "open shortcut must be shown: {h:?}");
+    }
+
+    #[test]
+    fn browse_hint_suppressed_during_rename_and_when_empty() {
+        // Rename editing: the selected item label already carries the Enter/Esc
+        // hint, so no redundant footer. Empty list: nothing to act on.
+        let mut renaming = SessionPicker::open(vec![meta("a", 1)]);
+        renaming.rename_editing = true;
+        assert_eq!(renaming.browse_hint(), None);
+
+        let empty = SessionPicker::open(vec![]);
+        assert_eq!(empty.browse_hint(), None);
     }
 
     #[test]
