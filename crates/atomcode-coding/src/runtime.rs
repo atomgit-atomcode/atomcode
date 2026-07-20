@@ -2644,7 +2644,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
                                 compaction_suspended = false;
-                                let provider = runtime.config.provider_type.clone();
+                                let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
                                 resources = Some(runtime);
                                 controls.state.store(
@@ -6203,6 +6203,7 @@ mod tests {
             "next-model",
             ".",
         );
+        next.provider_name = "next-provider".into();
         next.provider_type = "openai".into();
 
         assert_eq!(
@@ -6228,7 +6229,8 @@ mod tests {
         assert_eq!(second.generation, 1);
         assert!(matches!(
             second.event,
-            CodingRuntimeEvent::ProviderChanged { ref model, .. } if model == "next-model"
+            CodingRuntimeEvent::ProviderChanged { ref provider, ref model }
+                if provider == "next-provider" && model == "next-model"
         ));
         assert_eq!(third.generation, 1);
         assert!(matches!(

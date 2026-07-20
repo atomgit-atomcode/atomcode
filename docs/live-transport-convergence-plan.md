@@ -4,6 +4,8 @@
 >
 > 实施基线：`release/v5.0.1@97a21adb42ba69457cb6b7157f3681283e03a367`。
 >
+> 收口复核基线：`release/v5.0.1@a66b1433740f910a2b3b809201e248c35dd39d0f`。
+>
 > 当前四态：CLI、TUI、daemon 已使用 Coding Runtime 原生命令、事件和 snapshot；core `live`、
 > `TurnEvent`、daemon 第二 runtime 和 TUI snapshot handoff 已删除，达到状态④。
 
@@ -144,11 +146,12 @@ Live View: TUI / WebUI / mobile
 
 | 范围 | 结果 |
 |---|---|
-| core | 1236 passed，1 ignored |
-| daemon | 132 passed |
+| core | 既有实施验证 1236 passed，1 ignored；本次未修改，不重复运行 |
+| coding | 174 passed |
+| daemon | 137 passed |
 | TUI | 1406 passed；plugin target 1 passed |
-| CLI | 81 passed |
-| WebUI | 59 passed；TypeScript typecheck 通过 |
+| CLI | 82 passed |
+| WebUI | 60 passed；TypeScript typecheck、production build 通过 |
 | workspace | `cargo check --workspace --all-targets` 通过；仅保留既有 kernel liveness 测试 unused import 警告 |
 | legacy 搜索 | 生产代码中无 `LiveSession/TurnExecutor/TurnEvent/core::live/live_sync` 引用 |
 
@@ -157,7 +160,34 @@ Live View: TUI / WebUI / mobile
 deferred runtime 事件保留 generation/sequence；Web 的 submit/respond/cancel/provider/mode/session/cd/reload
 接口等待 Coding Runtime 真实终态，配置失败会回滚或显式报告。
 
-## 6. 当前唯一下一步
+## 6. 人工多端验收与收口修正
 
-完成一次人工多端验收：TUI 启动 `/webui`，浏览器加入同一会话，分别验证双向输入、审批、cancel、
-session resume、`/cd` 和 provider reload。该步骤验证真实浏览器/终端交互，不再新增迁移代码。
+人工验收已在同一 TUI/WebUI runtime 上完成：
+
+| 场景 | 结果 |
+|---|---|
+| WebUI → TUI、TUI → WebUI | 双向输入、响应和会话持久化一致 |
+| approval | WebUI 与 TUI 同时显示请求；WebUI 批准后命令执行成功 |
+| cancel | WebUI 停止后回到 idle；TUI 收到明确的 `cancelled` 终态 |
+| session resume | WebUI 恢复旧会话后，TUI 同步显示相同会话与消息 |
+| `/cd` | WebUI 发起目录切换后，TUI 与 runtime cwd 同步；可恢复原目录 |
+| provider reload | provider/model 保持同一 registry identity；reload 后可立即继续输入 |
+
+验收发现并修正的缺口：
+
+| 缺口 | 修正结果 |
+|---|---|
+| TUI/WebUI 初始 provider、mode 可能不一致 | live binding 后从 foreground runtime 显式同步 provider 和 mode；CLI provider override 成为进程内默认值 |
+| 请求当前 provider 仍触发 reload | 相同 provider 不再重建 runtime，避免无意义 generation 变化 |
+| reload 完成与下一条命令存在 generation 竞态 | reconfigure 成功后同步提交新 generation，再接受后续命令 |
+| runtime 事件把 adapter 类型误当 provider 名称 | 配置中保留稳定的 registry provider key，事件不再回退到错误模型 |
+| 单个 orphan sidecar 阻断全部 session catalog | 扫描诊断显式告警；有效会话继续可用，直接访问损坏会话仍显式失败 |
+| WebUI collection API 把错误 JSON 当数组 | 检查 HTTP 状态和数组结构，错误显式抛出，不再导致页面运行时崩溃 |
+
+本次修正未恢复任何 core/bridge legacy variant、handler、依赖或 fallback；live transport 仍保持状态④。
+历史 orphan sidecar 未被删除或改写，只作为可见诊断保留。
+
+## 7. 当前唯一下一步
+
+推送并评审本次收口提交。live transport 收敛方案本身已无待开发切片；历史损坏会话文件的清理属于独立的
+数据维护任务，不作为迁移完成前置。

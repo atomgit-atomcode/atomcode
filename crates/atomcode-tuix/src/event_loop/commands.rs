@@ -250,6 +250,7 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
 /// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
 pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
+    mode: AgentMode,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
     let snapshot = atomcode_daemon::legacy_convert::snapshot_to_kernel(
@@ -262,6 +263,10 @@ pub(crate) fn attach_live_runtime(
         std::sync::Arc::new(ctx.runtime.clone()),
     )
     .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    // The runtime binding owns execution, while these process-level values seed the
+    // first live snapshot before any ProviderChanged/ModeChanged event exists.
+    atomcode_daemon::live_set_provider(ctx.config.default_provider.clone());
+    atomcode_daemon::live_set_mode(mode);
     ctx.live_binding = Some(binding);
     let mut remote_commands = atomcode_daemon::native_live::register_remote_command_sink();
     let runtime_id = ctx.foreground_runtime_id;
@@ -1653,7 +1658,7 @@ fn execute_slash_command_impl(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
                     renderer.render(UiLine::Error(error));
                     renderer.flush();
                     return Ok(());
@@ -1682,7 +1687,7 @@ fn execute_slash_command_impl(
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
-                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
                     renderer.render(UiLine::Error(error));
                 }
             }
@@ -1903,7 +1908,7 @@ fn execute_slash_command_impl(
                                                     m_param
                                                 );
                                                 // 6) 手机视图复用 TUI 当前 CodingRuntime。
-                                                if let Err(error) = attach_live_runtime(ctx, renderer) {
+                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
                                                     if let Some(mut child) = ctx.app_relay_child.take() {
                                                         let _ = child.start_kill();
                                                     }

@@ -344,11 +344,13 @@ impl LiveViewHub {
         &self,
         next: atomcode_coding::CodingAgentConfig,
     ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
-        self.bound_handle()?
-            .1
+        let (binding, handle) = self.bound_handle()?;
+        let generation = handle
             .reassemble_provider(next)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        self.commit_reconfigure_generation(&binding, generation)?;
+        Ok(generation)
     }
 
     pub async fn resume_session(
@@ -641,6 +643,39 @@ impl LiveViewHub {
         Ok((binding.identity.clone(), handle))
     }
 
+    fn commit_reconfigure_generation(
+        &self,
+        binding: &LiveBinding,
+        generation: atomcode_coding::RuntimeGeneration,
+    ) -> Result<(), HubError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = state.binding.as_mut().ok_or(HubError::Unbound)?;
+        if current.identity.id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        let actual = current.control.status().generation;
+        if actual != generation.0 {
+            return Err(HubError::RuntimeGenerationChanged {
+                expected: generation.0,
+                actual,
+            });
+        }
+        if current.identity.generation > generation.0 {
+            return Err(HubError::RuntimeGenerationChanged {
+                expected: generation.0,
+                actual: current.identity.generation,
+            });
+        }
+        if current.identity.generation < generation.0 {
+            current.identity.generation = generation.0;
+            state.replay.clear();
+            state.pending_requests.clear();
+            state.turn_active = false;
+            state.last_runtime_sequence = None;
+        }
+        Ok(())
+    }
+
     async fn commit_changed_snapshot(
         &self,
         binding: &LiveBinding,
@@ -698,13 +733,13 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeControl {
-        status: RuntimeStatus,
+        status: Arc<Mutex<RuntimeStatus>>,
         commands: Arc<Mutex<Vec<DriverCommand>>>,
     }
 
     impl LiveRuntimeControl for FakeControl {
         fn status(&self) -> RuntimeStatus {
-            self.status
+            *self.status.lock().unwrap()
         }
 
         fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
@@ -721,10 +756,10 @@ mod tests {
         let commands = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(FakeControl {
-                status: RuntimeStatus {
+                status: Arc::new(Mutex::new(RuntimeStatus {
                     generation: 1,
                     phase: RuntimePhase::Ready,
-                },
+                })),
                 commands: commands.clone(),
             }),
             commands,
@@ -1050,10 +1085,10 @@ mod tests {
     fn runtime_already_in_turn_cannot_be_bound_without_replay_state() {
         let hub = LiveViewHub::new();
         let control = Arc::new(FakeControl {
-            status: RuntimeStatus {
+            status: Arc::new(Mutex::new(RuntimeStatus {
                 generation: 1,
                 phase: RuntimePhase::InTurn,
-            },
+            })),
             commands: Arc::new(Mutex::new(Vec::new())),
         });
 
@@ -1175,7 +1210,7 @@ mod tests {
                 "session-1",
                 PathBuf::from("/one"),
                 snapshot("committed"),
-                control,
+                control.clone(),
             )
             .unwrap();
 
@@ -1198,6 +1233,77 @@ mod tests {
             .expect("same-session reconfigure keeps snapshot valid");
         assert_eq!(join.binding.generation, 2);
         assert_eq!(join.snapshot.messages[0].text, "committed");
+    }
+
+    #[test]
+    fn confirmed_reconfigure_commits_generation_before_followup_commands() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind(
+                "session-1",
+                PathBuf::from("/one"),
+                snapshot("committed"),
+                control.clone(),
+            )
+            .unwrap();
+        *control.status.lock().unwrap() = RuntimeStatus {
+            generation: 2,
+            phase: RuntimePhase::Ready,
+        };
+
+        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2))
+            .unwrap();
+
+        assert_eq!(hub.join().unwrap().binding.generation, 2);
+    }
+
+    #[test]
+    fn confirmed_reconfigure_preserves_sequence_when_event_arrived_first() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind(
+                "session-1",
+                PathBuf::from("/one"),
+                snapshot("committed"),
+                control.clone(),
+            )
+            .unwrap();
+        *control.status.lock().unwrap() = RuntimeStatus {
+            generation: 2,
+            phase: RuntimePhase::Ready,
+        };
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 2,
+                sequence: 2,
+                event: CodingRuntimeEvent::ProviderChanged {
+                    provider: "provider".into(),
+                    model: "model".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        hub.commit_reconfigure_generation(&binding, atomcode_coding::RuntimeGeneration(2))
+            .unwrap();
+
+        let error = hub
+            .publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 2,
+                    sequence: 1,
+                    event: CodingRuntimeEvent::ProviderChanged {
+                        provider: "stale".into(),
+                        model: "stale".into(),
+                    },
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, HubError::StaleEvent);
     }
 
     #[test]

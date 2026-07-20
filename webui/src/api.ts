@@ -53,7 +53,10 @@ export interface ModelInfo {
 
 export async function getModels(): Promise<ModelInfo[]> {
   const r = await fetch('/models', { headers: authHeaders() });
-  return r.json();
+  if (!r.ok) throw new Error(`list models failed: ${r.status}`);
+  const body: unknown = await r.json();
+  if (!Array.isArray(body)) throw new Error('list models returned an invalid payload');
+  return body as ModelInfo[];
 }
 
 /** A base64-encoded image attachment (no data-URL prefix). */
@@ -371,7 +374,10 @@ export interface ProjectInfo {
 
 export async function getProjects(): Promise<ProjectInfo[]> {
   const resp = await fetch('/projects', { headers: authHeaders() });
-  return resp.json();
+  if (!resp.ok) throw new Error(`list projects failed: ${resp.status}`);
+  const body: unknown = await resp.json();
+  if (!Array.isArray(body)) throw new Error('list projects returned an invalid payload');
+  return body as ProjectInfo[];
 }
 
 // --- Current project state ---

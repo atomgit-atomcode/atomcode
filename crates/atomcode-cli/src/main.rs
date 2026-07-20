@@ -1320,16 +1320,11 @@ async fn run() -> Result<i32> {
                 } else {
                     Config::default()
                 };
-                // Apply the `--model` override the SAME way the TUI path does
-                // (see the default TUI branch below): mutate the active provider's
-                // model in `config` BEFORE resolving it, so both the EngineConfig
-                // and the built provider pick up the override.
-                if let Some(ref model) = cli.model {
-                    let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
-                    if let Some(p) = config.providers.get_mut(provider_name) {
-                        p.model = model.clone();
-                    }
-                }
+                apply_cli_runtime_overrides(
+                    &mut config,
+                    cli.provider.as_deref(),
+                    cli.model.as_deref(),
+                );
                 let working_dir = resolve_working_dir(cli.dir.clone());
                 let runtime_cfg = runtime_config_from(
                     &config,
@@ -1445,12 +1440,7 @@ async fn run() -> Result<i32> {
     // background task fires on completion, so the slash menu refreshes
     // without a restart.
 
-    if let Some(ref model) = cli.model {
-        let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
-        if let Some(provider) = config.providers.get_mut(provider_name) {
-            provider.model = model.clone();
-        }
-    }
+    apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref());
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
@@ -1541,9 +1531,9 @@ async fn run() -> Result<i32> {
     };
 
     // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
-    // builds a fresh native runtime from the CURRENT config, so a /provider switch inside
-    // the session takes effect (the launch-time --provider override only seeds the
-    // initial handle above).
+    // builds a fresh native runtime from the CURRENT in-process config. A launch-time
+    // `--provider` is applied to that config above, so the override remains authoritative
+    // for live views and subsequent runtime respawns without being persisted to disk.
     let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
         let tel = telemetry.clone();
         // Capture the bypass flag so in-TUI re-spawns also honor
@@ -1863,6 +1853,31 @@ fn redirect_stderr_to_log_file() {
     // Windows: NSPasteboard is mac-only; arboard on Windows uses
     // OpenClipboard which doesn't NSLog. Not a known leak path.
     // No-op for now; revisit if a similar Windows issue surfaces.
+}
+
+/// Apply launch-time provider/model overrides to the process-owned config.
+///
+/// The runtime already resolves `--provider` directly, but TUI respawns and live views
+/// read `config.default_provider`. Keeping those two sources different makes the footer
+/// correct while synchronized WebUI tabs expose and reload the wrong provider. This is
+/// deliberately in-memory only; persistence remains owned by `/model` and WebUI settings.
+fn apply_cli_runtime_overrides(
+    config: &mut atomcode_config::config::Config,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) {
+    let provider_name = provider_override
+        .unwrap_or(&config.default_provider)
+        .to_string();
+    let Some(provider) = config.providers.get_mut(&provider_name) else {
+        return;
+    };
+    if let Some(model) = model_override {
+        provider.model = model.to_string();
+    }
+    if provider_override.is_some() {
+        config.default_provider = provider_name;
+    }
 }
 
 /// Derive the coding runtime config from the current config + working dir.
@@ -3526,8 +3541,8 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        close_thinking_chunk, format_thinking_chunk, format_verbose_tool_chunk,
-        resolve_working_dir, runtime_config_from, truncate_log_line,
+        apply_cli_runtime_overrides, close_thinking_chunk, format_thinking_chunk,
+        format_verbose_tool_chunk, resolve_working_dir, runtime_config_from, truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -3568,6 +3583,7 @@ mod tests {
         let def = runtime_config_from(&config, &wd, None, None, false, false);
         assert_eq!(def.base_url, "https://llm-api.atomgit.com/v1");
         assert_eq!(def.model, "gw-model");
+        assert_eq!(def.provider_name, "gateway");
         assert_eq!(def.reasoning_history, None);
 
         // `--provider direct` → that provider's endpoint/model/key + its per-provider
@@ -3575,8 +3591,31 @@ mod tests {
         let ov = runtime_config_from(&config, &wd, Some("direct"), None, false, false);
         assert_eq!(ov.base_url, "https://api.deepseek.com");
         assert_eq!(ov.model, "direct-model");
+        assert_eq!(ov.provider_name, "direct");
         assert_eq!(ov.api_key, "sk-direct");
         assert_eq!(ov.reasoning_history.as_deref(), Some("exclude"));
+    }
+
+    #[test]
+    fn interactive_provider_override_becomes_the_in_process_default() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_provider = "gateway"
+
+                [providers.gateway]
+                type = "openai"
+                model = "gw-model"
+
+                [providers.direct]
+                type = "openai"
+                model = "direct-model"
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(&mut config, Some("direct"), None);
+
+        assert_eq!(config.default_provider, "direct");
     }
 
     #[test]

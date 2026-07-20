@@ -543,13 +543,7 @@ pub fn catalog_for_project(
 ) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
     let bucket = SessionManager::project_hash(working_dir);
     let scan = SessionManager::scan_all();
-    if let Some(diagnostic) = scan
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.project_bucket.as_deref() == Some(bucket.as_str()))
-    {
-        anyhow::bail!("{}: {}", diagnostic.path.display(), diagnostic.message)
-    }
+    report_catalog_diagnostics(&scan.diagnostics);
     Ok(scan
         .entries
         .into_iter()
@@ -559,13 +553,12 @@ pub fn catalog_for_project(
 
 pub fn find_catalog_session_view(query: &str) -> anyhow::Result<Option<CatalogSessionView>> {
     let scan = SessionManager::scan_all();
-    if let Some(diagnostic) = scan.diagnostics.first() {
-        anyhow::bail!("{}: {}", diagnostic.path.display(), diagnostic.message)
+    report_catalog_diagnostics(&scan.diagnostics);
+    let entry = scan.find(query)?;
+    if entry.is_none() {
+        reject_matching_catalog_diagnostic(&scan.diagnostics, query)?;
     }
-    scan.find(query)?
-        .as_ref()
-        .map(load_catalog_session_view)
-        .transpose()
+    entry.as_ref().map(load_catalog_session_view).transpose()
 }
 
 pub fn load_catalog_session_view(
@@ -588,18 +581,21 @@ fn load_catalog_session_view_in_project_root(
 ) -> anyhow::Result<Option<CatalogSessionView>> {
     validate_project_bucket(project_bucket)?;
     let scan = SessionManager::scan_catalog(sessions_root);
-    if let Some(diagnostic) = scan.diagnostics.iter().find(|diagnostic| {
-        diagnostic.project_bucket.as_deref() == Some(project_bucket)
-            && diagnostic
-                .path
-                .file_stem()
-                .is_some_and(|stem| stem.to_string_lossy().starts_with(id))
-    }) {
-        anyhow::bail!("{}: {}", diagnostic.path.display(), diagnostic.message)
-    }
-    scan.entries
+    report_catalog_diagnostics(&scan.diagnostics);
+    let entry = scan
+        .entries
         .iter()
-        .find(|entry| entry.project_bucket == project_bucket && entry.id == id)
+        .find(|entry| entry.project_bucket == project_bucket && entry.id == id);
+    if entry.is_none() {
+        let project_diagnostics: Vec<_> = scan
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.project_bucket.as_deref() == Some(project_bucket))
+            .cloned()
+            .collect();
+        reject_matching_catalog_diagnostic(&project_diagnostics, id)?;
+    }
+    entry
         .map(|entry| load_catalog_session_view_in_root(sessions_root, entry))
         .transpose()
 }
@@ -662,18 +658,22 @@ pub fn rename_catalog_session_in_project(
     new_name: &str,
 ) -> anyhow::Result<String> {
     let scan = SessionManager::scan_all();
-    if let Some(diagnostic) = scan
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.project_bucket.as_deref() == Some(project_bucket))
-    {
-        anyhow::bail!("{}: {}", diagnostic.path.display(), diagnostic.message)
-    }
+    report_catalog_diagnostics(&scan.diagnostics);
     let entry = scan
         .entries
         .iter()
         .find(|entry| entry.project_bucket == project_bucket && entry.id == id)
-        .ok_or_else(|| anyhow::anyhow!("session {project_bucket}/{id} not found"))?;
+        .ok_or_else(|| {
+            let project_diagnostics: Vec<_> = scan
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.project_bucket.as_deref() == Some(project_bucket))
+                .cloned()
+                .collect();
+            reject_matching_catalog_diagnostic(&project_diagnostics, id)
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("session {project_bucket}/{id} not found"))
+        })?;
     rename_catalog_entry_inner(entry, new_name, false)?.ok_or_else(|| {
         anyhow::anyhow!("session {project_bucket}/{id} rejected a user rename unexpectedly")
     })
@@ -819,13 +819,48 @@ fn rename_catalog_session_inner(
     ai: bool,
 ) -> anyhow::Result<Option<String>> {
     let scan = SessionManager::scan_all();
-    if let Some(diagnostic) = scan.diagnostics.first() {
-        anyhow::bail!("{}: {}", diagnostic.path.display(), diagnostic.message)
-    }
-    let entry = scan
-        .find(query)?
-        .ok_or_else(|| anyhow::anyhow!("session {query:?} not found"))?;
+    report_catalog_diagnostics(&scan.diagnostics);
+    let entry = scan.find(query)?.ok_or_else(|| {
+        reject_matching_catalog_diagnostic(&scan.diagnostics, query)
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("session {query:?} not found"))
+    })?;
     rename_catalog_entry_inner(&entry, new_name, ai)
+}
+
+fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
+    for diagnostic in diagnostics {
+        tracing::warn!(
+            path = %diagnostic.path.display(),
+            kind = ?diagnostic.kind,
+            message = %diagnostic.message,
+            "session catalog entry was skipped"
+        );
+    }
+}
+
+fn reject_matching_catalog_diagnostic(
+    diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic],
+    query: &str,
+) -> anyhow::Result<()> {
+    let mut matches = diagnostics.iter().filter(|diagnostic| {
+        catalog_diagnostic_session_id(&diagnostic.path)
+            .is_some_and(|id| id == query || id.starts_with(query))
+    });
+    let Some(first) = matches.next() else {
+        return Ok(());
+    };
+    if matches.next().is_some() {
+        anyhow::bail!("session query {query:?} matches multiple damaged catalog entries")
+    }
+    anyhow::bail!("{}: {}", first.path.display(), first.message)
+}
+
+fn catalog_diagnostic_session_id(path: &std::path::Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    [".ui.json", ".snapshot", ".meta", ".jsonl", ".json"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
 }
 
 fn rename_catalog_entry_inner(
@@ -1002,6 +1037,23 @@ mod tests {
             "../../atomcode-core/tests/fixtures/session/legacy_full.json"
         ))
         .expect("full legacy session fixture must parse")
+    }
+
+    #[test]
+    fn catalog_diagnostics_only_block_the_damaged_session() {
+        use atomcode_capabilities::session::{CatalogDiagnostic, CatalogDiagnosticKind};
+
+        let diagnostic = CatalogDiagnostic {
+            project_bucket: Some("0123456789abcdef".into()),
+            path: std::path::PathBuf::from("/sessions/0123456789abcdef/damaged.snapshot"),
+            kind: CatalogDiagnosticKind::Corrupt,
+            message: "sidecars but no metadata".into(),
+        };
+
+        reject_matching_catalog_diagnostic(std::slice::from_ref(&diagnostic), "healthy")
+            .expect("unrelated valid sessions must remain usable");
+        let error = reject_matching_catalog_diagnostic(&[diagnostic], "damaged").unwrap_err();
+        assert!(error.to_string().contains("sidecars but no metadata"));
     }
 
     #[test]

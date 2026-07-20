@@ -478,6 +478,7 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
         max_tokens: p.and_then(|p| p.max_tokens).map(|m| m as u32),
@@ -1077,6 +1078,10 @@ fn parse_session_id(session_id_str: Option<String>) -> Option<String> {
     })
 }
 
+fn provider_reload_required(active: &str, requested: &str) -> bool {
+    active != requested
+}
+
 /// GET /live 查询参数。`session_id` 可选：提供时绑定到该 native session。
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LiveStreamQuery {
@@ -1284,10 +1289,11 @@ pub(crate) async fn live_message(
 ) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
     let sid = parse_session_id(req.session_id);
+    let active_provider = live_current_provider();
     let requested_provider = req.provider.clone();
     let provider_name = requested_provider
         .clone()
-        .unwrap_or_else(live_current_provider);
+        .unwrap_or_else(|| active_provider.clone());
     let join = match crate::native_live::ensure_headless_runtime(
         live_current_working_dir(&working_dir),
         state.telemetry.clone(),
@@ -1303,35 +1309,37 @@ pub(crate) async fn live_message(
         }
     };
     if let Some(requested_provider) = requested_provider {
-        let config = match Config::load(&Config::default_path()) {
-            Ok(config) => config,
-            Err(error) => {
+        if provider_reload_required(&active_provider, &requested_provider) {
+            let config = match Config::load(&Config::default_path()) {
+                Ok(config) => config,
+                Err(error) => {
+                    return Json(serde_json::json!({
+                        "accepted": false,
+                        "error": format!("load provider config failed: {error}"),
+                    }));
+                }
+            };
+            if !config.providers.contains_key(&requested_provider) {
                 return Json(serde_json::json!({
                     "accepted": false,
-                    "error": format!("load provider config failed: {error}"),
+                    "error": format!("provider {requested_provider:?} not found"),
                 }));
             }
-        };
-        if !config.providers.contains_key(&requested_provider) {
-            return Json(serde_json::json!({
-                "accepted": false,
-                "error": format!("provider {requested_provider:?} not found"),
-            }));
+            let runtime_config = chat_runtime_config(
+                &config,
+                &provider_name,
+                &join.binding.working_dir,
+                state.telemetry.clone(),
+            );
+            let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
+            if let Err(error) = crate::native_live::reload_provider(next).await {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": format!("provider reload rejected: {error:?}"),
+                }));
+            }
+            live_set_provider(requested_provider);
         }
-        let runtime_config = chat_runtime_config(
-            &config,
-            &provider_name,
-            &join.binding.working_dir,
-            state.telemetry.clone(),
-        );
-        let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-        if let Err(error) = crate::native_live::reload_provider(next).await {
-            return Json(serde_json::json!({
-                "accepted": false,
-                "error": format!("provider reload rejected: {error:?}"),
-            }));
-        }
-        live_set_provider(requested_provider);
     }
     let original_images: Vec<ImagePart> = req
         .images
@@ -2022,6 +2030,12 @@ mod tests {
         // 不带 provider 的请求体默认 None。
         let req2: LiveMessageReq = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
         assert_eq!(req2.provider, None);
+    }
+
+    #[test]
+    fn live_message_does_not_reload_the_already_active_provider() {
+        assert!(!provider_reload_required("ds-gf", "ds-gf"));
+        assert!(provider_reload_required("ds-gf", "other"));
     }
 
     #[test]

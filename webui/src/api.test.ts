@@ -52,3 +52,19 @@ test('live control APIs reject protocol-level failures', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('collection APIs reject server error payloads instead of returning non-arrays', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify('session metadata is missing'),
+    { status: 500, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { getModels, getProjects } = await import('./api.ts');
+    await assert.rejects(() => getModels(), /list models failed: 500/);
+    await assert.rejects(() => getProjects(), /list projects failed: 500/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -15,6 +15,9 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Stable config/provider registry key exposed to drivers. This is distinct
+    /// from `provider_type`, which selects the adapter implementation.
+    pub provider_name: String,
     /// Directory the agent's tools see as their working dir — PINNED (via the kernel
     /// `working_dir` seam), not the process-global cwd, so concurrent agents don't race.
     pub working_dir: PathBuf,
@@ -118,6 +121,7 @@ pub struct CodingRuntimeConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
     pub max_tokens: Option<u32>,
@@ -147,7 +151,15 @@ impl CodingRuntimeConfig {
         dangerously_skip_permissions: bool,
         interactive: bool,
     ) -> Self {
-        let provider = config.active_provider(provider_override).ok();
+        let requested_provider = provider_override
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&config.default_provider);
+        let provider_name = if config.providers.contains_key(requested_provider) {
+            requested_provider.to_string()
+        } else {
+            config.providers.keys().min().cloned().unwrap_or_default()
+        };
+        let provider = config.providers.get(&provider_name);
         Self {
             api_key: provider
                 .and_then(|provider| provider.api_key.clone())
@@ -158,6 +170,7 @@ impl CodingRuntimeConfig {
             model: provider
                 .map(|provider| provider.model.clone())
                 .unwrap_or_default(),
+            provider_name,
             working_dir: working_dir.to_path_buf(),
             context_window: provider
                 .map(|provider| provider.context_window as u32)
@@ -195,6 +208,7 @@ impl CodingRuntimeConfig {
             &self.working_dir,
         );
         config.context_window = self.context_window;
+        config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
         config.reasoning_history = self.reasoning_history.clone();
@@ -363,10 +377,12 @@ impl CodingAgentConfig {
         model: impl Into<String>,
         working_dir: impl Into<PathBuf>,
     ) -> Self {
+        let model = model.into();
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            provider_name: model.clone(),
+            model,
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
@@ -530,6 +546,7 @@ impl std::fmt::Debug for CodingAgentConfig {
         f.debug_struct("CodingAgentConfig")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("provider_name", &self.provider_name)
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)

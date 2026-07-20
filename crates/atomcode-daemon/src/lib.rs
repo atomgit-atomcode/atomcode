@@ -1293,11 +1293,13 @@ fn catalog_scan_in_root(
     root: &std::path::Path,
 ) -> std::io::Result<atomcode_capabilities::session::CatalogScan> {
     let scan = atomcode_capabilities::session::SessionManager::scan_catalog(root);
-    if let Some(diagnostic) = scan.diagnostics.first() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: {}", diagnostic.path.display(), diagnostic.message),
-        ));
+    for diagnostic in &scan.diagnostics {
+        tracing::warn!(
+            path = %diagnostic.path.display(),
+            kind = ?diagnostic.kind,
+            message = %diagnostic.message,
+            "session catalog entry was skipped"
+        );
     }
     Ok(scan)
 }
@@ -5152,6 +5154,34 @@ mod tests {
             hash_path(path),
             "session create/append responses must return the physical session bucket hash"
         );
+    }
+
+    #[test]
+    fn catalog_consumers_keep_valid_entries_when_an_orphan_sidecar_is_diagnosed() {
+        use atomcode_capabilities::session::{SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        manager
+            .write_meta(&SessionMeta::new("valid", "/project", 1))
+            .unwrap();
+        manager
+            .save_snapshot(
+                "orphan",
+                &atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+            )
+            .unwrap();
+
+        let scan = catalog_scan_in_root(tmp.path())
+            .expect("an unrelated damaged session must not hide valid catalog entries");
+
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "valid");
+        assert_eq!(scan.diagnostics.len(), 1);
+        assert!(scan.diagnostics[0]
+            .message
+            .contains("sidecars but no metadata"));
     }
 
     // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions
