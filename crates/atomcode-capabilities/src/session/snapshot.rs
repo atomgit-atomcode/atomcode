@@ -131,11 +131,14 @@ impl LifecycleHooks for SnapshotHook {
                 meta.updated_at = now;
                 meta.turn_count = meta.turn_count.saturating_add(1);
                 meta.message_count = msg_count as u32;
-                // Drop turn_stats whose divider position no longer exists in the
-                // (possibly compacted, hence shorter) snapshot.
-                meta.turn_stats.retain(|s| s.after_message <= msg_count);
+                // New stats use stable turn ids and are pruned explicitly from the
+                // surviving-turn set. Keep the mutable message-position rule only
+                // for pre-S1d stats that have not been converted yet.
+                meta.turn_stats
+                    .retain(|s| s.turn_id != 0 || s.after_message <= msg_count);
                 meta.turn_stats.push(TurnStat {
                     after_message: msg_count,
+                    turn_id: ctx.turn_id,
                     round_count,
                     tool_call_count,
                     duration_ms,
@@ -219,7 +222,15 @@ mod tests {
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(2, 1234)).await;
         let convo = convo_with(3);
-        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(
+            &convo,
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 7,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
 
         // Snapshot is loadable and holds the conversation.
         let snap = mgr.load_snapshot("s1").unwrap();
@@ -237,6 +248,7 @@ mod tests {
         assert_eq!(st.used_tokens, 1234);
         assert_eq!(st.ctx_window, 0);
         assert_eq!(st.after_message, 3);
+        assert_eq!(st.turn_id, 7);
         assert!(!st.errored);
     }
 
@@ -252,7 +264,8 @@ mod tests {
             .await;
 
         let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(mgr.meta_path("s1a-stats")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(mgr.meta_path("s1a-stats").unwrap()).unwrap())
+                .unwrap();
         let stat = &raw["turn_stats"][0];
         assert_eq!(stat["round_count"], 2);
         assert_eq!(stat["tool_call_count"], 3);
@@ -268,10 +281,18 @@ mod tests {
         // The turn died before ANY assistant message was stored — the convo carries
         // no metas, so derive_counters alone would say 0. The live TurnCtx is
         // authoritative: a resume must seed PAST this turn.
-        let ctx = TurnCtx { turn_id: 7, request_id: 12, ..Default::default() };
-        h.turn_complete(&convo_with(1), &StopReason::ProviderError, &ctx).await;
+        let ctx = TurnCtx {
+            turn_id: 7,
+            request_id: 12,
+            ..Default::default()
+        };
+        h.turn_complete(&convo_with(1), &StopReason::ProviderError, &ctx)
+            .await;
         let snap = mgr.load_snapshot("s1").unwrap();
-        assert_eq!(snap.turn_counter, 7, "ctx.turn_id stamps the high-water mark");
+        assert_eq!(
+            snap.turn_counter, 7,
+            "ctx.turn_id stamps the high-water mark"
+        );
         assert_eq!(snap.request_counter, 12, "ctx.request_id too");
     }
 
@@ -280,9 +301,17 @@ mod tests {
         let (h, mgr, _d) = hook("s1");
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 10)).await;
-        h.turn_complete(&convo_with(2), &StopReason::ProviderError, &TurnCtx::default()).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::ProviderError,
+            &TurnCtx::default(),
+        )
+        .await;
         let meta = mgr.read_meta("s1").unwrap();
-        assert!(meta.turn_stats[0].errored, "a ProviderError terminal is errored");
+        assert!(
+            meta.turn_stats[0].errored,
+            "a ProviderError terminal is errored"
+        );
     }
 
     #[tokio::test]
@@ -291,7 +320,12 @@ mod tests {
         for t in 1..=3u32 {
             h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
             h.on_model_response(&mut resp(1, 100 * t)).await;
-            h.turn_complete(&convo_with(t as usize), &StopReason::Stopped, &TurnCtx::default()).await;
+            h.turn_complete(
+                &convo_with(t as usize),
+                &StopReason::Stopped,
+                &TurnCtx::default(),
+            )
+            .await;
         }
         let meta = mgr.read_meta("s1").unwrap();
         assert_eq!(meta.turn_count, 3);
@@ -305,30 +339,37 @@ mod tests {
         // Turn 1 writes a good meta.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // Corrupt the meta on disk → read_meta now returns InvalidData (NOT NotFound).
-        std::fs::write(mgr.meta_path("s1"), b"not valid json {{{").unwrap();
+        std::fs::write(mgr.meta_path("s1").unwrap(), b"not valid json {{{").unwrap();
         // Turn 2 must NOT overwrite the file with a fresh (reset) meta.
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
-        let raw = std::fs::read_to_string(mgr.meta_path("s1")).unwrap();
-        assert_eq!(raw, "not valid json {{{", "a non-NotFound read error must not clobber the meta");
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
+        let raw = std::fs::read_to_string(mgr.meta_path("s1").unwrap()).unwrap();
+        assert_eq!(
+            raw, "not valid json {{{",
+            "a non-NotFound read error must not clobber the meta"
+        );
         // The snapshot still saved fine — resume is unaffected by the meta read failure.
         assert_eq!(mgr.load_snapshot("s1").unwrap().messages.len(), 2);
     }
 
     #[tokio::test]
-    async fn prunes_stale_turn_stats_when_snapshot_shrinks() {
+    async fn prunes_unconverted_legacy_stats_when_snapshot_shrinks() {
         let (h, mgr, _d) = hook("s1");
         // Turn 1: a 5-message snapshot → stat at after_message=5.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(5), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(5), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // Turn 2: a compaction shrank the snapshot to 2 messages.
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         let meta = mgr.read_meta("s1").unwrap();
         assert!(
             meta.turn_stats.iter().all(|s| s.after_message <= 2),
@@ -339,17 +380,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shrinking_snapshot_does_not_prune_native_stable_turn_stats_by_position() {
+        let (h, mgr, _d) = hook("s1");
+        h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(5),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
+        h.on_model_response(&mut resp(0, 1)).await;
+        h.turn_complete(
+            &convo_with(2),
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 2,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        let stats = mgr.read_meta("s1").unwrap().turn_stats;
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].turn_id, 1);
+        assert_eq!(stats[0].after_message, 5);
+        assert_eq!(stats[1].turn_id, 2);
+    }
+
+    #[tokio::test]
     async fn preserves_user_rename_across_turns() {
         let (h, mgr, _d) = hook("s1");
         // First turn creates the meta.
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(1), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         // User renames; a later turn must NOT clobber it.
         mgr.rename("s1", "My Work").unwrap();
         h.user_prompt_submit(&mut "more".to_string()).await.unwrap();
         h.on_model_response(&mut resp(0, 1)).await;
-        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+            .await;
         let meta = mgr.read_meta("s1").unwrap();
         assert_eq!(meta.name, "My Work");
         assert!(meta.user_renamed);
@@ -364,18 +441,16 @@ mod tests {
         let (hook, mgr, _d) = hook("concurrent-meta");
         mgr.write_meta(&SessionMeta::new("concurrent-meta", "/proj", 1))
             .unwrap();
-        hook.user_prompt_submit(&mut "go".to_string()).await.unwrap();
+        hook.user_prompt_submit(&mut "go".to_string())
+            .await
+            .unwrap();
 
         // Pause turn-complete after it has read the old title. Without a lock, rename
         // completes next and the stale turn write then silently restores the old title.
         let pause = mgr.pause_next_meta_read();
         let turn = tokio::spawn(async move {
-            hook.turn_complete(
-                &convo_with(2),
-                &StopReason::Stopped,
-                &TurnCtx::default(),
-            )
-            .await;
+            hook.turn_complete(&convo_with(2), &StopReason::Stopped, &TurnCtx::default())
+                .await;
         });
         pause.wait_until_read();
 
@@ -391,7 +466,10 @@ mod tests {
 
         turn.await.unwrap();
         rename.join().unwrap().unwrap();
-        assert!(rename_waited, "rename must wait for the turn meta update lock");
+        assert!(
+            rename_waited,
+            "rename must wait for the turn meta update lock"
+        );
         let meta = mgr.read_meta("concurrent-meta").unwrap();
         assert_eq!(meta.name, "User title");
         assert!(meta.user_renamed);

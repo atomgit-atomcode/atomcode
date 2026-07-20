@@ -26,7 +26,7 @@ use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::provider::model_suggests_vision;
 use atomcode_capabilities::session::{
-    RecallTool, SessionContextHook, SessionManager, SnapshotHook, StatusReminderHook,
+    RecallTool, SessionContextHook, SessionLease, SessionManager, SnapshotHook, StatusReminderHook,
     TranscriptHook,
 };
 use atomcode_capabilities::skills::{
@@ -125,6 +125,9 @@ impl Default for PrepareOptions {
 pub struct SessionBinding {
     pub id: String,
     pub manager: Arc<SessionManager>,
+    /// Active-runtime ownership. Clones share the same OS lock and release it
+    /// only when the last runtime generation drops.
+    pub(crate) lease: SessionLease,
     /// Loaded snapshot on [`SessionMode::Resume`]; `None` on fresh.
     pub resume: Option<SessionSnapshot>,
 }
@@ -212,6 +215,15 @@ pub async fn prepare_with_plugin_hooks(
     cfg: &CodingAgentConfig,
     opts: PrepareOptions,
     plugin_cc_hooks: Vec<HookConfig>,
+) -> io::Result<CodingParts> {
+    prepare_with_plugin_hooks_reusing_lease(cfg, opts, plugin_cc_hooks, None).await
+}
+
+async fn prepare_with_plugin_hooks_reusing_lease(
+    cfg: &CodingAgentConfig,
+    opts: PrepareOptions,
+    plugin_cc_hooks: Vec<HookConfig>,
+    reuse_lease: Option<SessionLease>,
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
@@ -406,13 +418,20 @@ pub async fn prepare_with_plugin_hooks(
     // Session binding: the id's single owner.
     let session = match &opts.session {
         SessionMode::Disabled => None,
-        SessionMode::Fresh => Some(SessionBinding {
-            id: uuid::Uuid::new_v4().to_string(),
-            manager: Arc::new(SessionManager::for_project(&cfg.working_dir)),
-            resume: None,
-        }),
+        SessionMode::Fresh => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
+            let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
+            Some(SessionBinding {
+                id,
+                manager,
+                lease,
+                resume: None,
+            })
+        }
         SessionMode::Resume(id) => {
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
+            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
             match manager.load_snapshot(id) {
                 Ok(snap) => {
                     // A version-mismatched snapshot must FAIL here, not fall through
@@ -422,18 +441,22 @@ pub async fn prepare_with_plugin_hooks(
                     Some(SessionBinding {
                         id: id.clone(),
                         manager,
+                        lease,
                         resume: Some(snap),
                     })
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e),
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e.into()),
+                Err(e) => return Err(e.into()),
             }
         }
         SessionMode::ExternalSnapshot { id, snapshot } => {
             check_snapshot_version(snapshot)?;
+            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
+            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
             Some(SessionBinding {
                 id: id.clone(),
-                manager: Arc::new(SessionManager::for_project(&cfg.working_dir)),
+                manager,
+                lease,
                 resume: Some(snapshot.clone()),
             })
         }
@@ -583,10 +606,30 @@ pub async fn prepare_with_plugin_hook_source(
     opts: PrepareOptions,
     source: &dyn PluginHookSource,
 ) -> io::Result<CodingParts> {
+    prepare_with_plugin_hook_source_reusing_lease(cfg, opts, source, None).await
+}
+
+pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
+    cfg: &CodingAgentConfig,
+    opts: PrepareOptions,
+    source: &dyn PluginHookSource,
+    reuse_lease: Option<SessionLease>,
+) -> io::Result<CodingParts> {
     let hooks = source
         .load()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    prepare_with_plugin_hooks(cfg, opts, hooks).await
+    prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease).await
+}
+
+fn session_lease(
+    manager: &SessionManager,
+    id: &str,
+    reuse_lease: Option<&SessionLease>,
+) -> io::Result<SessionLease> {
+    match reuse_lease.filter(|lease| lease.id() == id) {
+        Some(lease) => Ok(lease.clone()),
+        None => manager.acquire_lease(id).map_err(Into::into),
+    }
 }
 
 impl CodingParts {
@@ -682,7 +725,7 @@ pub fn assemble(
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -1169,6 +1212,45 @@ mod tests {
 
         let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
         assert!(ephemeral.compaction_checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_rejects_a_second_binding_until_the_first_drops() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
+        let opts = || {
+            let mut opts = io_free_opts();
+            opts.session = SessionMode::ExternalSnapshot {
+                id: "same-session".into(),
+                snapshot: snapshot.clone(),
+            };
+            opts
+        };
+
+        let first = prepare(&cfg, opts()).await.unwrap();
+        let error = match prepare(&cfg, opts()).await {
+            Ok(_) => panic!("a second binding must not own the same session"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<
+                    atomcode_capabilities::session::SessionStoreError,
+                >()),
+            Some(atomcode_capabilities::session::SessionStoreError::SessionInUse {
+                id,
+                ..
+            }) if id == "same-session"
+        ));
+
+        drop(first);
+        prepare(&cfg, opts()).await.unwrap();
     }
 
     /// `prepare` loads a project `.hooks.json` and exposes the runner via

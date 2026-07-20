@@ -97,7 +97,7 @@ mod tests {
     use atomcode_core::session::Session;
 
     fn full_legacy_session() -> Session {
-        serde_json::from_str(include_str!("../../../testdata/sessions/legacy_full.json"))
+        serde_json::from_str(include_str!("../../atomcode-core/tests/fixtures/session/legacy_full.json"))
             .expect("full legacy session fixture must parse")
     }
 

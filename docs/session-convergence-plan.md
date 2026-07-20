@@ -1,8 +1,8 @@
 # Session / Conversation 收口方案
 
-> 状态：S0、S1a、S1b 已完成，S1c 待实施；本文件不代表生产路径已经切换。
+> 状态：S0、S1a、S1b、S1c、S1d、S1e 已完成，后续工作包已经评审并细化，S1f 待实施；本文件不代表生产路径已经切换。
 >
-> 核对基线：`release/v5.0.1@d90d195a7d9b1ce3231445513c1c1efd9613d4ea`
+> 核对基线：`release/v5.0.1@a27ffc67aac85c47337ae73bd12cd6bf0d92f152`
 >
 > 当前四态：native runtime/session 逻辑已实现，但 CLI、TUI、daemon 仍读写 core session JSON，
 > live 路径仍有 core ↔ kernel 双向转换，因此整体处于状态③：legacy writer/兼容路径仍可达。
@@ -18,8 +18,10 @@
 - core `<id>.json` 最终只作为只读、幂等、显式失败的历史 importer 输入；
 - 所有消费者切换后删除 core JSON writer、live mirror 和双向转换，保留 importer 不等于旧格式已删除。
 
-不允许长期双写。迁移期间必须通过明确的 session 级迁移状态决定由谁写，不能同时把 core JSON 和
-native 文件当作可相互覆盖的权威源。
+不允许长期双写。迁移期间必须通过明确的 session 级存储所有权决定由谁写，不能同时把
+core JSON 和 native 文件当作可相互覆盖的权威源。所有权缺失表示过渡期的未确认状态；
+一旦在 native meta 中 commit `owner=native`，所有 core writer 必须拒绝再写该 session，不得等到全局
+S4d 才停止。
 
 ## 2. 范围与非目标
 
@@ -28,6 +30,7 @@ native 文件当作可相互覆盖的权威源。
 - core `Session/SessionMeta/SessionManager` 与 `ConversationSnapshot`；
 - native `SessionSnapshot/SessionMeta/SessionManager/SnapshotHook/TranscriptHook`；
 - CLI、TUI、daemon、background 的 list/load/save/rename/delete/resume/undo/session switch；
+- headless、clix、ACP 的 native session 路径作为回归范围；
 - core ↔ kernel message/snapshot 转换；
 - macOS 历史 session 目录迁移；
 - session id、project bucket、原子写、损坏文件和跨项目查找语义。
@@ -67,7 +70,8 @@ native 文件当作可相互覆盖的权威源。
 
 ## 4. 字段兼容矩阵
 
-迁移前必须用真实 legacy fixture 固化以下映射；“可推导”也必须有唯一算法和回归测试。
+迁移前必须用符合真实 legacy schema 的合成 fixture 固化以下映射；“可推导”也必须有唯一算法
+和回归测试，不使用真实用户数据。
 
 | 语义 | core JSON | native 当前 | 目标处理 |
 |---|---|---|---|
@@ -75,6 +79,8 @@ native 文件当作可相互覆盖的权威源。
 | name | `Session.name` | `SessionMeta.name` | native meta 权威 |
 | user rename | `user_renamed` | `user_renamed` | 原样导入，用户命名优先 |
 | AI naming | `ai_named` | `ai_named`（S1a additive） | native meta 可表达并在改名时保留；切换命名写入方后才成为权威值 |
+| storage owner | 无 | S2 additive | `unconfirmed/legacy/native`；新 session 由 start 路径显式传入，历史缺省才是 unconfirmed |
+| import info | 无 | S2 additive | 仅 legacy cutover 写入 schema、原始字节 SHA-256、导入器版本与导入类型 |
 | working directory | `PathBuf` | meta `String` | 规范化后保存；保留原 project bucket |
 | timestamps | 秒 | 毫秒 | checked `seconds * 1000`；拒绝溢出/非法值 |
 | runtime messages | core `MessageContent` | kernel `Message` | importer 单向转换，native snapshot 权威 |
@@ -86,7 +92,7 @@ native 文件当作可相互覆盖的权威源。
 | cache epoch | 缺失 | snapshot 字段 | native 值权威；legacy-only 导入默认 0 |
 | turn/request counter | 缺失 | snapshot 字段 | 从 message meta 推导；legacy-only 无 meta 时默认 0 |
 | display-only messages | `display_messages` | 缺失 | 迁到独立、版本化的 presentation sidecar，不进入模型上下文 |
-| turn stats | `turn_count/tool_call_count/duration_ms/total_tokens/used_tokens/ctx_window` | `round_count/tool_call_count/duration_ms/total_tokens/used_tokens/ctx_window`（S1a） | core 每回合的 `turn_count` 映射为 native `round_count`；顶层 `SessionMeta.turn_count` 仍表示已完成用户回合数 |
+| turn stats | `turn_count/tool_call_count/duration_ms/total_tokens/used_tokens/ctx_window` | `round_count/tool_call_count/duration_ms/total_tokens/used_tokens/ctx_window`（S1a） | core 每回合的 `turn_count` 映射为 native `round_count`；顶层 `SessionMeta.turn_count` 仍表示已完成用户回合数；现有 `after_message` 下标在 S1d 迁到稳定 `turn_id` 锚点 |
 | message/file count | core list 动态计算 | native meta 持久化 | native meta 权威，导入时计算一次 |
 | raw transcript | 无等价权威记录 | JSONL | 保持 native；legacy 导入不伪造历史 raw transcript |
 
@@ -96,11 +102,14 @@ UI-only replay 数据不应塞回 kernel message，也不应继续要求 core `M
 `<id>.ui.json`（名称可在实现前确认），只保存：
 
 - schema version；
-- 以 native message position 为锚点的 display event；
+- 稳定的 `DisplayAnchor`：v1 只允许 `AtStart` 或 `AfterTurn(turn_id)`，不得使用可被
+  compaction/undo 重排的消息数组下标；
 - kernel-neutral 的展示文本/结构，不包含可被 provider 发送的 message 类型。
 
-若现状盘点证明 production 只需要纯文本，则第一版只支持纯文本，拒绝为历史未使用字段设计通用
-UI 协议。若存在图片、工具结构或其他真实数据，必须在 fixture 中证明后再扩展 schema。
+当前 production writer 只在 session 尾部追加纯文本，因此 v1 只支持 user/assistant 纯文本和上述
+turn 级锚点。legacy `after_message` 只在 importer 中按确定性规则转换一次：映射到该位置所属的
+已完成 turn；空会话映射为 `AtStart`；无法唯一映射时显式返回导入诊断，不静默猜测。
+若后续证明存在图片、工具结构或回合中间插入等真实数据，必须在 fixture 中证明后再扩展 schema。
 
 ## 5. 目标所有权与 API
 
@@ -111,7 +120,10 @@ UI 协议。若存在图片、工具结构或其他真实数据，必须在 fixt
 
 - `save_snapshot/load_snapshot`；
 - snapshot version、cache epoch、turn/request counter 校验；
-- compaction checkpoint 和 turn terminal 持久化。
+- compaction checkpoint 和 turn terminal 持久化；
+- `SessionLease` 是跨进程 advisory lock 的 RAII guard，由 coding `SessionBinding/CodingRuntime`
+  在 session 活跃期间持有；不使用单纯的存在标记或 TTL 猜测存活状态；
+- importer、delete 和所有权切换必须持有同一 session 的排他 lease。
 
 ### Catalog store
 
@@ -122,61 +134,102 @@ UI 协议。若存在图片、工具结构或其他真实数据，必须在 fixt
 
 ### Compatibility importer
 
-importer 暂时放在接入/兼容层，不允许 capabilities 或 coding 依赖 core。优先集中到一个共享的 core
-compatibility module，由 CLI/TUI/daemon 调用；不得继续维护 TUI 和 daemon 两份独立转换实现。
+importer 暂时放在接入/兼容层，不允许 capabilities 或 coding 依赖 core。第一阶段收口到 CLI/TUI/daemon
+已经共享依赖的 daemon 兼容模块（现有 `legacy_convert`，实施时可按职责改名为
+`session_compat`）；不新建通用 crate，不让 core 反向依赖 kernel/native 类型，也不继续维护
+TUI 和 daemon 两份独立转换实现。
 
 importer 输出 kernel snapshot、native meta 和 presentation DTO；写盘仍通过 native manager 完成。
 所有消费者切换后，importer 是 core session 类型唯一允许的生产消费者。
 
+### Session 存储所有权
+
+native meta 在 S2 增加带 serde default 的存储状态，与 import 详情分开：
+
+- `owner` 缺失/未确认：历史过渡状态，必须在 lease 下根据实际文件集合判定；
+- `owner=legacy`：core JSON 是唯一可写权威源，native 文件即使存在也只是未 commit 的准备数据；
+- `owner=native`：native snapshot/meta/presentation 是唯一可写权威源；
+- `import_info`：只在来源为 legacy 时记录 schema、原始字节 SHA-256、导入器版本和导入类型；
+  fresh native session 不伪造 `import_info`。
+
+新 session 的 owner 由 runtime/session start 路径显式传入，不根据某个文件当时是否存在来猜测；只有历史
+serde 缺省值才进入 unconfirmed 判定。
+
+`owner=native` 是多文件提交点，必须在该 session 的 native list/rename/delete/resume/UI/mutation
+路径全部就绪后才最后写入。在该状态可见之前，生产 reader 不得将 staging 文件当成
+已切换 session；在其可见之后，core writer 必须 fail-closed，不得继续更新 legacy JSON。
+
 ## 6. 导入状态机
 
-禁止用文件 mtime 决定谁覆盖谁。以 native meta 中显式的 import 标记和 legacy 内容摘要判断：
+禁止用文件 mtime 决定谁覆盖谁。catalog 的只读发现不会自动导入或切换所有权。只有显式进入
+native cutover 时才调用下述状态机；调用前必须获取 session 排他 lease，然后以 native meta 中的
+存储所有权和 `import_info` 判断：
 
 ```text
 查找 session
   │
-  ├─ native snapshot + meta 完整
-  │    ├─ 已有 import marker → 直接使用 native
-  │    └─ 无 marker、legacy 同时存在
-  │          → native messages 保持权威
-  │          → 只补齐缺失 metadata/presentation
-  │          → 写 import marker
+  ├─ meta.owner = native
+  │    ├─ snapshot/meta 完整 → 直接使用 native
+  │    │    └─ legacy 摘要与 import_info 不同
+  │    │          → native 仍保持权威，返回 LegacyChangedAfterCutover 诊断
+  │    └─ native 不完整 → 显式报损坏，不用 legacy 自动覆盖
+  │
+  ├─ meta.owner = legacy
+  │    ├─ 未请求 cutover → 继续使用 core JSON，不把 native staging 当权威源
+  │    └─ 请求 cutover → 按 legacy JSON 分支重新校验/转换，不信任旧 staging
+  │
+  ├─ native snapshot + meta 完整、owner 未确认
+  │    → native messages 保持权威
+  │    → 有 legacy 时只补齐缺失 metadata/presentation
+  │    → 最后 commit owner=native，从此禁止 core writer
   │
   ├─ 只有 legacy JSON
-  │    → 解析和校验
-  │    → 转换到内存
-  │    → 校验 tool pairing/schema/path/id
-  │    → 原子写 snapshot/presentation
-  │    → 最后写 meta + import marker 作为 commit point
+  │    → 有界读取、解析、转换到内存
+  │    → 校验 tool pairing/schema/path/id/presentation anchor
+  │    → 写唯一 staging snapshot/presentation
+  │    → 最后写 meta(owner=native + import_info) 作为 commit point
+  │    → 从此禁止 core writer
   │
-  ├─ 只有部分 native 文件
-  │    → 显式报损坏/不完整
-  │    → 有 legacy 时允许受控修复，但不得覆盖有效 native snapshot
+  ├─ 只有部分 native 文件、owner 未确认
+  │    → 显式报不完整
+  │    → 有 legacy 时可受控重建缺失文件，但不覆盖可验证的 native snapshot
+  │    → 重建成功后再 commit owner=native
   │
-  └─ 两边都不存在
-       → NotFound，不得 silent fresh
+  └─ 两边都不存在 → NotFound，不得 silent fresh
 ```
 
-import marker 至少记录：
+`import_info` 至少记录：
 
 - legacy schema/来源；
-- legacy 内容摘要；
+- legacy 原始字节的 SHA-256，不对重序列化后的 JSON 计算摘要；
 - 导入器版本；
 - 是否只补 metadata、还是创建完整 native snapshot。
 
-导入成功后不删除、不修改 legacy 文件。重复执行相同 legacy 内容必须幂等；legacy 内容后来发生变化时
-必须显式报告冲突，不能自动覆盖 native。
+多文件导入不宣称文件系统级“整体原子 rename”，而使用明确的 commit protocol：
+
+1. 持有 session 排他 lease；
+2. 在目标目录使用唯一、`create_new` 的同级 staging 文件，不复用固定 `<path>.tmp`；
+3. 全部内容完成 serde、大小、schema、pairing 和 regular-file 校验后才分别 rename 到最终路径；
+4. 最后写 meta `owner=native`，该步骤是 reader 可见的 commit point；
+5. 失败时保留原文件、清理本事务 staging；崩溃残留由下次持有 lease 的恢复流程识别和清理；
+6. 在平台支持时对文件和父目录执行必要的 flush/sync，不把单纯 rename 误称为掉电耐久。
+
+导入成功后不删除、不修改 legacy 文件。重复执行相同 legacy 内容必须幂等；legacy 后来变化时
+返回可观察诊断，但 native 仍是权威源，不得自动回写或覆盖。
 
 ## 7. 安全与数据完整性
 
 session 文件是外部输入，不能因为位于本地磁盘就默认可信：
 
 - session id 必须限制为安全文件名/合法 UUID 兼容形式，拒绝路径分隔符和 `..`；
-- 限制单文件大小、message 数量、单条文本、tool args/result 和 base64 image 大小；
+- 限制 meta、snapshot 和 JSONL 单文件大小，并限制 JSONL 行长/行数、message 数量、单条文本、
+  tool args/result 和 base64 image 大小；读取不得先无界加载到内存再校验；
 - schema version 超出支持范围时 fail-closed；
 - working directory 必须按现有跨平台规则规范化，不能改变历史 bucket；
 - importer 不执行 session 中的命令、模板或路径内容；
-- 临时文件必须位于目标文件同级，commit 前完成 serde 和 pairing 校验；
+- 读取和导入只接受预期根目录内的 regular file，拒绝 symlink、设备和越出根目录的路径；
+- 临时文件必须位于目标文件同级，使用唯一名与 `create_new`，commit 前完成 serde、
+  大小和 pairing 校验；不得通过可预测 `.tmp` 路径跟随 symlink；
 - 写入权限必须至少维持当前平台安全语义；是否统一收紧为 user-only 权限需单独评估，不能在迁移中静默改变；
 - 显式删除 session 时必须清理所有 native sidecar 和对应 legacy JSON，避免 raw transcript 泄漏；
 - 任何失败都保留原文件，并返回可观察错误，禁止跳过后显示“恢复成功”。
@@ -207,10 +260,12 @@ S0 不提交预期失败的测试，也不为尚不存在的 importer、安全�
 
 - production 中 `display_messages` 的写入点位于 daemon append API，当前只产生带 `after_message`
   锚点的 user/assistant 纯文本；现有 TUI/daemon replay 也只消费该锚点与 `MessageInfo` 投影。因此
-  presentation v1 的最小数据是 `version + (after_message, role, text)`，不先支持图片或工具结构；
+  presentation v1 只需纯文本角色与锚点，但 legacy `after_message` 是可变数组下标，不能直接成为
+  native 持久化合约；目标使用 `AtStart/AfterTurn(turn_id)`，不先支持图片或工具结构；
 - TUI 与 daemon 都可通过独立 `SessionManager` 保存同一个 core JSON，native meta/snapshot 也没有跨进程
-  revision 或 lock。原子 rename 能避免半文件，但不能避免 rename 与 turn-complete 的 read-modify-write
-  丢失更新；S1 必须实现 revision/lock，除非届时能用调用链证明同 session 单 writer；
+  统一所有权。原子 rename 能避免半文件，但不能避免 rename 与 turn-complete 的
+  read-modify-write 丢失更新；S1b 已使用 meta lock 解决该局部冲突，S1e 仍需解决同 session
+  多 runtime 的 snapshot 和删除所有权；
 - macOS v4.16 前目录迁移依赖平台目录和真实文件布局，非 macOS CI 无法用当前 API 做隔离测试。S0 只记录
   现有路径与行为；在修改该路径前必须增加可注入目录 seam 或在 macOS runner 上补 characterization test，
   不得把未自动化验证写成已覆盖。
@@ -223,14 +278,16 @@ S0 不提交预期失败的测试，也不为尚不存在的 importer、安全�
 
 实施：
 
-- additive 扩展 native meta：AI naming、完整 turn/context restore 字段、import marker；
+- additive 扩展 native meta：AI naming 和完整 turn/context restore 字段；存储所有权与
+  `import_info` 随 S2 状态机一起引入，不在没有切换语义时预留死字段；
 - 增加 versioned presentation sidecar；
 - 增加安全的 session id、大小和 schema 校验；
 - 增加 catalog 的跨项目查找和 logical delete；
 - native meta 的 read-modify-write 使用每 session advisory lock；runtime snapshot 和删除生命周期仍需
   通过单 writer 所有权或显式冲突语义解决。
 
-删除项：无。仅达到状态①，交付必须写“legacy writer 尚未退役”。
+删除项：无。S1 新增的单项能力只达到“逻辑已实现”，整体仍为状态③；交付必须写
+“legacy writer 尚未退役”，不把局部能力和整体迁移状态混用。
 
 #### S1a：Native meta additive parity（已完成）
 
@@ -241,7 +298,7 @@ S0 不提交预期失败的测试，也不为尚不存在的 importer、安全�
 - `SnapshotHook` 记录最终模型请求的 `prompt + completion` 为 `total_tokens`，并分别保留最终请求的
   `used_tokens`（上下文占用）与 `ctx_window`（上下文窗口），不再混用 token 语义；
 - additive 字段全部有 serde default，旧 v1 meta 可向后兼容，因此 `META_VERSION` 继续为 1；
-- 未引入 presentation sidecar、import marker、消费者切换或并发控制。
+- 未引入 presentation sidecar、存储所有权/`import_info`、消费者切换或并发控制。
 
 实际删除项：无。整体仍处于状态③，core JSON writer、native/core 双路径及 legacy 转换仍可达。
 
@@ -258,52 +315,250 @@ S0 不提交预期失败的测试，也不为尚不存在的 importer、安全�
 边界：该锁不合并两个并发 runtime snapshot，不保护 core JSON，也不阻止已删除 session 被仍在运行的
 writer 再次创建。实际删除项仍为无，整体仍处于状态③。
 
-### S2：单一 importer
+#### S1c：Native store 外部输入边界（已完成）
 
-目标：legacy → native 只有一个转换实现。
+目标：在 importer 读取历史文件前，先让 native store 对路径、大小和 schema 失败可控。
 
 实施：
 
-- 实现上述导入状态机和原子 commit；
-- TUI、daemon 共用 importer；
-- legacy-only session 首次访问后可以从 native resume；
-- native 已存在时只补缺失 metadata/presentation，不覆盖 snapshot；
-- 导入错误原样传播到 UI/API。
+- 先用失败测试固定非法 session id，至少覆盖空值、`.`、`..`、路径分隔符和绝对路径；
+- 允许安全的历史非 UUID id，不为了理想 schema 让旧 session 消失；
+- 定义 `SessionStoreError`，至少区分 `InvalidId/NotFound/TooLarge/FutureSchema/Corrupt/Io`；
+- meta、snapshot、JSONL 使用有界读取，JSONL 按流处理并限制行长、行数与总量；
+- 实现前先盘点 fixture 与正常生产上限，为 meta/snapshot/JSONL、JSONL 行长/行数、message、text、
+  tool args/result 和 image 定义命名常量及选择依据；测试固定上限值与上限 + 1；
+- future version、截断/损坏文件和超限输入由单文件 reader/recall 返回 typed error；
+- 路径构造收口到经校验的 manager API，拒绝 symlink/非普通文件，写入也在落盘前拒绝明确超限数据。
 
-预计删除：TUI/daemon 重复的 core → kernel import helper；仍服务 live mirror 的 kernel → core 转换暂留。
-状态仍为③。
+S1c 不改 `list/latest` 的批量扫描合约；“有效条目 + 诊断”由 S1f 一次定义，避免一个损坏文件
+拖垮整个 picker。不引入 presentation、存储所有权或消费者切换。删除项：无；整体仍为状态③。
+
+完成情况：
+
+- `SessionStoreError` 已区分 `InvalidId/NotFound/TooLarge/FutureSchema/Corrupt/Io`，并额外区分
+  `UnsafeFile`；coding 兼容入口只在现有 `io::Result` 边界转换，不把 typed error 静默降级；
+- 所有公开的按 id 路径构造 API 都先校验 id：拒绝空值、`.`、`..`、绝对路径、路径分隔符、
+  控制/跨平台保留字符和设备名，同时保留安全的历史非 UUID id；
+- meta 上限 4 MiB、snapshot 上限 64 MiB、单项目 recall JSONL 总量 512 MiB、单行 16 MiB、
+  行数 1,000,000；另限制 snapshot message 数、meta turn stat 数、持久化字符串和 base64 image；
+  这些是高于正常上下文载荷的防御上限，不是产品配额；
+- meta/snapshot 先检查 regular-file 和文件大小，再有界读取；JSONL 使用流式逐行读取，限制单行、
+  单文件和 recall 聚合总量，损坏/future record 由 recall 返回显式错误，不再跳过后假成功；
+- snapshot future schema 已下沉到 store reader；meta 文件名 id 与内容 id 必须一致，meta mutation
+  不得修改 session id；`list/latest` 仍维持 `Vec/Option` 合约，只在内部跳过无效条目；
+- 写入在序列化和结构校验后才落盘；临时文件改为同级唯一名 + `create_new`，读取、append 和 lock
+  在 Unix 使用 no-follow 打开并在打开后复核 regular-file，避免固定 `.tmp` 或 symlink 跟随；
+- 已覆盖非法/安全历史 id、future snapshot/record、损坏 record、超限、边界/边界 + 1、symlink
+  和固定 `.tmp` symlink 回归测试。
+
+实际删除项：无。没有引入 presentation、owner/importer 或 consumer 切换，legacy writer 仍可达，
+整体仍处于状态③。
+
+#### S1d：Presentation store 与稳定 replay 锚点（已完成）
+
+目标：用最小的 native sidecar 表达已证明存在的 UI-only replay 数据，并停止把可变消息下标
+当作 presentation/turn stat 的长期锚点。
+
+实施：
+
+- 定义 versioned `<id>.ui.json`，v1 只包含 `DisplayAnchor + role + text`，anchor 仅支持
+  `AtStart/AfterTurn(turn_id)`；
+- native `TurnStat` 增加稳定 `turn_id` 锚点；旧 meta 的 `after_message` 只作兼容输入，新 writer/reader
+  不再把可变数组下标当长期标识；
+- manager 提供有界读写、append、按稳定 turn anchor 裁剪和 delete；
+- 测试 undo/compaction 后锚点要么仍指向存活 turn、要么被明确裁剪，并证明 presentation
+  不会进入 provider context；
+- 本切片只实现 schema/store/测试，不切生产 writer 或 reader，也不删除 core `display_messages`；
+  importer 和生产纵向切换分别由 S2、S4b 完成。
+
+完成情况：
+
+- 新增独立、版本化的 `<id>.ui.json`，DTO 只包含 `DisplayAnchor + role + text`，不引用 kernel
+  `Message`；v1 anchor 仅允许 `AtStart` 和非零 `AfterTurn(turn_id)`，因此 display-only 数据不会
+  混入 runtime snapshot 或 provider context；
+- presentation reader/writer 复用 S1c 的 id、regular-file、symlink、大小和原子写安全边界，限制
+  文件、entry 数和单条文本大小；manager 提供 read/write/append、按存活 `turn_id` 裁剪和 delete；
+- 新增确定性的 legacy position 转换：`after_message=0` 映射 `AtStart`，其余位置映射到第一个覆盖
+  该位置的 completed turn；缺失、越界、重复或非单调 turn map 返回 typed `Corrupt`，不猜测锚点；
+- native `TurnStat` additive 增加 `turn_id`，旧 meta 缺省为 `0` 并继续保留 `after_message` 作为未转换
+  标记；`SnapshotHook` 对真实回合写入 kernel-minted `turn_id`，普通 snapshot 缩短只按位置裁剪旧统计，
+  native 统计由显式 surviving-turn 集合裁剪；
+- 测试覆盖 schema wire shape、旧位置转换、future/超限输入、stable prune、旧 meta 兼容、snapshot
+  缩短不误删 native stat、presentation 写入不改变 runtime snapshot，以及 delete 幂等清理 sidecar。
+
+实际删除项：无。生产 UI writer/reader、legacy importer、owner/lease 均未接入，core
+`display_messages` 和 legacy writer 仍可达；整体仍处于状态③。
+
+#### S1e：Active session 单 writer 所有权（已完成）
+
+目标：先在 native `CodingRuntime` 边界建立 active session 单 writer 原语，为后续所有权切换提供
+可转移的排他 guard；生产逻辑 session 的全局单 writer 要等 legacy writer 进入 S2c owner gate、
+并在 S4b cutover 时使用同一 lease 才成立。
+
+实施：
+
+- manager 提供跨进程 advisory lease，获取使用非阻塞 `try_lock`，冲突立即返回 `SessionInUse`；
+  coding `SessionBinding/CodingRuntime` 持有 RAII `SessionLease`；
+- fresh/resume 获取，session switch/shutdown/drop 释放；进程崩溃由 OS 释放 lock，不用 TTL 猜测；
+- 不尝试合并两份并发 runtime snapshot；
+- 同一 native session id 的重入、native manager 运行中 delete 和后台 runtime 冲突返回显式
+  “session in use”错误；
+- 覆盖所有使用同一持久 session id 创建 `CodingRuntime` 的 CLI/TUI/daemon deferred、
+  headless/background 路径；clix/ACP 作为已走 native 路径的回归消费者。
+
+完成情况：
+
+- native manager 新增持久 `<id>.lease` advisory lock 和 cloneable RAII `SessionLease`；获取使用
+  `try_lock_exclusive`，不等待，冲突返回 typed `SessionInUse`/`WouldBlock`；lock file 使用 S1c 的
+  id、regular-file 和 no-follow 安全边界，普通释放和进程退出均由 OS 关闭文件描述符解锁，不使用 TTL；
+- `SessionBinding` 持有 lease，fresh、resume 和 `ExternalSnapshot` 都在读取/使用 session 前获取；
+  `prepare/assemble` 直接调用路径也不能绕过 lease；
+- 同 session capability reload/reprepare 复用同一 lease clone；切换到其他 session 时先获取目标
+  lease，preflight/assemble 成功后才释放旧 lease，冲突或构建失败保留旧 runtime 和旧 lease；
+- runtime startup/reprepare 分别暴露 typed `RuntimeStartError::SessionInUse` 和
+  `RuntimeError::SessionInUse`；shutdown 在发布 terminal 前释放 lease，startup failure 和 runtime drop
+  也会释放，调用者可立即启动替代 runtime；
+- native manager delete 在删除数据前尝试获取相同 lease，因此不会删除正由 `CodingRuntime` 持有的
+  native session；持久 lease 文件不 unlink，避免旧 inode 和新 inode 同时被锁；S1f 再定义覆盖
+  native + legacy 数据的 logical delete；
+- 已覆盖第二 owner、最后 clone 才释放、symlink lock、运行中 delete、direct prepare、startup failure、
+  runtime drop、同 session reload、跨 session 冲突回滚/lease 转移，以及 daemon deferred runtime
+  将冲突投影为 TUI 可消费的显式 Failed 状态。使用相同持久 session id 的 CLI、TUI、daemon deferred、
+  headless/background、clix 和 ACP `CodingRuntime` 创建路径自动继承该约束。
+
+实际删除项：无。meta lock 继续只解决短临界区 RMW，active lease 解决 runtime 生命周期所有权；
+生产 catalog、legacy core JSON writer/delete 和 live mirror 尚未切换或删除，整体仍处于状态③。
+特别是 daemon `/chat` 目前仍以随机 native id 启动单回合 runtime、再以另一个 core session id 持久化，
+不能把本阶段结果解释为生产逻辑 session 已全局单 writer；直接把它改成 `ExternalSnapshot` 会提前制造
+native 权威文件，必须由 S2c writer gate 和 S4b 单提交点 cutover 一起解决。
+
+#### S1f：Catalog 原语与完整删除
+
+目标：在切消费者前，native manager 先具备 core catalog 的必要语义，delete 强制依赖 S1e lease。
+
+实施：
+
+- 按完整 id/安全前缀跨 project bucket 查找，多匹配返回歧义错误；
+- 定义 `CatalogScan { entries, diagnostics }`，每个 entry 至少包含 id、project bucket、working directory
+  和可区分的 unconfirmed/legacy/native 来源状态；list/latest/search 不将损坏或 future meta 伪装成“不存在”，
+  也不因单个损坏文件丢掉其他有效 session；
+- logical delete 必须接收有效 `SessionLease`，覆盖 snapshot/meta/jsonl/ui 和对应 legacy JSON；
+- 持久 `.meta.lock`/lease lock 不得在普通 delete 中 unlink，避免旧 inode 与新 inode 同时被锁；
+- 保持历史 project hash 字节级兼容，并为 macOS 旧目录发现预留可测试 seam。
+
+删除项：无；此阶段不先切某一个 driver。
+
+### S2：单一 importer
+
+目标：legacy → native 只有一个转换和导入状态机。
+
+#### S2a：收口解析与转换
+
+- 在 daemon 接入兼容模块定义单一 legacy DTO → kernel snapshot/native meta/presentation DTO 转换；
+- 用 S0 fixture 固定文本、图片、tool pairing、reasoning、cold summary 和旧字段缺省；
+- CLI/TUI/daemon 共用该转换，删除 TUI 重复的 core → kernel importer helper。
+
+#### S2b：事务导入与所有权 commit
+
+- 实现第 6 节状态机和 staging/commit/recovery protocol，不宣称多文件整体原子；
+- 在此切片引入 `owner` 与 `import_info`，meta `owner=native` 最后写入作为 commit point；
+- 只有已经不使用 core session writer 的 native-only driver 才为 fresh session 创建 `owner=native`；
+  兼容 driver 在 S4 cutover 前仍为 `owner=legacy`；历史 owner 未确认的 session 必须在 lease 下判定；
+- 覆盖 legacy-only、native-only、双格式、partial native、重复导入、staging 崩溃残留和 legacy 后改动；
+- 有效 native snapshot 永不被 legacy 覆盖，失败原样传播到 UI/API。
+
+#### S2c：Writer gate 与 owner-aware facade
+
+- 在任何生产入口允许 commit `owner=native` 前，让 CLI/TUI/daemon/background/live 的所有
+  session 写入经过同一 owner-aware facade；
+- `owner=legacy` 时只允许兼容模块写 core JSON；`owner=native` 时路由到已实现的 native 操作，
+  不存在 native 实现的操作必须阻止 cutover，不能在切换后才向用户报功能不可用；
+- owner gate 不能是各 driver 复制的 `if`；运行中旧 writer 未持有 lease 时也不得绕过；
+- S2 只交付 importer/facade/gate 机制和测试，不对兼容 driver 的生产 session 执行 `owner=native`
+  提交；真正 cutover 在 S4b 按 session 纵向完成；
+- 失败测试固定：人工构造 `owner=native` 后直接调用旧 core turn-complete、rename、
+  append UI-only、background save 均被拒绝且不改变 legacy JSON；成功路由到 native 由 S4a/S4b 测试。
+
+#### S2d：Legacy 发现
+
+- catalog 同时枚举 native meta 和经校验的 legacy candidate，不让 legacy-only session 在切换后消失；
+- 明确只读列表/查看不触发导入；恢复或写操作只能通过 S4b cutover 进入 importer，
+  不用 mtime 猜测权威源；
+- 保留 macOS 旧目录发现行为，修改前增加可注入目录 seam 或 macOS runner 测试。
+
+预计删除：重复的 core → kernel import helper；服务 live mirror 的 kernel → core 转换暂留。状态仍为③。
 
 ### S3：Catalog 与用户操作切换
 
-目标：所有 session 列表和管理操作以 native catalog 为准。
+目标：按“一类操作的全部消费者”纵向切换，避免一次提交同时改完所有用户操作。
 
-实施顺序：
+#### S3a：只读 catalog
 
-1. CLI/TUI/daemon list/latest/find-any；
-2. rename 和 AI naming；
-3. delete；
-4. picker/API metadata 与 context restore。
+- CLI `--continue`、TUI picker/resume lookup、daemon list/search/resolve 同时切换到 native catalog；
+- legacy-only 条目通过 S2d 只读发现，列表不触发导入或所有权切换；损坏或歧义显式展示错误；
+- 删除这类操作的 core list/load_any 和重复扫描调用点。
 
-每一步同时切所有实际消费者，不能让 TUI 和 daemon 展示不同 session 集合。
+#### S3b：Rename 与 AI naming
 
-预计删除：core `SessionMeta` 的生产消费者、core list/load_any/rename/delete 调用点及相应重复扫描逻辑。
+- 所有入口改用 owner-aware facade；`owner=native` 写 native meta，`owner=legacy` 暂由单一兼容模块
+  写 core JSON，保持 `user_renamed` 优先级；
+- 删除各 driver 直接调用 core rename/AI naming 的路径；兼容模块的 legacy writer 到 S4d/S5 再删除。
+
+#### S3c：Delete
+
+- 所有入口改用 owner-aware facade，在 active lease 下执行删除，运行中 session 显式拒绝；
+- `owner=native` 清理 snapshot/meta/jsonl/ui 和对应 legacy；`owner=legacy` 清理 legacy 及非权威 native staging；
+  重复删除幂等；
+- 删除各 driver 直接调用 core delete 或自行删文件的路径。
+
+picker/API metadata 和 context restore 随其所属的上述操作切片切换，不另留一个长期双源步骤。
 core JSON writer 仍在时，状态仍为③。
 
-### S4：Resume、undo 与持久化切换
+### S4：Runtime 与持久化切换
 
-目标：runtime 和 UI 不再通过 core snapshot 往返。
+目标：runtime 和 UI 不再通过 core snapshot 往返，最终停止 core JSON writer。
 
-实施：
+#### S4a：Native 操作纵向就绪
 
-- fresh/resume/session switch 直接使用 native `SessionSnapshot`；
-- undo/compact/terminal 直接更新 native snapshot、meta 和 presentation；
-- UI replay 从 native snapshot + presentation + turn stats 投影；
-- 停止 core JSON live mirror 和双写；
-- 停止 kernel snapshot → core snapshot → kernel snapshot 往返；
-- shutdown、cancel、provider reload 和 session switch 保持 terminal/persistence 语义。
+此切片先完成 `owner=native` 所需的全部操作，但不对兼容 driver 的生产 session 提交所有权：
 
-预计删除：live core JSON save 路径、kernel → core 持久化转换、`ExternalSnapshot` 中仅为 core 迁移服务的调用点
-（variant 是否保留由其他真实消费者决定）。此时 core JSON write surface 才达到状态④；legacy read importer 仍保留。
+- UI-only append 切片同时实现 native sidecar writer 和 TUI/web/API/background reader，不先删 writer、
+  后切 reader；
+- undo 切片同时更新 native snapshot/meta/presentation 并切所有调用者；
+- compact/checkpoint 切片同时更新 native snapshot/meta/presentation，校验 stable turn anchor、
+  cache epoch 和 turn/request counter；
+- owner-aware facade 对 `owner=native` 的 list/rename/delete/UI/replay/undo/compact 全部有可用实现；
+- 任何一项缺失都必须阻止 S4b cutover，不允许用功能降级作为中间态。
+
+#### S4b：按 session 单提交点切换所有权与 resume
+
+- 非活跃 session 先获取排他 lease；当前进程已持有该 session lease 时，先停止接收新回合、
+  完成可确认 terminal checkpoint，再复用/转移同一 guard；其他进程持有时返回 `SessionInUse`，
+  不等待或抢锁；
+- 对 legacy/unconfirmed session 执行 S2 importer，验证 S4a 的所有 native 操作已就绪；
+- 最后 commit `owner=native`，紧接着用 native `SessionMode::Resume` 启动 runtime；所有步骤共享
+  同一 lease，并将 guard 移交给 coding `SessionBinding/CodingRuntime` 继续持有，不暴露
+  “已导入但 core 仍可写”窗口；
+- fresh/session switch 也按相同 owner 规则执行；已切换 driver 的 fresh session 直接为 native；
+- S4b 启用后，对 `owner=legacy` 的 rename/AI naming/UI append 等写操作先 cutover 再执行 native 操作；
+  显式 delete 可在 lease 下直接清理 legacy 而不导入；只读列表/查看仍不触发 cutover；
+- 验证 cwd、session id、provider/model、approval、gateway affinity 和 provider reload/deactivate 语义；
+- CLI/TUI/daemon 中仅为 core session 迁移服务的 `ExternalSnapshot` 调用点在各自切换后删除。
+
+#### S4c：Native lifecycle 持久化
+
+- turn terminal、cancel、中途失败、session switch、shutdown 只更新 native snapshot、meta 和 presentation；
+- 不丢失最后已确认 checkpoint，不因 provider reload/deactivate 重建错误 session id、cwd 或 lease；
+- 删除已切换 session 的 kernel snapshot → core snapshot 持久化往返。
+
+#### S4d：停止 live mirror
+
+- CLI/TUI/daemon/background/live 停止 kernel snapshot → core snapshot 保存和 core JSON 双写；
+- 验证 shutdown、cancel、provider reload/deactivate、session switch 和 terminal 持久化；
+- 删除 kernel → core 持久化转换及实时 mirror 调用点。
+
+S4d 完成时只能声明“core JSON writer 子接口面已退役”；legacy read importer 仍保留，
+整体 session/conversation legacy 接口面仍是状态③，直到 S5 完成才能声明整体达到状态④。
 
 ### S5：Core session surface 退役
 
@@ -311,17 +566,20 @@ core JSON writer 仍在时，状态仍为③。
 
 实施：
 
-- 将 importer 使用的 legacy DTO 收窄为兼容专用类型；
-- 删除 core `SessionManager` 和 live session writer；
-- 删除 TUI/daemon 双向 runtime conversion；
-- 删除 CLI/TUI/daemon 对 core session/conversation 的直接依赖；
-- 保留只读 importer 及真实 legacy fixtures，直到产品明确停止支持旧格式。
+- 将 importer 使用的 legacy DTO 收窄到 daemon 兼容模块，使 importer 不再需要 core runtime/session 类型；
+- 按全仓调用点复核删除 core `SessionManager`、session/conversation 持久化类型和 live writer；
+- 删除 TUI/daemon 剩余双向 runtime conversion；
+- 删除 CLI/TUI/daemon 对 **core session/conversation** 的直接依赖。除非其他 core 功能也已退役，
+  不得将此误报为这些 crate 对整个 `atomcode-core` 依赖已删除；
+- `ExternalSnapshot` 仅在无其他真实消费者时删除；
+- 保留只读 importer 及 legacy fixtures，直到产品明确停止支持旧格式。
 
 最终报告必须分别声明：
 
 - core session **写接口面已退役**；
 - live runtime 双模型 **已退役**；
-- legacy JSON **仍可由 importer 读取，格式本身尚未删除**。
+- legacy JSON **仍可由 importer 读取，格式本身尚未删除**；
+- 只有上述删除项全部通过调用点搜索与验证后，整体 session/conversation legacy 接口面才达到状态④。
 
 ## 9. 验证矩阵
 
@@ -330,16 +588,18 @@ core JSON writer 仍在时，状态仍为③。
 | 范围 | 必测场景 |
 |---|---|
 | schema | 旧字段缺省、future version、未知字段、损坏/截断文件 |
-| import | legacy-only、native-only、双格式、partial native、重复导入、legacy 后改动冲突 |
+| import | legacy-only、native-only、双格式、partial native、重复导入、staging 崩溃残留、legacy 后改动诊断 |
 | messages | text、multipart image、tool call/result、失败 result、ToolResultRef、reasoning/signature、synthetic/internal origin |
 | snapshot | cache epoch、turn/request counter、compaction 后 resume、dangling tool pairing 修复 |
-| metadata | rename、user_renamed、ai_named、cwd、秒→毫秒、turn stats、used/context window |
-| presentation | display event 锚点、undo/compaction 后裁剪、不会进入 provider context |
-| lifecycle | fresh、resume、session switch、cd、provider reload、cancel、shutdown、中途失败 |
+| metadata | rename、user_renamed、ai_named、cwd、秒→毫秒、turn stats 稳定 turn anchor、used/context window |
+| presentation | legacy position 映射、stable turn anchor、undo/compaction 后裁剪、不会进入 provider context |
+| ownership | unconfirmed/legacy/native、cutover commit point、owner 后改动、旧 core writer 被拒绝、列表不触发 cutover |
+| lifecycle | fresh、resume、session switch、cd、provider reload/deactivate、cancel、shutdown、中途失败 |
 | catalog | list/latest/find-any、跨 bucket、Windows path hash、macOS 旧目录 |
 | delete | snapshot/meta/jsonl/presentation/legacy JSON 全部清理，重复删除幂等 |
-| concurrency | rename 与 turn complete 并发、daemon/TUI 同 session、revision 冲突 |
-| driver parity | CLI、TUI、daemon、headless、background 使用同一 session 集合和错误语义 |
+| concurrency | rename 与 turn complete 并发、daemon/TUI 同 session、active lease 冲突、运行中 delete、崩溃后 OS 释放 lease |
+| filesystem | 路径穿越、symlink/非普通文件、唯一 `create_new` staging、大小/行数边界、父目录同级 commit |
+| driver parity | CLI、TUI、daemon、headless、background 使用同一 session 集合和错误语义；clix、ACP native 路径不回退 |
 
 验证强度：
 
@@ -349,14 +609,22 @@ core JSON writer 仍在时，状态仍为③。
 - 最终使用真实 session 目录副本做人工 smoke，不在真实用户目录上直接试迁移；
 - 不伪造“导入成功”，任何未覆盖的 legacy 字段或并发语义必须在交付中明确。
 
+最终退役门槛不是某个新 API 可用，而是同时满足：
+
+- 上述 driver 矩阵全部通过；
+- 全仓搜索证明 core session writer、live mirror、双向转换和旧调用点已删除；
+- 导入、损坏数据、future schema、并发和跨平台路径均有显式结果；
+- 使用真实目录副本完成 smoke，并记录可回退方式；
+- 未修改版本号或发布配置，除非另有明确任务。
+
 ## 10. S0 出口决策
 
 | 问题 | S0 结论 |
 |---|---|
-| display message 最小 schema | `version + (after_message, role, text)`；当前 production writer 只产生 user/assistant 纯文本 |
+| display message 最小 schema | 当前 legacy 形状是 `after_message + role + text`；目标 v1 为 `version + DisplayAnchor + role + text`，anchor 仅为 `AtStart/AfterTurn(turn_id)` |
 | native meta 补齐字段 | additive 增加 `ai_named`；turn stat 增加 `round_count/used_tokens/ctx_window`，保留现有 `tool_call_count/duration_ms/total_tokens/errored`；顶层 `turn_count` 语义不变 |
 | 同 session 并发写 | 可能；S1b 已用每 session advisory lock 解决 native meta rename/turn-complete 丢更新，但 core JSON、snapshot 与删除生命周期仍需单 writer 所有权或冲突语义 |
-| legacy/native 冲突 | 有效 native snapshot 永不被 legacy 覆盖；只允许补缺失 metadata/presentation，且写 import marker |
+| legacy/native 冲突 | 有效 native snapshot 永不被 legacy 覆盖；只允许补缺失 metadata/presentation，最后提交 `owner=native` 并按需写 `import_info` |
 | session id 兼容 | 新建值继续使用 UUID；legacy 当前接受任意字符串，S1 校验必须允许安全文件名形式的历史非 UUID id，同时拒绝分隔符、`.`、`..` 和空值 |
 | fixture 下界 | `legacy_minimal.json` 省略所有现有 serde additive 字段，覆盖当前代码能推导出的最老可读结构；没有使用真实用户数据 |
 | 首个生产切换单元 | S3 先整体切 `list/latest/find-any`，不是只切一个 driver；CLI/TUI/daemon 同步切换并删除 core catalog 读调用点，避免会话集合分裂 |
@@ -364,6 +632,7 @@ core JSON writer 仍在时，状态仍为③。
 S1 按行为切片先写失败测试，再实现 native schema parity。S0 的 characterization tests 保持绿色，
 不把未来行为提前写成永久失败测试。
 
-唯一下一步：执行 S1c，先收紧 native store 的外部输入边界：为 session id 路径穿越、meta/snapshot
-文件大小上限和 future schema 写失败测试，再实现最小校验。暂不引入 presentation sidecar、importer
-或消费者切换；这些边界稳定后再让 importer 接触历史文件。
+唯一下一步：执行 S1f。先用失败测试固定跨 project 完整 id/安全前缀查找、歧义结果、
+`CatalogScan { entries, diagnostics }` 对损坏/future 条目的显式诊断，以及 logical delete 必须携带有效
+lease 并同时覆盖 snapshot/meta/jsonl/ui/对应 legacy JSON；再实现最小 catalog 原语。暂不切任何单一
+driver，不引入 importer，也不删除 core `display_messages`。

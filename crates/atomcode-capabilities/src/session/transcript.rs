@@ -8,8 +8,6 @@
 //! to the turn's calls BY `tool_call_id` from the live conversation at flush time.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -18,7 +16,7 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
 use serde::{Deserialize, Serialize};
 
-use super::{now_ms, SessionManager};
+use super::{now_ms, SessionManager, SessionResult};
 
 pub const RECORD_VERSION: u32 = 1;
 
@@ -103,7 +101,11 @@ pub struct TranscriptHook {
 
 impl TranscriptHook {
     pub fn new(mgr: Arc<SessionManager>, session_id: impl Into<String>) -> Self {
-        Self { mgr, session_id: session_id.into(), buf: Mutex::new(None) }
+        Self {
+            mgr,
+            session_id: session_id.into(),
+            buf: Mutex::new(None),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<TurnBuffer>> {
@@ -139,7 +141,12 @@ impl TranscriptHook {
                     .get(t.id.as_str())
                     .map(|(r, e)| (r.to_string(), *e))
                     .unwrap_or_default();
-                ToolRecord { name: t.name.clone(), args: t.args.clone(), result, is_error }
+                ToolRecord {
+                    name: t.name.clone(),
+                    args: t.args.clone(),
+                    result,
+                    is_error,
+                }
             })
             .collect();
 
@@ -163,16 +170,14 @@ impl TranscriptHook {
         let _ = self.append(&record);
     }
 
-    fn append(&self, record: &TurnRecord) -> io::Result<()> {
-        let path = self.mgr.jsonl_path(&self.session_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut line = serde_json::to_vec(record)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fn append(&self, record: &TurnRecord) -> SessionResult<()> {
+        let mut line =
+            serde_json::to_vec(record).map_err(|e| super::SessionStoreError::Corrupt {
+                kind: "transcript record",
+                message: e.to_string(),
+            })?;
         line.push(b'\n');
-        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        f.write_all(&line)
+        self.mgr.append_jsonl_line(&self.session_id, &line)
     }
 }
 
@@ -181,7 +186,10 @@ impl LifecycleHooks for TranscriptHook {
     /// Start a fresh turn buffer, recording the (post-hook) user text.
     async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
         let mut g = self.lock();
-        *g = Some(TurnBuffer { user: text.clone(), ..TurnBuffer::default() });
+        *g = Some(TurnBuffer {
+            user: text.clone(),
+            ..TurnBuffer::default()
+        });
         Ok(())
     }
 
@@ -244,16 +252,25 @@ mod tests {
         let mut m = Message::assistant(text, calls);
         m.meta = Some(MessageMeta {
             turn_id,
-            tokens: TokenUsage { prompt: 100, completion: 20, cached: 0 },
+            tokens: TokenUsage {
+                prompt: 100,
+                completion: 20,
+                cached: 0,
+            },
             ..Default::default()
         });
         m
     }
 
     fn read_lines(h: &TranscriptHook) -> Vec<TurnRecord> {
-        let path = h.mgr.jsonl_path(&h.session_id);
-        let Ok(content) = std::fs::read_to_string(path) else { return vec![] };
-        content.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        let path = h.mgr.jsonl_path(&h.session_id).unwrap();
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return vec![];
+        };
+        content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     #[tokio::test]
@@ -262,7 +279,11 @@ mod tests {
         let mut text = "list the files".to_string();
         h.user_prompt_submit(&mut text).await.unwrap();
 
-        let call = ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() };
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        };
         let mut resp = assistant("running ls", vec![call], 7);
         h.on_model_response(&mut resp).await;
 
@@ -272,7 +293,8 @@ mod tests {
         convo.push(resp.clone());
         convo.push(Message::tool_result("c1", "a.txt\nb.txt", false));
 
-        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default())
+            .await;
 
         let recs = read_lines(&h);
         assert_eq!(recs.len(), 1);
@@ -294,15 +316,21 @@ mod tests {
         let (h, _d) = hook("s1");
         let mut text = "do it".to_string();
         h.user_prompt_submit(&mut text).await.unwrap();
-        h.on_model_response(&mut assistant("first ", vec![], 1)).await;
-        h.on_model_response(&mut assistant("second", vec![], 1)).await;
+        h.on_model_response(&mut assistant("first ", vec![], 1))
+            .await;
+        h.on_model_response(&mut assistant("second", vec![], 1))
+            .await;
         let convo = Conversation::new();
-        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default()).await;
+        h.turn_complete(&convo, &StopReason::Stopped, &TurnCtx::default())
+            .await;
 
         let recs = read_lines(&h);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].assistant, "first second");
-        assert_eq!(recs[0].usage.completion, 40, "completion sums across rounds");
+        assert_eq!(
+            recs[0].usage.completion, 40,
+            "completion sums across rounds"
+        );
     }
 
     #[tokio::test]
@@ -312,8 +340,12 @@ mod tests {
         h.user_prompt_submit(&mut text).await.unwrap();
         // No on_model_response (prompt rejected / instant fail) → terminal.
         let convo = Conversation::new();
-        h.turn_complete(&convo, &StopReason::PromptRejected, &TurnCtx::default()).await;
-        assert!(read_lines(&h).is_empty(), "an empty turn must not be recorded");
+        h.turn_complete(&convo, &StopReason::PromptRejected, &TurnCtx::default())
+            .await;
+        assert!(
+            read_lines(&h).is_empty(),
+            "an empty turn must not be recorded"
+        );
     }
 
     #[tokio::test]
@@ -321,12 +353,18 @@ mod tests {
         let (h, _d) = hook("s1");
         let mut text = "go".to_string();
         h.user_prompt_submit(&mut text).await.unwrap();
-        h.on_model_response(&mut assistant("partial answer", vec![], 3)).await;
+        h.on_model_response(&mut assistant("partial answer", vec![], 3))
+            .await;
         let convo = Conversation::new();
-        h.turn_complete(&convo, &StopReason::ProviderError, &TurnCtx::default()).await;
+        h.turn_complete(&convo, &StopReason::ProviderError, &TurnCtx::default())
+            .await;
 
         let recs = read_lines(&h);
-        assert_eq!(recs.len(), 1, "an errored turn with output is still recorded");
+        assert_eq!(
+            recs.len(),
+            1,
+            "an errored turn with output is still recorded"
+        );
         assert_eq!(recs[0].assistant, "partial answer");
     }
 }

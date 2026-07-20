@@ -163,6 +163,9 @@ async fn full_assembly_lifecycle() {
     }
 
     // ================= Phase 3: resume continues the SAME session =================
+    // This phase models a new process. Dropping the previous parts releases its
+    // active-session lease before the new owner resumes the persisted session.
+    drop(parts);
     let mut parts2 = prepare(&cfg, PrepareOptions {
         session: SessionMode::Resume(session_id.clone()),
         ..opts()

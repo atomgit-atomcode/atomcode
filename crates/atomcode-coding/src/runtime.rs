@@ -6,9 +6,11 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use atomcode_capabilities::session::{SessionLease, SessionStoreError};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
@@ -25,6 +27,7 @@ use crate::controllers::{
     GoalResult, GoalState, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
     MAX_EVAL_FAILURES, MAX_UNPRODUCTIVE,
 };
+use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 use crate::{
     assemble, prepare_with_plugin_hook_source, CodingAgentConfig, CodingProviderFactory,
     PluginHookSource, PrepareOptions,
@@ -317,6 +320,7 @@ pub enum SubmitReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
     Busy,
+    SessionInUse { id: String },
     StaleRequest { id: RequestId },
     DeliveryFailed,
     Unavailable,
@@ -331,6 +335,9 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => f.write_str("coding runtime is busy"),
+            Self::SessionInUse { id } => {
+                write!(f, "session {id:?} is already in use by another runtime")
+            }
             Self::StaleRequest { id } => write!(f, "runtime request {id} is stale"),
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
@@ -457,6 +464,7 @@ pub struct RuntimeSessionInfo {
 #[derive(Debug)]
 pub enum RuntimeStartError {
     Prepare(std::io::Error),
+    SessionInUse { id: String },
     Provider(crate::ProviderBuildError),
     Assemble(std::io::Error),
 }
@@ -465,6 +473,9 @@ impl fmt::Display for RuntimeStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Prepare(error) => write!(f, "coding runtime prepare failed: {error}"),
+            Self::SessionInUse { id } => {
+                write!(f, "session {id:?} is already in use by another runtime")
+            }
             Self::Provider(error) => write!(f, "coding runtime provider failed: {error}"),
             Self::Assemble(error) => write!(f, "coding runtime assemble failed: {error}"),
         }
@@ -476,6 +487,7 @@ impl Error for RuntimeStartError {
         match self {
             Self::Prepare(error) | Self::Assemble(error) => Some(error),
             Self::Provider(error) => Some(error),
+            Self::SessionInUse { .. } => None,
         }
     }
 }
@@ -1230,7 +1242,7 @@ impl CodingRuntime {
         let mut parts =
             prepare_with_plugin_hook_source(&agent, prepare.clone(), plugin_hooks.as_ref())
                 .await
-                .map_err(RuntimeStartError::Prepare)?;
+                .map_err(runtime_start_prepare_error)?;
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
@@ -2797,10 +2809,15 @@ fn spawn_runtime_owner_with_optional_agent(
 
                         // Preflight the complete capability graph while the current agent is
                         // still alive. A prepare failure must leave the old runtime untouched.
-                        let candidate_parts = prepare_with_plugin_hook_source(
+                        let reuse_lease = matching_session_lease(
+                            &runtime.parts,
+                            &input.prepare.session,
+                        );
+                        let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
                             runtime.plugin_hooks.as_ref(),
+                            reuse_lease,
                         )
                         .await;
                         let mut candidate = match candidate_parts {
@@ -2814,14 +2831,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 loop_active: Arc::clone(&runtime.loop_active),
                             },
                             Err(error) => {
+                                let error = runtime_prepare_error(error);
                                 controls.state.store(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
                                 );
                                 resources = Some(runtime);
-                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(
-                                    error.to_string(),
-                                )));
+                                let _ = done.send(Err(error));
                                 continue;
                             }
                         };
@@ -3722,6 +3738,9 @@ fn spawn_runtime_owner_with_optional_agent(
             .await
             .forced;
         }
+        // Release the active-session lease before publishing the shutdown terminal,
+        // so a caller may safely start a replacement immediately after `shutdown`.
+        drop(resources);
         controls.terminal_tx.send_replace(Some(RuntimeExit {
             reason: exit_reason,
             forced: forced_shutdown,
@@ -3898,6 +3917,45 @@ fn resolve_reprepare_input(
                 operation: ReconfigureKind::ChangeDirectory,
             })
         }
+    }
+}
+
+fn matching_session_lease(
+    parts: &crate::CodingParts,
+    target: &crate::SessionMode,
+) -> Option<SessionLease> {
+    let target_id = match target {
+        crate::SessionMode::Resume(id) | crate::SessionMode::ExternalSnapshot { id, .. } => id,
+        crate::SessionMode::Fresh | crate::SessionMode::Disabled => return None,
+    };
+    parts
+        .session
+        .as_ref()
+        .filter(|binding| binding.id == *target_id)
+        .map(|binding| binding.lease.clone())
+}
+
+fn session_in_use_id(error: &io::Error) -> Option<String> {
+    match error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<SessionStoreError>())
+    {
+        Some(SessionStoreError::SessionInUse { id, .. }) => Some(id.clone()),
+        _ => None,
+    }
+}
+
+fn runtime_start_prepare_error(error: io::Error) -> RuntimeStartError {
+    match session_in_use_id(&error) {
+        Some(id) => RuntimeStartError::SessionInUse { id },
+        None => RuntimeStartError::Prepare(error),
+    }
+}
+
+fn runtime_prepare_error(error: io::Error) -> RuntimeError {
+    match session_in_use_id(&error) {
+        Some(id) => RuntimeError::SessionInUse { id },
+        None => RuntimeError::ReconfigureFailed(error.to_string()),
     }
 }
 
@@ -6047,6 +6105,148 @@ mod tests {
         assert!(changed.session_id.as_ref().is_some_and(|id| !id.is_empty()));
         assert_eq!(runtime.handle.status().generation, 1);
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn runtime_holds_one_session_lease_reuses_it_and_releases_on_shutdown() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "leased-runtime";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        manager
+            .save_snapshot(
+                session_id,
+                &SessionSnapshot::new(vec![Message::user("persisted")]),
+            )
+            .unwrap();
+        let start = || {
+            let mut start = native_start(false);
+            start.agent.working_dir = project.path().to_path_buf();
+            start.prepare.session = crate::SessionMode::Resume(session_id.into());
+            start
+        };
+
+        let first = CodingRuntime::start(start()).await.unwrap();
+        let second_error = match CodingRuntime::start(start()).await {
+            Ok(_) => panic!("a second runtime must not own the same session"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            second_error,
+            RuntimeStartError::SessionInUse { ref id } if id == session_id
+        ));
+
+        first.handle.reload_capabilities().await.unwrap();
+        first.handle.shutdown().await.unwrap();
+
+        let second = CodingRuntime::start(start()).await.unwrap();
+        second.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_switch_conflict_keeps_old_owner_then_transfers_both_leases() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        for id in ["session-a", "session-b"] {
+            manager
+                .save_snapshot(
+                    id,
+                    &SessionSnapshot::new(vec![Message::user(format!("snapshot {id}"))]),
+                )
+                .unwrap();
+        }
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume("session-a".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let session_b_owner = manager.acquire_lease("session-b").unwrap();
+
+        assert_eq!(
+            runtime.handle.resume_session("session-b").await,
+            Err(RuntimeError::SessionInUse {
+                id: "session-b".into()
+            })
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert!(matches!(
+            manager.acquire_lease("session-a"),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+
+        drop(session_b_owner);
+        runtime.handle.resume_session("session-b").await.unwrap();
+        manager.acquire_lease("session-a").unwrap();
+        assert!(matches!(
+            manager.acquire_lease("session-b"),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+
+        runtime.handle.shutdown().await.unwrap();
+        manager.acquire_lease("session-b").unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn startup_failure_releases_the_prepared_session_lease() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "failed-runtime";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        manager
+            .save_snapshot(
+                session_id,
+                &SessionSnapshot::new(vec![Message::user("persisted")]),
+            )
+            .unwrap();
+        let mut start = native_start(true);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(session_id.into());
+
+        assert!(matches!(
+            CodingRuntime::start(start).await,
+            Err(RuntimeStartError::Provider(_))
+        ));
+        manager.acquire_lease(session_id).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn dropping_runtime_releases_its_session_lease() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "dropped-runtime";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        manager
+            .save_snapshot(
+                session_id,
+                &SessionSnapshot::new(vec![Message::user("persisted")]),
+            )
+            .unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(session_id.into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+
+        drop(runtime);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match manager.acquire_lease(session_id) {
+                    Ok(_) => break,
+                    Err(SessionStoreError::SessionInUse { .. }) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected lease error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("runtime drop did not release the session lease");
     }
 
     #[tokio::test]
