@@ -403,11 +403,24 @@ export interface McpServerInfo {
 
 export interface McpStatusInfo {
   servers: McpServerInfo[];
+  /** Whether the current project is trusted for MCP. Absent on older daemons — treat as untrusted. */
+  trusted?: boolean;
+  /** Names of MCP servers withheld because the project is untrusted. Absent on older daemons — treat as empty. */
+  blocked?: string[];
 }
 
 export async function getMcpStatus(): Promise<McpStatusInfo> {
   const resp = await fetch('/mcp/status', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
+  return resp.json();
+}
+
+/** Trust the current project for MCP servers, then rebuild the MCP registry. */
+export async function postLiveMcpTrust(): Promise<{ ok: boolean; error?: string }> {
+  const resp = await fetch('/live/mcp/trust', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
   return resp.json();
 }
 

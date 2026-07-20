@@ -1816,6 +1816,23 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Blocked-untrusted-project notice inside the MCP popover. */
+.mcp-blocked-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  color: var(--app-warning-accent);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 4px 0;
+}
+.mcp-blocked-error {
+  font-size: 11px;
+  color: #ef4444;
+}
 
 /* Settings button at the bottom of the collapsed icon rail (inside rail-bottom). */
 .rail-btn-settings {
