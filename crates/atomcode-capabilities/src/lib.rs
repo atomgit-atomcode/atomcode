@@ -84,8 +84,9 @@ pub(crate) mod pathutil;
 
 /// Cross-platform atomic file write (tempfile → fsync → persist → parent-dir fsync).
 /// Ported from `atomcode-core`'s `fs_atomic` for the `plugin` feature (trust store).
-/// Opt-in behind `feature = "plugin"`.
-#[cfg(feature = "plugin")]
+/// Opt-in behind `feature = "plugin"` or `feature = "mcp"` (the mcp trust store
+/// uses `atomic_write` for the security-sensitive `mcp_trust.json`).
+#[cfg(any(feature = "plugin", feature = "mcp"))]
 pub mod fs;
 
 /// Plugin subsystem: loader / installer / marketplace / manifest / trust store.

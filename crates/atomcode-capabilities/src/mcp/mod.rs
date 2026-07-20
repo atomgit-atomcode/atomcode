@@ -30,6 +30,7 @@ pub mod registry;
 pub mod tool;
 pub mod transport_http;
 pub mod transport_stdio;
+pub mod trust;
 pub mod types;
 mod util;
 
