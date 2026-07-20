@@ -883,11 +883,14 @@ impl SseDecoder {
         };
         let data = data.trim();
         if data == "[DONE]" {
-            if let Some(u) = self.last_usage.take() {
-                out.push(StreamEvent::Usage(u));
-            }
-            out.push(StreamEvent::Done { truncated: self.truncated });
-            self.done = true;
+            // Same finalization as a stream EOF: flush any accumulated tool
+            // calls, then usage + Done. `finish()` does exactly this (and is a
+            // no-op if already done). Calling it here — instead of emitting
+            // only usage + Done — closes the gap where a gateway that reports
+            // ONLY `finish_reason:""` (never a real non-empty reason) and ends
+            // with `[DONE]` would otherwise drop its buffered tool call, since
+            // "" is treated as non-terminal and never triggers the flush above.
+            out.extend(self.finish());
             return;
         }
         if data.is_empty() {
@@ -990,7 +993,14 @@ impl SseDecoder {
                 }
             }
         }
-        if let Some(fr) = choice.finish_reason {
+        // Only a NON-EMPTY finish_reason is terminal. SenseNova's free
+        // `deepseek-v4-flash` sends `"finish_reason":""` (empty string, not
+        // null) on EVERY chunk — including the reasoning and tool_call-fragment
+        // chunks that precede the real `"tool_calls"`. Arming `seen_finish` on
+        // the empty string makes the `if self.seen_finish { return }` guard
+        // above discard every subsequent tool_call delta, so the whole call is
+        // dropped and the model shows "0 工具". Treat "" as non-terminal.
+        if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
                 if !id.is_empty() || !name.is_empty() || !args.is_empty() {
@@ -1605,6 +1615,65 @@ mod tests {
         assert_eq!(tc.id, "c1");
         assert_eq!(tc.name, "read");
         assert_eq!(tc.arguments, "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
+        // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
+        // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
+        // fragments — and only the real `"tool_calls"` on the final chunk
+        // (captured from the live wire 2026-07-20). Setting `seen_finish` on the
+        // empty string made the decoder discard every later tool_call delta
+        // (the `if self.seen_finish { return }` guard), so a real web_search
+        // call vanished and the model showed "0 工具".
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // reasoning chunk carrying finish_reason:"" — must NOT arm seen_finish
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"searching"},"finish_reason":""}]})).as_bytes()));
+        // tool_call fragments, each ALSO carrying finish_reason:""
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_915","function":{"name":"web_search","arguments":""}}]},"finish_reason":""}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\"bj\"}"}}]},"finish_reason":""}]})).as_bytes()));
+        // real terminal chunk
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]})).as_bytes()));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "empty-string finish_reason must not drop the tool call: {ev:?}"
+        );
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, "{\"query\":\"bj\"}");
+    }
+
+    #[test]
+    fn sse_tool_call_flushed_at_done_without_a_nonempty_finish_reason() {
+        // Defensive companion to the test above: a gateway that reports ONLY
+        // `finish_reason:""` (never a real non-empty reason) and terminates with
+        // `data: [DONE]` must still get its accumulated tool call flushed. Since
+        // "" is (correctly) non-terminal, the flush now has to happen at [DONE]
+        // — which mirrors the stream-EOF `finish()` path.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"web_search","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":""}]})).as_bytes()));
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| if let StreamEvent::ToolCall(t) = e { Some(t.clone()) } else { None })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "tool call must be flushed at [DONE] even without a non-empty finish_reason: {ev:?}"
+        );
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, "{\"q\":\"x\"}");
+        assert!(
+            ev.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "Done must still be emitted at [DONE]: {ev:?}"
+        );
     }
 
     #[test]
