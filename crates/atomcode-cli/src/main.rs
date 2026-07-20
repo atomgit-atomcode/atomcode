@@ -36,7 +36,7 @@ use atomcode_core::mcp::{
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 
-use atomcode_core::auth;
+use atomcode_auth as auth;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
     event::SessionMode,
@@ -2613,7 +2613,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             println!();
 
-            let untrusted: Vec<_> = atomcode_core::plugin::installed_plugin_hook_trust_status()
+            let untrusted: Vec<_> = atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
                 .into_iter()
                 .filter(|s| !s.trusted)
                 .collect();
@@ -3048,10 +3048,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 }
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
-/// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
+/// `atomcode_capabilities::plugin::*` API the TUI's `/plugin` slash command uses, so
 /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
-    use atomcode_core::plugin::{installer, marketplace};
+    use atomcode_capabilities::plugin::{installer, marketplace};
     match sub {
         PluginCli::Marketplace(MarketplaceCli::Add { url }) => {
             let info = marketplace::add_marketplace(&url)
@@ -3105,7 +3105,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     marketplace: mp,
                 } => {
                     let info =
-                        installer::install(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                        installer::install(&plugin, &mp, atomcode_capabilities::plugin::InstallScope::User)
                             .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                     println!("  installed `{}@{}`", info.plugin, info.marketplace);
                     installed_plugin_name = info.plugin;
@@ -3121,7 +3121,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             let info = installer::install(
                                 &resolved_plugin,
                                 &mp,
-                                atomcode_core::plugin::InstallScope::User,
+                                atomcode_capabilities::plugin::InstallScope::User,
                             )
                             .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
                             println!("  installed `{}@{}`", info.plugin, info.marketplace);
@@ -3150,7 +3150,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             // will NOT run until the user trusts them (loaded-code trust gate).
             // Filtered by `info.plugin` (the canonical plugin name returned by the
             // installer) so pre-existing untrusted plugins don't produce spurious output.
-            for s in atomcode_core::plugin::installed_plugin_hook_trust_status() {
+            for s in atomcode_capabilities::plugin::installed_plugin_hook_trust_status() {
                 if !s.trusted && s.plugin == installed_plugin_name {
                     println!(
                         "Plugin `{}` ships {} hook(s) on [{}]. They will NOT run until trusted:\n  atomcode plugin trust {}",
@@ -3166,7 +3166,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     plugin,
                     marketplace: mp,
                 } => {
-                    installer::uninstall(&plugin, &mp, atomcode_core::plugin::InstallScope::User)
+                    installer::uninstall(&plugin, &mp, atomcode_capabilities::plugin::InstallScope::User)
                         .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
                     println!("  uninstalled `{}@{}`", plugin, mp);
                 }
@@ -3177,7 +3177,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                         .filter(|p| {
                             p.plugin == plugin
                                 || p.plugin
-                                    == atomcode_core::plugin::marketplace::sanitize_name(&plugin)
+                                    == atomcode_capabilities::plugin::marketplace::sanitize_name(&plugin)
                         })
                         .collect();
                     match matches.len() {
@@ -3207,7 +3207,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             Ok(())
         }
         PluginCli::Trust { name } => {
-            let status = atomcode_core::plugin::installed_plugin_hook_trust_status();
+            let status = atomcode_capabilities::plugin::installed_plugin_hook_trust_status();
             let matches: Vec<_> = if name.contains('@') {
                 status.iter().filter(|s| s.plugin_id == name).collect()
             } else {
@@ -3216,7 +3216,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             match matches.as_slice() {
                 [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
                 [s] => {
-                    atomcode_core::plugin::hook_trust::trust(&s.plugin_id, &s.hash)?;
+                    atomcode_capabilities::plugin::hook_trust::trust(&s.plugin_id, &s.hash)?;
                     println!(
                         "Trusted {} hook(s) from `{}` [{}].",
                         s.hook_count,
@@ -3239,7 +3239,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             Ok(())
         }
         PluginCli::Untrust { name } => {
-            let status = atomcode_core::plugin::installed_plugin_hook_trust_status();
+            let status = atomcode_capabilities::plugin::installed_plugin_hook_trust_status();
             let matches: Vec<_> = if name.contains('@') {
                 status.iter().filter(|s| s.plugin_id == name).collect()
             } else {
@@ -3248,7 +3248,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             match matches.as_slice() {
                 [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
                 [s] => {
-                    atomcode_core::plugin::hook_trust::untrust(&s.plugin_id)?;
+                    atomcode_capabilities::plugin::hook_trust::untrust(&s.plugin_id)?;
                     println!("Untrusted hooks from `{name}`.");
                 }
                 many => {
@@ -3464,8 +3464,8 @@ fn run_codingplan_core(
     if report.auth_expired {
         use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
-        match atomcode_core::auth::login(telemetry)
-            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        match atomcode_auth::login(telemetry)
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
                 report = atomcode_codingplan::run(&mut config, telemetry)?;

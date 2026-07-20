@@ -316,6 +316,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "assert_cmd",
+ "atomcode-auth",
  "atomcode-capabilities",
  "atomcode-coding",
  "atomcode-codingplan",
