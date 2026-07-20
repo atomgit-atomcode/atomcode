@@ -2019,6 +2019,7 @@ async fn spawn_native_cli_runtime(
                 snapshot,
             })
             .unwrap_or(atomcode_coding::SessionMode::Fresh),
+        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs(),
         mcp: cfg.mcp,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()

@@ -27,6 +27,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: false,
         web: false,

@@ -40,6 +40,7 @@ pub use kernel_runtime::{
 };
 pub use runtime_host::{
     coding_plan_rate_limit_source, coding_provider_factory, installed_plugin_hook_source,
+    gather_plugin_skill_dirs,
 };
 pub(crate) mod live_api;
 pub use live_api::current_live_session;

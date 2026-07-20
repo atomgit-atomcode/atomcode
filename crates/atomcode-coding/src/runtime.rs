@@ -4194,6 +4194,7 @@ mod tests {
             prepare: PrepareOptions {
                 session: crate::SessionMode::Disabled,
                 skill_dirs: Some(Vec::new()),
+                plugin_skill_dirs: Vec::new(),
                 mcp: false,
                 memory: false,
                 web: false,

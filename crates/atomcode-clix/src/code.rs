@@ -174,6 +174,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let opts = PrepareOptions {
         session,
         skill_dirs: None,
+        plugin_skill_dirs: Vec::new(),
         mcp: !args.no_mcp,
         memory: !args.no_memory,
         web: !args.no_web,

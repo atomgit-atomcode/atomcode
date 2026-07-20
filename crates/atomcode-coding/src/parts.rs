@@ -80,6 +80,13 @@ pub struct PrepareOptions {
     /// Skill dirs in LOW→HIGH priority order; `None` = the standard home+project
     /// precedence ([`standard_skill_dirs`]).
     pub skill_dirs: Option<Vec<PathBuf>>,
+    /// Plugin-contributed skill directories, each paired with its namespace
+    /// (the plugin manifest's `name`). Loaded AFTER `skill_dirs` so plugin
+    /// skills are registered as `<namespace>:<skill-name>` — same convention
+    /// the slash-menu's `core::SkillRegistry::reload` uses. Empty = no
+    /// plugin skills (the L1 `capabilities::SkillRegistry::load` cannot reach
+    /// the core plugin loader by design — driver feeds these in).
+    pub plugin_skill_dirs: Vec<(PathBuf, String)>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
     /// Inject `memory.md` (global + project) at session start. KEEP THIS CONSISTENT
@@ -103,6 +110,7 @@ impl Default for PrepareOptions {
         Self {
             session: SessionMode::Fresh,
             skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
             mcp: true,
             memory: true,
             web: true,
@@ -366,7 +374,15 @@ pub async fn prepare_with_plugin_hooks(
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         standard_skill_dirs(&home, &cfg.working_dir)
     });
-    let skills = Arc::new(SkillRegistry::load(&skill_dirs));
+    // Plugin-contributed skills: each (dir, namespace) pair registered as
+    // `<namespace>:<skill-name>`, matching the slash-menu's core registry
+    // convention. Empty when the driver saw no installed plugins (the L1
+    // capabilities crate cannot reach the core plugin loader by design).
+    let mut skills = SkillRegistry::load(&skill_dirs);
+    for (dir, ns) in &opts.plugin_skill_dirs {
+        skills.load_dir(dir, Some(ns));
+    }
+    let skills = Arc::new(skills);
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
@@ -1087,6 +1103,7 @@ mod tests {
         PrepareOptions {
             session: SessionMode::Disabled,
             skill_dirs: Some(vec![]),
+            plugin_skill_dirs: Vec::new(),
             mcp: false,
             memory: false,
             web: false,

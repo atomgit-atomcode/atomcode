@@ -27,6 +27,7 @@ pub async fn start_native_runtime_with_session(
     let prepare = PrepareOptions {
         session,
         skill_dirs: None,
+        plugin_skill_dirs: crate::gather_plugin_skill_dirs(),
         mcp: cfg.mcp,
         memory: true,
         web: true,

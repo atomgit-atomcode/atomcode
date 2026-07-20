@@ -29,6 +29,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         skill_dirs: Some(vec![project.path().join("skills")]),
+        plugin_skill_dirs: Vec::new(),
         mcp: false,
         memory: false,
         web: false,

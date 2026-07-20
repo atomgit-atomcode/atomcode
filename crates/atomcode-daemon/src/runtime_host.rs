@@ -29,6 +29,19 @@ pub fn installed_plugin_hook_source() -> Arc<dyn PluginHookSource> {
     Arc::new(InstalledPluginHookSource)
 }
 
+pub fn gather_plugin_skill_dirs() -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    for assets in atomcode_core::plugin::loader::iter_installed_plugin_assets() {
+        for sd in assets.skills_dirs() {
+            if sd.exists() {
+                out.push((sd, assets.plugin.clone()));
+            }
+        }
+    }
+    out
+}
+
+
 #[derive(Debug, Default)]
 pub struct CodingPlanRateLimitSource;
 
