@@ -126,12 +126,12 @@ const zh = {
   'chat.rateLimited.hint': '已保留已完成内容 · 可换模型或稍后重试',
   'chat.rateLimited.waiting': '限流，{secs}s 后自动继续…',
 
-  // 会话内搜索反查定位
+  // 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,Esc 关闭,反查定位)
   'chat.searchPlaceholder': '搜索本会话消息…',
   'chat.searchNoMatch': '无匹配消息',
   'chat.searchPrev': '上一条',
   'chat.searchNext': '下一条',
-  'chat.searchClear': '清除搜索',
+  'chat.searchClose': '关闭搜索 (Esc)',
 
   // Input attach (+) menu
   'attach.menu': '添加',
@@ -435,12 +435,12 @@ const en: Record<MsgKey, string> = {
   'chat.rateLimited.hint': 'Completed work is preserved · switch model or retry later',
   'chat.rateLimited.waiting': 'Rate limited — auto-continuing in {secs}s…',
 
-  // 会话内搜索反查定位
+  // 会话内浮动搜索框 (Cmd/Ctrl+F 呼出,Esc 关闭,反查定位)
   'chat.searchPlaceholder': 'Search this conversation…',
   'chat.searchNoMatch': 'No matching messages',
   'chat.searchPrev': 'Previous match',
   'chat.searchNext': 'Next match',
-  'chat.searchClear': 'Clear search',
+  'chat.searchClose': 'Close search (Esc)',
 
   'attach.menu': 'Add',
   'attach.image': 'Upload image',

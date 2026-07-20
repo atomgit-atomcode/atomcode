@@ -4116,7 +4116,6 @@ fn render_codingplan_status_for_status_cmd() -> String {
         out
     })
 }
-}
 
 /// Pure-function core of `/context` — testable without constructing
 /// `LoopCtx`. Returns the rendered CommandOutput body.
