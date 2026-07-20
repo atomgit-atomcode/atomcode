@@ -5222,11 +5222,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // batch settles (p.done >= p.total below). During startup there is
                         // no explicit settle point, so we emit ONE notice on the first
                         // blocked event (flag prevents duplicates for the same batch).
+                        // The message is count-free so it is always accurate even when
+                        // multiple servers are blocked and arrive over time.
                         if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
                             ctx.mcp_blocked_notice_emitted = true;
-                            let n = ctx.mcp_blocked_untrusted.len();
                             renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
                             ));
                         }
                     }
@@ -5253,16 +5254,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                            p.connected, p.failed, elapsed_ms
-                        )));
-                        // Emit ONE coalesced blocked-server warning for this batch.
-                        let n = ctx.mcp_blocked_untrusted.len();
-                        if n > 0 {
+                        let blocked = ctx.mcp_blocked_untrusted.len();
+                        if blocked > 0 {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  MCP reload complete: {} connected, {} failed, {} blocked ({}ms)\n",
+                                p.connected, p.failed, blocked, elapsed_ms
+                            )));
                             renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
                             ));
+                        } else {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  MCP reload complete: {} connected, {} failed ({}ms)\n",
+                                p.connected, p.failed, elapsed_ms
+                            )));
                         }
                         ctx.mcp_reload = None;
                     }
@@ -5669,11 +5674,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // batch settles (p.done >= p.total below). During startup there is
                         // no explicit settle point, so we emit ONE notice on the first
                         // blocked event (flag prevents duplicates for the same batch).
+                        // The message is count-free so it is always accurate even when
+                        // multiple servers are blocked and arrive over time.
                         if ctx.mcp_reload.is_none() && !ctx.mcp_blocked_notice_emitted {
                             ctx.mcp_blocked_notice_emitted = true;
-                            let n = ctx.mcp_blocked_untrusted.len();
                             renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
                             ));
                         }
                     }
@@ -5700,16 +5706,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
-                            p.connected, p.failed, elapsed_ms
-                        )));
-                        // Emit ONE coalesced blocked-server warning for this batch.
-                        let n = ctx.mcp_blocked_untrusted.len();
-                        if n > 0 {
+                        let blocked = ctx.mcp_blocked_untrusted.len();
+                        if blocked > 0 {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  MCP reload complete: {} connected, {} failed, {} blocked ({}ms)\n",
+                                p.connected, p.failed, blocked, elapsed_ms
+                            )));
                             renderer.render(UiLine::Warning(
-                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted { n }).into_owned(),
+                                crate::i18n::t(crate::i18n::Msg::McpBlockedUntrusted).into_owned(),
                             ));
+                        } else {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  MCP reload complete: {} connected, {} failed ({}ms)\n",
+                                p.connected, p.failed, elapsed_ms
+                            )));
                         }
                         ctx.mcp_reload = None;
                     }

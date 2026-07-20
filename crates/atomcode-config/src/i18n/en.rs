@@ -629,8 +629,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Project trusted — reloading MCP servers.\n".into(),
         Msg::McpProjectUntrusted =>
             "  Project trust revoked.\n".into(),
-        Msg::McpBlockedUntrusted { n } =>
-            format!("Blocked {n} MCP server(s) from an untrusted project. Run /mcp trust to allow, then /mcp reload.\n").into(),
+        Msg::McpProjectNotTrusted =>
+            "  This project was not trusted.\n".into(),
+        Msg::McpBlockedUntrusted =>
+            "⚠ Blocked MCP server(s) from an untrusted project. Run /mcp trust to allow, then /mcp reload.\n".into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>

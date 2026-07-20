@@ -79,13 +79,18 @@ pub fn trust_project(project_dir: &Path) -> anyhow::Result<()> {
     save_store(&store)
 }
 
-/// Remove `project_dir` from the trust store (idempotent, atomic).
-pub fn untrust_project(project_dir: &Path) -> anyhow::Result<()> {
+/// Remove `project_dir` from the trust store.
+///
+/// Returns `Ok(true)` if the entry was present and has been removed (and saved).
+/// Returns `Ok(false)` if the project was not trusted to begin with (no-op, no save).
+pub fn untrust_project(project_dir: &Path) -> anyhow::Result<bool> {
     let mut store = load_store();
     if store.projects.remove(&key_for(project_dir)).is_some() {
         save_store(&store)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
 /// Result of splitting configs by trust.
@@ -166,7 +171,8 @@ mod tests {
         trust_project(proj).unwrap();
         assert!(is_project_trusted(proj), "after trust_project");
 
-        untrust_project(proj).unwrap();
+        let removed = untrust_project(proj).unwrap();
+        assert!(removed, "untrust of trusted project should return true");
         assert!(!is_project_trusted(proj), "after untrust_project");
     }
 
@@ -190,6 +196,33 @@ mod tests {
         let part = partition_by_trust(configs, proj);
         assert_eq!(part.blocked.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["evil"]);
         assert_eq!(part.allowed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["user-ok"]);
+    }
+
+    #[test]
+    #[serial]
+    fn untrust_never_trusted_returns_false() {
+        let _g = with_temp_store("store_un1.json");
+        let proj = Path::new("/tmp/never-trusted");
+        assert!(!untrust_project(proj).unwrap(), "untrust of untrusted project should be false");
+    }
+
+    #[test]
+    #[serial]
+    fn trust_then_untrust_returns_true() {
+        let _g = with_temp_store("store_un2.json");
+        let proj = Path::new("/tmp/was-trusted");
+        trust_project(proj).unwrap();
+        assert!(untrust_project(proj).unwrap(), "untrust of trusted project should be true");
+    }
+
+    #[test]
+    #[serial]
+    fn double_untrust_second_returns_false() {
+        let _g = with_temp_store("store_un3.json");
+        let proj = Path::new("/tmp/double-untrust");
+        trust_project(proj).unwrap();
+        assert!(untrust_project(proj).unwrap(), "first untrust should be true");
+        assert!(!untrust_project(proj).unwrap(), "second untrust should be false");
     }
 
     #[test]

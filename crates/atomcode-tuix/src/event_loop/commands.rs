@@ -2603,7 +2603,8 @@ fn execute_slash_command_impl(
 
                 Some(McpSub::Untrust) => {
                     match atomcode_core::mcp::trust::untrust_project(&ctx.working_dir) {
-                        Ok(()) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
+                        Ok(true) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectUntrusted).into_owned())),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(t(Msg::McpProjectNotTrusted).into_owned())),
                         Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
                     }
                     renderer.flush();
@@ -2631,16 +2632,28 @@ fn execute_slash_command_impl(
                         }
                     };
 
+                    // Partition by trust so the preflight header only lists servers that will
+                    // actually be attempted (project-source servers from untrusted projects are
+                    // withheld and should not appear in the "connecting to:" list).
+                    let partition = atomcode_core::mcp::trust::partition_by_trust(
+                        configs.clone(),
+                        &ctx.working_dir,
+                    );
+                    let connecting = &partition.allowed;
+
                     let mut header = t(Msg::McpReloading {
                         count: configs.len(),
                     })
                     .into_owned();
 
-                    if !configs.is_empty() {
+                    if !connecting.is_empty() {
                         header.push_str(&t(Msg::McpConnecting));
-                        for c in &configs {
+                        for c in connecting {
                             header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
                         }
+                    } else if !configs.is_empty() {
+                        // All servers are blocked (untrusted project); nothing will connect.
+                        header.push_str(&t(Msg::McpNoServersConfigured));
                     } else {
                         header.push_str(&t(Msg::McpNoServersConfigured));
                     }

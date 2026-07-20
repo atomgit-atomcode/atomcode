@@ -481,7 +481,8 @@ pub enum Msg<'a> {
     // /mcp trust / untrust
     McpProjectTrusted,
     McpProjectUntrusted,
-    McpBlockedUntrusted { n: usize },
+    McpProjectNotTrusted,
+    McpBlockedUntrusted,
     LspServerStarted { name: &'a str, ext: &'a str },
     LspServerFailed { name: &'a str, ext: &'a str, error: &'a str },
 
