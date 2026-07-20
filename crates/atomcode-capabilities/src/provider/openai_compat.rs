@@ -154,6 +154,13 @@ pub struct OpenAiCompatProvider {
     /// provider's life — a `/session` switch rebuilds the provider, never re-binds.
     /// Unset ⇒ header omitted (session-less sub-agent / summary).
     session_id: std::sync::OnceLock<String>,
+    /// Set once this provider's gateway has rejected a `reasoning_effort` value
+    /// with a 400 (e.g. SenseNova accepts low/medium/high/xhigh/none but NOT the
+    /// `max` that DeepSeek's own API takes). After that, the field is stripped
+    /// up front for the rest of the session so every subsequent turn doesn't
+    /// re-trigger the same 400. Session-scoped: a `/session` switch rebuilds the
+    /// provider and resets this.
+    effort_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl OpenAiCompatProvider {
@@ -170,7 +177,14 @@ impl OpenAiCompatProvider {
             build_http_client(connect_timeout, skip_tls_verify, user_agent.clone())
         })?);
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        Ok(Self { cfg, policy, client, url, session_id: std::sync::OnceLock::new() })
+        Ok(Self {
+            cfg,
+            policy,
+            client,
+            url,
+            session_id: std::sync::OnceLock::new(),
+            effort_unsupported: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
@@ -266,6 +280,21 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        // If this provider's gateway already rejected `reasoning_effort` earlier
+        // this session, strip it up front so the same 400 isn't re-triggered on
+        // every turn (see `effort_unsupported`).
+        let effort_known_unsupported = self
+            .effort_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let stripped_opts;
+        let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
+            let mut o = options.clone();
+            o.reasoning_effort = None;
+            stripped_opts = o;
+            &stripped_opts
+        } else {
+            options
+        };
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg, self.policy);
         super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
         // Serialize once and reuse the exact bytes across retries (hence `.body()`
@@ -293,8 +322,20 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
-        let resp =
-            open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await?;
+        let resp = match open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await {
+            Ok(r) => r,
+            // Gateway rejected `reasoning_effort`. Remember it for the session
+            // (next send strips the field up front → succeeds) and surface one
+            // actionable error instead of the raw `field ReasoningEffort invalid`.
+            // Guarded on `!effort_known_unsupported` so we never loop: once the
+            // field is stripped, any further 400 is a different problem.
+            Err(e) if !effort_known_unsupported && is_reasoning_effort_rejection(&e) => {
+                self.effort_unsupported
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(effort_unsupported_error());
+            }
+            Err(e) => return Err(e),
+        };
 
         let s = async_stream::stream! {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
@@ -676,6 +717,33 @@ fn build_request_body(
 fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
+}
+
+/// True when an OPEN failure is a 400 specifically complaining about
+/// `reasoning_effort`. Gateways hosting DeepSeek-V4 don't agree on the value
+/// enum — DeepSeek's own API takes `max`, but SenseNova's returns
+/// `field ReasoningEffort invalid, should be one of: low, medium, high, xhigh,
+/// none`. Matched narrowly (400 + the field name in either casing) so an
+/// unrelated 400 is never misrouted into the effort-strip path.
+fn is_reasoning_effort_rejection(e: &ProviderError) -> bool {
+    e.http_status == Some(400) && {
+        let m = e.message.to_ascii_lowercase();
+        m.contains("reasoning_effort") || m.contains("reasoningeffort")
+    }
+}
+
+/// The actionable error shown once when a gateway rejects `reasoning_effort`.
+/// The turn fails, but [`OpenAiCompatProvider::effort_unsupported`] is set so the
+/// user's next send strips the field and succeeds.
+fn effort_unsupported_error() -> ProviderError {
+    ProviderError {
+        retryable: false,
+        message: "当前模型/网关不支持「强度」(reasoning_effort) 设置，已为本会话自动禁用——请重新发送。\
+                  (Provider rejected reasoning_effort; auto-disabled for this session — resend to continue.)"
+            .to_string(),
+        http_status: Some(400),
+        ..Default::default()
+    }
 }
 
 /// Build Kimi's `thinking` request-body object from the two flat config fields. `None`
@@ -2243,6 +2311,151 @@ mod tests {
         assert!(
             head.contains("user-agent: atomcode"),
             "UA fallback must still be present: {head}"
+        );
+    }
+
+    // ---- reasoning_effort 400 self-heal (b2) ----
+
+    #[test]
+    fn is_reasoning_effort_rejection_matches_only_the_field_400() {
+        let mk = |code: u16, msg: &str| ProviderError {
+            retryable: false,
+            message: msg.into(),
+            http_status: Some(code),
+            code: None,
+            retry_after_secs: None,
+        };
+        // Real SenseNova shape.
+        assert!(is_reasoning_effort_rejection(&mk(
+            400,
+            "HTTP 400: field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none"
+        )));
+        // snake_case variant.
+        assert!(is_reasoning_effort_rejection(&mk(400, "HTTP 400: reasoning_effort not supported")));
+        // Unrelated 400 must NOT be misrouted into the effort-strip path.
+        assert!(!is_reasoning_effort_rejection(&mk(400, "HTTP 400: invalid api key")));
+        // Right text but not a 400 (e.g. a 500 that echoes the field) must not match.
+        assert!(!is_reasoning_effort_rejection(&mk(500, "reasoning_effort invalid")));
+    }
+
+    /// Read a full HTTP request (headers + Content-Length body) and return it as
+    /// a string so a stub can assert what the client sent.
+    fn read_req_full(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen.saturating_sub(buf.len() - (pos + 4));
+                while remaining > 0 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            remaining = remaining.saturating_sub(n);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_400_disables_it_for_session_then_succeeds() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies_w = bodies.clone();
+
+        let handle = std::thread::spawn(move || {
+            // #1: request carries reasoning_effort → gateway 400s rejecting it.
+            let (mut s1, _) = listener.accept().unwrap();
+            bodies_w.lock().unwrap().push(read_req_full(&mut s1));
+            let err = r#"{"error":{"message":"field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none","type":"invalid_request_error","code":"3"}}"#;
+            s1.write_all(
+                format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", err.len(), err)
+                    .as_bytes(),
+            )
+            .unwrap();
+            s1.flush().unwrap();
+            drop(s1);
+
+            // #2: after self-heal the retry must NOT carry reasoning_effort → 200.
+            let (mut s2, _) = listener.accept().unwrap();
+            bodies_w.lock().unwrap().push(read_req_full(&mut s2));
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            s2.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s2.flush().unwrap();
+            drop(s2);
+        });
+
+        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+
+        // Call 1: 400 → actionable error, effort flagged for the session.
+        let err = provider
+            .chat_stream(&[Message::user("hi")], &[], &opts)
+            .await
+            .err()
+            .expect("first open should fail on the effort 400");
+        assert!(
+            err.message.contains("强度") || err.message.to_ascii_lowercase().contains("reasoning_effort"),
+            "must surface the actionable effort message, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("field ReasoningEffort invalid"),
+            "raw gateway text must be replaced: {}",
+            err.message
+        );
+
+        // Call 2: SAME Max options → effort stripped up front → 200 succeeds.
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &opts)
+            .await
+            .expect("second open should succeed after self-heal");
+        let events: Vec<StreamEvent> = stream.collect().await;
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "ok")),
+            "self-healed turn must deliver the response: {events:?}"
+        );
+
+        let _ = handle.join();
+        let bodies = bodies.lock().unwrap();
+        assert!(
+            bodies[0].contains("reasoning_effort"),
+            "1st request should carry reasoning_effort: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("reasoning_effort"),
+            "2nd request must have effort stripped after the 400: {}",
+            bodies[1]
         );
     }
 }
