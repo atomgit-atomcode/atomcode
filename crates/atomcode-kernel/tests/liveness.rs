@@ -21,7 +21,7 @@ use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{
     ApprovalMiddleware, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, ScriptedProvider,
-    SilentStreamProvider,
+    SilentStreamProvider, StallThenProvider,
 };
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;
@@ -43,21 +43,24 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
     ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
 }
 
-// ── (1) STREAM TIMEOUT ───────────────────────────────────────────────────────
+// ── (1a) STREAM TIMEOUT → RECONNECT → RECOVER ────────────────────────────────
 //
-// A provider whose stream emits one TextDelta then PENDS FOREVER. With
-// `.stream_timeout(50ms)` the kernel races each `stream.next()` against a sleep
-// and, on the silent gap, takes the EXISTING clean-fail path: on_error +
-// AgentEvent::Error (message mentions timeout) + TurnComplete + return — exactly
-// like a mid-stream StreamEvent::Error. We assert the turn fails cleanly, does NOT
-// hang, and produces NO bogus assistant success (on_model_response never runs).
+// FIRST stream opens then PENDS FOREVER (idle stall); the SECOND succeeds. With
+// `.stream_timeout(50ms)` the idle-timeout fires, the kernel RECONNECTS (codex
+// parity, up to MAX_STREAM_RETRIES=5) — re-issuing the round from history with
+// backoff — and recovers. We assert a `reconnecting` Warning is emitted AND the
+// turn completes SUCCESSFULLY (success path runs; NO error). Core guarantee: a
+// single mid-stream stall no longer kills the turn.
 #[tokio::test]
-async fn stream_timeout_fails_turn_cleanly() {
+async fn stream_timeout_reconnects_then_recovers() {
     let reg = ToolRegistry::new();
-    // Emit one delta, then go silent forever — bounds inter-token latency.
-    let provider = Arc::new(SilentStreamProvider::new(vec![StreamEvent::TextDelta(
-        "partial".into(),
-    )]));
+    let provider = Arc::new(StallThenProvider::new(
+        1,
+        vec![
+            StreamEvent::TextDelta("recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
     let recorder = Arc::new(RecorderHook::new());
     let log = recorder.log.clone();
 
@@ -71,13 +74,13 @@ async fn stream_timeout_fails_turn_cleanly() {
 
     handle.commands.send(send("go")).unwrap();
 
-    // Collect events until TurnComplete, under the outer guard. If the stream
-    // timeout did NOT fire, recv() would block forever and this `timeout` trips.
-    let (error_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
+    let (saw_reconnect, error_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut saw_reconnect = false;
         let mut error_msg: Option<String> = None;
         let mut completed = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
+                AgentEvent::Warning(m) if m.contains("reconnecting") => saw_reconnect = true,
                 AgentEvent::Error { message, .. } => error_msg = Some(message),
                 AgentEvent::TurnComplete { .. } => {
                     completed = true;
@@ -86,26 +89,76 @@ async fn stream_timeout_fails_turn_cleanly() {
                 _ => {}
             }
         }
-        (error_msg, completed)
+        (saw_reconnect, error_msg, completed)
     })
     .await
-    .expect("stream-timeout turn must NOT hang — it must clean-fail within the outer guard");
+    .expect("reconnect-and-recover must finish within the outer guard, not hang");
 
-    assert!(completed, "the turn must clean-fail with a TurnComplete, not hang");
-    assert!(
-        error_msg.as_deref().is_some_and(|m| m.contains("timeout")),
-        "the timeout must surface as an AgentEvent::Error mentioning 'timeout'; got {error_msg:?}"
-    );
+    assert!(completed, "the turn must complete after a successful reconnect");
+    assert!(saw_reconnect, "a `reconnecting` Warning must be emitted on the idle timeout");
+    assert!(error_msg.is_none(), "a recovered turn must NOT surface an Error; got {error_msg:?}");
     let log = log.lock().unwrap();
     assert!(
-        log.contains(&"on_error".to_string()),
-        "the on_error hook must fire on a stream timeout (the clean-fail path)"
+        log.contains(&"on_model_response".to_string()),
+        "the success path must run on the recovered stream"
     );
-    // A timeout must NOT fall through to a normal-success completion: the success
-    // path (on_model_response) must NOT have run → no partial assistant pushed.
+}
+
+// ── (1b) STREAM TIMEOUT → EXHAUST RETRIES → CLEAN-FAIL ───────────────────────
+//
+// PENDS FOREVER on every attempt. The kernel reconnects MAX_STREAM_RETRIES=5
+// times (with backoff), then clean-fails: on_error + Error (mentions timeout) +
+// TurnComplete — never looping forever, never a bogus success. Slower than (1a)
+// because it walks the full backoff ladder, so it gets a generous guard.
+#[tokio::test]
+async fn stream_timeout_exhausts_retries_then_fails() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(StallThenProvider::new(100, vec![]));
+    let recorder = Arc::new(RecorderHook::new());
+    let log = recorder.log.clone();
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .hooks(recorder)
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+
+    // Guard >> the full backoff ladder (200+400+800+1600+3200 ≈ 6.2s) + 6× 50ms.
+    let (reconnects, error_msg, completed) = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut reconnects = 0;
+        let mut error_msg: Option<String> = None;
+        let mut completed = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Warning(m) if m.contains("reconnecting") => reconnects += 1,
+                AgentEvent::Error { message, .. } => error_msg = Some(message),
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (reconnects, error_msg, completed)
+    })
+    .await
+    .expect("exhausted retries must clean-fail within the guard, not loop forever");
+
+    assert!(completed, "after exhausting retries the turn must clean-fail with TurnComplete");
+    assert_eq!(reconnects, 5, "must reconnect exactly MAX_STREAM_RETRIES=5 times before failing");
+    assert!(
+        error_msg.as_deref().is_some_and(|m| m.contains("timeout")),
+        "the exhausted timeout must surface as an Error mentioning 'timeout'; got {error_msg:?}"
+    );
+    let log = log.lock().unwrap();
+    assert!(log.contains(&"on_error".to_string()), "on_error must fire on the clean-fail");
     assert!(
         !log.contains(&"on_model_response".to_string()),
-        "a timed-out turn must NOT run the success path (no bogus assistant message)"
+        "an exhausted-timeout turn must NOT run the success path"
     );
 }
 

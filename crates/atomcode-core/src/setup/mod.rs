@@ -59,7 +59,7 @@ pub fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     let signals = scan::scan(&opts.project_root);
 
     // 3. Install all embedded seeds (skills + commands + hooks + mcp).
-    let seeds_cache_root = crate::config::Config::config_dir();
+    let seeds_cache_root = atomcode_config::config::Config::config_dir();
     let cache_dir = ensure_seeds_extracted(&seeds_cache_root).map_err(SetupError::Other)?;
 
     let mut txn =
@@ -115,7 +115,7 @@ fn install_directory_skills_from_seeds(
     // Target path must match SkillRegistry::reload's scan path: a single
     // unified config dir (Config::config_dir()) that resolves to
     // ATOMCODE_HOME when set, else $HOME/.atomcode.
-    let target_skills = crate::config::Config::config_dir().join("skills");
+    let target_skills = atomcode_config::config::Config::config_dir().join("skills");
 
     let entries = match std::fs::read_dir(&seeds_skills) {
         Ok(e) => e,
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn render_includes_installed_count() {
         let _g = crate::i18n::test_lock();
-        crate::i18n::set_locale(crate::locale::Locale::ZhCn);
+        crate::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
 
         let mut sum = InstalledSummary::default();
         sum.installed

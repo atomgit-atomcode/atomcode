@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 
 /// Warnings the monitor can raise, displayed right-aligned on the
 /// status row below the input box.
@@ -132,7 +132,7 @@ pub fn decide_warning(
 /// `is_codingplan_provider(default_provider)`; do that up front so
 /// non-CodingPlan users never trigger any network I/O.
 pub fn spawn_check(
-    config_snapshot: atomcode_core::config::Config,
+    config_snapshot: atomcode_config::config::Config,
     default_model: String,
     slot: std::sync::Arc<std::sync::Mutex<Option<CodingPlanWarning>>>,
     wake_tx: tokio::sync::mpsc::Sender<()>,

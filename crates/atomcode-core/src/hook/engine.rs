@@ -8,6 +8,7 @@
 // ============================================================================
 
 use async_trait::async_trait;
+use atomcode_config::config::Config;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -404,6 +405,35 @@ impl HookEngine {
         }
     }
 
+    /// Collect names of all registered hooks across every slot.
+    /// Used by `hook test <name>` to show available hooks when the
+    /// requested name is not found in JSON configs.
+    pub fn list_hook_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        macro_rules! collect_names {
+            ($field:ident) => {
+                for h in &self.$field {
+                    names.push(h.name().to_string());
+                }
+            };
+        }
+        collect_names!(pre_tool_hooks);
+        collect_names!(post_tool_hooks);
+        collect_names!(post_turn_hooks);
+        collect_names!(system_prompt_hooks);
+        collect_names!(on_session_start_hooks);
+        collect_names!(on_session_end_hooks);
+        collect_names!(on_error_hooks);
+        collect_names!(on_user_prompt_submit_hooks);
+        collect_names!(on_turn_start_hooks);
+        collect_names!(on_turn_complete_hooks);
+        collect_names!(on_tool_call_start_hooks);
+        collect_names!(on_model_response_hooks);
+        names.sort();
+        names.dedup();
+        names
+    }
+
     // ── 加载 / 注册内置 Hook ──────────────────────────────────────
 
     /// 统一加载：JSON + TOML + 内置 + Webhook
@@ -468,43 +498,31 @@ impl HookEngine {
 
     /// 从 TOML 配置加载 ScriptHook + WebhookHook
     fn load_toml_hooks(&mut self, working_dir: &Path) {
-        // 全局 hooks
-        if let Some(home) = dirs::home_dir() {
-            let global_dir = home.join(".atomcode").join("hooks");
-            if global_dir.exists() {
-                if let Ok(config) = super::config_loader::HooksConfig::from_dir(&global_dir) {
-                    config.register_hooks_to_engine(self, &global_dir);
+        for hooks_dir in Self::toml_hook_dirs(working_dir) {
+            if hooks_dir.exists() {
+                if let Ok(config) = super::config_loader::HooksConfig::from_dir(&hooks_dir) {
+                    config.register_hooks_to_engine(self, &hooks_dir);
                 }
-            }
-        }
-
-        // 项目级 hooks
-        let project_dir = working_dir.join(".atomcode").join("hooks");
-        if project_dir.exists() {
-            if let Ok(config) = super::config_loader::HooksConfig::from_dir(&project_dir) {
-                config.register_hooks_to_engine(self, &project_dir);
             }
         }
     }
 
     /// 加载 Webhook hook
     fn load_webhook_hooks(&mut self, working_dir: &Path) {
-        // 全局
-        if let Some(home) = dirs::home_dir() {
-            let global_dir = home.join(".atomcode").join("hooks");
-            if global_dir.exists() {
-                if let Ok(config) = super::config_loader::HooksConfig::from_dir(&global_dir) {
+        for hooks_dir in Self::toml_hook_dirs(working_dir) {
+            if hooks_dir.exists() {
+                if let Ok(config) = super::config_loader::HooksConfig::from_dir(&hooks_dir) {
                     config.register_webhooks_to_engine(self);
                 }
             }
         }
-        // 项目
-        let project_dir = working_dir.join(".atomcode").join("hooks");
-        if project_dir.exists() {
-            if let Ok(config) = super::config_loader::HooksConfig::from_dir(&project_dir) {
-                config.register_webhooks_to_engine(self);
-            }
-        }
+    }
+
+    fn toml_hook_dirs(working_dir: &Path) -> [PathBuf; 2] {
+        [
+            Config::config_dir().join("hooks"),
+            working_dir.join(".atomcode").join("hooks"),
+        ]
     }
 
     /// 注册所有内置 hook。

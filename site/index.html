@@ -644,7 +644,7 @@
   <a class="hdr-logo" href="#top">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span data-scramble>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.26.0</span>
+    <span class="ver" id="verBadge" title="当前版本">v5.0.0</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
@@ -842,6 +842,30 @@
           <div class="p"><b>/review</b><span data-i18n="plugin.review">代码审阅</span></div>
           <div class="p"><b>/test</b><span data-i18n="plugin.test">跑测试</span></div>
           <div class="p"><b>/security</b><span data-i18n="plugin.security">安全审查</span></div>
+        </div>
+      </div>
+    </article>
+
+    <article class="feat">
+      <div class="icon">◎</div>
+      <h3 data-i18n="feat.loop.t">目标驱动与循环</h3>
+      <p data-i18n="feat.loop.d">/goal 设定目标后自动一轮轮跑到达成；/loop 按固定间隔或自定节奏重复任务；/todo 实时跟踪多步任务清单。</p>
+      <div class="demo">
+        <div class="gitcmd">
+          <div class="l1">› /goal 让所有测试通过</div>
+          <div class="l2">↻ <span data-i18n="feat.loop.demo">自动循环中 · 第 3 轮 · ☑ 4/6</span></div>
+        </div>
+      </div>
+    </article>
+
+    <article class="feat">
+      <div class="icon">▤</div>
+      <h3 data-i18n="feat.app.t">手机 App 远程接管</h3>
+      <p data-i18n="feat.app.d">/app 吐出二维码，手机扫码即可实时查看并接管当前会话；/webui 浏览器界面双向同步，随时换设备继续。</p>
+      <div class="demo">
+        <div class="gitcmd">
+          <div class="l1">› /app</div>
+          <div class="l2">▤ <span data-i18n="feat.app.demo">扫码配对 · 手机实时同步</span></div>
         </div>
       </div>
     </article>
@@ -1084,7 +1108,7 @@
           <div class="wiz-body">
             <div class="wiz-step active" data-step="1">
               <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
-              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.26.0 · 在终端里运行的 AI 编程代理</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v5.0.0 · 在终端里运行的 AI 编程代理</div>
               <ul class="intro-list">
                 <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
                 <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
@@ -1141,7 +1165,7 @@ try{
   else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
 }catch(e){}
 
-const VERSION='v4.26.0';
+const VERSION='v5.0.0';
 
 const T={
   'nav.features':{zh:'功能',en:'Features'},
@@ -1212,6 +1236,14 @@ const T={
   'feat.eco.t':{zh:'Skills + Plugin 生态',en:'Skills + Plugin Ecosystem'},
   'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
                 en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
+  'feat.loop.t':{zh:'目标驱动与循环',en:'Goals & Loops'},
+  'feat.loop.d':{zh:'/goal 设定目标后自动一轮轮跑到达成；/loop 按固定间隔或自定节奏重复任务；/todo 实时跟踪多步任务清单。',
+                 en:'/goal sets a target and runs turn after turn until met; /loop repeats a task on a fixed interval or self-paced; /todo tracks multi-step task lists live.'},
+  'feat.loop.demo':{zh:'自动循环中 · 第 3 轮 · ☑ 4/6',en:'looping · round 3 · ☑ 4/6'},
+  'feat.app.t':{zh:'手机 App 远程接管',en:'Mobile App Remote'},
+  'feat.app.d':{zh:'/app 吐出二维码，手机扫码即可实时查看并接管当前会话；/webui 浏览器界面双向同步，随时换设备继续。',
+                en:'/app prints a QR code — scan with your phone to watch and drive the current session live; /webui mirrors it in the browser, switch devices anytime.'},
+  'feat.app.demo':{zh:'扫码配对 · 手机实时同步',en:'scan to pair · live phone sync'},
   'plug.sidebar.t':{zh:'侧边栏聊天',en:'Sidebar Chat'},
   'plug.sidebar.d':{zh:'在编辑器侧边栏打开 AtomCode 面板，不离开上下文即可与 AI 对话',en:'Open AtomCode in the editor sidebar and chat with AI without leaving context'},
   'plug.context.t':{zh:'右键菜单',en:'Context Menu'},

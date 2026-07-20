@@ -3,7 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-05-08-uninstall-design.md
 //! Plan: docs/superpowers/plans/2026-05-08-uninstall-feature.md
 
-use atomcode_core::self_update::current_exe_path;
+use atomcode_updater::current_exe_path;
 use super::{
     actions::{PlatformSelfDelete, SelfDeleteStrategy},
     paths::atomcode_dir,

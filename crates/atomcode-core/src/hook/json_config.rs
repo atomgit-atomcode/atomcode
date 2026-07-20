@@ -39,30 +39,32 @@ fn default_timeout() -> u64 {
     10_000
 }
 
-/// Load and merge hooks from global (`$ATOMCODE_HOME/hooks.json`) and project
-/// (`.hooks.json`) config files.
+/// Load and merge hooks, discarding names.
 ///
-/// Project hooks override global hooks with the same name. Disabled hooks
-/// are filtered out.
+/// Delegates to [`load_hooks_config_with_names`] and discards the names so
+/// the two functions never drift out of sync.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
-    let global_path = crate::config::Config::config_dir().join("hooks.json");
+    load_hooks_config_with_names(project_dir)
+        .into_iter()
+        .map(|(_, config)| config)
+        .collect()
+}
+
+/// Load and merge hooks, returning each with its name.
+pub fn load_hooks_config_with_names(project_dir: &Path) -> Vec<(String, HookConfig)> {
+    let global_path = atomcode_config::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
     let mut merged: BTreeMap<String, HookConfig> = BTreeMap::new();
 
-    // Load global hooks first.
+    // Global hooks
     if let Ok(hooks) = load_hooks_file(&global_path) {
         for (name, hook) in hooks {
             merged.insert(name, hook);
         }
     }
 
-    // Plugin layer — two flavors per plugin:
-    //   1. CC-style inline hooks declared in plugin.json (priority).
-    //   2. Legacy atomcode hooks.json file (fallback).
-    // CC wins when both exist because plugin authors targeting CC are the
-    // common case, and a plugin shipping only a legacy hooks.json would not
-    // have a colliding plugin.json hooks block.
+    // Plugin hooks
     for assets in crate::plugin::loader::iter_installed_plugin_assets() {
         if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
             for (name, hook) in cc_hooks_to_atomcode(cc_map, &assets.plugin_dir) {
@@ -80,14 +82,14 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
         }
     }
 
-    // Load project hooks — override global by name.
+    // Project hooks override global/plugin by name
     if let Ok(hooks) = load_hooks_file(&project_path) {
         for (name, hook) in hooks {
             merged.insert(name, hook);
         }
     }
 
-    merged.into_values().collect()
+    merged.into_iter().collect()
 }
 
 /// Translate a Claude-Code-style nested hooks block (as found in

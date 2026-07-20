@@ -5,14 +5,17 @@
 //! turn 守卫。turn 的实际执行通过 [`TurnExecutor`] 注入，便于单测（`FakeExecutor`）
 //! 与后续接真实 `TurnRunner`（阶段②）。
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::tool::PermissionDecision;
 use crate::turn::event::TurnEvent;
 
@@ -33,12 +36,47 @@ pub enum TurnState {
     Running,
 }
 
+/// Owns an idle LiveSession handoff boundary. While this value is alive the
+/// session rejects new user turns. Dropping it releases the gate after a
+/// committed detach; consuming it with [`IdleHandoff::resume_receiver`] also
+/// returns the receiver captured at the same boundary for lossless rollback.
+pub struct IdleHandoff {
+    snapshot: ConversationSnapshot,
+    receiver: Option<broadcast::Receiver<LiveEvent>>,
+    _lease: HandoffLease,
+}
+
+struct HandoffLease(Arc<AtomicBool>);
+
+impl Drop for HandoffLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl IdleHandoff {
+    pub fn snapshot(&self) -> &ConversationSnapshot {
+        &self.snapshot
+    }
+
+    pub fn resume_receiver(mut self) -> broadcast::Receiver<LiveEvent> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("idle handoff receiver is consumed only once");
+        receiver
+    }
+}
+
 /// 广播给所有视图的事件。把「用户消息」「turn 事件」「turn 状态变化」统一成一个
 /// 信封，视图据此渲染与启停输入框。
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     /// 某视图刚提交的用户消息（让其他视图也能渲染出这条用户气泡）。
-    UserMessage { text: String, images: Vec<ImagePart> },
+    UserMessage {
+        text: String,
+        images: Vec<ImagePart>,
+    },
     /// 一次 turn 执行产生的事件（文本增量、工具、审批请求等）。
     Turn(TurnEvent),
     /// turn 状态变化（视图据此禁用/启用输入框）。
@@ -93,13 +131,15 @@ pub trait TurnExecutor: Send + Sync {
 
 /// 进程内活动会话总线。克隆廉价（内部全是 `Arc`）。
 pub struct LiveSession {
-    // 锁序：协调器始终先锁 `conversation`、再锁 `snapshot`；视图侧（join/snapshot）只锁 `snapshot`。
-    // 新增方法务必遵守此顺序以避免死锁。
+    // 锁序：协调器始终先锁 `conversation`、再锁 `snapshot`；视图侧通常只锁
+    // `snapshot`。`begin_idle_handoff` 持有 `turn_state` 后再锁 `snapshot`，而协调器
+    // 从不同时持有这两把锁，因此不会形成反向锁序。
     /// turn 边界更新的「已提交快照」，供 `join()` 不阻塞于运行中的 turn。
-    snapshot: Arc<Mutex<Vec<Message>>>,
+    snapshot: Arc<Mutex<ConversationSnapshot>>,
     events: broadcast::Sender<LiveEvent>,
     input_tx: mpsc::UnboundedSender<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    handoff_pending: Arc<AtomicBool>,
     /// 当前 turn 的审批响应通道。执行器在需要交互审批的 turn 开始时注册（经 run_turn
     /// 的 approver 参数）；任一视图调用 `approve` 先到先得地投递决定。
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
@@ -127,13 +167,13 @@ impl LiveSession {
         initial: Vec<Message>,
         cold_summaries: Vec<String>,
     ) -> Arc<Self> {
-        let conversation = Arc::new(Mutex::new({
-            Conversation::from_messages_and_cold_summaries(initial.clone(), cold_summaries)
-        }));
-        let snapshot = Arc::new(Mutex::new(initial));
+        let conversation = Conversation::from_messages_and_cold_summaries(initial, cold_summaries);
+        let snapshot = Arc::new(Mutex::new(conversation.snapshot()));
+        let conversation = Arc::new(Mutex::new(conversation));
         let (events, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let turn_state = Arc::new(Mutex::new(TurnState::Idle));
+        let handoff_pending = Arc::new(AtomicBool::new(false));
         let current_cancel = Arc::new(Mutex::new(None));
         let approver = Arc::new(Mutex::new(None));
         let turn_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -143,6 +183,7 @@ impl LiveSession {
             events: events.clone(),
             input_tx,
             turn_state: turn_state.clone(),
+            handoff_pending: handoff_pending.clone(),
             current_cancel: current_cancel.clone(),
             approver: approver.clone(),
             turn_buffer: turn_buffer.clone(),
@@ -155,6 +196,7 @@ impl LiveSession {
             events,
             input_rx,
             turn_state,
+            handoff_pending,
             current_cancel,
             approver,
             turn_buffer,
@@ -172,7 +214,7 @@ impl LiveSession {
     /// 晚加入：原子地拿「已提交快照 + 实时订阅」。快照取自 turn 边界更新的副本，
     /// 故运行中的长 turn 不会阻塞 join；新订阅者随后从广播接当前 turn 的增量。
     pub async fn join(&self) -> (Vec<Message>, broadcast::Receiver<LiveEvent>) {
-        let snap = self.snapshot.lock().await.clone();
+        let snap = self.snapshot.lock().await.messages.clone();
         let rx = self.events.subscribe();
         (snap, rx)
     }
@@ -187,11 +229,8 @@ impl LiveSession {
     pub async fn join_with_replay(
         &self,
     ) -> (Vec<Message>, Vec<LiveEvent>, broadcast::Receiver<LiveEvent>) {
-        let snap = self.snapshot.lock().await.clone();
-        let buf = self
-            .turn_buffer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let snap = self.snapshot.lock().await.messages.clone();
+        let buf = self.turn_buffer.lock().unwrap_or_else(|e| e.into_inner());
         let rx = self.events.subscribe();
         let replay = buf.clone();
         drop(buf);
@@ -200,7 +239,40 @@ impl LiveSession {
 
     /// 已提交消息快照（turn 边界更新）。
     pub async fn snapshot(&self) -> Vec<Message> {
-        self.snapshot.lock().await.clone()
+        self.snapshot.lock().await.messages.clone()
+    }
+
+    /// Create an atomic view-detach boundary for an idle session.
+    ///
+    /// `at_boundary` runs after the committed snapshot and a fallback receiver
+    /// have been captured, but before another input may transition the session to
+    /// Running. It must be non-blocking; callers use it to abort their old event
+    /// forwarder. The returned lease blocks new turns until it is committed or
+    /// consumed for rollback; its receiver resumes forwarding from this boundary.
+    pub async fn begin_idle_handoff<F>(
+        &self,
+        at_boundary: F,
+    ) -> Option<IdleHandoff>
+    where
+        F: FnOnce(),
+    {
+        let state = self.turn_state.lock().await;
+        if *state != TurnState::Idle {
+            return None;
+        }
+        if self.handoff_pending.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let lease = HandoffLease(self.handoff_pending.clone());
+        let snapshot = self.snapshot.lock().await.clone();
+        let receiver = self.events.subscribe();
+        at_boundary();
+        drop(state);
+        Some(IdleHandoff {
+            snapshot,
+            receiver: Some(receiver),
+            _lease: lease,
+        })
     }
 
     /// 当前 turn 状态。
@@ -219,10 +291,10 @@ impl LiveSession {
         }
     }
 
-    /// 投递一条用户输入。返回 `false` 表示总线已关闭（协调器任务已退出）。
+    /// 投递一条用户输入。返回 `false` 表示总线已关闭，或会话正在做 idle handoff。
     /// 注意：是否在「运行中」被忽略由协调器判定（见 `coordinator`）。
     pub fn send_input(&self, input: UserInput) -> bool {
-        self.input_tx.send(input).is_ok()
+        !self.handoff_pending.load(Ordering::Acquire) && self.input_tx.send(input).is_ok()
     }
 
     /// 执行器在需要交互审批时注册响应通道（也供测试直接用）。
@@ -233,7 +305,9 @@ impl LiveSession {
     /// 广播一次模型切换给所有视图（不触碰 turn 状态）。任一端切换模型时调用，
     /// 让另一端的下拉框 / 头部显示实时跟随。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_provider_changed(&self, provider: String) -> bool {
-        self.events.send(LiveEvent::ProviderChanged(provider)).is_ok()
+        self.events
+            .send(LiveEvent::ProviderChanged(provider))
+            .is_ok()
     }
 
     /// 广播一次审批模式切换（build / plan / bypass）给所有视图，让另一端的「模式」
@@ -251,7 +325,9 @@ impl LiveSession {
     /// 广播一次会话切换给所有视图（不触碰 turn 状态）。webui 新建对话时调用，
     /// 让同进程 TUI 跟随切换到新会话。返回 false 表示当前无订阅者（无妨）。
     pub fn notify_session_switched(&self, session_id: String) -> bool {
-        self.events.send(LiveEvent::SessionSwitched(session_id)).is_ok()
+        self.events
+            .send(LiveEvent::SessionSwitched(session_id))
+            .is_ok()
     }
 
     /// 广播「请在桌面 TUI 执行这条斜杠命令」（手机 App 发起）。返回 false 表示
@@ -302,10 +378,11 @@ impl LiveSession {
 async fn coordinator(
     executor: Arc<dyn TurnExecutor>,
     conversation: Arc<Mutex<Conversation>>,
-    snapshot: Arc<Mutex<Vec<Message>>>,
+    snapshot: Arc<Mutex<ConversationSnapshot>>,
     events: broadcast::Sender<LiveEvent>,
     mut input_rx: mpsc::UnboundedReceiver<UserInput>,
     turn_state: Arc<Mutex<TurnState>>,
+    handoff_pending: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     approver: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionDecision>>>>,
     turn_buffer: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
@@ -316,20 +393,33 @@ async fn coordinator(
     // display (DEC-graphics mojibake / flooding). See trace.rs.
     crate::ctrace!("LIVE", "coordinator START");
     while let Some(input) = input_rx.recv().await {
-        crate::ctrace!("LIVE", "coordinator received input: {} chars", input.text.len());
+        crate::ctrace!(
+            "LIVE",
+            "coordinator received input: {} chars",
+            input.text.len()
+        );
         // 单写者守卫：运行中直接忽略本次输入（不排队，避免乱序）。
         {
             let mut st = turn_state.lock().await;
-            if *st == TurnState::Running {
-                crate::ctrace!("LIVE", "coordinator REJECTED input: already running");
+            let handing_off = handoff_pending.load(Ordering::Acquire);
+            if *st == TurnState::Running || handing_off {
+                crate::ctrace!("LIVE", "coordinator REJECTED input: busy or handing off");
                 let _ = events.send(LiveEvent::Turn(TurnEvent::Warning(
-                    "对方正在对话，已忽略本次输入".to_string(),
+                    if handing_off {
+                        "会话正在切换 runtime，已忽略本次输入"
+                    } else {
+                        "对方正在对话，已忽略本次输入"
+                    }
+                    .to_string(),
                 )));
                 continue;
             }
             *st = TurnState::Running;
         }
-        crate::ctrace!("LIVE", "coordinator ACCEPTED input, broadcasting StateChanged(Running)");
+        crate::ctrace!(
+            "LIVE",
+            "coordinator ACCEPTED input, broadcasting StateChanged(Running)"
+        );
         // 回合开始：清回放缓冲并记入 Running——锁内一并广播，与
         // join_with_replay 的「订阅+克隆」互斥，保证晚加入者不丢不重。
         {
@@ -358,10 +448,11 @@ async fn coordinator(
                         images: input.images.clone(),
                     },
                     synthetic: false,
+                    internal_origin: None,
                 });
                 conv.turn_tracker.on_user_message(idx);
             }
-            *snapshot.lock().await = conv.messages.clone();
+            *snapshot.lock().await = conv.snapshot();
         }
         let _ = events.send(LiveEvent::UserMessage {
             text: input.text.clone(),
@@ -384,7 +475,7 @@ async fn coordinator(
                         };
                     }
                 }
-                *snapshot.lock().await = conv.messages.clone();
+                *snapshot.lock().await = conv.snapshot();
             }
         }
 
@@ -431,7 +522,7 @@ async fn coordinator(
             let conv = conversation.lock().await;
             let mut snap = snapshot.lock().await;
             let mut buf = turn_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            *snap = conv.messages.clone();
+            *snap = conv.snapshot();
             buf.clear();
         }
         // 排空 turn 执行期间堆积的输入（不排队，避免乱序）；逐条给出忽略提示，
@@ -442,7 +533,10 @@ async fn coordinator(
             )));
         }
         *turn_state.lock().await = TurnState::Idle;
-        crate::ctrace!("LIVE", "coordinator turn done, broadcasting StateChanged(Idle)");
+        crate::ctrace!(
+            "LIVE",
+            "coordinator turn done, broadcasting StateChanged(Idle)"
+        );
         let _ = events.send(LiveEvent::StateChanged(TurnState::Idle));
     }
     crate::ctrace!("LIVE", "coordinator EXIT (input_rx closed)");
@@ -451,7 +545,7 @@ async fn coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     /// 测试用执行器：对 conv 追加一条 assistant 消息，并广播一个 TextDelta +
     /// 一个 TokenUsage 作为「turn 事件」。记录被调用次数。`delay_ms` 用于模拟
@@ -493,7 +587,8 @@ mod tests {
             }
             {
                 let mut c = conv.lock().await;
-                c.messages.push(Message::new(Role::Assistant, self.reply.clone()));
+                c.messages
+                    .push(Message::new(Role::Assistant, self.reply.clone()));
             }
             let _ = events.send(LiveEvent::Turn(TurnEvent::TokenUsage {
                 prompt_tokens: 1,
@@ -505,7 +600,11 @@ mod tests {
     }
 
     fn fake(calls: Arc<AtomicUsize>) -> Arc<dyn TurnExecutor> {
-        Arc::new(FakeExecutor { calls, reply: "hi".to_string(), delay_ms: 0 })
+        Arc::new(FakeExecutor {
+            calls,
+            reply: "hi".to_string(),
+            delay_ms: 0,
+        })
     }
 
     /// 收集广播事件直到收到一个 StateChanged(Idle)（表示一次 turn 收尾）。
@@ -531,13 +630,26 @@ mod tests {
         let session = LiveSession::new(fake(calls.clone()), Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "你好".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "你好".into(),
+            images: vec![]
+        }));
 
         let events = drain_until_idle(&mut rx).await;
-        assert!(matches!(events.first(), Some(LiveEvent::StateChanged(TurnState::Running))));
-        assert!(events.iter().any(|e| matches!(e, LiveEvent::UserMessage { text, .. } if text == "你好")));
-        assert!(events.iter().any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")));
-        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        assert!(matches!(
+            events.first(),
+            Some(LiveEvent::StateChanged(TurnState::Running))
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LiveEvent::UserMessage { text, .. } if text == "你好")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")));
+        assert!(matches!(
+            events.last(),
+            Some(LiveEvent::StateChanged(TurnState::Idle))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let snap = session.snapshot().await;
@@ -547,27 +659,43 @@ mod tests {
     #[tokio::test]
     async fn rejects_input_while_running() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let exec: Arc<dyn TurnExecutor> =
-            Arc::new(FakeExecutor { calls: calls.clone(), reply: "x".into(), delay_ms: 80 });
+        let exec: Arc<dyn TurnExecutor> = Arc::new(FakeExecutor {
+            calls: calls.clone(),
+            reply: "x".into(),
+            delay_ms: 80,
+        });
         let session = LiveSession::new(exec, Vec::new());
         let mut rx = session.subscribe();
 
         // 第一条：开始一个长 turn。
-        assert!(session.send_input(UserInput { text: "first".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "first".into(),
+            images: vec![]
+        }));
         loop {
             if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
                 break;
             }
         }
         // 运行中投第二条：应被忽略（不排队、不作为新 turn 执行）。
-        session.send_input(UserInput { text: "second".into(), images: vec![] });
+        session.send_input(UserInput {
+            text: "second".into(),
+            images: vec![],
+        });
         let _ = drain_until_idle(&mut rx).await; // 第一条 turn 收尾
 
         // 再投第三条合法输入并等其收尾：若 "second" 被正确丢弃，calls 应为 2（first+third）；
         // 若 "second" 漏跑成了第二个 turn，calls 会是 3。事件驱动、无 sleep。
-        assert!(session.send_input(UserInput { text: "third".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "third".into(),
+            images: vec![]
+        }));
         let _ = drain_until_idle(&mut rx).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "运行中投的第二条应被丢弃，仅 first+third 执行");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "运行中投的第二条应被丢弃，仅 first+third 执行"
+        );
     }
 
     #[tokio::test]
@@ -575,7 +703,10 @@ mod tests {
         let session = LiveSession::new(Arc::new(CancellableExecutor), Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "cancel me".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "cancel me".into(),
+            images: vec![]
+        }));
         loop {
             if let Ok(LiveEvent::StateChanged(TurnState::Running)) = rx.recv().await {
                 break;
@@ -583,10 +714,14 @@ mod tests {
         }
 
         assert!(session.cancel_current_turn().await);
-        let events = tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
-            .await
-            .expect("cancelled turn should become idle promptly");
-        assert!(matches!(events.last(), Some(LiveEvent::StateChanged(TurnState::Idle))));
+        let events =
+            tokio::time::timeout(std::time::Duration::from_secs(1), drain_until_idle(&mut rx))
+                .await
+                .expect("cancelled turn should become idle promptly");
+        assert!(matches!(
+            events.last(),
+            Some(LiveEvent::StateChanged(TurnState::Idle))
+        ));
         assert!(!session.cancel_current_turn().await);
     }
 
@@ -600,17 +735,74 @@ mod tests {
         assert_eq!(snap[0].text(), Some("seed"));
     }
 
+    #[tokio::test]
+    async fn idle_handoff_preserves_cold_summaries_from_live_owner() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = LiveSession::new_with_cold_summaries(
+            fake(calls),
+            vec![Message::new(Role::User, "recent")],
+            vec!["older compressed context".to_string()],
+        );
+
+        let handoff = session
+            .begin_idle_handoff(|| {})
+            .await
+            .expect("idle session should provide its complete snapshot");
+        let snapshot = handoff.snapshot();
+
+        assert_eq!(snapshot.messages[0].text(), Some("recent"));
+        assert_eq!(snapshot.cold_summaries, vec!["older compressed context"]);
+    }
+
+    #[tokio::test]
+    async fn idle_handoff_receiver_has_no_post_boundary_subscribe_gap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let boundary_called = Arc::new(AtomicBool::new(false));
+        let session = LiveSession::new(fake(calls), Vec::new());
+        let marker = boundary_called.clone();
+        let handoff = session
+            .begin_idle_handoff(move || marker.store(true, Ordering::SeqCst))
+            .await
+            .expect("idle session should begin handoff");
+
+        assert!(boundary_called.load(Ordering::SeqCst));
+        assert!(!session.send_input(UserInput {
+            text: "after boundary".into(),
+            images: Vec::new(),
+        }));
+        let mut events = handoff.resume_receiver();
+        assert!(session.send_input(UserInput {
+            text: "after rollback".into(),
+            images: Vec::new(),
+        }));
+        let event = events
+            .recv()
+            .await
+            .expect("captured receiver should see the turn after rollback");
+
+        assert!(matches!(
+            event,
+            LiveEvent::StateChanged(TurnState::Running)
+        ));
+    }
+
     /// 中途加入（手机退后台回来重连）：join_with_replay 必须能补回当前回合
     /// 已发生的执行过程（Running + 已广播的 Turn 事件），且回合结束后缓冲清空。
     #[tokio::test]
     async fn join_with_replay_recovers_in_flight_turn_and_clears_at_boundary() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let exec: Arc<dyn TurnExecutor> =
-            Arc::new(FakeExecutor { calls: calls.clone(), reply: "hi".into(), delay_ms: 120 });
+        let exec: Arc<dyn TurnExecutor> = Arc::new(FakeExecutor {
+            calls: calls.clone(),
+            reply: "hi".into(),
+            delay_ms: 120,
+        });
         let session = LiveSession::new(exec, Vec::new());
         let mut rx = session.subscribe();
 
-        assert!(session.send_input(UserInput { text: "你好".into(), images: vec![] }));
+        assert!(session.send_input(UserInput {
+            text: "你好".into(),
+            images: vec![]
+        }));
         // 等 TextDelta 上广播（FakeExecutor 先发增量再 sleep），此刻回合仍在进行。
         loop {
             if let Ok(LiveEvent::Turn(TurnEvent::TextDelta(_))) = rx.recv().await {
@@ -622,15 +814,22 @@ mod tests {
         let (snap, replay, _rx2) = session.join_with_replay().await;
         assert_eq!(snap.len(), 1, "进行中：快照只含用户消息（turn 未到边界）");
         assert!(
-            matches!(replay.first(), Some(LiveEvent::StateChanged(TurnState::Running))),
+            matches!(
+                replay.first(),
+                Some(LiveEvent::StateChanged(TurnState::Running))
+            ),
             "回放首条应为 Running，让重连方恢复 streaming 状态"
         );
         assert!(
-            replay.iter().any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")),
+            replay
+                .iter()
+                .any(|e| matches!(e, LiveEvent::Turn(TurnEvent::TextDelta(t)) if t == "hi")),
             "回放应包含已发生的文本增量"
         );
         assert!(
-            !replay.iter().any(|e| matches!(e, LiveEvent::UserMessage { .. })),
+            !replay
+                .iter()
+                .any(|e| matches!(e, LiveEvent::UserMessage { .. })),
             "用户消息已在快照里，回放不应重复携带"
         );
 

@@ -1,6 +1,8 @@
 //! `StatusReminderHook` — a per-turn `<system-reminder>` tail carrying live runtime status
-//! (date/time, context-window usage, round budget) so the model can pace itself and resolve
-//! relative dates ("yesterday") into concrete `after`/`before` for [`recall`](super::recall).
+//! (date + round budget) so the model can pace itself and resolve relative dates ("yesterday")
+//! into concrete `after`/`before` for [`recall`](super::recall). Deliberately DATE-only (no
+//! wall-clock time) and with NO context-usage gauge — context pressure is handled silently by
+//! auto-compaction, never pushed to the model (see `render`).
 //!
 //! Two cache-safety disciplines:
 //!   1. **APPEND-ONLY at the tail** — it never mutates the cached prefix (the changing status
@@ -33,27 +35,36 @@ impl StatusReminderHook {
     /// Build the `<system-reminder>` body from wall-clock `now` and the turn context. Pure
     /// (clock + ctx injected) so it is unit-testable without a running agent.
     fn render(now: DateTime<Local>, ctx: &TurnCtx) -> String {
-        let mut lines = Vec::with_capacity(3);
+        let mut lines = Vec::with_capacity(2);
+        // Date + weekday only — NO wall-clock time. The minute-level clock made chatty weak
+        // models (e.g. deepseek-v4-flash) editorialize about the hour ("要休息了吗？快 1 点了")
+        // instead of working, and relative-date resolution for `recall` needs only the date.
         lines.push(format!(
-            "Current date: {} ({}), local time {}",
+            "Current date: {} ({})",
             now.format("%Y-%m-%d"),
-            now.format("%a"),
-            now.format("%H:%M")
+            now.format("%a")
         ));
-        // Context pressure — only when the window is known (0 before any response report).
-        if ctx.context_window > 0 {
-            let pct =
-                (ctx.used_tokens as f64 / ctx.context_window as f64 * 100.0).round() as u32;
-            lines.push(format!(
-                "Context window: {} / {} tokens used ({}%)",
-                ctx.used_tokens, ctx.context_window, pct
-            ));
-        }
-        // Round budget within the current turn.
-        match ctx.max_rounds {
-            Some(max) => lines.push(format!("Turn round: {} of {} (max)", ctx.round, max)),
-            None => lines.push(format!("Turn round: {}", ctx.round)),
-        }
+        // NO context-window usage line. Pushing a running "X / Y tokens used (Z%)" gauge to the
+        // model is a net negative: weak models (deepseek-v4-flash) read it as "almost full" and
+        // either rush to a FALSE completion or start reminding the USER to compact — the exact
+        // failure we kept seeing. Context pressure is handled where it belongs: SILENTLY, by the
+        // auto-compaction trigger (`should_compact` / `AUTO_DRAIN_UTILIZATION`), never surfaced to
+        // the model. The user keeps full visibility via the footer gauge and `/context`. This
+        // matches codex (auto-compact at a token limit, model never told the %) and opencode
+        // (`isOverflow` → silent summarize, model never told remaining tokens). `TurnCtx` still
+        // carries `context_window`/`used_tokens` for other consumers (e.g. cc-hooks).
+        // Turn round counter — the CURRENT round only, deliberately WITHOUT the
+        // `of {max} (max)` ceiling. Surfacing the ceiling ("48 of 50 (max)")
+        // reads as a countdown that pressures weaker models (deepseek-v4-flash)
+        // into rushing to declare the task "done" before running out of rounds
+        // — a FALSE completion that unravels on the next question. A bare
+        // progress counter keeps pacing awareness without the countdown.
+        // (codex exposes remaining budget as an on-demand tool, not a per-turn
+        // push; opencode injects no countdown at all. The anti-false-completion
+        // guardrail lives in the persona's EXECUTION DISCIPLINE section.)
+        // (`ctx.max_rounds` stays available to other hooks — e.g. cc-hooks in
+        // hooks.rs — it is simply no longer surfaced to the model here.)
+        lines.push(format!("Turn round: {}", ctx.round));
         crate::reminder::system_reminder(&lines.join("\n"))
     }
 }
@@ -99,17 +110,37 @@ mod tests {
             s.starts_with("<system-reminder>") && s.ends_with("</system-reminder>"),
             "must be wrapped so the model knows it's injected: {s}"
         );
-        assert!(s.contains("Current date: 2026-06-15 (Mon), local time 17:34"), "{s}");
-        assert!(s.contains("Context window: 40000 / 128000 tokens used (31%)"), "usage: {s}");
-        assert!(s.contains("Turn round: 3 of 50 (max)"), "round budget: {s}");
+        // Date + weekday only (no wall-clock HH:MM): the minute-level time made chatty weak
+        // models (deepseek-v4-flash) editorialize ("要休息了吗？快 1 点了"), and relative-date
+        // resolution for `recall` needs only the date.
+        assert!(s.contains("Current date: 2026-06-15 (Mon)"), "{s}");
+        assert!(!s.contains("local time"), "must not carry wall-clock time: {s}");
+        assert!(!s.contains("17:34"), "must not carry wall-clock time: {s}");
+        // NO context-usage gauge is pushed to the model, even when the window IS known —
+        // pressure is handled silently by auto-compaction (matches codex/opencode).
+        assert!(!s.contains("Context window"), "must not push a context-usage gauge: {s}");
+        assert!(!s.contains('%'), "must not push any usage percentage: {s}");
+        // Round counter shows the CURRENT round only — the `of N (max)` ceiling
+        // is deliberately NOT surfaced (countdown pressures weak models into
+        // false completions; see render() + persona EXECUTION DISCIPLINE).
+        assert!(s.contains("Turn round: 3"), "round counter: {s}");
+        assert!(!s.contains("(max)"), "no countdown ceiling: {s}");
+        assert!(!s.contains("of 50"), "no `of N` countdown framing: {s}");
     }
 
     #[test]
-    fn render_omits_context_when_window_unknown() {
+    fn render_never_injects_context_usage_even_at_high_pressure() {
+        // The window is known AND nearly full — the exact case the old code injected a scary
+        // "Context window: … (95%)". It must NOT be surfaced to the model: pressure is handled
+        // silently by auto-compaction, and pushing the gauge made weak models false-complete or
+        // nag the user to compact. Only date + round remain.
         let dt = Local.with_ymd_and_hms(2026, 6, 15, 9, 0, 0).single().unwrap();
-        let s = StatusReminderHook::render(dt, &ctx(2, 0, 0));
-        assert!(!s.contains("Context window"), "no context line when window=0: {s}");
-        assert!(s.contains("Turn round: 2 of 50"), "{s}");
+        let s = StatusReminderHook::render(dt, &ctx(2, 128_000, 121_600));
+        assert!(!s.contains("Context window"), "no context-usage gauge pushed to the model: {s}");
+        assert!(!s.contains('%'), "no usage percentage pushed to the model: {s}");
+        assert!(s.contains("Current date"), "date is still carried: {s}");
+        assert!(s.contains("Turn round: 2"), "{s}");
+        assert!(!s.contains("(max)"), "no countdown ceiling: {s}");
     }
 
     #[tokio::test]

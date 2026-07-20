@@ -85,10 +85,11 @@ pub struct OpenAiCompatConfig {
 /// `atomcode_core::provider::model_name_suggests_vision` — this L0 crate cannot
 /// depend on core, so it is duplicated (like `session::hash_path` is in the
 /// daemon). MUST stay in sync: it also gates the live VL-preprocess and the
-/// `read_file` vision path (both via core's copy); a drift silently drops (or
-/// wrongly forwards) images. Used only as the DEFAULT for `supports_vision`;
-/// core-aware callers (bridge / coding assemble) override it with core's copy.
-fn model_suggests_vision(name: &str) -> bool {
+/// `read_file` vision path; a drift silently drops (or wrongly forwards) images.
+/// `pub` so the v2 `bridge` reuses THIS copy for its resumed-image vision gate
+/// (dropping its former `atomcode_core::provider::model_name_suggests_vision`
+/// dependency) — one authority as the v1 stack is retired.
+pub fn model_suggests_vision(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("vision")
         || n.contains("-vl")
@@ -145,7 +146,13 @@ impl OpenAiCompatConfig {
 pub struct OpenAiCompatProvider {
     cfg: OpenAiCompatConfig,
     policy: ReasoningPolicy,
-    client: reqwest::Client,
+    /// The HTTP client, held behind a rebuild seam. A pooled keep-alive connection
+    /// that the gateway/LB silently half-closed can be handed back out, fail on the
+    /// first request (write ok, read → ConnectionReset), and — because every retry
+    /// reuses the SAME pool — keep failing until the client is rebuilt with an empty
+    /// pool. That rebuild used to require a manual `/login`; [`SwappableClient`] lets
+    /// the open path do it automatically on a transient-transport retry.
+    client: std::sync::Arc<SwappableClient>,
     url: String,
     /// Stable per-conversation id, bound ONCE via [`bind_session_id`] when the kernel
     /// spawns the owning Agent. Forwarded as the `x-atomcode-session-id` header so a
@@ -161,28 +168,86 @@ impl OpenAiCompatProvider {
         let policy = cfg
             .reasoning_policy
             .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
-        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-            .connect_timeout(cfg.connect_timeout)
-            // Drop idle keep-alive connections before the gateway LB does, so
-            // we don't reuse a server-closed socket (the "error sending
-            // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
-            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-            // Product UA so the gateway can attribute/slice traffic by version
-            // (parity with core's `build_http_client`). Driver injects the real
-            // `atomcode/<version>`; bare fallback when unset.
-            .user_agent(cfg.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
-        if cfg.skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| ProviderError {
-                retryable: false,
-                message: format!("http client build failed: {e}"),
-                ..Default::default()
-            })?;
+        // Capture only what the builder needs so the rebuild closure is `'static`
+        // and doesn't borrow `cfg` (which moves into `Self`).
+        let connect_timeout = cfg.connect_timeout;
+        let skip_tls_verify = cfg.skip_tls_verify;
+        let user_agent = cfg.user_agent.clone();
+        let client = std::sync::Arc::new(SwappableClient::new(move || {
+            build_http_client(connect_timeout, skip_tls_verify, user_agent.clone())
+        })?);
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         Ok(Self { cfg, policy, client, url, session_id: std::sync::OnceLock::new() })
+    }
+}
+
+/// Build a fresh streaming HTTP client from the process's current proxy env.
+/// Extracted so [`SwappableClient`] can rebuild an identical client with an EMPTY
+/// connection pool when a pooled connection goes stale.
+fn build_http_client(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+) -> Result<reqwest::Client, ProviderError> {
+    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+        .connect_timeout(connect_timeout)
+        // Drop idle keep-alive connections before the gateway LB does, so
+        // we don't reuse a server-closed socket (the "error sending
+        // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
+        .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+        // Product UA so the gateway can attribute/slice traffic by version
+        // (parity with core's `build_http_client`). Driver injects the real
+        // `atomcode/<version>`; bare fallback when unset.
+        .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    if skip_tls_verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|e| ProviderError {
+        retryable: false,
+        message: format!("http client build failed: {e}"),
+        ..Default::default()
+    })
+}
+
+/// An HTTP client held behind a rebuild seam. `get()` hands out the current client
+/// (cheap: `reqwest::Client` is `Arc` inside); `rebuild()` constructs a fresh client
+/// — hence a brand-new, EMPTY connection pool — and atomically swaps it in. This is
+/// the automatic form of the manual `/login` remedy for the "poisoned pool" failure:
+/// once a keep-alive connection is silently half-closed, only a fresh pool recovers,
+/// because every reuse of the old pool re-hands-out the dead socket.
+pub(crate) struct SwappableClient {
+    current: std::sync::RwLock<reqwest::Client>,
+    #[allow(clippy::type_complexity)]
+    build: Box<dyn Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync>,
+}
+
+impl SwappableClient {
+    fn new(
+        build: impl Fn() -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
+    ) -> Result<Self, ProviderError> {
+        let initial = build()?;
+        Ok(Self { current: std::sync::RwLock::new(initial), build: Box::new(build) })
+    }
+
+    /// The current client (clone is an `Arc` bump — the pool is shared). Poison-tolerant:
+    /// the guarded `reqwest::Client` is ALWAYS a valid client, so a lock poisoned by an
+    /// unrelated panic must not turn every subsequent request into a hard panic — that would
+    /// re-create the exact "wedged until restart" failure this seam exists to prevent.
+    pub(crate) fn get(&self) -> reqwest::Client {
+        self.current.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Rebuild with a fresh (empty) pool and swap it in, returning the new client.
+    /// If the rebuild itself fails (e.g. transient proxy/env read), the OLD client is
+    /// kept and returned — a rebuild failure must never wedge the provider.
+    pub(crate) fn rebuild(&self) -> reqwest::Client {
+        match (self.build)() {
+            Ok(fresh) => {
+                *self.current.write().unwrap_or_else(|p| p.into_inner()) = fresh.clone();
+                fresh
+            }
+            Err(_) => self.get(),
+        }
     }
 }
 
@@ -284,6 +349,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // stream.next() against cancellation, so a sleep here is
                                 // cancelled with the turn.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
+                                // A body that died mid-read on a half-closed pooled socket
+                                // is the canonical poisoned-pool trigger. Rebuild BEFORE the
+                                // reopen so its FIRST attempt gets a fresh (empty) pool instead
+                                // of re-grabbing the dead socket. Only for the transient-transport
+                                // class — a logical/decode failure isn't cured by a new pool.
+                                if retry::chain_has_transient_io(&e) {
+                                    client.rebuild();
+                                }
                                 if let Ok(fresh) =
                                     open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy).await
                                 {
@@ -327,7 +400,7 @@ impl LlmProvider for OpenAiCompatProvider {
 /// a 2xx, or a terminal `ProviderError`. Shared by the initial open and the
 /// mid-stream re-open so both paths behave identically.
 async fn open_stream(
-    client: &reqwest::Client,
+    client: &SwappableClient,
     url: &str,
     body_bytes: &[u8],
     signer: &Option<std::sync::Arc<dyn RequestSigner>>,
@@ -337,7 +410,10 @@ async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
-        let mut req = client
+        // Take the CURRENT client each attempt: a transport-error retry below
+        // rebuilds it, so the retried attempt gets a fresh (empty) pool.
+        let http = client.get();
+        let mut req = http
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.to_vec());
@@ -391,6 +467,17 @@ async fn open_stream(
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
+                    // Rebuild the client ONLY for the half-open-reuse class (a stale
+                    // pooled socket surfaces as ConnectionReset/EOF/TimedOut in the
+                    // chain) — that's the class a fresh pool actually cures. A plain
+                    // connect-refused / DNS / slow-gateway retry is NOT fixed by a new
+                    // pool, so rebuilding there would only churn a healthy pool (extra
+                    // TLS handshakes) and re-read proxy env on every attempt. Safe on
+                    // the OPEN path: no bytes consumed; a rebuild failure keeps the old
+                    // client. This is the automatic form of the `/login` remedy.
+                    if retry::chain_has_transient_io(&e) {
+                        client.rebuild();
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -692,6 +779,8 @@ fn error_code(err: &serde_json::Value) -> Option<String> {
 // SSE decoding (unit-testable, no network)
 // ---------------------------------------------------------------------------
 
+const MAX_TOOL_CALL_DELTAS: usize = 20000;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -705,6 +794,8 @@ struct SseDecoder {
     done: bool,
     /// True once the provider's response id has been emitted (emit it exactly once).
     response_id_seen: bool,
+    seen_finish: bool,
+    tool_call_delta_count: usize,
 }
 
 impl SseDecoder {
@@ -716,6 +807,8 @@ impl SseDecoder {
             truncated: false,
             done: false,
             response_id_seen: false,
+            seen_finish: false,
+            tool_call_delta_count: 0,
         }
     }
 
@@ -823,7 +916,12 @@ impl SseDecoder {
             }
         }
         if let Some(tcs) = choice.delta.tool_calls {
+            if self.seen_finish || self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
+                out.extend(self.finish());
+                return;
+            }
             for tc in tcs {
+                self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
@@ -865,14 +963,14 @@ impl SseDecoder {
             }
         }
         if let Some(fr) = choice.finish_reason {
-            match fr.as_str() {
-                "tool_calls" => {
-                    for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-                        out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
-                    }
+            self.seen_finish = true;
+            for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+                if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                    out.push(StreamEvent::ToolCall(ToolCall { id, name, arguments: args }));
                 }
-                "length" => self.truncated = true,
-                _ => {}
+            }
+            if fr == "length" {
+                self.truncated = true;
             }
         }
     }
@@ -974,8 +1072,79 @@ struct PromptTokensDetails {
 mod tests {
     use super::*;
 
+    // Parity lock: `model_suggests_vision` MUST classify identically to
+    // `atomcode_core::provider::model_name_suggests_vision` (verbatim copy). The
+    // v2 `bridge` now depends on THIS copy, so a drift would silently change the
+    // resumed-image vision gate. Covers every match rule (in core's list order)
+    // plus a representative text-only negative.
+    #[test]
+    fn model_suggests_vision_matches_core_classifications() {
+        for m in [
+            "gpt-4-vision-preview",
+            "glm-4v",
+            "qwen2-vl-7b",
+            "vl-max",
+            "got-ocr2",
+            "grok-4v",
+            "step-4.1v",
+            "gpt-4o-mini",
+            "claude-3-5-sonnet",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+            "gemini-2.0-flash",
+            "pixtral-12b",
+            "llava-1.6",
+            "qvq-72b",
+        ] {
+            assert!(model_suggests_vision(m), "should be vision: {m}");
+        }
+        for m in ["glm-5.2", "deepseek-v4", "gpt-4-turbo", "claude-2.1", "o3-mini"] {
+            assert!(!model_suggests_vision(m), "should be text-only: {m}");
+        }
+    }
+
     fn line(v: Value) -> String {
         format!("data: {}\n", v)
+    }
+
+    // ---- SwappableClient (auto-rebuild on poisoned pool) ----
+
+    #[tokio::test]
+    async fn swappable_client_rebuild_invokes_builder_and_swaps() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let sc = SwappableClient::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(reqwest::Client::new())
+        })
+        .expect("initial build");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "constructed once up front");
+        let _ = sc.get();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "get() must NOT rebuild");
+        sc.rebuild();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild() constructs a fresh client (empty pool)");
+    }
+
+    #[tokio::test]
+    async fn swappable_client_rebuild_failure_keeps_old_client() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        // First build succeeds; every rebuild after that fails.
+        let sc = SwappableClient::new(move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(reqwest::Client::new())
+            } else {
+                Err(ProviderError { retryable: false, message: "boom".into(), ..Default::default() })
+            }
+        })
+        .expect("initial build");
+        // A failing rebuild must not panic and must leave a usable client in place.
+        let _client = sc.rebuild();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "rebuild attempted the builder");
+        let _still_usable = sc.get(); // does not panic → old client retained
     }
 
     // ---- request building ----
@@ -1596,6 +1765,48 @@ mod tests {
         // no [DONE]; the network loop calls finish() on EOF
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn sse_degenerate_stream_after_finish_reason() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":"ok"}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()));
+        assert!(!d.done);
+
+        // This tool call delta chunk arrives after finish_reason.
+        // It must trigger early termination:
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x"}}]}}]})).as_bytes()));
+        assert!(d.done);
+        assert_eq!(kinds(&ev), vec!["text", "done"]);
+
+        // Any further feed calls should produce nothing because the decoder is done.
+        let further = d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"y"}}]}}]})).as_bytes());
+        assert!(further.is_empty());
+    }
+
+    #[test]
+    fn sse_degenerate_stream_exceeding_hard_limit() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // Send a tool call delta 20000 times.
+        // On the 20001-th time, it should terminate.
+        let delta_chunk = line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"w","arguments":"x"}}]}}]}));
+        let delta_bytes = delta_chunk.as_bytes();
+        for _ in 0..20000 {
+            ev.extend(d.feed(delta_bytes));
+            if d.done {
+                break;
+            }
+        }
+        // At this point, tool_call_delta_count should be exactly 20000. It hasn't terminated yet.
+        assert!(!d.done);
+
+        // The 20001-st chunk should trigger early termination.
+        ev.extend(d.feed(delta_bytes));
+        assert!(d.done);
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
     }
 
     // ---- mid-stream re-open (v1 parity: retry a body that dies before any event) ----

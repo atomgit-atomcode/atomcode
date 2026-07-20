@@ -8,7 +8,7 @@
 //! `edit_file::`), so one approval silently covered every later write this session — to ANY
 //! path, including `~/.ssh/authorized_keys` / `.env` / `/etc/...`. v1 instead:
 //! - AUTO-APPROVED in-workspace non-sensitive writes (no prompt at all), and
-//! - scoped "Always" PER CANONICAL FILE PATH for out-of-workspace writes, while
+//! - scoped "Always" PER CANONICAL DIRECTORY for out-of-workspace writes, while
 //! - treating SENSITIVE writes as un-grantable (prompt every time, never remembered).
 //!
 //! This gate reproduces that, in v2's middleware idiom. It fully OWNS approval for the write
@@ -24,7 +24,7 @@
 //! |---|---|
 //! | sensitive path (any location) | prompt EVERY time, never remembered |
 //! | in-workspace, non-sensitive | auto-approve, no prompt (v1 parity) |
-//! | out-of-workspace, non-sensitive | prompt; "Always" remembered PER canonical path (`edit_file`/`write_file`) or PER tool (`search_replace`/`parallel_edit_files`, which have no single target file) |
+//! | out-of-workspace, non-sensitive | prompt; "Always" remembered PER canonical DIRECTORY across `edit_file`/`write_file` (codex `grant_root` style — one approval covers sibling writes in that folder) or PER tool (`search_replace`/`parallel_edit_files`, which have no single target file) |
 //!
 //! Sensitivity is checked FIRST, so an in-workspace `.env` / `id_rsa` still prompts. New files
 //! (not yet on disk) are classified by their deepest EXISTING ancestor, and `..` escapes are
@@ -34,7 +34,7 @@
 //! [`SensitivePathGate`]: super::sensitive_path::SensitivePathGate
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -97,41 +97,79 @@ fn write_targets(tool: &str, args: &str) -> Vec<String> {
     }
 }
 
-/// True iff `raw` (resolved against `cwd`) lands INSIDE the workspace. Handles a not-yet-created
-/// file by canonicalizing its deepest EXISTING ancestor, and rejects `..` escapes because both
-/// the root and the (existing-prefix of the) target are canonicalized before the prefix check —
-/// a purely lexical `starts_with` would let `ws/../etc` through. CONSERVATIVE: an
-/// un-canonicalizable root returns `false` (→ defer to the prompt).
-pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(cwd) else {
+/// The canonical system temp roots (`$TMPDIR` / `/var/folders/...` on macOS, and `/tmp`).
+/// Process-stable (a mid-run `$TMPDIR` change is intentionally not observed — matches the
+/// codex writable-roots model). Empty if neither canonicalizes (→ nothing is temp → prompt).
+static TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
+});
+
+/// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Walks the target's
+/// ancestors, canonicalizing the deepest one that EXISTS (so a not-yet-created leaf is
+/// classified by its parent) — canonicalization resolves `..` traversal and symlinks, so a
+/// path that escapes every root via `..` or a symlink is correctly NOT matched.
+fn path_under_any(raw: &str, cwd: &Path, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
         return false;
-    };
+    }
     let target = resolve_path(raw, cwd);
     let mut cur: Option<&Path> = Some(target.as_path());
     while let Some(p) = cur {
         if let Ok(canon) = std::fs::canonicalize(p) {
-            return canon.starts_with(&root);
+            return roots.iter().any(|r| canon.starts_with(r));
         }
         cur = p.parent();
     }
     false
 }
 
-/// The session-grant key for an out-of-workspace, non-sensitive write. `edit_file`/`write_file`
-/// scope PER canonical file path (so "Always" on one file does not cover another); the bulk /
-/// multi-file tools have no single target and stay tool-wide.
-fn canonical_key(raw: &str, cwd: &Path) -> String {
-    let resolved = resolve_path(raw, cwd);
-    // Lexical fallback when the file does not exist yet (v1 did the same — keeps the key stable
-    // across the create-then-edit sequence in the common case where the parent exists).
-    std::fs::canonicalize(&resolved).unwrap_or(resolved).to_string_lossy().into_owned()
+/// True iff `raw` (resolved against `cwd`) lands INSIDE the workspace. Handles a not-yet-created
+/// file by canonicalizing its deepest EXISTING ancestor, and rejects `..` escapes because both
+/// the root and the (existing-prefix of the) target are canonicalized before the prefix check —
+/// a purely lexical `starts_with` would let `ws/../etc` through. CONSERVATIVE: an
+/// un-canonicalizable root returns `false` (→ defer to the prompt).
+pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
+    match std::fs::canonicalize(cwd) {
+        Ok(root) => path_under_any(raw, cwd, std::slice::from_ref(&root)),
+        Err(_) => false,
+    }
 }
 
-/// Grant key for an out-of-workspace write (see [`canonical_key`]). Free fn (no `self`)
-/// so it can run inside the off-thread, bounded classification in `before()`.
+/// True if `raw` (resolved against `cwd`) lands inside the SYSTEM TEMP DIR (`/tmp` or
+/// `$TMPDIR`). Mirrors codex's default writable roots — scratch/temp writes need no approval.
+/// Sensitive targets are still gated upstream; `/tmp/../etc/x` canonicalizes OUT of temp and
+/// is NOT matched.
+pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
+    path_under_any(raw, cwd, &TEMP_ROOTS)
+}
+
+/// The session-grant key fragment for an out-of-workspace, non-sensitive write:
+/// the canonical PARENT DIRECTORY of the target (codex `grant_root` style). Scoping
+/// to the folder — not the exact file — means approving one write under a directory
+/// covers sibling writes in that same directory this session (e.g. several report
+/// files under `~/Downloads/…`), without opening any other location.
+pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
+    let resolved = resolve_path(raw, cwd);
+    // Scope to the parent directory, which usually EXISTS even when the file being
+    // created does not — so canonicalizing it gives a stable key across the
+    // create-then-edit sequence. Fall back to the resolved path if there is no parent.
+    let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
+    std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned()
+}
+
+/// Grant key for an out-of-workspace write. Free fn (no `self`) so it can run inside
+/// the off-thread, bounded classification in `before()`.
+///
+/// `edit_file`/`write_file` (a single target) share the `writedir::` namespace keyed by
+/// the target's canonical directory — so "always" covers BOTH write tools writing to
+/// that folder this session, but not other folders. The bulk / multi-file tools have no
+/// single target and stay tool-wide.
 fn grant_key(tool: &str, targets: &[String], cwd: &Path) -> String {
     if matches!(tool, "edit_file" | "write_file") && targets.len() == 1 {
-        format!("{tool}::{}", canonical_key(&targets[0], cwd))
+        format!("writedir::{}", canonical_dir_key(&targets[0], cwd))
     } else {
         // No single target file → tool-wide (v1 routed these to its un-scoped tier).
         format!("{tool}::")
@@ -146,6 +184,10 @@ pub struct WriteApprovalGate {
     /// in-workspace boundary with it. Grant keys are canonicalized to ABSOLUTE paths, so a
     /// remembered out-of-workspace grant survives a `/cd`.
     cwd: Arc<RwLock<PathBuf>>,
+    /// Auto-accept-edits flag (SetMode(AcceptEdits)). While set, NON-sensitive edits
+    /// auto-approve with no prompt; sensitive paths still prompt every time. Defaults
+    /// to a private always-false Arc for construction sites that have no mode concept.
+    accept_edits: Arc<std::sync::atomic::AtomicBool>,
     kind: String,
 }
 
@@ -155,6 +197,7 @@ impl WriteApprovalGate {
         Self {
             store: Arc::new(InMemoryPermissionStore::new()),
             cwd,
+            accept_edits: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kind: APPROVAL_KIND.to_string(),
         }
     }
@@ -166,7 +209,20 @@ impl WriteApprovalGate {
 
     /// Use a caller-supplied (e.g. shared / persisted) grant store.
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
-        Self { store, cwd, kind: APPROVAL_KIND.to_string() }
+        Self {
+            store,
+            cwd,
+            accept_edits: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kind: APPROVAL_KIND.to_string(),
+        }
+    }
+
+    /// Wire the shared auto-accept-edits flag (from `CodingParts::accept_edits`). When
+    /// set, non-sensitive edits auto-approve without a prompt. Builder so the existing
+    /// constructors stay source-compatible.
+    pub fn with_accept_edits(mut self, accept_edits: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.accept_edits = accept_edits;
+        self
     }
 
     /// Round-trip the driver for an approval decision (same wire shape as [`ApprovalMiddleware`],
@@ -194,9 +250,8 @@ impl WriteApprovalGate {
                 BeforeOutcome::Allow { reason: Some("sensitive write approved (not remembered)".into()) }
             }
             PermissionDecision::Deny => BeforeOutcome::deny(format!(
-                "writing a sensitive path needs approval and was denied: {} {}",
-                tool.name(),
-                call.arguments
+                "writing a sensitive path needs approval and was denied: {}",
+                tool.name()
             )),
         }
     }
@@ -241,6 +296,14 @@ impl ToolMiddleware for WriteApprovalGate {
             return self.prompt_unremembered(call, tool, rt).await;
         }
 
+        // Auto-accept-edits mode: a non-sensitive edit auto-approves with NO prompt
+        // (sensitive was handled above and still prompts). This only affects the write
+        // tools this gate owns — bash still flows to ApprovalMiddleware and prompts.
+        // Enforced here (middleware), so it is independent of the bridge approval seam.
+        if self.accept_edits.load(std::sync::atomic::Ordering::Relaxed) {
+            return BeforeOutcome::Allow { reason: Some("accept-edits mode".into()) };
+        }
+
         // (2)+(3) classification CANONICALIZES paths (touches the filesystem). Run it OFF the
         // async worker, bounded: if the workspace lives on a stalled mount (e.g. a hung network
         // share as the cwd), `canonicalize()` can block for minutes — doing it inline freezes the
@@ -253,7 +316,10 @@ impl ToolMiddleware for WriteApprovalGate {
             let fallback = (false, format!("{name}::"));
             super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
                 let in_ws = !targets.is_empty()
-                    && targets.iter().all(|t| !t.trim().is_empty() && path_in_workspace(t, &cwd));
+                    && targets.iter().all(|t| {
+                        !t.trim().is_empty()
+                            && (path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
+                    });
                 (in_ws, grant_key(&name, &targets, &cwd))
             })
             .await
@@ -274,10 +340,10 @@ impl ToolMiddleware for WriteApprovalGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow { reason: Some("approved once".into()) },
             PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
-                BeforeOutcome::Allow { reason: Some("approved always (this path)".into()) }
+                BeforeOutcome::Allow { reason: Some("approved always (this folder)".into()) }
             }
             PermissionDecision::Deny => {
-                BeforeOutcome::deny(format!("denied by approval policy: {name} {}", call.arguments))
+                BeforeOutcome::deny(format!("denied by approval policy: {name}"))
             }
         }
     }
@@ -356,9 +422,9 @@ mod tests {
     #[tokio::test]
     async fn out_of_workspace_edit_prompts() {
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("x.rs");
-        std::fs::write(&target, "x").unwrap();
+        // Use a fabricated non-temp, non-workspace absolute path (need not exist — the gate
+        // canonicalizes ancestors, eventually reaching `/` which is not temp).
+        let target = std::path::PathBuf::from("/atomcode-test-outside-write/x.rs");
         let gate = WriteApprovalGate::pinned(ws.path().to_path_buf());
         let tool = edit_tool();
         let mut call = edit_call(target.to_str().unwrap());
@@ -381,31 +447,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_workspace_grant_is_per_path() {
-        // Pre-grant ONE out-of-workspace file's canonical key; the SAME file then auto-approves,
-        // a DIFFERENT out-of-workspace file still prompts. Proves "Always" is per-path, not tool-wide.
+    async fn out_of_workspace_grant_is_per_directory() {
+        // Pre-grant ONE out-of-workspace DIRECTORY; any file in that folder (incl. a
+        // sibling never itself granted, and via the OTHER write tool) auto-approves,
+        // while a file in a DIFFERENT folder still prompts. Proves "Always" is
+        // per-folder (codex grant_root style) — not per-file, not tool-wide.
+        // Uses fabricated non-temp absolute paths (need not exist — grant key is canonical dir).
         let ws = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let granted = outside.path().join("granted.rs");
-        let other = outside.path().join("other.rs");
-        std::fs::write(&granted, "x").unwrap();
-        std::fs::write(&other, "x").unwrap();
+        let dir_a = std::path::PathBuf::from("/atomcode-test-outside-write-grant/a");
+        let dir_b = std::path::PathBuf::from("/atomcode-test-outside-write-grant/b");
+        let granted = dir_a.join("granted.rs");
+        let sibling = dir_a.join("sibling.rs");
+        let other = dir_b.join("other.rs");
 
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("edit_file::{}", canonical_key(granted.to_str().unwrap(), ws.path())));
+        // Grant is keyed by the folder, from the `granted` file's target.
+        store.grant(&format!("writedir::{}", canonical_dir_key(granted.to_str().unwrap(), ws.path())));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
-        let tool = edit_tool();
 
-        let mut g = edit_call(granted.to_str().unwrap());
+        // A sibling in the SAME folder auto-approves — via edit_file...
+        let edit = edit_tool();
+        let mut s = edit_call(sibling.to_str().unwrap());
         assert!(
-            matches!(gate.before(&mut g, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
-            "granted path must auto-approve"
+            matches!(gate.before(&mut s, &edit, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "a sibling in the granted folder must auto-approve (edit_file)"
         );
+        // ...and via write_file (proves the grant is cross-tool, not per-tool).
+        let write = write_tool();
+        let mut w = write_call(dir_a.join("fresh.rs").to_str().unwrap());
+        assert!(
+            matches!(gate.before(&mut w, &write, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "a new file in the granted folder must auto-approve (write_file)"
+        );
+        // A file in a DIFFERENT folder still prompts.
         let mut o = edit_call(other.to_str().unwrap());
         assert!(
-            gate.before(&mut o, &tool, &silent_rt()).await.is_deny(),
-            "a different out-of-workspace file must still prompt"
+            gate.before(&mut o, &edit, &silent_rt()).await.is_deny(),
+            "a file in a different folder must still prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_edits_auto_approves_nonsensitive_but_not_sensitive() {
+        // accept-edits mode: a non-sensitive out-of-workspace edit auto-approves with
+        // NO prompt; a sensitive path still prompts every time (never auto-accepted).
+        // Uses fabricated non-temp absolute paths so temp-whitelist doesn't fire.
+        let ws = tempfile::tempdir().unwrap();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true)); // accept-edits ON
+        let gate = WriteApprovalGate::new(Arc::new(RwLock::new(ws.path().to_path_buf())))
+            .with_accept_edits(flag.clone());
+        let tool = write_tool();
+
+        // Non-sensitive out-of-workspace file (not in temp): normally prompts; with accept-edits → Allow.
+        let ordinary = std::path::PathBuf::from("/atomcode-test-outside-accept-edits/report.md");
+        let mut c = write_call(ordinary.to_str().unwrap());
+        assert!(
+            matches!(gate.before(&mut c, &tool, &silent_rt()).await, BeforeOutcome::Allow { .. }),
+            "accept-edits must auto-approve a non-sensitive edit"
+        );
+
+        // Sensitive path: accept-edits does NOT apply — silent_rt denies the prompt.
+        // Use a fabricated path; sensitivity is by name, not existence.
+        let secret = std::path::PathBuf::from("/atomcode-test-outside-accept-edits/id_rsa");
+        let mut s = write_call(secret.to_str().unwrap());
+        assert!(
+            gate.before(&mut s, &tool, &silent_rt()).await.is_deny(),
+            "accept-edits must NOT auto-approve a sensitive path (still prompts)"
+        );
+
+        // Flag off → back to normal prompting for the ordinary out-of-workspace file.
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut c2 = write_call(ordinary.to_str().unwrap());
+        assert!(
+            gate.before(&mut c2, &tool, &silent_rt()).await.is_deny(),
+            "with accept-edits off, a non-sensitive out-of-workspace edit prompts again"
         );
     }
 
@@ -488,7 +604,7 @@ mod tests {
         let secret = outside.path().join("id_rsa");
         std::fs::write(&secret, "k").unwrap();
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        store.grant(&format!("edit_file::{}", canonical_key(secret.to_str().unwrap(), ws.path())));
+        store.grant(&format!("writedir::{}", canonical_dir_key(secret.to_str().unwrap(), ws.path())));
         let gate =
             WriteApprovalGate::with_store(Arc::new(RwLock::new(ws.path().to_path_buf())), store);
         let tool = edit_tool();

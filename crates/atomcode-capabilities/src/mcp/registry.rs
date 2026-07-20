@@ -379,11 +379,13 @@ impl McpRegistry {
             match client.list_tools().await {
                 Ok(result) => {
                     for tool in result.tools {
+                        let read_only = tool.is_read_only();
                         all_tools.push(McpToolInfo {
                             server_name: server_name.clone(),
                             tool_name: tool.name,
                             description: tool.description,
                             input_schema: tool.input_schema,
+                            read_only,
                         });
                     }
                 }
@@ -423,11 +425,15 @@ impl McpRegistry {
             Ok(result) => result
                 .tools
                 .into_iter()
-                .map(|tool| McpToolInfo {
-                    server_name: server_name.to_string(),
-                    tool_name: tool.name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
+                .map(|tool| {
+                    let read_only = tool.is_read_only();
+                    McpToolInfo {
+                        server_name: server_name.to_string(),
+                        tool_name: tool.name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        read_only,
+                    }
                 })
                 .collect(),
             Err(e) => {

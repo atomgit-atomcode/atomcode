@@ -151,6 +151,14 @@ data class MessageInfo(
     val role: String,
     val content: String,
     val synthetic: Boolean = false,
+    val internalOrigin: String? = null,
+    val toolCalls: List<ToolCallInfo> = emptyList(),
+)
+
+data class ToolCallInfo(
+    val id: String?,
+    val name: String,
+    val arguments: String,
 )
 
 data class ChatRequest(
@@ -206,6 +214,7 @@ sealed interface ChatEvent {
     data class ToolBatch(val callsJson: String) : ChatEvent
     data class ToolStart(val id: String?, val name: String, val arguments: String) : ChatEvent
     data class ToolOutput(val chunk: String) : ChatEvent
+    data class ToolProgress(val id: String?, val progress: String) : ChatEvent
     data class ToolResult(
         val id: String?,
         val name: String,

@@ -18,8 +18,20 @@ export interface UserInfo {
 }
 
 const L = {
-  zh: { signIn: '登录', signingIn: '登录中…', signOut: '退出登录', hint: '已在浏览器打开登录页…' },
-  en: { signIn: 'Sign in', signingIn: 'Signing in…', signOut: 'Sign out', hint: 'Opened sign-in in your browser…' },
+  zh: {
+    signIn: '登录',
+    signingIn: '登录中…',
+    signOut: '退出登录',
+    hint: '已在浏览器打开登录页…',
+    expired: '登录已过期，点击重新登录',
+  },
+  en: {
+    signIn: 'Sign in',
+    signingIn: 'Signing in…',
+    signOut: 'Sign out',
+    hint: 'Opened sign-in in your browser…',
+    expired: 'Session expired — click to sign in again',
+  },
 };
 
 // Login/logout state + actions, consumed by the Sidebar settings menu.
@@ -28,6 +40,10 @@ export function useAuth() {
   const labels = L[lang === 'en' ? 'en' : 'zh'];
 
   const [loggedIn, setLoggedIn] = useState(false);
+  // Credentials exist but the token is dead (expired + unrefreshable). The
+  // server now probes real usability, so the sidebar can stop claiming
+  // "logged in" when chat would actually reject the token.
+  const [expired, setExpired] = useState(false);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const pollTimer = useRef<number | null>(null);
@@ -37,6 +53,7 @@ export function useAuth() {
       const r = await fetch('/auth/status', { headers: authHeaders() });
       const s = await r.json();
       setLoggedIn(!!s.logged_in);
+      setExpired(!!s.expired);
       setUser(s.user ?? null);
     } catch {
       /* ignore */
@@ -78,7 +95,12 @@ export function useAuth() {
           const sr = await fetch('/auth/status', { headers: authHeaders() });
           const s = await sr.json();
           if (s.logged_in) {
+            // Login completed — stop polling regardless of `expired`. A fresh
+            // token is normally usable, but even if the probe reports expired
+            // (odd edge: instant rejection / clock skew) we surface that state
+            // honestly instead of spinning "Signing in…" until the timeout.
             setLoggedIn(true);
+            setExpired(!!s.expired);
             setUser(s.user ?? null);
             stopPolling();
           }
@@ -107,8 +129,9 @@ export function useAuth() {
       /* ignore */
     }
     setLoggedIn(false);
+    setExpired(false);
     setUser(null);
   }
 
-  return { loggedIn, user, busy, labels, startLogin, doLogout };
+  return { loggedIn, expired, user, busy, labels, startLogin, doLogout };
 }

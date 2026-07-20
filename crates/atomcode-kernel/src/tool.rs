@@ -15,7 +15,7 @@
 //!   nothing; rating it `Risky` stops nothing on its own.
 //! * The kernel's ONE built-in safety mechanism at this altitude is the
 //!   **tool-result size cap** (`agent::AgentBuilder::max_tool_result_bytes`,
-//!   default 256 KiB): it bounds how many bytes a tool result can inject into the
+//!   default 64 KiB): it bounds how many bytes a tool result can inject into the
 //!   context window / host memory. That is the limit of what the kernel can own
 //!   here.
 //! * **OS-level isolation is the EMBEDDER's responsibility**, not the kernel's.
@@ -176,6 +176,25 @@ pub trait Tool: Send + Sync {
     fn risk(&self, _args: &str) -> RiskLevel {
         RiskLevel::Safe
     }
+    /// Whether this tool is KNOWN to be read-only (no side effects) — an intrinsic
+    /// property of the tool, distinct from `risk()` (which folds in trust/approval
+    /// state). Default `false` (unknown). An MCP tool sets this from the server's
+    /// `annotations.readOnlyHint`. A specialization (e.g. plan mode) reads it to allow
+    /// read-only external queries that it would otherwise gate — a read-only tool
+    /// cannot modify anything, so it is safe during read-only exploration.
+    fn read_only_hint(&self) -> bool {
+        false
+    }
+    /// Whether THIS call (with these args) may run CONCURRENTLY with other tools in
+    /// the same assistant message. Arg-aware: a tool's safety can depend on its
+    /// arguments — `bash` is parallel-safe only for provably read-only commands, so
+    /// it inspects `_args`. Arg-independent tools ignore `_args` and defer to
+    /// `read_only_hint()` (the single "no side effects" property, also read by plan
+    /// mode). A side-effecting tool leaves this `false` and is serialized behind the
+    /// write-lock by the executor.
+    fn parallel_safe(&self, _args: &str) -> bool {
+        self.read_only_hint()
+    }
     /// The scope under which an "always" approval grant ("总是 / Always") is
     /// remembered for THIS call. Two calls that yield the SAME scope string share a
     /// single grant — approving "always" on one auto-approves the other for the
@@ -244,6 +263,33 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    #[test]
+    fn parallel_safe_defaults_to_read_only_hint() {
+        struct Plain;
+        #[async_trait::async_trait]
+        impl Tool for Plain {
+            fn name(&self) -> &str { "plain" }
+            fn description(&self) -> &str { "" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+            }
+        }
+        struct RO;
+        #[async_trait::async_trait]
+        impl Tool for RO {
+            fn name(&self) -> &str { "ro" }
+            fn description(&self) -> &str { "" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn read_only_hint(&self) -> bool { true }
+            async fn execute(&self, _a: &str, _c: &ToolContext) -> ToolResult {
+                ToolResult { call_id: String::new(), content: String::new(), is_error: false, images: vec![] }
+            }
+        }
+        assert!(!Plain.parallel_safe("{}"), "default (no read_only_hint) is NOT parallel-safe");
+        assert!(RO.parallel_safe("{}"), "a read-only tool IS parallel-safe");
+    }
 
     struct Dummy(&'static str, RiskLevel);
 

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.26.0</span>
+    <span class="dhdr-ver">v5.0.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -74,7 +74,7 @@
 
   <main class="dmain prose-docs">
 <h1>Slash Commands</h1>
-      <p class="lede">Start an input with <code>/</code> in the TUI to trigger a command and get an autocomplete menu. The 30+ built-in commands are organised below; commands loaded from Skills and Plugins also appear in the menu automatically.</p>
+      <p class="lede">Start an input with <code>/</code> in the TUI to trigger a command and get an autocomplete menu. The 50+ built-in commands are organised below; commands loaded from Skills and Plugins also appear in the menu automatically.</p>
 
       <h2>Core</h2>
       <table>
@@ -113,6 +113,9 @@
           <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
           <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
           <tr><td><code>/issue</code></td><td>Interactive wizard: file a new issue against the AtomGit repository for the current git repo (requires OAuth login; cwd must be a clone of an atomgit.com repository)</td></tr>
+          <tr><td><code>/todo</code></td><td>Reprint the current todo list — derived from the session transcript (locates the most recent <code>todowrite</code> tool call and re-renders it), with "in-progress / done" status markers. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress</td></tr>
+          <tr><td><code>/copy</code></td><td>Copy a code block from the last reply to the clipboard: <code>/copy</code> copies the only block, <code>/copy N</code> the N-th, <code>/copy all</code> every code block, <code>/copy msg</code> the whole reply as raw markdown</td></tr>
+          <tr><td><code>/save</code></td><td>Export the current conversation to a markdown file: <code>/save</code> uses an auto-generated filename, <code>/save &lt;filename&gt;</code> a name you choose</td></tr>
         </tbody>
       </table>
 
@@ -125,6 +128,9 @@
           <tr><td><code>/plan</code></td><td>Switch to <strong>Plan mode</strong>: read-only exploration. The model can call <code>read_file</code> / <code>grep</code> / <code>list_directory</code> and other non-writing tools, but <code>edit_file</code> / <code>bash</code> are blocked. Useful for getting alignment before action</td></tr>
           <tr><td><code>/build</code></td><td>Switch back to <strong>Build mode</strong> (the default): all tools available — read, write, execute. <code>/plan</code> and <code>/build</code> are freely interchangeable</td></tr>
           <tr><td><code>/goal &lt;text&gt;</code></td><td>Set a completion goal and let the agent run an <strong>autonomous loop</strong> — turn after turn — until the goal is met. <code>/goal</code> (no args) shows the current goal and round count; <code>/goal clear</code> stops it</td></tr>
+          <tr><td><code>/loop &lt;interval&gt; &lt;prompt or /command&gt;</code></td><td>Repeat a prompt or slash command on a fixed <strong>interval</strong>. e.g. <code>/loop 5m /diff</code> runs <code>/diff</code> every 5 minutes; <code>/loop 30s check the build</code> re-sends that prompt every 30 seconds. Interval units are <code>s</code>/<code>m</code>/<code>h</code>, range 10s–24h</td></tr>
+          <tr><td><code>/loop &lt;prompt&gt;</code></td><td>With no interval, enters <strong>self-paced</strong> mode: the task is handed to the model, which decides when to run the next round itself — good for "keep at this until it converges" work that doesn't map onto a fixed period</td></tr>
+          <tr><td><code>/loop</code> · <code>/loop stop</code></td><td><code>/loop</code> (no args) shows the current loop status; <code>/loop stop</code> (or <code>off</code> / <code>clear</code> / <code>cancel</code>) stops it. <code>/loop</code> and <code>/goal</code> are mutually exclusive — setting one automatically cancels the other</td></tr>
           <tr><td><code>/think on</code> / <code>off</code></td><td>Toggle extended thinking (for supported models — Claude / DeepSeek-R1 / GLM-4.5 / …). When on, the model surfaces its reasoning at the cost of latency and tokens</td></tr>
           <tr><td><code>/think budget &lt;N&gt;</code></td><td>Cap the thinking token budget (Claude family); controls reasoning length</td></tr>
           <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek reasoning-effort control — trade latency/tokens for deeper reasoning on DeepSeek models</td></tr>
@@ -190,9 +196,11 @@
           <tr><td><code>/webui stop</code></td><td>Stop the webui server</td></tr>
           <tr><td><code>/sync</code></td><td>Attach the current TUI to a running webui session (run <code>/webui</code> first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session</td></tr>
           <tr><td><code>/sync off</code></td><td>Leave sync and return to a standalone session</td></tr>
+          <tr><td><code>/app</code></td><td>Expose the current session to the <strong>mobile App</strong> via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as <code>/webui</code> — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires <code>/login</code> first</td></tr>
+          <tr><td><code>/app stop</code></td><td>Stop App remote access, disconnect the relay, and return to a local session</td></tr>
         </tbody>
       </table>
-      <p>More in <a href="./webui.html">Web UI</a>.</p>
+      <p>More in <a href="./webui.html">Web UI</a> and the <a href="./webui-remote-access.html">Remote Access</a> guide.</p>
 
       <h2>Config &amp; help</h2>
       <table>
@@ -204,6 +212,7 @@
           <tr><td><code>/whoami</code></td><td>Show the username / email of the current AtomGit-logged-in user</td></tr>
           <tr><td><code>/config</code></td><td>Show the path of <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/login</code>) take effect without restarting atomcode</td></tr>
+          <tr><td><code>/proxy</code></td><td>Switch outbound proxy mode: follow the system proxy (default) / force a specific proxy / connect directly with no proxy. For corporate proxy networks or when you need to force a proxy or force a direct connection; the choice is written back to config</td></tr>
           <tr><td><code>/language</code></td><td>Switch UI language: auto-detect (<code>LC_ALL</code> / <code>LANG</code>), English, or Simplified Chinese. Takes effect immediately and is written back to <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>Re-open the 3-step first-run wizard (welcome → language → setup). Non-empty sessions are confirmed with a <code>y/N</code> before clearing the screen. Both language and default onboarding path can be revisited here</td></tr>
           <tr><td><code>/logout</code></td><td>Clear the AtomGit OAuth token</td></tr>

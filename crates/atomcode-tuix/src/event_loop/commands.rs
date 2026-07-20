@@ -25,15 +25,16 @@ use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::custom_commands::ArgsRequirement;
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
+    DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProviderWizard,
     ProxyPicker, SessionPicker,
 };
+use crate::modals::usage::{UsageData, UsageModal};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
+use atomcode_capabilities::memory::MemoryStore;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
+use atomcode_config::config::Config;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 use crate::markdown::{fence_start, is_closing_fence};
@@ -152,19 +153,20 @@ fn spawn_runtime(
     session: Session,
 ) -> (
     bg_runtime::RuntimeId,
-    atomcode_core::agent::AgentClient,
+    super::RuntimeEndpoint,
     Session,
 ) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    // Engine v2: spawn through the injected bridge so in-TUI session switches run
-    // on the new stack too. The override reads the CURRENT config/working_dir (the
-    // same values the v1 factory would), keeping /model /provider /cd honoured.
-    let (client, event_rx) = match &ctx.runtime_spawn_override {
-        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
-        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
-    };
-    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
-    (runtime_id, client, session)
+    // Spawn through the injected engine-v2 bridge so in-TUI session switches run
+    // on the new stack too. It reads the CURRENT config/working_dir, keeping
+    // /model /provider /cd honoured.
+    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir);
+    bg_runtime::spawn_event_forwarder(
+        runtime_id,
+        spawned.event_rx,
+        ctx.runtime_event_tx.clone(),
+    );
+    (runtime_id, spawned.endpoint, session)
 }
 
 /// Synchronise the current foreground session into `BgRuntimeManager`.
@@ -178,7 +180,10 @@ fn spawn_runtime(
 fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
-        ctx.agent.clone(),
+        super::RuntimeEndpoint {
+            legacy: ctx.agent.clone(),
+            native: ctx.runtime.clone(),
+        },
         ctx.current_session.clone(),
     );
 }
@@ -253,7 +258,7 @@ pub fn perform_session_rename(
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
 fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_core::config::instructions::LayeredInstructions;
+    use atomcode_config::config::instructions::LayeredInstructions;
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
     for (level, path) in instructions.status_lines() {
@@ -304,6 +309,98 @@ pub(crate) fn attach_live_session(
     renderer.render(UiLine::CommandOutput(
         "已同步当前会话（与浏览器实时互通）".to_string(),
     ));
+}
+
+fn restore_live_forwarder(
+    ctx: &mut LoopCtx,
+    session: std::sync::Arc<atomcode_core::live::LiveSession>,
+    receiver: tokio::sync::broadcast::Receiver<atomcode_core::live::LiveEvent>,
+) {
+    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
+        session,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+        receiver,
+    ));
+}
+
+pub(crate) fn rollback_pending_local_runtime_sync(ctx: &mut LoopCtx) -> bool {
+    let Some(pending) = ctx.pending_local_runtime_sync.take() else {
+        return false;
+    };
+    if pending.runtime_id != ctx.foreground_runtime_id
+        || pending.session_id != ctx.current_session.id
+    {
+        return false;
+    }
+    let live_session = pending.live_session;
+    let receiver = pending.handoff.resume_receiver();
+    ctx.sync_forwarder = Some(super::live_sync::spawn_live_forwarder_from_receiver(
+        live_session.clone(),
+        pending.runtime_id,
+        ctx.runtime_event_tx.clone(),
+        receiver,
+    ));
+    ctx.sync_session = Some(live_session);
+    true
+}
+
+/// Leave sync mode only after handing its authoritative idle snapshot back to
+/// the local runtime. If any step fails, resume the old event forwarder from a
+/// receiver captured at the same boundary so the TUI remains safely attached.
+fn detach_live_session(ctx: &mut LoopCtx) -> Result<bool, String> {
+    if ctx.pending_local_runtime_sync.is_some() {
+        return Err(t(Msg::LocalRuntimeRestorePending).into_owned());
+    }
+    let Some(session) = ctx.sync_session.clone() else {
+        return Ok(false);
+    };
+
+    let handoff = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(session.begin_idle_handoff(|| {
+            if let Some(handle) = ctx.sync_forwarder.as_ref() {
+                handle.abort();
+            }
+        }))
+    });
+    let Some(handoff) = handoff else {
+        return Err("同步会话仍在处理消息，请等当前回复结束后再退出同步".to_string());
+    };
+    let snapshot = handoff.snapshot().clone();
+    // The boundary callback already aborted it. Dropping the handle here makes
+    // ownership explicit before either committing the handoff or restoring it.
+    ctx.sync_forwarder.take();
+
+    let mut next_session = ctx.current_session.clone();
+    next_session.update_from_conversation_snapshot(snapshot.clone());
+    next_session.touch();
+    if let Err(error) = ctx.session_manager.save(&next_session) {
+        restore_live_forwarder(ctx, session, handoff.resume_receiver());
+        return Err(format!("无法保存同步会话快照：{error}"));
+    }
+    let restore_id = ctx.next_local_runtime_restore_id;
+    ctx.next_local_runtime_restore_id = ctx.next_local_runtime_restore_id.wrapping_add(1).max(1);
+    if let Err(error) = ctx.agent.cmd_tx.send(AgentCommand::SetConversation {
+        snapshot,
+        restore_id: Some(restore_id),
+    }) {
+        restore_live_forwarder(ctx, session, handoff.resume_receiver());
+        return Err(format!("无法把同步会话交给本地 runtime：{error}"));
+    }
+
+    ctx.current_session = next_session;
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    ctx.pending_local_runtime_sync = Some(super::PendingLocalRuntimeSync {
+        restore_id,
+        runtime_id: ctx.foreground_runtime_id,
+        session_id: ctx.current_session.id.clone(),
+        live_session: session,
+        handoff,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    ctx.sync_session = None;
+    Ok(true)
 }
 
 fn render_live_snapshot_messages(
@@ -397,9 +494,6 @@ impl Renderer for CaptureRenderer<'_> {
     fn flush_deferred(&mut self) {
         self.inner.flush_deferred();
     }
-    fn pop_approval_prompt(&mut self) {
-        self.inner.pop_approval_prompt();
-    }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
@@ -439,7 +533,7 @@ pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Re
         ctx.working_dir.clone(),
         ctx.telemetry.clone(),
         Some(ctx.current_session.id.clone()),
-        ctx.current_session.messages.clone(),
+        ctx.current_session.to_conversation_snapshot(),
     );
     attach_live_session(ctx, renderer, session, false);
     renderer.flush();
@@ -475,6 +569,19 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     state.on_submit();
 }
 
+fn compact_sync_guard(
+    sync_active: bool,
+    local_resync_pending: bool,
+) -> Result<(), Msg<'static>> {
+    if sync_active {
+        Err(Msg::CompactUnavailableDuringSync)
+    } else if local_resync_pending {
+        Err(Msg::CompactUnavailableDuringResync)
+    } else {
+        Ok(())
+    }
+}
+
 /// Fire one iteration of a fixed-interval `/loop`.
 ///
 /// Bumps the round, clears `due`, and re-arms `next_fire_at` (so the next
@@ -490,18 +597,18 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
 ///   returns `Stop`).
 ///
 /// Callers must thread `execute_slash_command`'s extra params through so a
-/// slash payload can open modals / drive the fixissue + setup side-channels
-/// exactly as a typed command would.
-#[allow(clippy::too_many_arguments)]
+/// slash payload can open modals / drive setup side-channels exactly as a
+/// typed command would.
 pub(crate) fn fire_interval_payload(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
+    if ctx.pending_local_runtime_sync.is_some() {
+        return;
+    }
     let payload = match ctx.loop_ctrl.as_mut() {
         Some(c) => {
             c.round += 1;
@@ -540,8 +647,6 @@ pub(crate) fn fire_interval_payload(
                 ctx,
                 renderer,
                 active_modal,
-                fixissue_pending,
-                fixissue_buffer,
                 setup_pending,
             );
             if let Some(c) = ctx.loop_ctrl.as_mut() {
@@ -575,7 +680,6 @@ pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
 ///
 /// A payload starting with `/` is a slash command (split into cmd + arg on
 /// the first whitespace); anything else is a free-text prompt.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_interval_loop(
     state: &mut UiState,
     ctx: &mut LoopCtx,
@@ -583,8 +687,6 @@ pub(crate) fn start_interval_loop(
     secs: u64,
     payload: String,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) {
     let p = if payload.starts_with('/') {
@@ -611,8 +713,6 @@ pub(crate) fn start_interval_loop(
         ctx,
         renderer,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
 }
@@ -624,10 +724,17 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
+    if ctx.pending_local_runtime_sync.is_some()
+        && !matches!(cmd.to_ascii_lowercase().as_str(), "quit" | "exit")
+    {
+        renderer.render(UiLine::Error(
+            t(Msg::LocalRuntimeRestorePending).into_owned(),
+        ));
+        renderer.flush();
+        return Ok(());
+    }
     // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
     // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
     let mirror = ctx
@@ -642,8 +749,6 @@ pub(super) fn execute_slash_command(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         );
     };
@@ -658,51 +763,12 @@ pub(super) fn execute_slash_command(
         ctx,
         &mut cap,
         active_modal,
-        fixissue_pending,
-        fixissue_buffer,
         setup_pending,
     );
     if !cap.captured.is_empty() {
         live.notify_command_output(format!("/{}\n{}", cmd.trim_start_matches('/'), cap.captured));
     }
     result
-}
-
-/// 解析 `/app` 要拉起的 relay-client 二进制路径。优先级：
-///
-/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 显式覆盖（联调/特殊布局）。
-/// 2. **与 atomcode 自身可执行文件同目录** —— 同一机制同时覆盖两件事：
-///    捆绑分发（安装包/zip 把两个二进制放一起，解压到任意目录都能找到）
-///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
-/// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
-///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
-/// 4. 以上都没有 → 自动从 GitCode Release 下载到 ~/.atomcode/bin/。
-fn resolve_relay_client_bin() -> String {
-    const BARE: &str = "atomcode-relay-client";
-
-    // 1) 显式环境变量覆盖（非空才采纳）。
-    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-
-    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
-    let exe_name = if cfg!(windows) {
-        "atomcode-relay-client.exe"
-    } else {
-        BARE
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
-            if sibling.is_file() {
-                return sibling.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    // 3) PATH 兜底。
-    BARE.to_string()
 }
 
 /// 中继客户端 oss 下载地址。
@@ -724,7 +790,7 @@ const FALLBACK_BINARIES: &[(&str, &str, u64)] = &[
     ("x86_64-macos", "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03", 4916448),
     ("x86_64-linux", "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94", 5263216),
     ("aarch64-linux", "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d", 4661464),
-    ("aarch64-ohos", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
+    ("ohos-arm64", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
     ("x86_64-win", "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e", 5683344),
 ];
 
@@ -777,7 +843,7 @@ fn relay_client_target() -> &'static str {
     #[cfg(target_env = "ohos")]
     {
         return match std::env::consts::ARCH {
-            "aarch64" | "arm64" => "aarch64-ohos",
+            "aarch64" | "arm64" => "ohos-arm64",
             _ => "unknown",
         };
     }
@@ -829,49 +895,70 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
+/// 解析 relay-client 二进制路径。优先级：
+/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 开发者/特殊部署覆盖。
+/// 2. 与 atomcode 自身可执行文件同目录 —— 安装包捆绑分发。
+fn resolve_relay_client_bin() -> Option<String> {
+    // 1) 显式环境变量覆盖（非空才采纳）。
+    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
+        if !p.is_empty() && std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+
+    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
+    let exe_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
+            if sibling.is_file() {
+                return Some(sibling.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
 /// 确保 relay-client 二进制可用。
-/// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
+/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到 ~/.atomcode/bin/。
 fn ensure_relay_client_bin() -> Result<String, String> {
+    // 先尝试环境变量和同目录
+    if let Some(bin) = resolve_relay_client_bin() {
+        return Ok(bin);
+    }
+
     let bare_name = if cfg!(windows) {
         "atomcode-relay-client.exe"
     } else {
         "atomcode-relay-client"
     };
 
-    // 跳过下载标志
-    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        let local = resolve_relay_client_bin();
-        if local != bare_name || std::path::Path::new(&local).is_file() {
-            return Ok(local);
-        }
-        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-                    请手动将 relay-client 放入 PATH 或与 atomcode 同目录".to_string());
-    }
-
-    // 1-3: 先尝试本地查找
-    let local = resolve_relay_client_bin();
-
-    // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
-    if local != bare_name {
-        return Ok(local);
-    }
-    // 裸名也可能是 PATH 上的文件
-    if std::path::Path::new(&local).is_file() {
-        return Ok(local);
-    }
-
-    // 4) 检查缓存目录 ~/.atomcode/bin/
     let cache_dir = dirs::home_dir()
         .map(|h| h.join(".atomcode").join("bin"))
         .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
     let cache_path = cache_dir.join(bare_name);
     let version_path = cache_dir.join(".version");
 
-    // 5) 检测平台
+    // 缓存已存在 → 直接使用
+    if cache_path.is_file() {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
+
+    // 跳过下载标志
+    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
+        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+                    请手动将 relay-client 放入 ~/.atomcode/bin/ 目录".to_string());
+    }
+
+    // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
         return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 PATH 中",
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 ~/.atomcode/bin/ 中",
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
@@ -1076,19 +1163,8 @@ fn execute_slash_command_impl(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
-    // entry that consumes them (the `/fixissue` arm was removed; the
-    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
-    // event_loop/mod.rs's AgentEvent handler still drains them on
-    // TurnComplete). They stay in the signature so callers don't have to
-    // change, and so a future restoration of the slash command is a
-    // one-arm-add rather than a refactor.
-    let _ = (&fixissue_pending, &fixissue_buffer);
-
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
@@ -1153,11 +1229,11 @@ fn execute_slash_command_impl(
         "save" => {
             // Export the full current conversation (every real user prompt +
             // assistant reply, in order) to a local markdown file.
-            //   /save            → ./atomcode-session-YYYYMMDD-HHMMSS.md
-            //   /save report.md  → ./report.md (relative to cwd)
+            //   /save            → <working-dir>/atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → <working-dir>/report.md
             //   /save /abs/x.md  → absolute path
             // Existing files are overwritten; missing parent dirs are an error.
-            match resolve_save(&ctx.current_session.messages, arg) {
+            match resolve_save_in(&ctx.current_session.messages, arg, &ctx.working_dir) {
                 SaveOutcome::Ok(path) => {
                     let path_str = path.to_string_lossy();
                     renderer.render(UiLine::CommandOutput(
@@ -1332,18 +1408,24 @@ fn execute_slash_command_impl(
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedPlanMode).into_owned(),
-            ));
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Plan)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Plan);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedPlanMode).into_owned()));
             renderer.flush();
         }
         "build" => {
             state.agent_mode = AgentMode::Build;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSwitchedBuildMode).into_owned(),
-            ));
+            state.build_badge_visible = true;
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Build)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Build);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedBuildMode).into_owned()));
+            renderer.flush();
+        }
+        "auto" => {
+            state.agent_mode = AgentMode::Auto;
+            ctx.agent.cmd_tx.send(AgentCommand::SetMode(AgentMode::Auto)).ok();
+            atomcode_daemon::live_set_mode(AgentMode::Auto);
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdSwitchedAutoMode).into_owned()));
             renderer.flush();
         }
         "review" => {
@@ -1416,7 +1498,6 @@ fn execute_slash_command_impl(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
-                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     // Refresh the footer context window now (see model_picker
                     // Enter handler) — no turn fires here either, so the cached
@@ -1470,11 +1551,11 @@ fn execute_slash_command_impl(
             if arg.is_empty() {
                 *active_modal = Some(Box::new(LanguagePicker::open()));
             } else {
-                match arg.parse::<atomcode_core::locale::Locale>() {
+                match arg.parse::<atomcode_config::locale::Locale>() {
                     Ok(locale) => {
                         crate::i18n::set_locale(locale);
                         ctx.config.language = Some(locale);
-                        let config_path = atomcode_core::config::Config::default_path();
+                        let config_path = atomcode_config::config::Config::default_path();
                         if let Err(e) = ctx.config.save(&config_path) {
                             // TODO: surface via renderer once a non-modal error display is available
                             eprintln!("[language] failed to save config: {e}");
@@ -1483,8 +1564,8 @@ fn execute_slash_command_impl(
                         // so /language en and /language zh both echo a
                         // human-readable name, not just the locale code.
                         let label = match locale {
-                            atomcode_core::locale::Locale::En => "English",
-                            atomcode_core::locale::Locale::ZhCn => "简体中文",
+                            atomcode_config::locale::Locale::En => "English",
+                            atomcode_config::locale::Locale::ZhCn => "简体中文",
                         };
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::LanguageSwitched {
@@ -1590,9 +1671,8 @@ fn execute_slash_command_impl(
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
         }
-        "cost" => {
-            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
-            renderer.flush();
+        "usage" | "cost" => {
+            open_usage(renderer, active_modal);
         }
         "context" => {
             // `/context` = breakdown only.
@@ -1619,53 +1699,77 @@ fn execute_slash_command_impl(
                 .ok();
         }
         "compact" => {
-            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-            // Agent streams the authoritative result back as TextDelta
-            // ("nothing to compact" / "compacted — dropped N messages").
-            // Don't pre-render a placeholder — the agent's reply could
-            // contradict it when the conversation is too short.
-            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+            if let Err(error) = compact_sync_guard(
+                ctx.sync_session.is_some(),
+                ctx.pending_local_runtime_sync.is_some(),
+            ) {
+                // LiveSession owns the authoritative conversation while attached.
+                // The local runtime is intentionally stale after remote turns.
+                renderer.render(UiLine::Error(t(error).into_owned()));
+                renderer.flush();
+            } else {
+                let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+                // The runtime reports the authoritative outcome asynchronously.
+                // Don't pre-render a placeholder: a committed shrink and a
+                // short-conversation no-op produce different output based on the
+                // current runtime state.
+                if let Err(error) = ctx.runtime.compact(focus) {
+                    renderer.render(UiLine::Error(error.to_string()));
+                    renderer.flush();
+                }
+            }
         }
         "remember" => {
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
                 renderer.flush();
             } else {
-                let (content, global) = if text.starts_with("--global ") {
-                    (text[9..].trim().to_string(), true)
+                let (content, global) = if let Some(rest) = text.strip_prefix("--global ") {
+                    (rest.trim().to_string(), true)
                 } else {
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
-                    renderer.flush();
                 } else {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::Remember { content, global })
-                        .ok();
+                    let store = if global { MemoryStore::global() } else { MemoryStore::project(&ctx.working_dir) };
+                    let scope = if global { "global" } else { "project" };
+                    // Dedup on write (parity with the model-facing `memory` tool) so a
+                    // repeated /remember of the same line doesn't double-write.
+                    match store.append_deduped(&content) {
+                        Ok(true) => renderer.render(UiLine::CommandOutput(format!("Remembered ({scope}): {content}"))),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(format!("Already remembered ({scope}): {content}"))),
+                        Err(e) => renderer.render(UiLine::Error(format!("Failed to remember: {e}"))),
+                    }
                 }
+                renderer.flush();
             }
         }
         "forget" => {
             let keyword = arg.trim();
             if keyword.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
-                renderer.flush();
             } else {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::Forget {
-                        keyword: keyword.to_string(),
-                    })
-                    .ok();
+                let mut removed = MemoryStore::project(&ctx.working_dir).remove_matching(keyword).unwrap_or_default();
+                removed.extend(MemoryStore::global().remove_matching(keyword).unwrap_or_default());
+                let msg = if removed.is_empty() {
+                    format!("No memory entries matched '{keyword}'.")
+                } else {
+                    format!("Forgot {} entr{}.", removed.len(), if removed.len() == 1 { "y" } else { "ies" })
+                };
+                renderer.render(UiLine::CommandOutput(msg));
             }
+            renderer.flush();
         }
         "memory" => {
-            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&ctx.working_dir);
+            let name = ctx.working_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+            let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
+            let out = if merged.trim().is_empty() { "(memory is empty)".to_string() } else { merged };
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
         }
         "webui" => {
             let a = arg.trim();
@@ -1701,7 +1805,7 @@ fn execute_slash_command_impl(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
@@ -1722,13 +1826,15 @@ fn execute_slash_command_impl(
         }
         "sync" => {
             if arg.trim() == "off" {
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
+                match detach_live_session(ctx) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput(
+                        "已退出同步，正在把最新会话交给本地 runtime".to_string(),
+                    )),
+                    Ok(false) => renderer.render(UiLine::CommandOutput(
+                        "当前未处于同步模式".to_string(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
-                ctx.sync_session = None;
-                renderer.render(UiLine::CommandOutput(
-                    "已退出同步，回到独立会话".to_string(),
-                ));
             } else {
                 // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
                 // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
@@ -1737,10 +1843,29 @@ fn execute_slash_command_impl(
                     ctx.working_dir.clone(),
                     ctx.telemetry.clone(),
                     Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
+                    ctx.current_session.to_conversation_snapshot(),
                 );
                 attach_live_session(ctx, renderer, session, true);
             }
+            renderer.flush();
+        }
+        "desktop" => {
+            // Detect an installed AtomCode desktop app (new "Desktop" preferred
+            // over old "Air"); launch it, or point the user at the download page.
+            let home = crate::platform::home_dir().unwrap_or_default();
+            let env = |k: &str| std::env::var(k).ok();
+            let cands = super::desktop::candidate_apps(&home, &env);
+            let line = match super::desktop::detect(&cands, |p| p.exists()) {
+                Some(c) => {
+                    let path = c.path.display().to_string();
+                    match super::desktop::launch(c) {
+                        Ok(()) => t(Msg::DesktopOpening { name: c.display_name, path: &path }).into_owned(),
+                        Err(e) => t(Msg::DesktopLaunchFailed { path: &path, err: &e.to_string() }).into_owned(),
+                    }
+                }
+                None => t(Msg::DesktopNotInstalled { url: super::desktop::DOWNLOAD_URL }).into_owned(),
+            };
+            renderer.render(UiLine::CommandOutput(line));
             renderer.flush();
         }
         "app" => {
@@ -1786,6 +1911,10 @@ fn execute_slash_command_impl(
 
             let a = arg.trim();
             let msg = if a == "stop" {
+                // Remote access must stop immediately even when the live session
+                // is busy. A failed handoff keeps only the TUI attached so it can
+                // continue receiving the in-flight turn safely.
+                let detach_error = detach_live_session(ctx).err();
                 let killed = ctx
                     .app_relay_child
                     .take()
@@ -1793,16 +1922,16 @@ fn execute_slash_command_impl(
                         let _ = c.start_kill();
                     })
                     .is_some();
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
-                }
-                ctx.sync_session = None;
                 let server_stopped = atomcode_daemon::stop_app_server();
-                if killed || server_stopped {
+                let mut output = if killed || server_stopped {
                     "已停止 App 远程访问".to_string()
                 } else {
                     "App 远程访问未在运行".to_string()
+                };
+                if let Some(error) = detach_error {
+                    output.push_str(&format!("\n{error}；TUI 暂时保持同步"));
                 }
+                output
             } else {
                 // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
                 // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
@@ -1822,14 +1951,10 @@ fn execute_slash_command_impl(
                         .to_string(),
                     Some(relay) => {
                         // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
-                        let (initial, sid) = if ctx.current_session.messages.is_empty() {
-                            (Vec::new(), None)
-                        } else {
-                            (
-                                ctx.current_session.messages.clone(),
-                                Some(ctx.current_session.id.clone()),
-                            )
-                        };
+                        let initial = ctx.current_session.to_conversation_snapshot();
+                        let sid = (!initial.messages.is_empty()
+                            || !initial.cold_summaries.is_empty())
+                        .then(|| ctx.current_session.id.clone());
                         // 合并 main 后函数更名为 ensure_live_session,且 session_id
                         // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
                         let session = atomcode_daemon::ensure_live_session(
@@ -1848,11 +1973,8 @@ fn execute_slash_command_impl(
                         }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
-                        //    清理旧的 sync 状态，避免旧 forwarder task 残留。
-                        if let Some(h) = ctx.sync_forwarder.take() {
-                            h.abort();
-                        }
-                        ctx.sync_session = None;
+                        //    Keep any current sync attachment until startup succeeds;
+                        //    attach_live_session replaces it atomically on the success path.
                         atomcode_daemon::stop_app_server();
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
@@ -1920,9 +2042,8 @@ fn execute_slash_command_impl(
                                         match cmd.spawn() {
                                             Err(e) => format!(
                                                 "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                                 relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
-                                                 请确认它在 PATH 中或与 atomcode 同目录，\
-                                                 也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
+                                                 请确认 relay-client 在 ~/.atomcode/bin/ 目录下，\
+                                                 或删除该目录后重试 /app 自动下载。"
                                             ),
                                             Ok(child) => {
                                                 if let Some(mut old) = ctx.app_relay_child.take() {
@@ -1942,14 +2063,26 @@ fn execute_slash_command_impl(
                                                 );
                                                 // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
                                                 attach_live_session(ctx, renderer, session, false);
+                                                use base64::Engine;
+                                                let encoded = base64::engine::general_purpose::STANDARD
+                                                    .encode(pair_uri.as_bytes());
                                                 match crate::render::qr::render_login_qr(
                                                     &pair_uri,
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 GitCode App 扫码连接
-                                                        \n{q}\n\
-                                                         （/app stop 断开）"
+                                                        "📱 使用 GitCode App 连接\n\
+                                                        \n\
+                                                        1. 在手机应用商店搜索「GitCode」下载最新版 App\n\
+                                                        2. 打开 App → 首页 → AtomCode 模块 → 扫一扫\n\
+                                                        3. 对准下方二维码即可配对连接\n\
+                                                        \n\
+                                                        {q}\n\
+                                                        \n\
+                                                        也可复制以下口令在App中连接：\n\
+                                                        {encoded}\n\
+                                                        \n\
+                                                        （/app stop 断开连接）"
                                                     ),
                                                     None => format!(
                                                         "配对链接（二维码生成失败，手动填）：{pair_uri}"
@@ -2016,12 +2149,12 @@ fn execute_slash_command_impl(
                 // Rollback is sync and fast (three renames). Run inline
                 // so the user sees the result immediately without waiting
                 // for an async task to schedule.
-                match atomcode_core::self_update::run_rollback() {
+                match atomcode_updater::run_rollback() {
                     Ok(sum) => {
                         // Route through the event channel so rendering
                         // and "set done → exit" logic stays in one place.
                         let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                            atomcode_updater::UpgradeEvent::RolledBack {
                                 exe: sum.exe,
                                 backup: sum.backup,
                             },
@@ -2030,7 +2163,7 @@ fn execute_slash_command_impl(
                     Err(e) => {
                         let _ =
                             ctx.upgrade_tx
-                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                .send(atomcode_updater::UpgradeEvent::Failed(format!(
                                     "{:#}",
                                     e
                                 )));
@@ -2056,37 +2189,15 @@ fn execute_slash_command_impl(
                     // we translate to a Failed event so the TUI layer
                     // only has to handle one event stream.
                     if let Err(e) =
-                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                        atomcode_updater::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                        let _ = tx.send(atomcode_updater::UpgradeEvent::Failed(format!(
                             "{:#}",
                             e
                         )));
                     }
                 });
             }
-        }
-        "issue" => {
-            // Two-step wizard to file a NEW issue against the **atomcode
-            // upstream repo** (atomgit_atomcode/atomcode), NOT against
-            // the user's current working project. Use case is in-tool
-            // bug reports / feature requests for atomcode itself; using
-            // cwd would be confusing (a user reporting an atomcode bug
-            // while in some unrelated repo would land their issue in
-            // the wrong place, or get blocked by cwd validation).
-            //
-            // Step 1 collects a title (required), step 2 collects a
-            // description (required, Shift+Enter for newlines). On
-            // submit the event loop's post-close branch POSTs
-            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
-            // new issue URL into scrollback.
-            let _ = arg; // reserved for future options (e.g. --template)
-            let mut wiz = IssueWizard::open(
-                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
-                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
-            );
-            wiz.emit_prompt(renderer);
-            *active_modal = Some(Box::new(wiz));
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
@@ -2147,10 +2258,10 @@ fn execute_slash_command_impl(
                     let old_short_id = ctx.current_session.short_id().to_string();
                     let new_session = Session::default_session(ctx.working_dir.clone());
                     let new_short_id = new_session.short_id().to_string();
-                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let (runtime_id, endpoint, new_session) = spawn_runtime(ctx, new_session);
                     let old_state = foreground_state_from_ui(state);
                     let slot = match ctx.bg_manager.background_current(
-                        client.clone(),
+                        endpoint.clone(),
                         new_session.clone(),
                         runtime_id,
                         old_state,
@@ -2166,11 +2277,18 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
                     };
 
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    // The todo panel is per-session and is NOT cleared at turn end;
+                    // this fresh foreground session has no todos, so drop the prior
+                    // session's list (mirrors reset_to_new_session / SessionSwitched).
+                    state.active_todos = None;
+                    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
+                    state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
                     // (same anti-flicker as `/resume`). Self-contained: the
@@ -2216,7 +2334,7 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                     };
-                    let Some(client) = outcome.resumed_client else {
+                    let Some(endpoint) = outcome.resumed_endpoint else {
                         renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
                         renderer.flush();
                         return Ok(());
@@ -2227,7 +2345,8 @@ fn execute_slash_command_impl(
                     // session (and clear the stale footer). ClearLoop reaches the outgoing
                     // agent before the swap below.
                     stop_active_loop(state, ctx);
-                    ctx.agent = client;
+                    ctx.agent = endpoint.legacy;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
@@ -2246,7 +2365,9 @@ fn execute_slash_command_impl(
                     // lack corresponding ToolResult entries.
                     let pending_approval = find_pending_approval(&ctx.current_session);
                     if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt {
+                        state.approval_panel = Some(crate::state::ApprovalPanel {
+                            options: crate::event_loop::build_approval_options(&tool_name),
+                            selected: 0,
                             tool: tool_name,
                             detail,
                         });
@@ -2286,8 +2407,8 @@ fn execute_slash_command_impl(
                         Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
-                        if let Some(client) = dropped.client.as_ref() {
-                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        if let Some(endpoint) = dropped.endpoint.as_ref() {
+                            endpoint.legacy.cmd_tx.send(AgentCommand::Cancel).ok();
                         }
                     }
                     if !dropped.session.messages.is_empty() {
@@ -2327,10 +2448,10 @@ fn execute_slash_command_impl(
             let mut session = Session::default_session(ctx.working_dir.clone());
             session.name = short_task_name(task);
             let short_id = session.short_id().to_string();
-            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let (runtime_id, endpoint, session) = spawn_runtime(ctx, session);
             let slot = match ctx.bg_manager.push_background_runtime(
                 runtime_id,
-                client.clone(),
+                endpoint.clone(),
                 session,
                 bg_runtime::RuntimeState::Running,
             ) {
@@ -2344,7 +2465,8 @@ fn execute_slash_command_impl(
                 }
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
             };
-            client
+            endpoint
+                .legacy
                 .cmd_tx
                 .send(AgentCommand::SendMessage {
                     text: task.to_string(),
@@ -2362,50 +2484,11 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "init" => {
-            // Generate .atomcode.md from project structure. Refuses to
-            // overwrite by default — `/init --force` opts in. The file is
-            // picked up by agent::prompt next time the system prompt is
-            // built; in-flight turns finish on the old prompt.
-            let target = ctx.working_dir.join(".atomcode.md");
-            let force = matches!(arg.trim(), "--force" | "force");
-            if target.exists() && !force {
-                let path_str = target.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::InitAlreadyExists { path: &path_str }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-            let content = crate::init::generate_project_instructions(&ctx.working_dir);
-            match std::fs::write(&target, &content) {
-                Ok(()) => {
-                    let path_str = target.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote {
-                            path: &path_str,
-                            bytes: content.len(),
-                        })
-                        .into_owned(),
-                    ));
-                    // Confirm the file is reachable for the prompt-builder by
-                    // re-running the same load that `/status` uses. If the
-                    // freshly written file does NOT appear under PROJECT here,
-                    // the user knows immediately — instead of asking the AI
-                    // a question and trying to infer load state from its
-                    // answer.
-                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
-                        &ctx.working_dir,
-                    )));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::InitFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
-            }
+            // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
+            // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
+            // static .atomcode.md generator.
+            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
         "mcp" => {
@@ -2979,8 +3062,6 @@ fn execute_slash_command_impl(
                         secs,
                         payload,
                         active_modal,
-                        fixissue_pending,
-                        fixissue_buffer,
                         setup_pending,
                     );
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
@@ -3148,16 +3229,38 @@ fn execute_slash_command_impl(
             }
         }
         "todo" => {
-            // Derive the current todo list from the session transcript and
-            // print it.  Stateless: finds the last `todowrite` tool call in
-            // `ctx.current_session.messages` and re-renders its payload.
-            // No args used; any extra text is silently ignored.
-            let out = format_todo_command(
-                &ctx.current_session.messages,
-                ctx.caps.unicode_symbols,
-            );
-            renderer.render(UiLine::CommandOutput(out));
-            renderer.flush();
+            // `/todo` derives + prints the current list. `/todo clear` (first
+            // word "clear", extra words ignored) deterministically wipes it
+            // (reseeds the kernel with an empty `todowrite`) so cancelled/stale
+            // tasks stop reappearing — then the print shows the now-empty "no
+            // list" as confirmation.
+            let want_clear = arg
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("clear"));
+            if want_clear && ctx.sync_session.is_some() {
+                // Sync mode: the conversation is owned by the daemon. A local
+                // reseed would target the idle local runtime AND clobber the
+                // daemon's authoritative session snapshot — refuse instead.
+                renderer.render(UiLine::CommandOutput(
+                    "同步模式下暂不支持 /todo clear（会话由服务端维护）——退出同步后再清空。"
+                        .to_string(),
+                ));
+                renderer.flush();
+            } else {
+                // Only reseed when there's actually something to clear, so a
+                // no-op `/todo clear` doesn't pollute the transcript with an
+                // empty-todowrite pair.
+                if want_clear && state.active_todos.is_some() {
+                    clear_todos(ctx, state);
+                }
+                let out = format_todo_command(
+                    &ctx.current_session.messages,
+                    ctx.caps.unicode_symbols,
+                );
+                renderer.render(UiLine::CommandOutput(out));
+                renderer.flush();
+            }
         }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
@@ -3176,39 +3279,12 @@ fn execute_slash_command_impl(
                         submit_agent_turn(ctx, state, rendered);
                     } else {
                         // Unknown command — emit failure telemetry
-                        let available_commands: Vec<&str> = vec![
-                            "help",
-                            "quit",
-                            "exit",
-                            "clear",
-                            "compact",
-                            "reload",
-                            "config",
-                            "plan",
-                            "build",
-                            "session",
-                            "model",
-                            "language",
-                            "resume",
-                            "rename",
-                            "provider",
-                            "status",
-                            "diff",
-                            "undo",
-                            "cost",
-                            "context",
-                            "remember",
-                            "forget",
-                            "memory",
-                            "login",
-                            "logout",
-                            "whoami",
-                            "upgrade",
-                            "issue",
-                            "cd",
-                            "bg",
-                            "codingplan",
-                        ];
+                        let available_commands: Vec<&str> =
+                            crate::commands::CommandRegistry::builtin()
+                                .all()
+                                .iter()
+                                .map(|command| command.name)
+                                .collect();
                         ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
                             type_: other.to_string(),
                             success: Some(false),
@@ -4271,67 +4347,6 @@ fn format_context_report(
     out
 }
 
-/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
-/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
-/// the event loop's post-close hook when `IssueWizard` has stashed a
-/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
-/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
-/// Run it arms the post-completion hook (`fixissue_pending` +
-/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
-/// UiState to Streaming via `state.on_submit()`.
-/// Currently unused — the `/fixissue` slash command was removed from
-/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
-/// a future restoration of the slash command can re-add a one-line
-/// dispatcher arm without re-implementing this whole flow. The
-/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
-/// directly and does not depend on this function.
-#[allow(dead_code)]
-pub(crate) fn launch_fixissue(
-    url: &str,
-    state: &mut UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
-) {
-    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
-            prompt,
-            issue_title,
-            issue_number,
-            issue_ref,
-        }) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
-                issue_number, issue_title,
-            )));
-            renderer.flush();
-            *fixissue_pending = Some(issue_ref);
-            fixissue_buffer.clear();
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: prompt,
-                    images: vec![],
-                    image_markers: vec![],
-                })
-                .ok();
-            state.on_submit();
-        }
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
-            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
-            renderer.flush();
-        }
-        Err(e) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  fixissue failed: {:#}\n",
-                e
-            )));
-            renderer.flush();
-        }
-    }
-}
-
 /// Assemble the `/status` body in canonical display order: the login line FIRST
 /// (so you see who you're signed in as at a glance), then the model/dir/config
 /// block, the CodingPlan section, an optional Proxy line (interactive `/status`
@@ -4377,32 +4392,6 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
     )
 }
 
-/// `/cost` 的用量报告文本。TUI arm 与手机远程执行共用。
-pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
-    let total = state.prompt_tokens + state.completion_tokens;
-    let cache_rate = if state.prompt_tokens > 0 {
-        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
-    } else {
-        0
-    };
-    let cost = crate::pricing::calculate_cost(
-        &ctx.model_name,
-        state.prompt_tokens,
-        state.completion_tokens,
-        state.cached_tokens,
-    );
-    let cost_str = crate::pricing::format_cost(cost);
-    t(Msg::CostReport {
-        prompt: state.prompt_tokens,
-        completion: state.completion_tokens,
-        cached: state.cached_tokens,
-        cache_rate,
-        total,
-        cost: &cost_str,
-    })
-    .into_owned()
-}
-
 /// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
 pub(super) fn build_whoami_text() -> String {
     if let Some(auth) = atomcode_core::auth::get_stored_auth() {
@@ -4442,12 +4431,55 @@ pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
     }
 }
 
+/// `/usage` (and its hidden alias `/cost`) — open the CodingPlan usage modal.
+///
+/// Mirrors the `"model" =>` arm pattern: render a notice and return when the
+/// precondition isn't met, otherwise push the modal into `active_modal`.
+fn open_usage(
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+) {
+    let client = match atomcode_core::coding_plan::client::Client::from_stored_auth() {
+        Ok(c) => c,
+        Err(_) => {
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::UsageCodingPlanOnly).into_owned(),
+            ));
+            renderer.flush();
+            return;
+        }
+    };
+    let status = client.status_v2().ok();
+    let window = status.as_ref().and_then(|s| {
+        s.rate_limit_windows
+            .iter()
+            .filter(|w| w.show_enable == 1)
+            .filter(|w| w.window_hours > 0)
+            .min_by_key(|w| w.window_hours)
+            .cloned()
+    });
+    let plan = status.and_then(|s| s.codingplan_free);
+    let (usage, error) = match client.usage() {
+        Ok(u) => (Some(u), None),
+        Err(e) => (None, Some(format!("{e}"))),
+    };
+    let overview = usage
+        .as_ref()
+        .map(atomcode_core::coding_plan::usage::compute_overview);
+    *active_modal = Some(Box::new(UsageModal::new(UsageData {
+        window,
+        plan,
+        usage,
+        overview,
+        error,
+    })));
+}
+
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
 /// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
-pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
+pub(super) fn run_remote_command(ctx: &LoopCtx, _state: &UiState, cmd: &str) -> Option<String> {
     match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
         "status" => Some(build_status_text(ctx, None)),
-        "cost" => Some(build_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
         "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
@@ -4483,6 +4515,9 @@ pub(crate) fn reset_to_new_session(
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
+    state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
+    state.approval_panel = None;
     // New session = new session file on disk. Old session (already saved at its
     // last TurnComplete) stays on disk so it can still be `/resume`d; we just
     // stop writing into it.
@@ -4528,7 +4563,6 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
-    ctx.runtime_factory.set_working_dir(path.clone());
     // Re-index the @-mention file index for the new working directory.
     // Without this, the popup continues showing files from the original
     // startup directory after the user runs `/cd`.
@@ -4540,15 +4574,10 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
     // sessions from the old project because the manager still points at the
     // old hash bucket.
     ctx.session_manager = SessionManager::new(&path);
-    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
-    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
-    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
-    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
-    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
-    // ctx.working_dir already equals `path`.
-    if ctx.sync_session.is_some() {
-        atomcode_daemon::live_set_working_dir(path.clone());
-    }
+    // 通知 daemon 工作目录已切换：更新 LIVE_WORKING_DIR 静态变量，
+    // 使得后续 app 通过 /live 重连时能在 snapshot 中拿到最新的目录。
+    // 不限于 sync 模式 – TUI 独立使用时 app 也应能跟随。
+    atomcode_daemon::live_set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -4590,7 +4619,7 @@ fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
 /// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
 /// so stale entries from a deleted project don't linger in the picker.
 pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| {
@@ -4607,7 +4636,7 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
 /// failure (read-only HOME, permission denied) is swallowed so it can
 /// never break an interactive `/cd`.
 pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     let content = dirs
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -4908,7 +4937,7 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 }
 
 /// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
-/// Extracted from [`resolve_save`] so unit tests can check the naming scheme
+/// Extracted from [`resolve_save_in`] so unit tests can check the naming scheme
 /// without touching the filesystem (where parallel chdir would race).
 fn default_save_filename() -> String {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -4945,12 +4974,13 @@ fn render_save_markdown(messages: &[atomcode_core::conversation::message::Messag
 }
 
 /// Map `/save [filename]` to a written file. `""` → a timestamped default
-/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the current working directory;
-/// a bare name or relative path resolves against the current working dir;
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the active project directory;
+/// a bare name or relative path resolves against `working_dir`;
 /// an absolute path is used as-is. Existing files are overwritten.
-fn resolve_save(
+fn resolve_save_in(
     messages: &[atomcode_core::conversation::message::Message],
     arg: &str,
+    working_dir: &std::path::Path,
 ) -> SaveOutcome {
     let Some(content) = render_save_markdown(messages) else {
         return SaveOutcome::EmptyHistory;
@@ -4964,10 +4994,15 @@ fn resolve_save(
         // works like it does in the shell / other file-taking commands.
         expand_tilde_path(arg, crate::platform::home_dir().as_deref())
     };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        working_dir.join(path)
+    };
 
-    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir
-    // so a typo can't silently scatter directories. An empty parent (writing
-    // to the cwd, the common relative-name case) always "exists".
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir,
+    // so a typo can't silently scatter directories. Relative paths are already
+    // rooted at `working_dir`; absolute paths are checked as provided.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
@@ -5210,10 +5245,10 @@ mod status_login_tests {
     #[test]
     fn status_body_no_longer_shows_a_token_line() {
         // /status is a quick-glance state view; per-session token count is /cost's job.
-        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
+        let en = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::En, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
-        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
+        let zh = atomcode_config::i18n::t_with(atomcode_config::i18n::Locale::ZhCn, Msg::StatusBody {
             model: "m", dir: "/d", config: "/c",
         });
         assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
@@ -5539,9 +5574,9 @@ fn run_oauth_with_renderer(
 /// inside an existing runtime panics with "Cannot drop a runtime in a
 /// context where blocking is not allowed".
 fn run_coding_plan_blocking(
-    config: &atomcode_core::config::Config,
+    config: &atomcode_config::config::Config,
     tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
-) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+) -> Result<(atomcode_config::config::Config, atomcode_core::coding_plan::SetupReport)> {
     let mut cfg = config.clone();
     let tel = tel.clone();
     // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
@@ -5706,6 +5741,68 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     Ok(())
 }
 
+/// The synthetic `todowrite`-empty call + its tool result. Appended to the
+/// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
+/// `[]` (the empty list is the last plan), while keeping the transcript's
+/// call/result pairing valid for the next request. Core (session) message model.
+fn todo_clear_messages(id: String) -> Vec<atomcode_core::conversation::message::Message> {
+    use atomcode_core::conversation::message::{Message, MessageContent, Role};
+    use atomcode_core::tool::{ToolCall, ToolResult};
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "todowrite".to_string(),
+                    arguments: r#"{"todos":[]}"#.to_string(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: Vec::new(),
+            },
+            synthetic: false,
+            internal_origin: Some("todo_clear".to_string()),
+        },
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: id,
+                output: "0 tasks".to_string(),
+                success: true,
+            }),
+            synthetic: false,
+            internal_origin: Some("todo_clear".to_string()),
+        },
+    ]
+}
+
+/// `/todo clear` — deterministically wipe the task list without waiting on the
+/// model. Appends the synthetic empty-`todowrite` pair and reseeds the kernel
+/// conversation (the proven `/resume` `SetConversation` path), so the next turn's
+/// TodoHook derives an empty list and injects nothing; then clears the live panel
+/// + local mirror and persists.
+fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
+    // Unique tool_call id per invocation (the message count grows by 2 each
+    // clear) — a constant id would collide if `/todo clear` ran twice, which a
+    // strict gateway can reject as duplicate `tool_call_id`.
+    let id = format!("todo-clear-{}", ctx.current_session.messages.len());
+    let mut snapshot = ctx.current_session.to_conversation_snapshot();
+    snapshot.messages.extend(todo_clear_messages(id));
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::SetConversation {
+            snapshot: snapshot.clone(),
+            restore_id: None,
+        })
+        .ok();
+    ctx.current_session.update_from_conversation_snapshot(snapshot);
+    ctx.current_session.touch();
+    let _ = ctx.session_manager.save(&ctx.current_session);
+    state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state);
+}
+
 /// Build the `/todo` output from the session message history.
 ///
 /// Scans the transcript backwards for the most recent `todowrite` tool call,
@@ -5718,21 +5815,18 @@ pub(crate) fn format_todo_command(
     unicode: bool,
 ) -> String {
     use atomcode_core::conversation::message::MessageContent;
-    // Walk backwards to find the last VALID `todowrite` tool-call, skipping
-    // calls whose args fail validation so an invalid final call never wipes
-    // an earlier valid list (mirrors derive_current_todos in capabilities).
-    let todos = 'found: {
-        for m in messages.iter().rev() {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                for call in tool_calls.iter().rev().filter(|c| c.name == "todowrite") {
-                    if let Ok(parsed) = atomcode_capabilities::tools::todo::parse_todos(&call.arguments) {
-                        break 'found parsed;
-                    }
-                }
-            }
-        }
-        Vec::new()
-    };
+    // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
+    // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
+    // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
+    let calls: Vec<(&str, &str)> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flat_map(|tcs| tcs.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
+        .collect();
+    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
         return t(Msg::TodoNoList).into_owned();
     }
@@ -5846,7 +5940,8 @@ mod copy_tests {
 #[cfg(test)]
 mod save_tests {
     use super::{
-        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save, SaveOutcome,
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save_in,
+        SaveOutcome,
     };
     use atomcode_core::conversation::message::{Message, Role};
     use std::path::{Path, PathBuf};
@@ -5871,7 +5966,7 @@ mod save_tests {
         let target = dir.path().join("config.py");
         std::fs::write(&target, "SECRET = 1\n").unwrap();
         let msgs = vec![Message::new(Role::User, "hi")];
-        match resolve_save(&msgs, target.to_str().unwrap()) {
+        match resolve_save_in(&msgs, target.to_str().unwrap(), dir.path()) {
             SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
             other => panic!("expected RefuseOverwrite, got {other:?}"),
         }
@@ -5886,11 +5981,11 @@ mod save_tests {
         // Existing .md → overwrite is fine (re-export).
         let md = dir.path().join("report.md");
         std::fs::write(&md, "old").unwrap();
-        assert!(matches!(resolve_save(&msgs, md.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(matches!(resolve_save_in(&msgs, md.to_str().unwrap(), dir.path()), SaveOutcome::Ok(_)));
         assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
         // A NEW non-md file (no clobber) → allowed.
         let fresh = dir.path().join("notes");
-        assert!(matches!(resolve_save(&msgs, fresh.to_str().unwrap()), SaveOutcome::Ok(_)));
+        assert!(matches!(resolve_save_in(&msgs, fresh.to_str().unwrap(), dir.path()), SaveOutcome::Ok(_)));
         assert!(Path::new(&fresh).is_file());
     }
 
@@ -5907,19 +6002,20 @@ mod save_tests {
 
     #[test]
     fn save_empty_history_when_no_messages() {
-        assert!(matches!(resolve_save(&[], ""), SaveOutcome::EmptyHistory));
+        // Empty history short-circuits before any path work, so working_dir is unused.
+        assert!(matches!(resolve_save_in(&[], "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
     fn save_empty_history_when_only_tool_messages() {
         let msgs = vec![Message::new(Role::Tool, "tool output")];
-        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+        assert!(matches!(resolve_save_in(&msgs, "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
     fn save_empty_history_when_only_whitespace() {
         let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
-        assert!(matches!(resolve_save(&msgs, ""), SaveOutcome::EmptyHistory));
+        assert!(matches!(resolve_save_in(&msgs, "", Path::new(".")), SaveOutcome::EmptyHistory));
     }
 
     #[test]
@@ -5963,11 +6059,28 @@ mod save_tests {
     }
 
     #[test]
+    fn save_writes_relative_path_in_active_working_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+
+        match resolve_save_in(&msgs, "session.md", tmp.path()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(
+                    got,
+                    tmp.path().join("session.md").canonicalize().unwrap()
+                );
+                assert!(got.is_file());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn save_writes_custom_absolute_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("report.md");
         let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::Ok(got) => {
                 // canonicalize() may add a platform-specific prefix
                 // (e.g. \\?\ on Windows), so compare by file name + read-back
@@ -5977,7 +6090,7 @@ mod save_tests {
                 assert!(content.contains("## User\nping"));
                 assert!(content.contains("## Assistant\npong"));
             }
-            _ => panic!("expected Ok, got {:?}", resolve_save(&msgs, path.to_str().unwrap())),
+            _ => panic!("expected Ok, got {:?}", resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path())),
         }
     }
 
@@ -5987,7 +6100,7 @@ mod save_tests {
         let path = tmp.path().join("old.md");
         std::fs::write(&path, "OLD CONTENT").expect("seed");
         let msgs = conv(&[("user", "new turn")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::Ok(got) => {
                 assert_eq!(got.file_name(), path.file_name());
                 let content = std::fs::read_to_string(&got).expect("read");
@@ -6003,7 +6116,7 @@ mod save_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("nonexistent_dir").join("out.md");
         let msgs = conv(&[("user", "hi")]);
-        match resolve_save(&msgs, path.to_str().unwrap()) {
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
             SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
             other => panic!("expected InvalidPath, got {other:?}"),
         }
@@ -6067,6 +6180,27 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_sync_guard_rejects_stale_local_runtime() {
+        assert_eq!(
+            compact_sync_guard(true, false),
+            Err(Msg::CompactUnavailableDuringSync)
+        );
+    }
+
+    #[test]
+    fn compact_sync_guard_waits_for_local_runtime_restore() {
+        assert_eq!(
+            compact_sync_guard(false, true),
+            Err(Msg::CompactUnavailableDuringResync)
+        );
+    }
+
+    #[test]
+    fn compact_sync_guard_allows_restored_local_runtime() {
+        assert_eq!(compact_sync_guard(false, false), Ok(()));
+    }
 
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and
@@ -6547,12 +6681,27 @@ mod tests {
 }
 
 #[cfg(test)]
+mod memory_command_tests {
+    #[test]
+    fn remember_project_writes_directly_to_store() {
+        use atomcode_capabilities::memory::MemoryStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::project(tmp.path());
+        // 迁移后 /remember 走 MemoryStore::project(cwd).append —— 这里直接验证 store 语义,
+        // 命令臂在 Step 4 改为调用它。
+        store.append("uses tabs not spaces").unwrap();
+        let entries = MemoryStore::project(tmp.path()).load();
+        assert!(entries.iter().any(|e| e == "uses tabs not spaces"));
+    }
+}
+
+#[cfg(test)]
 mod todo_command_tests {
     use super::{decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch};
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
     use atomcode_core::conversation::message::{Message, MessageContent, Role};
-    use atomcode_core::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
     use atomcode_core::tool::ToolCall;
     use std::path::PathBuf;
 
@@ -6580,6 +6729,7 @@ mod todo_command_tests {
                 thinking_blocks: vec![],
             },
             synthetic: false,
+            internal_origin: None,
         }];
         let out = format_todo_command(&with, false);
         assert!(out.contains("[ ] do x"), "expected '[ ] do x' in output, got:\n{out}");
@@ -6673,6 +6823,36 @@ mod todo_command_tests {
     }
 
     #[test]
+    fn todo_clear_pair_folds_the_list_to_empty() {
+        // A live plan, then the `/todo clear` synthetic pair appended, must
+        // derive to an empty list → `/todo` shows the "no list" message. This
+        // is what makes cancelled/stale tasks stop reappearing.
+        let mut msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        }];
+        assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
+        msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
+        let no_list = t(Msg::TodoNoList).into_owned();
+        assert!(
+            format_todo_command(&msgs, false).contains(&no_list),
+            "after the clear pair, /todo must show the no-list message; got:\n{}",
+            format_todo_command(&msgs, false)
+        );
+    }
+
+    #[test]
     fn dispatch_required_whitespace_only_arg_is_rejected() {
         // The dispatcher trims before checking emptiness, so a bare
         // space/tab arg should also reject — otherwise the user could
@@ -6692,6 +6872,40 @@ mod todo_command_tests {
             matches!(decision, CustomDispatch::Reject),
             "Required command with whitespace-only arg must be rejected, got {:?}",
             decision
+        );
+    }
+
+    #[test]
+    fn todo_command_applies_incremental_updates_after_the_plan() {
+        // Merge regression: `/todo` folds via `reduce_todos`, so a `{action:update}` after the
+        // plan is reflected — not just the initial (pending) plan.
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "1".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+                    },
+                    ToolCall {
+                        id: "2".into(),
+                        name: "todowrite".into(),
+                        arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+                    },
+                ],
+                reasoning_content: None,
+                thinking_blocks: vec![],
+            },
+            synthetic: false,
+            internal_origin: None,
+        }];
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("do x"), "task shown: {out}");
+        assert!(
+            !out.contains("[ ] do x"),
+            "must reflect the completed update, not the pending plan: {out}"
         );
     }
 
@@ -6948,5 +7162,11 @@ mod todo_command_tests {
             "Submit must not render any Error line, got {:?}",
             rec.lines
         );
+    }
+
+    #[test]
+    fn init_submits_the_coding_init_prompt() {
+        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
+        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
     }
 }

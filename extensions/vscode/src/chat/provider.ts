@@ -14,6 +14,7 @@ import {
   ProvidersResponse,
   ImageInput,
   PermissionDecision,
+  SessionMeta,
 } from '../daemon/types';
 import { getQuickActionPrompt } from './quickActions';
 import {
@@ -32,9 +33,60 @@ type WorkspacePathItem = { path: string; fileName: string; relativePath: string;
 type PanelSessionInfo = {
   sessionId: string;
   projectHash?: string;
+  workingDir?: string;
   messages?: MessageInfo[];
   messagesPromise?: Promise<MessageInfo[] | undefined>;
 };
+
+type SessionMetaLike = SessionMeta & {
+  isGenerating?: boolean;
+  hasUnread?: boolean;
+};
+
+type LoadedSessionsForDisplay = {
+  sessions: SessionMetaLike[];
+  currentProjectHash?: string;
+  workspaceFolder?: string;
+};
+
+function sessionUpdatedAt(session: SessionMetaLike): number {
+  return typeof session.updated_at === 'number' ? session.updated_at : 0;
+}
+
+function sessionKey(session: SessionMetaLike, fallbackProjectHash?: string): string {
+  return `${session.project_hash || fallbackProjectHash || session.working_dir || 'unknown'}:${session.id}`;
+}
+
+export function mergeSessionsForDisplay(
+  globalSessions: SessionMetaLike[],
+  currentProjectSessions: SessionMetaLike[],
+  currentProjectHash?: string,
+): SessionMetaLike[] {
+  if (currentProjectHash) {
+    const current = new Map<string, SessionMetaLike>();
+    for (const session of currentProjectSessions) {
+      const withProjectHash = {
+        ...session,
+        project_hash: session.project_hash || currentProjectHash,
+      };
+      current.set(sessionKey(withProjectHash, currentProjectHash), withProjectHash);
+    }
+    return Array.from(current.values()).sort((a, b) => sessionUpdatedAt(b) - sessionUpdatedAt(a));
+  }
+
+  const merged = new Map<string, SessionMetaLike>();
+  for (const session of globalSessions) {
+    merged.set(sessionKey(session), session);
+  }
+  for (const session of currentProjectSessions) {
+    const withProjectHash = {
+      ...session,
+      project_hash: session.project_hash || currentProjectHash,
+    };
+    merged.set(sessionKey(withProjectHash, currentProjectHash), withProjectHash);
+  }
+  return Array.from(merged.values()).sort((a, b) => sessionUpdatedAt(b) - sessionUpdatedAt(a));
+}
 
 interface SessionRuntime {
   abortController?: AbortController;
@@ -43,7 +95,7 @@ interface SessionRuntime {
   projectHash?: string;
   errorMessage?: string;
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
 }
@@ -87,6 +139,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
     private readonly _client: DaemonClient,
   ) {}
+
+  private async _loadSessionsForDisplay(): Promise<LoadedSessionsForDisplay> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspaceFolder) {
+      try {
+        const currentProjectSessions = await this._client.listSessionsForWorkingDir(workspaceFolder) as SessionMetaLike[];
+        const currentProjectHash = currentProjectSessions.find((session) => session.project_hash)?.project_hash;
+        return {
+          sessions: currentProjectHash
+            ? mergeSessionsForDisplay([], currentProjectSessions, currentProjectHash)
+            : currentProjectSessions,
+          currentProjectHash,
+          workspaceFolder,
+        };
+      } catch {
+        // Fall back to the global list only if the scoped endpoint is unavailable.
+      }
+    }
+
+    const globalSessions = await this._client.listSessions() as SessionMetaLike[];
+    return { sessions: globalSessions };
+  }
 
   public dispose() {
     this._clearLoginPoll();
@@ -617,7 +691,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const session = await this._client.createSession(undefined, workspaceFolder);
       sid = session.id;
       this._getRuntime(sid).projectHash = session.project_hash;
-      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash, workingDir: session.working_dir });
       this.openInTab(sid);
       await this._refreshSessions();
     } else {
@@ -647,7 +721,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const session = await this._client.createSession(undefined, workspaceFolder);
       sid = session.id;
       this._getRuntime(sid).projectHash = session.project_hash;
-      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash, workingDir: session.working_dir });
       this.openInTab(sid);
       await this._refreshSessions();
     }
@@ -681,7 +755,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._getRuntime(sessionId).projectHash = session.project_hash;
 
     // Open new tab for the new session
-    this._panelSessions.set(sessionId, { sessionId, projectHash });
+    this._panelSessions.set(sessionId, { sessionId, projectHash, workingDir: session.working_dir });
     this.openInTab(sessionId);
 
     // Notify all panels + sidebar about the new active session
@@ -825,6 +899,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolStart', data: { id, name, args } });
         this._postMessageToPanel(streamSessionId, { type: 'toolStart', id, name, args });
+      },
+      onToolProgress: (id, progress) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'toolProgress', data: { id, progress } });
+        this._postMessageToPanel(streamSessionId, { type: 'toolProgress', id, progress });
       },
       onToolResult: (id, name, output, success, durationMs) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -1047,7 +1127,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._getRuntime(session.id).projectHash = session.project_hash;
 
     if (sid) {
-      this._panelSessions.set(sid, { sessionId: session.id, projectHash: session.project_hash });
+      this._panelSessions.set(sid, { sessionId: session.id, projectHash: session.project_hash, workingDir: session.working_dir });
     }
 
     await this._refreshSessions();
@@ -1091,8 +1171,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     } catch { /* daemon not available */ }
 
+    let currentProjectHash: string | undefined;
     try {
-      const sessions = await this._client.listSessions();
+      const loaded = await this._loadSessionsForDisplay();
+      const sessions = loaded.sessions;
+      currentProjectHash = loaded.currentProjectHash;
       await this._annotateSessionGenerating(sessions as any[]);
       this._postMessage({ type: 'sessions', sessions }, webview);
     } catch {}
@@ -1128,7 +1211,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const projectHash = sid ? (this._panelSessions.get(sid)?.projectHash ?? this._sessionRuntimes.get(sid)?.projectHash) : undefined;
+    const projectHash = sid
+      ? (this._panelSessions.get(sid)?.projectHash ?? this._sessionRuntimes.get(sid)?.projectHash ?? currentProjectHash)
+      : currentProjectHash;
 
     this._postMessage({
       type: 'init',
@@ -1505,6 +1590,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'toolStart':
           post({ type: 'toolStart', id: evt.data.id, name: evt.data.name, args: evt.data.args });
+          break;
+        case 'toolProgress':
+          post({ type: 'toolProgress', id: evt.data.id, progress: evt.data.progress });
           break;
         case 'toolResult':
           post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
@@ -1921,19 +2009,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _refreshSessions() {
     try {
-      const sessions = await this._client.listSessions();
+      const loaded = await this._loadSessionsForDisplay();
+      const sessions = loaded.sessions;
       await this._annotateSessionGenerating(sessions as any[]);
       // If we have panel sessions that the daemon filtered out (e.g. newly
       // created with no messages yet), prepend synthetic entries so they appear
       // in the session list immediately.
       const existingIds = new Set(sessions.map((s: any) => s.meta?.id || s.id));
-      for (const [pid, info] of this._panelSessions) {
+      for (const [, info] of this._panelSessions) {
+        const belongsToCurrentWorkspace = !loaded.workspaceFolder
+          || (loaded.currentProjectHash && info.projectHash === loaded.currentProjectHash)
+          || info.workingDir === loaded.workspaceFolder;
+        if (!belongsToCurrentWorkspace) {
+          continue;
+        }
         if (!existingIds.has(info.sessionId)) {
           sessions.unshift({
             id: info.sessionId,
             name: vscode.l10n.t('New session'),
             created_at: Date.now(),
             updated_at: Date.now(),
+            project_hash: info.projectHash,
             isGenerating: this._sessionRuntimes.get(info.sessionId)?.isGenerating ?? false,
             hasUnread: false,
           } as any);

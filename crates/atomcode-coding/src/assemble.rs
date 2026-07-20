@@ -33,6 +33,17 @@ use std::sync::Arc;
 pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     let mut provider_cfg = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     provider_cfg.context_window = cfg.context_window;
+    // Thread the coding layer's liveness knob down to the L1 adapter's byte-idle
+    // watchdog. Without this, `OpenAiCompatConfig::new`'s hardcoded 120s default
+    // stays in effect even when the user raised `ATOMCODE_STREAM_TIMEOUT_SECS`
+    // (or relied on the 300s default documented in `config.rs`). Thinking models
+    // (GLM-5.2, DeepSeek V4 Flash, …) go quiet for >2min during hidden reasoning
+    // after a large prompt; the 120s ceiling cut them off mid-think and surfaced
+    // as a spurious `[Error: stream idle timeout]` even though the connection
+    // was healthy. `cfg.stream_timeout` already carries the env-overridable value
+    // (default 300s), so propagating it here makes the documented tunable actually
+    // govern the L1 watchdog end-to-end.
+    provider_cfg.idle_timeout = cfg.stream_timeout;
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. SAME canonical detector
     // as the tool-mount / read_file vision gate above.
@@ -70,7 +81,7 @@ pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmPro
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).
         .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
-        .hook(Arc::new(VerifyCadenceHook::new()))
+        .hook(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).

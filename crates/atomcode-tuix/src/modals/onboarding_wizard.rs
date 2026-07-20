@@ -418,12 +418,12 @@ impl OnboardingWizard {
     /// step 2 instead of Auto-detect.
     pub fn with_initial_language(
         mut self,
-        config_lang: Option<atomcode_core::locale::Locale>,
+        config_lang: Option<atomcode_config::locale::Locale>,
     ) -> Self {
         self.language_idx = match config_lang {
             None => 0,
-            Some(atomcode_core::locale::Locale::En) => 1,
-            Some(atomcode_core::locale::Locale::ZhCn) => 2,
+            Some(atomcode_config::locale::Locale::En) => 1,
+            Some(atomcode_config::locale::Locale::ZhCn) => 2,
         };
         self
     }
@@ -694,9 +694,9 @@ impl OnboardingWizard {
     /// the env-detected locale.
     pub(super) fn apply_language(
         &self,
-        config: &mut atomcode_core::config::Config,
-    ) -> anyhow::Result<atomcode_core::locale::Locale> {
-        use atomcode_core::locale::Locale;
+        config: &mut atomcode_config::config::Config,
+    ) -> anyhow::Result<atomcode_config::locale::Locale> {
+        use atomcode_config::locale::Locale;
         let new_locale = match self.language_idx {
             0 => {
                 // Auto-detect: clear config field, re-resolve from env.
@@ -714,7 +714,7 @@ impl OnboardingWizard {
             _ => unreachable!("language_idx is bounded 0..=2"),
         };
         crate::i18n::set_locale(new_locale);
-        config.save(&atomcode_core::config::Config::default_path())?;
+        config.save(&atomcode_config::config::Config::default_path())?;
         Ok(new_locale)
     }
 
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn with_initial_language_seeds_idx() {
-        use atomcode_core::locale::Locale;
+        use atomcode_config::locale::Locale;
         assert_eq!(make_wizard().with_initial_language(None).language_idx, 0);
         assert_eq!(
             make_wizard()
@@ -1491,7 +1491,7 @@ mod tests {
     /// override so tests don't touch real `~/.atomcode`.
     #[test]
     fn apply_language_writes_config_and_sets_locale() {
-        use atomcode_core::locale::Locale;
+        use atomcode_config::locale::Locale;
         let _g = crate::i18n::test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         // ATOMCODE_HOME drives Config::config_dir() ahead of $HOME, so
@@ -1523,7 +1523,7 @@ mod tests {
     /// an explicit choice.
     #[test]
     fn apply_language_auto_clears_config_field() {
-        use atomcode_core::locale::Locale;
+        use atomcode_config::locale::Locale;
         let _g = crate::i18n::test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("ATOMCODE_HOME").ok();
@@ -1546,8 +1546,8 @@ mod tests {
     /// Default impl (every field is intentionally required so adding
     /// a new field forces every test to update), so we mirror the
     /// blank_config_with_lsp helper from `core::config::tests` here.
-    fn blank_config_for_test() -> atomcode_core::config::Config {
-        atomcode_core::config::Config::default()
+    fn blank_config_for_test() -> atomcode_config::config::Config {
+        atomcode_config::config::Config::default()
     }
 
     // ── Step 3 (Setup) draw tests ──
@@ -1851,8 +1851,8 @@ mod tests {
     /// step 3 render must come out ASCII-only.
     #[test]
     fn draw_setup_lines_ascii_fallback_produces_pure_ascii_box() {
-        let _g = atomcode_core::i18n::test_lock();
-        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let _g = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
         let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
         for bad in ['┌', '┐', '└', '┘', '─', '│', '●', '○', '·', '←', '•'] {
@@ -1874,8 +1874,8 @@ mod tests {
     /// border zig-zagging).
     #[test]
     fn draw_panel_ascii_fallback_right_border_column_aligned() {
-        let _g = atomcode_core::i18n::test_lock();
-        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let _g = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
         // Drop the step header row that sits ABOVE the panel — it's
         // not bordered.

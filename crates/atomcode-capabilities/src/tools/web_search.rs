@@ -19,6 +19,17 @@ use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 
+/// Flip the offline verdict toward offline on a transport failure (offline_mode="auto"
+/// self-correction). No-op unless the `offline` feature is enabled (which pulls the
+/// config leaf) AND the verdict is currently Auto-optimistic. Called ONLY on genuine
+/// connection failures (reqwest send() error), never on a completed HTTP response.
+#[cfg(feature = "offline")]
+fn note_network_unreachable() {
+    atomcode_config::config::offline::mark_network_unreachable();
+}
+#[cfg(not(feature = "offline"))]
+fn note_network_unreachable() {}
+
 /// Which backend `web_search` queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchProvider {
@@ -165,7 +176,10 @@ impl WebSearchTool {
             .await
         {
             Ok(r) => r,
-            Err(e) => return fail(format!("Exa web search could not reach mcp.exa.ai for '{query}': {e}")),
+            Err(e) => {
+                note_network_unreachable();
+                return fail(format!("Exa web search could not reach mcp.exa.ai for '{query}': {e}"));
+            }
         };
         if !resp.status().is_success() {
             return fail(format!("Exa web search: HTTP {} for '{query}'", resp.status().as_u16()));
@@ -198,7 +212,10 @@ impl WebSearchTool {
             .await
         {
             Ok(r) => r,
-            Err(e) => return fail(format!("web_search: request failed for '{query}': {e}.")),
+            Err(e) => {
+                note_network_unreachable();
+                return fail(format!("web_search: request failed for '{query}': {e}."));
+            }
         };
         if !resp.status().is_success() {
             return fail(format!("web_search: HTTP {} from DuckDuckGo", resp.status().as_u16()));
@@ -459,5 +476,18 @@ mod tests {
     #[test]
     fn strip_html_tags_decodes_entities() {
         assert_eq!(strip_html_tags("<b>a</b> &amp; <i>b</i>"), "a & b");
+    }
+
+    #[cfg(feature = "offline")]
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn auto_flips_offline_on_transport_failure() {
+        use atomcode_config::config::offline::{seed_offline_verdict, reset_offline_verdict_for_test, is_offline_active, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Auto, None);
+        assert!(!is_offline_active());
+        note_network_unreachable();
+        assert!(is_offline_active(), "auto flips offline after a web_search transport failure");
+        reset_offline_verdict_for_test();
     }
 }

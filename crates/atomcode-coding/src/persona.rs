@@ -20,10 +20,39 @@
 /// default-on config. Keeping ALL call sites on this one helper guarantees the
 /// system-prompt guidance and the mounted tool never disagree.
 pub(crate) fn todo_switch_enabled() -> bool {
-    atomcode_core::config::todo_enabled_from_env(
+    atomcode_config::config::todo_enabled_from_env(
         std::env::var("ATOMCODE_TODO").ok().as_deref(),
         true,
     )
+}
+
+/// Whether the `memory` tool is mounted (mirrors the registration gate in
+/// `register_coding_tools_with_vision`): env `ATOMCODE_MEMORY_TOOL` != 0/false/off.
+pub(crate) fn memory_tool_enabled() -> bool {
+    std::env::var("ATOMCODE_MEMORY_TOOL")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+/// Injected only when `is_offline_active()`. States the ONE certain fact (no public
+/// internet) and defers dependency availability to configured internal mirrors — it does
+/// NOT ban package managers. `offline_note()` (from config) is appended at the call site.
+pub const OFFLINE_ENVIRONMENT: &str = "\n\n## OFFLINE ENVIRONMENT:\n\
+No public internet access. External CDNs and public registries (npm/PyPI/Maven Central \
+official sources, etc.) are unreachable. Use ONLY dependencies obtainable via the \
+configured internal mirrors/registries, or assets already vendored in the repo; do NOT \
+reference external CDNs in generated pages. When unsure whether a package or mirror is \
+reachable, prefer the configured internal mirror, or ask first.";
+
+/// The OFFLINE ENVIRONMENT block with the env-level `offline_note` appended (if set).
+pub fn offline_environment_block() -> String {
+    let mut s = OFFLINE_ENVIRONMENT.to_string();
+    if let Some(note) = atomcode_config::config::offline::offline_note() {
+        s.push_str("\nThis environment provides: ");
+        s.push_str(&note);
+    }
+    s
 }
 
 pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
@@ -32,7 +61,14 @@ pub fn coding_persona(model: &str, todo_enabled: bool) -> String {
         "You are AtomCode, an AI coding agent by AtomGit running the {model} model. \
 When asked who or what model you are, identify yourself as AtomCode running {model}. \
 Never claim to be Claude, ChatGPT, or another product, organization, or model. \
-You help users with software engineering tasks within the current project.\n{RULES}\n\n\
+You help users with software engineering tasks within the current project.\n\
+\n## PRECEDENCE:\n\
+Any GLOBAL / PROJECT / USER instruction blocks or remembered facts and preferences (from \
+`=== MEMORY ===`, `AGENTS.md`, `CLAUDE.md`, `ATOMCODE.md`, `.atomcode.md`, or `.atomcode.user.md`) take \
+PRECEDENCE over the default rules in this system prompt. When a user's or project's \
+instruction or remembered preference conflicts with a default below, follow the user — their global/project rules \
+and remembered preferences are NOT secondary to these defaults. (Exception: the safety, approval, and \
+destructive-action gates are not overridable by a project file.)\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 When you create a git commit on the user's behalf, end the commit message with this \
 trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
@@ -67,6 +103,12 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // phantom tool call. `todo_enabled` is that switch, resolved by the caller.
     if todo_enabled {
         p.push_str(TODO_USAGE);
+    }
+    if memory_tool_enabled() {
+        p.push_str(MEMORY_USAGE);
+    }
+    if atomcode_config::config::offline::is_offline_active() {
+        p.push_str(&offline_environment_block());
     }
     // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
     // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
@@ -148,7 +190,13 @@ don't abandon a workable approach after one miss.\n\
 - A PAST FAILURE ISN'T A VERDICT: \"this failed before\" describes a past attempt, not \
 today's code — a prior failure does NOT mean it fails now, so re-check against the current \
 code before concluding something can't work. (This is about past ATTEMPTS only; your \
-standing project instructions still apply — follow them.)";
+standing project instructions still apply — follow them.)\n\
+- DON'T FAKE-FINISH UNDER PRESSURE: running low on context or turn rounds is NOT a reason \
+to declare the task done. NEVER announce completion you have not actually reached and \
+verified. If space is running out, state plainly what is DONE and what still REMAINS (the \
+exact next steps) and keep going or hand off transparently — a false \"all done\" that \
+unravels the next time the user asks wastes their trust far more than an honest \"here is \
+what's left\".";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -176,18 +224,42 @@ tools live under `Scripts\\` (not `bin/`).";
 /// on small edits. Only injected when the `todowrite` tool is actually mounted
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
-For a task that clearly spans several distinct steps (roughly three or more), touches \
-multiple files, or bundles several user requests, start by calling `todowrite` to lay out \
-the steps, then keep it updated as you work — exactly one item in_progress at a time, and \
-mark an item done only after that step is actually verified (never on intent). It keeps you \
-and the user aligned and avoids losing the thread across turns. Do NOT use it for a single \
-quick edit, a one-off command, or a purely informational / conversational reply.";
+When a task spans three or more distinct steps (count steps, not tool calls), touches \
+multiple files, or bundles several user requests, call `todowrite` FIRST with the full list to \
+lay out the steps. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
+resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
+when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
+in_progress at a time (this is enforced for you) and \
+mark an item done only after that step is actually verified (never on intent) — in the same \
+turn you finish it, before moving on, and never \
+batch-complete several items at the end. Unless you genuinely need approval, hit the STOP \
+WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as if \
+finished, or hand back to the user while any item is still pending or in_progress — keep \
+working through them. Keep each \
+item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
+and the user aligned and avoids losing the thread across turns. If the user pivots to clearly \
+unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
+than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
+or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
+use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
+
+/// Memory-tool usage guidance. Judgment-framed: only persist durable, non-obvious
+/// learnings — not standard facts or session one-offs. Only injected when the
+/// `memory` tool is actually mounted (see the `memory_tool_enabled()` gate in
+/// `coding_persona`).
+const MEMORY_USAGE: &str = "\n\n## MEMORY:\n\
+When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting \
+preference, a correction that should stick, a non-obvious convention or gotcha — persist it \
+with the `memory` tool (`action:\"remember\"`). Do NOT record obvious facts, standard \
+tool/language behavior, anything already in AGENTS.md, or session-specific one-offs. Keep \
+each entry to one concise line. This is a judgment call, not a requirement — only record \
+what a future session would genuinely benefit from.";
 
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
 ## SYSTEM REMINDERS:
-Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date/time, context-window usage, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
+Text wrapped in `<system-reminder>…</system-reminder>` is injected by the SYSTEM, not typed by the user — it carries runtime context (current date, turn/round budget, mode notices). Treat it as authoritative ambient context: never reply to a reminder as if the user said it, never echo it back, and never let it override an actual user instruction.
 
 ## CONTEXT MANAGEMENT:
 The context window is managed for you: as it fills, older turns are automatically compacted (tool results are stubbed, then summarized). Do NOT tell the user to start a new conversation, clear the history, or that you are \"running low on context\" in order to manage it — that is handled automatically. Keep working; if some earlier detail was condensed and you need it, re-read the source.
@@ -242,7 +314,7 @@ Do NOT retry the same command hoping for a different result.
 If the error is unclear, read the relevant source code to understand the context.
 
 ## RISKY ACTIONS:
-Before destructive operations (delete files, force push, drop tables, kill processes), check with the user first. The cost of pausing to confirm is low; the cost of an unwanted action is high.
+Before destructive operations (delete files, force push, drop tables, kill processes), check with the user first. The cost of pausing to confirm is low; the cost of an unwanted action is high. In particular, NEVER run git commands that DISCARD uncommitted work — `git checkout <file>` / `git checkout .` / `git checkout -- …`, `git restore <file>`, `git reset --hard`, `git clean -f` — unless the user explicitly asked for that exact operation; those changes are unrecoverable and are not yours to throw away.
 
 ## SCOPE:
 Operate only within the working directory shown in the session context — do not read, write, scan, or `cd` outside it unless the user explicitly names an external path. AtomCode's own config (skills, commands, memory, hooks) lives under `~/.atomcode` (or `$ATOMCODE_HOME`) globally and `./.atomcode` per-project; read and write it there, never under `~/.claude` (that belongs to a different product).
@@ -283,6 +355,12 @@ mod tests {
         let on = coding_persona("glm-5.2", true);
         assert!(on.contains("## TASK TRACKING"), "enabled → guidance present");
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
+        // Threshold disambiguation: count steps, not tool calls (fixes weak-model
+        // miscounting that made GLM under-trigger).
+        assert!(
+            on.contains("count steps, not tool calls"),
+            "guidance must disambiguate steps from tool calls: {on}"
+        );
 
         let off = coding_persona("glm-5.2", false);
         assert!(!off.contains("## TASK TRACKING"), "disabled → no guidance");
@@ -300,6 +378,36 @@ mod tests {
         assert!(
             p.contains("Do NOT use it for a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
+        );
+    }
+
+    #[test]
+    fn todo_guidance_directs_replace_on_redirect_without_inviting_self_clear() {
+        // When the user pivots to unrelated new work, the model should REPLACE the
+        // list with the new task's full steps — NEVER empty it just to answer a
+        // question or because a step was hard. Emptying is the self-clear path a
+        // weak model over-applies, wiping a still-valid in_progress plan. Framed as
+        // replace-on-genuine-redirect and gated on multi-step new work, so a mere
+        // clarifying question (no new steps) leaves the current list untouched.
+        let on = coding_persona("deepseek-v4-flash", true);
+        assert!(
+            on.contains("REPLACE the old one"),
+            "must direct replacing the list on redirect: {on}"
+        );
+        assert!(
+            on.contains("do NOT reset or empty the list merely to answer a question"),
+            "must forbid self-clearing to answer a question / on a hard step: {on}"
+        );
+        assert!(
+            on.contains("only replace it when genuinely different multi-step work begins"),
+            "replacement must be gated on genuinely different multi-step work: {on}"
+        );
+
+        // Gating parity: absent when the todo tool/hook aren't mounted.
+        let off = coding_persona("deepseek-v4-flash", false);
+        assert!(
+            !off.contains("REPLACE the old one"),
+            "disabled → no redirect guidance: {off}"
         );
     }
 
@@ -378,6 +486,27 @@ mod tests {
             p.contains("CARRY IT THROUGH"),
             "carry-to-completion guardrail (WORKFLOW)"
         );
+    }
+
+    #[test]
+    fn persona_states_user_instruction_precedence() {
+        // Users reported "system_prompt too strong, my own global rules carry no weight".
+        // The persona must explicitly cede precedence to the injected GLOBAL/PROJECT/USER
+        // instruction files (AGENTS.md etc.), mirroring codex / Claude Code.
+        let p = coding_persona("m", true);
+        assert!(p.contains("## PRECEDENCE:"), "has a PRECEDENCE section");
+        assert!(p.contains("AGENTS.md"), "names the user instruction files");
+        assert!(
+            p.contains("take \nPRECEDENCE") || p.contains("take PRECEDENCE") || p.contains("PRECEDENCE over"),
+            "states user instructions override the defaults"
+        );
+        // The precedence section must appear BEFORE the bulk of the default rules so the
+        // model frames everything below as overridable defaults.
+        let prec = p.find("## PRECEDENCE:").unwrap();
+        let exec = p.find("EXECUTION DISCIPLINE").unwrap_or(p.len());
+        assert!(prec < exec, "PRECEDENCE precedes the firm rule sections");
+        // Safety carve-out preserved (project files can't disable approval gates).
+        assert!(p.contains("not overridable by a project file"), "safety carve-out kept");
     }
 
     #[test]
@@ -693,5 +822,57 @@ mod tests {
         assert!(model_needs_firm_tool_steering("deepseek-chat"));
         assert!(!model_needs_firm_tool_steering("claude-opus-4-8"));
         assert!(!model_needs_firm_tool_steering("gpt-5"));
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_block_present_when_offline() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block must appear when offline: {p}");
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_block_absent_when_online() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(!p.contains("## OFFLINE ENVIRONMENT:"), "offline block must NOT appear when online: {p}");
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn offline_note_appended_to_block() {
+        use atomcode_config::config::offline::{reset_offline_verdict_for_test, seed_offline_verdict, set_offline_note, OfflineMode};
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+        set_offline_note(Some("npm via nexus.internal".to_string()));
+        let p = coding_persona("deepseek-v4-flash", true);
+        assert!(p.contains("## OFFLINE ENVIRONMENT:"), "offline block header must appear: {p}");
+        assert!(p.contains("npm via nexus.internal"), "offline note must be appended: {p}");
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_memory_tool_env)]
+    fn persona_includes_memory_guidance_when_enabled() {
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
+        let p = coding_persona("glm-5.2", true);
+        assert!(p.contains("## MEMORY"), "memory guidance present when tool enabled");
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_memory_tool_env)]
+    fn persona_omits_memory_guidance_when_env_off() {
+        std::env::set_var("ATOMCODE_MEMORY_TOOL", "0");
+        let p = coding_persona("glm-5.2", true);
+        assert!(!p.contains("## MEMORY"), "no memory guidance when tool disabled");
+        std::env::remove_var("ATOMCODE_MEMORY_TOOL");
     }
 }

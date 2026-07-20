@@ -278,6 +278,10 @@ fn build_provider(cfg: &CodingAgentConfig) -> Result<Arc<dyn LlmProvider>> {
     use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
     let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     pc.context_window = cfg.context_window;
+    // Byte-idle liveness: follow the config's stream_timeout instead of the adapter's
+    // hardcoded 120s default, else a thinking model's >120s mid-reasoning silence is
+    // misclassified as `[Error: stream idle timeout]` (mirrors build_coding_agent).
+    pc.idle_timeout = cfg.stream_timeout;
     Ok(Arc::new(OpenAiCompatProvider::new(pc).map_err(|e| anyhow::anyhow!(e.message))?))
 }
 
@@ -365,6 +369,9 @@ async fn drive_turn(
             }
             AgentEvent::Compacted { committed, .. } => {
                 eprintln!("[compacted{}]", if committed { "" } else { " — refused (no gain)" });
+            }
+            AgentEvent::CompactionFailed { error, .. } => {
+                eprintln!("[compact failed] {error}");
             }
             AgentEvent::TurnComplete { reason } => {
                 if streamed {
@@ -560,7 +567,7 @@ fn split_global_flag(rest: &str) -> (bool, &str) {
 }
 
 /// epoch ms → `YYYY-MM-DD HH:MM UTC` (dependency-free; UTC — labeled as such, while
-/// the engine's StatusReminderHook shows the MODEL local time; negative ms clamp to epoch).
+/// the engine's StatusReminderHook shows the MODEL local date; negative ms clamp to epoch).
 fn fmt_ts(ms: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let Some(t) = UNIX_EPOCH.checked_add(Duration::from_millis(ms.max(0) as u64)) else {

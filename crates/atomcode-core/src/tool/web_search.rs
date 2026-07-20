@@ -77,7 +77,7 @@ impl Default for WebSearchTool {
 impl WebSearchTool {
     /// Build from the `[web_search]` config block. `EXA_API_KEY` env var
     /// takes precedence over a configured `api_key`.
-    pub fn from_config(cfg: &crate::config::WebSearchConfig) -> Self {
+    pub fn from_config(cfg: &atomcode_config::config::WebSearchConfig) -> Self {
         let exa_api_key =
             env_exa_key().or_else(|| cfg.api_key.clone().filter(|s| !s.trim().is_empty()));
         Self {
@@ -147,6 +147,14 @@ impl Tool for WebSearchTool {
 /// browser-based `web-access` skill instead of fruitlessly retrying.
 const SKILL_FALLBACK_HINT: &str = "\n\nIf web search keeps failing here (blocked / unreachable network) and a `web-access` skill is listed under Available Skills, call `use_skill web-access` to perform this via a real browser instead of retrying web_search.";
 
+/// Signal the offline verdict that the network looks unreachable. No-op unless
+/// `offline_mode = "auto"` (forced on/off verdicts ignore it). Called only on
+/// CONNECTION/TRANSPORT failures (DNS/connect/timeout), never on a successful
+/// HTTP response that merely carried an error body.
+fn note_web_search_network_error() {
+    atomcode_config::config::offline::mark_network_unreachable();
+}
+
 /// Build a failed `ToolResult`, appending the web-access skill fallback hint.
 fn fail(msg: String) -> ToolResult {
     ToolResult {
@@ -207,6 +215,9 @@ impl WebSearchTool {
             match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
                 Ok(r) => r,
                 Err(_) => {
+                    // Tokio timeout = curl couldn't complete the TCP handshake/DNS in time.
+                    // This is a transport-level failure → signal the auto-offline verdict.
+                    note_web_search_network_error();
                     return fail(format!("Exa web search timed out after 30s for '{}'.", query))
                 }
             };
@@ -216,6 +227,8 @@ impl WebSearchTool {
             // TLS) — exactly the GFW-block signature. HTTP-level errors exit 0
             // and fall through to the empty-parse branch below.
             Ok(o) => {
+                // Non-zero curl exit = DNS/connect/TLS failure → signal auto-offline verdict.
+                note_web_search_network_error();
                 return fail(format!(
                     "Exa web search could not reach mcp.exa.ai for '{}' (curl exit {:?}): {}",
                     query,
@@ -223,6 +236,8 @@ impl WebSearchTool {
                     String::from_utf8_lossy(&o.stderr).trim()
                 ))
             }
+            // Spawn failure = curl binary not found / OS error, NOT a network failure.
+            // Do NOT call note_web_search_network_error() here.
             Err(e) => return fail(format!("Exa web search failed to spawn curl: {}", e)),
         };
 
@@ -293,6 +308,9 @@ impl WebSearchTool {
             }
             Err(_) => {
                 crate::ctrace!("TOOL", "web_search tokio timeout (20s) fired");
+                // Tokio timeout = transport-level failure (DNS/connect wedge) → signal
+                // auto-offline verdict. Do NOT call this for HTTP-level failures.
+                note_web_search_network_error();
                 return fail(format!(
                     "Search timed out after 20s for '{}'. Network may be unreachable or DuckDuckGo is slow.",
                     query
@@ -302,6 +320,8 @@ impl WebSearchTool {
 
         let html = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            // Spawn/IO failure = curl binary not found / OS error, NOT a network failure.
+            // Do NOT call note_web_search_network_error() here.
             Err(e) => return fail(format!("Search failed: {}", e)),
         };
 
@@ -621,5 +641,38 @@ mod tests {
             SearchProvider::from_config_str(" ddg "),
             SearchProvider::DuckDuckGo
         );
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn auto_flips_offline_on_connection_error() {
+        use atomcode_config::config::offline::{
+            is_offline_active, reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Auto, None);
+        assert!(!is_offline_active(), "auto starts optimistic-online");
+        note_web_search_network_error();
+        assert!(
+            is_offline_active(),
+            "auto flips offline after a transport failure"
+        );
+        reset_offline_verdict_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn forced_off_not_flipped_by_network_error() {
+        use atomcode_config::config::offline::{
+            is_offline_active, reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+        note_web_search_network_error();
+        assert!(
+            !is_offline_active(),
+            "explicit off is never flipped by detection"
+        );
+        reset_offline_verdict_for_test();
     }
 }

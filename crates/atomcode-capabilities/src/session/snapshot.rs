@@ -13,6 +13,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use atomcode_kernel::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
@@ -52,6 +53,14 @@ impl SnapshotHook {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnAccum> {
         self.accum.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl CompactionCheckpoint for SnapshotHook {
+    fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
+        self.mgr
+            .save_snapshot(&self.session_id, snapshot)
+            .map_err(|error| CompactionCheckpointError::new(error.to_string()))
     }
 }
 
@@ -149,6 +158,16 @@ mod tests {
             c.push(Message::user(format!("m{i}")));
         }
         c
+    }
+
+    #[test]
+    fn compaction_checkpoint_is_immediately_resumable() {
+        let (hook, manager, _dir) = hook("compact-now");
+        let snapshot = SessionSnapshot::from_conversation(&convo_with(2));
+
+        CompactionCheckpoint::save(&hook, &snapshot).expect("checkpoint save");
+
+        assert_eq!(manager.load_snapshot("compact-now").unwrap(), snapshot);
     }
 
     fn resp(tool_calls: usize, used: u32) -> Message {

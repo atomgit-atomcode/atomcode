@@ -333,7 +333,10 @@ async fn timeout_reason() {
         .spawn();
     handle.commands.send(send("go")).unwrap();
 
-    let reason = tokio::time::timeout(OUTER_GUARD, async {
+    // Guard >> OUTER_GUARD: a stream idle-timeout now RECONNECTS up to
+    // MAX_STREAM_RETRIES=5 (exponential backoff ≈6.2s) before clean-failing, so
+    // the whole ladder must fit inside this longer guard.
+    let reason = tokio::time::timeout(Duration::from_secs(15), async {
         let mut reason: Option<StopReason> = None;
         while let Some(ev) = handle.events.recv().await {
             if let AgentEvent::TurnComplete { reason: r } = ev {
@@ -344,11 +347,11 @@ async fn timeout_reason() {
         reason
     })
     .await
-    .expect("a timed-out turn must clean-fail, not hang");
+    .expect("a timed-out turn must clean-fail after exhausting retries, not hang");
     assert_eq!(
         reason,
         Some(StopReason::Timeout),
-        "a timed-out turn must end with StopReason::Timeout"
+        "a timed-out turn must end with StopReason::Timeout after exhausting retries"
     );
 }
 

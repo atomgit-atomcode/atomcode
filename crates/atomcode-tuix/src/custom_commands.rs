@@ -105,7 +105,7 @@ impl CustomCommandRegistry {
     /// (`<project_root>/.atomcode/commands/`) directories, merging results.
     /// Project entries win on name collision.
     pub fn load(project_root: &Path) -> Self {
-        let config_dir = atomcode_core::config::Config::config_dir();
+        let config_dir = atomcode_config::config::Config::config_dir();
         let mut commands = HashMap::new();
         // Global first — project overrides on second pass.
         Self::load_from_dir(&config_dir.join("commands"), None, &mut commands);

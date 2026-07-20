@@ -30,11 +30,12 @@ use atomcode_capabilities::session::{
 };
 use atomcode_capabilities::skills::{register_skill_tools, standard_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, OpenFileWorkspaceGate, ReadFileTool,
-    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, BashWorkspaceGate, OpenFileWorkspaceGate,
+    ReadFileTool, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_core::provider::model_name_suggests_vision;
 use atomcode_kernel::agent::Agent;
+use atomcode_kernel::checkpoint::CompactionCheckpoint;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
@@ -115,6 +116,9 @@ pub struct CodingParts {
     pub approval: Arc<ApprovalMiddleware>,
     /// Lifecycle hooks in the CANONICAL ORDER (see [`assemble`]).
     hooks: Vec<Arc<dyn LifecycleHooks>>,
+    /// The same session snapshot writer used by `SnapshotHook`, exposed through
+    /// the kernel's manual-compaction checkpoint seam.
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     pub session: Option<SessionBinding>,
     /// Connected MCP servers (None when `opts.mcp` was false or no config exists).
     pub mcp_registry: Option<Arc<McpRegistry>>,
@@ -130,6 +134,22 @@ pub struct CodingParts {
     /// `SetPlanMode`); the [`PlanModeGate`](crate::PlanModeGate) middleware reads it to
     /// block mutating tools. Shared (not rebuilt) so a respawn preserves the mode.
     pub plan_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime auto-approve (bypass) flag. `SetMode(Auto)` sets it; the bridge
+    /// approval seam auto-Allows while set. Mirrors `plan_mode`.
+    pub bypass_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Auto-accept-edits flag. `SetMode(AcceptEdits)` sets it; the
+    /// [`WriteApprovalGate`](crate::tools) reads it to auto-approve NON-sensitive
+    /// file edits without a prompt (bash + sensitive paths still prompt). Unlike
+    /// `bypass_mode` this is enforced in a middleware (bridge-independent), mirroring
+    /// `plan_mode`. Shared (not rebuilt) so a respawn preserves the mode.
+    pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session grant store for mutating MCP tools the user approved "always" while in
+    /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
+    /// preserves the grants — the same reason the mode flags above are shared.
+    pub mcp_plan_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub write_approval_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub bash_workspace_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub sensitive_path_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -182,7 +202,7 @@ pub async fn prepare_with_plugin_hooks(
         atomcode_capabilities::codeintel::codeintel_tool_names().iter().map(|s| s.to_string()),
     );
 
-    if opts.web {
+    if opts.web && !atomcode_config::config::offline::is_offline_active() {
         registry.register(Arc::new(WebFetchTool));
         // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`
         // env knob (the zero-core path for legacy drivers, whose config types we can't
@@ -212,9 +232,11 @@ pub async fn prepare_with_plugin_hooks(
                 model: cfg.model.clone(),
                 context_window: cfg.context_window,
                 stream_timeout: cfg.stream_timeout,
-                // The review sub-agent isn't the interactive approval surface; keep a
-                // concrete fail-closed bound even when the main agent parks (None).
                 request_timeout: cfg.request_timeout.unwrap_or_else(|| std::time::Duration::from_secs(300)),
+                max_commits_without_confirmation: 20,
+                max_files_without_confirmation: 40,
+                max_changed_lines_without_confirmation: 4_000,
+                max_diff_bytes_without_confirmation: 256 * 1024,
                 rules_dir: None,
             },
         )));
@@ -363,6 +385,7 @@ pub async fn prepare_with_plugin_hooks(
     // 6. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
+    let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
     if opts.memory {
@@ -370,15 +393,35 @@ pub async fn prepare_with_plugin_hooks(
     }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
-        hooks.push(Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd)));
+        let snapshot_hook = Arc::new(SnapshotHook::new(b.manager.clone(), &b.id, &wd));
+        compaction_checkpoint = Some(snapshot_hook.clone());
+        hooks.push(snapshot_hook);
         hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
-    // with date + context-window usage + round budget. Serves recall's relative-date
-    // resolution and lets the model pace itself. Injected from round 2 of each turn (round 1
-    // is skipped — see StatusReminderHook — to avoid a user-after-user wire pair).
+    // with date + round budget (NO context-usage gauge — pressure is handled silently by
+    // auto-compaction, never pushed to the model). Serves recall's relative-date resolution and
+    // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
+    // StatusReminderHook — to avoid a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
-    hooks.push(Arc::new(VerifyCadenceHook::new()));
+    // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
+    // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
+    // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
+    // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
+    // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
+    hooks.push(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())));
+    // Todo hook (bridge/daemon path — the live TUI + webui): per-turn <system-reminder> of the
+    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
+    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
+    // ATOMCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
+    // references tools that aren't mounted). Pushed AFTER VerifyCadenceHook so verify's
+    // "first Some wins" continuation outranks the todo-completion nudge. This is the ONLY
+    // production registration of TodoHook — every real entrypoint (bridge, daemon, clix) goes
+    // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
+    // it) is reachable only from tests + examples, so there is no double-registration.
+    if crate::persona::todo_switch_enabled() {
+        hooks.push(Arc::new(crate::todo::TodoHook));
+    }
     // Rate-limit hook: on a 429 it fetches CodingPlan usage windows and picks the
     // right wait-vs-pause decision (decide_from_windows). Returns None for
     // non-CodingPlan providers / fetch failures so the kernel falls back to its
@@ -420,10 +463,25 @@ pub async fn prepare_with_plugin_hooks(
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mcp_plan_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        write_approval_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        bash_workspace_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        sensitive_path_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
         registry,
         tool_names: names,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         hooks,
+        compaction_checkpoint,
         session,
         mcp_registry,
         mcp_events,
@@ -616,7 +674,10 @@ pub fn assemble(
         // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
-        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(parts.plan_mode.clone())))
+        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(
+            parts.plan_mode.clone(),
+            parts.mcp_plan_grants.clone(),
+        )))
         // Plan-mode reminder (ephemeral request tail) — pairs with the gate: the gate
         // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
         // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
@@ -624,7 +685,9 @@ pub fn assemble(
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::new()));
+        .middleware(Arc::new(SensitivePathGate::with_store(
+            parts.sensitive_path_grants.clone(),
+        )));
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
@@ -650,7 +713,24 @@ pub fn assemble(
         // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
         // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
         // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
-        .middleware(Arc::new(WriteApprovalGate::new(parts.shared_cwd.clone())))
+        .middleware(Arc::new(
+            WriteApprovalGate::with_store(
+                parts.shared_cwd.clone(),
+                parts.write_approval_grants.clone(),
+            )
+            .with_accept_edits(parts.accept_edits.clone()),
+        ))
+        // Workspace-aware approval for DESTRUCTIVE bash (rm/mv/cp/dd/redirect…) whose target
+        // lands OUTSIDE the workspace: prompt with a per-directory "Always", mirroring
+        // WriteApprovalGate for the write tools. In-workspace destructive bash is unchanged
+        // (single-file rm stays Safe→runs; recursive rm still reaches ApprovalMiddleware).
+        // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
+        // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
+        // edits only); full Auto bypasses it via the driver auto-answering.
+        .middleware(Arc::new(BashWorkspaceGate::with_store(
+            parts.shared_cwd.clone(),
+            parts.bash_workspace_grants.clone(),
+        )))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
         // bytes that run.
@@ -678,6 +758,9 @@ pub fn assemble(
     }
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
+    }
+    if let Some(checkpoint) = &parts.compaction_checkpoint {
+        builder = builder.compaction_checkpoint(checkpoint.clone());
     }
     if let Some(b) = &parts.session {
         builder = builder.session_id(&b.id);
@@ -812,7 +895,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(offline_verdict)]
     fn model_switch_replaces_persona_without_duplication() {
+        atomcode_config::config::offline::reset_offline_verdict_for_test();
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(coding_persona("old-model", crate::persona::todo_switch_enabled())),
             Message::system("SESSION CONTEXT"),
@@ -832,7 +917,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(offline_verdict)]
     fn current_persona_keeps_snapshot_byte_stable() {
+        atomcode_config::config::offline::reset_offline_verdict_for_test();
         let persona = coding_persona("deepseek-v4-flash", crate::persona::todo_switch_enabled());
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(persona.clone()),
@@ -856,6 +943,23 @@ mod tests {
             web: false,
             review: false,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn prepare_injects_checkpoint_only_for_persistent_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+
+        let mut persistent = io_free_opts();
+        persistent.session = SessionMode::Fresh;
+        let parts = prepare(&cfg, persistent).await.unwrap();
+        assert!(parts.compaction_checkpoint.is_some());
+
+        let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(ephemeral.compaction_checkpoint.is_none());
     }
 
     /// `prepare` loads a project `.hooks.json` and exposes the runner via
@@ -1009,5 +1113,64 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
+    }
+
+    /// Helper: run `prepare` with `opts.web = web_enabled` (all other optional capabilities
+    /// OFF so the call is I/O-free) and return the registered tool names.
+    async fn tool_names_for_test(web_enabled: bool) -> Vec<String> {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.web = web_enabled;
+        let parts = prepare(&cfg, opts).await.unwrap();
+        parts.tool_names.clone()
+    }
+
+    /// Offline mode must drop `web_fetch` and `web_search` from the coding-path tool
+    /// registry even when `opts.web` is `true` (the normal production setting).
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn offline_removes_web_tools_from_coding_registry() {
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::On, None);
+
+        let names = tool_names_for_test(true).await;
+        assert!(
+            !names.contains(&"web_fetch".to_string()),
+            "web_fetch must be absent when offline; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"web_search".to_string()),
+            "web_search must be absent when offline; got: {names:?}"
+        );
+
+        reset_offline_verdict_for_test();
+    }
+
+    /// When online (the default), `opts.web = true` must still register both web tools
+    /// (0-intrusion: behaviour is byte-identical to before this feature).
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn online_keeps_web_tools() {
+        use atomcode_config::config::offline::{
+            reset_offline_verdict_for_test, seed_offline_verdict, OfflineMode,
+        };
+        reset_offline_verdict_for_test();
+        seed_offline_verdict(OfflineMode::Off, None);
+
+        let names = tool_names_for_test(true).await;
+        assert!(
+            names.contains(&"web_fetch".to_string()),
+            "web_fetch must be present when online; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"web_search".to_string()),
+            "web_search must be present when online; got: {names:?}"
+        );
+
+        reset_offline_verdict_for_test();
     }
 }

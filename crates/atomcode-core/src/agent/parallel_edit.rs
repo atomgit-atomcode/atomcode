@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use atomcode_config::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
@@ -81,12 +81,7 @@ struct ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn observe_turn(
-        &mut self,
-        turn_idx: usize,
-        edited: &[String],
-        reads: &[String],
-    ) {
+    fn observe_turn(&mut self, turn_idx: usize, edited: &[String], reads: &[String]) {
         if !edited.is_empty() {
             for f in edited {
                 self.edited_files.insert(f.clone());
@@ -231,11 +226,7 @@ async fn run_turn_with_retry(
 /// Construct a human-readable summary of what the sub-agent did.
 /// Replaces the previous "first 200 chars of last_text" approach with
 /// a compact, signal-aware multi-part line.
-fn build_summary(
-    assigned: &str,
-    tracker: &ProgressTracker,
-    last_text: &str,
-) -> String {
+fn build_summary(assigned: &str, tracker: &ProgressTracker, last_text: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     if tracker.edited_files.is_empty() {
         parts.push(format!("Did not edit `{}`", assigned));
@@ -357,8 +348,8 @@ impl crate::tool::Tool for ScopedReadFile {
         // First: inner schema check.
         self.inner.validate_args(args)?;
         // Second: scope check. Parse args to peek at file_path.
-        let parsed: serde_json::Value = serde_json::from_str(args)
-            .map_err(|e| format!("scope check parse: {e}"))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(args).map_err(|e| format!("scope check parse: {e}"))?;
         let path = parsed
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -392,10 +383,7 @@ impl crate::tool::Tool for ScopedReadFile {
 ///
 /// Async because the parent registry's lock is `tokio::sync::RwLock`. Called
 /// from `SubAgentTask::execute` (Task 8 wiring) which is itself async.
-async fn filter_tools_for_subagent(
-    parent: &ToolRegistry,
-    assigned_file: &str,
-) -> ToolRegistry {
+async fn filter_tools_for_subagent(parent: &ToolRegistry, assigned_file: &str) -> ToolRegistry {
     let filtered = ToolRegistry::new();
     for (name, tool) in parent.iter().await {
         match name.as_str() {
@@ -429,7 +417,7 @@ impl SubAgentTask {
         max_turns: usize,
     ) -> SubAgentResult {
         // 1. Build minimal system prompt
-        let rules = crate::config::prompt_sections::build_rules();
+        let rules = atomcode_config::config::prompt_sections::build_rules();
         let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte")
         {
             "\nCRITICAL: This is a Vue SFC. Edit <script> and <template> in SEPARATE edit_file calls. \
@@ -471,7 +459,7 @@ impl SubAgentTask {
         // isn't in the config — matches AgentLoop::new's fallback.
         let build_ctx = match config.providers.get(&config.default_provider) {
             Some(pc) => crate::ctx::for_provider(pc),
-            None => crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+            None => crate::ctx::for_provider(&atomcode_config::config::provider::ProviderConfig {
                 provider_type: String::new(),
                 api_key: None,
                 model: String::new(),
@@ -489,8 +477,7 @@ impl SubAgentTask {
                 skip_tls_verify: false,
                 ephemeral: true,
                 capable_model: None,
-
-}),
+            }),
         };
 
         // Sandbox: filter parent tools to the sub-agent whitelist
@@ -499,8 +486,7 @@ impl SubAgentTask {
         // web_*, glob, list_directory, change_dir, write_file, grep)
         // are absent — the runner returns "tool not registered" to the
         // model, which routes it back via re-think.
-        let sandboxed_tools =
-            Arc::new(filter_tools_for_subagent(&tools, &self.file_path).await);
+        let sandboxed_tools = Arc::new(filter_tools_for_subagent(&tools, &self.file_path).await);
 
         let mut runner = TurnRunner {
             provider,
@@ -580,8 +566,7 @@ impl SubAgentTask {
                     if let Some(t) = text {
                         last_text = t;
                     }
-                    let (edited, reads) =
-                        scan_turn_signals(&conversation.messages, pre_msg_count);
+                    let (edited, reads) = scan_turn_signals(&conversation.messages, pre_msg_count);
                     tracker.observe_turn(turn, &edited, &reads);
                     let delta = tracker.budget_adjustment(&res_cfg);
                     dynamic_budget = (dynamic_budget + delta)
@@ -880,7 +865,8 @@ mod tests {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 
@@ -892,7 +878,8 @@ mod tests {
                 output: output.into(),
                 success,
             }),
-                    synthetic: false,
+            synthetic: false,
+            internal_origin: None,
         }
     }
 

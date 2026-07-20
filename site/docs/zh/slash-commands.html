@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.26.0</span>
+    <span class="dhdr-ver">v5.0.0</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -74,7 +74,7 @@
 
   <main class="dmain prose-docs">
 <h1>斜杠命令</h1>
-      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 30+ 个内置命令如下;Skills 和 Plugin 加载的命令也会自动出现在补全菜单里。</p>
+      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 50+ 个内置命令如下;Skills 和 Plugin 加载的命令也会自动出现在补全菜单里。</p>
 
       <h2>核心功能</h2>
       <table>
@@ -113,6 +113,9 @@
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
           <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
+          <tr><td><code>/todo</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
+          <tr><td><code>/copy</code></td><td>把上一条回复里的代码块复制到剪贴板:<code>/copy</code> 复制唯一代码块、<code>/copy N</code> 复制第 N 个、<code>/copy all</code> 复制全部代码块、<code>/copy msg</code> 复制整条回复的 markdown 原文</td></tr>
+          <tr><td><code>/save</code></td><td>把当前会话导出成 markdown 文件:<code>/save</code> 用自动生成的文件名,<code>/save &lt;文件名&gt;</code> 指定文件名</td></tr>
         </tbody>
       </table>
 
@@ -125,6 +128,9 @@
           <tr><td><code>/plan</code></td><td>切到 <strong>Plan 模式</strong>:只读探索,模型可以调用 <code>read_file</code> / <code>grep</code> / <code>list_directory</code> 等不写盘的工具,但 <code>edit_file</code> / <code>bash</code> 等会被屏蔽。适合在动手之前让模型先理清方案</td></tr>
           <tr><td><code>/build</code></td><td>切回 <strong>Build 模式</strong>(默认):全部工具可用,可以读、写、执行。<code>/plan</code> 和 <code>/build</code> 之间可随时来回切</td></tr>
           <tr><td><code>/goal &lt;目标&gt;</code></td><td>设定一个完成目标,让 agent <strong>自动循环</strong>——一轮接一轮——直到目标达成。<code>/goal</code>(无参数)查看当前目标与轮数,<code>/goal clear</code> 停止</td></tr>
+          <tr><td><code>/loop &lt;间隔&gt; &lt;prompt 或 /命令&gt;</code></td><td>按固定<strong>间隔</strong>重复执行一个 prompt 或斜杠命令。例 <code>/loop 5m /diff</code> 每 5 分钟跑一次 <code>/diff</code>;<code>/loop 30s 检查一下构建</code> 每 30 秒发一次该 prompt。间隔单位 <code>s</code>/<code>m</code>/<code>h</code>,范围 10s–24h</td></tr>
+          <tr><td><code>/loop &lt;prompt&gt;</code></td><td>不带间隔时进入<strong>自定节奏</strong>模式:任务交给模型,由它自己决定何时进行下一轮,适合「盯着某件事直到收敛」这类不好用固定周期表达的任务</td></tr>
+          <tr><td><code>/loop</code> · <code>/loop stop</code></td><td><code>/loop</code>(无参数)查看当前循环状态;<code>/loop stop</code>(或 <code>off</code> / <code>clear</code> / <code>cancel</code>)停止循环。<code>/loop</code> 与 <code>/goal</code> 互斥,设定其中一个会自动取消另一个</td></tr>
           <tr><td><code>/think on</code> / <code>off</code></td><td>开关 extended thinking(对支持的模型 — Claude / DeepSeek-R1 / GLM-4.5 等)。开启后模型会输出推理过程,代价是更慢更费 token</td></tr>
           <tr><td><code>/think budget &lt;N&gt;</code></td><td>给 thinking 设个 token 预算上限(对 Claude 系列生效),控制推理长度</td></tr>
           <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek 推理努力控制——在 DeepSeek 模型上用更多延迟/token 换取更深的推理</td></tr>
@@ -190,9 +196,11 @@
           <tr><td><code>/webui stop</code></td><td>关闭 webui 服务</td></tr>
           <tr><td><code>/sync</code></td><td>把当前 TUI 接入正在运行的 webui 会话(需先 <code>/webui</code>)。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话</td></tr>
           <tr><td><code>/sync off</code></td><td>退出同步,回到独立会话</td></tr>
+          <tr><td><code>/app</code></td><td>把当前会话通过官方中继暴露给 <strong>手机 App</strong>:终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 <code>/webui</code> 同源共用同一段会话,双向实时同步;区别是不开浏览器、走中继而非局域网)。需先 <code>/login</code> 登录</td></tr>
+          <tr><td><code>/app stop</code></td><td>停止 App 远程访问,断开中继并回到本地会话</td></tr>
         </tbody>
       </table>
-      <p>详细见 <a href="./webui.html">WebUI 界面</a>。</p>
+      <p>详细见 <a href="./webui.html">WebUI 界面</a> 与 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
 
       <h2>配置与帮助</h2>
       <table>
@@ -204,6 +212,7 @@
           <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
           <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
           <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/login</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/proxy</code></td><td>切换出站代理模式:跟随系统代理(默认)/ 指定固定代理 / 直连不走代理。适合公司代理网、需要强制走某个代理或强制直连等场景,选择会写回配置</td></tr>
           <tr><td><code>/language</code></td><td>切换界面语言:自动检测(<code>LC_ALL</code> / <code>LANG</code>)、English、或 简体中文。立即生效并写回 <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>重新打开 3 步首次启动向导(欢迎页 → 语言 → 接入方式)。会话非空时会先弹 <code>y/N</code> 二次确认,确认后清屏。语言和默认接入方式都可以从这里再调一次</td></tr>
           <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>

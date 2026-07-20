@@ -75,6 +75,11 @@ fn review_tool_names(no_web: bool, mount_graph: bool) -> Vec<&'static str> {
 pub fn build_review_agent(cfg: ReviewAgentConfig) -> Result<(Agent, ReportFindingTool), String> {
     let mut provider_cfg = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     provider_cfg.context_window = cfg.context_window;
+    // Byte-idle liveness follows the review config's stream_timeout (the same value
+    // handed to the kernel below), not the adapter's hardcoded 120s default — so the
+    // provider watchdog and the kernel watchdog agree instead of the provider cutting
+    // a long-thinking review off early with a spurious `[Error: stream idle timeout]`.
+    provider_cfg.idle_timeout = cfg.stream_timeout;
     let provider =
         OpenAiCompatProvider::new(provider_cfg).map_err(|e| format!("provider init failed: {}", e.message))?;
     Ok(build_review_agent_with(&cfg, Arc::new(provider)))
@@ -142,6 +147,11 @@ pub fn build_review_agent_with_cancel(
         builder = builder
             .max_rounds(n)
             .hook(Arc::new(crate::round_budget::RoundBudgetHook::new()));
+    }
+    if let Some(progress) = cfg.progress.clone() {
+        builder = builder.hook(Arc::new(crate::review_tool::ReviewProgressHook::new(
+            progress,
+        )));
     }
     // Turn total-time cap via the kernel's cancel seam. The TOKEN is now caller-owned
     // (see `build_review_agent_with_cancel`): the driver creates ONE token + ONE timer
