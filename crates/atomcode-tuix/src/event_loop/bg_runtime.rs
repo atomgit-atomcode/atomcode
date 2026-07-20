@@ -1,6 +1,7 @@
 use super::ui_event::UiEvent as AgentEvent;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::i18n::{t, Msg};
+use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crate::session::Session;
 
 use super::RuntimeEndpoint;
@@ -416,7 +417,7 @@ impl BgRuntimeManager {
                     if let CompactionCompletion::Completed(outcome) = &completion {
                         if outcome.committed {
                             if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
-                                let core_snapshot = super::kernel_snapshot_to_core(snapshot);
+                                let core_snapshot = snapshot_to_core(snapshot);
                                 super::apply_session_snapshot(&mut bg.session, core_snapshot);
                                 // The background CodingRuntime owns native persistence.
                             } else {

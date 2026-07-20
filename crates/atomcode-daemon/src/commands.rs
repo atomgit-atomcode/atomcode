@@ -36,7 +36,10 @@ impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
         futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
         atomcode_kernel::stream::ProviderError,
     > {
-        let messages: Vec<_> = messages.iter().map(message_to_core).collect();
+        let messages: Vec<_> = messages
+            .iter()
+            .map(crate::legacy_convert::message_to_core)
+            .collect();
         let stream = self.inner.chat_stream(&messages, None).map_err(|error| {
             atomcode_kernel::stream::ProviderError {
                 message: error.to_string(),
@@ -68,70 +71,6 @@ impl atomcode_kernel::provider::LlmProvider for KernelSummaryProvider {
                 }
             })
             .boxed())
-    }
-}
-
-pub(crate) fn message_to_core(
-    message: &atomcode_kernel::message::Message,
-) -> atomcode_core::conversation::message::Message {
-    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-    use atomcode_kernel::message::Role as KernelRole;
-    let role = match message.role {
-        KernelRole::System => Role::System,
-        KernelRole::User => Role::User,
-        KernelRole::Assistant => Role::Assistant,
-        KernelRole::Tool => Role::Tool,
-    };
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(),
-            success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| atomcode_core::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(
-                    |block| atomcode_core::conversation::message::ThinkingBlock {
-                        text: block.text.clone(),
-                        signature: block.opaque.clone().unwrap_or_default(),
-                    },
-                )
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message
-                .images
-                .iter()
-                .map(|image| ImagePart {
-                    media_type: image.media_type.clone(),
-                    data: image.data.clone(),
-                })
-                .collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    Message {
-        role,
-        content,
-        synthetic: message.synthetic,
-        internal_origin: message.internal_origin.clone(),
     }
 }
 

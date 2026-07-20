@@ -37,6 +37,7 @@ use anyhow::Result;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
+use atomcode_daemon::legacy_convert::snapshot_to_core;
 use crate::session::{Session, SessionId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::{mpsc, watch};
@@ -11046,7 +11047,7 @@ fn handle_runtime_event(
                     let snapshot = request
                         .snapshot
                         .as_deref()
-                        .map(kernel_snapshot_to_core)
+                        .map(snapshot_to_core)
                         .unwrap_or_default();
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
@@ -11079,7 +11080,7 @@ fn handle_runtime_event(
                             ..
                         } if matches!(reason, atomcode_kernel::event::StopReason::Cancelled) => {
                             AgentEvent::TurnCancelled {
-                                snapshot: kernel_snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot_to_core(snapshot.as_ref()),
                             }
                         }
                         atomcode_coding::TurnCompletion::Completed {
@@ -11099,7 +11100,7 @@ fn handle_runtime_event(
                                 turn_count: stats.turn_count,
                                 tool_call_count: stats.tool_call_count,
                                 stop_reason: kernel_stop_reason(reason),
-                                snapshot: kernel_snapshot_to_core(snapshot.as_ref()),
+                                snapshot: snapshot_to_core(snapshot.as_ref()),
                             }
                         }
                         atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
@@ -11229,7 +11230,7 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::UndoFinished(result) => {
                     match result {
                         Ok(result) => handle_undo_success(
-                            kernel_snapshot_to_core(result.snapshot.as_ref()),
+                            snapshot_to_core(result.snapshot.as_ref()),
                             result.restored_prompt,
                             result.target_n,
                             result.prompts_before,
@@ -11471,7 +11472,7 @@ fn handle_snapshot_restore_finished(
         Ok(snapshot) => {
             let _completed = ctx.pending_local_runtime_sync.take();
             ctx.current_session
-                .update_from_conversation_snapshot(kernel_snapshot_to_core(snapshot.as_ref()));
+                .update_from_conversation_snapshot(snapshot_to_core(snapshot.as_ref()));
             ctx.current_session.touch();
             ctx.bg_manager
                 .set_foreground_session(ctx.current_session.clone());
@@ -11518,7 +11519,7 @@ fn persist_native_compaction_snapshot(
         return false;
     };
 
-    let core_snapshot = kernel_snapshot_to_core(snapshot);
+    let core_snapshot = snapshot_to_core(snapshot);
     persist_current_session(ctx, core_snapshot, renderer)
 }
 
@@ -11556,93 +11557,6 @@ fn mirror_compaction_finished_event(event: &CodingRuntimeEvent, ctx: &LoopCtx) {
     };
     if let Some(txt) = text {
         live.notify_command_output(txt);
-    }
-}
-
-fn kernel_snapshot_to_core(
-    snapshot: &atomcode_kernel::message::SessionSnapshot,
-) -> atomcode_core::conversation::ConversationSnapshot {
-    use atomcode_core::conversation::{LEGACY_COLD_SUMMARY_ORIGIN, LEGACY_COLD_SUMMARY_PREFIX};
-
-    let mut messages = Vec::with_capacity(snapshot.messages.len());
-    let mut cold_summaries = Vec::new();
-    for message in &snapshot.messages {
-        if message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN) {
-            if let Some(summary) = message.text.strip_prefix(LEGACY_COLD_SUMMARY_PREFIX) {
-                cold_summaries.push(summary.to_string());
-                continue;
-            }
-        }
-        messages.push(kernel_message_to_core(message));
-    }
-    atomcode_core::conversation::ConversationSnapshot {
-        messages,
-        cold_summaries,
-    }
-}
-
-fn kernel_message_to_core(
-    message: &atomcode_kernel::message::Message,
-) -> atomcode_core::conversation::message::Message {
-    use atomcode_core::conversation::message::{ImagePart, Message, MessageContent, Role};
-    use atomcode_kernel::message::Role as KernelRole;
-
-    let role = match message.role {
-        KernelRole::System => Role::System,
-        KernelRole::User => Role::User,
-        KernelRole::Assistant => Role::Assistant,
-        KernelRole::Tool => Role::Tool,
-    };
-    let content = if message.role == KernelRole::Tool {
-        MessageContent::ToolResult(atomcode_core::tool::ToolResult {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: message.text.clone(),
-            success: !message.is_error,
-        })
-    } else if !message.tool_calls.is_empty() {
-        MessageContent::AssistantWithToolCalls {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| atomcode_core::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-            reasoning_content: message.reasoning.clone(),
-            thinking_blocks: message
-                .reasoning_blocks
-                .iter()
-                .map(
-                    |block| atomcode_core::conversation::message::ThinkingBlock {
-                        text: block.text.clone(),
-                        signature: block.opaque.clone().unwrap_or_default(),
-                    },
-                )
-                .collect(),
-        }
-    } else if !message.images.is_empty() {
-        MessageContent::MultiPart {
-            text: (!message.text.is_empty()).then(|| message.text.clone()),
-            images: message
-                .images
-                .iter()
-                .map(|image| ImagePart {
-                    media_type: image.media_type.clone(),
-                    data: image.data.clone(),
-                })
-                .collect(),
-        }
-    } else {
-        MessageContent::Text(message.text.clone())
-    };
-    Message {
-        role,
-        content,
-        synthetic: message.synthetic,
-        internal_origin: message.internal_origin.clone(),
     }
 }
 
@@ -11794,7 +11708,13 @@ mod coding_runtime_event_tests {
             provider: Some("anthropic".into()),
         }];
 
-        let projected = kernel_message_to_core(&message);
+        let projected = snapshot_to_core(
+            &atomcode_kernel::message::SessionSnapshot::new(vec![message]),
+        )
+        .messages
+        .into_iter()
+        .next()
+        .expect("projected message");
         let atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
             thinking_blocks,
             ..
@@ -11820,7 +11740,7 @@ mod coding_runtime_event_tests {
             atomcode_kernel::message::Message::user("recent"),
         ]);
 
-        let projected = kernel_snapshot_to_core(&snapshot);
+        let projected = snapshot_to_core(&snapshot);
 
         assert_eq!(projected.cold_summaries, vec!["older context"]);
         assert_eq!(projected.messages.len(), 1);

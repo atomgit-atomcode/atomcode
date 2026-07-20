@@ -1,13 +1,12 @@
 # Session / Conversation 收口方案
 
-> 状态：S0～S4、S5a 已完成；生产 session writer 已切到 native。S5 经当前 live 接口复核后修正为
-> core session **持久化接口面**退役，剩余 S5b～S5e 共 4 个切片；core live transport 单独规划。
+> 状态：S0～S5 已完成；core session **持久化接口面**达到状态④。core live transport 单独规划。
 >
 > 核对基线：`release/v5.0.1@c212245d8916ff02b776122401bf633cb1ef4339`
 >
-> 当前四态：CLI、TUI、daemon 的生产持久化已切到 native，core JSON writer 与 live mirror 写路径已删除；
-> TUI/daemon 仍使用 core session 类型作为磁盘读取/展示投影，importer 仍依赖 core legacy DTO，因此
-> core session 持久化接口面处于状态③。core `LiveSession/TurnExecutor` 的内存协议仍使用 core
+> 当前四态：CLI、TUI、daemon 的生产持久化与磁盘读取均已切到 native；core session 模块、JSON writer、
+> manager、磁盘读取投影和直接依赖已删除。legacy JSON 仅由 daemon 私有 DTO 只读导入。core
+> `LiveSession/TurnExecutor` 的内存协议仍使用 core
 > `Conversation/TurnEvent/provider/tool`，属于独立的 live transport 收口，不再混入本方案的完成门槛。
 
 ## 1. 结论
@@ -48,7 +47,7 @@ S4d 才停止。
 - 不用长期双写、mtime 猜测或 silent fresh 作为兼容策略；
 - 不从 JSONL transcript 重建 runtime snapshot。transcript 不包含完整 system/synthetic/cache epoch 语义。
 
-## 3. 当前存储与调用关系
+## 3. 迁移前存储与调用关系
 
 同一 `$ATOMCODE_HOME/sessions/<project_hash>/` bucket 中存在两套存储：
 
@@ -658,6 +657,10 @@ sidecar 均显式失败。
 - 删除 daemon 的 core `SessionManager/Session/SessionMeta/SessionId` 持久化依赖和只为磁盘加载服务的
   kernel → core session 转换；live transport 边界所需的 message 投影暂保留并集中在一个 adapter。
 
+完成情况：command context/cost/todo、API detail/replay、live/chat 磁盘 seed 已统一读取 native catalog、
+`LoadedSession` 与 kernel snapshot；daemon 不再依赖 core `SessionManager/Session/SessionMeta/SessionId`。
+kernel → core 的剩余转换集中在 live/provider adapter，只服务仍保留的 core conversation 协议，不读写磁盘。
+
 #### S5c：TUI 持久化会话模型切换
 
 - 将 picker、resume、session switch、background、replay/stats 的内存模型改为 driver-local native view，
@@ -666,11 +669,20 @@ sidecar 均显式失败。
   `ConversationSnapshot` 投影集中保留，不得再用于磁盘读写；
 - 清理已无真实消费者的 `ExternalSnapshot` 参数/调用点；若仍有非迁移用途，明确保留理由。
 
+完成情况：picker、resume、session switch、background 和 replay 使用 TUI-local session view，字段来自
+native catalog 聚合；CLI/TUI 已无 core session 持久化类型依赖。TUI 重复的 kernel → core 转换已删除，
+复用 daemon 的 live adapter。`ExternalSnapshot` 仍由 daemon live 单回合执行使用：它把已连接
+`LiveSession` 的内存前缀交给临时 native runtime，不是 legacy 磁盘迁移 fallback，因此保留。
+
 #### S5d：Importer legacy DTO 收窄
 
 - 在 daemon 兼容模块定义只用于反序列化旧 JSON 的私有 DTO，并直接转换为 kernel/native schema；
 - importer 不再构造或依赖 core runtime/session 类型；
 - 保留只读 legacy fixtures 和格式边界，仍不允许生产写 legacy JSON。
+
+完成情况：daemon 兼容模块使用私有、冻结的 `LegacySession/LegacyDisplayMessage/LegacyTurnStat` DTO
+反序列化旧 JSON，并直接转换为 kernel snapshot、native meta 与 presentation；不再构造或依赖 core
+session runtime/persistence 类型。完整、最小和损坏 fixture 继续覆盖格式边界。
 
 #### S5e：接口面与依赖清理
 
@@ -679,6 +691,18 @@ sidecar 均显式失败。
   使用时，不得误报为这些 crate 对整个 `atomcode-core` 依赖已删除；
 - 调用点搜索、相关 crate 完整测试和真实目录副本 smoke 均通过后，声明 core session 持久化接口面
   达到状态④；core conversation/live transport 仍是独立的状态③任务。
+
+完成情况：已删除 `atomcode-core/src/session.rs`、core 模块导出、旧 manager/DTO 兼容测试，以及
+CLI/TUI/daemon 的全部 core session 持久化调用点；共享 project bucket hash 下沉到 leaf config helper，
+native store 与 MCP trust 保持既有磁盘 key。全仓搜索不再存在 `atomcode_core::session` 调用。
+
+真实目录副本 smoke 共枚举 1842 个会话：1818 个完成 legacy → native 转换并通过严格聚合读取；11 个
+catalog 文件健康诊断被显式报告；24 个结构损坏会话被 fail-closed 拒绝（7 个回合中悬空 tool call、
+6 个重复 call id、4 个孤儿/重复 result、7 个非法 turn/presentation 边界）。没有修改真实目录，也没有
+用 silent fresh、猜测配对或丢弃统计掩盖损坏数据；验证完成后已删除临时副本，真实目录始终未写入。
+
+因此 core session 持久化接口面达到状态④；上述 24 个历史数据诊断属于显式数据修复/取舍问题，
+不是第二条持久化路径或未删除的 legacy API。
 
 最终报告必须分别声明：
 
@@ -740,6 +764,5 @@ sidecar 均显式失败。
 S1 按行为切片先写失败测试，再实现 native schema parity。S0 的 characterization tests 保持绿色，
 不把未来行为提前写成永久失败测试。
 
-唯一下一步：执行 S5b。daemon 的 command context/cost/todo、API detail/replay、live/chat 磁盘 seed
-改为直接消费 `LoadedSession` 与 kernel snapshot；删除 core Session 磁盘中间投影，把 live transport
-仍需的 message 转换收口到单一 adapter。
+唯一下一步：单独评审 core live transport 收口方案，先定义 `LiveSession/TurnExecutor` 的 owner、
+kernel-neutral 事件 DTO、审批和多视图回放边界；不得把它继续塞进已经完成的 session 持久化迁移。

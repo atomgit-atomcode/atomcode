@@ -10,7 +10,7 @@
 - `crates/atomcode-capabilities/`；
 - `crates/atomcode-coding/` 的 runtime、provider、session、controller；
 - CLI、TUI、daemon、ACP、clix 的 runtime、session、command/event 接入；
-- `atomcode-core` 中仍被接入层使用的 conversation、session、plugin、live、MCP 等模块；
+- `atomcode-core` 中仍被接入层使用的 conversation、plugin、live、MCP 等模块；
 - 公共协议、持久化格式、审批、安全边界或跨 crate 依赖方向。
 
 本文件描述的是约束，不是永远正确的现状快照。若约束中的事实与当前代码冲突，以当前代码为准；先说明差异，再修正文档或实现，不得按旧路径盲目补代码。
@@ -36,8 +36,9 @@ CLI / TUI / daemon / background / ACP / clix code
 - kernel `AgentCommand/AgentEvent` 是运行时执行边界。coding 产品 driver 应使用 `CodingRuntime`；其他业务 driver 可以驱动其 L2 已装配的 kernel agent，但不得另建第二生命周期 owner，也不得把 provider、session、cd、goal、loop 等 coding 生命周期重新塞进 kernel 命令。
 - core legacy `AgentClient/AgentCommand/AgentEvent`、v1 engine 和 `atomcode-bridge` 已退役。不得重新引入 bridge、双 endpoint、v1/v2 选择开关或 core driver fallback。
 - `atomcode-kernel`、`atomcode-capabilities`、`atomcode-coding` 的生产依赖必须保持 core-free；尤其禁止 capabilities 反向依赖 core、L2 或前端。
-- `atomcode-core` 当前仍承载历史 session/conversation、plugin、live transport 和部分旧能力实现。它们不是旧 engine driver 协议，但属于待按职责收口的接入层/兼容层负担。
-- daemon/TUI 中的 core ↔ kernel 数据转换只允许服务历史 session 导入、持久化兼容或 UI 投影；不得借转换层恢复旧 engine 命令、第二 runtime owner 或静默 fallback。
+- native `SessionManager/SessionMeta/SessionSnapshot/PresentationFile` 是唯一 session 持久化模型；core session 模块与持久化 API 已退役。历史 core JSON 只允许由 daemon 私有 DTO 单向导入，禁止恢复 legacy writer、core 磁盘投影或双向持久化转换。
+- `atomcode-core` 当前仍承载 conversation、plugin、live transport 和部分旧能力实现。它们不是旧 engine driver 协议，但属于待按职责收口的接入层/兼容层负担。
+- daemon/TUI 中的 core ↔ kernel 数据转换只允许服务仍在运行的 live/provider/UI 投影；持久化读取必须先得到严格 native 聚合。不得借转换层恢复旧 engine 命令、第二 runtime owner、core session 磁盘模型或静默 fallback。
 
 ## 架构方向
 
@@ -79,8 +80,8 @@ CLI / TUI / daemon / background / ACP / clix code
 
 当前优先方向是：
 
-1. 收敛 native session/conversation 持久化，逐步把 core session JSON 降为历史导入格式；
-2. 按职责收口 plugin、live transport、MCP host 等接入层服务；
+1. 单独收口 core live transport：先定义 owner、kernel-neutral 事件 DTO、审批和多视图回放边界，不与已完成的 session 持久化迁移混做；
+2. 按职责收口 plugin、MCP host 等接入层服务；
 3. 在消费者归零后删除 core 中重复的 provider/tool/MCP/LSP/graph/semantic 等实现；
 4. 只有 core 自然失去职责和消费者后，才从 workspace 移除 crate。
 

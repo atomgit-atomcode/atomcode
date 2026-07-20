@@ -213,7 +213,7 @@ pub fn message_to_kernel(message: &CoreMessage) -> KernelMessage {
     converted
 }
 
-fn message_to_core(message: &KernelMessage) -> CoreMessage {
+pub(crate) fn message_to_core(message: &KernelMessage) -> CoreMessage {
     let content = if message.role == KernelRole::Tool {
         MessageContent::ToolResult(atomcode_core::tool::ToolResult {
             call_id: message.tool_call_id.clone().unwrap_or_default(),
